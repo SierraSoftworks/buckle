@@ -1,0 +1,142 @@
+name: Release
+on:
+  release:
+    types: [published]
+jobs:
+  version:
+    name: Start Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Sentry CLI
+        uses: mathieu-bour/setup-sentry-cli@1.2.0
+        with:
+          token: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          organization: sierra-softworks
+          project: git-tool
+
+      - name: Check out code
+        uses: actions/checkout@v2.3.4
+
+      - name: Create Sentry Release
+        run: |
+          VERSION="git-tool@${{ github.event.release.tag_name }}"
+          sentry-cli releases new "$VERSION"
+          sentry-cli releases set-commits "$VERSION" --auto
+      - name: Generate Package Version
+        id: version
+        shell: pwsh
+        run: Write-Host "::set-output name=version::$('${{ github.event.release.tag_name }}'.substring(1))"
+
+      - name: Set Package Version
+        uses: ciiiii/toml-editor@1.0.0
+        with:
+          file: Cargo.toml
+          key: package.version
+          value: ${{ steps.version.outputs.version }}
+
+      - name: Stash Versioned Cargo.toml
+        uses: actions/upload-artifact@v2
+        with:
+          name: cargofile
+          path: Cargo.toml
+
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}-release
+    runs-on: ${{ matrix.run_on }}
+    continue-on-error: true
+    needs:
+      - version
+    strategy:
+      matrix:
+        include:
+          # Windows builds
+          - arch: amd64
+            os: windows
+            run_on: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: .exe
+
+          # Linux builds
+          - arch: amd64
+            run_on: ubuntu-latest
+            os: linux
+            target: x86_64-unknown-linux-gnu
+            setup: |
+              sudo apt-get update
+              sudo apt-get install -y libdbus-1-3 libdbus-1-dev
+            strip: strip --strip-debug
+
+          # Apple MacOS builds
+          - arch: amd64
+            run_on: macos-latest
+            os: darwin
+            target: x86_64-apple-darwin
+    steps:
+      - name: setup dependencies
+        run: ${{ matrix.setup }}
+        if: matrix.setup
+
+      - name: Get Rust Stable
+        uses: actions-rs/toolchain@v1.0.7
+        with:
+          toolchain: stable
+          override: true
+          target: ${{ matrix.target }}
+
+      - name: Setup Sentry CLI
+        uses: mathieu-bour/setup-sentry-cli@1.2.0
+        with:
+          token: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          organization: sierra-softworks
+          project: git-tool
+
+      - name: Check out code
+        uses: actions/checkout@v2.3.4
+
+      - name: Fetch Versioned Cargo.toml
+        uses: actions/download-artifact@v2
+        with:
+          name: cargofile
+
+      - name: cargo build
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }} ${{ matrix.flags }}
+
+      - name: Upload Debug Symbols to Sentry
+        run: |
+          sentry-cli upload-dif -o sierra-softworks -p git-tool --include-sources ./target/${{ matrix.target }}/release/
+      - name: Strip Debug Symbols
+        run: |
+          ${{ matrix.strip }} target/${{ matrix.target }}/release/git-tool${{ matrix.extension }}
+        if: matrix.strip
+
+      - name: Upload GitHub Release Artifacts
+        uses: Shopify/upload-to-release@v1.0.1
+        with:
+          name: "git-tool-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}"
+          path: "target/${{ matrix.target }}/release/git-tool${{ matrix.extension }}"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          content-type: application/octet-stream
+
+  sentry:
+    name: Finalize Release
+    runs-on: ubuntu-latest
+    needs:
+      - version
+      - build
+
+    steps:
+      - name: Setup Sentry CLI
+        uses: mathieu-bour/setup-sentry-cli@1.2.0
+        with:
+          token: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          organization: sierra-softworks
+          project: git-tool
+
+      - name: Finalize Sentry Release
+        run: |
+          VERSION="git-tool@${{ github.event.release.tag_name }}"
+          sentry-cli releases finalize "$VERSION"
