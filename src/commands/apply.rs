@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tracing::instrument;
+use tracing::{info_span, instrument};
 use opentelemetry::trace::SpanKind;
 
 use super::*;
@@ -41,6 +41,8 @@ impl CommandRunnable for ApplyCommand {
         let packages = crate::core::package::get_all_packages(&config_dir.join("packages"))?;
 
         for package in packages {
+            let _span = info_span!("package.plan", "package.id"=%package.id).entered();
+
             writeln!(output, "")?;
             writeln!(output, " + package '{}'", &package.id)?;
 

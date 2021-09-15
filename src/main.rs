@@ -84,6 +84,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     })?;
 
+    opentelemetry::global::shutdown_tracer_provider();
+
     Ok(())
 }
 
@@ -125,11 +127,14 @@ fn register_telemetry(
             let layer = tracing_opentelemetry::layer()
                 .with_tracer(tracer);
 
-            println!("Using AppInsights to report telemetry");
-                
+            let default_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(true)
+                .with_writer(std::io::stderr);
+
             let registry = registry()
                 .with(LevelFilter::DEBUG)
-                .with(layer);
+                .with(layer)
+                .with(default_layer);
 
             tracing::subscriber::set_global_default(registry).unwrap();
 
@@ -146,12 +151,15 @@ fn register_telemetry(
             };
         
             let (honeycomb_layer, guard) = new_honeycomb_telemetry_layer("buckle", config.clone());
+            
+            let default_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(true)
+                .with_writer(std::io::stderr);
 
-            println!("Using Honeycomb to report telemetry");
-           
             let registry = registry()
                 .with(LevelFilter::DEBUG)
-                .with(honeycomb_layer);
+                .with(honeycomb_layer)
+                .with(default_layer);
 
             tracing::subscriber::set_global_default(registry).unwrap();
 
