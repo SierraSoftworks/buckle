@@ -77,8 +77,9 @@ impl Script {
     }
 }
 
+#[cfg_attr(test, mockable)]
 #[instrument(name = "command.run", fields(stdout, stderr), skip(config), err)]
-fn run_script_task(interpreter: &str, config: &HashMap<String, String>, file: &Path) -> Result<(), errors::Error> {
+pub fn run_script_task(interpreter: &str, config: &HashMap<String, String>, file: &Path) -> Result<(), errors::Error> {
     process::Command::new(interpreter)
         .arg(file)
         .envs(config)
@@ -98,7 +99,7 @@ fn run_script_task(interpreter: &str, config: &HashMap<String, String>, file: &P
                 Ok(())
             } else {
                 Err(errors::user_with_internal(
-                    "Failed to load configuration from script.",
+                    "Failed to run script.",
                     "Read the internal error message and take the appropriate steps to resolve the issue.",
                     human_errors::detailed_message(&format!(
                         "---- STDOUT: ----\n{}\n\n---- STDERR: ----\n{}",

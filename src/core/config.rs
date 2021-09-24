@@ -84,8 +84,9 @@ fn load_env_config(file: &Path) -> Result<String, errors::Error> {
     })
 }
 
+#[cfg_attr(test, mockable)]
 #[instrument(level = "debug", name = "config.load.script", fields(stdout, stderr), err)]
-fn load_script_config(interpreter: &str, file: &Path) -> Result<String, errors::Error> {
+pub fn load_script_config(interpreter: &str, file: &Path) -> Result<String, errors::Error> {
     process::Command::new(interpreter)
         .arg(file)
         .output()

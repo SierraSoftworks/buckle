@@ -100,9 +100,21 @@ mod tests {
         
         let temp_path = temp.path().to_owned();
         crate::core::file::File::apply.mock_safe(move |f, target, config| {
-            let target = Box::leak(Box::new(temp_path.join(target)));
+            let target = Box::leak(Box::new(temp_path.join(target.strip_prefix("/").unwrap())));
 
             MockResult::Continue((f, target, config))
+        });
+
+        crate::core::config::load_script_config.mock_safe(|interpreter, _file| {
+            assert_eq!(interpreter, "pwsh");
+
+            MockResult::Return(Ok(()))
+        });
+
+        crate::core::script::run_script_task.mock_safe(|interpreter, _config, _file| {
+            assert_eq!(interpreter, "pwsh");
+
+            MockResult::Return(Ok(()))
         });
 
         match cmd.run(&args) {
