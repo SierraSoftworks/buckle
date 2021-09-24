@@ -108,7 +108,7 @@ mod tests {
         crate::core::config::load_script_config.mock_safe(|interpreter, _file| {
             assert_eq!(interpreter, "pwsh");
 
-            MockResult::Return(Ok(()))
+            MockResult::Return(Ok("TESTING=yes".to_string()))
         });
 
         crate::core::script::run_script_task.mock_safe(|interpreter, _config, _file| {

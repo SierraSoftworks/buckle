@@ -7,6 +7,9 @@ use tracing::{Span, instrument};
 
 use crate::errors;
 
+#[cfg(test)]
+use mocktopus::macros::*;
+
 #[instrument(level = "debug", name = "config.load_all", err)]
 pub fn load_all_config(dir: &Path) -> Result<HashMap<String, String>, errors::Error> {
     if !dir.exists() {
