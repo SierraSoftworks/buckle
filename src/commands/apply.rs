@@ -81,6 +81,8 @@ impl CommandRunnable for ApplyCommand {
 
 #[cfg(test)]
 mod tests {
+    use mocktopus::mocking::{MockResult, Mockable};
+
     use crate::test::{get_test_data, test_tracing};
 
     use super::*;
@@ -88,12 +90,20 @@ mod tests {
     #[test]
     fn run() {
         let _guard = test_tracing();
+        let temp = tempfile::tempdir().unwrap();
         
         let cmd = ApplyCommand{};
-
+        
         let args = cmd.app().get_matches_from(vec!["apply", "--config", get_test_data().to_str().unwrap()]);
-
+        
         let output = crate::core::output::mock();
+        
+        let temp_path = temp.path().to_owned();
+        crate::core::file::File::apply.mock_safe(move |f, target, config| {
+            let target = Box::leak(Box::new(temp_path.join(target)));
+
+            MockResult::Continue((f, target, config))
+        });
 
         match cmd.run(&args) {
             Ok(_) => {}
