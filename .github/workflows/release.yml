@@ -86,7 +86,7 @@ jobs:
       - name: Upload GitHub Release Artifacts
         uses: Shopify/upload-to-release@v1.0.1
         with:
-          name: "git-tool-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}"
-          path: "target/${{ matrix.target }}/release/git-tool${{ matrix.extension }}"
+          name: "buckle-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}"
+          path: "target/${{ matrix.target }}/release/buckle${{ matrix.extension }}"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           content-type: application/octet-stream
