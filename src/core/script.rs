@@ -8,6 +8,10 @@ use tracing::{instrument, Span};
 
 use crate::errors;
 
+#[cfg(test)]
+use mocktopus::macros::*;
+
+#[cfg_attr(test, mockable)]
 #[derive(Clone)]
 pub struct Script {
     pub name: String,
@@ -37,20 +41,11 @@ pub fn get_all_scripts(dir: &Path) -> Result<Vec<Script>, errors::Error> {
 
     Ok(files.map(|f| Script {
         name: f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap(),
-        path: f.clone(),
+        path: dunce::simplified(&f).to_owned(),
     }).sorted_by_key(|s| s.name.clone()).collect())
 }
 
-#[instrument(level = "debug", name = "script.run_all", err, skip(config))]
-pub fn run_all_scripts(config: &HashMap<String, String>, dir: &Path) -> Result<(), errors::Error> {
-    let tasks = get_all_scripts(dir)?;
-    for task in tasks {
-        task.run(config)?;
-    }
-
-    Ok(())
-}
-
+#[cfg_attr(test, mockable)]
 impl Script {
     #[instrument(level = "info", name = "script.run", fields(task.name = %self.name, task.path = %self.path.display()), err, skip(self))]
     pub fn run(&self, config: &HashMap<String, String>) -> Result<(), errors::Error> {
@@ -111,4 +106,23 @@ fn run_script_task(interpreter: &str, config: &HashMap<String, String>, file: &P
                         stderr))))
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test::get_test_data;
+
+    use super::get_all_scripts;
+
+    #[test]
+    fn test_load() {
+        let path = get_test_data().join("packages").join("test1").join("scripts");
+        let scripts = get_all_scripts(&path).expect("scripts should be loaded");
+        
+        assert_eq!(scripts.len(), 1, "there should be 1 script in the package");
+        
+        let script = &scripts[0];
+        assert_eq!(script.name, "setup.ps1", "the script's name should be correct");
+        assert_eq!(script.path, dunce::simplified(&path.join("setup.ps1")), "the script's path should be correct");
+    }
 }

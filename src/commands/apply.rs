@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use clap::Arg;
 use tracing::{info_span, instrument};
 use opentelemetry::trace::SpanKind;
 
@@ -17,6 +18,13 @@ impl Command for ApplyCommand {
             .version("1.0")
             .about("applies a bootstrapping configuration to the local machine")
             .long_about("Reads the bootstrapping configuration passed in the --config parameter and attempts to apply it to the local machine.")
+            .arg(Arg::new("config")
+                    .short('c')
+                    .long("config")
+                    .env("BUCKLE_CONFIG")
+                    .value_name("FOLDER")
+                    .about("The path to your buckle configuration directory.")
+                    .takes_value(true))
     }
 }
 
@@ -73,23 +81,33 @@ impl CommandRunnable for ApplyCommand {
 
 #[cfg(test)]
 mod tests {
+    use crate::test::{get_test_data, test_tracing};
+
     use super::*;
 
     #[test]
     fn run() {
-        let args = ArgMatches::default();
+        let _guard = test_tracing();
+        
+        let cmd = ApplyCommand{};
+
+        let args = cmd.app().get_matches_from(vec!["apply", "--config", get_test_data().to_str().unwrap()]);
 
         let output = crate::core::output::mock();
 
-        let cmd = ApplyCommand {};
         match cmd.run(&args) {
             Ok(_) => {}
             Err(err) => panic!("{}", err.message()),
         }
 
         assert!(
-            output.to_string().contains("shell"),
-            "the output should contain the default app"
+            output.to_string().contains(" + package 'test1'"),
+            "the output should contain the first package"
+        );
+
+        assert!(
+            output.to_string().contains(" + package 'test2'"),
+            "the output should contain the second package"
         );
     }
 }

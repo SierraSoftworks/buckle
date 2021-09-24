@@ -30,7 +30,7 @@ pub fn load_all_config(dir: &Path) -> Result<HashMap<String, String>, errors::Er
         .and_then(|files| {
             let mut output = HashMap::new();
 
-            let mut errs: Vec<errors::Error> = files.map(|file| load_config(&file).map(|config| {
+            let mut errs: Vec<errors::Error> = files.map(|file| load_config(dunce::simplified(&file)).map(|config| {
                 for (key, val) in config {
                     output.insert(key,val);
                 }

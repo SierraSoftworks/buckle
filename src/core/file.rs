@@ -7,6 +7,10 @@ use tracing::{instrument};
 
 use crate::errors;
 
+#[cfg(test)]
+use mocktopus::macros::*;
+
+#[cfg_attr(test, mockable)]
 #[derive(Clone)]
 pub struct File {
     pub group: String,
@@ -93,6 +97,7 @@ pub fn get_files(dir: &Path) -> Result<Vec<File>, errors::Error> {
     Ok(files)
 }
 
+#[cfg_attr(test, mockable)]
 impl File {
     #[instrument(level = "info", name = "file.apply", fields(file.path = %self.relative_path.display()), err, skip(self))]
     pub fn apply(

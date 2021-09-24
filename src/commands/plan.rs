@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use clap::Arg;
 use tracing::{info_span, instrument};
 use opentelemetry::trace::SpanKind;
 use crate::errors;
@@ -17,6 +18,13 @@ impl Command for PlanCommand {
             .version("1.0")
             .about("shows the planned strategy for bootstrapping the local machine")
             .long_about("Reads the bootstrapping configuration and shows how it would be executed if run against the local machine.")
+            .arg(Arg::new("config")
+                    .short('c')
+                    .long("config")
+                    .env("BUCKLE_CONFIG")
+                    .value_name("FOLDER")
+                    .about("The path to your buckle configuration directory.")
+                    .takes_value(true))
     }
 }
 
@@ -69,23 +77,36 @@ impl CommandRunnable for PlanCommand {
 
 #[cfg(test)]
 mod tests {
+    use crate::test::{get_test_data, test_tracing};
+    use mocktopus::mocking::*;
     use super::*;
 
     #[test]
     fn run() {
-        let args = ArgMatches::default();
+        let _guard = test_tracing();
+        
+        let cmd = PlanCommand {};
+        let args = cmd.app().get_matches_from(vec!["plan", "--config", get_test_data().to_str().unwrap()]);
 
         let output = crate::core::output::mock();
 
-        let cmd = PlanCommand {};
+        crate::core::file::File::apply.mock_safe(|f, target, config| {
+            panic!("The file should not have been written during the planning phase.");
+        });
+
         match cmd.run(&args) {
             Ok(_) => {}
             Err(err) => panic!("{}", err.message()),
         }
 
         assert!(
-            output.to_string().contains("shell"),
-            "the output should contain the default app"
+            output.to_string().contains(" + package 'test1'"),
+            "the output should contain the first package"
+        );
+
+        assert!(
+            output.to_string().contains(" + package 'test2'"),
+            "the output should contain the second package"
         );
     }
 }
