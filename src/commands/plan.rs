@@ -90,7 +90,7 @@ mod tests {
 
         let output = crate::core::output::mock();
 
-        crate::core::file::File::apply.mock_safe(|f, target, config| {
+        crate::core::file::File::apply.mock_safe(|_f, _target, _config| {
             panic!("The file should not have been written during the planning phase.");
         });
 
