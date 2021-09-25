@@ -10,6 +10,7 @@ use tracing_subscriber::{prelude::*, registry};
 use std::sync::Arc;
 use opentelemetry_otlp::WithExportConfig;
 use tonic::{metadata::*};
+use gethostname::gethostname;
 
 #[macro_use]
 mod macros;
@@ -68,9 +69,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         matches.value_of("honeycomb-dataset"));
 
     let result = {
-        let span = info_span!("app.main", otel.kind=%SpanKind::Client, exit_code = field::Empty);
+        let span = info_span!(
+            "app.main",
+            otel.kind=%SpanKind::Client,
+            hostname=%gethostname().to_str().unwrap(),
+            state="succeeded",
+            exit_code = field::Empty
+        ).entered();
 
-        span.in_scope(|| match run(app, commands, matches) {
+        match run(app, commands, matches) {
             Result::Ok(status) => {
                 span.record("exit_code", &status);
 
@@ -78,15 +85,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Result::Err(err) => {
                 span.record("exit_code", &1);
+                span.record("state", &"failed");
                 error!("{}", err.message());
                 Err(err)
             }
-        })
+        }
     };
 
     opentelemetry::global::shutdown_tracer_provider();
 
-    result
+    result?;
+
+    Ok(())
 }
 
 #[instrument(name = "app.run", fields(otel.kind = %SpanKind::Client), skip(app, commands, matches), err)]
