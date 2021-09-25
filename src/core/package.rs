@@ -45,6 +45,10 @@ impl Package {
         super::config::load_all_config(&self.path.join("config"))
     }
 
+    pub fn get_secrets(&self) -> Result<HashMap<String, String>, errors::Error> {
+        super::config::load_all_config(&self.path.join("secrets"))
+    }
+
     pub fn get_files(&self) -> Result<Vec<File>, errors::Error> {
         super::file::get_all_files(&self.path.join("files"))
     }

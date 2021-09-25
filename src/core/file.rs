@@ -99,24 +99,26 @@ pub fn get_files(dir: &Path) -> Result<Vec<File>, errors::Error> {
 
 #[cfg_attr(test, mockable)]
 impl File {
-    #[instrument(level = "info", name = "file.apply", fields(file.path = %self.relative_path.display()), err, skip(self))]
+    #[instrument(level = "info", name = "file.apply", fields(file.path = %self.relative_path.display()), err, skip(self, secrets))]
     pub fn apply(
         &self,
         target: &Path,
         config: &HashMap<String, String>,
+        secrets: &HashMap<String, String>,
     ) -> Result<(), errors::Error> {
         if self.is_template {
-            self.template(target, config)
+            self.template(target, config, secrets)
         } else {
             self.copy(target)
         }
     }
 
-    #[instrument(level = "debug", name = "file.template", fields(file.path = %self.relative_path.display()), err, skip(self))]
+    #[instrument(level = "debug", name = "file.template", fields(file.path = %self.relative_path.display()), err, skip(self, secrets))]
     fn template(
         &self,
         target: &Path,
         config: &HashMap<String, String>,
+        secrets: &HashMap<String, String>,
     ) -> Result<(), errors::Error> {
         let output_path = target.join(&self.relative_path);
 
@@ -129,6 +131,10 @@ impl File {
 
         let mut context = HashMap::new();
         for (key, val) in config {
+            context.insert(key.clone(), Value::String(val.clone()));
+        }
+
+        for (key, val) in secrets {
             context.insert(key.clone(), Value::String(val.clone()));
         }
 

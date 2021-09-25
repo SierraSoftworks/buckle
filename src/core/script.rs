@@ -47,8 +47,12 @@ pub fn get_all_scripts(dir: &Path) -> Result<Vec<Script>, errors::Error> {
 
 #[cfg_attr(test, mockable)]
 impl Script {
-    #[instrument(level = "info", name = "script.run", fields(task.name = %self.name, task.path = %self.path.display()), err, skip(self))]
-    pub fn run(&self, config: &HashMap<String, String>) -> Result<(), errors::Error> {
+    #[instrument(level = "info", name = "script.run", fields(task.name = %self.name, task.path = %self.path.display()), err, skip(self, secrets))]
+    pub fn run(
+        &self,
+        config: &HashMap<String, String>,
+        secrets: &HashMap<String, String>,
+    ) -> Result<(), errors::Error> {
         let extension = match self.path.extension() {
             Some(ext) => ext.to_str().ok_or(errors::user(
                 &format!("Unable to parse the file extension used by the task file '{}'", self.path.display()),
@@ -58,12 +62,17 @@ impl Script {
                 &format!("Could not determine how to run the task file '{}' because it did not have a file extension.", self.path.display()), 
                 "Use one of the supported file extensions to tell buckle how to execute this task file."))?
         };
+
+        let mut config = config.clone();
+        for (key, val) in secrets {
+            config.insert(key.clone(), val.into());
+        }
     
         match extension {
-            "ps1" => run_script_task("pwsh", config, &self.path)?,
-            "sh" => run_script_task("bash", config, &self.path)?,
-            "bat" => run_script_task("cmd.exe", config, &self.path)?,
-            "cmd" => run_script_task("cmd.exe", config, &self.path)?,
+            "ps1" => run_script_task("pwsh", &config, &self.path)?,
+            "sh" => run_script_task("bash", &config, &self.path)?,
+            "bat" => run_script_task("cmd.exe", &config, &self.path)?,
+            "cmd" => run_script_task("cmd.exe", &config, &self.path)?,
             _ => Err(errors::user(
                 &format!(
                     "The '{}' extension is not supported for task files.",
@@ -78,11 +87,15 @@ impl Script {
 }
 
 #[cfg_attr(test, mockable)]
-#[instrument(name = "command.run", fields(stdout, stderr), skip(config), err)]
-pub fn run_script_task(interpreter: &str, config: &HashMap<String, String>, file: &Path) -> Result<(), errors::Error> {
+#[instrument(name = "command.run", fields(stdout, stderr), skip(env), err)]
+pub fn run_script_task(
+    interpreter: &str,
+    env: &HashMap<String, String>,
+    file: &Path,
+) -> Result<(), errors::Error> {
     process::Command::new(interpreter)
         .arg(file)
-        .envs(config)
+        .envs(env)
         .output()
         .map_err(|err| errors::user_with_internal(
             &format!("Failed to execute the command '{} {}'.", interpreter, file.display()), 

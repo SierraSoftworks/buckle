@@ -38,12 +38,16 @@ impl CommandRunnable for ApplyCommand {
         .map(|p| p.into())
         .ok_or(errors::user("No configuration directory provided.", "Provide the --config directory when running this command."))?;
 
-        let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
-
         let mut output = crate::core::output::output();
 
+        let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
         for (key, val) in config.iter() {
             writeln!(output, " = config {}={}", key, val)?;
+        }
+        
+        let secrets = crate::core::config::load_all_config(&config_dir.join("secrets"))?;
+        for (key, _val) in secrets.iter() {
+            writeln!(output, " = secret {}=******", key)?;
         }
 
         let packages = crate::core::package::get_all_packages(&config_dir.join("packages"))?;
@@ -60,19 +64,25 @@ impl CommandRunnable for ApplyCommand {
                 config.insert(key, val);
             }
 
+            let mut secrets = secrets.clone();
+            for (key, val) in package.get_secrets()? {
+                writeln!(output, "   = secret {}=******", key)?;
+                secrets.insert(key, val);
+            }
+
             let root_path = PathBuf::from("/");
             let files = package.get_files()?;
             for file in files {
                 let target_path = package.files.get(&file.group).map(|f| f.as_path()).unwrap_or(&root_path);
                 writeln!(output, "   + {} '{}'", if file.is_template { "template" } else { "file" }, target_path.join(&file.relative_path).display())?;
 
-                file.apply(target_path, &config)?;
+                file.apply(target_path, &config, &secrets)?;
             }
 
             let tasks = package.get_tasks()?;
             for task in tasks {
                 writeln!(output, "   + task '{}'", &task.name)?;
-                task.run(&config)?;
+                task.run(&config, &secrets)?;
             }
         }
         Ok(0)
@@ -99,10 +109,10 @@ mod tests {
         let output = crate::core::output::mock();
         
         let temp_path = temp.path().to_owned();
-        crate::core::file::File::apply.mock_safe(move |f, target, config| {
+        crate::core::file::File::apply.mock_safe(move |f, target, config, secrets| {
             let target = Box::leak(Box::new(temp_path.join(target.strip_prefix("/").unwrap())));
 
-            MockResult::Continue((f, target, config))
+            MockResult::Continue((f, target, config, secrets))
         });
 
         crate::core::config::load_script_config.mock_safe(|interpreter, _file| {

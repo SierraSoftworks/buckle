@@ -38,12 +38,16 @@ impl CommandRunnable for PlanCommand {
             .map(|p| p.into())
             .ok_or(errors::user("No configuration directory provided.", "Provide the --config directory when running this command."))?;
 
-        let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
-
         let mut output = crate::core::output::output();
-
+        
+        let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
         for (key, val) in config {
             writeln!(output, " = config {}={}", key, val)?;
+        }
+        
+        let secrets = crate::core::config::load_all_config(&config_dir.join("secrets"))?;
+        for (key, _val) in secrets {
+            writeln!(output, " = secret {}=******", key)?;
         }
 
         let packages = crate::core::package::get_all_packages(&config_dir.join("packages"))?;
@@ -56,6 +60,11 @@ impl CommandRunnable for PlanCommand {
             let config = package.get_config()?;
             for (key, val) in config {
                 writeln!(output, "   = config {}={}", key, val)?;
+            }
+
+            let secrets = package.get_secrets()?;
+            for (key, _val) in secrets {
+                writeln!(output, "   = secret {}=******", key)?;
             }
 
             let root_path = PathBuf::from("/");
@@ -90,7 +99,7 @@ mod tests {
 
         let output = crate::core::output::mock();
 
-        crate::core::file::File::apply.mock_safe(|_f, _target, _config| {
+        crate::core::file::File::apply.mock_safe(|_f, _target, _config, _secrets| {
             panic!("The file should not have been written during the planning phase.");
         });
 
