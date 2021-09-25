@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         matches.value_of("honeycomb-key"), 
         matches.value_of("honeycomb-dataset"));
 
-    {
+    let result = {
         let span = info_span!("app.main", otel.kind=%SpanKind::Client, exit_code = field::Empty);
 
         span.in_scope(|| match run(app, commands, matches) {
@@ -81,12 +81,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 error!("{}", err.message());
                 Err(err)
             }
-        })?;
-    }
+        })
+    };
 
     opentelemetry::global::shutdown_tracer_provider();
 
-    Ok(())
+    result
 }
 
 #[instrument(name = "app.run", fields(otel.kind = %SpanKind::Client), skip(app, commands, matches), err)]
