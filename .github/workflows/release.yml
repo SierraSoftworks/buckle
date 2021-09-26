@@ -82,6 +82,11 @@ jobs:
         with:
           command: build
           args: --release --target ${{ matrix.target }} ${{ matrix.flags }}
+          
+      - name: Strip Debug Symbols
+        run: |
+          ${{ matrix.strip }} target/${{ matrix.target }}/release/buckle${{ matrix.extension }}
+        if: matrix.strip
 
       - name: Upload GitHub Release Artifacts
         uses: Shopify/upload-to-release@v1.0.1
