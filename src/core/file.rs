@@ -85,9 +85,15 @@ pub fn get_files(dir: &Path) -> Result<Vec<File>, errors::Error> {
             let name = e.file_name().to_string_lossy();
             let is_template = name.ends_with(".tpl");
 
+            let target_path = if is_template {
+                e.path().with_extension("")
+            } else {
+                e.path().to_owned()
+            };
+
             File {
                 group: group.clone(),
-                relative_path: e.path().strip_prefix(dir).unwrap().to_owned(),
+                relative_path: target_path.strip_prefix(dir).unwrap().to_owned(),
                 source_path: e.path().to_owned(),
                 is_template,
             }
