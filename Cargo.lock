@@ -107,7 +107,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "reqwest",
- "rustls 0.19.1",
+ "rustls 0.20.5",
  "serde",
  "serde_json",
  "serde_yaml",
