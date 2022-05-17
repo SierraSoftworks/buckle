@@ -57,15 +57,13 @@ impl Package {
 #[instrument(level = "debug", name = "package.load_all", err)]
 pub fn get_all_packages(dir: &Path) -> Result<Vec<Package>, errors::Error> {
     let results = dir.read_dir()
-        .map(|dirs| dirs.map(|dir| match dir {
+        .map(|dirs| dirs.filter_map(|dir| match dir {
             Ok(d) => match d.file_type() {
                 Ok(ft) if ft.is_dir() => Some(d.path()),
                 _ => None
             },
             _ => None,
-        })
-        .filter(|d| d.is_some())
-        .map(|d| d.unwrap()))
+        }))
         .map_err(|err| errors::user_with_internal(
             "Failed to read the list of packages files.", 
             "Read the internal error message and take the appropriate steps to resolve the issue.", 
@@ -105,7 +103,7 @@ pub fn get_all_packages(dir: &Path) -> Result<Vec<Package>, errors::Error> {
         match node {
             "__complete" => {}
             _ => {
-                let package = packages_lookup.get(node).ok_or(errors::user(
+                let package = packages_lookup.get(node).ok_or_else(|| errors::user(
                     &format!("Failed to find package with name '{}' although it was present in the dependency graph.", node),
                     "Make sure that this package is present, or remove the dependency from any packages which currently need it."
                 ))?;

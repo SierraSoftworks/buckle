@@ -17,15 +17,13 @@ pub fn load_all_config(dir: &Path) -> Result<HashMap<String, String>, errors::Er
     }
 
     dir.read_dir()
-        .map(|dirs| dirs.map(|dir| match dir {
+        .map(|dirs| dirs.filter_map(|dir| match dir {
             Ok(d) => match d.file_type() {
                 Ok(ft) if ft.is_file() => Some(d.path()),
                 _ => None
             },
             _ => None,
-        })
-        .filter(|d| d.is_some())
-        .map(|d| d.unwrap()))
+        }))
         .map_err(|err| errors::user_with_internal(
             "Failed to read the list of configuration files.", 
             "Read the internal error message and take the appropriate steps to resolve the issue.", 
@@ -49,7 +47,7 @@ pub fn load_all_config(dir: &Path) -> Result<HashMap<String, String>, errors::Er
 #[instrument(level = "info", name = "config.load", err)]
 pub fn load_config(file: &Path) -> Result<HashMap<String, String>, errors::Error> {
     let extension = match file.extension() {
-        Some(ext) => ext.to_str().ok_or(errors::user(
+        Some(ext) => ext.to_str().ok_or_else(|| errors::user(
             &format!("Unable to parse the file extension used by the config file '{}'", file.display()),
             "Make sure that the config file uses a valid file extension."
         ))?,
@@ -123,14 +121,10 @@ fn parse_config(content: &str) -> HashMap<String, String> {
     let pairs = content
         .split_terminator('\n')
         .map(|line| line.trim())
-        .map(|line| line.split_once('='));
-    for pair in pairs {
-        match pair {
-            Some((key, value)) => {
-                output.insert(key.to_owned(), value.to_owned());
-            }
-            _ => {}
-        }
+        .filter_map(|line| line.split_once('='));
+
+    for (key, value) in pairs {
+        output.insert(key.to_owned(), value.to_owned());
     }
 
     output

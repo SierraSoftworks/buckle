@@ -36,7 +36,7 @@ impl CommandRunnable for ApplyCommand {
     ) -> Result<i32, crate::errors::Error> {
         let config_dir: PathBuf = matches.value_of("config")
         .map(|p| p.into())
-        .ok_or(errors::user("No configuration directory provided.", "Provide the --config directory when running this command."))?;
+        .ok_or_else(|| errors::user("No configuration directory provided.", "Provide the --config directory when running this command."))?;
 
         let mut output = crate::core::output::output();
 
@@ -55,7 +55,7 @@ impl CommandRunnable for ApplyCommand {
         for package in packages {
             let _span = info_span!("package.apply", "package.id"=%package.id).entered();
 
-            writeln!(output, "")?;
+            writeln!(output)?;
             writeln!(output, " + package '{}'", &package.id)?;
 
             let mut config = config.clone();

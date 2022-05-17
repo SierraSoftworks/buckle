@@ -25,15 +25,13 @@ pub fn get_all_scripts(dir: &Path) -> Result<Vec<Script>, errors::Error> {
     }
 
     let files = dir.read_dir()
-        .map(|dirs| dirs.map(|dir| match dir {
+        .map(|dirs| dirs.filter_map(|dir| match dir {
             Ok(d) => match d.file_type() {
                 Ok(ft) if ft.is_file() => Some(d.path()),
                 _ => None
             },
             _ => None,
-        })
-        .filter(|d| d.is_some())
-        .map(|d| d.unwrap()))
+        }))
         .map_err(|err| errors::user_with_internal(
             "Failed to read the list of tasks.", 
             "Read the internal error message and take the appropriate steps to resolve the issue.", 
@@ -54,7 +52,7 @@ impl Script {
         secrets: &HashMap<String, String>,
     ) -> Result<(), errors::Error> {
         let extension = match self.path.extension() {
-            Some(ext) => ext.to_str().ok_or(errors::user(
+            Some(ext) => ext.to_str().ok_or_else(|| errors::user(
                 &format!("Unable to parse the file extension used by the task file '{}'", self.path.display()),
                 "Make sure that the task file uses a valid file extension."
             ))?,

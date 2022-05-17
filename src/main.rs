@@ -4,12 +4,11 @@ extern crate tracing;
 
 use crate::commands::CommandRunnable;
 use clap::{crate_authors, App, Arg, ArgMatches};
-use opentelemetry::{sdk, KeyValue, trace::SpanKind};
+use opentelemetry::trace::SpanKind;
 use tracing::{error, field, info_span, instrument, metadata::LevelFilter};
 use tracing_subscriber::{prelude::*, registry};
 use std::sync::Arc;
 use opentelemetry_otlp::WithExportConfig;
-use tonic::{metadata::*};
 use gethostname::gethostname;
 
 #[macro_use]
@@ -35,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .env("APPINSIGHTS_INSTRUMENTATIONKEY")
                 .about("The Application Insights API key which should be used to report telemetry.")
                 .takes_value(true)
-                .conflicts_with_all(&vec!["honeycomb-key", "honeycomb-dataset"])
+                .conflicts_with_all(&["honeycomb-key", "honeycomb-dataset"])
                 .global(true)
                 .requires("appinsights-endpoint"))
         .arg(Arg::new("appinsights-endpoint")
@@ -63,10 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let matches = app.clone().get_matches();
 
     register_telemetry(
-        matches.value_of("appinsights-key"), 
-        matches.value_of("appinsights-endpoint"), 
-        matches.value_of("honeycomb-key"), 
-        matches.value_of("honeycomb-dataset"));
+        matches.value_of("honeycomb-team"),);
 
     let result = {
         let span = info_span!(
@@ -116,77 +112,46 @@ fn run<'a>(
 }
 
 fn register_telemetry(
-    appinsights_key: Option<&str>,
-    appinsights_endpoint: Option<&str>,
-    honeycomb_key: Option<&str>,
-    honeycomb_dataset: Option<&str>
+    honeycomb_team: Option<&str>,
 ) {
-    match (appinsights_key, appinsights_endpoint, honeycomb_key, honeycomb_dataset) {
-        (Some(appinsights_key), Some(appinsights_endpoint), _, _) if !appinsights_key.is_empty() && !appinsights_endpoint.is_empty() => {
-            let tracer = opentelemetry_application_insights::new_pipeline(appinsights_key.to_string())
-                .with_service_name("buckle")
-                .with_client(reqwest::blocking::Client::new())
-                .with_trace_config(sdk::trace::config().with_resource(sdk::Resource::new(
-                    vec![
-                        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-                    ],
-                )))
-                .with_endpoint(appinsights_endpoint).unwrap()
-                .install_batch(opentelemetry::runtime::Tokio);
+    match honeycomb_team {
+        Some(honeycomb_team) if !honeycomb_team.is_empty() => {
 
-            let layer = tracing_opentelemetry::layer()
-                .with_tracer(tracer);
-
-            let default_layer = tracing_subscriber::fmt::layer()
-                .with_ansi(true)
-                .with_writer(std::io::stderr);
-
-            let registry = registry()
-                .with(LevelFilter::DEBUG)
-                .with(layer)
-                .with(default_layer);
-
-            tracing::subscriber::set_global_default(registry).unwrap();
-        },
-        (_, _, Some(honeycomb_key), Some(honeycomb_dataset)) if !honeycomb_key.is_empty() && !honeycomb_dataset.is_empty() => {
-            let mut metadata_map = MetadataMap::new();
-            metadata_map.insert("x-honeycomb-team", honeycomb_key.parse().unwrap());
-            metadata_map.insert("x-honeycomb-dataset", honeycomb_dataset.parse().unwrap());
-
-            let mut tls_config = rustls::ClientConfig::new();
-            tls_config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-            tls_config.set_protocols(&["h2".into()]);
-
-            let exporter = opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint("https://api.honeycomb.io:443")
-                .with_metadata(metadata_map)
-                .with_tls_config(tonic::transport::channel::ClientTlsConfig::new().rustls_client_config(tls_config));
+            let mut tracing_metadata = tonic::metadata::MetadataMap::new();
+            tracing_metadata.insert(
+                "x-honeycomb-team",honeycomb_team.parse().unwrap()
+            );
 
             let tracer = opentelemetry_otlp::new_pipeline()
                 .tracing()
-                .with_exporter(exporter)
-                .with_trace_config(sdk::trace::config().with_resource(sdk::Resource::new(
-                        vec![
-                            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-                        ],
-                    )))
+                .with_exporter(
+                    opentelemetry_otlp::new_exporter()
+                        .tonic()
+                        .with_endpoint("https://api.honeycomb.io:443")
+                        .with_metadata(tracing_metadata),
+                )
+                .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
+                    opentelemetry::sdk::Resource::new(vec![
+                        opentelemetry::KeyValue::new("service.name", "buckle"),
+                        opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                    ]),
+                ))
                 .install_batch(opentelemetry::runtime::Tokio)
                 .unwrap();
 
-                let layer = tracing_opentelemetry::layer()
-                .with_tracer(tracer);
-
-            let default_layer = tracing_subscriber::fmt::layer()
-                .with_ansi(true)
-                .with_writer(std::io::stderr);
-
-            let registry = registry()
-                .with(LevelFilter::DEBUG)
-                .with(layer)
-                .with(default_layer);
-
-            tracing::subscriber::set_global_default(registry).unwrap();
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with(tracing_subscriber::filter::dynamic_filter_fn(
+                    |_metadata, ctx| {
+                        !ctx
+                            .lookup_current()
+                            // Exclude the rustls session "Connection" events which don't have a parent span
+                            .map(|s| s.parent().is_none() && s.name() == "Connection")
+                            .unwrap_or_default()
+                    },
+                ))
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .init();
         },
         _ => {
             let default_layer = tracing_subscriber::fmt::layer()

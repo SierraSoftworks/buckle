@@ -40,15 +40,13 @@ pub fn get_file_groups(dir: &Path) -> Result<Vec<String>, errors::Error> {
     let groups = dir
         .read_dir()
         .map(|dirs| {
-            dirs.map(|dir| match dir {
+            dirs.filter_map(|dir| match dir {
                 Ok(d) => match d.file_type() {
                     Ok(ft) if ft.is_dir() => Some(d.path()),
                     _ => None,
                 },
                 _ => None,
             })
-            .filter(|d| d.is_some())
-            .map(|d| d.unwrap())
         })
         .map_err(|err| {
             errors::user_with_internal(
@@ -56,9 +54,7 @@ pub fn get_file_groups(dir: &Path) -> Result<Vec<String>, errors::Error> {
             "Read the internal error message and take the appropriate steps to resolve the issue.", 
             err)
         })?
-        .map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
-        .filter(|p| p.is_some())
-        .map(|p| p.unwrap())
+        .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
         .collect();
 
     Ok(groups)
