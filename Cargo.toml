@@ -19,7 +19,7 @@ human-errors = "0.1.3"
 http = "0.2"
 itertools = "0.10"
 lazy_static = "1.4"
-nix = "0.23.0"
+nix = "0.24.1"
 once_cell = "1.8"
 opentelemetry = { version = "0.17", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.10", features = ["tonic", "tls"] }
@@ -40,7 +40,7 @@ webpki-roots = "0.22"
 
 [dev-dependencies]
 mocktopus = { git = "https://github.com/notheotherben/mocktopus.git" }
-tempfile = "3.2"
+tempfile = "3.3"
 
 [profile.release]
 debug = true
