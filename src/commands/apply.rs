@@ -13,8 +13,8 @@ impl Command for ApplyCommand {
     fn name(&self) -> String {
         String::from("apply")
     }
-    fn app<'a>(&self) -> clap::App<'a> {
-        App::new(&self.name())
+    fn app<'a>(&self) -> clap::Command<'a> {
+        clap::Command::new(&self.name())
             .version("1.0")
             .about("applies a bootstrapping configuration to the local machine")
             .long_about("Reads the bootstrapping configuration passed in the --config parameter and attempts to apply it to the local machine.")
@@ -23,7 +23,7 @@ impl Command for ApplyCommand {
                     .long("config")
                     .env("BUCKLE_CONFIG")
                     .value_name("FOLDER")
-                    .about("The path to your buckle configuration directory.")
+                    .help("The path to your buckle configuration directory.")
                     .takes_value(true))
     }
 }

@@ -13,8 +13,8 @@ impl Command for PlanCommand {
     fn name(&self) -> String {
         String::from("plan")
     }
-    fn app<'a>(&self) -> clap::App<'a> {
-        App::new(&self.name())
+    fn app<'a>(&self) -> clap::Command<'a> {
+        clap::Command::new(&self.name())
             .version("1.0")
             .about("shows the planned strategy for bootstrapping the local machine")
             .long_about("Reads the bootstrapping configuration and shows how it would be executed if run against the local machine.")
@@ -23,7 +23,7 @@ impl Command for PlanCommand {
                     .long("config")
                     .env("BUCKLE_CONFIG")
                     .value_name("FOLDER")
-                    .about("The path to your buckle configuration directory.")
+                    .help("The path to your buckle configuration directory.")
                     .takes_value(true))
     }
 }

@@ -3,7 +3,7 @@ extern crate gtmpl;
 extern crate tracing;
 
 use crate::commands::CommandRunnable;
-use clap::{crate_authors, App, Arg, ArgMatches};
+use clap::{crate_authors, Arg, ArgMatches};
 use opentelemetry::trace::SpanKind;
 use tracing::{error, field, info_span, instrument, metadata::LevelFilter};
 use tracing_subscriber::{prelude::*, registry};
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let commands = commands::commands();
     let version = version!("v");
 
-    let app = App::new("buckle")
+    let app = clap::Command::new("buckle")
         .version(version.as_str())
         .author(crate_authors!("\n"))
         .about("Taking care of your bootstrapping needs")
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .arg(Arg::new("appinsights-key")
                 .long("appinsights-key")
                 .env("APPINSIGHTS_INSTRUMENTATIONKEY")
-                .about("The Application Insights API key which should be used to report telemetry.")
+                .help("The Application Insights API key which should be used to report telemetry.")
                 .takes_value(true)
                 .conflicts_with_all(&["honeycomb-key", "honeycomb-dataset"])
                 .global(true)
@@ -40,20 +40,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .arg(Arg::new("appinsights-endpoint")
                 .long("appinsights-endpoint")
                 .env("APPINSIGHTS_ENDPOINT")
-                .about("The Application Insights API endpoint which should be used to report telemetry.")
+                .help("The Application Insights API endpoint which should be used to report telemetry.")
                 .global(true)
                 .takes_value(true))
         
         .arg(Arg::new("honeycomb-key")
                 .long("honeycomb-key")
                 .env("HONEYCOMB_APIKEY")
-                .about("The Honeycomb API key which should be used to report telemetry.")
+                .help("The Honeycomb API key which should be used to report telemetry.")
                 .global(true)
                 .takes_value(true))
         .arg(Arg::new("honeycomb-dataset")
                 .long("honeycomb-dataset")
                 .env("HONEYCOMB_DATASET")
-                .about("The Honeycomb dataset which should be used to report telemetry.")
+                .help("The Honeycomb dataset which should be used to report telemetry.")
                 .takes_value(true)
                 .global(true)
                 .default_value("buckle"))
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[instrument(name = "app.run", fields(otel.kind = %SpanKind::Client), skip(app, commands, matches), err)]
 fn run<'a>(
-    mut app: App<'a>,
+    mut app: clap::Command<'a>,
     commands: Vec<Arc<dyn CommandRunnable>>,
     matches: ArgMatches,
 ) -> Result<i32, errors::Error> {

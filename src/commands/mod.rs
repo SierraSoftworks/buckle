@@ -1,5 +1,5 @@
 use super::errors;
-use clap::{App, ArgMatches};
+use clap::ArgMatches;
 use std::sync::Arc;
 use std::{io::Write, vec::Vec};
 
@@ -8,7 +8,7 @@ mod plan;
 
 pub trait Command: Send + Sync {
     fn name(&self) -> String;
-    fn app<'a>(&self) -> App<'a>;
+    fn app<'a>(&self) -> clap::Command<'a>;
 }
 
 pub trait CommandRunnable: Command {
