@@ -9,7 +9,7 @@ edition = "2018"
 name = "buckle"
 
 [dependencies]
-clap = { version = "3.2.4", features = ["cargo", "env"] }
+clap = { version = "3.2.5", features = ["cargo", "env"] }
 directories-next = "2.0"
 dunce = "1.0"
 futures = "0.3"
