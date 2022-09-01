@@ -1,15 +1,16 @@
 extern crate clap;
 extern crate gtmpl;
-extern crate tracing;
+#[macro_use] extern crate tracing;
 
 use crate::commands::CommandRunnable;
 use clap::{crate_authors, Arg, ArgMatches};
-use opentelemetry::trace::SpanKind;
-use tracing::{error, field, info_span, instrument, metadata::LevelFilter};
+use opentelemetry::trace::{SpanKind, StatusCode, TraceContextExt};
+use tracing::{field, instrument, metadata::LevelFilter, Span};
 use tracing_subscriber::{prelude::*, registry};
 use std::sync::Arc;
 use opentelemetry_otlp::WithExportConfig;
 use gethostname::gethostname;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[macro_use]
 mod macros;
@@ -64,40 +65,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     register_telemetry(
         matches.value_of("honeycomb-team"),);
 
-    let result = {
-        let span = info_span!(
-            "app.main",
-            otel.kind=%SpanKind::Client,
-            hostname=%gethostname().to_str().unwrap(),
-            state="succeeded",
-            exit_code = field::Empty
-        ).entered();
-
-        match run(app, commands, matches) {
-            Result::Ok(status) => {
-                span.record("exit_code", &status);
-
-                Ok(())
-            }
-            Result::Err(err) => {
-                span.record("exit_code", &1);
-                span.record("state", &"failed");
-                error!("{}", err.message());
-                Err(err)
-            }
+    std::process::exit(match host(app, commands, matches) {
+        Ok(status) => {
+            opentelemetry::global::shutdown_tracer_provider();
+            status
         }
-    };
-
-    opentelemetry::global::shutdown_tracer_provider();
-
-    result?;
-
-    Ok(())
+        Err(_err) => {
+            opentelemetry::global::shutdown_tracer_provider();
+            1
+        }
+    });
 }
 
-#[instrument(name = "app.run", fields(otel.kind = %SpanKind::Client), skip(app, commands, matches), err)]
+#[instrument(name = "app.host", fields(otel.name="buckle", otel.kind=%SpanKind::Client, otel.status=?StatusCode::Unset,exception=field::Empty, host.hostname=field::Empty, exit_code=field::Empty), skip(app, commands))]
+fn host<'a>(app: clap::App<'a>, commands: Vec<Arc<dyn CommandRunnable>>, matches: ArgMatches) -> Result<i32, errors::Error> {
+    let command_name = format!("buckle {}", matches.subcommand_name().unwrap_or(""))
+        .trim()
+        .to_string();
+
+    Span::current()
+        .record("otel.name", command_name)
+        .record("host.hostname", gethostname().to_string_lossy().trim());
+
+    match run(commands, matches) {
+        Ok(2) => {
+            app.clone().print_help().unwrap_or_default();
+
+            Span::current()
+                .record("otel.status", &field::debug(StatusCode::Error))
+                .record("exit_code", &2_u32);
+
+            warn!("Exiting with status code {}", 2);
+            Ok(2)
+        }
+        Ok(status) => {
+            info!("Exiting with status code {}", status);
+            Span::current()
+                .record("otel.status", &field::debug(StatusCode::Ok))
+                .record("exit_code", &status);
+            Ok(status)
+        }
+        Err(error) => {
+            println!("{}", error);
+
+            error!("Exiting with status code {}", 1);
+            Span::current()
+                .record("otel.status", &field::debug(StatusCode::Error))
+                .record("exit_code", &1_u32);
+
+            if error.is_system() {
+                Span::current().record("exception", &field::display(&error));
+            } else {
+                Span::current().record("exception", &error.description());
+            }
+
+            println!(
+                "Trace ID: {:032x}",
+                Span::current()
+                    .context()
+                    .span()
+                    .span_context()
+                    .trace_id()
+            );
+
+            Err(error)
+        }
+    }
+}
+
+#[instrument(name = "app.run", fields(otel.kind = %SpanKind::Client), skip(commands, matches), err)]
 fn run<'a>(
-    mut app: clap::Command<'a>,
     commands: Vec<Arc<dyn CommandRunnable>>,
     matches: ArgMatches,
 ) -> Result<i32, errors::Error> {
@@ -107,8 +144,7 @@ fn run<'a>(
         }
     }
 
-    app.print_help().unwrap_or_default();
-    Ok(-1)
+    Ok(2)
 }
 
 fn register_telemetry(
@@ -134,13 +170,15 @@ fn register_telemetry(
                     opentelemetry::sdk::Resource::new(vec![
                         opentelemetry::KeyValue::new("service.name", "buckle"),
                         opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                        opentelemetry::KeyValue::new("host.os", std::env::consts::OS),
+                        opentelemetry::KeyValue::new("host.architecture", std::env::consts::ARCH),
                     ]),
                 ))
                 .install_batch(opentelemetry::runtime::Tokio)
                 .unwrap();
 
             tracing_subscriber::registry()
-                .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with(LevelFilter::DEBUG)
                 .with(tracing_subscriber::filter::dynamic_filter_fn(
                     |_metadata, ctx| {
                         !ctx
