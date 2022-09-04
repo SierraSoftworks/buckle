@@ -1,16 +1,18 @@
 extern crate clap;
 extern crate gtmpl;
-#[macro_use] extern crate tracing;
+#[macro_use]
+extern crate tracing;
 
 use crate::commands::CommandRunnable;
-use clap::{crate_authors, Arg, ArgMatches};
-use opentelemetry::trace::{SpanKind, StatusCode, TraceContextExt};
+use clap::{crate_authors, value_parser, Arg, ArgMatches};
+use gethostname::gethostname;
+use opentelemetry::trace::{
+    StatusCode, SpanKind,
+};
+use opentelemetry_otlp::WithExportConfig;
+use std::sync::Arc;
 use tracing::{field, instrument, metadata::LevelFilter, Span};
 use tracing_subscriber::{prelude::*, registry};
-use std::sync::Arc;
-use opentelemetry_otlp::WithExportConfig;
-use gethostname::gethostname;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[macro_use]
 mod macros;
@@ -29,41 +31,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .version(version.as_str())
         .author(crate_authors!("\n"))
         .about("Taking care of your bootstrapping needs")
-        
-        .arg(Arg::new("appinsights-key")
-                .long("appinsights-key")
-                .env("APPINSIGHTS_INSTRUMENTATIONKEY")
-                .help("The Application Insights API key which should be used to report telemetry.")
-                .takes_value(true)
-                .conflicts_with_all(&["honeycomb-key", "honeycomb-dataset"])
-                .global(true)
-                .requires("appinsights-endpoint"))
-        .arg(Arg::new("appinsights-endpoint")
-                .long("appinsights-endpoint")
-                .env("APPINSIGHTS_ENDPOINT")
-                .help("The Application Insights API endpoint which should be used to report telemetry.")
-                .global(true)
-                .takes_value(true))
-        
-        .arg(Arg::new("honeycomb-key")
-                .long("honeycomb-key")
-                .env("HONEYCOMB_APIKEY")
-                .help("The Honeycomb API key which should be used to report telemetry.")
-                .global(true)
-                .takes_value(true))
-        .arg(Arg::new("honeycomb-dataset")
-                .long("honeycomb-dataset")
-                .env("HONEYCOMB_DATASET")
-                .help("The Honeycomb dataset which should be used to report telemetry.")
-                .takes_value(true)
-                .global(true)
-                .default_value("buckle"))
-        .subcommands(commands.iter().map(|x| x.app()));
+        .subcommands(commands.iter().map(|x| x.app()))
+        .arg(Arg::new("otel-endpoint")
+            .help("The OpenTelemetry endpoint to send traces to. This endpoint must support the OTLP protocol.")
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .long("otel-endpoint")
+            .takes_value(true)
+            .value_parser(value_parser!(String)))
+        .arg(Arg::new("otel-headers")
+            .help("The list of headers to send to the OTLP endpoint. Headers are specified as a comma-separated list of key=value pairs.")
+            .env("OTEL_EXPORTER_OTLP_HEADERS")
+            .long("otel-headers")
+            .takes_value(true)
+            .value_parser(value_parser!(String)));
 
     let matches = app.clone().get_matches();
 
-    register_telemetry(
-        matches.value_of("honeycomb-team"),);
+    register_telemetry(&matches);
 
     std::process::exit(match host(app, commands, matches) {
         Ok(status) => {
@@ -77,8 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 }
 
-#[instrument(name = "app.host", fields(otel.name="buckle", otel.kind=%SpanKind::Client, otel.status=?StatusCode::Unset,exception=field::Empty, host.hostname=field::Empty, exit_code=field::Empty), skip(app, commands))]
-fn host<'a>(app: clap::App<'a>, commands: Vec<Arc<dyn CommandRunnable>>, matches: ArgMatches) -> Result<i32, errors::Error> {
+#[instrument(name = "app.host", fields(otel.name="buckle", otel.kind=%SpanKind::Client, otel.status=?StatusCode::Unset,exception=field::Empty, host.hostname=field::Empty, exit_code=field::Empty), skip(app, commands, matches))]
+fn host<'a>(
+    app: clap::App<'a>,
+    commands: Vec<Arc<dyn CommandRunnable>>,
+    matches: ArgMatches,
+) -> Result<i32, errors::Error> {
     let command_name = format!("buckle {}", matches.subcommand_name().unwrap_or(""))
         .trim()
         .to_string();
@@ -88,20 +76,23 @@ fn host<'a>(app: clap::App<'a>, commands: Vec<Arc<dyn CommandRunnable>>, matches
         .record("host.hostname", gethostname().to_string_lossy().trim());
 
     match run(commands, matches) {
-        Ok(2) => {
-            app.clone().print_help().unwrap_or_default();
-
+        Ok(status@0) => {
             Span::current()
-                .record("otel.status", &field::debug(StatusCode::Error))
-                .record("exit_code", &2_u32);
-
-            warn!("Exiting with status code {}", 2);
-            Ok(2)
+                .record("otel.status", &field::debug(StatusCode::Ok))
+                .record("exit_code", &status);
+            Ok(0)
+        }
+        Ok(status@2) => {
+            app.clone().print_help().unwrap_or_default();
+            Span::current()
+                .record("otel.status", &field::debug(StatusCode::Ok))
+                .record("exit_code", &status);
+            Ok(0)
         }
         Ok(status) => {
             info!("Exiting with status code {}", status);
             Span::current()
-                .record("otel.status", &field::debug(StatusCode::Ok))
+                .record("otel.status", &field::debug(StatusCode::Error))
                 .record("exit_code", &status);
             Ok(status)
         }
@@ -118,15 +109,6 @@ fn host<'a>(app: clap::App<'a>, commands: Vec<Arc<dyn CommandRunnable>>, matches
             } else {
                 Span::current().record("exception", &error.description());
             }
-
-            println!(
-                "Trace ID: {:032x}",
-                Span::current()
-                    .context()
-                    .span()
-                    .span_context()
-                    .trace_id()
-            );
 
             Err(error)
         }
@@ -147,24 +129,30 @@ fn run<'a>(
     Ok(2)
 }
 
-fn register_telemetry(
-    honeycomb_team: Option<&str>,
-) {
-    match honeycomb_team {
-        Some(honeycomb_team) if !honeycomb_team.is_empty() => {
+fn register_telemetry(matches: &ArgMatches) {
+    match matches.get_one::<String>("otel-endpoint") {
+        Some(otel_endpoint) if !otel_endpoint.is_empty() => {
+            let mut metadata = tonic::metadata::MetadataMap::new();
 
-            let mut tracing_metadata = tonic::metadata::MetadataMap::new();
-            tracing_metadata.insert(
-                "x-honeycomb-team",honeycomb_team.parse().unwrap()
-            );
+            if let Some(headers) = matches.get_one::<String>("otel-headers") {
+                let leaked_headers = Box::leak(headers.clone().into_boxed_str());
+                leaked_headers.split_terminator(',').for_each(|x| {
+                    if let Some((name, value)) = x.split_once('=') {
+                        if let Some(value) = value.parse().ok() {
+                            metadata.insert(name, value);
+                        }
+                    }
+                });
+            }
 
             let tracer = opentelemetry_otlp::new_pipeline()
                 .tracing()
                 .with_exporter(
                     opentelemetry_otlp::new_exporter()
                         .tonic()
-                        .with_endpoint("https://api.honeycomb.io:443")
-                        .with_metadata(tracing_metadata),
+                        .with_endpoint(otel_endpoint)
+                        .with_metadata(metadata)
+                        .with_env(),
                 )
                 .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
                     opentelemetry::sdk::Resource::new(vec![
@@ -181,8 +169,7 @@ fn register_telemetry(
                 .with(LevelFilter::DEBUG)
                 .with(tracing_subscriber::filter::dynamic_filter_fn(
                     |_metadata, ctx| {
-                        !ctx
-                            .lookup_current()
+                        !ctx.lookup_current()
                             // Exclude the rustls session "Connection" events which don't have a parent span
                             .map(|s| s.parent().is_none() && s.name() == "Connection")
                             .unwrap_or_default()
@@ -190,15 +177,13 @@ fn register_telemetry(
                 ))
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
-        },
+        }
         _ => {
             let default_layer = tracing_subscriber::fmt::layer()
                 .with_ansi(true)
                 .with_writer(std::io::stderr);
-                
-            let registry = registry()
-                .with(LevelFilter::DEBUG)
-                .with(default_layer);
+
+            let registry = registry().with(LevelFilter::DEBUG).with(default_layer);
 
             tracing::subscriber::set_global_default(registry).unwrap();
         }

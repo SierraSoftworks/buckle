@@ -1,8 +1,11 @@
-use std::{collections::HashMap, path::{Path, PathBuf}};
 use serde::*;
 use solvent::DepGraph;
-use tracing::instrument;
 use std::fs;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+use tracing::instrument;
 
 use crate::errors;
 
@@ -29,7 +32,8 @@ impl Package {
         let mut pkg: Package = serde_yaml::from_slice(&content)?;
 
         pkg.path = path.to_owned();
-        pkg.id = path.components()
+        pkg.id = path
+            .components()
             .last()
             .map(|c| c.as_os_str().to_string_lossy().to_string())
             .unwrap();
@@ -56,25 +60,29 @@ impl Package {
 
 #[instrument(level = "debug", name = "package.load_all", err)]
 pub fn get_all_packages(dir: &Path) -> Result<Vec<Package>, errors::Error> {
-    let results = dir.read_dir()
-        .map(|dirs| dirs.filter_map(|dir| match dir {
-            Ok(d) => match d.file_type() {
-                Ok(ft) if ft.is_dir() => Some(d.path()),
-                _ => None
-            },
-            _ => None,
-        }))
-        .map_err(|err| errors::user_with_internal(
+    let results = dir
+        .read_dir()
+        .map(|dirs| {
+            dirs.filter_map(|dir| match dir {
+                Ok(d) => match d.file_type() {
+                    Ok(ft) if ft.is_dir() => Some(d.path()),
+                    _ => None,
+                },
+                _ => None,
+            })
+        })
+        .map_err(|err| {
+            errors::user_with_internal(
             "Failed to read the list of packages files.", 
             "Read the internal error message and take the appropriate steps to resolve the issue.", 
-            err))?
+            err)
+        })?
         .map(|p| Package::load(&p));
-
 
     let mut packages_lookup: HashMap<String, Package> = HashMap::new();
 
     let mut depgraph: DepGraph<&str> = DepGraph::new();
-    
+
     for result in results {
         let package = result?;
 

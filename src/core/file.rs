@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path};
 use walkdir::WalkDir;
 
 use gtmpl::{template, Value};
-use tracing::{instrument};
+use tracing::instrument;
 
 use crate::errors;
 

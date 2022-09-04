@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-use clap::Arg;
-use tracing::{info_span, instrument};
-use opentelemetry::trace::SpanKind;
 use crate::errors;
+use clap::Arg;
+use opentelemetry::trace::SpanKind;
+use std::path::PathBuf;
+use tracing::{info_span, instrument};
 
 use super::*;
 
@@ -30,21 +30,25 @@ impl Command for PlanCommand {
 
 impl CommandRunnable for PlanCommand {
     #[instrument(name = "command.plan", fields(otel.kind = %SpanKind::Client), skip(self, matches), err)]
-    fn run(
-        &self,
-        matches: &clap::ArgMatches,
-    ) -> Result<i32, crate::errors::Error> {
-        let config_dir: PathBuf = matches.value_of("config")
-            .map(|p| p.into())
-            .ok_or_else(|| errors::user("No configuration directory provided.", "Provide the --config directory when running this command."))?;
+    fn run(&self, matches: &clap::ArgMatches) -> Result<i32, crate::errors::Error> {
+        let config_dir: PathBuf =
+            matches
+                .value_of("config")
+                .map(|p| p.into())
+                .ok_or_else(|| {
+                    errors::user(
+                        "No configuration directory provided.",
+                        "Provide the --config directory when running this command.",
+                    )
+                })?;
 
         let mut output = crate::core::output::output();
-        
+
         let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
         for (key, val) in config {
             writeln!(output, " = config {}={}", key, val)?;
         }
-        
+
         let secrets = crate::core::config::load_all_config(&config_dir.join("secrets"))?;
         for (key, _val) in secrets {
             writeln!(output, " = secret {}=******", key)?;
@@ -70,8 +74,17 @@ impl CommandRunnable for PlanCommand {
             let root_path = PathBuf::from("/");
             let files = package.get_files()?;
             for file in files {
-                let group = package.files.get(&file.group).map(|f| f.as_path()).unwrap_or(&root_path);
-                writeln!(output, "   + {} '{}'", if file.is_template { "template" } else { "file" }, group.join(file.relative_path).display())?;
+                let group = package
+                    .files
+                    .get(&file.group)
+                    .map(|f| f.as_path())
+                    .unwrap_or(&root_path);
+                writeln!(
+                    output,
+                    "   + {} '{}'",
+                    if file.is_template { "template" } else { "file" },
+                    group.join(file.relative_path).display()
+                )?;
             }
 
             let tasks = package.get_tasks()?;
@@ -86,16 +99,18 @@ impl CommandRunnable for PlanCommand {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::test::{get_test_data, test_tracing};
     use mocktopus::mocking::*;
-    use super::*;
 
     #[test]
     fn run() {
         let _guard = test_tracing();
-        
+
         let cmd = PlanCommand {};
-        let args = cmd.app().get_matches_from(vec!["plan", "--config", get_test_data().to_str().unwrap()]);
+        let args =
+            cmd.app()
+                .get_matches_from(vec!["plan", "--config", get_test_data().to_str().unwrap()]);
 
         let output = crate::core::output::mock();
 

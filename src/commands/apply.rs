@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use clap::Arg;
-use tracing::{info_span, instrument};
 use opentelemetry::trace::SpanKind;
+use tracing::{info_span, instrument};
 
 use super::*;
 
@@ -30,13 +30,17 @@ impl Command for ApplyCommand {
 
 impl CommandRunnable for ApplyCommand {
     #[instrument(name = "command.apply", fields(otel.kind = %SpanKind::Client), skip(self, matches), err)]
-    fn run(
-        &self,
-        matches: &clap::ArgMatches,
-    ) -> Result<i32, crate::errors::Error> {
-        let config_dir: PathBuf = matches.value_of("config")
-        .map(|p| p.into())
-        .ok_or_else(|| errors::user("No configuration directory provided.", "Provide the --config directory when running this command."))?;
+    fn run(&self, matches: &clap::ArgMatches) -> Result<i32, crate::errors::Error> {
+        let config_dir: PathBuf =
+            matches
+                .value_of("config")
+                .map(|p| p.into())
+                .ok_or_else(|| {
+                    errors::user(
+                        "No configuration directory provided.",
+                        "Provide the --config directory when running this command.",
+                    )
+                })?;
 
         let mut output = crate::core::output::output();
 
@@ -44,7 +48,7 @@ impl CommandRunnable for ApplyCommand {
         for (key, val) in config.iter() {
             writeln!(output, " = config {}={}", key, val)?;
         }
-        
+
         let secrets = crate::core::config::load_all_config(&config_dir.join("secrets"))?;
         for (key, _val) in secrets.iter() {
             writeln!(output, " = secret {}=******", key)?;
@@ -73,8 +77,17 @@ impl CommandRunnable for ApplyCommand {
             let root_path = PathBuf::from("/");
             let files = package.get_files()?;
             for file in files {
-                let target_path = package.files.get(&file.group).map(|f| f.as_path()).unwrap_or(&root_path);
-                writeln!(output, "   + {} '{}'", if file.is_template { "template" } else { "file" }, target_path.join(&file.relative_path).display())?;
+                let target_path = package
+                    .files
+                    .get(&file.group)
+                    .map(|f| f.as_path())
+                    .unwrap_or(&root_path);
+                writeln!(
+                    output,
+                    "   + {} '{}'",
+                    if file.is_template { "template" } else { "file" },
+                    target_path.join(&file.relative_path).display()
+                )?;
 
                 file.apply(target_path, &config, &secrets)?;
             }
@@ -101,13 +114,17 @@ mod tests {
     fn run() {
         let _guard = test_tracing();
         let temp = tempfile::tempdir().unwrap();
-        
-        let cmd = ApplyCommand{};
-        
-        let args = cmd.app().get_matches_from(vec!["apply", "--config", get_test_data().to_str().unwrap()]);
-        
+
+        let cmd = ApplyCommand {};
+
+        let args = cmd.app().get_matches_from(vec![
+            "apply",
+            "--config",
+            get_test_data().to_str().unwrap(),
+        ]);
+
         let output = crate::core::output::mock();
-        
+
         let temp_path = temp.path().to_owned();
         crate::core::file::File::apply.mock_safe(move |f, target, config, secrets| {
             let target = Box::leak(Box::new(temp_path.join(target.strip_prefix("/").unwrap())));

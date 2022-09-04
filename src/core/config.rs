@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path};
 use std::fs::read_to_string;
 use std::process;
 use tracing::field::display;
-use tracing::{Span, instrument};
+use tracing::{instrument, Span};
 
 use crate::errors;
 
@@ -13,33 +13,43 @@ use mocktopus::macros::*;
 #[instrument(level = "debug", name = "config.load_all", err)]
 pub fn load_all_config(dir: &Path) -> Result<HashMap<String, String>, errors::Error> {
     if !dir.exists() {
-        return Ok(HashMap::new())
+        return Ok(HashMap::new());
     }
 
     dir.read_dir()
-        .map(|dirs| dirs.filter_map(|dir| match dir {
-            Ok(d) => match d.file_type() {
-                Ok(ft) if ft.is_file() => Some(d.path()),
-                _ => None
-            },
-            _ => None,
-        }))
-        .map_err(|err| errors::user_with_internal(
+        .map(|dirs| {
+            dirs.filter_map(|dir| match dir {
+                Ok(d) => match d.file_type() {
+                    Ok(ft) if ft.is_file() => Some(d.path()),
+                    _ => None,
+                },
+                _ => None,
+            })
+        })
+        .map_err(|err| {
+            errors::user_with_internal(
             "Failed to read the list of configuration files.", 
             "Read the internal error message and take the appropriate steps to resolve the issue.", 
-            err))
+            err)
+        })
         .and_then(|files| {
             let mut output = HashMap::new();
 
-            let mut errs: Vec<errors::Error> = files.map(|file| load_config(dunce::simplified(&file)).map(|config| {
-                for (key, val) in config {
-                    output.insert(key,val);
-                }
-            })).filter(|r| r.is_err()).map(|r| r.unwrap_err()).collect();
+            let mut errs: Vec<errors::Error> = files
+                .map(|file| {
+                    load_config(dunce::simplified(&file)).map(|config| {
+                        for (key, val) in config {
+                            output.insert(key, val);
+                        }
+                    })
+                })
+                .filter(|r| r.is_err())
+                .map(|r| r.unwrap_err())
+                .collect();
 
             match errs.pop() {
                 Some(err) => Err(err),
-                None => Ok(output)
+                None => Ok(output),
             }
         })
 }
@@ -86,7 +96,12 @@ fn load_env_config(file: &Path) -> Result<String, errors::Error> {
 }
 
 #[cfg_attr(test, mockable)]
-#[instrument(level = "debug", name = "config.load.script", fields(stdout, stderr), err)]
+#[instrument(
+    level = "debug",
+    name = "config.load.script",
+    fields(stdout, stderr),
+    err
+)]
 pub fn load_script_config(interpreter: &str, file: &Path) -> Result<String, errors::Error> {
     process::Command::new(interpreter)
         .arg(file)
