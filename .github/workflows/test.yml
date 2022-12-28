@@ -1,7 +1,5 @@
 name: Test Changes
 on: [push]
-env:
-  GRCOV_VERSION: 0.8.0
 
 jobs:
   test-platforms:
@@ -20,7 +18,6 @@ jobs:
             run_on: ubuntu-20.04
             os: linux
             target: x86_64-unknown-linux-gnu
-            coverage: true
             setup: |
               sudo apt-get update
               sudo apt-get install -y libdbus-1-3 libdbus-1-dev
@@ -34,33 +31,35 @@ jobs:
         run: ${{ matrix.setup }}
         if: matrix.setup
 
-      - uses: actions/checkout@v3.1.0
-
-      - name: cache ~/.cargo
-        uses: Swatinem/rust-cache@v1
+      - uses: actions/checkout@v3.2.0
 
       - name: rustup install nightly
         uses: actions-rs/toolchain@v1.0.7
         with:
-          toolchain: nightly
+          toolchain: stable
           profile: minimal
-          target: ${{ matrix.target }}
-          override: true
-
-      - name: rustup install nightly llvm-tools-preview
-        uses: actions-rs/toolchain@v1.0.7
-        if: matrix.coverage || false
-        with:
-          toolchain: nightly
           target: ${{ matrix.target }}
           override: true
           components: llvm-tools-preview
 
-      - name: cargo install grcov
-        uses: SierraSoftworks/setup-grcov@v1
-        if: matrix.coverage || false
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: cache ~/.cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: install protoc
+        run: |
+          if ('${{ matrix.os }}' -eq 'windows') {
+            $protoc_arch = 'win64'
+          } elseif ('${{ matrix.os }}' -eq 'darwin') {
+            $protoc_arch = 'osx-x86_64'
+          } else {
+            $protoc_arch = 'linux-x86_64'
+          }
+          $protoc_url = "https://github.com/protocolbuffers/protobuf/releases/download/v3.20.2/protoc-3.20.2-$protoc_arch.zip"
+          Write-Host "Downloading protoc from '$protoc_url'"
+          Invoke-WebRequest -OutFile protoc.zip -Uri $protoc_url
+          Expand-Archive protoc.zip -DestinationPath ../tools
+          Add-Content -Path $env:GITHUB_PATH -Value "$((Get-Item ./).Parent.FullName)/tools/bin"
+        shell: pwsh
 
       - name: git config
         run: |
@@ -76,33 +75,44 @@ jobs:
 
       - name: cargo test
         uses: actions-rs/cargo@v1.0.3
-        if: "!matrix.skiptests && !matrix.coverage"
+        if: "!matrix.skiptests"
         with:
           command: test
           args: --no-fail-fast --target ${{ matrix.target }} ${{ matrix.flags }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUSTFLAGS: "-C instrument_coverage"
+          LLVM_PROFILE_FILE: default.profraw
 
-      - name: cargo test +coverage
+      - name: install rustfilt
         uses: actions-rs/cargo@v1.0.3
-        if: "!matrix.skiptests && matrix.coverage"
+        if: "!matrix.skiptests"
         with:
-          command: test
-          args: --no-fail-fast --target ${{ matrix.target }} ${{ matrix.flags }}
-        env:
-          RUSTFLAGS: -Zinstrument-coverage
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          command: install
+          args: rustfilt
 
-      - name: grcov
-        run: grcov . --binary-path target/${{ matrix.target }}/debug/deps/ -s . -t lcov --ignore-not-existing --ignore '../**' --ignore '/*' --ignore 'C:/' -o ./lcov.info
-        if: matrix.coverage || false
+      - name: prepare coverage output
+        shell: pwsh
+        if: "!matrix.skiptests"
+        run: |
+          Write-Host "Merging raw profile output files"
+          &"$(rustc --print target-libdir)/../bin/llvm-profdata" merge -sparse default.profraw -o default.profdata
+          $latest_asset = Get-ChildItem -Path ./target/${{ matrix.target }}/debug/deps -Filter "git_tool-*" -File `
+          | Where-Object { $_.Name.EndsWith(".exe") -or (-not $_.Name.Contains(".")) } `
+          | Sort-Object -Top 1 -Property LastWriteTime
+          Write-Host "Latest Asset: $latest_asset"
+          Write-Host "Exporting LCOV coverage report"
+          &"$(rustc --print target-libdir)/../bin/llvm-cov" export -instr-profile default.profdata $latest_asset `
+              -Xdemangler=rustfilt `
+              -ignore-filename-regex='.cargo|rustc' `
+              -compilation-dir=src `
+              -format=lcov > lcov.info
 
       - name: codecov upload
         uses: codecov/codecov-action@v3
-        if: matrix.coverage || false
+        if: "!matrix.skiptests"
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          file: ./lcov.info
 
   test-done:
     name: Tests Complete
