@@ -29,7 +29,7 @@ impl Command for PlanCommand {
 }
 
 impl CommandRunnable for PlanCommand {
-    #[instrument(name = "command.plan", fields(otel.kind = %SpanKind::Client), skip(self, matches), err)]
+    #[instrument(name = "command.plan", fields(otel.kind = ?SpanKind::Client), skip(self, matches), err)]
     fn run(&self, matches: &clap::ArgMatches) -> Result<i32, crate::errors::Error> {
         let config_dir: PathBuf =
             matches
