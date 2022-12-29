@@ -92,7 +92,7 @@ jobs:
         run: |
           Write-Host "Merging raw profile output files"
           &"$(rustc --print target-libdir)/../bin/llvm-profdata" merge -sparse default.profraw -o default.profdata
-          $latest_asset = Get-ChildItem -Path ./target/${{ matrix.target }}/debug/deps -Filter "git_tool-*" -File `
+          $latest_asset = Get-ChildItem -Path ./target/${{ matrix.target }}/debug/deps -Filter "buckle-*" -File `
           | Where-Object { $_.Name.EndsWith(".exe") -or (-not $_.Name.Contains(".")) } `
           | Sort-Object -Top 1 -Property LastWriteTime
           Write-Host "Latest Asset: $latest_asset"
