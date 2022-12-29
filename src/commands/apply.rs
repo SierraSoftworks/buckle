@@ -46,12 +46,12 @@ impl CommandRunnable for ApplyCommand {
 
         let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
         for (key, val) in config.iter() {
-            writeln!(output, " = config {}={}", key, val)?;
+            writeln!(output, " = config {key}={val}")?;
         }
 
         let secrets = crate::core::config::load_all_config(&config_dir.join("secrets"))?;
         for (key, _val) in secrets.iter() {
-            writeln!(output, " = secret {}=******", key)?;
+            writeln!(output, " = secret {key}=******")?;
         }
 
         let packages = crate::core::package::get_all_packages(&config_dir.join("packages"))?;
@@ -64,13 +64,13 @@ impl CommandRunnable for ApplyCommand {
 
             let mut config = config.clone();
             for (key, val) in package.get_config()? {
-                writeln!(output, "   = config {}={}", key, val)?;
+                writeln!(output, "   = config {key}={val}")?;
                 config.insert(key, val);
             }
 
             let mut secrets = secrets.clone();
             for (key, val) in package.get_secrets()? {
-                writeln!(output, "   = secret {}=******", key)?;
+                writeln!(output, "   = secret {key}=******")?;
                 secrets.insert(key, val);
             }
 

@@ -99,6 +99,7 @@ pub fn get_files(dir: &Path) -> Result<Vec<File>, errors::Error> {
     Ok(files)
 }
 
+#[allow(clippy::swap_ptr_to_ref)]
 #[cfg_attr(test, mockable)]
 impl File {
     #[instrument(level = "info", name = "file.apply", fields(file.path = %self.relative_path.display()), err, skip(self, secrets))]

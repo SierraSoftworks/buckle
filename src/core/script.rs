@@ -54,6 +54,7 @@ pub fn get_all_scripts(dir: &Path) -> Result<Vec<Script>, errors::Error> {
         .collect())
 }
 
+#[allow(clippy::swap_ptr_to_ref)]
 #[cfg_attr(test, mockable)]
 impl Script {
     #[instrument(level = "info", name = "script.run", fields(task.name = %self.name, task.path = %self.path.display()), err, skip(self, secrets))]
@@ -84,8 +85,7 @@ impl Script {
             "cmd" => run_script_task("cmd.exe", &config, &self.path)?,
             _ => Err(errors::user(
                 &format!(
-                    "The '{}' extension is not supported for task files.",
-                    extension
+                    "The '{extension}' extension is not supported for task files."
                 ),
                 "Try using a file extension that is supported by buckle.",
             ))?,
@@ -95,6 +95,7 @@ impl Script {
     }
 }
 
+#[allow(clippy::swap_ptr_to_ref)]
 #[cfg_attr(test, mockable)]
 #[instrument(name = "command.run", fields(stdout, stderr), skip(env), err)]
 pub fn run_script_task(
@@ -108,7 +109,7 @@ pub fn run_script_task(
         .output()
         .map_err(|err| errors::user_with_internal(
             &format!("Failed to execute the command '{} {}'.", interpreter, file.display()), 
-            &format!("Make sure that '{}' is installed and present on your path and that you have permission to access it.", interpreter),
+            &format!("Make sure that '{interpreter}' is installed and present on your path and that you have permission to access it."),
             err))
         .and_then(|output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -124,9 +125,7 @@ pub fn run_script_task(
                     "Failed to run script.",
                     "Read the internal error message and take the appropriate steps to resolve the issue.",
                     human_errors::detailed_message(&format!(
-                        "---- STDOUT: ----\n{}\n\n---- STDERR: ----\n{}",
-                        stdout,
-                        stderr))))
+                        "---- STDOUT: ----\n{stdout}\n\n---- STDERR: ----\n{stderr}"))))
             }
         })
 }

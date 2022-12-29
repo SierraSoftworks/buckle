@@ -112,7 +112,7 @@ pub fn get_all_packages(dir: &Path) -> Result<Vec<Package>, errors::Error> {
             "__complete" => {}
             _ => {
                 let package = packages_lookup.get(node).ok_or_else(|| errors::user(
-                    &format!("Failed to find package with name '{}' although it was present in the dependency graph.", node),
+                    &format!("Failed to find package with name '{node}' although it was present in the dependency graph."),
                     "Make sure that this package is present, or remove the dependency from any packages which currently need it."
                 ))?;
                 packages.push(package.clone());

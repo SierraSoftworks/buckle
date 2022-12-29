@@ -76,27 +76,27 @@ fn host<'a>(
     match run(commands, matches) {
         Ok(status@0) => {
             Span::current()
-                .record("exit_code", &status);
+                .record("exit_code", status);
             Ok(0)
         }
         Ok(status@2) => {
             app.clone().print_help().unwrap_or_default();
             Span::current()
-                .record("exit_code", &status);
+                .record("exit_code", status);
             Ok(0)
         }
         Ok(status) => {
             info!("Exiting with status code {}", status);
             Span::current()
-                .record("exit_code", &status);
+                .record("exit_code", status);
             Ok(status)
         }
         Err(error) => {
-            println!("{}", error);
+            println!("{error}");
 
             error!("Exiting with status code {}", 1);
             Span::current()
-                .record("exit_code", &1_u32);
+                .record("exit_code", 1_u32);
 
             if error.is_system() {
                 Span::current().record("exception", &field::display(&error));
@@ -163,7 +163,7 @@ fn load_otlp_headers() -> tonic::metadata::MetadataMap {
                     if let Ok(value) = value.parse() {
                         tracing_metadata.insert(key, value);
                     } else {
-                        eprintln!("Could not parse value for header {}.", key);
+                        eprintln!("Could not parse value for header {key}.");
                     }
                 }
             }

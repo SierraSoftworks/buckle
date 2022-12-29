@@ -74,8 +74,7 @@ pub fn load_config(file: &Path) -> Result<HashMap<String, String>, errors::Error
         "cmd" => load_script_config("cmd.exe", file)?,
         _ => Err(errors::user(
             &format!(
-                "The '{}' extension is not supported for config files.",
-                extension
+                "The '{extension}' extension is not supported for config files."
             ),
             "Try using a file extension that is supported by buckle.",
         ))?,
@@ -95,6 +94,7 @@ fn load_env_config(file: &Path) -> Result<String, errors::Error> {
     })
 }
 
+#[allow(clippy::swap_ptr_to_ref)]
 #[cfg_attr(test, mockable)]
 #[instrument(
     level = "debug",
@@ -108,7 +108,7 @@ pub fn load_script_config(interpreter: &str, file: &Path) -> Result<String, erro
         .output()
         .map_err(|err| errors::user_with_internal(
             &format!("Failed to execute the command '{} {}'.", interpreter, file.display()), 
-            &format!("Make sure that '{}' is installed and present on your path and that you have permission to access it.", interpreter),
+            &format!("Make sure that '{interpreter}' is installed and present on your path and that you have permission to access it."),
             err))
         .and_then(|output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -123,9 +123,7 @@ pub fn load_script_config(interpreter: &str, file: &Path) -> Result<String, erro
                     "Failed to load configuration from script.",
                     "Read the internal error message and take the appropriate steps to resolve the issue.",
                     human_errors::detailed_message(&format!(
-                        "---- STDOUT: ----\n{}\n\n---- STDERR: ----\n{}",
-                        stdout,
-                        stderr))))
+                        "---- STDOUT: ----\n{stdout}\n\n---- STDERR: ----\n{stderr}"))))
             }
         })
 }

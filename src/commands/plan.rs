@@ -46,12 +46,12 @@ impl CommandRunnable for PlanCommand {
 
         let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
         for (key, val) in config {
-            writeln!(output, " = config {}={}", key, val)?;
+            writeln!(output, " = config {key}={val}")?;
         }
 
         let secrets = crate::core::config::load_all_config(&config_dir.join("secrets"))?;
         for (key, _val) in secrets {
-            writeln!(output, " = secret {}=******", key)?;
+            writeln!(output, " = secret {key}=******")?;
         }
 
         let packages = crate::core::package::get_all_packages(&config_dir.join("packages"))?;
@@ -63,12 +63,12 @@ impl CommandRunnable for PlanCommand {
 
             let config = package.get_config()?;
             for (key, val) in config {
-                writeln!(output, "   = config {}={}", key, val)?;
+                writeln!(output, "   = config {key}={val}")?;
             }
 
             let secrets = package.get_secrets()?;
             for (key, _val) in secrets {
-                writeln!(output, "   = secret {}=******", key)?;
+                writeln!(output, "   = secret {key}=******")?;
             }
 
             let root_path = PathBuf::from("/");
