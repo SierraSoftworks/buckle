@@ -4,7 +4,7 @@ extern crate gtmpl;
 extern crate tracing;
 
 use crate::commands::CommandRunnable;
-use clap::{crate_authors, value_parser, Arg, ArgMatches};
+use clap::{crate_authors, value_parser, Arg, ArgMatches, ArgAction};
 use gethostname::gethostname;
 use opentelemetry::trace::SpanKind;
 use opentelemetry_otlp::WithExportConfig;
@@ -23,10 +23,9 @@ mod test;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let commands = commands::commands();
-    let version = version!("v");
 
     let app = clap::Command::new("buckle")
-        .version(version.as_str())
+        .version(version!("v"))
         .author(crate_authors!("\n"))
         .about("Taking care of your bootstrapping needs")
         .subcommands(commands.iter().map(|x| x.app()))
@@ -34,13 +33,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .help("The OpenTelemetry endpoint to send traces to. This endpoint must support the OTLP protocol.")
             .env("OTEL_EXPORTER_OTLP_ENDPOINT")
             .long("otel-endpoint")
-            .takes_value(true)
+            .action(ArgAction::Set)
             .value_parser(value_parser!(String)))
         .arg(Arg::new("otel-headers")
             .help("The list of headers to send to the OTLP endpoint. Headers are specified as a comma-separated list of key=value pairs.")
             .env("OTEL_EXPORTER_OTLP_HEADERS")
             .long("otel-headers")
-            .takes_value(true)
+            .action(ArgAction::Set)
             .value_parser(value_parser!(String)));
 
     let matches = app.clone().get_matches();
@@ -60,8 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 #[instrument(name = "app.host", fields(otel.name="buckle", otel.kind=?SpanKind::Client, exception=field::Empty, host.hostname=field::Empty, exit_code=field::Empty), skip(app, commands, matches), ret, err)]
-fn host<'a>(
-    app: clap::App<'a>,
+fn host(
+    app: clap::Command,
     commands: Vec<Arc<dyn CommandRunnable>>,
     matches: ArgMatches,
 ) -> Result<i32, errors::Error> {
@@ -110,12 +109,12 @@ fn host<'a>(
 }
 
 #[instrument(name = "app.run", fields(otel.kind = ?SpanKind::Client), skip(commands, matches), ret, err)]
-fn run<'a>(
+fn run(
     commands: Vec<Arc<dyn CommandRunnable>>,
     matches: ArgMatches,
 ) -> Result<i32, errors::Error> {
     for cmd in commands.iter() {
-        if let Some(cmd_matches) = matches.subcommand_matches(cmd.name()) {
+        if let Some(cmd_matches) = matches.subcommand_matches(&cmd.name()) {
             return cmd.run(cmd_matches);
         }
     }

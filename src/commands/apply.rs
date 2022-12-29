@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Arg;
+use clap::{Arg, ArgAction, value_parser};
 use opentelemetry::trace::SpanKind;
 use tracing::{info_span, instrument};
 
@@ -13,8 +13,8 @@ impl Command for ApplyCommand {
     fn name(&self) -> String {
         String::from("apply")
     }
-    fn app<'a>(&self) -> clap::Command<'a> {
-        clap::Command::new(&self.name())
+    fn app(&self) -> clap::Command {
+        clap::Command::new(self.name())
             .version("1.0")
             .about("applies a bootstrapping configuration to the local machine")
             .long_about("Reads the bootstrapping configuration passed in the --config parameter and attempts to apply it to the local machine.")
@@ -24,7 +24,9 @@ impl Command for ApplyCommand {
                     .env("BUCKLE_CONFIG")
                     .value_name("FOLDER")
                     .help("The path to your buckle configuration directory.")
-                    .takes_value(true))
+                    .action(ArgAction::Set)
+                    .value_parser(value_parser!(PathBuf))
+                    .required(true))
     }
 }
 
@@ -33,8 +35,8 @@ impl CommandRunnable for ApplyCommand {
     fn run(&self, matches: &clap::ArgMatches) -> Result<i32, crate::errors::Error> {
         let config_dir: PathBuf =
             matches
-                .value_of("config")
-                .map(|p| p.into())
+                .get_one::<PathBuf>("config")
+                .cloned()
                 .ok_or_else(|| {
                     errors::user(
                         "No configuration directory provided.",
