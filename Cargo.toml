@@ -13,7 +13,7 @@ clap = { version = "4.0.32", features = ["cargo", "env", "string"] }
 directories-next = "2.0"
 dunce = "1.0"
 futures = "0.3"
-gethostname = "0.2"
+gethostname = "0.4"
 gtmpl = "0.7"
 human-errors = "0.1.3"
 http = "0.2"
