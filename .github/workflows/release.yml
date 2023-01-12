@@ -110,7 +110,7 @@ jobs:
         run: |
           docker build -t buckle:dev -f ${{ matrix.dockerfile }} .
           mkdir -p out
-          docker run --rm -it -v $(pwd):/buckle buckle:dev cp /app/buckle /buckle/out/buckle${{ matrix.extension }}
+          docker run --rm -v $(pwd):/buckle buckle:dev cp /app/buckle /buckle/out/buckle${{ matrix.extension }}
         if: matrix.dockerfile
 
       - name: Prepare release artifacts
