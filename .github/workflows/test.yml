@@ -109,6 +109,15 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  test-docker:
+    name: Docker Build
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v3.3.0
+      - run: |
+          docker build -t buckle:latest -f build/Dockerfile.linux-x86_64 .
+          docker run --rm buckle:latest buckle --version
+
   test-done:
     name: Tests Complete
     needs: test-platforms
