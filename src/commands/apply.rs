@@ -62,7 +62,9 @@ impl CommandRunnable for ApplyCommand {
             let mut retries = 0;
             while retries <= package.retry.limit {
                 match self.apply_package(&config, &secrets, &package) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        break;
+                    }
                     Err(err) => {
                         retries += 1;
                         if package.retry.limit >= retries {
