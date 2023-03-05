@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, collections::HashMap, hash::Hash};
 
 use clap::{Arg, ArgAction, value_parser};
 use opentelemetry::trace::SpanKind;
@@ -59,48 +59,70 @@ impl CommandRunnable for ApplyCommand {
         let packages = crate::core::package::get_all_packages(&config_dir.join("packages"))?;
 
         for package in packages {
-            let _span = info_span!("package.apply", "package.id"=%package.id).entered();
-
-            writeln!(output)?;
-            writeln!(output, " + package '{}'", &package.id)?;
-
-            let mut config = config.clone();
-            for (key, val) in package.get_config()? {
-                writeln!(output, "   = config {key}={val}")?;
-                config.insert(key, val);
-            }
-
-            let mut secrets = secrets.clone();
-            for (key, val) in package.get_secrets()? {
-                writeln!(output, "   = secret {key}=******")?;
-                secrets.insert(key, val);
-            }
-
-            let root_path = PathBuf::from("/");
-            let files = package.get_files()?;
-            for file in files {
-                let target_path = package
-                    .files
-                    .get(&file.group)
-                    .map(|f| f.as_path())
-                    .unwrap_or(&root_path);
-                writeln!(
-                    output,
-                    "   + {} '{}'",
-                    if file.is_template { "template" } else { "file" },
-                    target_path.join(&file.relative_path).display()
-                )?;
-
-                file.apply(target_path, &config, &secrets)?;
-            }
-
-            let tasks = package.get_tasks()?;
-            for task in tasks {
-                writeln!(output, "   + task '{}'", &task.name)?;
-                task.run(&config, &secrets)?;
+            let mut retries = 0;
+            while retries <= package.retry.limit {
+                match self.apply_package(&config, &secrets, &package) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        retries += 1;
+                        if package.retry.limit >= retries {
+                            return Err(err);
+                        }
+                        std::thread::sleep(package.retry.delay.into());
+                    }
+                }
             }
         }
+
         Ok(0)
+    }
+}
+
+impl ApplyCommand {
+    fn apply_package(&self, config: &HashMap<String, String>, secrets: &HashMap<String, String>, package: &crate::core::package::Package) -> Result<(), crate::errors::Error> {
+        let mut output = crate::core::output::output();
+        let _span = info_span!("package.apply", "package.id"=%package.id).entered();
+
+        writeln!(output)?;
+        writeln!(output, " + package '{}'", &package.id)?;
+
+        let mut config = config.clone();
+        for (key, val) in package.get_config()? {
+            writeln!(output, "   = config {key}={val}")?;
+            config.insert(key, val);
+        }
+
+        let mut secrets = secrets.clone();
+        for (key, val) in package.get_secrets()? {
+            writeln!(output, "   = secret {key}=******")?;
+            secrets.insert(key, val);
+        }
+
+        let root_path = PathBuf::from("/");
+        let files = package.get_files()?;
+        for file in files {
+            let target_path = package
+                .files
+                .get(&file.group)
+                .map(|f| f.as_path())
+                .unwrap_or(&root_path);
+            writeln!(
+                output,
+                "   + {} '{}'",
+                if file.is_template { "template" } else { "file" },
+                target_path.join(&file.relative_path).display()
+            )?;
+
+            file.apply(target_path, &config, &secrets)?;
+        }
+
+        let tasks = package.get_tasks()?;
+        for task in tasks {
+            writeln!(output, "   + task '{}'", &task.name)?;
+            task.run(&config, &secrets)?;
+        }
+
+        Ok(())
     }
 }
 

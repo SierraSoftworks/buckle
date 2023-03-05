@@ -9,6 +9,7 @@ use tracing::instrument;
 
 use crate::errors;
 
+use super::retry::RetryConfig;
 use super::{file::File, script::Script};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,8 @@ pub struct Package {
     pub needs: Vec<String>,
     #[serde(default)]
     pub files: HashMap<String, PathBuf>,
+    #[serde(default)]
+    pub retry: RetryConfig,
 
     #[serde(skip)]
     path: PathBuf,
