@@ -37,7 +37,7 @@ tracing-attributes = { git="https://github.com/SierraSoftworks/tracing.git" }
 tracing-futures = { git="https://github.com/SierraSoftworks/tracing.git" , features = ["futures-03"] }
 tracing-opentelemetry = { git="https://github.com/SierraSoftworks/tracing.git" }
 tracing-subscriber = { git="https://github.com/SierraSoftworks/tracing.git" , features = ["tracing-log"] }
-walkdir = "2.3"
+walkdir = "2.4"
 webpki-roots = "0.25"
 
 [dev-dependencies]
