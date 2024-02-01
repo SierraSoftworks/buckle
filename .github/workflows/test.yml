@@ -104,7 +104,7 @@ jobs:
               -format=lcov > lcov.info
 
       - name: codecov upload
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v4
         if: "!matrix.skiptests"
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
