@@ -42,7 +42,7 @@ webpki-roots = "0.26"
 
 [dev-dependencies]
 mocktopus = { git = "https://github.com/notheotherben/mocktopus.git" }
-tempfile = "3.16"
+tempfile = "3.17"
 
 [profile.release]
 debug = true
