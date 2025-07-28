@@ -264,7 +264,7 @@ dependencies = [
  "opentelemetry 0.20.0",
  "opentelemetry-otlp",
  "reqwest",
- "rustls 0.23.29",
+ "rustls 0.23.30",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1755,9 +1755,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.29"
+version = "0.23.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2491382039b29b9b11ff08b76ff6c97cf287671dbb74f0be44bda389fffe9bd1"
+checksum = "069a8df149a16b1a12dcc31497c3396a173844be3cac4bd40c9e7671fef96671"
 dependencies = [
  "aws-lc-rs",
  "log",
