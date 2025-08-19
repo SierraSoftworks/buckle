@@ -120,7 +120,7 @@ jobs:
         if: matrix.target
 
       - name: Upload GitHub Release Artifacts
-        uses: SierraSoftworks/gh-releases@v1.0.7
+        uses: SierraSoftworks/gh-releases@v1.0.8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           overwrite: "true"
