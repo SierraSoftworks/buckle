@@ -124,7 +124,7 @@ pub fn run_script_task(
                 Err(errors::user_with_internal(
                     "Failed to run script.",
                     "Read the internal error message and take the appropriate steps to resolve the issue.",
-                    human_errors::detailed_message(&format!(
+                    errors::detailed_message(format!(
                         "---- STDOUT: ----\n{stdout}\n\n---- STDERR: ----\n{stderr}"))))
             }
         })
