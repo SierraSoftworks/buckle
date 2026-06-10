@@ -15,7 +15,7 @@ jobs:
             target: x86_64-pc-windows-msvc
 
           - arch: amd64
-            run_on: ubuntu-20.04
+            run_on: ubuntu-latest
             os: linux
             target: x86_64-unknown-linux-gnu
             setup: |
@@ -44,6 +44,8 @@ jobs:
 
       - name: cache ~/.cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: install protoc
         run: |
@@ -111,7 +113,7 @@ jobs:
 
   test-docker:
     name: Docker Build
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.3
       - run: |
@@ -121,6 +123,6 @@ jobs:
   test-done:
     name: Tests Complete
     needs: test-platforms
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
       - run: echo "Tests Complete for All Platforms"

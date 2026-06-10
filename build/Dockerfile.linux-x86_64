@@ -6,7 +6,7 @@ ARG CRATE_NAME=buckle
 RUN apt-get update && apt-get install -y openssl unzip
 
 # Install protoc
-RUN curl -sSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" && unzip /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip
+RUN curl -sSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" && unzip -o /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip
 
 WORKDIR /src
 

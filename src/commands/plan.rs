@@ -1,8 +1,8 @@
 use crate::errors;
 use clap::{Arg, ArgAction, value_parser};
-use opentelemetry::trace::SpanKind;
 use std::path::PathBuf;
 use tracing::{info_span, instrument};
+use tracing_batteries::prelude::opentelemetry::trace::SpanKind;
 
 use super::*;
 
