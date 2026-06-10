@@ -6,11 +6,10 @@ extern crate tracing;
 use crate::commands::CommandRunnable;
 use clap::{crate_authors, value_parser, Arg, ArgMatches, ArgAction};
 use gethostname::gethostname;
-use opentelemetry::trace::SpanKind;
-use opentelemetry_otlp::WithExportConfig;
 use std::sync::Arc;
-use tracing::{field, instrument, Span, Collect};
-use tracing_subscriber::{prelude::*, registry::LookupSpan, Subscribe};
+use tracing::{field, instrument, Span};
+use tracing_batteries::prelude::opentelemetry::trace::SpanKind;
+use tracing_batteries::{OpenTelemetry, OpenTelemetryLevel, Session};
 
 #[macro_use]
 mod macros;
@@ -44,15 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let matches = app.clone().get_matches();
 
-    register_telemetry(&matches);
+    let telemetry = register_telemetry(&matches);
 
     std::process::exit(match host(app, commands, matches) {
         Ok(status) => {
-            opentelemetry::global::shutdown_tracer_provider();
+            telemetry.shutdown();
             status
         }
         Err(_err) => {
-            opentelemetry::global::shutdown_tracer_provider();
+            telemetry.shutdown();
             1
         }
     });
@@ -123,86 +122,29 @@ fn run(
 }
 
 #[allow(unused_variables)]
-fn register_telemetry(matches: &ArgMatches) {
+fn register_telemetry(matches: &ArgMatches) -> Session {
+    // In release builds the endpoint is sourced from the --otel-endpoint flag (or the
+    // OTEL_EXPORTER_OTLP_ENDPOINT environment variable it is bound to). An empty endpoint
+    // disables OTLP export and falls back to logging on stdout.
     #[cfg(not(debug_assertions))]
-    let tracing_endpoint = matches.get_one::<String>("otel-endpoint").cloned();
+    let endpoint = matches
+        .get_one::<String>("otel-endpoint")
+        .cloned()
+        .unwrap_or_default();
 
+    // Debug builds default to shipping traces to the shared Honeycomb environment.
     #[cfg(debug_assertions)]
-    let tracing_endpoint = Some("https://api.honeycomb.io:443".to_string());
+    let endpoint = "https://api.honeycomb.io:443".to_string();
 
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::filter::LevelFilter::DEBUG)
-        .with(tracing_subscriber::filter::dynamic_filter_fn(
-            |_metadata, ctx| {
-                !ctx.lookup_current()
-                    // Exclude the rustls session "Connection" events which don't have a parent span
-                    .map(|s| s.parent().is_none() && s.name() == "Connection")
-                    .unwrap_or_default()
-            },
-        ))
-        .with(load_output_layer(tracing_endpoint))
-        .init();
-}
+    let telemetry = OpenTelemetry::new(endpoint).with_default_level(OpenTelemetryLevel::DEBUG);
 
-fn load_otlp_headers() -> tonic::metadata::MetadataMap {
-    let mut tracing_metadata = tonic::metadata::MetadataMap::new();
-
+    // Additional OTLP headers are read automatically from OTEL_EXPORTER_OTLP_HEADERS; in debug
+    // builds we also attach the Honeycomb API key used by the shared environment.
     #[cfg(debug_assertions)]
-    tracing_metadata.insert(
-        "x-honeycomb-team",
-        "X6naTEMkzy10PMiuzJKifF".parse().unwrap(),
-    );
+    let telemetry = telemetry.with_header("x-honeycomb-team", "X6naTEMkzy10PMiuzJKifF");
 
-    match std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok() {
-        Some(headers) if !headers.is_empty() => {
-            for header in headers.split_terminator(',') {
-                if let Some((key, value)) = header.split_once('=') {
-                    let key: &str = Box::leak(key.to_string().into_boxed_str());
-                    let value = value.to_owned();
-                    if let Ok(value) = value.parse() {
-                        tracing_metadata.insert(key, value);
-                    } else {
-                        eprintln!("Could not parse value for header {key}.");
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    tracing_metadata
-}
-
-fn load_output_layer<S>(tracing_endpoint: Option<String>) -> Box<dyn Subscribe<S> + Send + Sync + 'static> 
-where S: Collect + Send + Sync,
-for<'a> S: LookupSpan<'a>,
-{
-    if let Some(endpoint) = tracing_endpoint {
-        let metadata = load_otlp_headers();
-        let tracer = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    .with_endpoint(endpoint)
-                    .with_metadata(metadata),
-            )
-            .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
-                opentelemetry::sdk::Resource::new(vec![
-                    opentelemetry::KeyValue::new("service.name", "buckle"),
-                    opentelemetry::KeyValue::new("service.version", version!("v")),
-                    opentelemetry::KeyValue::new("host.os", std::env::consts::OS),
-                    opentelemetry::KeyValue::new("host.architecture", std::env::consts::ARCH),
-                ]),
-            ))
-            .install_batch(opentelemetry::runtime::Tokio)
-            .unwrap();
-
-        tracing_opentelemetry::subscriber()
-            .with_tracer(tracer)
-            .boxed()
-    } else {
-        tracing_subscriber::fmt::subscriber()
-            .boxed()
-    }
+    Session::new("buckle", version!("v"))
+        .with_context("host.os", std::env::consts::OS)
+        .with_context("host.architecture", std::env::consts::ARCH)
+        .with_battery(telemetry)
 }

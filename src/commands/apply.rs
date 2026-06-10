@@ -1,8 +1,8 @@
 use std::{path::PathBuf, collections::HashMap, hash::Hash};
 
 use clap::{Arg, ArgAction, value_parser};
-use opentelemetry::trace::SpanKind;
 use tracing::{info_span, instrument};
+use tracing_batteries::prelude::opentelemetry::trace::SpanKind;
 
 use super::*;
 
