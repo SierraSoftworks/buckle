@@ -39,26 +39,18 @@ jobs:
           targets: ${{ matrix.target }}
           components: llvm-tools-preview
 
+      - name: install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
       - name: cache ~/.cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
       - name: install protoc
-        run: |
-          if ('${{ matrix.os }}' -eq 'windows') {
-            $protoc_arch = 'win64'
-          } elseif ('${{ matrix.os }}' -eq 'darwin') {
-            $protoc_arch = 'osx-x86_64'
-          } else {
-            $protoc_arch = 'linux-x86_64'
-          }
-          $protoc_url = "https://github.com/protocolbuffers/protobuf/releases/download/v3.20.2/protoc-3.20.2-$protoc_arch.zip"
-          Write-Host "Downloading protoc from '$protoc_url'"
-          Invoke-WebRequest -OutFile protoc.zip -Uri $protoc_url
-          Expand-Archive protoc.zip -DestinationPath ../tools
-          Add-Content -Path $env:GITHUB_PATH -Value "$((Get-Item ./).Parent.FullName)/tools/bin"
-        shell: pwsh
+        uses: SierraSoftworks/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: cargo build
         if: matrix.skiptests
@@ -74,7 +66,7 @@ jobs:
 
       - name: install rustfilt
         if: "!matrix.skiptests"
-        run: cargo install rustfilt
+        run: cargo binstall --no-confirm rustfilt
 
       - name: prepare coverage output
         shell: pwsh
