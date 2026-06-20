@@ -12,6 +12,13 @@ on Azure to bootstrap or upgrade a machine.
 Buckle is written in Rust and takes advantage of the great OpenTelemetry integration provided
 by [tracing.rs](https://tracing.rs/tracing/) to provide centralized visibility into your deployments.
 
+## Installation
+Install with [Homebrew](https://brew.sh):
+
+```sh
+brew install sierrasoftworks/tap/buckle
+```
+
 ## Features
  - Lightweight agent written in Rust.
  - Exceptional execution tracing through OpenTelemetry.
