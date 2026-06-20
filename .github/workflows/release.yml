@@ -126,3 +126,17 @@ jobs:
           overwrite: "true"
           files: |
             out/buckle${{ matrix.extension }} | buckle-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}
+
+  tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    steps:
+      - name: Update Homebrew Tap
+        uses: SierraSoftworks/actions-tap@v1
+        with:
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          aliases: major minor
