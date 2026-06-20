@@ -1,0 +1,8 @@
+# Configuration for `cross` (https://github.com/cross-rs/cross), used to build
+# the Linux arm64 release binaries (see .github/workflows/release.yml).
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    # protoc is needed for the OpenTelemetry/tonic build path, and cmake is
+    # required to compile aws-lc-sys (the default rustls crypto backend).
+    "apt-get update && apt-get --assume-yes install protobuf-compiler cmake",
+]
