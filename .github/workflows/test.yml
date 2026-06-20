@@ -33,13 +33,10 @@ jobs:
 
       - uses: actions/checkout@v7.0.0
 
-      - name: rustup install nightly
-        uses: actions-rs/toolchain@v1.0.7
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
-          profile: minimal
-          target: ${{ matrix.target }}
-          override: true
+          targets: ${{ matrix.target }}
           components: llvm-tools-preview
 
       - name: cache ~/.cargo
@@ -64,29 +61,20 @@ jobs:
         shell: pwsh
 
       - name: cargo build
-        uses: actions-rs/cargo@v1.0.3
         if: matrix.skiptests
-        with:
-          command: build
-          args: --target ${{ matrix.target }} ${{ matrix.flags }}
+        run: cargo build --target ${{ matrix.target }} ${{ matrix.flags }}
 
       - name: cargo test
-        uses: actions-rs/cargo@v1.0.3
         if: "!matrix.skiptests"
-        with:
-          command: test
-          args: --no-fail-fast --target ${{ matrix.target }} ${{ matrix.flags }}
+        run: cargo test --no-fail-fast --target ${{ matrix.target }} ${{ matrix.flags }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUSTFLAGS: "-C instrument_coverage"
           LLVM_PROFILE_FILE: default.profraw
 
       - name: install rustfilt
-        uses: actions-rs/cargo@v1.0.3
         if: "!matrix.skiptests"
-        with:
-          command: install
-          args: rustfilt
+        run: cargo install rustfilt
 
       - name: prepare coverage output
         shell: pwsh

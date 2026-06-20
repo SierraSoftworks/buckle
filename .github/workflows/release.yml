@@ -57,12 +57,10 @@ jobs:
         if: matrix.setup
 
       - name: Get Rust Stable
-        uses: actions-rs/toolchain@v1.0.7
+        uses: dtolnay/rust-toolchain@stable
         if: matrix.target
         with:
-          toolchain: stable
-          override: true
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Check out code
         uses: actions/checkout@v7.0.0
@@ -91,10 +89,7 @@ jobs:
 
       - name: cargo build
         if: matrix.target
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: build
-          args: --release --target ${{ matrix.target }} ${{ matrix.flags }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.flags }}
           
       - name: Strip Debug Symbols
         run: |
