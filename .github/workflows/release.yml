@@ -57,12 +57,10 @@ jobs:
         if: matrix.setup
 
       - name: Get Rust Stable
-        uses: actions-rs/toolchain@v1.0.7
+        uses: dtolnay/rust-toolchain@stable
         if: matrix.target
         with:
-          toolchain: stable
-          override: true
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Check out code
         uses: actions/checkout@v7.0.0
@@ -74,27 +72,13 @@ jobs:
 
       - name: install protoc
         if: matrix.target
-        run: |
-          if ('${{ matrix.os }}' -eq 'windows') {
-            $protoc_arch = 'win64'
-          } elseif ('${{ matrix.os }}' -eq 'darwin') {
-            $protoc_arch = 'osx-x86_64'
-          } else {
-            $protoc_arch = 'linux-x86_64'
-          }
-          $protoc_url = "https://github.com/protocolbuffers/protobuf/releases/download/v3.20.2/protoc-3.20.2-$protoc_arch.zip"
-          Write-Host "Downloading protoc from '$protoc_url'"
-          Invoke-WebRequest -OutFile protoc.zip -Uri $protoc_url
-          Expand-Archive protoc.zip -DestinationPath ../tools
-          Add-Content -Path $env:GITHUB_PATH -Value "$((Get-Item ./).Parent.FullName)/tools/bin"
-        shell: pwsh
+        uses: SierraSoftworks/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: cargo build
         if: matrix.target
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: build
-          args: --release --target ${{ matrix.target }} ${{ matrix.flags }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.flags }}
           
       - name: Strip Debug Symbols
         run: |
