@@ -21,11 +21,23 @@ jobs:
             setup: |
               sudo apt-get update
               sudo apt-get install -y libdbus-1-3 libdbus-1-dev
+          # Linux arm64 is cross-compiled with `cross`; we build rather than run
+          # the tests, since executing them would require qemu emulation.
+          - arch: arm64
+            run_on: ubuntu-latest
+            os: linux
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            skiptests: true
 
           - arch: amd64
             run_on: macos-latest
             os: darwin
             target: x86_64-apple-darwin
+          - arch: arm64
+            run_on: macos-latest
+            os: darwin
+            target: aarch64-apple-darwin
     steps:
       - name: setup dependencies
         run: ${{ matrix.setup }}
@@ -48,27 +60,38 @@ jobs:
         if: "!matrix.skiptests"
         run: cargo binstall --no-confirm rustfilt
 
+      - name: install cross
+        if: matrix.cross
+        run: cargo binstall --no-confirm cross
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: cache ~/.cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
       - name: install protoc
+        if: ${{ !matrix.cross }}
         uses: SierraSoftworks/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: cargo build
         if: matrix.skiptests
-        run: cargo build --target ${{ matrix.target }} ${{ matrix.flags }}
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --target ${{ matrix.target }} ${{ matrix.flags }}
 
       - name: cargo test
         if: "!matrix.skiptests"
-        run: cargo test --no-fail-fast --target ${{ matrix.target }} ${{ matrix.flags }}
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} test --no-fail-fast --target ${{ matrix.target }} ${{ matrix.flags }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUSTFLAGS: "-C instrument_coverage"
           LLVM_PROFILE_FILE: default.profraw
+
+      - name: Reclaim cache ownership from cross
+        if: matrix.cross
+        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo" target
 
       - name: prepare coverage output
         shell: pwsh
