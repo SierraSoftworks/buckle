@@ -1013,9 +1013,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "human-errors"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5d10d3cf923652ca5b097e0795ddf1053f56bd7a2f4258089c64f45f1b70335"
+checksum = "ef44dcc0e508d433319e72dcd65819757dde3f756b17f91e875a43d0b65bb7cb"
 
 [[package]]
 name = "hyper"
@@ -3312,7 +3312,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
