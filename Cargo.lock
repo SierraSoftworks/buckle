@@ -396,7 +396,7 @@ dependencies = [
  "tracing-batteries",
  "tracing-subscriber",
  "walkdir",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -1090,7 +1090,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tower-service",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -2004,7 +2004,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -2802,7 +2802,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -3051,7 +3051,7 @@ dependencies = [
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -3283,9 +3283,9 @@ checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.8"
+version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -3312,7 +3312,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
