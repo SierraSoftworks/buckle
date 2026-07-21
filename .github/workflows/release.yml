@@ -9,7 +9,7 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Generate Package Version
         shell: pwsh
@@ -72,7 +72,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Check out code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Fetch Versioned Cargo.toml
         uses: actions/download-artifact@v8
