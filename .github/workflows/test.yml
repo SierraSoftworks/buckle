@@ -43,7 +43,7 @@ jobs:
         run: ${{ matrix.setup }}
         if: matrix.setup
 
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -120,7 +120,7 @@ jobs:
     name: Docker Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
       - run: |
           docker build -t buckle:latest -f build/Dockerfile.linux-x86_64 .
           docker run --rm buckle:latest buckle --version
