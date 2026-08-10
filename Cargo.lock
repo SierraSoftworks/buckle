@@ -2066,7 +2066,6 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
- "h2 0.4.14",
  "http 1.5.0",
  "http-body 1.0.1",
  "http-body-util",
@@ -2322,9 +2321,9 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sentry"
-version = "0.48.2"
+version = "0.49.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "931a20b0da02350676e3d6d3c9028d58eaa448cf42a866712eec5845a505421e"
+checksum = "63207365db50cb817402f0ec8097d6dad3d644ef3fffd6ba30c75b3077e514da"
 dependencies = [
  "cfg_aliases",
  "httpdate",
@@ -2339,9 +2338,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-actix"
-version = "0.48.2"
+version = "0.49.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ffb8fd78b8f4527146013ab52293e03242770a31dcd97eee4b82b7f770ffab3"
+checksum = "4a0eb1ed18478fb48db007aeaa672a3de176055357feb768eee0c3471802d0ce"
 dependencies = [
  "actix-http",
  "actix-web",
@@ -2352,9 +2351,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-core"
-version = "0.48.2"
+version = "0.49.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "545dc562b6758d646ac19e1407f4ebc26d452111386743e03323464bc48bb2e0"
+checksum = "48759bc392fb5e3b36b4efcb485f51074c0ba8479711cd5c8cf79e86f9f75d41"
 dependencies = [
  "rand 0.9.4",
  "sentry-types",
@@ -2365,9 +2364,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-log"
-version = "0.48.2"
+version = "0.49.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c13b9313bdd6a9db19e65ac0e4754e64dea6f18cdd15444656abb050db4538d"
+checksum = "f9553a2f0f75bc8550137ebc753e8d2161af63ff780ca59983935f8df8f01655"
 dependencies = [
  "bitflags 2.13.0",
  "log",
@@ -2376,9 +2375,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-types"
-version = "0.48.2"
+version = "0.49.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "041359745a44dd2e14fe21b7510fe7ca8b5beffce6636a0b52e5bc7d5f736887"
+checksum = "fab146d15a30ab4897a95fd15d6a038b8d7fbf2661c5f8b13738ce8df7a095b7"
 dependencies = [
  "debugid",
  "hex",
@@ -2976,7 +2975,7 @@ dependencies = [
 [[package]]
 name = "tracing-batteries"
 version = "0.1.0"
-source = "git+https://github.com/sierrasoftworks/tracing-batteries-rs.git#f059e936623c2eb0ca67f6ae3301487c9443ffd0"
+source = "git+https://github.com/sierrasoftworks/tracing-batteries-rs.git#2bdcc42b2dfa2f5baecad83e051638d977113a7d"
 dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -3371,7 +3370,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
