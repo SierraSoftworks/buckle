@@ -20,6 +20,12 @@ RUN rm src/*.rs
 # Add the source code
 COPY . .
 
+# Ensure the real source is treated as newer than the placeholder build above. COPY
+# preserves the git checkout mtimes, which can otherwise match (or predate) the
+# mtimes cargo recorded when it built the placeholder, causing cargo to believe the
+# ${CRATE_NAME} binary is already up to date and skip rebuilding it below.
+RUN find src -type f -exec touch {} +
+
 # Run the test suite
 RUN cargo test --release && rm -rf target/x86_64-unknown-linux-musl/release/deps/${CRATE_NAME}*
 
@@ -28,8 +34,7 @@ RUN cargo build --release --bin ${CRATE_NAME}
 
 # Ensure that the binary is at a known location for the next stage
 RUN mkdir /out && \
-    rm /src/target/x86_64-unknown-linux-musl/release/deps/${CRATE_NAME}*.d && \
-    cp /src/target/x86_64-unknown-linux-musl/release/deps/${CRATE_NAME}* /out/${CRATE_NAME}
+    cp /src/target/x86_64-unknown-linux-musl/release/${CRATE_NAME} /out/${CRATE_NAME}
 
 RUN strip --strip-debug /out/${CRATE_NAME}
 
