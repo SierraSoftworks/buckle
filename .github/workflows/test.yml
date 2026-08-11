@@ -96,15 +96,30 @@ jobs:
       - name: prepare coverage output
         shell: pwsh
         if: "!matrix.skiptests"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUSTFLAGS: "-C instrument_coverage"
         run: |
           Write-Host "Merging raw profile output files"
           &"$(rustc --print target-libdir)/../bin/llvm-profdata" merge -sparse default.profraw -o default.profdata
-          $latest_asset = Get-ChildItem -Path ./target/${{ matrix.target }}/debug/deps -Filter "buckle-*" -File `
-          | Where-Object { $_.Name.EndsWith(".exe") -or (-not $_.Name.Contains(".")) } `
-          | Sort-Object -Top 1 -Property LastWriteTime
-          Write-Host "Latest Asset: $latest_asset"
+
+          # Ask Cargo where it placed the test binaries, rather than guessing at
+          # the layout of the target directory (which changes between releases).
+          Write-Host "Locating test binaries"
+          $binaries = cargo test --no-run --message-format=json --target ${{ matrix.target }} ${{ matrix.flags }} `
+          | Where-Object { $_.StartsWith("{") } `
+          | ForEach-Object { $_ | ConvertFrom-Json } `
+          | Where-Object { $_.reason -eq "compiler-artifact" -and $_.profile.test -and $_.executable } `
+          | ForEach-Object { $_.executable }
+
+          if (-not $binaries) {
+            throw "Could not find any test binaries to generate a coverage report from."
+          }
+
+          $objects = $binaries | ForEach-Object { "-object", $_ }
+          Write-Host "Test Binaries: $($binaries -join ', ')"
           Write-Host "Exporting LCOV coverage report"
-          &"$(rustc --print target-libdir)/../bin/llvm-cov" export -instr-profile default.profdata $latest_asset `
+          &"$(rustc --print target-libdir)/../bin/llvm-cov" export -instr-profile default.profdata @objects `
               -Xdemangler=rustfilt `
               -ignore-filename-regex='.cargo|rustc' `
               -compilation-dir=src `
