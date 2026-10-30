@@ -17,8 +17,11 @@ COPY ./Cargo.toml .
 RUN cargo build --release && rm -rf target/x86_64-unknown-linux-musl/release/deps/${CRATE_NAME}*
 RUN rm src/*.rs
 
-# Add the source code
+# Add the source code. `touch` the entrypoint so that cargo always rebuilds the
+# crate itself, rather than trusting fingerprints left by the placeholder build
+# above (the copied files may carry older mtimes than that build).
 COPY . .
+RUN touch src/main.rs
 
 # Run the test suite
 RUN cargo test --release && rm -rf target/x86_64-unknown-linux-musl/release/deps/${CRATE_NAME}*
@@ -26,10 +29,11 @@ RUN cargo test --release && rm -rf target/x86_64-unknown-linux-musl/release/deps
 # Build the final executable of the project
 RUN cargo build --release --bin ${CRATE_NAME}
 
-# Ensure that the binary is at a known location for the next stage
+# Ensure that the binary is at a known location for the next stage. We copy the
+# uplifted binary from the profile directory rather than reaching into `deps/`,
+# since newer cargo releases no longer place intermediate artifacts there.
 RUN mkdir /out && \
-    rm /src/target/x86_64-unknown-linux-musl/release/deps/${CRATE_NAME}*.d && \
-    cp /src/target/x86_64-unknown-linux-musl/release/deps/${CRATE_NAME}* /out/${CRATE_NAME}
+    cp /src/target/x86_64-unknown-linux-musl/release/${CRATE_NAME} /out/${CRATE_NAME}
 
 RUN strip --strip-debug /out/${CRATE_NAME}
 
