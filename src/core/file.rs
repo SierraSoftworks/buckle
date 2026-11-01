@@ -1,8 +1,11 @@
 use std::path::PathBuf;
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 use walkdir::WalkDir;
 
-use gotmpl::{MissingKey, Template};
+use gotmpl::{MissingKey, Template, Value};
 use tracing::instrument;
 
 use crate::errors;
@@ -163,19 +166,16 @@ impl File {
 
         let template_content = std::fs::read_to_string(&self.source_path)?;
 
-        let mut context: HashMap<&str, &str> = HashMap::new();
+        let mut context: BTreeMap<String, Value> = BTreeMap::new();
         for (key, val) in config {
-            context.insert(key, val);
+            context.insert(key.clone(), Value::from(val.as_str()));
         }
 
         for (key, val) in secrets {
-            context.insert(key, val);
+            context.insert(key.clone(), Value::from(val.as_str()));
         }
 
-        let context = gotmpl::to_value(&context).map_err(|e| errors::system_with_internal(
-            format!("Could not prepare the context used to render the template '{}'.", self.source_path.display()),
-            "Please report this issue to us on GitHub, including the config and secrets keys you are using.",
-            e))?;
+        let context = Value::from(context);
 
         let template_name = self.source_path.to_string_lossy();
         let rendered = Template::new(&template_name)
