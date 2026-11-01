@@ -31,3 +31,27 @@ impl Into<Duration> for RetryDelay {
         Duration::from_millis(self.0 as u64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_no_retries_with_a_five_second_delay() {
+        let config: RetryConfig = serde_yaml::from_str("{}").expect("an empty config should parse");
+
+        assert_eq!(config.limit, 0);
+        let delay: Duration = config.delay.into();
+        assert_eq!(delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn reads_the_limit_and_delay_in_milliseconds() {
+        let config: RetryConfig =
+            serde_yaml::from_str("limit: 3\ndelay: 250\n").expect("the config should parse");
+
+        assert_eq!(config.limit, 3);
+        let delay: Duration = config.delay.into();
+        assert_eq!(delay, Duration::from_millis(250));
+    }
+}

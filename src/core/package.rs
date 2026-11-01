@@ -126,3 +126,84 @@ pub fn get_all_packages(dir: &Path) -> Result<Vec<Package>, errors::Error> {
 
     Ok(packages)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::{get_test_data, ConfigDir};
+
+    #[test]
+    fn load_reads_the_package_definition() {
+        let package = Package::load(&get_test_data().join("packages").join("test1"))
+            .expect("the package should load");
+
+        assert_eq!(package.id, "test1");
+        assert_eq!(package.description, "The first test package.");
+        assert!(package.needs.is_empty());
+        assert_eq!(
+            package.files.get("conf.d"),
+            Some(&PathBuf::from("/etc/test.conf")),
+            "file groups should map to their target paths"
+        );
+        assert_eq!(package.retry.limit, 0, "retries should default to none");
+    }
+
+    #[test]
+    fn load_fails_without_a_package_file() {
+        let dir = ConfigDir::new();
+        std::fs::create_dir_all(dir.path().join("packages").join("empty")).unwrap();
+
+        let result = Package::load(&dir.path().join("packages").join("empty"));
+
+        assert!(result.is_err(), "a package without package.yml should not load");
+    }
+
+    #[test]
+    fn get_all_packages_orders_dependencies_first() {
+        let dir = ConfigDir::new()
+            .with_package("app", "description: app\nneeds: [runtime, config]\n")
+            .with_package("runtime", "description: runtime\nneeds: [base]\n")
+            .with_package("config", "description: config\nneeds: [base]\n")
+            .with_package("base", "description: base\n");
+
+        let packages = get_all_packages(&dir.path().join("packages"))
+            .expect("the packages should load");
+        let order: Vec<&str> = packages.iter().map(|p| p.id.as_str()).collect();
+
+        assert_eq!(order.len(), 4, "every package should be included exactly once");
+        let position = |id: &str| order.iter().position(|p| *p == id).unwrap();
+        assert!(position("base") < position("runtime"));
+        assert!(position("base") < position("config"));
+        assert!(position("runtime") < position("app"));
+        assert!(position("config") < position("app"));
+    }
+
+    #[test]
+    fn get_all_packages_rejects_dependency_cycles() {
+        let dir = ConfigDir::new()
+            .with_package("a", "description: a\nneeds: [b]\n")
+            .with_package("b", "description: b\nneeds: [a]\n");
+
+        let result = get_all_packages(&dir.path().join("packages"));
+
+        assert!(result.is_err(), "a dependency cycle should be reported");
+    }
+
+    #[test]
+    fn get_all_packages_rejects_unknown_dependencies() {
+        let dir = ConfigDir::new().with_package("a", "description: a\nneeds: [missing]\n");
+
+        let result = get_all_packages(&dir.path().join("packages"));
+
+        assert!(result.is_err(), "a dependency on a missing package should be reported");
+    }
+
+    #[test]
+    fn get_all_packages_fails_for_a_missing_directory() {
+        let dir = ConfigDir::new();
+
+        let result = get_all_packages(&dir.path().join("packages"));
+
+        assert!(result.is_err(), "a missing packages directory should be reported");
+    }
+}
