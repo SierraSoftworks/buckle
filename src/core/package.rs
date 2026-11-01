@@ -10,6 +10,7 @@ use tracing::instrument;
 use crate::errors;
 
 use super::retry::RetryConfig;
+use super::Core;
 use super::{file::File, script::Script};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,12 +49,12 @@ impl Package {
         super::script::get_all_scripts(&self.path.join("scripts"))
     }
 
-    pub fn get_config(&self) -> Result<HashMap<String, String>, errors::Error> {
-        super::config::load_all_config(&self.path.join("config"))
+    pub fn get_config(&self, core: &Core) -> Result<HashMap<String, String>, errors::Error> {
+        super::config::load_all_config(core, &self.path.join("config"))
     }
 
-    pub fn get_secrets(&self) -> Result<HashMap<String, String>, errors::Error> {
-        super::config::load_all_config(&self.path.join("secrets"))
+    pub fn get_secrets(&self, core: &Core) -> Result<HashMap<String, String>, errors::Error> {
+        super::config::load_all_config(core, &self.path.join("secrets"))
     }
 
     pub fn get_files(&self) -> Result<Vec<File>, errors::Error> {
