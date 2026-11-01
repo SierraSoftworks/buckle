@@ -45,7 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let telemetry = register_telemetry(&matches);
 
-    std::process::exit(match host(app, commands, matches) {
+    let core = core::Core::default();
+
+    std::process::exit(match host(&core, app, commands, matches) {
         Ok(status) => {
             telemetry.shutdown();
             status
@@ -57,8 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 }
 
-#[instrument(name = "app.host", fields(otel.name="buckle", otel.kind=?SpanKind::Client, exception=field::Empty, host.hostname=field::Empty, exit_code=field::Empty), skip(app, commands, matches), ret, err)]
+#[instrument(name = "app.host", fields(otel.name="buckle", otel.kind=?SpanKind::Client, exception=field::Empty, host.hostname=field::Empty, exit_code=field::Empty), skip(core, app, commands, matches), ret, err)]
 fn host(
+    core: &core::Core,
     app: clap::Command,
     commands: Vec<Arc<dyn CommandRunnable>>,
     matches: ArgMatches,
@@ -71,7 +74,7 @@ fn host(
         .record("otel.name", command_name)
         .record("host.hostname", gethostname().to_string_lossy().trim());
 
-    match run(commands, matches) {
+    match run(core, commands, matches) {
         Ok(status@0) => {
             Span::current()
                 .record("exit_code", status);
@@ -107,14 +110,15 @@ fn host(
     }
 }
 
-#[instrument(name = "app.run", fields(otel.kind = ?SpanKind::Client), skip(commands, matches), ret, err)]
+#[instrument(name = "app.run", fields(otel.kind = ?SpanKind::Client), skip(core, commands, matches), ret, err)]
 fn run(
+    core: &core::Core,
     commands: Vec<Arc<dyn CommandRunnable>>,
     matches: ArgMatches,
 ) -> Result<i32, errors::Error> {
     for cmd in commands.iter() {
         if let Some(cmd_matches) = matches.subcommand_matches(&cmd.name()) {
-            return cmd.run(cmd_matches);
+            return cmd.run(core, cmd_matches);
         }
     }
 

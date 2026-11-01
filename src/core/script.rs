@@ -2,17 +2,13 @@ use std::path::PathBuf;
 use std::{collections::HashMap, path::Path};
 
 use itertools::Itertools;
-use std::process;
-use tracing::field::display;
-use tracing::{instrument, Span};
+use tracing::instrument;
 
 use crate::errors;
 
-#[cfg(test)]
-use mocktopus::macros::*;
+use super::Core;
 
-#[cfg_attr(test, mockable)]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Script {
     pub name: String,
     pub path: PathBuf,
@@ -54,12 +50,11 @@ pub fn get_all_scripts(dir: &Path) -> Result<Vec<Script>, errors::Error> {
         .collect())
 }
 
-#[allow(clippy::swap_ptr_to_ref)]
-#[cfg_attr(test, mockable)]
 impl Script {
-    #[instrument(level = "info", name = "script.run", fields(task.name = %self.name, task.path = %self.path.display()), err, skip(self, secrets))]
+    #[instrument(level = "info", name = "script.run", fields(task.name = %self.name, task.path = %self.path.display()), err, skip(self, core, secrets))]
     pub fn run(
         &self,
+        core: &Core,
         config: &HashMap<String, String>,
         secrets: &HashMap<String, String>,
     ) -> Result<(), errors::Error> {
@@ -79,10 +74,10 @@ impl Script {
         }
 
         match extension {
-            "ps1" => run_script_task("pwsh", &config, &self.path)?,
-            "sh" => run_script_task("bash", &config, &self.path)?,
-            "bat" => run_script_task("cmd.exe", &config, &self.path)?,
-            "cmd" => run_script_task("cmd.exe", &config, &self.path)?,
+            "ps1" => core.launcher().run_task("pwsh", &config, &self.path)?,
+            "sh" => core.launcher().run_task("bash", &config, &self.path)?,
+            "bat" => core.launcher().run_task("cmd.exe", &config, &self.path)?,
+            "cmd" => core.launcher().run_task("cmd.exe", &config, &self.path)?,
             _ => Err(errors::user(
                 &format!(
                     "The '{extension}' extension is not supported for task files."
@@ -93,41 +88,6 @@ impl Script {
 
         Ok(())
     }
-}
-
-#[allow(clippy::swap_ptr_to_ref)]
-#[cfg_attr(test, mockable)]
-#[instrument(name = "command.run", fields(stdout, stderr), skip(env), err)]
-pub fn run_script_task(
-    interpreter: &str,
-    env: &HashMap<String, String>,
-    file: &Path,
-) -> Result<(), errors::Error> {
-    process::Command::new(interpreter)
-        .arg(file)
-        .envs(env)
-        .output()
-        .map_err(|err| errors::user_with_internal(
-            &format!("Failed to execute the command '{} {}'.", interpreter, file.display()), 
-            &format!("Make sure that '{interpreter}' is installed and present on your path and that you have permission to access it."),
-            err))
-        .and_then(|output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            Span::current().record("stdout", &display(String::from_utf8_lossy(&output.stdout)));
-            Span::current().record("stderr", &display(String::from_utf8_lossy(&output.stderr)));
-
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(errors::user_with_internal(
-                    "Failed to run script.",
-                    "Read the internal error message and take the appropriate steps to resolve the issue.",
-                    errors::detailed_message(format!(
-                        "---- STDOUT: ----\n{stdout}\n\n---- STDERR: ----\n{stderr}"))))
-            }
-        })
 }
 
 #[cfg(test)]

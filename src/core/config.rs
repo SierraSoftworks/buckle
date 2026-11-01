@@ -1,17 +1,14 @@
 use std::{collections::HashMap, path::Path};
 
 use std::fs::read_to_string;
-use std::process;
-use tracing::field::display;
-use tracing::{instrument, Span};
+use tracing::instrument;
 
 use crate::errors;
 
-#[cfg(test)]
-use mocktopus::macros::*;
+use super::Core;
 
-#[instrument(level = "debug", name = "config.load_all", err)]
-pub fn load_all_config(dir: &Path) -> Result<HashMap<String, String>, errors::Error> {
+#[instrument(level = "debug", name = "config.load_all", skip(core), err)]
+pub fn load_all_config(core: &Core, dir: &Path) -> Result<HashMap<String, String>, errors::Error> {
     if !dir.exists() {
         return Ok(HashMap::new());
     }
@@ -37,7 +34,7 @@ pub fn load_all_config(dir: &Path) -> Result<HashMap<String, String>, errors::Er
 
             let mut errs: Vec<errors::Error> = files
                 .map(|file| {
-                    load_config(dunce::simplified(&file)).map(|config| {
+                    load_config(core, dunce::simplified(&file)).map(|config| {
                         for (key, val) in config {
                             output.insert(key, val);
                         }
@@ -54,8 +51,8 @@ pub fn load_all_config(dir: &Path) -> Result<HashMap<String, String>, errors::Er
         })
 }
 
-#[instrument(level = "info", name = "config.load", err)]
-pub fn load_config(file: &Path) -> Result<HashMap<String, String>, errors::Error> {
+#[instrument(level = "info", name = "config.load", skip(core), err)]
+pub fn load_config(core: &Core, file: &Path) -> Result<HashMap<String, String>, errors::Error> {
     let extension = match file.extension() {
         Some(ext) => ext.to_str().ok_or_else(|| errors::user(
             &format!("Unable to parse the file extension used by the config file '{}'", file.display()),
@@ -68,10 +65,10 @@ pub fn load_config(file: &Path) -> Result<HashMap<String, String>, errors::Error
 
     let content = match extension {
         "env" => load_env_config(file)?,
-        "ps1" => load_script_config("pwsh", file)?,
-        "sh" => load_script_config("bash", file)?,
-        "bat" => load_script_config("cmd.exe", file)?,
-        "cmd" => load_script_config("cmd.exe", file)?,
+        "ps1" => core.launcher().load_config("pwsh", file)?,
+        "sh" => core.launcher().load_config("bash", file)?,
+        "bat" => core.launcher().load_config("cmd.exe", file)?,
+        "cmd" => core.launcher().load_config("cmd.exe", file)?,
         _ => Err(errors::user(
             &format!(
                 "The '{extension}' extension is not supported for config files."
@@ -92,40 +89,6 @@ fn load_env_config(file: &Path) -> Result<String, errors::Error> {
             e,
         )
     })
-}
-
-#[allow(clippy::swap_ptr_to_ref)]
-#[cfg_attr(test, mockable)]
-#[instrument(
-    level = "debug",
-    name = "config.load.script",
-    fields(stdout, stderr),
-    err
-)]
-pub fn load_script_config(interpreter: &str, file: &Path) -> Result<String, errors::Error> {
-    process::Command::new(interpreter)
-        .arg(file)
-        .output()
-        .map_err(|err| errors::user_with_internal(
-            &format!("Failed to execute the command '{} {}'.", interpreter, file.display()), 
-            &format!("Make sure that '{interpreter}' is installed and present on your path and that you have permission to access it."),
-            err))
-        .and_then(|output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            Span::current().record("stdout", &display(String::from_utf8_lossy(&output.stdout)));
-            Span::current().record("stderr", &display(String::from_utf8_lossy(&output.stderr)));
-            if output.status.success() {
-                Ok(stdout.to_string())
-            } else {
-                Err(errors::user_with_internal(
-                    "Failed to load configuration from script.",
-                    "Read the internal error message and take the appropriate steps to resolve the issue.",
-                    errors::detailed_message(format!(
-                        "---- STDOUT: ----\n{stdout}\n\n---- STDERR: ----\n{stderr}"))))
-            }
-        })
 }
 
 fn parse_config(content: &str) -> HashMap<String, String> {

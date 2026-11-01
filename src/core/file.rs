@@ -8,10 +8,45 @@ use tracing::instrument;
 use crate::errors;
 
 #[cfg(test)]
-use mocktopus::macros::*;
+use mockall::automock;
 
-#[cfg_attr(test, mockable)]
-#[derive(Clone)]
+use super::Core;
+
+/// Writes a package's files to their target location.
+#[cfg_attr(test, automock)]
+pub trait FileWriter: Send + Sync {
+    /// Copies (or renders, for templates) `file` into the `target` directory.
+    fn apply(
+        &self,
+        file: &File,
+        target: &Path,
+        config: &HashMap<String, String>,
+        secrets: &HashMap<String, String>,
+    ) -> Result<(), errors::Error>;
+}
+
+/// Writes files to the local filesystem.
+#[derive(Debug, Default)]
+pub struct LocalFileWriter;
+
+impl FileWriter for LocalFileWriter {
+    #[instrument(level = "info", name = "file.apply", fields(file.path = %file.relative_path.display()), err, skip(self, file, secrets))]
+    fn apply(
+        &self,
+        file: &File,
+        target: &Path,
+        config: &HashMap<String, String>,
+        secrets: &HashMap<String, String>,
+    ) -> Result<(), errors::Error> {
+        if file.is_template {
+            file.template(target, config, secrets)
+        } else {
+            file.copy(target)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct File {
     pub group: String,
     pub relative_path: PathBuf,
@@ -99,21 +134,17 @@ pub fn get_files(dir: &Path) -> Result<Vec<File>, errors::Error> {
     Ok(files)
 }
 
-#[allow(clippy::swap_ptr_to_ref)]
-#[cfg_attr(test, mockable)]
 impl File {
-    #[instrument(level = "info", name = "file.apply", fields(file.path = %self.relative_path.display()), err, skip(self, secrets))]
+    /// Writes this file into the `target` directory using the file writer
+    /// configured on `core`.
     pub fn apply(
         &self,
+        core: &Core,
         target: &Path,
         config: &HashMap<String, String>,
         secrets: &HashMap<String, String>,
     ) -> Result<(), errors::Error> {
-        if self.is_template {
-            self.template(target, config, secrets)
-        } else {
-            self.copy(target)
-        }
+        core.files().apply(self, target, config, secrets)
     }
 
     #[instrument(level = "debug", name = "file.template", fields(file.path = %self.relative_path.display()), err, skip(self, secrets))]

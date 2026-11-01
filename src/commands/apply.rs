@@ -1,4 +1,4 @@
-use std::{path::PathBuf, collections::HashMap, hash::Hash};
+use std::{collections::HashMap, path::PathBuf};
 
 use clap::{Arg, ArgAction, value_parser};
 use tracing::{info_span, instrument};
@@ -31,8 +31,8 @@ impl Command for ApplyCommand {
 }
 
 impl CommandRunnable for ApplyCommand {
-    #[instrument(name = "command.apply", fields(otel.kind = ?SpanKind::Client), skip(self, matches), err)]
-    fn run(&self, matches: &clap::ArgMatches) -> Result<i32, crate::errors::Error> {
+    #[instrument(name = "command.apply", fields(otel.kind = ?SpanKind::Client), skip(self, core, matches), err)]
+    fn run(&self, core: &Core, matches: &clap::ArgMatches) -> Result<i32, crate::errors::Error> {
         let config_dir: PathBuf =
             matches
                 .get_one::<PathBuf>("config")
@@ -44,14 +44,14 @@ impl CommandRunnable for ApplyCommand {
                     )
                 })?;
 
-        let mut output = crate::core::output::output();
+        let mut output = core.output().writer();
 
-        let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
+        let config = crate::core::config::load_all_config(core, &config_dir.join("config"))?;
         for (key, val) in config.iter() {
             writeln!(output, " = config {key}={val}")?;
         }
 
-        let secrets = crate::core::config::load_all_config(&config_dir.join("secrets"))?;
+        let secrets = crate::core::config::load_all_config(core, &config_dir.join("secrets"))?;
         for (key, _val) in secrets.iter() {
             writeln!(output, " = secret {key}=******")?;
         }
@@ -61,7 +61,7 @@ impl CommandRunnable for ApplyCommand {
         for package in packages {
             let mut retries = 0;
             while retries <= package.retry.limit {
-                match self.apply_package(&config, &secrets, &package) {
+                match self.apply_package(core, &config, &secrets, &package) {
                     Ok(_) => {
                         break;
                     }
@@ -81,21 +81,21 @@ impl CommandRunnable for ApplyCommand {
 }
 
 impl ApplyCommand {
-    fn apply_package(&self, config: &HashMap<String, String>, secrets: &HashMap<String, String>, package: &crate::core::package::Package) -> Result<(), crate::errors::Error> {
-        let mut output = crate::core::output::output();
+    fn apply_package(&self, core: &Core, config: &HashMap<String, String>, secrets: &HashMap<String, String>, package: &crate::core::package::Package) -> Result<(), crate::errors::Error> {
+        let mut output = core.output().writer();
         let _span = info_span!("package.apply", "package.id"=%package.id).entered();
 
         writeln!(output)?;
         writeln!(output, " + package '{}'", &package.id)?;
 
         let mut config = config.clone();
-        for (key, val) in package.get_config()? {
+        for (key, val) in package.get_config(core)? {
             writeln!(output, "   = config {key}={val}")?;
             config.insert(key, val);
         }
 
         let mut secrets = secrets.clone();
-        for (key, val) in package.get_secrets()? {
+        for (key, val) in package.get_secrets(core)? {
             writeln!(output, "   = secret {key}=******")?;
             secrets.insert(key, val);
         }
@@ -115,13 +115,13 @@ impl ApplyCommand {
                 target_path.join(&file.relative_path).display()
             )?;
 
-            file.apply(target_path, &config, &secrets)?;
+            file.apply(core, target_path, &config, &secrets)?;
         }
 
         let tasks = package.get_tasks()?;
         for task in tasks {
             writeln!(output, "   + task '{}'", &task.name)?;
-            task.run(&config, &secrets)?;
+            task.run(core, &config, &secrets)?;
         }
 
         Ok(())
@@ -130,8 +130,8 @@ impl ApplyCommand {
 
 #[cfg(test)]
 mod tests {
-    use mocktopus::mocking::{MockResult, Mockable};
-
+    use crate::core::file::{FileWriter, LocalFileWriter};
+    use crate::core::output::mocks::OutputBuffer;
     use crate::test::{get_test_data, test_tracing};
 
     use super::*;
@@ -149,28 +149,36 @@ mod tests {
             get_test_data().to_str().unwrap(),
         ]);
 
-        let output = crate::core::output::mock();
-
+        let output = OutputBuffer::default();
         let temp_path = temp.path().to_owned();
-        crate::core::file::File::apply.mock_safe(move |f, target, config, secrets| {
-            let target = Box::leak(Box::new(temp_path.join(target.strip_prefix("/").unwrap())));
 
-            MockResult::Continue((f, target, config, secrets))
-        });
+        let core = Core::builder()
+            .with_mock_output(|mock| {
+                let output = output.clone();
+                mock.expect_writer()
+                    .returning(move || Box::new(output.clone()));
+            })
+            .with_mock_files(|mock| {
+                // Redirect every file write into the temporary directory so that
+                // the real template/copy logic runs without touching `/`.
+                mock.expect_apply()
+                    .returning(move |file, target, config, secrets| {
+                        let target = temp_path.join(target.strip_prefix("/").unwrap());
+                        LocalFileWriter.apply(file, &target, config, secrets)
+                    });
+            })
+            .with_mock_launcher(|mock| {
+                mock.expect_load_config()
+                    .withf(|interpreter, _file| interpreter == "pwsh")
+                    .returning(|_, _| Ok("TESTING=yes".to_string()));
 
-        crate::core::config::load_script_config.mock_safe(|interpreter, _file| {
-            assert_eq!(interpreter, "pwsh");
+                mock.expect_run_task()
+                    .withf(|interpreter, _env, _file| interpreter == "pwsh")
+                    .returning(|_, _, _| Ok(()));
+            })
+            .build();
 
-            MockResult::Return(Ok("TESTING=yes".to_string()))
-        });
-
-        crate::core::script::run_script_task.mock_safe(|interpreter, _config, _file| {
-            assert_eq!(interpreter, "pwsh");
-
-            MockResult::Return(Ok(()))
-        });
-
-        match cmd.run(&args) {
+        match cmd.run(&core, &args) {
             Ok(_) => {}
             Err(err) => panic!("{}", err.message()),
         }
@@ -183,6 +191,11 @@ mod tests {
         assert!(
             output.to_string().contains(" + package 'test2'"),
             "the output should contain the second package"
+        );
+
+        assert!(
+            temp.path().join("etc/test.conf/test.conf").exists(),
+            "the templated file should have been written into the temporary directory"
         );
     }
 }

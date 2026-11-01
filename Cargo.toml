@@ -34,7 +34,7 @@ walkdir = "2.5"
 webpki-roots = "1.0"
 
 [dev-dependencies]
-mocktopus = { git = "https://github.com/notheotherben/mocktopus.git" }
+mockall = "0.15"
 tempfile = "3.27"
 tracing-subscriber = "0.3"
 
