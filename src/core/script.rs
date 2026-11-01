@@ -92,9 +92,95 @@ impl Script {
 
 #[cfg(test)]
 mod tests {
-    use crate::test::get_test_data;
+    use crate::core::Core;
+    use crate::test::{get_test_data, ConfigDir};
 
-    use super::get_all_scripts;
+    use super::*;
+
+    fn pairs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn get_all_scripts_is_empty_for_a_missing_directory() {
+        let dir = ConfigDir::new();
+
+        let scripts = get_all_scripts(&dir.path().join("scripts"))
+            .expect("a missing directory should be treated as empty");
+
+        assert!(scripts.is_empty());
+    }
+
+    #[test]
+    fn get_all_scripts_sorts_by_name() {
+        let dir = ConfigDir::new()
+            .with_package_script("pkg", "20-second.sh", "")
+            .with_package_script("pkg", "10-first.sh", "");
+
+        let scripts = get_all_scripts(&dir.path().join("packages").join("pkg").join("scripts"))
+            .expect("the scripts should be listed");
+        let names: Vec<&str> = scripts.iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(names, vec!["10-first.sh", "20-second.sh"]);
+    }
+
+    #[test]
+    fn run_dispatches_to_the_interpreter_with_config_and_secrets() {
+        let cases = [("ps1", "pwsh"), ("sh", "bash"), ("bat", "cmd.exe"), ("cmd", "cmd.exe")];
+
+        for (extension, interpreter) in cases {
+            let script = Script {
+                name: format!("setup.{extension}"),
+                path: PathBuf::from(format!("/pkg/scripts/setup.{extension}")),
+            };
+
+            let core = Core::builder()
+                .with_mock_launcher(move |mock| {
+                    let expected_path = script_path(extension);
+                    mock.expect_run_task()
+                        .withf(move |i, env, file| {
+                            i == interpreter
+                                && file == expected_path
+                                && env.get("FROM_CONFIG").map(String::as_str) == Some("yes")
+                                && env.get("FROM_SECRET").map(String::as_str) == Some("shh")
+                        })
+                        .once()
+                        .returning(|_, _, _| Ok(()));
+                })
+                .build();
+
+            script
+                .run(&core, &pairs(&[("FROM_CONFIG", "yes")]), &pairs(&[("FROM_SECRET", "shh")]))
+                .unwrap_or_else(|e| panic!(".{extension} should run: {}", e.message()));
+        }
+
+        fn script_path(extension: &str) -> PathBuf {
+            PathBuf::from(format!("/pkg/scripts/setup.{extension}"))
+        }
+    }
+
+    #[test]
+    fn run_rejects_unsupported_extensions() {
+        let core = Core::builder()
+            .with_mock_launcher(|mock| {
+                mock.expect_run_task().never();
+            })
+            .build();
+
+        for name in ["setup.py", "setup"] {
+            let script = Script {
+                name: name.to_string(),
+                path: PathBuf::from("/pkg/scripts").join(name),
+            };
+
+            let result = script.run(&core, &pairs(&[]), &pairs(&[]));
+
+            assert!(result.is_err(), "'{}' should not be runnable", name);
+        }
+    }
 
     #[test]
     fn test_load() {

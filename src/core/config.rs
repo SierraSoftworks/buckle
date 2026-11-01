@@ -105,3 +105,115 @@ fn parse_config(content: &str) -> HashMap<String, String> {
 
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Core;
+    use crate::test::{get_test_data, ConfigDir};
+
+    fn core() -> Core {
+        Core::builder()
+            .with_mock_launcher(|mock| {
+                mock.expect_load_config().never();
+            })
+            .build()
+    }
+
+    #[test]
+    fn parse_config_reads_key_value_pairs() {
+        let config = parse_config("A=1\n  B = two \r\nC=x=y\nnot a pair\n\nA=overridden\n");
+
+        assert_eq!(config.get("A").map(String::as_str), Some("overridden"));
+        assert_eq!(config.get("B ").map(String::as_str), Some(" two"));
+        assert_eq!(config.get("C").map(String::as_str), Some("x=y"));
+        assert_eq!(config.len(), 3, "lines without an '=' should be ignored");
+    }
+
+    #[test]
+    fn load_config_reads_env_files() {
+        let config = load_config(&core(), &get_test_data().join("config").join("defaults.env"))
+            .expect("the env file should load");
+
+        assert!(!config.is_empty(), "the env file should contain config");
+    }
+
+    #[test]
+    fn load_config_runs_scripts_through_the_launcher() {
+        let cases = [("ps1", "pwsh"), ("sh", "bash"), ("bat", "cmd.exe"), ("cmd", "cmd.exe")];
+
+        for (extension, interpreter) in cases {
+            let dir = ConfigDir::new().with_config(&format!("values.{extension}"), "");
+            let file = dir.path().join("config").join(format!("values.{extension}"));
+
+            let core = Core::builder()
+                .with_mock_launcher(move |mock| {
+                    let expected = file.clone();
+                    mock.expect_load_config()
+                        .withf(move |i, f| i == interpreter && f == expected)
+                        .once()
+                        .returning(|_, _| Ok("FROM_SCRIPT=yes\n".to_string()));
+                })
+                .build();
+
+            let config = load_config(&core, &dir.path().join("config").join(format!("values.{extension}")))
+                .unwrap_or_else(|e| panic!("the .{extension} file should load: {}", e.message()));
+
+            assert_eq!(
+                config.get("FROM_SCRIPT").map(String::as_str),
+                Some("yes"),
+                "the script output for .{extension} should be parsed as config"
+            );
+        }
+    }
+
+    #[test]
+    fn load_config_rejects_unsupported_files() {
+        let dir = ConfigDir::new()
+            .with_config("notes.txt", "A=1")
+            .with_config("noextension", "A=1");
+
+        for name in ["notes.txt", "noextension"] {
+            let result = load_config(&core(), &dir.path().join("config").join(name));
+            assert!(result.is_err(), "'{}' should not be loadable as config", name);
+        }
+    }
+
+    #[test]
+    fn load_all_config_merges_every_file_in_the_directory() {
+        let dir = ConfigDir::new()
+            .with_config("a.env", "A=1\nSHARED=a")
+            .with_config("b.env", "B=2\nSHARED=b");
+
+        let config = load_all_config(&core(), &dir.path().join("config"))
+            .expect("the config directory should load");
+
+        assert_eq!(config.get("A").map(String::as_str), Some("1"));
+        assert_eq!(config.get("B").map(String::as_str), Some("2"));
+        assert!(
+            matches!(config.get("SHARED").map(String::as_str), Some("a") | Some("b")),
+            "a key defined in two files should take one of their values"
+        );
+    }
+
+    #[test]
+    fn load_all_config_is_empty_for_a_missing_directory() {
+        let dir = ConfigDir::new();
+
+        let config = load_all_config(&core(), &dir.path().join("config"))
+            .expect("a missing directory should be treated as empty");
+
+        assert!(config.is_empty());
+    }
+
+    #[test]
+    fn load_all_config_fails_on_an_unsupported_file() {
+        let dir = ConfigDir::new()
+            .with_config("a.env", "A=1")
+            .with_config("README.md", "not config");
+
+        let result = load_all_config(&core(), &dir.path().join("config"));
+
+        assert!(result.is_err(), "an unsupported file should fail the load");
+    }
+}

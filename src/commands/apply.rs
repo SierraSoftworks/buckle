@@ -132,7 +132,7 @@ impl ApplyCommand {
 mod tests {
     use crate::core::file::{FileWriter, LocalFileWriter};
     use crate::core::output::mocks::OutputBuffer;
-    use crate::test::{get_test_data, test_tracing};
+    use crate::test::{get_test_data, test_tracing, ConfigDir};
 
     use super::*;
 
@@ -197,5 +197,61 @@ mod tests {
             temp.path().join("etc/test.conf/test.conf").exists(),
             "the templated file should have been written into the temporary directory"
         );
+    }
+
+    #[test]
+    fn secrets_are_masked_in_the_output_but_available_to_templates() {
+        let _guard = test_tracing();
+        let config_dir = ConfigDir::new()
+            .with_config("defaults.env", "REGION=eu")
+            .with_secret("magic.env", "TOKEN=hunter2")
+            .with_package("app", "description: app\nfiles:\n  etc: /etc/app\n")
+            .with_package_config("app", "version.env", "VERSION=1.2.3")
+            .with_package_file("app", "etc", "app.conf.tpl", "{{ .REGION }} {{ .VERSION }} {{ .TOKEN }}");
+        let target = tempfile::tempdir().unwrap();
+
+        let cmd = ApplyCommand {};
+        let args = cmd.app().get_matches_from(vec![
+            "apply",
+            "--config",
+            config_dir.path().to_str().unwrap(),
+        ]);
+
+        let output = OutputBuffer::default();
+        let target_path = target.path().to_owned();
+        let core = Core::builder()
+            .with_mock_output(|mock| {
+                let output = output.clone();
+                mock.expect_writer()
+                    .returning(move || Box::new(output.clone()));
+            })
+            .with_mock_files(|mock| {
+                mock.expect_apply()
+                    .once()
+                    .returning(move |file, target, config, secrets| {
+                        let target = target_path.join(target.strip_prefix("/").unwrap());
+                        LocalFileWriter.apply(file, &target, config, secrets)
+                    });
+            })
+            .with_mock_launcher(|mock| {
+                mock.expect_load_config().never();
+                mock.expect_run_task().never();
+            })
+            .build();
+
+        cmd.run(&core, &args)
+            .unwrap_or_else(|e| panic!("apply should succeed: {}", e.message()));
+
+        let printed = output.to_string();
+        assert!(printed.contains(" = config REGION=eu"));
+        assert!(printed.contains("   = config VERSION=1.2.3"));
+        assert!(printed.contains(" = secret TOKEN=******"));
+        assert!(
+            !printed.contains("hunter2"),
+            "secret values must never be written to the output"
+        );
+
+        let rendered = std::fs::read_to_string(target.path().join("etc/app/app.conf")).unwrap();
+        assert_eq!(rendered, "eu 1.2.3 hunter2");
     }
 }
