@@ -1,3 +1,4 @@
+use super::core::Core;
 use super::errors;
 use clap::ArgMatches;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ pub trait Command: Send + Sync {
 }
 
 pub trait CommandRunnable: Command {
-    fn run(&self, matches: &ArgMatches) -> Result<i32, errors::Error>;
+    fn run(&self, core: &Core, matches: &ArgMatches) -> Result<i32, errors::Error>;
 }
 
 pub fn commands() -> Vec<Arc<dyn CommandRunnable>> {

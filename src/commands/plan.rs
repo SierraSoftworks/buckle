@@ -31,8 +31,8 @@ impl Command for PlanCommand {
 }
 
 impl CommandRunnable for PlanCommand {
-    #[instrument(name = "command.plan", fields(otel.kind = ?SpanKind::Client), skip(self, matches), err)]
-    fn run(&self, matches: &clap::ArgMatches) -> Result<i32, crate::errors::Error> {
+    #[instrument(name = "command.plan", fields(otel.kind = ?SpanKind::Client), skip(self, core, matches), err)]
+    fn run(&self, core: &Core, matches: &clap::ArgMatches) -> Result<i32, crate::errors::Error> {
         let config_dir: PathBuf =
             matches
                 .get_one::<PathBuf>("config")
@@ -44,14 +44,14 @@ impl CommandRunnable for PlanCommand {
                     )
                 })?;
 
-        let mut output = crate::core::output::output();
+        let mut output = core.output().writer();
 
-        let config = crate::core::config::load_all_config(&config_dir.join("config"))?;
+        let config = crate::core::config::load_all_config(core, &config_dir.join("config"))?;
         for (key, val) in config {
             writeln!(output, " = config {key}={val}")?;
         }
 
-        let secrets = crate::core::config::load_all_config(&config_dir.join("secrets"))?;
+        let secrets = crate::core::config::load_all_config(core, &config_dir.join("secrets"))?;
         for (key, _val) in secrets {
             writeln!(output, " = secret {key}=******")?;
         }
@@ -63,12 +63,12 @@ impl CommandRunnable for PlanCommand {
             writeln!(output)?;
             writeln!(output, " + package '{}'", &package.id)?;
 
-            let config = package.get_config()?;
+            let config = package.get_config(core)?;
             for (key, val) in config {
                 writeln!(output, "   = config {key}={val}")?;
             }
 
-            let secrets = package.get_secrets()?;
+            let secrets = package.get_secrets(core)?;
             for (key, _val) in secrets {
                 writeln!(output, "   = secret {key}=******")?;
             }
@@ -102,8 +102,8 @@ impl CommandRunnable for PlanCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::output::mocks::OutputBuffer;
     use crate::test::{get_test_data, test_tracing};
-    use mocktopus::mocking::*;
 
     #[test]
     fn run() {
@@ -114,13 +114,25 @@ mod tests {
             cmd.app()
                 .get_matches_from(vec!["plan", "--config", get_test_data().to_str().unwrap()]);
 
-        let output = crate::core::output::mock();
+        let output = OutputBuffer::default();
 
-        crate::core::file::File::apply.mock_safe(|_f, _target, _config, _secrets| {
-            panic!("The file should not have been written during the planning phase.");
-        });
+        let core = Core::builder()
+            .with_mock_output(|mock| {
+                let output = output.clone();
+                mock.expect_writer()
+                    .returning(move || Box::new(output.clone()));
+            })
+            // Planning must never write files or run scripts.
+            .with_mock_files(|mock| {
+                mock.expect_apply().never();
+            })
+            .with_mock_launcher(|mock| {
+                mock.expect_load_config().never();
+                mock.expect_run_task().never();
+            })
+            .build();
 
-        match cmd.run(&args) {
+        match cmd.run(&core, &args) {
             Ok(_) => {}
             Err(err) => panic!("{}", err.message()),
         }

@@ -1,19 +1,22 @@
 use std::io::{stdout, Write};
 
 #[cfg(test)]
-use mocktopus::{macros::*, mocking::*};
+use mockall::automock;
 
-#[cfg_attr(test, mockable)]
-pub fn output() -> Box<dyn Write + Send> {
-    Box::new(stdout())
+/// Provides the writer that user-facing output is sent to.
+#[cfg_attr(test, automock)]
+pub trait Output: Send + Sync {
+    fn writer(&self) -> Box<dyn Write + Send>;
 }
 
-#[cfg(test)]
-pub fn mock() -> mocks::MockOutput {
-    let writer = mocks::MockOutput::default();
-    let sacrificial_writer = writer.clone();
-    output.mock_safe(move || MockResult::Return(Box::new(sacrificial_writer.clone())));
-    writer
+/// Writes output to the process's stdout.
+#[derive(Debug, Default)]
+pub struct StdoutOutput;
+
+impl Output for StdoutOutput {
+    fn writer(&self) -> Box<dyn Write + Send> {
+        Box::new(stdout())
+    }
 }
 
 #[cfg(test)]
@@ -25,12 +28,17 @@ pub mod mocks {
         sync::{Arc, Mutex},
     };
 
-    #[derive(Clone)]
-    pub struct MockOutput {
+    /// An in-memory [`Write`] implementation which collects everything written
+    /// to it so that tests can inspect the output of a command.
+    ///
+    /// Clones share the same buffer, so a test can keep one handle and hand
+    /// another to the [`Core`](crate::core::Core) under test.
+    #[derive(Clone, Debug, Default)]
+    pub struct OutputBuffer {
         written_data: Arc<Mutex<String>>,
     }
 
-    impl MockOutput {
+    impl OutputBuffer {
         pub fn clear(&self) {
             self.written_data
                 .lock()
@@ -39,35 +47,31 @@ pub mod mocks {
         }
     }
 
-    impl Default for MockOutput {
-        fn default() -> Self {
-            Self {
-                written_data: Arc::new(Mutex::new(String::new())),
-            }
-        }
-    }
-
-    impl ToString for MockOutput {
-        fn to_string(&self) -> String {
-            self.written_data
+    impl std::fmt::Display for OutputBuffer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let data = self
+                .written_data
                 .lock()
                 .map(|m| m.to_string())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            f.write_str(&data)
         }
     }
 
-    impl Write for MockOutput {
+    impl Output for OutputBuffer {
+        fn writer(&self) -> Box<dyn Write + Send> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl Write for OutputBuffer {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.written_data
                 .lock()
                 .map_err(|_| ErrorKind::Other.into())
                 .map(|mut data| {
-                    if let Ok(s) = String::from_utf8(buf.to_vec()) {
-                        data.push_str(&s);
-                        buf.len()
-                    } else {
-                        0
-                    }
+                    data.push_str(&String::from_utf8_lossy(buf));
+                    buf.len()
                 })
         }
 
