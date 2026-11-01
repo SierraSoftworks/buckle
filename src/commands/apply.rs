@@ -59,17 +59,21 @@ impl CommandRunnable for ApplyCommand {
         let packages = crate::core::package::get_all_packages(&config_dir.join("packages"))?;
 
         for package in packages {
-            let mut retries = 0;
-            while retries <= package.retry.limit {
+            let mut attempts: u32 = 0;
+            loop {
                 match self.apply_package(core, &config, &secrets, &package) {
-                    Ok(_) => {
-                        break;
-                    }
+                    Ok(_) => break,
                     Err(err) => {
-                        retries += 1;
-                        if package.retry.limit >= retries {
+                        attempts += 1;
+                        if attempts > u32::from(package.retry.limit) {
                             return Err(err);
                         }
+
+                        writeln!(
+                            output,
+                            "   ! package '{}' failed, retrying ({attempts}/{})",
+                            &package.id, package.retry.limit
+                        )?;
                         std::thread::sleep(package.retry.delay.into());
                     }
                 }
@@ -196,6 +200,90 @@ mod tests {
         assert!(
             temp.path().join("etc/test.conf/test.conf").exists(),
             "the templated file should have been written into the temporary directory"
+        );
+    }
+
+    /// Writes a config directory containing a single package whose only task
+    /// is a script, so that the launcher mock decides whether it succeeds.
+    fn config_with_retrying_package(limit: u8) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("packages").join("flaky");
+        std::fs::create_dir_all(package.join("scripts")).unwrap();
+        std::fs::write(
+            package.join("package.yml"),
+            format!("description: A package which fails sometimes.\nretry:\n  limit: {limit}\n  delay: 1\n"),
+        )
+        .unwrap();
+        std::fs::write(package.join("scripts").join("setup.sh"), "exit 1\n").unwrap();
+        temp
+    }
+
+    fn run_with_failing_task(limit: u8, failures: usize, expected_attempts: usize) -> Result<i32, crate::errors::Error> {
+        let _guard = test_tracing();
+        let config = config_with_retrying_package(limit);
+
+        let cmd = ApplyCommand {};
+        let args = cmd.app().get_matches_from(vec![
+            "apply",
+            "--config",
+            config.path().to_str().unwrap(),
+        ]);
+
+        let output = OutputBuffer::default();
+        let core = Core::builder()
+            .with_mock_output(|mock| {
+                let output = output.clone();
+                mock.expect_writer()
+                    .returning(move || Box::new(output.clone()));
+            })
+            .with_mock_launcher(|mock| {
+                let mut calls = 0;
+                mock.expect_run_task()
+                    .times(expected_attempts)
+                    .returning(move |_, _, _| {
+                        calls += 1;
+                        if calls <= failures {
+                            Err(crate::errors::user(
+                                "The task failed.",
+                                "Try again.",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    });
+            })
+            .build();
+
+        cmd.run(&core, &args)
+    }
+
+    #[test]
+    fn retry_recovers_when_a_later_attempt_succeeds() {
+        // Two retries allowed, two failures, then success on the third attempt.
+        let result = run_with_failing_task(2, 2, 3);
+        assert_eq!(
+            result.ok(),
+            Some(0),
+            "the package should succeed once a retry passes"
+        );
+    }
+
+    #[test]
+    fn retry_gives_up_once_the_limit_is_reached() {
+        // One retry allowed, but the task never succeeds.
+        let result = run_with_failing_task(1, usize::MAX, 2);
+        assert!(
+            result.is_err(),
+            "the error should be reported once the retries are used up"
+        );
+    }
+
+    #[test]
+    fn failure_without_retries_is_reported() {
+        let result = run_with_failing_task(0, usize::MAX, 1);
+        assert!(
+            result.is_err(),
+            "a failing package with no retries should fail the run"
         );
     }
 }
