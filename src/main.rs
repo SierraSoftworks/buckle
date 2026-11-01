@@ -1,5 +1,4 @@
 extern crate clap;
-extern crate gtmpl;
 #[macro_use]
 extern crate tracing;
 

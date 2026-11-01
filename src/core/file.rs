@@ -1,8 +1,11 @@
 use std::path::PathBuf;
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 use walkdir::WalkDir;
 
-use gtmpl::{template, Value};
+use gotmpl::{MissingKey, Template, Value};
 use tracing::instrument;
 
 use crate::errors;
@@ -163,21 +166,25 @@ impl File {
 
         let template_content = std::fs::read_to_string(&self.source_path)?;
 
-        let mut context = HashMap::new();
+        let mut context: BTreeMap<String, Value> = BTreeMap::new();
         for (key, val) in config {
-            context.insert(key.clone(), Value::String(val.clone()));
+            context.insert(key.clone(), Value::from(val.as_str()));
         }
 
         for (key, val) in secrets {
-            context.insert(key.clone(), Value::String(val.clone()));
+            context.insert(key.clone(), Value::from(val.as_str()));
         }
 
-        let context = Value::Object(context);
+        let context = Value::from(context);
 
-        let rendered = template(&template_content, context)
+        let template_name = self.source_path.to_string_lossy();
+        let rendered = Template::new(&template_name)
+            .missing_key(MissingKey::Error)
+            .parse(&template_content)
+            .and_then(|template| template.execute_to_string(&context))
             .map_err(|e| errors::user_with_internal(
-                &format!("Could not render the template '{}' due to a problem in your template.", self.source_path.display()),
-                "Check that your template is valid and review the internal error message for more information.", 
+                format!("Could not render the template '{}' due to a problem in your template.", self.source_path.display()),
+                "Check that your template is valid Go template syntax, that every key it references is defined in your config or secrets, and review the internal error message for more information.",
                 e))?;
 
         std::fs::write(output_path, rendered)?;
@@ -299,18 +306,42 @@ mod tests {
 
     #[test]
     fn local_writer_reports_template_errors() {
-        // Note: gtmpl's parser never returns for an unterminated action such as
-        // `{{ .Unclosed `, so this uses an action that is rejected cleanly.
-        let dir = ConfigDir::new().with_package_file("pkg", "etc", "broken.conf.tpl", "{{ end }}");
+        let dir = ConfigDir::new()
+            .with_package_file("pkg", "etc", "unterminated.conf.tpl", "{{ .Unclosed ")
+            .with_package_file("pkg", "etc", "unexpected-char.conf.tpl", "{{ .USER }")
+            .with_package_file("pkg", "etc", "undefined-function.conf.tpl", "{{ nosuchfunc }}");
         let target = ConfigDir::new();
 
         let files = get_all_files(&dir.path().join("packages").join("pkg").join("files")).unwrap();
-        let result = LocalFileWriter.apply(&files[0], target.path(), &config(&[]), &config(&[]));
+        assert_eq!(files.len(), 3);
 
-        assert!(result.is_err(), "a broken template should be reported");
+        for file in &files {
+            let result = LocalFileWriter.apply(file, target.path(), &config(&[]), &config(&[]));
+
+            assert!(
+                result.is_err(),
+                "the broken template '{}' should be reported",
+                file.relative_path.display()
+            );
+            assert!(
+                !target.path().join(&file.relative_path).exists(),
+                "nothing should be written for the broken template '{}'",
+                file.relative_path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn local_writer_rejects_templates_which_reference_undefined_keys() {
+        let dir = ConfigDir::new().with_package_file("pkg", "etc", "app.conf.tpl", "user={{ .USER }}\nport={{ .PORT }}\n");
+        let target = ConfigDir::new();
+
+        let files = get_all_files(&dir.path().join("packages").join("pkg").join("files")).unwrap();
+        let result = LocalFileWriter.apply(&files[0], target.path(), &config(&[("USER", "ben")]), &config(&[]));
+
         assert!(
-            !target.path().join("broken.conf").exists(),
-            "nothing should be written for a broken template"
+            result.is_err(),
+            "a template referencing a key that is not configured should be reported rather than rendered with a placeholder"
         );
     }
 }
