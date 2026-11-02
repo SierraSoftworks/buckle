@@ -1,0 +1,39 @@
+name: docker
+description: Docker Engine from Docker's own apt repository, with log rotation configured.
+when: 'host.groups contains "nomad-clients"'
+tags: [docker]
+vars:
+  docker_log_opts: { max-size: 10m, max-file: "3" }     # a typed map, rendered with `to_json`
+tasks:
+  - apt.repository:
+      name: docker
+      uri: 'https://download.docker.com/linux/{{ vars.apt_distro }}'
+      suites: ['{{ host.facts.os.codename }}']
+      components: [stable]
+      signed_by: { url: 'https://download.docker.com/linux/{{ vars.apt_distro }}/gpg' }
+    tags: [network]
+
+  - apt.package:
+      names: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+    # Dropping this module from the config must not apt-remove the engine from
+    # under containers that are still running; uninstalling it is a deliberate act.
+    removal: leave
+
+  - file.directory: { path: /etc/docker, mode: "0755" }
+  - file.template:
+      src: daemon.json.j2
+      dest: /etc/docker/daemon.json
+      mode: "0644"
+    # The engine restarts, and so must Nomad: its Docker driver only fingerprints
+    # the daemon at start. Another module's handler is named as `module:handler`.
+    notify: [restart, "nomad:restart"]
+
+  - systemd.unit: { name: docker, enabled: true, active: true }
+
+handlers:
+  restart:
+    systemd.restart: { name: docker }
+
+health:
+  - name: daemon
+    systemd: { unit: docker, state: active, min_uptime: 15s }

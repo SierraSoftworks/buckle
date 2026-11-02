@@ -105,6 +105,7 @@ pub fn summary(record: &RolloutRecord, hosts: &[RolloutHostRecord]) -> RolloutSu
             .map(|p| p.name.clone()),
         pause_reason: record.runtime.pause.as_ref().map(|p| p.reason.clone()),
         trace_id: record.runtime.trace_id.clone(),
+        trace_url: None,
     }
 }
 

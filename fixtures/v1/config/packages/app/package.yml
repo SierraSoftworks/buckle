@@ -1,0 +1,3 @@
+description: Reads global and package config.
+files:
+  etc: /etc/app

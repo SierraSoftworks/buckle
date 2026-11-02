@@ -1,0 +1,6 @@
+# {{ buckle_managed }}
+export EDITOR={{ vars.terminal_editor }}
+export VISUAL={{ vars.terminal_editor }}
+if [ -x /usr/local/bin/atuin ] && [ -n "$BASH_VERSION" ]; then
+  eval "$(/usr/local/bin/atuin init bash)"
+fi

@@ -1,0 +1,113 @@
+# A fictional fleet: a few Raspberry Pis at home plus three cloud instances, all on the tailnet example.ts.net.
+#
+# Hosts (nothing below names them; they are described by labels set at install
+# time and facts the agent discovers):
+#   pi-1 pi-2 pi-3  arm64 Raspberry Pi, Debian, home site; Nomad servers + clients
+#   pi-4            arm64 Raspberry Pi, Debian, home site; Nomad client, the canary
+#   oci-1 oci-2     arm64 Ubuntu cloud instances (Oracle Cloud); Nomad clients
+#   az-1            amd64 Ubuntu cloud instance (Azure); Nomad client
+#
+# Labels each agent reports (see `buckle install agent --label ...`):
+#   role=worker          every host runs a Nomad client
+#   nomad_server=true    pi-1, pi-2 and pi-3 also run a Nomad server
+#   site=home|oci|azure  where the machine lives
+#   canary=true          pi-4 only
+version: 2
+
+fleet:
+  # Groups are derived, never enumerated. Selectors are filt-rs expressions over
+  # host.labels.* and host.facts.*; the result is exposed as host.groups.
+  groups:
+    pis:           'host.labels.site == "home" && host.facts.hardware.arch == "aarch64"'
+    cloud:         'host.facts.cloud.provider in ["oci", "azure"]'
+    nomad-clients: 'host.labels.role == "worker"'
+    nomad-servers: 'host.labels.nomad_server == true'
+    canary:        'host.labels.canary == true'
+
+# Variable overlays. Precedence is the order of this list: later wins, and every
+# overlay beats the `vars:` defaults of the module that reads the variable.
+# The layering is deliberate, broad to narrow:
+#
+#   module defaults  <  base  <  platform  <  group  <  host
+#
+# Where two overlays set the same variable, the later one is meant to win:
+#   oci-1 is arm64 (platform says nomad_node_class "arm") and a cloud host
+#   (group says "cloud"); the group overlay is later, so "cloud" wins.
+#   pi-1 is in both `pis` and `nomad-servers`, which both set nomad_log_level;
+#   `nomad-servers` is narrower and later, so DEBUG beats WARN.
+# Reorder these entries and those answers change, which is why the order is
+# written down here and covered by a test (crates/buckle/tests/example.rs).
+vars:
+  # 1. base: applies to every host (no `when`).
+  - file: vars/defaults.yaml
+
+  # 2. platform: what the machine is.
+  - when: 'host.facts.os.id == "ubuntu"'
+    file: vars/platform-ubuntu.yaml
+  - when: 'host.facts.hardware.arch == "aarch64"'
+    file: vars/platform-arm64.yaml
+
+  # 3. group: what the machine is for.
+  - when: 'host.groups contains "pis"'
+    file: vars/group-pis.yaml
+  - when: 'host.groups contains "cloud"'
+    file: vars/group-cloud.yaml
+  - when: 'host.groups contains "nomad-servers"'
+    file: vars/group-nomad-servers.yaml
+
+  # 4. host: the rare per-machine exception, as inline values. (Hosts are
+  #    otherwise never named; prefer a label when more than one host needs it.)
+  - when: 'host.id == "pi-4"'
+    values:
+      swap_profile: small          # unlike the other Pis, pi-4 boots from NVMe
+  - when: 'host.id == "oci-2"'
+    values:
+      nomad_node_class: batch      # beats the "cloud" group and the "arm" platform value
+  - when: 'host.id == "az-1"'
+    values:
+      swap_profile: large          # 4 GiB of RAM, the smallest machine in the fleet
+
+# Secrets are references, never values. File providers point at paths that a
+# Nomad `template` stanza renders into the server's allocation; the one
+# environment provider is delivered with `template { env = true }`.
+secrets:
+  TAILSCALE_AUTHKEY:   { file: /secrets/TAILSCALE_AUTHKEY }
+  NOMAD_ENCRYPT_KEY:   { file: /secrets/NOMAD_ENCRYPT_KEY }
+  ALICE_PASSWORD_HASH: { file: /secrets/ALICE_PASSWORD_HASH }
+  RUSTIC_PASSWORD:     { env: RUSTIC_PASSWORD }
+
+# A revision moves canary -> pis -> cloud. A host belongs to the first phase
+# whose selector matches, so pi-4 (which is also in `pis`) is only ever a canary.
+rollout:
+  trigger: auto            # every valid revision starts a rollout
+  supersede: queue         # finish the current rollout, then roll the newest revision
+  on_failure: pause        # a human decides between retry, continue and rollback
+  settle: 2m               # a required check must fail this long before it counts
+  health:
+    bake: 5m               # default bake window per phase
+    baseline: hold         # an already-unhealthy host waits for an operator
+  local_rollback:          # the agent's safety net if a change cuts it off from the server
+    enabled: true
+    after: 5m
+    on_health: true
+  stragglers:              # hosts that missed their phase converge here after promotion
+    parallel: 2
+    approval: auto
+  phases:
+    - name: canary
+      select: 'host.labels.canary == true'
+      parallel: 1
+      approval: required   # a person signs off the plan digest before pi-4 changes
+      bake: 10m
+      max_failures: 0
+    - name: pis
+      select: 'host.groups contains "pis"'
+      parallel: 2
+      bake: 5m
+      max_failures: 0
+    - name: cloud
+      select: 'host.groups contains "cloud"'
+      parallel: 50%        # of the phase's hosts, rounded up
+      approval: if_destructive   # stop for sign-off when the plan removes anything
+      bake: 5m
+      max_failures: 10%

@@ -1,0 +1,112 @@
+name: nomad
+description: Nomad agent, a client on every host and a server on pi-1..pi-3, joined over the tailnet.
+when: 'host.groups contains "nomad-clients"'
+# Ordering and fact dependencies: the advertise address is a tailscale fact, and
+# the Docker task driver needs a running engine. Both modules are selected on at
+# least the hosts this one is, which the engine requires of a `needs` edge.
+needs: [tailscale, docker]
+tags: [nomad]
+vars:                                   # module defaults; fleet overlays override them
+  nomad_version: "1.9.3-*"              # apt version, wildcards allowed
+  nomad_data_dir: /opt/nomad/data
+  nomad_server_bootstrap_expect: 3
+  # A var may reference other vars (tailnet comes from vars/defaults.yaml) and
+  # always-available facts. It must not read host.facts.tailscale: vars are
+  # resolved on every plan, including the one that runs before tailscale is up.
+  nomad_server_peers:
+    - 'pi-1.{{ vars.tailnet }}'
+    - 'pi-2.{{ vars.tailnet }}'
+    - 'pi-3.{{ vars.tailnet }}'
+  nomad_docker_allow_privileged: false
+  cni_version: "1.6.2"
+tasks:
+  - apt.repository:
+      name: hashicorp
+      uri: https://apt.releases.hashicorp.com
+      suites: ['{{ host.facts.os.codename }}']
+      components: [main]
+      signed_by: { url: 'https://apt.releases.hashicorp.com/gpg' }
+    tags: [network]
+  - apt.package: { name: nomad, version: '{{ vars.nomad_version }}' }
+
+  - file.directory: { path: /etc/nomad.d/conf.d, mode: "0750" }
+  - file.directory: { path: '{{ vars.nomad_data_dir }}', mode: "0700" }
+
+  # One archive owns the CNI plugin directory (the Ansible role it replaces
+  # extracted two different versions into it). `creates` is relative to `dest`
+  # and keeps plans from downloading the tarball.
+  - archive.extract:
+      src: 'https://github.com/containernetworking/plugins/releases/download/v{{ vars.cni_version }}/cni-plugins-linux-{{ vars.cni_arch }}-v{{ vars.cni_version }}.tgz'
+      dest: /opt/cni/bin
+      creates: bridge
+      owner: root
+      group: root
+      mode: "0755"
+    tags: [network]
+    notify: [restart]
+
+  - file.template:
+      src: nomad.hcl.j2
+      dest: /etc/nomad.d/nomad.hcl
+      mode: "0640"
+      validate: ["nomad", "config", "validate", "{path}"]
+    notify: [restart]
+
+  # conf.d fragments are separate tracked resources. When a host stops matching
+  # a `when` (a server is demoted, say) its fragment is removed with the task
+  # instead of lingering and being loaded forever.
+  - file.template: { src: conf.d/client.hcl.j2, dest: /etc/nomad.d/conf.d/client.hcl, mode: "0640" }
+    notify: [reload]
+  - file.template: { src: conf.d/docker.hcl.j2, dest: /etc/nomad.d/conf.d/docker.hcl, mode: "0640" }
+    notify: [restart]               # plugin changes need a restart; a reload does not apply them
+  - file.template: { src: conf.d/telemetry.hcl.j2, dest: /etc/nomad.d/conf.d/telemetry.hcl, mode: "0640" }
+    notify: [reload]
+  - file.template:
+      src: conf.d/server.hcl.j2
+      dest: /etc/nomad.d/conf.d/server.hcl
+      mode: "0640"                  # holds the gossip encryption key
+    when: 'host.groups contains "nomad-servers"'
+    notify: [restart]
+
+  - systemd.dropin:
+      unit: nomad.service
+      content: |
+        [Service]
+        LimitNOFILE=65536
+        Restart=on-failure
+        RestartSec=5s
+    notify: [restart]
+
+  - systemd.unit: { name: nomad, enabled: true, active: true }
+
+  # The escape hatch, still plannable: `unless` is a read-only probe that runs
+  # in plan mode too, so an eligible node plans as a no-op.
+  - command.run:
+      run: ["nomad", "node", "eligibility", "-enable", "-self"]
+      unless: >-
+        nomad node status -self -json | grep -Eq '"SchedulingEligibility": *"eligible"'
+    when: 'vars.nomad_eligible == true'
+    # No inverse exists for "make this node eligible", and a host that leaves
+    # the config should keep whatever eligibility an operator last gave it.
+    removal: leave
+
+# Handlers run once, at the end of the module, ordered daemon-reload -> restart
+# -> reload; a restart subsumes a reload of the same unit.
+handlers:
+  daemon-reload: { systemd.daemon_reload: {} }
+  restart:       { systemd.restart: { name: nomad } }
+  reload:        { systemd.reload: { name: nomad } }
+
+# Three shallow checks: "did my change break the thing I changed?"
+health:
+  - name: api
+    http:
+      url: 'http://127.0.0.1:4646/v1/agent/health'
+      expect: { status: 200 }
+    interval: 30s                       # repeats inside the bake window only
+  - name: unit
+    systemd: { unit: nomad, state: active, min_uptime: 30s }    # min_uptime catches crash loops
+  - name: eligible
+    command:
+      run: ["nomad", "node", "status", "-self", "-json"]
+      expect: { stdout_matches: '"SchedulingEligibility":\s*"eligible"' }

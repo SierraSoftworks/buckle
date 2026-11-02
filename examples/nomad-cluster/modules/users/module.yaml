@@ -1,0 +1,53 @@
+name: users
+description: The admin group, local accounts, their authorised keys and the sudo policy.
+when: 'host.facts.os.family == "debian"'
+needs: [packages]                 # sudo and the sudo group come from the packages module
+tags: [base, access]
+vars:
+  users_sudo_nopasswd: true       # admins are key-only on most hosts; flip per group with a fleet overlay
+  # Public keys are not secret. They live here as the module's defaults so that
+  # one reviewed file shows who can log in; override them from a fleet overlay.
+  users_alice_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvN72+kQC9crvoSj+y4Jk0LY8CxRqPR0LxcO+c8+FvH alice@example.com"
+  users_bob_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJQd/dwimA/99zGl8xjeMU0LZOcxO8RH07dhzat453+o bob@example.com"
+  users_ops_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFNwcsPT90RHBxOZz8sQddO64gWHGDWNbH7I/oUTS428 ops@example.com"
+tasks:
+  - user.group: { name: admin }
+
+  - user.account:
+      name: alice
+      groups: [admin, sudo]
+      shell: /bin/bash
+      comment: Alice Example
+      # A crypt(3) hash. The secret is rendered through the task's secret sink,
+      # so it never appears in the plan, the logs or the recorded state.
+      password: '{{ secrets.ALICE_PASSWORD_HASH }}'
+
+  - user.account:
+      name: bob
+      groups: [admin, sudo]
+      shell: /bin/bash
+      comment: Bob Example         # key-only: no password hash, so no password login
+
+  - user.account:
+      name: ops
+      uid: 2000
+      shell: /bin/bash
+      comment: Automation account for CI deploys
+    # Opt out of cleanup. If this task ever leaves the config, Buckle stops
+    # managing the account instead of running `userdel`: the account owns CI
+    # checkouts and cron jobs that live outside this module, and deleting an
+    # account is not something a config edit should do unattended.
+    removal: leave
+
+  - ssh.authorized_key: { user: alice, key: '{{ vars.users_alice_key }}' }
+  - ssh.authorized_key: { user: bob, key: '{{ vars.users_bob_key }}' }
+  - ssh.authorized_key: { user: ops, key: '{{ vars.users_ops_key }}' }
+
+  - file.template:
+      src: sudoers-admin.j2
+      dest: /etc/sudoers.d/90-admin
+      mode: "0440"
+      owner: root
+      group: root
+      # A broken sudoers file locks everyone out of root, so check it first.
+      validate: ["visudo", "-cf", "{path}"]

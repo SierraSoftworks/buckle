@@ -8,6 +8,7 @@ members = [
     "crates/buckle-api",
     "crates/buckle-agent",
     "crates/buckle-server",
+    "crates/buckle-integration",
 ]
 # The `ui` crate is compiled to WebAssembly with `trunk` and embedded into the
 # server at build time; it is excluded so that `cargo build` of the workspace

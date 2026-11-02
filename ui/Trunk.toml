@@ -3,7 +3,7 @@ target = "index.html"
 dist = "dist"
 
 [watch]
-watch = ["src", "styles.scss", "index.html"]
+watch = ["src", "styles", "styles.scss", "index.html"]
 
 [serve]
 port = 8081

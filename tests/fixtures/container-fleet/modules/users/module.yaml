@@ -1,0 +1,12 @@
+name: users
+description: A system group and a system account for the demo service.
+tasks:
+  - user.group: { name: buckle-demo, system: true }
+  - user.account:
+      name: buckle-demo
+      group: buckle-demo
+      system: true
+      shell: /usr/sbin/nologin
+      home: /var/lib/buckle-demo
+      create_home: false
+      comment: Buckle container test

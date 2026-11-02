@@ -1,0 +1,4 @@
+# Managed by Buckle; local edits are reported as drift.
+greeting = "{{ vars.greeting }}"
+host = "{{ host.id }}"
+os = "{{ host.facts.os.id | default('unknown') }}"

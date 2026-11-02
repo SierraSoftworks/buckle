@@ -1,0 +1,18 @@
+name: swap
+description: A swap file sized by the swap_profile variable (none, small or large).
+# Selected on the variable, so `swap_profile: none` takes the whole module out
+# (and anything it applied earlier is cleaned up).
+when: 'vars.swap_profile != "none"'
+tags: [base]
+vars:
+  swap_profile: small       # module default; the Pis override it to none, pi-4 and az-1 differ again
+tasks:
+  # Task fields are plain strings once templated, so a number cannot come from
+  # a variable. Two mutually exclusive variants share one id, hence one resource
+  # (and one swap file on the host) whichever is selected.
+  - swap.file: { path: /swapfile, size_mb: 1024, swappiness: 10 }
+    id: swapfile
+    when: 'vars.swap_profile == "small"'
+  - swap.file: { path: /swapfile, size_mb: 2048, swappiness: 10 }
+    id: swapfile
+    when: 'vars.swap_profile == "large"'

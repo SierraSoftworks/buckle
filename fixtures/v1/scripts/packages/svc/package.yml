@@ -1,0 +1,4 @@
+description: Installs and starts a service.
+retry:
+  limit: 3
+  delay: 250

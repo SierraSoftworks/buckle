@@ -1,0 +1,4 @@
+# Group layer: Nomad servers (pi-1..pi-3). Narrower than `pis` and listed after
+# it in buckle.yaml, so its nomad_log_level wins on these hosts.
+tailscale_tags: "tag:server"
+nomad_log_level: DEBUG

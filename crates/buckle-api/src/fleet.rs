@@ -65,6 +65,27 @@ pub struct HostDetail {
     pub resources: Vec<ResourceSummary>,
     pub recent_runs: Vec<RunSummary>,
     pub health_results: Vec<HealthResultDto>,
+    /// What the latest drift check found different from the applied revision,
+    /// one entry per drifted resource. Empty when the host has not drifted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drift: Vec<DriftItem>,
+}
+
+/// One resource whose live state no longer matches what Buckle applied, as
+/// the drift check (design §04, §07) reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftItem {
+    pub module: String,
+    pub kind: String,
+    pub key: String,
+    /// The task's own description of the difference (`1 → 60`, `mode 0644 → 0600`).
+    pub summary: String,
+    /// A unified diff of redacted shadows (applied vs current), when the kind
+    /// can produce one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +111,10 @@ pub struct RunSummary {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// A link to the run's trace in the configured tracing UI, when the
+    /// server knows one (otherwise the UI shows `trace_id` as text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +128,10 @@ pub struct HealthResultDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub at: DateTime<Utc>,
+    /// The rollout the check ran for (`baseline`, `bake` and `rollout`
+    /// scopes); absent for `drift` readings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_id: Option<String>,
 }
 
 /// `PATCH /api/v1/hosts/{id}`.
@@ -130,6 +159,10 @@ pub struct Fleet {
     pub stable_revision: Option<String>,
     pub active_rollout: Option<String>,
     pub counts: FleetCounts,
+    /// The server's own version, which agents converge to on self-update; the
+    /// UI flags agents reporting a different one as version skew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,4 +174,73 @@ pub struct FleetCounts {
     pub drifted: u32,
     pub pending: u32,
     pub paused: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+    use serde_json::json;
+
+    /// The fields the UI lane added are optional on the wire, so a server that
+    /// predates them (or chooses not to fill them) still deserialises.
+    #[test]
+    fn fields_added_for_the_ui_default_when_absent() {
+        let summary = json!({
+            "id": "pi-1", "status": "active", "connection": "online",
+            "agent_labels": {}, "labels": {}, "effective_labels": {}, "groups": [],
+            "platform": null, "arch": null, "agent_version": null, "applied_revision": null,
+            "health": "healthy", "health_at": null, "drifted": false,
+            "first_seen": "2026-11-01T00:00:00Z", "last_seen": null
+        });
+        let mut detail = summary.clone();
+        let extra = json!({
+            "facts": {}, "facts_at": null, "resources": [],
+            "recent_runs": [{
+                "revision": "r", "plan_digest": "d",
+                "started_at": "2026-11-01T00:00:00Z", "finished_at": "2026-11-01T00:01:00Z",
+                "outcome": "success", "changes": 1, "removals": 0
+            }],
+            "health_results": [{
+                "scope": "drift", "module": "m", "check": "c", "kind": "http",
+                "required": true, "status": "pass", "at": "2026-11-01T00:00:00Z"
+            }]
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            detail[k] = v.clone();
+        }
+        let detail: HostDetail = serde_json::from_value(detail).unwrap();
+        assert!(detail.drift.is_empty());
+        assert_eq!(detail.recent_runs[0].trace_url, None);
+        assert_eq!(detail.health_results[0].rollout_id, None);
+
+        let fleet: Fleet = serde_json::from_value(json!({
+            "hosts": [summary], "stable_revision": null, "active_rollout": null,
+            "counts": FleetCounts::default()
+        }))
+        .unwrap();
+        assert_eq!(fleet.server_version, None);
+
+        let rollout: RolloutSummary = serde_json::from_value(json!({
+            "id": "42", "revision": "r", "revision_message": "m", "state": "rolling",
+            "started_at": "2026-11-01T00:00:00Z", "triggered_by": "controller",
+            "hosts_total": 1, "hosts_done": 0, "hosts_failed": 0
+        }))
+        .unwrap();
+        assert_eq!(rollout.trace_url, None);
+    }
+
+    #[test]
+    fn drift_items_round_trip_and_stay_off_the_wire_when_empty() {
+        let item = DriftItem {
+            module: "common".into(),
+            kind: "sysctl.param".into(),
+            key: "vm.swappiness".into(),
+            summary: "1 → 60".into(),
+            unified: None,
+            detected_at: None,
+        };
+        let text = serde_json::to_string(&item).unwrap();
+        assert!(!text.contains("unified"));
+        assert_eq!(serde_json::from_str::<DriftItem>(&text).unwrap(), item);
+    }
 }

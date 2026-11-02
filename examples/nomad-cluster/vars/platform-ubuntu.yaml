@@ -1,0 +1,2 @@
+# Platform layer: Ubuntu hosts (oci-1, oci-2, az-1).
+apt_distro: ubuntu

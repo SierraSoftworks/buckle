@@ -440,6 +440,7 @@ async fn fleet(state: Data, _: Authenticated) -> ApiResult {
         stable_revision: stable,
         active_rollout: active,
         counts,
+        server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
     }))
 }
 
@@ -485,6 +486,7 @@ fn run_dto(r: crate::store::RunRecord) -> RunSummary {
         removals: r.removals,
         error: r.error,
         trace_id: r.trace_id,
+        trace_url: None,
     }
 }
 
@@ -498,6 +500,7 @@ fn health_dto(h: crate::store::HealthEventRecord) -> HealthResultDto {
         status: h.status,
         reason: h.reason,
         at: h.at,
+        rollout_id: None,
     }
 }
 
@@ -523,6 +526,8 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
             .unwrap_or(serde_json::Value::Null),
         facts_at: facts.map(|(_, at)| at),
         resources: resources(row),
+        // Drift diffs are not persisted per item yet; the UI tolerates an empty list.
+        drift: Vec::new(),
         recent_runs: runs.into_iter().map(run_dto).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
     }))

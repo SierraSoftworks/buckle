@@ -1,0 +1,8 @@
+{
+  "os": { "family": "debian", "id": "ubuntu", "codename": "noble", "version": "24.04", "kernel": "6.8.0" },
+  "arch": "aarch64",
+  "hardware": { "arch": "aarch64", "cpus": 4, "mem": { "total_mb": 24576 }, "swap": { "total_mb": 0 } },
+  "net": { "hostname": "oci-1", "fqdn": "oci-1.example.ts.net" },
+  "tailscale": { "hostname": "oci-1.example.ts.net", "ips": ["100.64.0.31"], "tags": ["tag:worker"], "online": true },
+  "cloud": { "provider": "oci", "region": "eu-frankfurt-1", "shape": "VM.Standard.A1.Flex" }
+}

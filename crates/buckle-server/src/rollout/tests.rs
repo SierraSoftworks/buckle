@@ -648,15 +648,32 @@ async fn a_bake_regression_past_settle_pauses() {
     let a = host(&hosts, "a");
     assert_eq!(a.state, HostPhase::Failed);
     assert_eq!(a.runtime.failed_checks, vec!["web/http"]);
-    let applied_at = h.applies()[0].0;
+    // Measure from the first failing report the controller saw rather than from
+    // the Apply: on a paused clock, store writes on blocking threads let virtual
+    // time jump ahead between the two, which made an Apply-relative bound flaky.
+    let failing_since = *a
+        .runtime
+        .failing_since
+        .get("web/http")
+        .expect("the regression is still recorded on the host");
     let paused_at = r.runtime.pause.as_ref().unwrap().at;
     assert!(
-        paused_at - applied_at >= chrono::Duration::minutes(2),
+        paused_at - failing_since >= chrono::Duration::minutes(2),
         "settle is honoured"
     );
     assert!(
-        paused_at - applied_at < chrono::Duration::minutes(10),
-        "before the bake window closes"
+        paused_at - failing_since < chrono::Duration::minutes(3),
+        "the pause follows settle rather than waiting for the bake window"
+    );
+    assert!(
+        r.runtime
+            .pause
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("regression"),
+        "{:?}",
+        r.runtime.pause
     );
 }
 

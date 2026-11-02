@@ -668,6 +668,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "buckle-integration"
+version = "2.0.0-dev"
+dependencies = [
+ "async-trait",
+ "buckle-agent",
+ "buckle-api",
+ "buckle-core",
+ "buckle-server",
+ "buckle-std",
+ "chrono",
+ "futures",
+ "pretty_assertions",
+ "prost",
+ "reqwest 0.13.5",
+ "rstest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "buckle-proto"
 version = "2.0.0-dev"
 dependencies = [

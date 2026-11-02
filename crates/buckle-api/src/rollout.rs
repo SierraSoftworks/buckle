@@ -117,6 +117,10 @@ pub struct RolloutSummary {
     pub pause_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// A link to `trace_id` in the configured tracing UI (Honeycomb), when the
+    /// server knows one (otherwise the UI shows the id as text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

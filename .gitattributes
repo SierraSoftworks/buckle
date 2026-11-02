@@ -1,0 +1,6 @@
+# Keep text files LF on every platform: fixtures, templates and the example
+# fleet are compared byte for byte by tests and rendered line by line.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.woff2 binary

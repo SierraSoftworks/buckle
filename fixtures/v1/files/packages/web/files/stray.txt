@@ -1,0 +1,1 @@
+v1 only treated sub-directories of files/ as groups
