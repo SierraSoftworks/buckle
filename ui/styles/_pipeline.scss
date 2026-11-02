@@ -260,6 +260,13 @@
     box-shadow: inset 0 0 0 3px var(--danger);
   }
 
+  // Its own rollback failed: ringed outside, so it stands out from a
+  // plain failure.
+  &--attention {
+    outline: 2px solid var(--danger);
+    outline-offset: 2px;
+  }
+
   &--offline {
     opacity: 0.5;
   }

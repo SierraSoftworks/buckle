@@ -65,6 +65,10 @@ pub fn pipeline(props: &PipelineProps) -> Html {
                         <span class="block block--legend block--planned block--needs-approval" aria-hidden="true" />
                         { "needs approval" }
                     </li>
+                    <li class="legend__item">
+                        <span class="block block--legend block--failed block--attention" aria-hidden="true" />
+                        { "needs attention" }
+                    </li>
                 </ul>
             }
             if !p.duplicates.is_empty() {
@@ -214,6 +218,9 @@ fn block(entry: &RolloutHost, host: Option<&HostSummary>, now: DateTime<Utc>) ->
     if !entry.waived_checks.is_empty() {
         detail
             .push(html! { <span>{ format!("waived: {}", entry.waived_checks.join(", ")) }</span> });
+    }
+    if entry.needs_attention {
+        detail.push(html! { <span class="block__error">{ "needs attention: its own rollback failed" }</span> });
     }
     if let Some(error) = &entry.error {
         detail.push(html! { <span class="block__error">{ error.clone() }</span> });

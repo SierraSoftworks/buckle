@@ -41,10 +41,18 @@ describe("the rollout pipeline", () => {
     const tip = block.locator(".block__tip");
     await tip.waitFor({ state: "visible" });
     assert.match(await tip.textContent(), /pi-5.*failed.*nomad\/api/s);
-    assert.equal(await block.getAttribute("aria-label"), "pi-5: failed");
+    assert.equal(await block.getAttribute("aria-label"), "pi-5: failed, needs attention");
     await block.focus();
     await block.press("Enter");
     assert.equal(await heading(page), "pi-5");
+    await close();
+  });
+
+  test("a host whose own rollback failed is flagged for attention", async () => {
+    const { page, close } = await open("/rollouts/42");
+    await page.locator('a.block.block--attention[data-host="pi-5"]').waitFor();
+    const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });
+    await row.getByText("needs attention").waitFor();
     await close();
   });
 

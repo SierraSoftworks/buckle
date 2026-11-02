@@ -685,6 +685,9 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td>
                                     <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} title={h.error.clone()} />
                                     if h.needs_approval { <span class="badge badge--info">{ "needs approval" }</span> }
+                                    if h.needs_attention {
+                                        <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>
+                                    }
                                     if let Some(until) = h.bake_until.filter(|u| *u > props.now) {
                                         <span class="small muted">{ " " }<Countdown {until} /></span>
                                     }

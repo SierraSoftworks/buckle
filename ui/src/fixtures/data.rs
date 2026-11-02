@@ -449,7 +449,8 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
     let mut pi5 = entry("pi-5", "home", 1, S::Failed, Some(PLAN_NOMAD), now, 4);
     pi5.failed_module = Some("nomad".into());
     pi5.failed_checks = vec!["nomad/api".into()];
-    pi5.error = Some("Required check nomad/api failed for longer than settle (2m): GET http://127.0.0.1:4646/v1/agent/health answered 500.".into());
+    pi5.error = Some("Required check nomad/api failed for longer than settle (2m): GET http://127.0.0.1:4646/v1/agent/health answered 500. Rolling nomad back failed too: apt.package[nomad] is blocked (1.9.2 is no longer in the repository), so the host is left on a mix of revisions.".into());
+    pi5.needs_attention = true;
     let mut pi6 = entry("pi-6", "home", 1, S::RolledBack, Some(PLAN_NOMAD), now, 6);
     pi6.error = Some("The agent applied the cached stable revision after 5m without a session while nomad/unit was failing (local rollback).".into());
     let mut pi7 = entry("pi-7", "home", 2, S::Skipped, Some(PLAN_NOMAD), now, 9);
