@@ -364,7 +364,8 @@ async fn download_deb(cx: &Cx, url: &str) -> Result<PathBuf> {
             &["Check the URL in the task's `deb` field."],
         ));
     }
-    let path = state_dir(cx).join("downloads").join(file);
+    // apt only runs on Linux, so the path is always `/`-separated (also under Windows tests).
+    let path = PathBuf::from(format!("{}/downloads/{file}", state_dir(cx).display()));
     cx.system
         .write_atomic(&path, &response.body, &FilePerms::mode(0o644))
         .await?;

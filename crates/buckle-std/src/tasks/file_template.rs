@@ -464,7 +464,7 @@ mod tests {
         for (path, content) in seen.iter() {
             assert_ne!(path, "{path}", "the placeholder was substituted");
             assert!(
-                path.starts_with("/etc/app/"),
+                path.replace('\\', "/").starts_with("/etc/app/"),
                 "the temp file is next to dest: {path}"
             );
             assert_eq!(content, "name = nomad\n", "it saw the real render");
