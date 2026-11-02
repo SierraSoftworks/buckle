@@ -1579,3 +1579,119 @@ async fn a_host_that_stays_away_after_a_restart_misses_its_phase() {
     let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
     assert_eq!(host(&hosts, "b").phase, STRAGGLERS, "b missed its phase");
 }
+
+/// Retrying one of two failed hosts lets that host proceed, but the phase
+/// stays over its budget (max_failures 0) while the other failure stands: no
+/// completion, no promotion, until that one is resolved too.
+#[tokio::test(start_paused = true)]
+async fn a_phase_over_budget_does_not_complete_while_a_failure_stands() {
+    let mut h = Harness::new().await;
+    h.revision("r1", ONE_PHASE_TWO_WIDE).await;
+    for x in ["a", "b"] {
+        h.enrol(x, "web").await;
+        h.connect(x, None);
+        h.script(x, |s| s.apply_fail = Some(vec![]));
+    }
+    let id = h.start("r1").await;
+    h.wait(&id, "both failed and paused", |r, hs| {
+        r.state == RolloutState::Paused && hs.iter().all(|x| x.state == HostPhase::Failed)
+    })
+    .await;
+    h.script("a", |s| s.apply_fail = None);
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: "a".into(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "a healthy", |_, hs| {
+        host(hs, "a").state == HostPhase::Healthy
+    })
+    .await;
+    h.idle(120).await;
+    let (r, hosts) = h.snapshot(&id).await;
+    assert_eq!(r.state, RolloutState::Paused, "b's failure still stands");
+    assert_eq!(r.runtime.pause.as_ref().unwrap().kind, "failure_budget");
+    assert_eq!(host(&hosts, "b").state, HostPhase::Failed);
+    let stable = h
+        .store
+        .call(|db| db.kv().get("stable_revision"))
+        .await
+        .unwrap();
+    assert_eq!(stable, None);
+
+    // Skipping b clears the breach; the rollout resumes and completes.
+    h.command(Command::Skip {
+        rollout: id.clone(),
+        host: "b".into(),
+        note: "decommissioning".into(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "b").state, HostPhase::Skipped);
+    assert!(
+        host(&hosts, "b")
+            .runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("decommissioning")
+    );
+}
+
+/// An operator's pause is never lifted by a host decision: skip and retry
+/// act on the host but the rollout stays paused until resumed.
+#[tokio::test(start_paused = true)]
+async fn host_decisions_do_not_override_an_operator_pause() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', parallel: 1, max_failures: 1 }\n",
+    )
+    .await;
+    for x in ["a", "b", "c"] {
+        h.enrol(x, "web").await;
+        h.connect(x, None);
+    }
+    h.script("a", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r1").await;
+    h.wait(&id, "a failed within budget", |_, hs| {
+        host(hs, "a").state == HostPhase::Failed
+    })
+    .await;
+    h.command(Command::Pause {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let applies = h.applies().len();
+    h.script("a", |s| s.apply_fail = None);
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: "a".into(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.idle(300).await;
+    let (r, hosts) = h.snapshot(&id).await;
+    assert_eq!(r.state, RolloutState::Paused);
+    assert_eq!(r.runtime.pause.as_ref().unwrap().kind, "operator");
+    assert_eq!(host(&hosts, "a").state, HostPhase::Planned);
+    assert_eq!(
+        h.applies().len(),
+        applies,
+        "nothing applies under an operator pause"
+    );
+    h.command(Command::Resume {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+}

@@ -284,6 +284,11 @@ pub struct HostRuntime {
     /// How often the Apply was re-sent after reconnects without being run.
     #[serde(default)]
     pub apply_resends: u32,
+    /// An operator retried or continued this host: it may proceed while the
+    /// rollout is paused by a failure (never under an operator's pause).
+    /// Cleared when the host finishes.
+    #[serde(default)]
+    pub released: bool,
 }
 
 /// One `rollout_hosts` row.

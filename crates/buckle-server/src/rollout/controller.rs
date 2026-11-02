@@ -562,9 +562,22 @@ impl Controller {
         let open = if self.is_virtual(ri, hi) {
             record.runtime.stragglers_open
         } else {
-            record.is_running()
+            record.is_running() || self.released_while_paused(ri, hi)
         };
         open && self.eligible(&self.live[ri].hosts[hi].host)
+    }
+
+    /// An operator released host `hi` (retry, continue) while the rollout is
+    /// paused by a failure: it proceeds although nothing else starts.
+    fn released_while_paused(&self, ri: usize, hi: usize) -> bool {
+        let record = &self.live[ri].record;
+        record.state == RolloutState::Paused
+            && self.live[ri].hosts[hi].runtime.released
+            && record
+                .runtime
+                .pause
+                .as_ref()
+                .is_none_or(|p| p.kind != "operator")
     }
 
     /// Returns a host whose baseline check or apply cannot go ahead (the
@@ -635,6 +648,7 @@ impl Controller {
         self.touch_host(ri, hi);
         if state.finished() || state == HostPhase::Held {
             self.live[ri].host_spans.remove(&host);
+            self.live[ri].hosts[hi].runtime.released = false;
         }
         let message = if why.is_empty() {
             format!("{host}: {} → {}", from.as_str(), state.as_str())
@@ -1323,18 +1337,19 @@ impl Controller {
                         &["Check the rollout's state."],
                     ));
                 }
-                // Accept the failures that caused the pause.
-                let p = self.live[ri].record.runtime.current_phase;
-                if p < self.live[ri].record.runtime.phases.len() {
-                    let hosts = self.live[ri].phase_hosts(p);
-                    let failures = hosts
-                        .iter()
-                        .filter(|&&i| self.live[ri].hosts[i].state == HostPhase::Failed)
-                        .count() as u32;
-                    let phase = &mut self.live[ri].record.runtime.phases[p];
-                    let budget = phase.failure_budget(hosts.len());
+                // Accept the failures that caused the pause, in the current
+                // phase and in earlier ones (a pre-phase gate can fail a host
+                // of an earlier phase).
+                let current = self.live[ri].record.runtime.current_phase;
+                for p in 0..self.live[ri].record.runtime.phases.len() {
+                    if p > current || self.live[ri].record.runtime.phases[p].virtual_stage {
+                        continue;
+                    }
+                    let (failures, budget) = self.phase_failures(ri, p);
                     if failures > budget {
-                        phase.accepted_failures += failures - budget;
+                        self.live[ri].record.runtime.phases[p].accepted_failures +=
+                            failures - budget;
+                        self.live[ri].dirty = true;
                     }
                 }
                 self.command_audit(
@@ -1854,6 +1869,7 @@ impl Controller {
             h.runtime.request_id = None;
             h.runtime.bake_until = None;
             h.runtime.attempts += 1;
+            h.runtime.released = true;
             h.plan_digest = None;
         }
         self.set_host_state(ri, hi, HostPhase::PlanPending, "re-planning");
@@ -1884,11 +1900,85 @@ impl Controller {
     }
 
     /// Operator decisions on a host resume a paused rollout (design: "Paused
-    /// → Rolling: resume or retry host"); a failure-budget breach that still
-    /// stands will pause it again on the next failure.
+    /// → Rolling: resume or retry host") once what paused it is cleared: never
+    /// an operator's own pause, never while a failure budget is still breached,
+    /// and for a gate or local-rollback pause only once the host it named is
+    /// no longer failed.
     fn unpause_if_cleared(&mut self, ri: usize, actor: &str) {
-        if self.live[ri].record.state == RolloutState::Paused {
+        if self.live[ri].record.state == RolloutState::Paused && self.pause_cleared(ri) {
             self.unpause(ri, actor);
+        }
+    }
+
+    fn pause_cleared(&self, ri: usize) -> bool {
+        let live = &self.live[ri];
+        let Some(pause) = &live.record.runtime.pause else {
+            return true;
+        };
+        if pause.kind == "operator" || self.breach(ri).is_some() {
+            return false;
+        }
+        match pause.kind.as_str() {
+            "failure_budget" => true,
+            "gate" | "local_rollback" => pause.host.as_ref().is_none_or(|h| {
+                live.find(h).is_none_or(|i| {
+                    !matches!(live.hosts[i].state, HostPhase::Failed | HostPhase::Held)
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    /// Failed hosts in phase `p` and the failures it tolerates.
+    fn phase_failures(&self, ri: usize, p: usize) -> (u32, u32) {
+        let hosts = self.live[ri].phase_hosts(p);
+        let failures = hosts
+            .iter()
+            .filter(|&&i| self.live[ri].hosts[i].state == HostPhase::Failed)
+            .count() as u32;
+        let budget = self.live[ri].record.runtime.phases[p].failure_budget(hosts.len());
+        (failures, budget)
+    }
+
+    /// The first phase up to the current one whose failures exceed its
+    /// budget, as (phase, failures, budget), unless `on_failure: continue`.
+    fn breach(&self, ri: usize) -> Option<(usize, u32, u32)> {
+        let record = &self.live[ri].record;
+        if record.policy.on_failure == FailurePolicy::Continue {
+            return None;
+        }
+        let current = record.runtime.current_phase;
+        (0..record.runtime.phases.len())
+            .filter(|&p| p <= current && !record.runtime.phases[p].virtual_stage)
+            .find_map(|p| {
+                let (failures, budget) = self.phase_failures(ri, p);
+                (failures > budget).then_some((p, failures, budget))
+            })
+    }
+
+    /// Acts on a standing failure-budget breach per `on_failure`.
+    fn on_breach(&mut self, ri: usize, p: usize, failures: u32, latest: Option<(String, String)>) {
+        let phase = &self.live[ri].record.runtime.phases[p];
+        let reason = match &latest {
+            Some((host, why)) => format!(
+                "phase '{}': {failures} failed host(s) exceed max_failures {} (latest: {host}: {why})",
+                phase.name,
+                view::parallel_str(phase.max_failures)
+            ),
+            None => format!(
+                "phase '{}': {failures} failed host(s) exceed max_failures {}",
+                phase.name,
+                view::parallel_str(phase.max_failures)
+            ),
+        };
+        let host = latest.map(|(h, _)| h);
+        match self.live[ri].record.policy.on_failure {
+            FailurePolicy::Pause => self.pause(ri, "failure_budget", reason, host),
+            FailurePolicy::Rollback if self.live[ri].record.runtime.previous_stable.is_some() => {
+                self.begin_rollback(ri, "controller")
+            }
+            FailurePolicy::Rollback => self.pause(ri, "failure_budget", reason, host),
+            FailurePolicy::Continue => {}
         }
     }
 
@@ -2112,30 +2202,12 @@ impl Controller {
         let Some(pi) = self.live[ri].hosts[hi].runtime.phase_index else {
             return;
         };
-        let hosts = self.live[ri].phase_hosts(pi);
-        let failures = hosts
-            .iter()
-            .filter(|&&i| self.live[ri].hosts[i].state == HostPhase::Failed)
-            .count() as u32;
-        let phase = &self.live[ri].record.runtime.phases[pi];
-        let budget = phase.failure_budget(hosts.len());
+        let (failures, budget) = self.phase_failures(ri, pi);
         if failures <= budget {
             return;
         }
         let host = self.live[ri].hosts[hi].host.clone();
-        let reason = format!(
-            "phase '{}': {failures} failed host(s) exceed max_failures {} (latest: {host}: {why})",
-            phase.name,
-            view::parallel_str(phase.max_failures)
-        );
-        match self.live[ri].record.policy.on_failure {
-            FailurePolicy::Pause => self.pause(ri, "failure_budget", reason, Some(host)),
-            FailurePolicy::Rollback if self.live[ri].record.runtime.previous_stable.is_some() => {
-                self.begin_rollback(ri, "controller")
-            }
-            FailurePolicy::Rollback => self.pause(ri, "failure_budget", reason, Some(host)),
-            FailurePolicy::Continue => {}
-        }
+        self.on_breach(ri, pi, failures, Some((host, why.to_owned())));
     }
 
     // ------------------------------------------------------------ timers
@@ -2279,7 +2351,17 @@ impl Controller {
                 let state = self.live[ri].record.state;
                 if self.live[ri].record.is_running() {
                     changed |= self.drive_phases(ri).await;
-                } else if state == RolloutState::RollingBack {
+                }
+                if matches!(
+                    self.live[ri].record.state,
+                    RolloutState::Paused
+                        | RolloutState::Rolling
+                        | RolloutState::Baking
+                        | RolloutState::AwaitingApproval
+                ) {
+                    changed |= self.drive_released(ri);
+                }
+                if state == RolloutState::RollingBack {
                     changed |= self.drive_rollback(ri);
                 }
                 if self.live[ri].record.runtime.stragglers_open {
@@ -2367,6 +2449,13 @@ impl Controller {
             if !self.live[ri].record.is_running() {
                 return changed;
             }
+            // A standing failure-budget breach (failures charged once their
+            // phase started, or left after an operator acted on another
+            // host) stops the phase before anything else starts.
+            if let Some((bp, failures, _)) = self.breach(ri) {
+                self.on_breach(ri, bp, failures, None);
+                return true;
+            }
             let hosts = self.live[ri].phase_hosts(p);
             let cap = self.live[ri].record.runtime.phases[p]
                 .parallel
@@ -2387,7 +2476,17 @@ impl Controller {
                     changed = true;
                 }
             }
-            let done = hosts.iter().all(|&i| {
+            // The phase is done when its hosts, and hosts of earlier phases an
+            // operator retried, have finished (or missed it).
+            let upto: Vec<usize> = (0..self.live[ri].hosts.len())
+                .filter(|&i| {
+                    self.live[ri].hosts[i]
+                        .runtime
+                        .phase_index
+                        .is_some_and(|q| q <= p)
+                })
+                .collect();
+            let done = upto.iter().all(|&i| {
                 let h = &self.live[ri].hosts[i];
                 h.state.finished()
                     || (matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
@@ -2396,7 +2495,7 @@ impl Controller {
             if !done {
                 return changed;
             }
-            for &hi in &hosts {
+            for &hi in &upto {
                 if matches!(
                     self.live[ri].hosts[hi].state,
                     HostPhase::PlanPending | HostPhase::Planned
@@ -2412,6 +2511,40 @@ impl Controller {
             self.start_gate(ri, p);
             changed = true;
         }
+    }
+
+    /// Starts hosts an operator retried or continued, in whichever phase
+    /// (the current phase's are also started by [`Controller::drive_phases`]),
+    /// including while the rollout is paused by a failure.
+    fn drive_released(&mut self, ri: usize) -> bool {
+        let mut changed = false;
+        for hi in 0..self.live[ri].hosts.len() {
+            let h = &self.live[ri].hosts[hi];
+            if !h.runtime.released
+                || h.state != HostPhase::Planned
+                || self.is_virtual(ri, hi)
+                || !self.may_apply(ri, hi)
+                || !self.approved(ri, hi)
+            {
+                continue;
+            }
+            let Some(pi) = h.runtime.phase_index else {
+                continue;
+            };
+            let hosts = self.live[ri].phase_hosts(pi);
+            let cap = self.live[ri].record.runtime.phases[pi]
+                .parallel
+                .resolve(hosts.len());
+            let inflight = hosts
+                .iter()
+                .filter(|&&i| self.live[ri].hosts[i].state.in_flight())
+                .count();
+            if inflight < cap {
+                self.start_baseline(ri, hi);
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn start_gate(&mut self, ri: usize, p: usize) {

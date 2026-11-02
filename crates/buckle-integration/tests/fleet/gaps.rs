@@ -79,12 +79,10 @@ async fn a_paused_host_stops_correcting_drift() {
 
 /// Design §10 "Waves": failures over `max_failures` pause the phase and
 /// "nothing else is started"; the operator moves past a failed host with
-/// retry, continue, skip or a resume that accepts it. When an operator acts on
-/// a different host, the controller unpauses, and once that host finishes the
-/// phase counts the still-failed host as finished, passes its gate and
-/// promotes the revision with the breach unresolved.
+/// retry, continue, skip or a resume that accepts it. Retrying one host lets
+/// it proceed, but the phase does not complete (or promote) while the other
+/// failure keeps it over budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "design violation: a phase over its failure budget completes and promotes once every other host finishes (rollout/controller.rs drive_phases `done` treats Failed as finished)"]
 async fn a_phase_over_its_failure_budget_does_not_complete_while_the_failure_stands() {
     let fleet = |n: u32| {
         let deploy = if n > 1 {
