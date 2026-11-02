@@ -121,7 +121,7 @@ pub fn plan_groups(hosts: &[RolloutHostRecord]) -> Vec<PlanGroup> {
             changes: h.runtime.plan_changes.unwrap_or(0),
             removals: h.runtime.plan_removals.unwrap_or(0),
             destructive: h.runtime.destructive,
-            plan: h.plan.clone().unwrap_or(serde_json::Value::Null),
+            plan: crate::views::stored_plan_view(h.plan.as_ref()),
         });
         entry.hosts.push(h.host.clone());
     }

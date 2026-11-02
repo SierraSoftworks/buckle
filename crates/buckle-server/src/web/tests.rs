@@ -1473,3 +1473,68 @@ async fn reject_is_409_unless_awaiting_approval_and_404_for_no_rollout() {
         assert_eq!(resp.status(), expected, "{uri}");
     }
 }
+
+// ------------------------------------------------------------ typed plans
+
+#[actix_web::test]
+async fn plans_are_served_typed_and_deduplicated_by_digest() {
+    let e = env(WebConfig::default()).await;
+    let plan = crate::views::tests::review_plan();
+    let stored = serde_json::to_value(&plan).unwrap();
+    let digest = plan.digest.to_string();
+    let host = |name: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
+        rollout: "7".into(),
+        host: name.into(),
+        phase: "canary".into(),
+        wave: Some(1),
+        state: crate::rollout::model::HostPhase::Healthy,
+        plan_digest: Some(digest.clone()),
+        plan,
+        result: None,
+        health: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        runtime: crate::rollout::model::HostRuntime {
+            plan_changes: Some(4),
+            plan_removals: Some(2),
+            destructive: true,
+            phase_index: Some(0),
+            ..Default::default()
+        },
+    };
+    // pi-0 is stored first and holds no copy of the plan.
+    let rows = [host("pi-0", None), host("pi-1", Some(stored))];
+    e.store
+        .call(move |db| {
+            db.rollouts().save(&finished_rollout("7", None))?;
+            for r in &rows {
+                db.rollouts().save_host(r)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let groups: Vec<buckle_api::PlanGroup> = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/rollouts/7/plans")
+                .to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(groups.len(), 1, "one digest, one review");
+    let g = &groups[0];
+    assert_eq!(g.hosts, vec!["pi-0", "pi-1"]);
+    assert!(g.destructive);
+    let view = g.plan.as_ref().expect("pi-1's copy of the plan");
+    assert_eq!(view, &crate::views::plan_view(&plan));
+    assert!(
+        view.modules[0]
+            .steps
+            .iter()
+            .any(|s| s.destructive && s.key == "/etc/nomad.d/old.hcl")
+    );
+}

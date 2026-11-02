@@ -834,6 +834,14 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
         found.ok_or_else(|| ApiError::not_found(format!("No rollout '{id}'.")))?;
     let mut detail = view::detail(&r, &hosts, &approvals, &audit);
     detail.summary = state.link_rollout(detail.summary);
+    // A group takes its first host's copy of the plan; when that host holds
+    // none, any other host with the digest will do.
+    for g in detail.plans.iter_mut().filter(|g| g.plan.is_none()) {
+        g.plan = hosts
+            .iter()
+            .filter(|h| h.plan_digest.as_deref() == Some(g.digest.as_str()))
+            .find_map(|h| crate::views::stored_plan_view(h.plan.as_ref()));
+    }
     Ok(detail)
 }
 

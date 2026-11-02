@@ -6,10 +6,11 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    AuditEntry, Catalog, Connection, DriftItem, HealthResultDto, HealthSummary, HostDetail,
-    HostRolloutState as S, HostStatus, HostSummary, KindDescriptor, Me, PhaseState, PlanGroup,
-    ResourceSummary, RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutHost,
-    RolloutPhase, RolloutState, RolloutSummary, RunSummary,
+    AuditEntry, Catalog, Connection, DiffKind, DriftItem, HandlerView, HealthResultDto,
+    HealthSummary, HostDetail, HostRolloutState as S, HostStatus, HostSummary, KindDescriptor, Me,
+    ModuleNote, ModuleView, PhaseState, PlanGroup, PlanView, RemovalView, ResourceSummary,
+    RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase,
+    RolloutState, RolloutSummary, RunSummary, StepOutcome, StepView,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
@@ -857,77 +858,204 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
     v
 }
 
-fn step(module: &str, kind: &str, key: &str, planned: Value) -> Value {
-    json!({
-        "task": {"module": module, "id": key, "kind": kind},
-        "resource": {"module": module, "kind": kind, "key": key},
-        "planned": planned,
-        "locks": if kind.starts_with("apt.") { json!(["apt"]) } else { json!([]) },
-        "notifies": if module == "nomad" && kind != "systemd.unit" { json!(["nomad:restart"]) } else { json!([]) },
-        "always_runs": false,
-        "removal": "cleanup"
-    })
+/// A step of the demo plans: `diff` with its summary for a change, `None`
+/// for a step that is already in line.
+fn step(module: &str, kind: &str, key: &str, diff: Option<(DiffKind, &str)>) -> StepView {
+    StepView {
+        kind: kind.into(),
+        key: key.into(),
+        task: key.into(),
+        name: None,
+        outcome: if diff.is_some() {
+            StepOutcome::Change
+        } else {
+            StepOutcome::NoOp
+        },
+        summary: diff.map(|(_, s)| s.to_string()).unwrap_or_default(),
+        diff: diff.map(|(d, _)| d),
+        unified: None,
+        preview: None,
+        destructive: matches!(diff, Some((DiffKind::Delete, _))),
+        locks: if kind.starts_with("apt.") {
+            vec!["apt".into()]
+        } else {
+            vec![]
+        },
+        notifies: if module == "nomad" && kind != "systemd.unit" {
+            vec!["nomad:restart".into()]
+        } else {
+            vec![]
+        },
+        always_runs: false,
+    }
 }
 
-fn change(kind: &str, summary: &str) -> Value {
-    json!({"outcome": "change", "diff": {"kind": kind, "summary": summary}})
+fn with_diff(mut step: StepView, unified: &str) -> StepView {
+    step.unified = Some(unified.into());
+    step
 }
 
 const NOMAD_DIFF: &str = "--- current\n+++ planned\n@@ -3,7 +3,7 @@\n datacenter = \"home\"\n data_dir   = \"/opt/nomad/data\"\n \n client {\n   enabled = true\n-  servers = [\"«secret:nomad_server@3f9a»\"]\n+  servers = [\"«secret:nomad_server@b21c»\"]\n }\n@@ -18,3 +18,4 @@\n telemetry {\n   publish_allocation_metrics = true\n+  prometheus_metrics         = true\n }\n";
 
-fn common_module() -> Value {
-    json!({
-        "module": "common",
-        "steps": [
-            step("common", "apt.package", "ufw, jq, curl", json!({"outcome": "no_op"})),
-            step("common", "file.line", "/etc/ssh/sshd_config:PasswordAuthentication", change("update", "append line PasswordAuthentication no")),
-            step("common", "sysctl.param", "vm.swappiness", json!({"outcome": "change", "diff": {"kind": "update", "summary": "1 → 1 (drift: current 60)", "unified": "--- current\n+++ planned\n@@ -1 +1 @@\n-vm.swappiness = 60\n+vm.swappiness = 1\n"}})),
-        ]
-    })
+fn common_module() -> ModuleView {
+    ModuleView {
+        module: "common".into(),
+        needs: vec![],
+        steps: vec![
+            step("common", "apt.package", "ufw, jq, curl", None),
+            step(
+                "common",
+                "file.line",
+                "/etc/ssh/sshd_config:PasswordAuthentication",
+                Some((DiffKind::Update, "append line PasswordAuthentication no")),
+            ),
+            with_diff(
+                step(
+                    "common",
+                    "sysctl.param",
+                    "vm.swappiness",
+                    Some((DiffKind::Update, "1 → 1 (drift: current 60)")),
+                ),
+                "--- current\n+++ planned\n@@ -1 +1 @@\n-vm.swappiness = 60\n+vm.swappiness = 1\n",
+            ),
+        ],
+        handlers: vec![],
+    }
 }
 
-fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> Value {
+fn removal(
+    kind: &str,
+    key: &str,
+    summary: &str,
+    cleanup: bool,
+    caution: bool,
+    introduced: Option<&str>,
+) -> RemovalView {
+    RemovalView {
+        module: "grey".into(),
+        kind: kind.into(),
+        key: key.into(),
+        summary: summary.into(),
+        cleanup,
+        caution,
+        introduced_in: introduced.map(Into::into),
+    }
+}
+
+fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
     let mut modules = vec![common_module()];
     if nomad {
-        modules.push(json!({
-            "module": "nomad",
-            "needs": ["tailscale", "docker"],
-            "steps": [
-                step("nomad", "apt.package", "nomad", change("update", "1.9.2 → 1.9.3")),
-                step("nomad", "file.template", "/etc/nomad.d/nomad.hcl", json!({"outcome": "change", "diff": {"kind": "update", "summary": "3 lines changed", "unified": NOMAD_DIFF}})),
-                step("nomad", "systemd.unit", "nomad", json!({"outcome": "no_op"})),
+        modules.push(ModuleView {
+            module: "nomad".into(),
+            needs: vec!["tailscale".into(), "docker".into()],
+            steps: vec![
+                step(
+                    "nomad",
+                    "apt.package",
+                    "nomad",
+                    Some((DiffKind::Update, "1.9.2 → 1.9.3")),
+                ),
+                with_diff(
+                    step(
+                        "nomad",
+                        "file.template",
+                        "/etc/nomad.d/nomad.hcl",
+                        Some((DiffKind::Update, "3 lines changed")),
+                    ),
+                    NOMAD_DIFF,
+                ),
+                step("nomad", "systemd.unit", "nomad", None),
             ],
-            "handlers": [{"module": "nomad", "handler": "restart", "kind": "systemd.restart", "summary": "restart nomad.service"}]
-        }));
+            handlers: vec![HandlerView {
+                handler: "restart".into(),
+                kind: "systemd.restart".into(),
+                summary: "restart nomad.service".into(),
+            }],
+        });
     }
     if grey {
-        modules.push(json!({
-            "module": "cleanup",
-            "steps": [
-                step("cleanup", "file.absent", "/etc/grey/agent.token", change("delete", "delete /etc/grey/agent.token (contains «secret:grey_token@91d0»)")),
-            ]
-        }));
+        modules.push(ModuleView {
+            module: "cleanup".into(),
+            needs: vec![],
+            steps: vec![step(
+                "cleanup",
+                "file.absent",
+                "/etc/grey/agent.token",
+                Some((
+                    DiffKind::Delete,
+                    "delete /etc/grey/agent.token (contains «secret:grey_token@91d0»)",
+                )),
+            )],
+            handlers: vec![],
+        });
     }
     let removals = if grey {
-        json!([
-            {"resource": {"module": "grey", "kind": "file.template", "key": "/var/www/grey/config.yaml"}, "policy": "cleanup", "summary": "module no longer selected · delete file (content still matches what Buckle wrote)", "caution": false, "introduced_in": OLD_REV},
-            {"resource": {"module": "grey", "kind": "systemd.unit", "key": "grey"}, "policy": "cleanup", "summary": "disable + stop grey.service", "caution": false, "introduced_in": OLD_REV},
-            {"resource": {"module": "grey", "kind": "apt.package", "key": "grey-agent"}, "policy": "cleanup", "summary": "remove package grey-agent (apt purge)", "caution": true, "introduced_in": OLDEST_REV},
-            {"resource": {"module": "grey", "kind": "file.copy", "key": "/var/log/grey"}, "policy": "leave", "summary": "forget only (removal: leave)", "caution": false}
-        ])
+        vec![
+            removal(
+                "file.template",
+                "/var/www/grey/config.yaml",
+                "module no longer selected · delete file (content still matches what Buckle wrote)",
+                true,
+                false,
+                Some(OLD_REV),
+            ),
+            removal(
+                "systemd.unit",
+                "grey",
+                "disable + stop grey.service",
+                true,
+                false,
+                Some(OLD_REV),
+            ),
+            removal(
+                "apt.package",
+                "grey-agent",
+                "remove package grey-agent (apt purge)",
+                true,
+                true,
+                Some(OLDEST_REV),
+            ),
+            removal(
+                "file.copy",
+                "/var/log/grey",
+                "forget only (removal: leave)",
+                false,
+                false,
+                None,
+            ),
+        ]
     } else {
-        json!([])
+        vec![]
     };
-    json!({
-        "revision": NEW_REV,
-        "host": host,
-        "digest": digest,
-        "modules": modules,
-        "removals": removals,
-        "deferred": if nomad { json!([{"module": "otel_ebpf_profiler", "waiting_on": ["docker.version"], "reason": "waits for facts from docker (docker.version)"}]) } else { json!([]) },
-        "skipped": ["backup: host.groups contains \"storage\"", "caddy: host.labels.role == \"edge\""],
-        "warnings": if grey { json!(["Removing apt.package[grey-agent] can remove packages that depend on it."]) } else { json!([]) }
-    })
+    PlanView {
+        revision: NEW_REV.into(),
+        host: host.into(),
+        digest: digest.into(),
+        modules,
+        removals,
+        rehomed: vec![],
+        deferred: if nomad {
+            vec![ModuleNote {
+                module: "otel_ebpf_profiler".into(),
+                reason: "waits for facts from docker (docker.version)".into(),
+                waiting_on: vec!["docker.version".into()],
+                plan_error: false,
+            }]
+        } else {
+            vec![]
+        },
+        held: vec![],
+        indeterminate: vec![],
+        skipped: vec![
+            "backup: host.groups contains \"storage\"".into(),
+            "caddy: host.labels.role == \"edge\"".into(),
+        ],
+        warnings: if grey {
+            vec!["Removing apt.package[grey-agent] can remove packages that depend on it.".into()]
+        } else {
+            vec![]
+        },
+    }
 }
 
 pub fn plans() -> Vec<PlanGroup> {
@@ -946,7 +1074,7 @@ pub fn plans() -> Vec<PlanGroup> {
             changes: 4,
             removals: 0,
             destructive: false,
-            plan: plan_doc("pi-1", PLAN_NOMAD, false, true),
+            plan: Some(plan_doc("pi-1", PLAN_NOMAD, false, true)),
         },
         PlanGroup {
             digest: PLAN_GREY.into(),
@@ -954,7 +1082,7 @@ pub fn plans() -> Vec<PlanGroup> {
             changes: 5,
             removals: 3,
             destructive: true,
-            plan: plan_doc("hz-3", PLAN_GREY, true, true),
+            plan: Some(plan_doc("hz-3", PLAN_GREY, true, true)),
         },
         PlanGroup {
             digest: PLAN_LAB.into(),
@@ -962,7 +1090,7 @@ pub fn plans() -> Vec<PlanGroup> {
             changes: 2,
             removals: 0,
             destructive: false,
-            plan: plan_doc("lab-1", PLAN_LAB, false, false),
+            plan: Some(plan_doc("lab-1", PLAN_LAB, false, false)),
         },
     ]
 }
@@ -1160,7 +1288,7 @@ fn finished(
             changes: 2,
             removals: 0,
             destructive: false,
-            plan: plan_doc("pi-1", PLAN_NOMAD, false, false),
+            plan: Some(plan_doc("pi-1", PLAN_NOMAD, false, false)),
         }],
         events,
     }

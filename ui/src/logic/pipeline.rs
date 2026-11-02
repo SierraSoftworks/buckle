@@ -468,7 +468,7 @@ mod tests {
             changes: 3,
             removals: 1,
             destructive: true,
-            plan: serde_json::Value::Null,
+            plan: None,
         }];
         let mut approved_ahead = phase("late", PhaseState::Pending, "required", vec![]);
         approved_ahead.approved_by = Some("alice".into());

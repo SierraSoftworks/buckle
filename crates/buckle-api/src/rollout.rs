@@ -1,4 +1,4 @@
-use crate::{HostSummary, RevisionSummary};
+use crate::{HostSummary, PlanView, RevisionSummary};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -136,8 +136,10 @@ pub struct PlanGroup {
     pub changes: u32,
     pub removals: u32,
     pub destructive: bool,
-    /// The redacted plan document (buckle_core::plan::Plan as JSON).
-    pub plan: serde_json::Value,
+    /// The plan, as one of `hosts` planned it. `None` when the server holds
+    /// no readable copy (the counts above still come from the host's report).
+    #[serde(default)]
+    pub plan: Option<PlanView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
