@@ -26,8 +26,10 @@ pub mod validate;
 #[cfg(test)]
 mod tests;
 
+pub use context::merged_labels;
 pub use validate::{
-    HostSummary, ValidationIssue, ValidationReport, validate, validate_host, validate_with_facts,
+    HostSummary, ValidationIssue, ValidationReport, host_context, reads_unknown_facts,
+    secret_names_for_host, validate, validate_host, validate_with_facts,
 };
 
 use crate::facts::Facts;

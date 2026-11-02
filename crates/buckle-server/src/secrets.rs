@@ -105,41 +105,13 @@ impl ServerSecrets {
     }
 
     /// [`Self::scoped_names`] against a context that already carries the
-    /// secrets the conditions test (or deliberately none).
+    /// secrets the conditions test (or deliberately none). A module whose
+    /// `when` reads facts the server has not received from the host yet is
+    /// counted as selected: the agent decides with the real facts, and
+    /// withholding the secret would fail its first plan
+    /// ([`buckle_core::engine::secret_names_for_host`]).
     pub fn scoped_names_with(revision: &Revision, ctx: &HostContext) -> BTreeSet<String> {
-        let mut names = BTreeSet::new();
-        for module in &revision.modules {
-            let cfg = &module.config;
-            let selected = match &cfg.when {
-                None => true,
-                Some(when) => ctx.in_module(&cfg.name, &cfg.tags).matches(when),
-            };
-            if !selected {
-                continue;
-            }
-            if let Ok(yaml) = serde_yaml::to_string(cfg) {
-                names.extend(Self::references(&yaml));
-            }
-            for (_, template) in &module.templates {
-                names.extend(Self::references(template));
-            }
-        }
-        for overlay in &revision.fleet.vars {
-            if overlay.when.as_ref().is_some_and(|w| !ctx.matches(w)) {
-                continue;
-            }
-            if let Ok(yaml) = serde_yaml::to_string(&overlay.values) {
-                names.extend(Self::references(&yaml));
-            }
-            if let Some(file) = &overlay.file
-                && let Some(value) = revision.var_files.get(file)
-                && let Ok(yaml) = serde_yaml::to_string(value)
-            {
-                names.extend(Self::references(&yaml));
-            }
-        }
-        names.retain(|n| revision.fleet.secrets.contains_key(n));
-        names
+        buckle_core::engine::secret_names_for_host(revision, ctx)
     }
 
     /// Resolves `names` (which must be declared by the revision). Secrets

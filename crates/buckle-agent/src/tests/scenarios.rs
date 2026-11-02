@@ -966,3 +966,68 @@ async fn changed_facts_top_up_secrets_for_newly_selected_modules() {
     );
     h.stop().await.expect("clean exit");
 }
+
+/// A revision bundle with a module whose task fields read `secrets.db`,
+/// gated on a fact this test host never reports.
+fn bundle_with_secret_module() -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("buckle.yaml"),
+        format!("{FLEET_YAML}secrets:\n  db: {{ file: /secrets/db }}\n  other: {{ file: /secrets/other }}\n"),
+    )
+    .expect("write");
+    std::fs::create_dir_all(dir.path().join("modules/accounts")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("modules/accounts/module.yaml"),
+        "name: accounts\nwhen: 'host.facts.os.family == \"debian\"'\ntasks:\n  - user.account: { name: alice, password: '{{ secrets.db }}' }\n",
+    )
+    .expect("write");
+    crate::bundle::pack_dir(dir.path()).expect("pack")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_plan_fetches_the_secrets_its_selected_modules_need_first() {
+    let runner = FakeRunner::new();
+    runner.with_plans(&rev("rev1"), vec![plan_with_changes(&rev("rev1"), 1)]);
+    let mut h = Harness::start(Setup {
+        runner: runner.clone(),
+        ..Default::default()
+    })
+    .await;
+    // The server resolved the host's modules without its facts and sent
+    // nothing in the Assign; FetchSecrets, made once the agent knows what it
+    // needs, answers.
+    h.fleet.set_secrets(vec![
+        pb::SecretValue {
+            name: "db".into(),
+            value: b"hunter2".to_vec(),
+            fingerprint: "0a1b2c3d".into(),
+        },
+        pb::SecretValue {
+            name: "other".into(),
+            value: b"unused".to_vec(),
+            fingerprint: "0a1b2c3e".into(),
+        },
+    ]);
+    let digest = h.fleet.add_revision("rev1", bundle_with_secret_module());
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    session.send(assign("rev1", &digest)).await;
+    session.send(request_plan("rev1")).await;
+    session.expect(plan_result).await;
+    let store = Store::new(h.state_dir());
+    let key = store.install_key().expect("key");
+    let cached = store
+        .load_secrets(&rev("rev1"), &key)
+        .expect("load")
+        .expect("the missing secret was fetched before planning");
+    assert_eq!(
+        cached.get("db").expect("db").fingerprint().as_hex(),
+        "0a1b2c3d"
+    );
+    assert!(
+        cached.get("other").is_none(),
+        "only secrets the selected modules reference are asked for"
+    );
+    h.stop().await.expect("clean exit");
+}

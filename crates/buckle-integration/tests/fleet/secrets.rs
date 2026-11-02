@@ -166,3 +166,69 @@ async fn secret_values_reach_the_sink_and_nothing_else_while_the_reference_token
     sse.close();
     world.shutdown().await;
 }
+
+/// A module whose secret lives in task fields (`user.account.password`,
+/// `command.run.env`) rather than a file template: the task renders the
+/// field itself at plan time, through the same store the engine gives
+/// file templates.
+fn task_field_fleet() -> Fleet {
+    let base = Fleet::with_phases("", ONE_PHASE);
+    let yaml = base.yaml().replacen(
+        "rollout:\n",
+        "secrets:\n  db_password: { file: db_password }\nrollout:\n",
+        1,
+    );
+    common::app_module(base.buckle_yaml(yaml), 1).module(
+        "accounts",
+        "name: accounts\ntasks:\n  - user.account:\n      name: alice\n      password: '{{ secrets.db_password }}'\n  - command.run:\n      run: [\"echo\", \"hi\"]\n      unless: [\"probe\"]\n      env:\n        TOKEN: '{{ secrets.db_password }}'\n",
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secrets_in_task_fields_render_in_server_mode() {
+    use buckle_core::system::{FilePerms, UserInfo};
+    let hash = "$6$rounds=5000$salt$hashhashhash";
+    let mut world = World::start(task_field_fleet()).await;
+    world.write_secret("db_password", hash);
+    let v1 = world.source_revision();
+    let system = common::healthy_system("acct-1")
+        .with_user(UserInfo {
+            name: "alice".into(),
+            uid: 1001,
+            gid: 1000,
+            home: "/home/alice".into(),
+            shell: "/bin/bash".into(),
+            gecos: String::new(),
+        })
+        .with_file(
+            "/etc/shadow",
+            "root:*:19000:0:99999:7:::\nalice:!:19000:0:99999:7:::\n",
+            FilePerms::mode(0o640),
+        )
+        .on_command_ok("probe", &[], "")
+        .with_program("chpasswd")
+        .on_command_ok("chpasswd", &["-e"], "");
+    world.spawn(buckle_integration::AgentSpec::new("acct-1").system(system));
+    let rollout = world.rollout_for(&v1).await;
+    let detail = world
+        .wait_rollout(&rollout.summary.id, "acct-1 planned or failed", |d| {
+            buckle_integration::rollout_host(d, "acct-1").is_some_and(|h| {
+                h.error.is_some() || h.state == buckle_api::HostRolloutState::Healthy
+            })
+        })
+        .await;
+    let row = buckle_integration::rollout_host(&detail, "acct-1").expect("row");
+    assert!(
+        row.error.is_none(),
+        "planning with secret task fields failed: {:?}",
+        row.error
+    );
+    world.converge(&v1, &["acct-1"]).await;
+    let ran = world.agent("acct-1").system.command_lines();
+    assert!(ran.iter().any(|c| c == "chpasswd -e"), "{ran:?}");
+    assert!(
+        !ran.iter().any(|c| c.contains(hash)),
+        "the hash never reaches a command line: {ran:?}"
+    );
+    world.shutdown().await;
+}
