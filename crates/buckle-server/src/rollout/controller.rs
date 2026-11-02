@@ -509,8 +509,10 @@ fn rollback_target(h: &RolloutHostRecord) -> bool {
     h.runtime.applied && h.state != HostPhase::Skipped
 }
 
-/// Host states that wait on the agent after a server restart: the
-/// disconnect clock starts for them on load.
+/// Host states that wait on the agent: the disconnect clock starts for them
+/// on load (after a restart) and when their session drops, so a host still
+/// to plan or apply is not taken for offline, and missed, inside the
+/// reconnect grace.
 fn awaits_reconnect(state: HostPhase) -> bool {
     state.in_flight()
         || matches!(
@@ -1119,7 +1121,7 @@ impl Controller {
                 continue;
             };
             let state = self.live[ri].hosts[hi].state;
-            if state.in_flight() || state == HostPhase::RollingBack || gate_pending {
+            if awaits_reconnect(state) || gate_pending {
                 self.live[ri].hosts[hi].runtime.disconnected_at = Some(now);
                 self.touch_host(ri, hi);
             }
