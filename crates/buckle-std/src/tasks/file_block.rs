@@ -35,6 +35,14 @@ use tracing::instrument;
 /// The marker lines delimit what Buckle owns, so removal deletes everything
 /// between them, and a file Buckle created is deleted if that leaves it empty.
 /// Two blocks in one file need different `marker`s.
+///
+/// `validate` is a command (argv) that checks the new content before it
+/// replaces the file (and while planning); `{path}` stands for a private
+/// temporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero
+/// exit fails the task and leaves the file untouched. Without `validate`,
+/// `/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with
+/// `visudo -cf {path}` and `sshd -t -f {path}` (when those tools are
+/// installed); `validate: []` turns that off.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Spec {
     /// Absolute path of the file to edit.
@@ -59,6 +67,10 @@ pub struct Spec {
     /// Keep a timestamped `.bak` copy before editing.
     #[serde(default)]
     pub backup: bool,
+    /// A command that checks the new content; `{path}` stands for the file to check.
+    /// Default: automatic for sudoers and sshd_config; `[]` disables.
+    #[serde(default)]
+    pub validate: Option<Vec<String>>,
 }
 
 fn default_marker() -> String {
@@ -232,7 +244,16 @@ impl Task for FileBlock {
         Ok(match self.inspect(cx, spec).await? {
             Outcome::NoOp => Planned::NoOp,
             Outcome::Blocked(reason) => Planned::blocked(reason),
-            Outcome::Change { diff, .. } => Planned::change(diff),
+            Outcome::Change { diff, new_text, .. } => {
+                hostkit::validate::check(
+                    cx,
+                    &spec.path,
+                    spec.validate.as_deref(),
+                    hostkit::validate::Content::Bytes(new_text.as_bytes()),
+                )
+                .await?;
+                Planned::change(diff)
+            }
         })
     }
 
@@ -253,6 +274,13 @@ impl Task for FileBlock {
                 created,
                 existing,
             } => {
+                hostkit::validate::check(
+                    cx,
+                    &spec.path,
+                    spec.validate.as_deref(),
+                    hostkit::validate::Content::Bytes(new_text.as_bytes()),
+                )
+                .await?;
                 hostkit::save_text(
                     cx,
                     &spec.path,
@@ -463,5 +491,25 @@ mod tests {
             FileBlock::key(&s(json!({"marker": "# {mark} one"}))),
             FileBlock::key(&s(json!({"marker": "# {mark} two"})))
         );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_validator_checks_the_edited_file() {
+        let sys = FakeSystem::new()
+            .with_file("/etc/app.conf", "a\n", FilePerms::default())
+            .on_command_fail("appcheck", &[], 1, "bad block");
+        let c = cx(&sys);
+        let s: Spec = spec(
+            json!({"path": "/etc/app.conf", "block": "b", "validate": ["appcheck", "{path}"]}),
+        );
+        assert!(
+            FileBlock
+                .plan(&c, &s)
+                .await
+                .unwrap_err()
+                .description()
+                .contains("bad block")
+        );
+        assert_eq!(sys.file_string("/etc/app.conf").unwrap(), "a\n");
     }
 }

@@ -6,8 +6,8 @@ use buckle_core::plan::{Diff, Planned};
 use buckle_core::secrets::sinks::FileSink;
 use buckle_core::secrets::{Redacted, Rendered};
 use buckle_core::state::ResourceRecord;
-use buckle_core::system::{Command, FileKind, FileMeta, FilePerms};
-use buckle_core::task::{Applied, Cx, Mode, Task};
+use buckle_core::system::{FileKind, FileMeta, FilePerms};
+use buckle_core::task::{Applied, Cx, Task};
 use buckle_core::{Digest, Platforms, Result, error};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -36,9 +36,13 @@ use tracing::instrument;
 /// the plan reports `content changed (digest a → b)` rather than a diff.
 ///
 /// `validate` is a command (argv) run against the rendered content before it
-/// replaces the destination; `{path}` is replaced with a temporary file next
-/// to `dest`. A non-zero exit fails the task and leaves `dest` untouched.
-/// When the file contains secrets, the validator's output is not echoed.
+/// replaces the destination (and while planning); `{path}` is replaced with a
+/// private temporary file under `<state_dir>/tmp`, deleted afterwards. A
+/// non-zero exit fails the task and leaves `dest` untouched. When the file
+/// contains secrets, the validator's output is not echoed. Without
+/// `validate`, `/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are
+/// checked with `visudo -cf {path}` and `sshd -t -f {path}` (when those tools
+/// are installed); `validate: []` turns that off.
 ///
 /// Removal deletes `dest` only if its content still matches what Buckle wrote.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -50,6 +54,7 @@ pub struct Spec {
     #[serde(flatten)]
     pub perms: FilePerms,
     /// A command that checks the rendered file; `{path}` stands for the file to check.
+    /// Default: automatic for sudoers and sshd_config; `[]` disables.
     #[serde(default)]
     pub validate: Option<Vec<String>>,
     /// Keep a timestamped `.bak` copy of the destination before replacing its content.
@@ -138,72 +143,6 @@ impl FileTemplate {
             existing: Some((meta, current)),
         })
     }
-
-    /// Runs the `validate` command against the real render in a temporary file next to `dest`.
-    async fn validate(&self, cx: &Cx, spec: &Spec, rendered: &Rendered) -> Result<()> {
-        let Some(argv) = &spec.validate else {
-            return Ok(());
-        };
-        if !argv.iter().any(|a| a.contains("{path}")) {
-            return Err(error::user(
-                "The `validate` command does not contain the `{path}` placeholder.",
-                &[
-                    "Add `{path}` where the command takes the file to check, e.g. [\"nginx\", \"-t\", \"-c\", \"{path}\"].",
-                ],
-            ));
-        }
-        let parent = spec.dest.parent().unwrap_or(std::path::Path::new("/"));
-        if cx.mode == Mode::Plan && cx.system.stat(parent).await?.is_none() {
-            // Validating would mean creating the directory; apply will validate.
-            return Ok(());
-        }
-        let tmp = hostkit::sibling_temp(&spec.dest, "buckle-validate");
-        let perms = FilePerms {
-            mode: Some(spec.perms.mode.unwrap_or(0o600)),
-            owner: None,
-            group: None,
-        };
-        FileSink
-            .write_rendered(&*cx.system, &tmp, rendered, &perms)
-            .await?;
-        let substituted: Vec<String> = argv
-            .iter()
-            .map(|a| a.replace("{path}", &tmp.to_string_lossy()))
-            .collect();
-        let outcome = match Command::from_argv(&substituted) {
-            Some(command) => cx.system.run(command).await,
-            None => Err(error::user(
-                "The `validate` command is empty.",
-                &["Give the program and its arguments as a list."],
-            )),
-        };
-        // Always clean up, whatever the validator said.
-        let _ = cx.system.remove(&tmp, false).await;
-        let out = outcome?;
-        if out.success() {
-            return Ok(());
-        }
-        let detail = if rendered.is_sensitive() {
-            "Its output is withheld because the file contains secrets.".to_owned()
-        } else {
-            format!("stderr: {}", hostkit::output_tail(&out.stderr))
-        };
-        Err(error::user(
-            format!(
-                "The rendered content for {} failed validation: `{}` {}. {detail}",
-                spec.dest.display(),
-                substituted.join(" "),
-                match out.code {
-                    Some(c) => format!("exited with status {c}"),
-                    None => "did not exit cleanly".to_owned(),
-                },
-            ),
-            &[
-                "Fix the template or the variables it uses; the destination file was not changed.",
-                "Run the validator by hand against the rendered file to see the full message.",
-            ],
-        ))
-    }
 }
 
 #[async_trait]
@@ -230,7 +169,13 @@ impl Task for FileTemplate {
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         let inspection = self.inspect(cx, spec).await?;
         if inspection.planned.is_change() && content_changes(&inspection) {
-            self.validate(cx, spec, &inspection.rendered).await?;
+            hostkit::validate::check(
+                cx,
+                &spec.dest,
+                spec.validate.as_deref(),
+                hostkit::validate::Content::Rendered(&inspection.rendered),
+            )
+            .await?;
         }
         Ok(inspection.planned)
     }
@@ -255,7 +200,13 @@ impl Task for FileTemplate {
         }
         let wrote_content = content_changes(&inspection);
         if wrote_content {
-            self.validate(cx, spec, &inspection.rendered).await?;
+            hostkit::validate::check(
+                cx,
+                &spec.dest,
+                spec.validate.as_deref(),
+                hostkit::validate::Content::Rendered(&inspection.rendered),
+            )
+            .await?;
             let existing_meta = inspection.existing.as_ref().map(|(m, _)| m);
             if spec.backup
                 && let Some((meta, current)) = &inspection.existing
@@ -475,8 +426,8 @@ mod tests {
         for (path, content) in seen.iter() {
             assert_ne!(path, "{path}", "the placeholder was substituted");
             assert!(
-                path.replace('\\', "/").starts_with("/etc/app/"),
-                "the temp file is next to dest: {path}"
+                path.replace('\\', "/").starts_with("/var/lib/buckle/tmp/"),
+                "the temp file is in Buckle's scratch directory, not next to dest: {path}"
             );
             assert_eq!(content, "name = nomad\n", "it saw the real render");
             assert!(!sys.exists(path), "the temp file is removed");
@@ -517,7 +468,7 @@ mod tests {
         assert!(
             sys.paths()
                 .iter()
-                .all(|p| !p.to_string_lossy().contains("buckle-validate"))
+                .all(|p| !p.to_string_lossy().contains("validate-"))
         );
     }
 

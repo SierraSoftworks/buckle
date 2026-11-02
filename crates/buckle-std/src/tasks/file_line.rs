@@ -43,6 +43,14 @@ use tracing::instrument;
 /// The file must exist unless `create: true`. Mode and ownership are
 /// preserved. `backup: true` keeps a timestamped copy before each edit.
 ///
+/// `validate` is a command (argv) that checks the new content before it
+/// replaces the file (and while planning); `{path}` stands for a private
+/// temporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero
+/// exit fails the task and leaves the file untouched. Without `validate`,
+/// `/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with
+/// `visudo -cf {path}` and `sshd -t -f {path}` (when those tools are
+/// installed); `validate: []` turns that off.
+///
 /// Removal reverts the edit: a line Buckle added is deleted again, a line it
 /// replaced is restored to its original text, and a file it created is deleted
 /// when it ends up empty. Edits made by `state: absent` are not restored.
@@ -70,6 +78,10 @@ pub struct Spec {
     /// Keep a timestamped `.bak` copy before editing.
     #[serde(default)]
     pub backup: bool,
+    /// A command that checks the new content; `{path}` stands for the file to check.
+    /// Default: automatic for sudoers and sshd_config; `[]` disables.
+    #[serde(default)]
+    pub validate: Option<Vec<String>>,
 }
 
 pub struct FileLine;
@@ -275,7 +287,16 @@ impl Task for FileLine {
         Ok(match self.inspect(cx, spec).await? {
             Outcome::NoOp => Planned::NoOp,
             Outcome::Blocked(reason) => Planned::blocked(reason),
-            Outcome::Change { diff, .. } => Planned::change(diff),
+            Outcome::Change { diff, new_text, .. } => {
+                hostkit::validate::check(
+                    cx,
+                    &spec.path,
+                    spec.validate.as_deref(),
+                    hostkit::validate::Content::Bytes(new_text.as_bytes()),
+                )
+                .await?;
+                Planned::change(diff)
+            }
         })
     }
 
@@ -296,6 +317,13 @@ impl Task for FileLine {
                 marker,
                 existing,
             } => {
+                hostkit::validate::check(
+                    cx,
+                    &spec.path,
+                    spec.validate.as_deref(),
+                    hostkit::validate::Content::Bytes(new_text.as_bytes()),
+                )
+                .await?;
                 hostkit::save_text(
                     cx,
                     &spec.path,
@@ -588,6 +616,40 @@ mod tests {
         assert_ne!(
             FileLine::key(&s(json!({"line": "a"}))),
             FileLine::key(&s(json!({"line": "b"})))
+        );
+    }
+
+    #[tokio::test]
+    async fn sshd_config_edits_are_validated_before_they_are_written() {
+        let sys = FakeSystem::new()
+            .with_file(
+                "/etc/ssh/sshd_config",
+                "PermitRootLogin yes\n",
+                FilePerms::mode(0o644),
+            )
+            .on_command_fail(
+                "sshd",
+                &["-t"],
+                255,
+                "Bad configuration option: PermitRootLogn",
+            );
+        let c = cx(&sys);
+        let s: Spec = spec(
+            json!({"path": "/etc/ssh/sshd_config", "line": "PermitRootLogn no", "regex": "^PermitRootLogin"}),
+        );
+        assert!(FileLine.plan(&c, &s).await.is_err());
+        assert!(FileLine.apply(&c, &s, &Planned::NoOp).await.is_err());
+        assert_eq!(
+            sys.file_string("/etc/ssh/sshd_config").unwrap(),
+            "PermitRootLogin yes\n"
+        );
+
+        let sys = sys.on_command_ok("sshd", &["-t"], "");
+        let c = cx(&sys);
+        apply(&FileLine, &c, &s).await;
+        assert_eq!(
+            sys.file_string("/etc/ssh/sshd_config").unwrap(),
+            "PermitRootLogn no\n"
         );
     }
 }

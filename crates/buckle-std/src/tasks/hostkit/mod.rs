@@ -7,6 +7,7 @@
 pub(crate) mod ownership;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub(crate) mod validate;
 
 use buckle_core::error;
 use buckle_core::plan::Planned;
@@ -391,15 +392,6 @@ pub fn file_artefact(path: &Path) -> Artefact {
     Artefact::File {
         path: path.to_path_buf(),
     }
-}
-
-/// A path next to `dest` with a name that directory-globbing consumers ignore.
-pub fn sibling_temp(dest: &Path, suffix: &str) -> PathBuf {
-    let name = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    dest.with_file_name(format!(".{name}.{suffix}"))
 }
 
 /// A timestamped backup path for `path`.
