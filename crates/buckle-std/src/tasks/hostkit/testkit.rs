@@ -137,3 +137,47 @@ impl FakeExt for FakeSystem {
             .expect("fake remove");
     }
 }
+
+/// Builds a `.tar.gz` in memory from `(path, content, mode)`; a path ending in `/` is a directory.
+pub fn tar_gz(entries: &[(&str, &str, u32)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, content, mode) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(*mode);
+        if path.ends_with('/') {
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, std::io::empty())
+                .unwrap();
+        } else {
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, content.as_bytes())
+                .unwrap();
+        }
+    }
+    let tar = builder.into_inner().unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&tar).unwrap();
+    gz.finish().unwrap()
+}
+
+/// Builds a `.zip` in memory from `(path, content)`, every file mode 0755.
+pub fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (path, content) in entries {
+        writer
+            .start_file(
+                *path,
+                zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}

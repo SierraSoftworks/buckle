@@ -615,3 +615,38 @@ pub fn url_basename(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     path.rsplit('/').next().unwrap_or(path).to_owned()
 }
+
+/// The host's CPU architecture as `uname -m` spells it (`x86_64`, `aarch64`,
+/// `armv7l`). Taken from the `hardware` facts when present, then `uname -m`,
+/// then the architecture Buckle itself was built for.
+pub async fn host_arch(cx: &Cx) -> String {
+    for path in ["hardware.arch", "arch"] {
+        if let Some(arch) = buckle_core::selectors::lookup_path(&cx.host.facts, path)
+            .and_then(|v| v.as_str())
+            .filter(|a| !a.is_empty())
+        {
+            return arch.to_owned();
+        }
+    }
+    if let Ok(out) = cx.system.run(Command::new("uname").arg("-m")).await
+        && out.success()
+    {
+        let arch = out.stdout_str().trim().to_owned();
+        if !arch.is_empty() {
+            return arch;
+        }
+    }
+    std::env::consts::ARCH.to_owned()
+}
+
+/// The first version-looking token in `text` (`1.2.3`, `v1.2.3-rc.1`), without any leading `v`.
+pub fn find_version(text: &str) -> Option<String> {
+    static VERSION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"v?(\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.\-+]+)?)")
+            .expect("the version pattern is valid")
+    });
+    VERSION
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_owned())
+}
