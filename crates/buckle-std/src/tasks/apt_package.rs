@@ -1,6 +1,8 @@
 //! `apt.package`: install, upgrade or remove Debian packages.
 
-use super::apt_common::{PkgState, apt_get, query_package, query_policy, version_matches};
+use super::apt_common::{
+    PkgState, apt_get, query_package, query_policy, removal_takes_along, version_matches,
+};
 use super::hostkit;
 use super::sys_exec::{run_checked, state_dir};
 use async_trait::async_trait;
@@ -34,6 +36,12 @@ use std::time::Duration;
 /// Removal removes only the packages this resource installed itself:
 /// packages that were already on the host when Buckle first managed them are
 /// left alone. Plans flag the removal with a caution.
+///
+/// Removing (with `state: absent`, or when the task leaves the config) is
+/// simulated first with `apt-get -s remove`. If apt would also remove other
+/// packages that depend on the ones named, the task is blocked with the list
+/// (and a removal is skipped, leaving the package installed) unless
+/// `remove_dependents: true`.
 pub struct AptPackage;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -60,6 +68,21 @@ pub struct Spec {
     /// Install recommended packages too (apt's default).
     #[serde(default = "default_true")]
     pub install_recommends: bool,
+    /// Allow removal to take along packages that depend on these.
+    #[serde(default)]
+    pub remove_dependents: bool,
+}
+
+/// Recorded when `remove_dependents` was set, so that removal may take dependents too.
+const REMOVE_DEPENDENTS: &str = "apt.package: removal may take dependent packages";
+
+fn dependents_blocked(pkgs: &[String], extra: &[String]) -> String {
+    format!(
+        "removing {} would also remove {} other package(s) that depend on it: {}; set `remove_dependents: true` if that is intended",
+        pkgs.join(", "),
+        extra.len(),
+        extra.join(", ")
+    )
 }
 
 fn default_true() -> bool {
@@ -187,6 +210,21 @@ impl Task for AptPackage {
         if actions.is_empty() {
             return Ok(Planned::NoOp);
         }
+        if spec.state == State::Absent && !spec.remove_dependents {
+            let mut targets = Vec::new();
+            for p in &pkgs {
+                if !matches!(
+                    query_package(cx, p).await?,
+                    PkgState::NotInstalled | PkgState::ConfigFiles { .. }
+                ) {
+                    targets.push(p.clone());
+                }
+            }
+            let extra = removal_takes_along(cx, &targets).await?;
+            if !extra.is_empty() {
+                return Ok(Planned::blocked(dependents_blocked(&targets, &extra)));
+            }
+        }
         let summary = actions.join(", ");
         Ok(Planned::change(match spec.state {
             State::Absent => Diff::Delete { summary },
@@ -221,6 +259,20 @@ impl Task for AptPackage {
                     "{} is already absent",
                     pkgs.join(", ")
                 )));
+            }
+            if !spec.remove_dependents {
+                let extra = removal_takes_along(cx, &installed).await?;
+                if !extra.is_empty() {
+                    return Err(buckle_core::error::user(
+                        format!(
+                            "Nothing was removed: {}.",
+                            dependents_blocked(&installed, &extra)
+                        ),
+                        &[
+                            "Remove the dependent packages first, or opt in with `remove_dependents: true`.",
+                        ],
+                    ));
+                }
             }
             run_checked(cx, apt_get("remove", true).args(installed.clone())).await?;
             return Ok(Applied::changed(format!(
@@ -273,6 +325,11 @@ impl Task for AptPackage {
                 });
             }
         }
+        if spec.remove_dependents {
+            applied = applied.with_artefact(Artefact::Other {
+                description: REMOVE_DEPENDENTS.into(),
+            });
+        }
         Ok(applied)
     }
 
@@ -307,6 +364,18 @@ impl Task for AptPackage {
                 "{} was already removed",
                 names.join(", ")
             )));
+        }
+        let may_take_dependents = record.artefacts.iter().any(
+            |a| matches!(a, Artefact::Other { description } if description == REMOVE_DEPENDENTS),
+        );
+        if !may_take_dependents {
+            let extra = removal_takes_along(cx, &present).await?;
+            if !extra.is_empty() {
+                return Ok(Applied::skipped(format!(
+                    "left installed: {}",
+                    dependents_blocked(&present, &extra)
+                )));
+            }
         }
         run_checked(cx, apt_get("remove", true).args(present.clone())).await?;
         Ok(Applied::changed(format!("removed {}", present.join(", "))))
@@ -725,5 +794,84 @@ mod tests {
                 .removal_caution()
         );
         assert_eq!(AptPackage::key(&spec(json!({"names": ["a", "b"]}))), "a,b");
+    }
+
+    #[tokio::test]
+    async fn removing_a_package_others_depend_on_is_blocked_unless_opted_in() {
+        let apt = Apt::new()
+            .installed("containerd", "1.6")
+            .installed("docker-ce", "24.0")
+            .depends("docker-ce", "containerd");
+        let (_sys, cx) = host(&apt);
+        let absent: Spec = spec(json!({"name": "containerd", "state": "absent"}));
+        match AptPackage.plan(&cx, &absent).await.unwrap() {
+            Planned::Blocked { reason } => {
+                assert!(
+                    reason.contains("docker-ce") && reason.contains("remove_dependents"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected blocked, got {other:?}"),
+        }
+        assert!(
+            AptPackage
+                .apply(&cx, &absent, &Planned::NoOp)
+                .await
+                .is_err()
+        );
+        assert!(apt.is_installed("containerd") && apt.is_installed("docker-ce"));
+
+        let opted: Spec =
+            spec(json!({"name": "containerd", "state": "absent", "remove_dependents": true}));
+        assert!(AptPackage.plan(&cx, &opted).await.unwrap().is_change());
+        AptPackage.apply(&cx, &opted, &Planned::NoOp).await.unwrap();
+        assert!(!apt.is_installed("containerd"));
+    }
+
+    #[tokio::test]
+    async fn removal_of_a_record_leaves_a_package_others_depend_on() {
+        let apt = Apt::new()
+            .candidate("libfoo", "1.0")
+            .installed("app", "2.0")
+            .depends("app", "libfoo");
+        let (_sys, cx) = host(&apt);
+        let installed = AptPackage
+            .apply(&cx, &spec(json!({"name": "libfoo"})), &Planned::NoOp)
+            .await
+            .unwrap();
+        let record = record_of("apt.package", "libfoo", &installed);
+        let out = AptPackage.remove(&cx, &record).await.unwrap();
+        assert!(
+            !out.changed && out.summary.contains("app"),
+            "{}",
+            out.summary
+        );
+        assert!(apt.is_installed("libfoo") && apt.is_installed("app"));
+
+        // Opting in at install time is remembered for removal.
+        let installed = AptPackage
+            .apply(
+                &cx,
+                &spec(json!({"name": "libfoo", "remove_dependents": true})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        let mut record = record_of("apt.package", "libfoo", &installed);
+        record.artefacts.push(Artefact::Package {
+            manager: "apt".into(),
+            name: "libfoo".into(),
+        });
+        assert!(AptPackage.remove(&cx, &record).await.unwrap().changed);
+        assert!(!apt.is_installed("libfoo") && !apt.is_installed("app"));
+    }
+
+    #[test]
+    fn simulated_removals_are_parsed() {
+        let text = "NOTE: This is only a simulation!\nRemv docker-ce [24.0]\nRemv containerd:amd64 [1.6]\nConf x\n";
+        assert_eq!(
+            crate::tasks::apt_common::parse_simulated_removals(text),
+            vec!["docker-ce".to_owned(), "containerd".to_owned()]
+        );
     }
 }

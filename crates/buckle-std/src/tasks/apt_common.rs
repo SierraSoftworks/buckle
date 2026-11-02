@@ -28,6 +28,47 @@ pub(crate) fn apt_get(subcommand: &str, assume_yes: bool) -> Command {
     ])
 }
 
+/// The packages `apt-get remove <pkgs>` would remove besides `pkgs`
+/// themselves (packages that depend on them), from a simulation
+/// (`apt-get -s remove`), which changes nothing.
+pub(crate) async fn removal_takes_along(cx: &Cx, pkgs: &[String]) -> Result<Vec<String>> {
+    let out = cx
+        .system
+        .run(
+            apt_get("remove", false)
+                .arg("-s")
+                .args(pkgs.iter().cloned()),
+        )
+        .await?;
+    if !out.success() {
+        return Err(buckle_core::error::user(
+            format!(
+                "Simulating `apt-get remove {}` failed: {}",
+                pkgs.join(" "),
+                super::sys_exec::first_lines(&out.stderr_str(), &out.stdout_str(), 4)
+            ),
+            &["Run `apt-get -s remove` by hand to see why apt cannot remove the package."],
+        ));
+    }
+    Ok(parse_simulated_removals(&out.stdout_str())
+        .into_iter()
+        .filter(|p| !pkgs.contains(p))
+        .collect())
+}
+
+/// Package names from the `Remv <name> [<version>]` lines of a simulation.
+pub(crate) fn parse_simulated_removals(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("Remv "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        // `name:arch` on multi-arch hosts.
+        .map(|n| n.split(':').next().unwrap_or(n).to_owned())
+        .collect();
+    out.dedup();
+    out
+}
+
 /// What `dpkg-query -W -f='${Status} ${Version}\n'` says about a package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PkgState {
@@ -173,6 +214,8 @@ pub(crate) mod testkit {
         pub candidates: BTreeMap<String, String>,
         pub updates: usize,
         pub deb_names: BTreeSet<String>,
+        /// package → packages that depend on it (and go with it on removal)
+        pub dependents: BTreeMap<String, Vec<String>>,
     }
 
     #[derive(Clone, Default)]
@@ -207,6 +250,18 @@ pub(crate) mod testkit {
                 .unwrap()
                 .candidates
                 .insert(name.into(), version.into());
+            self
+        }
+
+        /// `dependent` depends on `on`, so removing `on` removes `dependent` too.
+        pub fn depends(self, dependent: &str, on: &str) -> Self {
+            self.0
+                .lock()
+                .unwrap()
+                .dependents
+                .entry(on.into())
+                .or_default()
+                .push(dependent.into());
             self
         }
 
@@ -268,6 +323,7 @@ pub(crate) mod testkit {
                 let mut w = w.lock().unwrap();
                 let sub = cmd.args.first().cloned().unwrap_or_default();
                 let mut targets: Vec<String> = Vec::new();
+                let simulate = cmd.args.iter().any(|a| a == "-s");
                 let mut args = cmd.args.iter().skip(1);
                 while let Some(a) = args.next() {
                     if a == "-o" {
@@ -305,7 +361,24 @@ pub(crate) mod testkit {
                         }
                     }
                     "remove" => {
+                        let mut all = targets.clone();
                         for t in &targets {
+                            for d in w.dependents.get(t).cloned().unwrap_or_default() {
+                                if w.installed.contains_key(&d) && !all.contains(&d) {
+                                    all.push(d);
+                                }
+                            }
+                        }
+                        if simulate {
+                            let text: String = all
+                                .iter()
+                                .filter_map(|t| {
+                                    w.installed.get(t).map(|(v, _)| format!("Remv {t} [{v}]\n"))
+                                })
+                                .collect();
+                            return ok_output(&format!("NOTE: This is only a simulation!\n{text}"));
+                        }
+                        for t in &all {
                             if let Some((v, _)) = w.installed.remove(t) {
                                 w.config_files.insert(t.clone(), v);
                             }
