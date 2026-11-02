@@ -1,132 +1,101 @@
 name: Release
+
 on:
   release:
     types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   version:
     name: Start Release
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out code
-        uses: actions/checkout@v7.0.1
-
+      - uses: actions/checkout@v4
       - name: Generate Package Version
-        shell: pwsh
-        run: Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$('${{ github.event.release.tag_name }}'.substring(1))"
-
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: Set Package Version
-        run: sed -i "s/^version\s*=\s*\".*\"/version = \"$VERSION\"/g" Cargo.toml
-
-      - name: Stash Versioned Cargo.toml
-        uses: actions/upload-artifact@v7
+        run: sed -i "0,/^version\s*=\s*\".*\"/s//version = \"$VERSION\"/" Cargo.toml && sed -i "0,/^version\s*=\s*\".*\"/s//version = \"$VERSION\"/" ui/Cargo.toml
+      - uses: actions/upload-artifact@v4
         with:
-          name: cargofile
-          path: Cargo.toml
+          name: versioned-manifests
+          path: |
+            Cargo.toml
+            ui/Cargo.toml
+
+  ui:
+    name: Build UI
+    runs-on: ubuntu-latest
+    needs: [version]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: versioned-manifests
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall --no-confirm trunk
+      - run: cd ui && trunk build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
   build:
-    name: ${{ matrix.os }}-${{ matrix.arch }}-release
+    name: ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.run_on }}
-    continue-on-error: true
-    needs:
-      - version
+    needs: [version, ui]
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # Windows builds
-          - arch: amd64
-            os: windows
-            run_on: windows-latest
-            target: x86_64-pc-windows-msvc
-            extension: .exe
-
-          # Linux builds
-          - arch: amd64
-            run_on: ubuntu-latest
-            os: linux
-            dockerfile: build/Dockerfile.linux-x86_64
-          - arch: arm64
-            run_on: ubuntu-latest
-            os: linux
-            target: aarch64-unknown-linux-gnu
-            cross: true
-
-          # Apple MacOS builds
-          - arch: amd64
-            run_on: macos-latest
-            os: darwin
-            target: x86_64-apple-darwin
-          - arch: arm64
-            run_on: macos-latest
-            os: darwin
-            target: aarch64-apple-darwin
+          - { os: linux, arch: amd64, run_on: ubuntu-latest, target: x86_64-unknown-linux-musl, extension: "" }
+          - { os: linux, arch: arm64, run_on: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, extension: "" }
+          - { os: darwin, arch: amd64, run_on: macos-latest, target: x86_64-apple-darwin, extension: "" }
+          - { os: darwin, arch: arm64, run_on: macos-latest, target: aarch64-apple-darwin, extension: "" }
+          - { os: windows, arch: amd64, run_on: windows-latest, target: x86_64-pc-windows-msvc, extension: ".exe" }
     steps:
-      - name: setup dependencies
-        run: ${{ matrix.setup }}
-        if: matrix.setup
-
-      - name: Get Rust Stable
-        uses: dtolnay/rust-toolchain@stable
-        if: matrix.target
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: versioned-manifests
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Check out code
-        uses: actions/checkout@v7.0.1
-
-      - name: Fetch Versioned Cargo.toml
-        uses: actions/download-artifact@v8
-        with:
-          name: cargofile
-
-      - name: install protoc
-        if: ${{ matrix.target && !matrix.cross }}
-        uses: SierraSoftworks/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: install cargo-binstall
-        if: matrix.cross
-        uses: cargo-bins/cargo-binstall@main
-
-      - name: install cross
-        if: matrix.cross
-        run: cargo binstall --no-confirm cross
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: cache ~/.cargo
-        if: matrix.target
-        uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      - name: cargo build
-        if: matrix.target
-        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }} ${{ matrix.flags }}
-          
-      - name: Reclaim cache ownership from cross
-        if: matrix.cross
-        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo" target
-
-      - name: Strip Debug Symbols
-        run: |
-          ${{ matrix.strip }} target/${{ matrix.target }}/release/buckle${{ matrix.extension }}
-        if: matrix.strip
-
-      - name: Build Docker image
-        run: |
-          docker build -t buckle:dev -f ${{ matrix.dockerfile }} .
-          mkdir -p out
-          docker run --rm -v $(pwd):/buckle buckle:dev cp /app/buckle /buckle/out/buckle${{ matrix.extension }}
-        if: matrix.dockerfile
-
+      - name: Build
+        run: cargo build --release -p buckle --target ${{ matrix.target }}
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: 1
+          CARGO_PROFILE_RELEASE_STRIP: none
+      - name: Publish symbols
+        uses: SierraSoftworks/symbols@v1
+        continue-on-error: true
+        with:
+          files: target/${{ matrix.target }}/release/buckle${{ matrix.extension }}
+      - name: Report binary size
+        shell: bash
+        run: ls -l target/${{ matrix.target }}/release/buckle${{ matrix.extension }} | awk '{ printf "buckle-${{ matrix.os }}-${{ matrix.arch }}: %.1f MB\n", $5/1048576 }' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Prepare release artifacts
+        shell: bash
         run: |
           mkdir -p out
           cp target/${{ matrix.target }}/release/buckle${{ matrix.extension }} out/buckle${{ matrix.extension }}
-        if: matrix.target
-
       - name: Upload GitHub Release Artifacts
         uses: SierraSoftworks/gh-releases@v1.0.10
         with:
@@ -134,15 +103,91 @@ jobs:
           overwrite: "true"
           files: |
             out/buckle${{ matrix.extension }} | buckle-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'linux'
+        with:
+          name: binary-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/buckle
+
+  docker:
+    name: Docker (${{ matrix.arch }})
+    runs-on: ${{ matrix.run_on }}
+    needs: [build]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, run_on: ubuntu-latest, platform: linux/amd64 }
+          - { arch: arm64, run_on: ubuntu-24.04-arm, platform: linux/arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-linux-${{ matrix.arch }}
+          path: .
+      - run: chmod +x buckle
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" | sed 's/sha256://' | xargs -I{} touch /tmp/digests/{}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  docker-publish:
+    name: Docker manifest
+    runs-on: ubuntu-latest
+    needs: [docker]
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 
   tap:
     name: Update Homebrew Tap
     runs-on: ubuntu-latest
-    needs:
-      - build
+    needs: [build]
     steps:
-      - name: Update Homebrew Tap
-        uses: SierraSoftworks/actions-tap@v1
+      - uses: SierraSoftworks/actions-tap@v1
         with:
           app-id: ${{ secrets.TAP_APP_ID }}
           private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
