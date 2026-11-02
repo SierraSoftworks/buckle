@@ -413,6 +413,7 @@ mod tests {
                 approved_by: Some("alice".into()),
                 approved_at: None,
                 bake_until: None,
+                health_checks: vec![],
             }],
             plans: vec![],
             events: vec![],

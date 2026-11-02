@@ -260,6 +260,13 @@
     box-shadow: inset 0 0 0 3px var(--danger);
   }
 
+  // Its own rollback failed: ringed outside, so it stands out from a
+  // plain failure.
+  &--attention {
+    outline: 2px solid var(--danger);
+    outline-offset: 2px;
+  }
+
   &--offline {
     opacity: 0.5;
   }
@@ -390,4 +397,25 @@
       padding: 0 0.3rem;
     }
   }
+}
+
+// A phase's health gate: one chip per required check.
+.gate-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0.2rem 0 0;
+  padding: 0;
+  list-style: none;
+
+  .pill {
+    font-size: 0.72rem;
+  }
+}
+
+.approval__gate {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0.75rem 0;
 }

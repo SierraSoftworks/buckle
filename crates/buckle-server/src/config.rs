@@ -73,6 +73,18 @@ impl ServerConfig {
                 ],
             ));
         }
+        if let Some(template) = &self.telemetry.trace_url_template
+            && !template.contains(TRACE_ID_PLACEHOLDER)
+        {
+            return Err(buckle_core::error::user(
+                format!(
+                    "`telemetry.trace_url_template` ('{template}') has no `{TRACE_ID_PLACEHOLDER}` placeholder, so every link would open the same page."
+                ),
+                &[
+                    "Put {trace_id} where the trace id goes, e.g. https://ui.honeycomb.io/<team>/environments/<env>/trace?trace_id={trace_id}.",
+                ],
+            ));
+        }
         if self.web.oidc.is_some() && self.web.base_url.is_none() {
             return Err(buckle_core::error::user(
                 "`web.base_url` is required when OIDC is configured, so the callback URL can be built.",
@@ -443,11 +455,44 @@ pub struct WebConfig {
     /// Who may read. Absent means everyone the OIDC provider authenticates (or everyone, without OIDC).
     #[serde(default)]
     pub user_acl: Option<filt_rs::Filter>,
-    /// Who may approve, pause, roll back and manage hosts. Absent means nobody.
+    /// Who may approve, pause, roll back and manage hosts. Absent means
+    /// nobody when `oidc` is configured, and everyone without it (sign-in
+    /// is then off, for local development).
     #[serde(default)]
     pub admin_acl: Option<filt_rs::Filter>,
+    /// Sign-in. Absent turns authentication off: every request is
+    /// anonymous, and the ACLs see only its metadata.
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+}
+
+impl WebConfig {
+    /// What the server should warn about at start-up: settings that leave
+    /// the UI more open, or more closed, than an operator may expect.
+    pub fn startup_warnings(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        match (&self.oidc, &self.user_acl, &self.admin_acl) {
+            (Some(_), user, admin) => {
+                if user.is_none() {
+                    out.push(
+                        "web.oidc is configured without web.user_acl: anyone the identity provider signs in may read the fleet",
+                    );
+                }
+                if admin.is_none() {
+                    out.push(
+                        "web.oidc is configured without web.admin_acl: nobody may approve, pause, roll back or manage hosts",
+                    );
+                }
+            }
+            (None, _, None) => out.push(
+                "web.oidc is not configured: sign-in is off and every request may approve, pause, roll back and manage hosts",
+            ),
+            (None, _, Some(_)) => out.push(
+                "web.oidc is not configured: sign-in is off; web.admin_acl sees only request metadata",
+            ),
+        }
+        out
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -561,6 +606,7 @@ pub struct ExecProviderConfig {
 /// telemetry:
 ///   otlp_endpoint: http://otel-collector.example.internal:4317
 ///   otlp_headers: { x-honeycomb-team: "${{ env.HONEYCOMB_KEY }}" }
+///   trace_url_template: https://ui.honeycomb.io/acme/environments/prod/trace?trace_id={trace_id}
 /// ```
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -570,6 +616,21 @@ pub struct TelemetryConfig {
     /// Extra OTLP headers (often an API key); values are redacted in logs.
     #[serde(default)]
     pub otlp_headers: IndexMap<String, String>,
+    /// A link to one trace in the tracing UI, with `{trace_id}` where the
+    /// id goes. When set, the API fills `trace_url` beside every `trace_id`
+    /// it serves (rollouts and runs), and the UI links to it.
+    #[serde(default)]
+    pub trace_url_template: Option<String>,
+}
+
+/// The placeholder [`TelemetryConfig::trace_url_template`] substitutes.
+pub const TRACE_ID_PLACEHOLDER: &str = "{trace_id}";
+
+/// `template` with its `{trace_id}` replaced by `trace_id`, percent-encoded
+/// (a W3C trace id is hex, but whatever arrives cannot break the link).
+pub fn trace_url(template: &str, trace_id: &str) -> String {
+    let id: String = url::form_urlencoded::byte_serialize(trace_id.as_bytes()).collect();
+    template.replace(TRACE_ID_PLACEHOLDER, &id)
 }
 
 impl TelemetryConfig {
@@ -593,6 +654,7 @@ impl std::fmt::Debug for TelemetryConfig {
                 "otlp_headers",
                 &self.otlp_headers.keys().collect::<Vec<_>>(),
             )
+            .field("trace_url_template", &self.trace_url_template)
             .finish()
     }
 }
@@ -770,6 +832,59 @@ secrets:
         assert_eq!(t.otlp_headers["x-api-key"], "k3y");
         assert!(!format!("{t:?}").contains("k3y"));
         assert!(TelemetryConfig::peek(&dir.path().join("missing.yaml")).is_none());
+    }
+
+    #[rstest]
+    #[case(true, false, false, &["without web.user_acl", "without web.admin_acl"])]
+    #[case(true, true, true, &[])]
+    #[case(true, true, false, &["without web.admin_acl"])]
+    #[case(false, false, false, &["every request may approve"])]
+    #[case(false, false, true, &["only request metadata"])]
+    fn startup_warnings_name_what_is_open_or_shut(
+        #[case] oidc: bool,
+        #[case] user_acl: bool,
+        #[case] admin_acl: bool,
+        #[case] expected: &[&str],
+    ) {
+        let web = WebConfig {
+            base_url: Some("https://buckle.example".into()),
+            user_acl: user_acl.then(|| filt_rs::Filter::new("true").unwrap()),
+            admin_acl: admin_acl.then(|| filt_rs::Filter::new("true").unwrap()),
+            oidc: oidc.then(|| OidcConfig {
+                endpoint: "https://auth.example".into(),
+                client_id: "c".into(),
+                client_secret: "s".into(),
+                scopes: vec![],
+            }),
+            ..Default::default()
+        };
+        let warnings = web.startup_warnings();
+        assert_eq!(warnings.len(), expected.len(), "{warnings:?}");
+        for (w, e) in warnings.iter().zip(expected) {
+            assert!(w.contains(e), "{w:?} should mention {e:?}");
+        }
+    }
+
+    #[test]
+    fn a_trace_url_template_needs_the_placeholder_and_fills_it() {
+        let yaml = format!(
+            "{EXAMPLE}telemetry:\n  trace_url_template: https://ui.honeycomb.io/acme/trace?trace_id={{trace_id}}\n"
+        );
+        let cfg = with_env(&yaml).unwrap();
+        let template = cfg.telemetry.trace_url_template.as_deref().unwrap();
+        assert_eq!(
+            trace_url(template, "00af7651"),
+            "https://ui.honeycomb.io/acme/trace?trace_id=00af7651"
+        );
+        assert_eq!(
+            trace_url(template, "a&b"),
+            "https://ui.honeycomb.io/acme/trace?trace_id=a%26b"
+        );
+        let missing = format!(
+            "{EXAMPLE}telemetry:\n  trace_url_template: https://ui.honeycomb.io/acme/trace\n"
+        );
+        let err = with_env(&missing).unwrap_err();
+        assert!(err.description().contains("trace_url_template"), "{err}");
     }
 
     #[test]

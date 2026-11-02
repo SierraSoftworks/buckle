@@ -4,7 +4,7 @@
 //! with the parser the server uses, and lives in the URL so a filtered view
 //! can be linked to.
 
-use buckle_api::{AuditEntry, LiveEvent};
+use buckle_api::{AuditEntry, LiveEvent, PROGRESS_ACTIONS};
 use serde::{Deserialize, Serialize};
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -25,6 +25,9 @@ use crate::store::use_live;
 struct Query {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     filter: String,
+    /// Show the controller's progress transitions (hidden by default).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    progress: bool,
 }
 
 const EXAMPLES: &[(&str, &str)] = &[
@@ -46,10 +49,10 @@ pub fn audit() -> Html {
     let live = use_live();
     let location = use_location();
     let navigator = use_navigator();
-    let applied = location
+    let query = location
         .and_then(|l| l.query::<Query>().ok())
-        .unwrap_or_default()
-        .filter;
+        .unwrap_or_default();
+    let (applied, progress) = (query.filter.clone(), query.progress);
     let draft = use_state(|| applied.clone());
     let settled = use_debounced((*draft).clone(), 250);
     let more = use_state(Vec::<AuditEntry>::new);
@@ -71,6 +74,7 @@ pub fn audit() -> Html {
                     &Route::Audit,
                     &Query {
                         filter: expr.clone(),
+                        progress,
                     },
                 );
             }
@@ -88,10 +92,9 @@ pub fn audit() -> Html {
         });
     }
 
-    let page = use_fetch(
-        applied.clone(),
-        |f| async move { api::audit(&f, None).await },
-    );
+    let page = use_fetch((applied.clone(), progress), |(f, progress)| async move {
+        api::audit(&f, None, progress).await
+    });
     let seen_seq = page.data.as_ref().map(|d| d.0).unwrap_or(0);
     let fresh = live
         .log
@@ -99,7 +102,12 @@ pub fn audit() -> Html {
         .map(|events| {
             events
                 .iter()
-                .filter(|e| matches!(***e, LiveEvent::Audit { .. }))
+                .filter(|e| match &***e {
+                    LiveEvent::Audit { entry } => {
+                        progress || !PROGRESS_ACTIONS.contains(&entry.action.as_str())
+                    }
+                    _ => false,
+                })
                 .count()
         })
         .unwrap_or(0);
@@ -108,7 +116,7 @@ pub fn audit() -> Html {
         let first_next = page
             .value()
             .and_then(|p| p.next.as_ref().and_then(|n| n.parse().ok()));
-        use_effect_with((applied.clone(), first_next), move |(_, n)| {
+        use_effect_with((applied.clone(), progress, first_next), move |(_, _, n)| {
             more.set(Vec::new());
             next.set(*n);
             || ()
@@ -118,6 +126,21 @@ pub fn audit() -> Html {
     let set_filter = {
         let draft = draft.clone();
         Callback::from(move |value: String| draft.set(value))
+    };
+    let toggle_progress = {
+        let (navigator, applied) = (navigator.clone(), applied.clone());
+        Callback::from(move |e: Event| {
+            let progress = e.target_unchecked_into::<HtmlInputElement>().checked();
+            if let Some(n) = &navigator {
+                let _ = n.replace_with_query(
+                    &Route::Audit,
+                    &Query {
+                        filter: applied.clone(),
+                        progress,
+                    },
+                );
+            }
+        })
     };
     let oninput = {
         let set_filter = set_filter.clone();
@@ -146,7 +169,7 @@ pub fn audit() -> Html {
             );
             loading_more.set(true);
             wasm_bindgen_futures::spawn_local(async move {
-                if let Ok(p) = api::audit(&applied, Some(before)).await {
+                if let Ok(p) = api::audit(&applied, Some(before), progress).await {
                     let mut all = (*more).clone();
                     all.extend(p.items);
                     more.set(all);
@@ -263,6 +286,10 @@ pub fn audit() -> Html {
                             <button type="button" class="chip" onclick={{ let s = set_filter.clone(); Callback::from(move |_| s.emit(String::new())) }}>{ "Clear" }</button>
                         }
                     </div>
+                    <label class="toggle" title="Controller transitions that only show a host moving through a rollout's ordinary steps: planned, baseline, applying, baking.">
+                        <input type="checkbox" checked={progress} onchange={toggle_progress} data-testid="audit-progress" />
+                        <span>{ "Show rollout progress (planned, applying, baking…)" }</span>
+                    </label>
                 </div>
                 { body }
             </Panel>

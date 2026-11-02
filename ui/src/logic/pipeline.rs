@@ -246,6 +246,30 @@ fn gate(phase: &RolloutPhase, hosts: &[&RolloutHost], plans: &[PlanGroup]) -> Ga
     }
 }
 
+/// How one check of a phase's health gate stands, for its chip: failing on
+/// one of the phase's hosts, waived on one, held by a finished phase, or not
+/// yet decided.
+pub fn gate_check_tone(phase: &RolloutPhase, check: &str) -> super::tone::Tone {
+    use super::tone::Tone;
+    if phase
+        .hosts
+        .iter()
+        .any(|h| h.failed_checks.iter().any(|c| c == check))
+    {
+        Tone::Danger
+    } else if phase
+        .hosts
+        .iter()
+        .any(|h| h.waived_checks.iter().any(|c| c == check))
+    {
+        Tone::Mute
+    } else if phase.state == PhaseState::Done {
+        Tone::Ok
+    } else {
+        Tone::Neutral
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +314,7 @@ mod tests {
             approved_by: None,
             approved_at: None,
             bake_until: None,
+            health_checks: vec![],
         }
     }
 
@@ -469,7 +494,7 @@ mod tests {
             changes: 3,
             removals: 1,
             destructive: true,
-            plan: serde_json::Value::Null,
+            plan: None,
         }];
         let mut approved_ahead = phase("late", PhaseState::Pending, "required", vec![]);
         approved_ahead.approved_by = Some("alice".into());
@@ -517,5 +542,25 @@ mod tests {
         assert!(p.stages[1].gate.closed());
         assert_eq!(p.stages[1].gate.label(), "needs approval");
         assert!(!p.stages[0].gate.closed());
+    }
+
+    #[test]
+    fn health_gate_chips_follow_the_phase_hosts_checks() {
+        use crate::logic::tone::Tone;
+        let mut failed = host("pi-5", "home", HostRolloutState::Failed, 10);
+        failed.failed_checks = vec!["nomad/api".into()];
+        let mut waived = host("pi-6", "home", HostRolloutState::Healthy, 10);
+        waived.waived_checks = vec!["backup/marker".into()];
+        let mut home = phase("home", PhaseState::Running, "auto", vec![failed, waived]);
+        home.health_checks = vec![
+            "nomad/api".into(),
+            "backup/marker".into(),
+            "nomad/unit".into(),
+        ];
+        assert_eq!(gate_check_tone(&home, "nomad/api"), Tone::Danger);
+        assert_eq!(gate_check_tone(&home, "backup/marker"), Tone::Mute);
+        assert_eq!(gate_check_tone(&home, "nomad/unit"), Tone::Neutral);
+        home.state = PhaseState::Done;
+        assert_eq!(gate_check_tone(&home, "nomad/unit"), Tone::Ok);
     }
 }

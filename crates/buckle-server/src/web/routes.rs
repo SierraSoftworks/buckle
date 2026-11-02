@@ -10,7 +10,7 @@ use actix_web::{HttpMessage, HttpRequest, HttpResponse, web};
 use buckle_api::{
     ActionRequest, ApproveRequest, ContinueRequest, CsrfToken, Fleet, FleetCounts, HealthResultDto,
     HealthSummary, HostDetail, HostPatch, HostPreview, HostStatus, LiveEvent, Me, Page,
-    ResourceSummary, RunSummary, StartRollout,
+    RejectRequest, ResourceSummary, RolloutState, RunSummary, StartRollout,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -47,6 +47,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/rollouts/{id}", web::get().to(rollout))
             .route("/rollouts/{id}/plans", web::get().to(rollout_plans))
             .route("/rollouts/{id}/approve", web::post().to(rollout_approve))
+            .route("/rollouts/{id}/reject", web::post().to(rollout_reject))
             .route(
                 "/rollouts/{id}/hosts/{host}/continue",
                 web::post().to(rollout_continue),
@@ -86,6 +87,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("GET", "/api/v1/rollouts/r"),
     ("GET", "/api/v1/rollouts/r/plans"),
     ("POST", "/api/v1/rollouts/r/approve"),
+    ("POST", "/api/v1/rollouts/r/reject"),
     ("POST", "/api/v1/rollouts/r/pause"),
     ("POST", "/api/v1/rollouts/r/resume"),
     ("POST", "/api/v1/rollouts/r/rollback"),
@@ -102,16 +104,20 @@ pub const PROTECTED: &[(&str, &str)] = &[
 
 // ------------------------------------------------------------------ auth
 
+/// `GET /me`: who the caller is and whether they may act (`is_admin`).
+/// Without OIDC the caller is anonymous, and `is_admin` is what
+/// `admin_acl` (absent: allowed) makes of the request's metadata.
 async fn me(state: Data, req: HttpRequest) -> ApiResult {
-    if state.oidc.is_none() {
-        return Ok(HttpResponse::NoContent().finish());
-    }
     let p = auth::resolve(&state, &req).await?;
+    if !p.authenticated {
+        return Ok(HttpResponse::Ok().json(Me::anonymous(p.is_admin)));
+    }
     Ok(HttpResponse::Ok().json(Me {
         name: p.name,
         email: p.email,
         subject: p.subject,
         is_admin: p.is_admin,
+        anonymous: false,
     }))
 }
 
@@ -137,12 +143,18 @@ fn peer_ip(state: &AppState, req: &HttpRequest) -> Option<std::net::IpAddr> {
     auth::client_ip(&state.web, req).and_then(|s| s.parse().ok())
 }
 
+/// `GET /auth/login?return_to=/rollouts/42`.
 #[derive(Deserialize)]
 struct LoginQuery {
+    /// Where the browser lands after signing in: a local path (with its
+    /// query and fragment), checked by [`auth::safe_return_to`]; anything
+    /// else, or nothing, lands on `/`. This is the only spelling read.
     #[serde(default)]
     return_to: Option<String>,
 }
 
+/// Starts a sign-in: remembers PKCE, nonce and `return_to` for ten minutes
+/// and redirects to the identity provider.
 async fn login(state: Data, req: HttpRequest, q: web::Query<LoginQuery>) -> ApiResult {
     let Some(oidc) = state.oidc.clone() else {
         return Err(ApiError::not_found(
@@ -482,8 +494,9 @@ fn resources(row: Option<crate::store::RolloutHostRecord>) -> Vec<ResourceSummar
         .collect()
 }
 
-fn run_dto(r: crate::store::RunRecord) -> RunSummary {
+fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
     RunSummary {
+        trace_url: state.trace_url(r.trace_id.as_deref()),
         revision: r.revision,
         plan_digest: r.plan_digest,
         started_at: r.started_at,
@@ -493,7 +506,6 @@ fn run_dto(r: crate::store::RunRecord) -> RunSummary {
         removals: r.removals,
         error: r.error,
         trace_id: r.trace_id,
-        trace_url: None,
     }
 }
 
@@ -514,7 +526,7 @@ fn health_dto(h: crate::store::HealthEventRecord) -> HealthResultDto {
 async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
     let id = path.into_inner();
     let summary = summary_or_404(&state, &id).await?;
-    let (facts, row, runs, health) = state
+    let (facts, row, runs, health, drift) = state
         .store
         .call(move |db| {
             Ok((
@@ -522,6 +534,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
                 db.rollouts().latest_healthy_for_host(&id)?,
                 db.runs().for_host(&id, 20)?,
                 db.health().for_host(&id, 100)?,
+                db.drift().for_host(&id)?,
             ))
         })
         .await?;
@@ -533,9 +546,8 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
             .unwrap_or(serde_json::Value::Null),
         facts_at: facts.map(|(_, at)| at),
         resources: resources(row),
-        // Drift diffs are not persisted per item yet; the UI tolerates an empty list.
-        drift: Vec::new(),
-        recent_runs: runs.into_iter().map(run_dto).collect(),
+        drift,
+        recent_runs: runs.into_iter().map(|r| run_dto(&state, r)).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
     }))
 }
@@ -577,7 +589,11 @@ async fn host_runs(state: Data, _: Authenticated, path: web::Path<String>) -> Ap
         .store
         .call(move |db| db.runs().for_host(&id, 50))
         .await?;
-    Ok(HttpResponse::Ok().json(rows.into_iter().map(run_dto).collect::<Vec<_>>()))
+    Ok(HttpResponse::Ok().json(
+        rows.into_iter()
+            .map(|r| run_dto(&state, r))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 async fn host_changed(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {
@@ -816,7 +832,100 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
         .await?;
     let (r, hosts, approvals, audit) =
         found.ok_or_else(|| ApiError::not_found(format!("No rollout '{id}'.")))?;
-    Ok(view::detail(&r, &hosts, &approvals, &audit))
+    let mut detail = view::detail(&r, &hosts, &approvals, &audit);
+    detail.summary = state.link_rollout(detail.summary);
+    // The audit trail comes newest first; the timeline reads oldest first,
+    // so live entries append.
+    detail.events.reverse();
+    // A group takes its first host's copy of the plan; when that host holds
+    // none, any other host with the digest will do.
+    for g in detail.plans.iter_mut().filter(|g| g.plan.is_none()) {
+        g.plan = hosts
+            .iter()
+            .filter(|h| h.plan_digest.as_deref() == Some(g.digest.as_str()))
+            .find_map(|h| crate::views::stored_plan_view(h.plan.as_ref()));
+    }
+    fill_health_checks(state, &r.revision, &hosts, &mut detail).await?;
+    Ok(detail)
+}
+
+/// Fills each phase's health gate: the required checks of the modules its
+/// hosts apply, each host judged against the revision it is moving to (the
+/// rollout's, or the stable one in the stragglers stage).
+async fn fill_health_checks(
+    state: &AppState,
+    rollout_revision: &str,
+    hosts: &[crate::store::RolloutHostRecord],
+    detail: &mut buckle_api::RolloutDetail,
+) -> Result<(), ApiError> {
+    let revision_of = |h: &crate::store::RolloutHostRecord| {
+        if h.runtime.revision.is_empty() {
+            rollout_revision.to_owned()
+        } else {
+            h.runtime.revision.clone()
+        }
+    };
+    let mut revisions = HashMap::new();
+    for id in hosts.iter().map(revision_of) {
+        if !revisions.contains_key(&id)
+            && let Ok(rev) = state.revisions.load(&id).await
+        {
+            revisions.insert(id, rev);
+        }
+    }
+    let plans: HashMap<&str, Option<buckle_api::PlanView>> = hosts
+        .iter()
+        .map(|h| {
+            (
+                h.host.as_str(),
+                crate::views::stored_plan_view(h.plan.as_ref()),
+            )
+        })
+        .collect();
+    // Hosts without a plan are judged by their labels and facts.
+    let unplanned: Vec<String> = plans
+        .iter()
+        .filter(|(_, p)| p.is_none())
+        .map(|(h, _)| (*h).to_owned())
+        .collect();
+    let contexts = state
+        .store
+        .call(move |db| {
+            let mut out = HashMap::new();
+            for id in unplanned {
+                if let Some(h) = db.hosts().get(&id)? {
+                    let facts = db.hosts().latest_facts(&id)?.map(|(f, _)| f);
+                    out.insert(id, (h, facts.unwrap_or(serde_json::Value::Null)));
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+    for phase in &mut detail.phases {
+        let mut checks: Vec<String> = Vec::new();
+        for entry in &phase.hosts {
+            let Some(record) = hosts.iter().find(|h| h.host == entry.host) else {
+                continue;
+            };
+            let Some(revision) = revisions.get(&revision_of(record)) else {
+                continue;
+            };
+            let selected = crate::views::selected_modules(
+                revision,
+                plans.get(record.host.as_str()).and_then(Option::as_ref),
+                contexts.get(&record.host).map(|(h, f)| (h, f)),
+            );
+            for check in
+                crate::views::required_checks(revision, selected.iter().map(String::as_str))
+            {
+                if !checks.contains(&check) {
+                    checks.push(check);
+                }
+            }
+        }
+        phase.health_checks = checks;
+    }
+    Ok(())
 }
 
 async fn rollouts(state: Data, _: Authenticated, q: web::Query<PageQuery>) -> ApiResult {
@@ -833,6 +942,7 @@ async fn rollouts(state: Data, _: Authenticated, q: web::Query<PageQuery>) -> Ap
             Ok((out, db.rollouts().count()?))
         })
         .await?;
+    let items: Vec<_> = items.into_iter().map(|r| state.link_rollout(r)).collect();
     let next = ((offset as u64 + items.len() as u64) < total)
         .then(|| (offset + items.len() as u32).to_string());
     Ok(HttpResponse::Ok().json(Page { items, next, total }))
@@ -866,6 +976,63 @@ async fn rollout_approve(
             },
         )
         .await?;
+    Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))
+}
+
+/// `POST /rollouts/{id}/reject`: valid only while the rollout awaits
+/// approval (409 otherwise). The controller has no reject transition of its
+/// own, so this is its abort command with the reason as the note, followed
+/// by a `rollout.reject` audit entry carrying the reason; the rollout ends
+/// `aborted`.
+async fn rollout_reject(
+    state: Data,
+    admin: Administrative,
+    path: web::Path<String>,
+    body: web::Json<RejectRequest>,
+) -> ApiResult {
+    let id = path.into_inner();
+    let reason = body.into_inner().reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err(ApiError::bad_request(
+            "Say why the rollout is rejected: the reason is recorded in the audit log.",
+        ));
+    }
+    let i2 = id.clone();
+    let record = state
+        .store
+        .call(move |db| db.rollouts().get(&i2))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("No rollout '{id}'.")))?;
+    if record.state != RolloutState::AwaitingApproval {
+        return Err(ApiError::conflict(format!(
+            "Rollout {id} is not awaiting approval, so there is nothing to reject; abort it instead."
+        )));
+    }
+    let phase = record
+        .runtime
+        .phases
+        .get(record.runtime.current_phase)
+        .map(|p| p.name.clone());
+    let actor = admin.0.actor();
+    state
+        .controller
+        .command(
+            &actor,
+            Command::Abort {
+                rollout: id.clone(),
+                note: format!("Rejected: {reason}"),
+            },
+        )
+        .await?;
+    audit_action(
+        &state,
+        &actor,
+        "rollout.reject",
+        &id,
+        format!("{actor} rejected the rollout: {reason}"),
+        Some(serde_json::json!({ "reason": reason, "phase": phase })),
+    )
+    .await;
     Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))
 }
 
@@ -949,6 +1116,17 @@ async fn rollout_continue(
 
 // ------------------------------------------------------------------ events, catalog, audit, webhook
 
+/// An event as a client sees it: links filled in where the server knows
+/// them (the controller publishes rollouts without).
+fn for_client(state: &AppState, event: LiveEvent) -> LiveEvent {
+    match event {
+        LiveEvent::RolloutChanged { rollout } => LiveEvent::RolloutChanged {
+            rollout: state.link_rollout(rollout),
+        },
+        other => other,
+    }
+}
+
 fn sse_frame(event: &LiveEvent) -> web::Bytes {
     let json = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
     let kind = serde_json::to_value(event)
@@ -999,7 +1177,7 @@ async fn events(state: Data, req: HttpRequest, _: Authenticated) -> HttpResponse
         }
         let wait = keepalive.min(s.next_check.saturating_duration_since(now));
         let frame = match tokio::time::timeout(wait, s.rx.recv()).await {
-            Ok(Ok(ev)) => sse_frame(&ev),
+            Ok(Ok(ev)) => sse_frame(&for_client(&s.state, ev)),
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                 web::Bytes::from_static(b"event: lagged\ndata: {}\n\n")
             }
@@ -1028,7 +1206,8 @@ struct AuditQuery {
     before: Option<u64>,
     #[serde(default)]
     limit: Option<u32>,
-    /// `false` leaves out controller progress transitions.
+    /// `false` leaves out controller progress transitions
+    /// (`buckle_api::PROGRESS_ACTIONS`); absent or `true` keeps them.
     #[serde(default)]
     progress: Option<bool>,
 }

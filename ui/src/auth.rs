@@ -76,6 +76,17 @@ pub async fn refresh_session() -> Result<(), ()> {
         .await
 }
 
+/// The server ended the event stream because the session no longer passes:
+/// renew it from the refresh cookie if possible (`true`: carry on), and
+/// otherwise go to sign in, coming back here.
+pub async fn session_ended() -> bool {
+    if refresh_session().await.is_ok() {
+        return true;
+    }
+    begin_login();
+    false
+}
+
 /// Where the browser is now, to come back to after signing in.
 pub fn here() -> String {
     let location = window().location();
@@ -85,14 +96,13 @@ pub fn here() -> String {
     format!("{path}{search}{hash}")
 }
 
-/// The sign-in URL that returns to `next`. Both spellings of the parameter
-/// are sent: the UI contract names it `next` and the server's handler reads
-/// `return_to`; whichever it reads, it finds the same value.
-pub fn login_url(next: &str) -> String {
-    let next = enc(next);
+/// The sign-in URL that comes back to `return_to` (the server's
+/// `GET /auth/login?return_to=` parameter, a local path).
+pub fn login_url(return_to: &str) -> String {
     format!(
-        "{}/auth/login?next={next}&return_to={next}",
-        crate::api::BASE
+        "{}/auth/login?return_to={}",
+        crate::api::BASE,
+        enc(return_to)
     )
 }
 

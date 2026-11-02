@@ -5,9 +5,12 @@
 //! the id token in the HttpOnly session cookie (re-validated each request);
 //! without it, an anonymous principal. `user_acl` decides whether the
 //! request may proceed at all (absent: anyone authenticated) and
-//! `admin_acl` whether it carries administrative rights (absent: nobody),
-//! both evaluated over [`AclRequest`]. Mutating requests also need the
-//! double-submit CSRF token.
+//! `admin_acl` whether it carries administrative rights, both evaluated
+//! over [`AclRequest`]. An absent `admin_acl` means nobody when OIDC is
+//! configured, and everybody when it is not: omitting `oidc` turns
+//! authentication off for local development (design §12), and the ACLs
+//! that are given still see the request's metadata. Mutating requests also
+//! need the double-submit CSRF token.
 //!
 //! ACLs see the path the router dispatches on: percent-decoded, with any
 //! path that could be read two ways (an encoded `/` or `\`, a `.` or `..`
@@ -243,9 +246,9 @@ pub async fn resolve(state: &AppState, req: &HttpRequest) -> Result<Principal, A
     })
 }
 
-/// Evaluates `user_acl` (absent: allowed) and `admin_acl` (absent: denied)
-/// for a request carrying `claims`. An expression that fails to evaluate
-/// counts as not matching.
+/// Evaluates `user_acl` (absent: allowed) and `admin_acl` (absent: denied
+/// with OIDC, allowed without it) for a request carrying `claims`. An
+/// expression that fails to evaluate counts as not matching.
 pub fn evaluate(
     web: &crate::config::WebConfig,
     req: &HttpRequest,
@@ -267,11 +270,12 @@ pub fn evaluate(
         .as_ref()
         .map(|f| f.matches(&acl).unwrap_or(false))
         .unwrap_or(true);
-    let is_admin = web
-        .admin_acl
-        .as_ref()
-        .map(|f| f.matches(&acl).unwrap_or(false))
-        .unwrap_or(false);
+    let is_admin = match &web.admin_acl {
+        Some(f) => f.matches(&acl).unwrap_or(false),
+        // Without sign-in nobody can be told apart, so an absent ACL keeps
+        // the local-development promise that everything is permitted.
+        None => web.oidc.is_none(),
+    };
     (allowed, is_admin)
 }
 
@@ -429,15 +433,34 @@ fn unverified_expiry(token: &str) -> Option<i64> {
         .as_i64()
 }
 
-/// A fixed-window limiter per client address for the sign-in endpoints.
+/// A fixed-window limiter per client for the sign-in endpoints.
+///
+/// IPv4 clients are counted per address. IPv6 clients are counted per /64:
+/// a single host is routinely handed a whole /64 and can pick a fresh
+/// address for every request, so the address alone limits nothing. An
+/// IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counts as its IPv4 address.
 pub struct RateLimiter {
     limit: u32,
     window: Duration,
     inner: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
+/// The bucket a client address is counted in: the address itself for IPv4,
+/// its /64 prefix for IPv6.
+fn client_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(std::net::Ipv6Addr::from_bits(
+                v6.to_bits() & !((1u128 << 64) - 1),
+            )),
+        },
+    }
+}
+
 impl RateLimiter {
-    /// `limit` requests per `window` per address.
+    /// `limit` requests per `window` per client.
     pub fn new(limit: u32, window: Duration) -> Self {
         Self {
             limit,
@@ -446,17 +469,22 @@ impl RateLimiter {
         }
     }
 
-    /// Counts a request; `false` when over the limit.
+    /// Counts a request; `false` when over the limit. A poisoned lock (a
+    /// panic while counting) refuses rather than waving everyone through:
+    /// the sign-in endpoints are what this protects.
     pub fn allow(&self, ip: Option<IpAddr>) -> bool {
         let Some(ip) = ip else { return true };
         let Ok(mut m) = self.inner.lock() else {
-            return true;
+            tracing::error!(
+                "the sign-in rate limiter's lock is poisoned; refusing sign-in requests"
+            );
+            return false;
         };
         let now = Instant::now();
         if m.len() > 10_000 {
             m.retain(|_, (start, _)| now.duration_since(*start) < self.window);
         }
-        let entry = m.entry(ip).or_insert((now, 0));
+        let entry = m.entry(client_key(ip)).or_insert((now, 0));
         if now.duration_since(entry.0) >= self.window {
             *entry = (now, 0);
         }
@@ -619,6 +647,49 @@ mod tests {
         assert!(rl.allow(Some(a)) && rl.allow(Some(a)));
         assert!(!rl.allow(Some(a)));
         assert!(rl.allow(Some(b)));
+    }
+
+    #[rstest]
+    #[case("2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ffff", true)]
+    #[case("2001:db8:1:2::1", "2001:db8:1:2:abcd::9", true)]
+    #[case("2001:db8:1:2::1", "2001:db8:1:3::1", false)]
+    #[case("::ffff:10.0.0.1", "10.0.0.1", true)]
+    #[case("::ffff:10.0.0.1", "10.0.0.2", false)]
+    fn ipv6_clients_share_a_budget_per_64(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] shared: bool,
+    ) {
+        let rl = RateLimiter::new(2, Duration::from_secs(60));
+        let first: IpAddr = first.parse().unwrap();
+        let second: IpAddr = second.parse().unwrap();
+        assert!(rl.allow(Some(first)) && rl.allow(Some(first)));
+        assert!(!rl.allow(Some(first)));
+        assert_eq!(
+            rl.allow(Some(second)),
+            !shared,
+            "{second} shares {first}'s budget: {shared}"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_rate_limiter_fails_closed() {
+        let rl = RateLimiter::new(100, Duration::from_secs(60));
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(rl.allow(Some(a)));
+        std::thread::scope(|s| {
+            let poisoner = s.spawn(|| {
+                let _guard = rl.inner.lock().unwrap();
+                panic!("a bug while counting");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(rl.inner.is_poisoned());
+        assert!(!rl.allow(Some(a)), "refused rather than unlimited");
+        assert!(
+            !rl.allow(Some("10.0.0.2".parse().unwrap())),
+            "every client is refused"
+        );
     }
 
     #[test]

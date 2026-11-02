@@ -805,3 +805,14 @@ textarea.input {
     display: none;
   }
 }
+
+// A labelled checkbox that changes what a list shows.
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+  color: var(--fg-2);
+  font-size: 0.85rem;
+  cursor: pointer;
+}

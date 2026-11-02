@@ -10,7 +10,8 @@ use filt_rs::{FilterValue, Filterable};
 
 /// The audit entry properties the server's filter can see.
 pub const AUDIT_FIELDS: &[&str] = &[
-    "id", "at", "actor", "action", "outcome", "subject", "message", "trace_id", "detail.*",
+    "id", "at", "actor", "action", "outcome", "subject", "message", "trace_id", "progress",
+    "detail.*",
 ];
 
 /// What the box can say about an expression before it is sent.
@@ -156,6 +157,7 @@ impl Filterable for AuditView<'_> {
             "subject" => e.subject.as_deref().into(),
             "message" => e.message.as_str().into(),
             "trace_id" => e.trace_id.as_deref().into(),
+            "progress" => FilterValue::Bool(e.is_progress()),
             other => match (other.strip_prefix("detail."), &e.detail) {
                 (Some(path), Some(detail)) => {
                     let mut v = detail;

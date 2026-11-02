@@ -54,10 +54,11 @@ pub fn rollout_page(props: &Props) -> Html {
         props.id.clone(),
         |id| async move { api::rollout(&id).await },
     );
+    // Host entries, the summary and timeline entries arrive on the stream
+    // and are applied as they come. Phase states and approvals do not: when
+    // the rollout itself changes, its detail is fetched again once the burst
+    // of events has settled.
     let live = use_live_value(&detail, apply_rollout);
-    // The stream carries host and rollout state, not timeline entries: when
-    // this rollout changes, its detail (and timeline) is fetched again once
-    // the burst of events has settled.
     let store = use_live();
     let touched = detail
         .data
@@ -66,11 +67,7 @@ pub fn rollout_page(props: &Props) -> Html {
         .map(|events| {
             events
                 .iter()
-                .filter(|e| match &***e {
-                    LiveEvent::RolloutChanged { rollout } => rollout.id == props.id,
-                    LiveEvent::RolloutHostChanged { rollout_id, .. } => *rollout_id == props.id,
-                    _ => false,
-                })
+                .filter(|e| matches!(&***e, LiveEvent::RolloutChanged { rollout } if rollout.id == props.id))
                 .count()
         })
         .unwrap_or(0);
@@ -164,8 +161,8 @@ pub fn rollout_page(props: &Props) -> Html {
                         ),
                     ),
                     Ask::Reject => (
-                        api::rollout_action(&id, "abort", &note).await,
-                        format!("Rollout #{id} rejected and aborted."),
+                        api::reject(&id, &note).await,
+                        format!("Rollout #{id} rejected."),
                     ),
                     Ask::Action(action) => (
                         api::rollout_action(&id, action, &note).await,
@@ -281,6 +278,7 @@ pub fn rollout_page(props: &Props) -> Html {
             &d,
             &plan_groups,
             admin,
+            s.state == RolloutState::AwaitingApproval,
             &open,
             &focus_phase,
         ),
@@ -341,12 +339,15 @@ fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalScope {
     approval_scope(&approval_hosts(phase), plans)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn approval_pane(
     phase: &RolloutPhase,
     wanting: &[&RolloutPhase],
     d: &RolloutDetail,
     plans: &[PlanGroup],
     admin: bool,
+    // The rollout is held at a gate: rejecting it is possible (only then).
+    rejectable: bool,
     open: &Callback<Ask>,
     focus: &UseStateHandle<Option<String>>,
 ) -> Html {
@@ -414,6 +415,13 @@ fn approval_pane(
                     <PlanGroupView group={plans[*i].clone()} focus={focus_names.clone()} open={n == 0 || plans[*i].destructive} />
                 }) }
             </div>
+            if !phase.health_checks.is_empty() {
+                <div class="approval__gate" data-testid="health-gate">
+                    <h4 class="subhead">{ "Health gate" }</h4>
+                    { crate::components::pipeline::health_gate(phase) }
+                    <p class="muted small">{ "Checked on each host before it applies, through its bake, and on every updated host again before the next phase starts." }</p>
+                </div>
+            }
             if !scope.without_plan.is_empty() {
                 <p class="note note--warn">
                     { format!("{} no plan yet ({}): not covered by this approval. A host that misses its wave moves to the stragglers stage.",
@@ -425,7 +433,9 @@ fn approval_pane(
                     <Button kind={Kind::Primary} onclick={approve} disabled={scope.digests.is_empty()}>
                         { "Review and approve…" }
                     </Button>
-                    <Button kind={Kind::Danger} onclick={reject}>{ "Reject…" }</Button>
+                    if rejectable {
+                        <Button kind={Kind::Danger} onclick={reject}>{ "Reject…" }</Button>
+                    }
                     <span class="muted small">{ format!("Binds {} for {}. A host whose plan changes after approval asks again.",
                         count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</span>
                 } else {
@@ -514,9 +524,10 @@ fn dialog(
             }
         }
         Ask::Reject => html! {
-            <Confirm title={format!("Reject rollout #{id}")} confirm_label="Reject and abort" danger=true note=true
+            <Confirm title={format!("Reject rollout #{id}")} confirm_label="Reject rollout" danger=true note_required=true
+                note_placeholder="What is wrong with these plans"
                 type_to_confirm={AttrValue::from(format!("#{id}"))} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
-                <p>{ "Rejecting aborts the rollout where it stands. Hosts already updated keep the new revision until a later rollout or a rollback changes them." }</p>
+                <p>{ "Rejecting ends the rollout here: nothing in the waiting phase is applied, and the rollout is recorded as aborted with your reason. Hosts updated in earlier phases keep the new revision until a later rollout or a rollback changes them." }</p>
             </Confirm>
         },
         Ask::Action(action) => {
@@ -671,6 +682,9 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td>
                                     <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} title={h.error.clone()} />
                                     if h.needs_approval { <span class="badge badge--info">{ "needs approval" }</span> }
+                                    if h.needs_attention {
+                                        <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>
+                                    }
                                     if let Some(until) = h.bake_until.filter(|u| *u > props.now) {
                                         <span class="small muted">{ " " }<Countdown {until} /></span>
                                     }

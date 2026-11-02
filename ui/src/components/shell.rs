@@ -172,9 +172,17 @@ fn user_chip() -> Html {
                 <button type="button" class="btn btn--subtle btn--small" onclick={sign_out}>{ "Sign out" }</button>
             </div>
         },
-        Session::Open => html! {
-            <span class="badge badge--warn" title="This server has no sign-in configured; every action is permitted (the ACLs still see request metadata).">
+        Session::Open { admin: true } => html! {
+            <span class="badge badge--warn" title="This server has no sign-in configured; every action is permitted (admin_acl, when set, still sees request metadata).">
                 { "no sign-in" }
+            </span>
+        },
+        Session::Open { admin: false } => html! {
+            <span class="user">
+                <span class="badge badge--warn" title="This server has no sign-in configured; its admin_acl does not match this request's metadata, so actions are refused.">
+                    { "no sign-in" }
+                </span>
+                <span class="user__role">{ "read only" }</span>
             </span>
         },
         _ => html! {},

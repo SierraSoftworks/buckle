@@ -122,7 +122,7 @@ pub fn plan_groups(hosts: &[RolloutHostRecord]) -> Vec<PlanGroup> {
             changes: h.runtime.plan_changes.unwrap_or(0),
             removals: h.runtime.plan_removals.unwrap_or(0),
             destructive: h.runtime.destructive,
-            plan: h.plan.clone().unwrap_or(serde_json::Value::Null),
+            plan: crate::views::stored_plan_view(h.plan.as_ref()),
         });
         entry.hosts.push(h.host.clone());
     }
@@ -160,6 +160,7 @@ pub fn detail(
                 approved_by: approval.map(|a| a.approver.clone()),
                 approved_at: approval.map(|a| a.at),
                 bake_until: p.bake_until,
+                health_checks: Vec::new(),
             }
         })
         .collect();

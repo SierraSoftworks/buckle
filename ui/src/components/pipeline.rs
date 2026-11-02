@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{HostSummary, RolloutDetail, RolloutHost};
+use buckle_api::{HostSummary, RolloutDetail, RolloutHost, RolloutPhase};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
@@ -16,7 +16,7 @@ use super::link::RouteLink;
 use super::ui::Pill;
 use crate::app::Route;
 use crate::logic::format::{config_duration, relative, short};
-use crate::logic::pipeline::{Gate, GateKind, GateState, Stage, layout};
+use crate::logic::pipeline::{Gate, GateKind, GateState, Stage, gate_check_tone, layout};
 use crate::logic::tone::{
     LEGEND, block_look, host_state_class, host_state_label, phase_state_label, phase_state_tone,
 };
@@ -40,7 +40,7 @@ pub fn pipeline(props: &PipelineProps) -> Html {
         html! {
             <div class="pipeline__step" role="listitem">
                 { gate(&stage.gate, i == 0, props.now) }
-                { column(stage, &props.hosts, props.now) }
+                { column(stage, &props.hosts, props.compact, props.now) }
             </div>
         }
     });
@@ -64,6 +64,10 @@ pub fn pipeline(props: &PipelineProps) -> Html {
                     <li class="legend__item">
                         <span class="block block--legend block--planned block--needs-approval" aria-hidden="true" />
                         { "needs approval" }
+                    </li>
+                    <li class="legend__item">
+                        <span class="block block--legend block--failed block--attention" aria-hidden="true" />
+                        { "needs attention" }
                     </li>
                 </ul>
             }
@@ -113,7 +117,27 @@ fn gate(gate: &Gate, first: bool, now: DateTime<Utc>) -> Html {
     }
 }
 
-fn column(stage: &Stage, hosts: &BTreeMap<String, HostSummary>, now: DateTime<Utc>) -> Html {
+/// A phase's health gate (design §12 mock): one chip per required check of
+/// the modules its hosts apply, red where a host fails it.
+pub fn health_gate(phase: &RolloutPhase) -> Html {
+    if phase.health_checks.is_empty() {
+        return html! {};
+    }
+    html! {
+        <ul class="gate-checks" aria-label={format!("Health gate of {}", phase.name)}>
+            { for phase.health_checks.iter().map(|c| html! {
+                <li><Pill tone={gate_check_tone(phase, c)} label={c.clone()} /></li>
+            }) }
+        </ul>
+    }
+}
+
+fn column(
+    stage: &Stage,
+    hosts: &BTreeMap<String, HostSummary>,
+    compact: bool,
+    now: DateTime<Utc>,
+) -> Html {
     let phase = stage.phase;
     let c = &stage.counts;
     let mut tally = vec![format!("{}/{} healthy", c.healthy, c.total)];
@@ -162,6 +186,7 @@ fn column(stage: &Stage, hosts: &BTreeMap<String, HostSummary>, now: DateTime<Ut
                     }
                     { bake }
                 </div>
+                if !compact { { health_gate(phase) } }
             </header>
             if stage.counts.total == 0 {
                 <p class="stage__empty muted">{ "No hosts" }</p>
@@ -193,6 +218,9 @@ fn block(entry: &RolloutHost, host: Option<&HostSummary>, now: DateTime<Utc>) ->
     if !entry.waived_checks.is_empty() {
         detail
             .push(html! { <span>{ format!("waived: {}", entry.waived_checks.join(", ")) }</span> });
+    }
+    if entry.needs_attention {
+        detail.push(html! { <span class="block__error">{ "needs attention: its own rollback failed" }</span> });
     }
     if let Some(error) = &entry.error {
         detail.push(html! { <span class="block__error">{ error.clone() }</span> });

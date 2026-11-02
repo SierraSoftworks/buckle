@@ -1,4 +1,4 @@
-use crate::{HostSummary, RevisionSummary};
+use crate::{HostSummary, PlanView, RevisionSummary};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,11 @@ pub struct RolloutPhase {
     pub approved_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bake_until: Option<DateTime<Utc>>,
+    /// The health gate: the required checks (`module/check`) of the modules
+    /// selected for this phase's hosts, which baseline, bake and the
+    /// pre-phase re-check hold the phase to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +135,8 @@ pub struct RolloutDetail {
     pub phases: Vec<RolloutPhase>,
     /// Distinct plans across hosts, for review.
     pub plans: Vec<PlanGroup>,
+    /// The timeline, oldest first (the newest 200 entries); later entries
+    /// arrive as [`LiveEvent::RolloutTimeline`].
     pub events: Vec<RolloutEvent>,
 }
 
@@ -141,8 +148,10 @@ pub struct PlanGroup {
     pub changes: u32,
     pub removals: u32,
     pub destructive: bool,
-    /// The redacted plan document (buckle_core::plan::Plan as JSON).
-    pub plan: serde_json::Value,
+    /// The plan, as one of `hosts` planned it. `None` when the server holds
+    /// no readable copy (the counts above still come from the host's report).
+    #[serde(default)]
+    pub plan: Option<PlanView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +175,14 @@ pub struct ApproveRequest {
     pub plan_digests: Vec<String>,
     #[serde(default)]
     pub note: String,
+}
+
+/// `POST /api/v1/rollouts/{id}/reject`: turns a rollout down while it waits
+/// for approval. It ends aborted, with the reason in the audit log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectRequest {
+    /// Why; required, and recorded with the `rollout.reject` audit entry.
+    pub reason: String,
 }
 
 /// `POST /api/v1/rollouts/{id}/hosts/{host}/continue`.
@@ -196,6 +213,11 @@ pub enum LiveEvent {
     RolloutHostChanged {
         rollout_id: String,
         host: RolloutHost,
+    },
+    /// An entry was added to a rollout's timeline (`RolloutDetail.events`).
+    RolloutTimeline {
+        rollout_id: String,
+        event: RolloutEvent,
     },
     RevisionAdded {
         revision: RevisionSummary,

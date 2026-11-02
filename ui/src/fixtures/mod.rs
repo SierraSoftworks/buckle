@@ -11,10 +11,12 @@
 //! | flag | effect |
 //! |---|---|
 //! | `role=viewer` | signed in without admin rights: admin actions are hidden and refused |
-//! | `auth=off` | `/me` answers 204, as a server without OIDC does |
+//! | `auth=off` | `/me` answers anonymous, as a server without OIDC does (with `role=viewer`: one whose `admin_acl` does not match) |
 //! | `auth=expired` | `/me` answers 401 and the refresh fails, so the UI sends you to sign in |
+//! | `session=ended` | a moment after loading, the event stream ends with `session_ended` and the refresh fails, so the UI sends you to sign in |
 //! | `slow` | every call takes 700 ms, to see the loading states |
 //! | `live` | the active rollout moves on by itself through the live event path |
+//! | `awaiting` | the active rollout has finished its home phase and is held at the cloud gate, awaiting approval (so it can be rejected) |
 //! | `empty` | an empty fleet with no rollouts, to see the empty states |
 //!
 //! The choice is remembered for the tab (`sessionStorage`), so a reload or a
