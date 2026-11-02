@@ -297,6 +297,9 @@ pub struct HostRuntime {
     /// e.g. another rollout's, are not this bake's).
     #[serde(default)]
     pub bake_requests: Vec<String>,
+    /// Modules the plan defers to apply time (their plan is unknown yet).
+    #[serde(default)]
+    pub deferred_modules: Vec<String>,
 }
 
 /// One `rollout_hosts` row.

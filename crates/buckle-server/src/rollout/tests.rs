@@ -46,6 +46,10 @@ struct Script {
     silent_bake: bool,
     /// Planning fails with this error.
     plan_error: Option<String>,
+    /// Never answer a Rollback.
+    silent_rollback: bool,
+    /// The plan defers these modules to apply time.
+    deferred: Vec<String>,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -228,6 +232,7 @@ impl Harness {
                         changes: 1,
                         destructive: s.destructive,
                         removals: u32::from(s.destructive),
+                        deferred_modules: s.deferred.clone(),
                         plan_json: b"{}".to_vec(),
                         ..Default::default()
                     })),
@@ -329,6 +334,7 @@ impl Harness {
                             ..Default::default()
                         }));
                     }
+                    SMsg::Rollback(_) if s.silent_rollback => {}
                     SMsg::Rollback(r) => reply(AMsg::Result(ApplyResult {
                         revision: r.revision.clone(),
                         succeeded: true,
@@ -1364,7 +1370,15 @@ async fn an_applying_host_that_reconnects_off_target_gets_the_same_apply_again()
     h.disconnect("a");
     h.idle(5).await;
     h.connect("a", None);
-    h.idle(5).await;
+    // Wait on the outcome rather than a fixed idle: on the paused clock,
+    // virtual time can jump ahead while the controller's store calls run on
+    // blocking threads.
+    for _ in 0..600 {
+        if h.applies().len() >= 2 {
+            break;
+        }
+        h.idle(1).await;
+    }
     let applies = h.applies();
     assert_eq!(applies.len(), 2);
     assert_eq!(applies[0].2.plan_digest, applies[1].2.plan_digest);
@@ -2248,4 +2262,330 @@ async fn a_host_forgotten_mid_rollout_is_skipped_and_can_register_again() {
     let (_, hosts) = h.wait_state(&second, RolloutState::Completed).await;
     assert_eq!(host(&hosts, "a").state, HostPhase::Healthy);
     assert_eq!(host(&hosts, "a").phase, "web");
+}
+
+const THREE_PHASES: &str = "  health: { bake: 30s }\n  phases:\n    - { name: canary, select: 'host.groups contains \"canary\"' }\n    - { name: web, select: 'host.groups contains \"web\"' }\n    - { name: db, select: 'host.groups contains \"db\"' }\n";
+
+/// Three hosts converged on r1 (stable), ready for a rollout of r2 whose
+/// policy appends `extra` to THREE_PHASES' rollout section.
+async fn on_stable_r1(extra: &str) -> Harness {
+    let mut h = Harness::new().await;
+    h.revision("r1", THREE_PHASES).await;
+    h.revision("r2", &format!("{extra}{THREE_PHASES}")).await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.enrol("d1", "db").await;
+    for x in ["c1", "w1", "d1"] {
+        h.connect(x, Some("r0"));
+    }
+    let first = h.start("r1").await;
+    h.wait_state(&first, RolloutState::Completed).await;
+    h
+}
+
+/// `on_failure: rollback` rolls the updated hosts back on its own when the
+/// budget is breached.
+#[tokio::test(start_paused = true)]
+async fn on_failure_rollback_rolls_back_without_an_operator() {
+    let h = on_stable_r1("  on_failure: rollback\n").await;
+    h.script("w1", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r2").await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::RolledBack).await;
+    assert!(r.runtime.pause.is_none());
+    assert_eq!(host(&hosts, "c1").state, HostPhase::RolledBack);
+    assert_eq!(
+        host(&hosts, "d1").state,
+        HostPhase::Planned,
+        "the db phase never started"
+    );
+    assert!(
+        h.applies()
+            .iter()
+            .all(|x| !(x.1 == "d1" && x.2.revision == "r2"))
+    );
+    let rolled: Vec<String> = h
+        .sent(|_, m| matches!(m, SMsg::Rollback(_)))
+        .into_iter()
+        .map(|x| x.1)
+        .collect();
+    assert_eq!(rolled, vec!["w1", "c1"]);
+}
+
+/// `on_failure: continue` records failures without pausing: the rollout
+/// completes with the failed host shown failed.
+#[tokio::test(start_paused = true)]
+async fn on_failure_continue_completes_past_failures() {
+    let h = on_stable_r1("  on_failure: continue\n").await;
+    h.script("w1", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r2").await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(r.runtime.pause.is_none());
+    assert_eq!(host(&hosts, "w1").state, HostPhase::Failed);
+    assert_eq!(host(&hosts, "d1").state, HostPhase::Healthy);
+}
+
+/// Abort stops the rollout where it is: nothing else applies and no
+/// stragglers stage opens.
+#[tokio::test(start_paused = true)]
+async fn abort_stops_the_rollout_where_it_is() {
+    let h = on_stable_r1("").await;
+    h.script("w1", |s| s.silent_apply = true);
+    let id = h.start("r2").await;
+    h.wait(&id, "w1 applying", |_, hs| {
+        host(hs, "w1").state == HostPhase::Applying
+    })
+    .await;
+    h.command(Command::Abort {
+        rollout: id.clone(),
+        note: "wrong change".into(),
+    })
+    .await
+    .unwrap();
+    let (r, _) = h.snapshot(&id).await;
+    assert_eq!(r.state, RolloutState::Aborted);
+    assert!(r.finished_at.is_some());
+    assert!(!r.runtime.stragglers_open);
+    assert!(r.runtime.end_reason.unwrap().contains("aborted by alice"));
+    h.idle(600).await;
+    assert!(
+        h.applies()
+            .iter()
+            .all(|a| a.2.revision != "r2" || a.1 != "d1"),
+        "nothing starts after an abort"
+    );
+    let again = h
+        .command(Command::Abort {
+            rollout: id.clone(),
+            note: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(again.kind, CommandErrorKind::NotFound);
+    assert!(
+        h.audit_actions(&id)
+            .await
+            .contains(&"rollout.abort".to_owned())
+    );
+}
+
+/// A skipped host is excluded from the rollout, including from a rollback;
+/// and a forward result that failed (leaving the host on the previous
+/// revision) is not read as a rollback result.
+#[tokio::test(start_paused = true)]
+async fn rollback_leaves_skipped_hosts_and_ignores_forward_results() {
+    let mut h = Harness::new().await;
+    let policy = "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', parallel: 1, max_failures: 0 }\n";
+    h.revision("r1", policy).await;
+    h.revision("r2", policy).await;
+    for x in ["a", "b", "c"] {
+        h.enrol(x, "web").await;
+        h.connect(x, None);
+    }
+    let first = h.start("r1").await;
+    h.wait_state(&first, RolloutState::Completed).await;
+    h.script("a", |s| s.apply_fail = Some(vec![]));
+    h.script("b", |s| {
+        s.apply_fail = Some(vec![]);
+        s.silent_rollback = true;
+    });
+    let id = h.start("r2").await;
+    h.wait(&id, "a failed and paused", |r, hs| {
+        r.state == RolloutState::Paused && host(hs, "a").state == HostPhase::Failed
+    })
+    .await;
+    h.command(Command::Skip {
+        rollout: id.clone(),
+        host: "a".into(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "b failed and paused", |r, hs| {
+        r.state == RolloutState::Paused && host(hs, "b").state == HostPhase::Failed
+    })
+    .await;
+    h.command(Command::Rollback {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "b rolling back", |_, hs| {
+        host(hs, "b").state == HostPhase::RollingBack
+    })
+    .await;
+    // A late forward result for r2 that left b on r1.
+    h.handle.agent_message(
+        "b",
+        AMsg::Result(ApplyResult {
+            revision: "r2".into(),
+            succeeded: false,
+            applied_revision: "r1".into(),
+            error: "late".into(),
+            ..Default::default()
+        }),
+    );
+    h.idle(5).await;
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(host(&hosts, "b").state, HostPhase::RollingBack);
+    h.handle.agent_message(
+        "b",
+        AMsg::Result(ApplyResult {
+            revision: "r1".into(),
+            succeeded: true,
+            applied_revision: "r1".into(),
+            ..Default::default()
+        }),
+    );
+    let (_, hosts) = h.wait_state(&id, RolloutState::RolledBack).await;
+    assert_eq!(host(&hosts, "b").state, HostPhase::RolledBack);
+    assert_eq!(host(&hosts, "a").state, HostPhase::Skipped);
+    assert!(
+        h.sent(|x, m| x == "a" && matches!(m, SMsg::Rollback(_)))
+            .is_empty(),
+        "a skipped host is not rolled back"
+    );
+}
+
+/// A rollback the agent cannot even plan fails the host (needs attention)
+/// instead of leaving it rolling back for ever.
+#[tokio::test(start_paused = true)]
+async fn a_rollback_that_cannot_be_planned_fails_the_host() {
+    let h = on_stable_r1("").await;
+    h.script("w1", |s| {
+        s.apply_fail = Some(vec![]);
+        s.silent_rollback = true;
+    });
+    let id = h.start("r2").await;
+    h.wait_state(&id, RolloutState::Paused).await;
+    h.command(Command::Rollback {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "w1 rolling back", |_, hs| {
+        host(hs, "w1").state == HostPhase::RollingBack
+    })
+    .await;
+    h.handle.agent_message(
+        "w1",
+        AMsg::Plan(PlanResult {
+            revision: "r1".into(),
+            error: "cannot fetch r1".into(),
+            ..Default::default()
+        }),
+    );
+    let (_, hosts) = h.wait_state(&id, RolloutState::RolledBack).await;
+    let w1 = host(&hosts, "w1");
+    assert_eq!(w1.state, HostPhase::Failed);
+    assert!(
+        w1.runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("rollback failed")
+    );
+}
+
+/// `baseline: skip` excludes an unhealthy host; `baseline: ignore` applies
+/// to it anyway.
+#[rstest::rstest]
+#[case::skip("skip", HostPhase::Skipped)]
+#[case::ignore("ignore", HostPhase::Healthy)]
+#[tokio::test(start_paused = true)]
+async fn the_baseline_policy_skips_or_ignores_an_unhealthy_host(
+    #[case] policy: &str,
+    #[case] expected: HostPhase,
+) {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        &format!("  health: {{ bake: 30s, baseline: {policy} }}\n  phases:\n    - {{ name: web, select: 'true' }}\n"),
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.enrol("b", "web").await;
+    h.script("a", |s| s.baseline_fail = true);
+    h.connect("a", None);
+    h.connect("b", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "a").state, expected);
+    assert_eq!(host(&hosts, "b").state, HostPhase::Healthy);
+    let applied_a = h.applies().iter().any(|x| x.1 == "a");
+    assert_eq!(applied_a, expected == HostPhase::Healthy);
+}
+
+/// Continue waives only checks the host actually failed.
+#[tokio::test(start_paused = true)]
+async fn continue_refuses_to_waive_checks_the_host_did_not_fail() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.apply_fail = Some(vec!["web/http".into()]));
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::Paused).await;
+    let refused = h
+        .command(Command::Continue {
+            rollout: id.clone(),
+            host: "a".into(),
+            waive: vec!["web/http".into(), "db/ping".into()],
+            note: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind, CommandErrorKind::Invalid);
+    assert!(refused.to_string().contains("db/ping"), "{refused}");
+    let (r, _) = h.snapshot(&id).await;
+    assert_eq!(r.state, RolloutState::Paused);
+}
+
+/// Under `if_destructive`, a plan with modules deferred to apply time needs
+/// approval: their plan is unknown and may turn out destructive.
+#[tokio::test(start_paused = true)]
+async fn deferred_modules_need_approval_under_if_destructive() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', parallel: 2, approval: if_destructive }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.enrol("b", "web").await;
+    h.script("a", |s| {
+        s.deferred = vec!["docker_app".into()];
+        s.digest = "plan-deferred".into();
+    });
+    h.connect("a", None);
+    h.connect("b", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "b healthy", |_, hs| {
+        host(hs, "b").state == HostPhase::Healthy
+    })
+    .await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::AwaitingApproval).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Planned);
+    assert!(h.applies().iter().all(|x| x.1 != "a"));
+    let detail = super::view::detail(&r, &hosts, &[], &[]);
+    let a = detail.phases[0]
+        .hosts
+        .iter()
+        .find(|x| x.host == "a")
+        .unwrap();
+    assert!(a.needs_approval);
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "web".into(),
+        digests: vec!["plan-deferred".into(), "plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait_state(&id, RolloutState::Completed).await;
 }

@@ -34,7 +34,11 @@ pub fn needs_approval(
     let required = match phase.approval {
         ApprovalPolicy::Auto => false,
         ApprovalPolicy::Required => true,
-        ApprovalPolicy::IfDestructive => host.runtime.destructive,
+        // A deferred module's plan is only known at apply time, so it may
+        // turn out destructive: the plan is reviewed as if it were.
+        ApprovalPolicy::IfDestructive => {
+            host.runtime.destructive || !host.runtime.deferred_modules.is_empty()
+        }
     };
     if !required {
         return false;

@@ -406,6 +406,12 @@ fn is_failure(r: &pb::HealthResult, waived: &[String]) -> bool {
     r.required && !r.passed && !r.unknown && !waived.contains(&check_name(r))
 }
 
+/// A host a rollback applies the previous stable revision to: one this
+/// rollout sent an Apply, unless an operator excluded (skipped) it.
+fn rollback_target(h: &RolloutHostRecord) -> bool {
+    h.runtime.applied && h.state != HostPhase::Skipped
+}
+
 /// Host states that wait on the agent after a server restart: the
 /// disconnect clock starts for them on load.
 fn awaits_reconnect(state: HostPhase) -> bool {
@@ -925,6 +931,23 @@ impl Controller {
                 continue;
             };
             let h = &self.live[ri].hosts[hi];
+            // The agent could not plan the rollback (it reports a failed
+            // plan for the previous stable revision): the rollback failed.
+            if h.state == HostPhase::RollingBack
+                && !plan.error.is_empty()
+                && self.live[ri].record.runtime.previous_stable.as_deref()
+                    == Some(plan.revision.as_str())
+            {
+                self.live[ri].hosts[hi].runtime.error =
+                    Some(format!("rollback failed: planning failed: {}", plan.error));
+                self.set_host_state(
+                    ri,
+                    hi,
+                    HostPhase::Failed,
+                    "rollback failed; needs attention",
+                );
+                continue;
+            }
             if h.runtime.revision != plan.revision {
                 continue;
             }
@@ -960,6 +983,10 @@ impl Controller {
                 h.runtime.plan_changes = Some(plan.changes);
                 h.runtime.plan_removals = Some(plan.removals);
                 h.runtime.destructive = plan.destructive;
+                h.runtime.deferred_modules = plan.deferred_modules.clone();
+                // A new plan: what failed before no longer describes it.
+                h.runtime.failed_checks.clear();
+                h.runtime.failed_module = None;
                 // A valid plan with modules that could not be planned: shown
                 // on the host; applying it fails those modules only.
                 h.runtime.error = (!plan.module_errors.is_empty()).then(|| {
@@ -1021,10 +1048,10 @@ impl Controller {
                         self.fail_host(ri, hi, &why);
                     }
                 }
-                HostPhase::RollingBack
-                    if prev.as_deref() == Some(result.revision.as_str())
-                        || prev.as_deref() == Some(result.applied_revision.as_str()) =>
-                {
+                // Only the result of applying the previous stable revision is
+                // the rollback's: a forward result that failed and left the
+                // host on that revision (applied_revision) is not.
+                HostPhase::RollingBack if prev.as_deref() == Some(result.revision.as_str()) => {
                     if result.succeeded {
                         self.set_host_state(
                             ri,
@@ -1552,6 +1579,24 @@ impl Controller {
                 if waive.is_empty() {
                     return Err(CommandError::invalid(
                         "Name at least one check (module/check) to waive.",
+                        &["Pass the failed checks shown on the host."],
+                    ));
+                }
+                let unknown: Vec<&String> = waive
+                    .iter()
+                    .filter(|w| !h.runtime.failed_checks.contains(w))
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(CommandError::invalid(
+                        format!(
+                            "Host '{host}' did not fail {}; only its failed checks ({}) can be waived.",
+                            unknown
+                                .iter()
+                                .map(|w| w.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            h.runtime.failed_checks.join(", ")
+                        ),
                         &["Pass the failed checks shown on the host."],
                     ));
                 }
@@ -2088,7 +2133,7 @@ impl Controller {
         let last = self.live[ri]
             .hosts
             .iter()
-            .filter(|h| h.runtime.applied)
+            .filter(|h| rollback_target(h))
             .filter_map(|h| h.runtime.phase_index)
             .max();
         self.live[ri].record.runtime.rollback_phase = last;
@@ -3080,7 +3125,7 @@ impl Controller {
             let targets: Vec<usize> = self.live[ri]
                 .phase_hosts(p)
                 .into_iter()
-                .filter(|&i| self.live[ri].hosts[i].runtime.applied)
+                .filter(|&i| rollback_target(&self.live[ri].hosts[i]))
                 .collect();
             for &hi in &targets {
                 let state = self.live[ri].hosts[hi].state;
@@ -3116,7 +3161,7 @@ impl Controller {
                 self.live[ri]
                     .phase_hosts(q)
                     .iter()
-                    .any(|&i| self.live[ri].hosts[i].runtime.applied)
+                    .any(|&i| rollback_target(&self.live[ri].hosts[i]))
             });
             self.live[ri].dirty = true;
             changed = true;
