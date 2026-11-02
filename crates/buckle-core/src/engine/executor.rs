@@ -1527,7 +1527,7 @@ impl<'a> Executor<'a> {
             deferred = deferred_names.len(),
             "apply finished"
         );
-        Ok(ApplyOutcome {
+        let outcome = ApplyOutcome {
             plan_digest,
             succeeded,
             changes: total_changes,
@@ -1546,7 +1546,12 @@ impl<'a> Executor<'a> {
             removals_run,
             started_at: Some(started_at),
             finished_at: Some(finished_at),
-        })
+        };
+        // For `buckle status`; never fails the apply.
+        if let Err(e) = self.inputs.state.save_last_run(&outcome) {
+            tracing::warn!(error = %e.description(), "the outcome of the run could not be kept for `buckle status`");
+        }
+        Ok(outcome)
     }
 }
 

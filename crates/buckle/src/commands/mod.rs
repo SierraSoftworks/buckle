@@ -35,6 +35,9 @@ pub enum Command {
     Plan(local::PlanArgs),
     /// Apply a configuration directory to this host.
     Apply(local::ApplyArgs),
+    /// Show the last apply on this host: every module and step with its state
+    /// and any errors.
+    Status(local::StatusArgs),
     /// Run the health checks of the modules applied to this host.
     Health(local::HealthArgs),
     /// Print the facts collected about this host as JSON.
@@ -79,6 +82,7 @@ pub async fn run(cli: Cli) -> buckle_core::Result<i32> {
     match cli.command {
         Command::Plan(args) => local::plan(args).await,
         Command::Apply(args) => local::apply(args).await,
+        Command::Status(args) => local::status(args).await,
         Command::Health(args) => local::health(args).await,
         Command::Facts(args) => local::facts(args).await,
         Command::Validate(args) => local::validate(args).await,
