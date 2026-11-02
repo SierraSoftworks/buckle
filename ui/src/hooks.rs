@@ -15,7 +15,7 @@ use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 use crate::api::{self, ApiError};
-use crate::logic::run::{Applied, Watch, follow};
+use crate::logic::run::{Applied, RefetchPolicy, Watch, follow, refetch_key};
 use crate::store::use_live;
 
 /// The state of one fetched resource.
@@ -175,6 +175,32 @@ pub struct RunFeed {
     pub reload: Callback<()>,
 }
 
+/// A fetched answer and the source it answers: a report, or `None` for "no
+/// run yet". An answer counts only for the source it was asked for, so a
+/// "no run yet" from one source does not answer the next.
+type Answer = (Option<RunSource>, Option<RunReport>);
+
+/// Of what a fetch holds, what belongs to the source asked about now: the
+/// answer when it was given for this source, and the error only once this
+/// source's own request has failed (a fetch keeps its last error until a
+/// request succeeds, so an earlier source's error would otherwise show
+/// while this one loads).
+/// What a fetch holds: the live store's sequence number when it was asked,
+/// and the answer tagged with its source.
+type Tagged<S, R> = (u64, (S, R));
+
+fn current<'a, S: PartialEq, R>(
+    source: &S,
+    data: Option<&'a Tagged<S, R>>,
+    error: Option<&'a ApiError>,
+    asked: Option<&S>,
+    loading: bool,
+) -> (Option<&'a Tagged<S, R>>, Option<&'a ApiError>) {
+    let answer = data.filter(|d| d.1.0 == *source);
+    let error = error.filter(|_| !loading && asked == Some(source));
+    (answer, error)
+}
+
 /// Fetches a run report and applies the `run_progress` updates that follow.
 /// It fetches again when an update names something the report does not hold
 /// (or, for a rollout's host, a run other than the one held), and, like
@@ -189,56 +215,59 @@ pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> Run
     let seed =
         seed.filter(|s| matches!(&source, Some(RunSource::Host { run, .. }) if *run == s.id));
     let first = use_mut_ref(|| true);
+    // The source of the newest request, set as it is sent.
+    let asked = use_mut_ref(|| None::<Option<RunSource>>);
     let fetch = {
-        let (first, seed) = (first.clone(), seed.clone());
+        let (first, asked, seed) = (first.clone(), asked.clone(), seed.clone());
         use_fetch(source.clone(), move |source| {
+            *asked.borrow_mut() = Some(source.clone());
             let seeded = std::mem::replace(&mut *first.borrow_mut(), false)
                 .then_some(seed)
                 .flatten();
             async move {
-                if let Some(report) = seeded {
-                    return Ok(Some(report));
-                }
-                match source {
-                    None => Ok(None),
-                    Some(RunSource::Host { host, run }) => {
-                        api::host_run(&host, &run).await.map(Some)
+                let report = match (&source, seeded) {
+                    (_, Some(report)) => Some(report),
+                    (None, None) => None,
+                    (Some(RunSource::Host { host, run }), None) => {
+                        Some(api::host_run(host, run).await?)
                     }
-                    Some(RunSource::Rollout { rollout, host, .. }) => {
-                        match api::rollout_host_report(&rollout, &host).await {
-                            Ok(report) => Ok(Some(report)),
+                    (Some(RunSource::Rollout { rollout, host, .. }), None) => {
+                        match api::rollout_host_report(rollout, host).await {
+                            Ok(report) => Some(report),
                             // No run in this rollout yet.
-                            Err(ApiError::NotFound(_)) => Ok(None),
-                            Err(e) => Err(e),
+                            Err(ApiError::NotFound(_)) => None,
+                            Err(e) => return Err(e),
                         }
                     }
-                }
+                };
+                Ok::<Answer, ApiError>((source, report))
             }
         })
     };
 
-    // While another run is being fetched, the previous answer is not this
-    // source's (a host's runs are fetched by id; a rollout's by host).
-    let answers = |r: &RunReport| match &source {
-        Some(RunSource::Host { host, run }) => r.host == *host && r.id == *run,
-        Some(RunSource::Rollout { host, .. }) => r.host == *host,
-        None => false,
-    };
-    let current = fetch
-        .data
-        .as_ref()
-        .filter(|d| d.1.as_ref().is_none_or(answers));
-    let mut report = match current {
-        Some(data) => data.1.clone(),
+    let asked_for = asked.borrow().clone();
+    let (answer, error) = current(
+        &source,
+        fetch.data.as_deref(),
+        fetch.error.as_ref(),
+        asked_for.as_ref(),
+        fetch.loading,
+    );
+    let mut report = match answer {
+        Some((_, (_, report))) => report.clone(),
         None => seed,
     };
-    let mut stale = false;
-    if let (Some(data), Some(watch)) = (current, source.as_ref().map(RunSource::watch))
-        && let Some(events) = live.log.since(data.0)
+    // The first thing an update asked about that the report could not take.
+    let mut question: Option<String> = None;
+    if let (Some((seq, _)), Some(watch)) = (answer, source.as_ref().map(RunSource::watch))
+        && let Some(events) = live.log.since(*seq)
     {
         for event in events {
-            if let LiveEvent::RunProgress { progress } = &*event {
-                stale |= follow(report.as_mut(), progress, &watch) == Applied::Refetch;
+            if let LiveEvent::RunProgress { progress } = &*event
+                && follow(report.as_mut(), progress, &watch) == Applied::Refetch
+                && question.is_none()
+            {
+                question = Some(refetch_key(report.as_ref(), progress));
             }
         }
     }
@@ -246,22 +275,28 @@ pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> Run
         r.recount();
     }
 
-    // Once per fetched answer: the next answer has a newer sequence number.
-    let stale_at = stale.then(|| current.map(|d| d.0)).flatten();
+    // Fetch again for it: never while a fetch is in flight, and for the
+    // same question as the last fetch (whose answer did not have it yet)
+    // only after a growing wait, so a server slow to learn of a new step is
+    // not asked once per update.
+    let policy = use_mut_ref(RefetchPolicy::default);
     {
-        let reload = fetch.reload.clone();
-        use_effect_with(stale_at, move |at| {
-            if at.is_some() {
-                reload.emit(());
-            }
-            || ()
-        });
+        let (reload, policy) = (fetch.reload.clone(), policy.clone());
+        let at = answer.map(|d| d.0);
+        use_effect_with(
+            (at, question, fetch.loading),
+            move |(_, question, loading)| {
+                let wait = policy.borrow_mut().next(question.as_deref(), *loading);
+                let timer = wait.map(|ms| Timeout::new(ms, move || reload.emit(())));
+                move || drop(timer)
+            },
+        );
     }
 
     RunFeed {
         report,
-        settled: current.is_some(),
-        error: fetch.error.clone(),
+        settled: answer.is_some(),
+        error: error.cloned(),
         reload: fetch.reload.clone(),
     }
 }
@@ -296,4 +331,51 @@ where
         });
     }
     (*settled).clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(
+        seq: u64,
+        source: &'static str,
+        report: Option<u32>,
+    ) -> (u64, (&'static str, Option<u32>)) {
+        (seq, (source, report))
+    }
+
+    #[test]
+    fn an_answer_counts_only_for_the_source_it_was_asked_for() {
+        // "No run yet" for run A is not an answer about run B.
+        let none_for_a = answer(3, "a", None);
+        let (got, _) = current(&"b", Some(&none_for_a), None, Some(&"b"), true);
+        assert_eq!(got, None, "B is still loading");
+        let (got, _) = current(&"a", Some(&none_for_a), None, Some(&"a"), false);
+        assert_eq!(got, Some(&none_for_a));
+        let report_for_b = answer(4, "b", Some(7));
+        let (got, _) = current(&"b", Some(&report_for_b), None, Some(&"b"), false);
+        assert_eq!(got.map(|a| a.1.1), Some(Some(7)));
+    }
+
+    #[test]
+    fn an_error_shows_only_once_this_sources_request_failed() {
+        let failed = ApiError::Server("boom".into());
+        // The render right after the source changed: the request for B has
+        // not been sent yet, and the error is A's.
+        assert_eq!(
+            current::<_, ()>(&"b", None, Some(&failed), Some(&"a"), false).1,
+            None
+        );
+        // B's request is on its way.
+        assert_eq!(
+            current::<_, ()>(&"b", None, Some(&failed), Some(&"b"), true).1,
+            None
+        );
+        // B's request failed.
+        assert_eq!(
+            current::<_, ()>(&"b", None, Some(&failed), Some(&"b"), false).1,
+            Some(&failed)
+        );
+    }
 }

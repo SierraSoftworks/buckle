@@ -325,12 +325,14 @@ pub fn host_error_tone(entry: &RolloutHost) -> Tone {
 /// A rollout host's error in one line, for a tooltip: the structured
 /// headline when there is one, the reported string otherwise.
 pub fn host_error_headline(entry: &RolloutHost) -> Option<String> {
+    let said = |e: &&str| !e.trim().is_empty();
     entry
         .error_detail
         .as_ref()
-        .map(|e| e.message.clone())
-        .or_else(|| entry.error.clone())
-        .filter(|e| !e.trim().is_empty())
+        .map(|e| e.message.as_str())
+        .filter(said)
+        .or_else(|| entry.error.as_deref().filter(said))
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -501,6 +503,11 @@ mod tests {
         assert_eq!(host_error_headline(&e).as_deref(), Some("a: b: c"));
         e.error_detail = Some(buckle_api::ErrorView::user("nomad failed"));
         assert_eq!(host_error_headline(&e).as_deref(), Some("nomad failed"));
+        // A structured error with nothing to say does not hide the string.
+        e.error_detail = Some(buckle_api::ErrorView::user("  "));
+        assert_eq!(host_error_headline(&e).as_deref(), Some("a: b: c"));
+        e.error = Some(String::new());
+        assert_eq!(host_error_headline(&e), None);
         assert_eq!(error_kind_label(ErrorKind::User), "user");
         assert_eq!(error_kind_label(ErrorKind::System), "system");
         assert_ne!(

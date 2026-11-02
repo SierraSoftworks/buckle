@@ -517,6 +517,15 @@
   }
 }
 
+.run-picker__error {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem 0.4rem;
+  color: var(--warn);
+  font-size: 0.8rem;
+}
+
 @media (max-width: $small) {
   // The name takes the line; the count and time follow it, together.
   .run-module__row {

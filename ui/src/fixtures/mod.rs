@@ -18,6 +18,7 @@
 //! | `live` | the active rollout moves on by itself through the live event path, and pi-4's run advances step by step (`run_progress`) until it succeeds |
 //! | `awaiting` | the active rollout has finished its home phase and is held at the cloud gate, awaiting approval (so it can be rejected) |
 //! | `empty` | an empty fleet with no rollouts, to see the empty states |
+//! | `runs=fail` | listing a host's runs fails, so the run picker says so |
 //!
 //! The choice is remembered for the tab (`sessionStorage`), so a reload or a
 //! deep link opened in the same tab stays in demo mode; `?demo=off` leaves.

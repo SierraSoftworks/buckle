@@ -10,6 +10,7 @@ use buckle_api::{
 };
 use chrono::{DateTime, Utc};
 
+use super::live::EventLog;
 use super::tone::Tone;
 
 pub fn run_label(state: RunState) -> &'static str {
@@ -213,13 +214,31 @@ pub fn current_step(m: &ModuleReport) -> Option<&StepReport> {
 }
 
 /// The step's key without its kind, since the kind is shown beside it:
-/// `file.template[/etc/x]` → `/etc/x`. An id of another shape is kept whole.
+/// `file.template[/etc/x]` → `/etc/x`, and a removal's resource without
+/// its module too: `nomad/file.copy[/etc/x]` → `/etc/x`. An id of another
+/// shape is kept whole.
 pub fn step_key<'a>(kind: &str, id: &'a str) -> &'a str {
-    id.strip_prefix(kind)
-        .and_then(|rest| rest.strip_prefix('['))
-        .and_then(|rest| rest.strip_suffix(']'))
-        .filter(|key| !key.is_empty())
+    let bare = |id: &'a str| {
+        id.strip_prefix(kind)
+            .and_then(|rest| rest.strip_prefix('['))
+            .and_then(|rest| rest.strip_suffix(']'))
+            .filter(|key| !key.is_empty())
+    };
+    bare(id)
+        .or_else(|| {
+            id.split_once('/')
+                .filter(|(module, _)| !module.contains('['))
+                .and_then(|(_, rest)| bare(rest))
+        })
         .unwrap_or(id)
+}
+
+/// The module of a removal's resource (`nomad/file.copy[/etc/x]` → `nomad`).
+pub fn resource_module(resource: &str) -> Option<&str> {
+    resource
+        .split_once('/')
+        .map(|(module, _)| module)
+        .filter(|module| !module.is_empty() && !module.contains('['))
 }
 
 /// How long something took, or has been running so far: the reported
@@ -324,12 +343,22 @@ fn fresh(step: StepState) -> bool {
 
 fn apply_step(s: &mut StepReport, p: &RunProgress) {
     if let Some(state) = p.step_state {
-        if state == StepState::Running && s.state != StepState::Running {
-            s.started_at = Some(p.at);
-            s.finished_at = None;
-            s.duration_ms = None;
-        } else if !fresh(state) && s.finished_at.is_none() {
-            s.finished_at = Some(p.at);
+        match state {
+            // Started (again): the last attempt's times are not this one's.
+            StepState::Running if s.state != StepState::Running => {
+                s.started_at = Some(p.at);
+                s.finished_at = None;
+                s.duration_ms = None;
+            }
+            StepState::Running => {}
+            // Planned again: it has not run yet.
+            StepState::Pending => {
+                s.started_at = None;
+                s.finished_at = None;
+                s.duration_ms = None;
+            }
+            _ if s.finished_at.is_none() => s.finished_at = Some(p.at),
+            _ => {}
         }
         s.state = state;
     }
@@ -347,15 +376,21 @@ fn apply_module(m: &mut ModuleReport, p: &RunProgress, own_error: bool) {
     let Some(state) = p.module_state else {
         return;
     };
-    if state == ModuleState::Running && m.state != ModuleState::Running {
-        m.started_at.get_or_insert(p.at);
-        m.finished_at = None;
-    } else if !matches!(
-        state,
-        ModuleState::Pending | ModuleState::Running | ModuleState::Deferred
-    ) && m.finished_at.is_none()
-    {
-        m.finished_at = Some(p.at);
+    match state {
+        // Started (again), as for a step: a retry's time is its own.
+        ModuleState::Running if m.state != ModuleState::Running => {
+            m.started_at = Some(p.at);
+            m.finished_at = None;
+            m.duration_ms = None;
+        }
+        ModuleState::Running => {}
+        ModuleState::Pending | ModuleState::Deferred => {
+            m.started_at = None;
+            m.finished_at = None;
+            m.duration_ms = None;
+        }
+        _ if m.finished_at.is_none() => m.finished_at = Some(p.at),
+        _ => {}
     }
     m.state = state;
     if own_error {
@@ -408,7 +443,9 @@ pub fn apply_progress(report: &mut RunReport, p: &RunProgress) -> Applied {
             {
                 // A step started before the module's own update arrived.
                 m.state = ModuleState::Running;
-                m.started_at.get_or_insert(p.at);
+                m.started_at = Some(p.at);
+                m.finished_at = None;
+                m.duration_ms = None;
             }
             m.changes = m
                 .steps
@@ -442,7 +479,9 @@ pub fn apply_progress(report: &mut RunReport, p: &RunProgress) -> Applied {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Watch {
     pub host: String,
-    /// Only the run of this rollout (a rollout page's host drawer).
+    /// Only the run of this rollout (a rollout page's host drawer): an
+    /// update must name it, since a run outside any rollout (drift
+    /// correction, a local rollback) on the same host names none.
     pub rollout: Option<String>,
     /// An update about another run of the host means the one held is no
     /// longer the one to show (a retry started a new run), so fetch again.
@@ -456,15 +495,100 @@ pub fn follow(held: Option<&mut RunReport>, p: &RunProgress, watch: &Watch) -> A
     if p.host != watch.host {
         return Applied::Ignored;
     }
-    if let (Some(want), Some(got)) = (&watch.rollout, &p.rollout_id)
-        && want != got
-    {
+    if watch.rollout.is_some() && p.rollout_id != watch.rollout {
         return Applied::Ignored;
     }
     match held {
         Some(report) if report.id == p.run_id => apply_progress(report, p),
         _ if watch.follow => Applied::Refetch,
         _ => Applied::Ignored,
+    }
+}
+
+/// Keeps a host's list of runs current from the updates after `base` (the
+/// sequence number the list was fetched at; `None` when it never loaded, so
+/// every update still in the log counts), and returns the sequence number
+/// of the newest update about a run the list does not hold. A caller fetches
+/// the list again for it, and, should that fail, again on the next such
+/// update, whose number is higher.
+pub fn follow_run_list(
+    list: &mut [RunSummary],
+    host: &str,
+    base: Option<u64>,
+    log: &EventLog,
+) -> Option<u64> {
+    let from = base.unwrap_or_else(|| log.oldest());
+    let events = log.since(from)?;
+    let mut newest = None;
+    for (i, event) in events.iter().enumerate() {
+        if let LiveEvent::RunProgress { progress } = &**event
+            && !apply_run_list(list, host, progress)
+        {
+            newest = Some(from + 1 + i as u64);
+        }
+    }
+    newest
+}
+
+/// What an update the report cannot take is about, so that the same
+/// question is not asked again before the last answer is in: the run, when
+/// it is not the run held (or none is); the module, when the report does
+/// not have it (a deferred module just planned, all its steps new); the
+/// step otherwise.
+pub fn refetch_key(held: Option<&RunReport>, p: &RunProgress) -> String {
+    let step = p.step.as_deref().unwrap_or("");
+    match (held, &p.module) {
+        (Some(r), Some(m)) if r.id == p.run_id => {
+            if r.modules.iter().any(|x| x.name == *m) {
+                format!("{}|{m}|{step}", p.run_id)
+            } else {
+                format!("{}|{m}", p.run_id)
+            }
+        }
+        (Some(r), None) if r.id == p.run_id => format!("{}||{step}", p.run_id),
+        _ => p.run_id.clone(),
+    }
+}
+
+/// How long to wait before fetching a report again for the `attempt`th
+/// time about the same thing: at once the first time, then half a second,
+/// doubling up to fifteen seconds.
+pub fn refetch_delay(attempt: u32) -> u32 {
+    match attempt {
+        0 => 0,
+        n => (500u32 << (n - 1).min(5)).min(15_000),
+    }
+}
+
+/// Paces the refetches a report's updates ask for, so a server that is
+/// slow to learn of a new step is not asked once per update: nothing while
+/// a fetch is in flight, the first fetch for a question at once, and the
+/// same question again (the last answer did not have it yet) only after a
+/// growing wait.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefetchPolicy {
+    last: Option<String>,
+    attempts: u32,
+}
+
+impl RefetchPolicy {
+    /// Milliseconds to wait before fetching again for `question`, or `None`
+    /// to not fetch (nothing to ask, or a fetch is in flight).
+    pub fn next(&mut self, question: Option<&str>, in_flight: bool) -> Option<u32> {
+        if in_flight {
+            return None;
+        }
+        let Some(question) = question else {
+            *self = Self::default();
+            return None;
+        };
+        if self.last.as_deref() == Some(question) {
+            self.attempts += 1;
+        } else {
+            self.last = Some(question.to_string());
+            self.attempts = 0;
+        }
+        Some(refetch_delay(self.attempts))
     }
 }
 
@@ -571,46 +695,161 @@ pub fn track(current: Option<Activity>, p: &RunProgress) -> Option<Activity> {
     }
 }
 
-/// What each host of a rollout is doing, described for its block: from the
-/// reports held, kept current by the updates since, and from the updates
-/// alone for hosts without one. (A plain list while it is built: a rollout
-/// applies a handful of hosts at once, and the bundle is smaller for it.)
-pub fn activities<'a>(
-    mut reports: Vec<RunReport>,
-    rollout: &str,
-    events: impl IntoIterator<Item = &'a LiveEvent>,
-) -> BTreeMap<String, String> {
-    let mut tracked: Vec<(String, Option<Activity>)> = reports
-        .iter()
-        .map(|r| (r.host.clone(), activity(r)))
-        .collect();
-    for event in events {
-        let LiveEvent::RunProgress { progress: p } = event else {
-            continue;
-        };
-        if p.rollout_id.as_deref().is_some_and(|r| r != rollout) {
-            continue;
+/// One applying host's report, held by a rollout page and kept current in
+/// place by the updates that follow it.
+#[derive(Debug, Clone, PartialEq)]
+struct Held {
+    host: String,
+    /// The live store's sequence number the report reflects updates up to.
+    seq: u64,
+    report: RunReport,
+    /// What the host is doing: from the report while it can take the
+    /// updates, from the updates alone when one names something it lacks.
+    now: Option<Activity>,
+}
+
+/// What the hosts of a rollout are doing, for their blocks: the report of
+/// each applying host, fetched once and then kept current by the updates
+/// (applied in place, never copied), and the updates alone for a host whose
+/// report is not held. A report that cannot take an update (a module it
+/// lacks) is not fetched again: the updates carry on from there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RolloutActivity {
+    rollout: String,
+    epoch: u64,
+    /// The last update looked at for the hosts not held.
+    seq: u64,
+    held: Vec<Held>,
+    /// Hosts known only from their updates.
+    loose: Vec<(String, Option<Activity>)>,
+    /// Hosts whose report is being fetched.
+    asking: Vec<String>,
+    /// Hosts the server had no report for: not asked again while they apply.
+    unanswered: Vec<String>,
+}
+
+impl RolloutActivity {
+    /// Brings everything up to the log's newest update. A rollout or an
+    /// epoch (a reconnection, a lag) of its own starts over; hosts that are
+    /// no longer applying are let go; a report whose updates were dropped
+    /// from the log is let go too, to be fetched again.
+    pub fn sync(&mut self, rollout: &str, epoch: u64, applying: &[String], log: &EventLog) {
+        if self.rollout != rollout || self.epoch != epoch {
+            *self = Self {
+                rollout: rollout.to_string(),
+                epoch,
+                seq: log.seq,
+                ..Self::default()
+            };
         }
-        let slot = match tracked.iter().position(|(h, _)| *h == p.host) {
-            Some(i) => i,
-            None => {
-                tracked.push((p.host.clone(), None));
-                tracked.len() - 1
+        self.held.retain(|h| applying.contains(&h.host));
+        self.loose.retain(|(h, _)| applying.contains(h));
+        self.unanswered.retain(|h| applying.contains(h));
+        let rollout = &self.rollout;
+        self.held.retain_mut(|h| {
+            let Some(events) = log.since(h.seq) else {
+                return false;
+            };
+            for event in events {
+                if let LiveEvent::RunProgress { progress: p } = &*event
+                    && p.host == h.host
+                    && p.rollout_id.as_deref() == Some(rollout.as_str())
+                {
+                    h.now = match apply_progress(&mut h.report, p) {
+                        Applied::Changed => activity(&h.report),
+                        _ => track(h.now.take(), p),
+                    };
+                }
             }
-        };
-        let held = reports
-            .iter_mut()
-            .find(|r| r.host == p.host && r.id == p.run_id);
-        let now = match held.map(|report| (apply_progress(report, p), report)) {
-            Some((Applied::Changed, report)) => activity(report),
-            _ => track(tracked[slot].1.take(), p),
-        };
-        tracked[slot].1 = now;
+            h.seq = log.seq;
+            true
+        });
+        match log.since(self.seq) {
+            None => self.loose.clear(),
+            Some(events) => {
+                for event in events {
+                    let LiveEvent::RunProgress { progress: p } = &*event else {
+                        continue;
+                    };
+                    if p.rollout_id.as_deref() != Some(rollout.as_str())
+                        || !applying.contains(&p.host)
+                        || self.held.iter().any(|h| h.host == p.host)
+                    {
+                        continue;
+                    }
+                    match self.loose.iter_mut().find(|(h, _)| *h == p.host) {
+                        Some((_, now)) => *now = track(now.take(), p),
+                        None => self.loose.push((p.host.clone(), track(None, p))),
+                    }
+                }
+            }
+        }
+        self.seq = log.seq;
     }
-    tracked
-        .into_iter()
-        .filter_map(|(host, a)| a.map(|a| (host, a.describe())))
-        .collect()
+
+    /// The applying hosts to fetch a report for, at most `max` in all held
+    /// or being fetched: neither held, nor being fetched, nor known to have
+    /// none.
+    pub fn to_ask(&self, applying: &[String], max: usize) -> Vec<String> {
+        let room = max.saturating_sub(self.held.len() + self.asking.len());
+        applying
+            .iter()
+            .filter(|h| {
+                !self.held.iter().any(|x| x.host == **h)
+                    && !self.asking.contains(h)
+                    && !self.unanswered.contains(h)
+            })
+            .take(room)
+            .cloned()
+            .collect()
+    }
+
+    /// Notes that these hosts' reports are being fetched.
+    pub fn asking(&mut self, hosts: &[String]) {
+        self.asking.extend(hosts.iter().cloned());
+    }
+
+    /// Takes the answers to a fetch made at `seq` in `epoch`: the reports,
+    /// to be brought up to date by the next [`RolloutActivity::sync`], and
+    /// the hosts without one. Answers from an earlier epoch are dropped.
+    pub fn answered(
+        &mut self,
+        epoch: u64,
+        seq: u64,
+        answers: impl IntoIterator<Item = (String, Option<RunReport>)>,
+    ) {
+        for (host, report) in answers {
+            self.asking.retain(|h| *h != host);
+            if epoch != self.epoch {
+                continue;
+            }
+            match report {
+                Some(report) => {
+                    self.loose.retain(|(h, _)| *h != host);
+                    self.held.retain(|h| h.host != host);
+                    self.held.push(Held {
+                        now: activity(&report),
+                        host,
+                        seq,
+                        report,
+                    });
+                }
+                None if !self.unanswered.contains(&host) => self.unanswered.push(host),
+                None => {}
+            }
+        }
+    }
+
+    /// What each host is doing, described for its block
+    /// (`nomad › file.template[…]`).
+    pub fn describe(&self) -> BTreeMap<String, String> {
+        self.held
+            .iter()
+            .map(|h| (h.host.as_str(), h.now.as_ref()))
+            .chain(self.loose.iter().map(|(h, a)| (h.as_str(), a.as_ref())))
+            .filter_map(|(host, a)| a.map(|a| (host.to_string(), a.describe())))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -794,6 +1033,22 @@ pub(crate) mod tests {
         assert_eq!(step_key("apt.package", "apt.package[ufw, jq]"), "ufw, jq");
         assert_eq!(step_key("file.copy", "restart"), "restart");
         assert_eq!(step_key("file.copy", "file.copy[]"), "file.copy[]");
+        // A removal's resource names its module first.
+        assert_eq!(
+            step_key("file.copy", "nomad/file.copy[/etc/nomad.d/client.hcl]"),
+            "/etc/nomad.d/client.hcl"
+        );
+        assert_eq!(
+            resource_module("nomad/file.copy[/etc/nomad.d/client.hcl]"),
+            Some("nomad")
+        );
+        // A key with slashes is not mistaken for a module.
+        assert_eq!(step_key("file.copy", "file.copy[/etc/a/b]"), "/etc/a/b");
+        assert_eq!(resource_module("file.copy[/etc/a/b]"), None);
+        assert_eq!(
+            step_key("file.copy", "other/apt.package[x]"),
+            "other/apt.package[x]"
+        );
     }
 
     #[test]
@@ -911,6 +1166,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_retry_times_itself_afresh() {
+        let mut r = live_report();
+        let earlier = Utc::now() - chrono::Duration::minutes(5);
+        {
+            let m = &mut r.modules[1];
+            m.state = ModuleState::Failed;
+            m.started_at = Some(earlier);
+            m.finished_at = Some(earlier + chrono::Duration::seconds(40));
+            m.duration_ms = Some(40_000);
+            let s = &mut m.steps[0];
+            s.state = StepState::Failed;
+            s.started_at = Some(earlier);
+            s.finished_at = Some(earlier + chrono::Duration::seconds(30));
+            s.duration_ms = Some(30_000);
+        }
+        // The module is retried: its own times start again, so a duration
+        // computed while it runs is this attempt's, not the last one's.
+        let mut p = progress(Some("nomad"), None);
+        p.module_state = Some(ModuleState::Running);
+        apply_progress(&mut r, &p);
+        let m = &r.modules[1];
+        assert_eq!(m.started_at, Some(p.at));
+        assert_eq!((m.finished_at, m.duration_ms), (None, None));
+        assert_eq!(
+            elapsed_ms(m.duration_ms, m.started_at, m.finished_at, p.at, true),
+            Some(0)
+        );
+
+        // Its failed step is planned again, then runs again.
+        let mut q = progress(Some("nomad"), Some("file.copy[b]"));
+        q.step_state = Some(StepState::Pending);
+        apply_progress(&mut r, &q);
+        let s = &r.modules[1].steps[0];
+        assert_eq!(
+            (s.started_at, s.finished_at, s.duration_ms),
+            (None, None, None)
+        );
+        q.step_state = Some(StepState::Running);
+        apply_progress(&mut r, &q);
+        assert_eq!(r.modules[1].steps[0].started_at, Some(q.at));
+
+        // A module planned again has not started.
+        let mut d = progress(Some("nomad"), None);
+        d.module_state = Some(ModuleState::Pending);
+        apply_progress(&mut r, &d);
+        assert_eq!(r.modules[1].started_at, None);
+    }
+
+    #[test]
     fn module_handler_removal_and_run_updates_land_where_they_belong() {
         let mut r = live_report();
         let mut p = progress(Some("nomad"), Some("file.copy[restart]"));
@@ -997,9 +1301,13 @@ pub(crate) mod tests {
         assert_eq!(follow(Some(&mut r), &p, &watch), Applied::Refetch);
         // The host had no run yet: now it has one.
         assert_eq!(follow(None, &p, &watch), Applied::Refetch);
-        // Another rollout's run, or another host's, is not this view's.
+        // Another rollout's run, or another host's, is not this view's, and
+        // nor is a run outside any rollout on the same host.
         p.rollout_id = Some("43".into());
         assert_eq!(follow(None, &p, &watch), Applied::Ignored);
+        p.rollout_id = None;
+        assert_eq!(follow(None, &p, &watch), Applied::Ignored);
+        assert_eq!(follow(Some(&mut r), &p, &watch), Applied::Ignored);
         p.rollout_id = Some("42".into());
         p.host = "pi-2".into();
         assert_eq!(follow(None, &p, &watch), Applied::Ignored);
@@ -1012,6 +1320,97 @@ pub(crate) mod tests {
         let mut p = progress(None, None);
         p.run_id = "run-2".into();
         assert_eq!(follow(Some(&mut r), &p, &pinned), Applied::Ignored);
+    }
+
+    #[test]
+    fn a_run_list_names_the_newest_update_about_a_run_it_lacks() {
+        let summary = |id: &str| RunSummary {
+            id: id.into(),
+            state: Some(RunState::Running),
+            revision: "r".into(),
+            plan_digest: "d".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            outcome: "running".into(),
+            changes: 0,
+            removals: 0,
+            error: None,
+            trace_id: None,
+            trace_url: None,
+        };
+        let on = |host: &str, run: &str, state: RunState| LiveEvent::RunProgress {
+            progress: RunProgress {
+                host: host.into(),
+                run_id: run.into(),
+                run_state: state,
+                ..progress(None, None)
+            },
+        };
+        let mut log = EventLog::default();
+        log.push(on("pi-1", "run-1", RunState::Succeeded)); // 1
+        let fetched_at = log.seq;
+        log.push(on("pi-1", "run-1", RunState::Succeeded)); // 2
+        log.push(on("pi-1", "run-2", RunState::Running)); // 3: a new run
+        log.push(on("pi-2", "run-9", RunState::Running)); // 4: another host
+        let mut list = vec![summary("run-1")];
+        assert_eq!(
+            follow_run_list(&mut list, "pi-1", Some(fetched_at), &log),
+            Some(3)
+        );
+        assert_eq!(list[0].state, Some(RunState::Succeeded));
+        // The fetch for it failed (the list is as it was): the next update
+        // about the new run is a later one, so it is tried again then.
+        log.push(on("pi-1", "run-2", RunState::Running)); // 5
+        let mut list = vec![summary("run-1")];
+        assert_eq!(
+            follow_run_list(&mut list, "pi-1", Some(fetched_at), &log),
+            Some(5)
+        );
+        // A list that never loaded counts every update still held.
+        assert_eq!(follow_run_list(&mut [], "pi-1", None, &log), Some(5));
+        assert_eq!(follow_run_list(&mut [], "pi-3", None, &log), None);
+        // A list fetched after the new run is known has nothing to fetch for.
+        let mut list = vec![summary("run-2"), summary("run-1")];
+        assert_eq!(
+            follow_run_list(&mut list, "pi-1", Some(fetched_at), &log),
+            None
+        );
+    }
+
+    #[test]
+    fn a_refetch_question_names_the_run_module_or_step() {
+        let r = live_report();
+        let mut p = progress(Some("nomad"), Some("file.copy[zz]"));
+        assert_eq!(refetch_key(Some(&r), &p), "run-1|nomad|file.copy[zz]");
+        // Every step of a module the report lacks is one question.
+        p.module = Some("otel".into());
+        assert_eq!(refetch_key(Some(&r), &p), "run-1|otel");
+        p.step = Some("apt.package[otel]".into());
+        assert_eq!(refetch_key(Some(&r), &p), "run-1|otel");
+        // Another run, or none held: the run is the question.
+        p.run_id = "run-2".into();
+        assert_eq!(refetch_key(Some(&r), &p), "run-2");
+        assert_eq!(refetch_key(None, &p), "run-2");
+    }
+
+    #[test]
+    fn refetches_wait_for_the_last_answer_and_then_back_off() {
+        let mut policy = RefetchPolicy::default();
+        // The first time, at once; never while a fetch is in flight.
+        assert_eq!(policy.next(Some("run-1|otel"), false), Some(0));
+        assert_eq!(policy.next(Some("run-1|otel"), true), None);
+        assert_eq!(policy.next(Some("run-1|otel"), true), None);
+        // The answer still lacked it: wait, longer each time, up to a cap.
+        assert_eq!(policy.next(Some("run-1|otel"), false), Some(500));
+        assert_eq!(policy.next(Some("run-1|otel"), false), Some(1_000));
+        for _ in 0..10 {
+            policy.next(Some("run-1|otel"), false);
+        }
+        assert_eq!(policy.next(Some("run-1|otel"), false), Some(15_000));
+        // A new question is asked at once; an answered one starts over.
+        assert_eq!(policy.next(Some("run-2"), false), Some(0));
+        assert_eq!(policy.next(None, false), None);
+        assert_eq!(policy.next(Some("run-2"), false), Some(0));
     }
 
     #[test]
@@ -1094,29 +1493,159 @@ pub(crate) mod tests {
         assert_eq!(track(a, &end), None);
     }
 
-    #[test]
-    fn a_rollouts_hosts_report_what_they_are_doing() {
-        let held = live_report();
-        let event = |host: &str, run: &str, rollout: &str, step: &str| LiveEvent::RunProgress {
+    fn update(
+        host: &str,
+        run: &str,
+        rollout: Option<&str>,
+        step: &str,
+        state: StepState,
+    ) -> LiveEvent {
+        LiveEvent::RunProgress {
             progress: RunProgress {
                 host: host.into(),
                 run_id: run.into(),
-                rollout_id: Some(rollout.into()),
-                step_state: Some(StepState::Running),
+                rollout_id: rollout.map(Into::into),
+                step_state: Some(state),
                 ..progress(Some("nomad"), Some(step))
             },
-        };
-        let events = [
-            event("pi-1", "run-1", "42", "file.copy[c]"),
-            event("pi-2", "run-7", "42", "apt.package[nomad]"),
-            event("pi-3", "run-8", "41", "apt.package[nomad]"),
-        ];
-        let map = activities(vec![held], "42", &events);
-        // pi-1's held report was moved on by the update: two steps running,
-        // the first is named.
+        }
+    }
+
+    fn hosts(list: &[&str]) -> Vec<String> {
+        list.iter().map(|h| h.to_string()).collect()
+    }
+
+    #[test]
+    fn a_rollouts_hosts_report_what_they_are_doing() {
+        let mut log = EventLog::default();
+        let applying = hosts(&["pi-1", "pi-2", "pi-3", "pi-4"]);
+        let mut a = RolloutActivity::default();
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.to_ask(&applying, 24), applying, "nothing held yet");
+        a.asking(&applying);
+        assert!(a.to_ask(&applying, 24).is_empty(), "being fetched");
+
+        // The fetch was made at sequence 0; updates arrive meanwhile.
+        log.push(update(
+            "pi-1",
+            "run-1",
+            Some("42"),
+            "file.copy[c]",
+            StepState::Running,
+        ));
+        log.push(update(
+            "pi-2",
+            "run-7",
+            Some("42"),
+            "apt.package[nomad]",
+            StepState::Running,
+        ));
+        log.push(update(
+            "pi-3",
+            "run-8",
+            Some("41"),
+            "apt.package[nomad]",
+            StepState::Running,
+        ));
+        log.push(update(
+            "pi-4",
+            "run-9",
+            None,
+            "apt.package[nomad]",
+            StepState::Running,
+        ));
+        a.sync("42", 0, &applying, &log);
+        a.answered(
+            0,
+            0,
+            [
+                ("pi-1".to_string(), Some(live_report())),
+                ("pi-2".to_string(), None),
+                ("pi-3".to_string(), None),
+                ("pi-4".to_string(), None),
+            ],
+        );
+        a.sync("42", 0, &applying, &log);
+        let map = a.describe();
+        // pi-1's report took the update made while it was fetched: two
+        // steps running, the first is named.
         assert_eq!(map["pi-1"], "nomad › file.copy[b]");
+        // pi-2 has no report: its updates alone say what it does.
         assert_eq!(map["pi-2"], "nomad › apt.package[nomad]");
-        assert!(!map.contains_key("pi-3"), "another rollout's host");
+        assert!(!map.contains_key("pi-3"), "another rollout's run");
+        assert!(!map.contains_key("pi-4"), "a run outside any rollout");
+        // Nobody is asked about twice: held, or known to have no report.
+        assert!(a.to_ask(&applying, 24).is_empty());
+
+        // The held report is kept current in place.
+        log.push(update(
+            "pi-1",
+            "run-1",
+            Some("42"),
+            "file.copy[b]",
+            StepState::Changed,
+        ));
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.describe()["pi-1"], "nomad › file.copy[c]");
+        // An update it cannot take (a step it lacks) is followed alone,
+        // without fetching it again.
+        log.push(update(
+            "pi-1",
+            "run-1",
+            Some("42"),
+            "file.copy[new]",
+            StepState::Running,
+        ));
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.describe()["pi-1"], "nomad › file.copy[new]");
+        assert!(a.to_ask(&applying, 24).is_empty());
+    }
+
+    #[test]
+    fn rollout_activity_lets_go_of_what_it_can_no_longer_vouch_for() {
+        let mut log = EventLog::default();
+        let applying = hosts(&["pi-1", "pi-2"]);
+        let mut a = RolloutActivity::default();
+        a.sync("42", 0, &applying, &log);
+        a.asking(&applying);
+        a.answered(
+            0,
+            0,
+            [
+                ("pi-1".to_string(), Some(live_report())),
+                ("pi-2".to_string(), None),
+            ],
+        );
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.to_ask(&applying, 24), Vec::<String>::new());
+        assert_eq!(
+            a.to_ask(&hosts(&["pi-1", "pi-2", "pi-5"]), 1),
+            Vec::<String>::new(),
+            "one report held, at most one"
+        );
+        assert_eq!(
+            a.to_ask(&hosts(&["pi-1", "pi-2", "pi-5"]), 24),
+            hosts(&["pi-5"])
+        );
+
+        // A host that stopped applying is let go, and asked about afresh if
+        // it applies again.
+        a.sync("42", 0, &hosts(&["pi-1"]), &log);
+        assert_eq!(a.to_ask(&applying, 24), hosts(&["pi-2"]));
+
+        // Updates dropped from the log: the report is fetched again.
+        for _ in 0..EventLog::CAPACITY + 1 {
+            log.push(update("pi-9", "run-0", Some("42"), "x", StepState::Running));
+        }
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.to_ask(&applying, 24), applying);
+
+        // A new epoch starts over, and an answer from the old one is dropped.
+        a.asking(&applying);
+        a.sync("42", 1, &applying, &log);
+        a.answered(0, 0, [("pi-1".to_string(), Some(live_report()))]);
+        assert!(a.describe().is_empty());
+        assert_eq!(a.to_ask(&applying, 24), applying);
     }
 
     #[test]

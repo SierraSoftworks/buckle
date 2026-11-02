@@ -210,6 +210,14 @@ impl EventLog {
         }
     }
 
+    /// The sequence number just before the oldest event still held: what
+    /// [`EventLog::since`] takes to return everything it has.
+    pub fn oldest(&self) -> u64 {
+        self.entries
+            .front()
+            .map_or(self.seq, |(seq, _)| seq.saturating_sub(1))
+    }
+
     /// The events after `seq`, oldest first, or `None` when some of them have
     /// already been dropped and the caller must fetch afresh.
     pub fn since(&self, seq: u64) -> Option<Vec<Rc<LiveEvent>>> {
@@ -638,6 +646,11 @@ mod tests {
             log.push(ev());
         }
         assert_eq!(log.since(1), None, "events 2 and 3 were dropped");
+        assert_eq!(
+            log.since(log.oldest()).map(|v| v.len()),
+            Some(EventLog::CAPACITY),
+            "everything still held"
+        );
         assert_eq!(log.since(log.seq - 1).map(|v| v.len()), Some(1));
     }
 
