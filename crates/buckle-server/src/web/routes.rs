@@ -500,6 +500,7 @@ fn resources(row: Option<crate::store::RolloutHostRecord>) -> Vec<ResourceSummar
 }
 
 fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
+    let running = r.is_running();
     RunSummary {
         state: Some(crate::views::run_state(&r, true)),
         id: r.id,
@@ -507,7 +508,13 @@ fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
         revision: r.revision,
         plan_digest: r.plan_digest,
         started_at: r.started_at,
-        finished_at: r.finished_at,
+        // A run in progress has no duration yet: the UI reads
+        // finished_at <= started_at as such.
+        finished_at: if running {
+            r.started_at
+        } else {
+            r.finished_at
+        },
         outcome: r.outcome,
         changes: r.changes,
         removals: r.removals,
@@ -589,7 +596,8 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
             Ok((
                 db.hosts().latest_facts(&id)?,
                 db.rollouts().latest_healthy_for_host(&id)?,
-                db.runs().for_host(&id, 20)?,
+                // Newest first, the run in progress included.
+                db.runs().page(&id, None, 20)?.0,
                 db.health().for_host(&id, 100)?,
                 db.drift().for_host(&id)?,
                 db.runs().latest_for_host(&id)?,

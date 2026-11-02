@@ -299,11 +299,7 @@ fn apply_event(report: &mut RunReport, event: &ApplyEvent, at: DateTime<Utc>) {
             summary,
         } => {
             let id = if id.is_empty() { task_id } else { id };
-            let m = module_mut(report, module);
-            if *changed {
-                m.changes += 1;
-            }
-            let s = step_mut(m, id, kind);
+            let s = step_mut(module_mut(report, module), id, kind);
             s.result = Some(summary.clone());
             finish_step(
                 s,
@@ -406,7 +402,6 @@ fn apply_outcome(report: &mut RunReport, outcome: &ApplyOutcome) {
     for mo in &outcome.module_results {
         let m = module_mut(report, &mo.module);
         m.state = module_state(mo.status);
-        m.changes = mo.changes as u32;
         m.duration_ms = Some(mo.duration_ms);
         m.started_at = mo.started_at.or(m.started_at);
         m.finished_at = mo.finished_at.or(m.finished_at);
@@ -609,6 +604,13 @@ pub fn run_report(
     }
     for m in &mut report.modules {
         m.health.sort_by_key(|h| h.at);
+        // Tasks (not handlers) that changed something, as they stand now (a
+        // rolled-back step no longer counts).
+        m.changes = m
+            .steps
+            .iter()
+            .filter(|s| s.state == StepState::Changed)
+            .count() as u32;
     }
     report.recount();
     report
@@ -691,9 +693,19 @@ pub fn progress(run: &RunRecord, event: &ApplyEvent, at: DateTime<Utc>) -> RunPr
                     .unwrap_or_else(|| legacy_error(error)),
             )
         }
+        // A removal: no module, the step is its `resource`.
         ApplyEvent::RemovalRun { resource, summary } => {
             p.step = Some(resource.clone());
-            p.result = Some(summary.clone());
+            match summary.strip_prefix("failed: ") {
+                Some(message) => {
+                    p.step_state = Some(StepState::Failed);
+                    p.error = Some(legacy_error(message));
+                }
+                None => {
+                    p.step_state = Some(StepState::Changed);
+                    p.result = Some(summary.clone());
+                }
+            }
         }
         _ => {}
     }
@@ -956,6 +968,7 @@ mod tests {
         );
         let a = &module(&report, "base").steps[0];
         assert_eq!(a.result.as_deref(), Some("wrote /a"));
+        assert_eq!(module(&report, "base").changes, 1);
         assert_eq!(report.updated_at, t(3));
         assert_eq!(report.counts.steps.running, 1);
     }
@@ -1107,6 +1120,14 @@ mod tests {
         assert_eq!(report.removals[0].state, StepState::NotRun);
         assert_eq!(report.finished_at, Some(t(60)));
         assert_eq!(report.counts.steps.running, 0);
+        assert_eq!(
+            module(&report, "base").changes,
+            expected
+                .iter()
+                .filter(|s| **s == StepState::Changed)
+                .count() as u32,
+            "changes count the tasks that stand changed"
+        );
         if status == ModuleStatus::Failed {
             let failed = &module(&report, "base").steps[1];
             assert_eq!(failed.error.as_ref().unwrap().advice, vec!["fix it"]);
@@ -1192,6 +1213,17 @@ mod tests {
         assert_eq!(p.step.as_deref(), Some("file.copy[/b]"));
         assert_eq!(p.step_state, Some(StepState::Running));
         assert_eq!(p.run_state, RunState::Running);
+        let removal = progress(
+            &run(crate::store::RUNNING),
+            &ApplyEvent::RemovalRun {
+                resource: "old/file.copy[/x]".into(),
+                summary: "deleted /x".into(),
+            },
+            t(6),
+        );
+        assert_eq!(removal.module, None);
+        assert_eq!(removal.step.as_deref(), Some("old/file.copy[/x]"));
+        assert_eq!(removal.step_state, Some(StepState::Changed));
         let done = finished_progress(&run("failed"), Some(&outcome(ModuleStatus::Failed, vec![])));
         assert_eq!(done.run_state, RunState::Failed);
         assert_eq!(

@@ -1935,6 +1935,18 @@ async fn run_reports_are_served_per_host_and_per_rollout_host() {
         test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1".into())).await)
             .await;
     assert_eq!(detail.latest_run.map(|r| r.id), Some(run_id.clone()));
+    assert_eq!(
+        detail.recent_runs[0].id, run_id,
+        "the run in progress is listed"
+    );
+    assert_eq!(
+        detail.recent_runs[0].state,
+        Some(buckle_api::RunState::Running)
+    );
+    assert_eq!(
+        detail.recent_runs[0].finished_at, detail.recent_runs[0].started_at,
+        "a run in progress has no duration yet"
+    );
     let runs: buckle_api::Page<buckle_api::RunSummary> = test::read_body_json(
         test::call_service(&app, get("/api/v1/hosts/pi-1/runs?limit=1".into())).await,
     )
