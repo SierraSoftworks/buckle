@@ -28,8 +28,10 @@ tasks:
       # The shell expands $TS_AUTHKEY; the key itself is only ever in the
       # process environment, never on a command line or in the plan.
       run: 'tailscale up --auth-key="$TS_AUTHKEY" --hostname={{ host.id }} --advertise-tags={{ vars.tailscale_tags }} --accept-dns=false'
-      # A probe that also runs in plan mode: `tailscale ip` fails until the node is logged in.
-      unless: ["tailscale", "ip", "-4"]
+      # A probe that also runs in plan mode. It is a shell string rather than an
+      # argv list so that a host without tailscale yet (the very first plan)
+      # sees exit 127 and plans the change, instead of failing to start the probe.
+      unless: "tailscale ip -4 >/dev/null 2>&1"
       env:
         TS_AUTHKEY: '{{ secrets.TAILSCALE_AUTHKEY }}'
       timeout: 2m

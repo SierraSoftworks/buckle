@@ -39,7 +39,7 @@ tasks:
   # initialise a repository there.
   - command.run:
       run: ["rustic", "init"]
-      only_if: ["mountpoint", "-q", "{{ vars.rustic_mount }}"]
+      only_if: "mountpoint -q {{ vars.rustic_mount }}"
       creates: '{{ vars.rustic_repository }}/config'
       timeout: 2m
     removal: leave                           # a backup repository is never deleted by a config edit

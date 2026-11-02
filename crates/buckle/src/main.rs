@@ -1,6 +1,7 @@
 //! `buckle`: one binary that plans, applies, runs as an agent or as the server.
 
 mod commands;
+mod migrate;
 mod telemetry;
 
 use clap::Parser;
