@@ -1,8 +1,22 @@
 name: Release
 
+# Releases are cut by running this workflow, not by publishing a release in the
+# UI: every binary is uploaded to a draft which is only published (creating the
+# tag) once all of them are attached, so this keeps working with immutable
+# releases enabled.
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to increment
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: read
+
+concurrency: release
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,12 +25,33 @@ jobs:
   version:
     name: Start Release
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-      - name: Generate Package Version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Determine release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          latest="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          IFS=. read -r major minor patch <<< "${latest#v}"
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          tag="v$major.$minor.$patch"
+          echo "Releasing $tag (previous: $latest)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Set Package Version
-        run: sed -i "0,/^version\s*=\s*\".*\"/s//version = \"$VERSION\"/" Cargo.toml && sed -i "0,/^version\s*=\s*\".*\"/s//version = \"$VERSION\"/" ui/Cargo.toml
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          sed -i "0,/^version\s*=\s*\".*\"/s//version = \"$VERSION\"/" Cargo.toml
+          sed -i "0,/^version\s*=\s*\".*\"/s//version = \"$VERSION\"/" ui/Cargo.toml
       - uses: actions/upload-artifact@v4
         with:
           name: versioned-manifests
@@ -51,6 +86,10 @@ jobs:
     name: ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.run_on }}
     needs: [version, ui]
+    # id-token lets the symbols action authenticate to the symbol server.
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -83,11 +122,14 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_DEBUG: 1
           CARGO_PROFILE_RELEASE_STRIP: none
+      # Extracts and publishes the debug symbols, then strips the binary in
+      # place (Linux and macOS) so the release assets stay small.
       - name: Publish symbols
         uses: SierraSoftworks/symbols@v1
         continue-on-error: true
         with:
-          files: target/${{ matrix.target }}/release/buckle${{ matrix.extension }}
+          binary: target/${{ matrix.target }}/release/buckle${{ matrix.extension }}
+          version: ${{ needs.version.outputs.tag }}
       - name: Report binary size
         shell: bash
         run: |
@@ -98,19 +140,44 @@ jobs:
         shell: bash
         run: |
           mkdir -p out
-          cp target/${{ matrix.target }}/release/buckle${{ matrix.extension }} out/buckle${{ matrix.extension }}
-      - name: Upload GitHub Release Artifacts
-        uses: SierraSoftworks/gh-releases@v1.0.10
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          overwrite: "true"
-          files: |
-            out/buckle${{ matrix.extension }} | buckle-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}
+          cp target/${{ matrix.target }}/release/buckle${{ matrix.extension }} out/buckle-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}
       - uses: actions/upload-artifact@v4
-        if: matrix.os == 'linux'
         with:
           name: binary-${{ matrix.os }}-${{ matrix.arch }}
-          path: out/buckle
+          path: out/buckle-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      # Creates a draft (or reuses one left by a failed run), uploads every
+      # binary to it and only then publishes it, creating the tag.
+      - uses: SierraSoftworks/gh-releases@v1.1.0
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release_tag: ${{ needs.version.outputs.tag }}
+          create: "true"
+          publish: "true"
+          overwrite: "true"
+          files: |
+            dist/buckle-linux-amd64
+            dist/buckle-linux-arm64
+            dist/buckle-darwin-amd64
+            dist/buckle-darwin-arm64
+            dist/buckle-windows-amd64.exe
+      - run: echo "Published [${{ steps.release.outputs.tag }}](${{ steps.release.outputs.url }})" >> "$GITHUB_STEP_SUMMARY"
 
   docker:
     name: Docker (${{ matrix.arch }})
@@ -130,19 +197,24 @@ jobs:
         with:
           name: binary-linux-${{ matrix.arch }}
           path: .
-      - run: chmod +x buckle
+      - run: mv buckle-linux-${{ matrix.arch }} buckle && chmod +x buckle
+      # Registry references must be lowercase, and the org name isn't.
+      - name: Image name
+        run: echo "FULL_IMAGE_NAME=$(echo 'ghcr.io/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Pushed by digest only: tags are added by docker-publish once the
+      # release is published.
       - id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.FULL_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
@@ -156,7 +228,7 @@ jobs:
   docker-publish:
     name: Docker manifest
     runs-on: ubuntu-latest
-    needs: [docker]
+    needs: [docker, release]
     permissions:
       packages: write
     steps:
@@ -165,6 +237,8 @@ jobs:
           pattern: digest-*
           path: /tmp/digests
           merge-multiple: true
+      - name: Image name
+        run: echo "FULL_IMAGE_NAME=$(echo 'ghcr.io/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -174,25 +248,26 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.FULL_IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.release.outputs.tag }}
       - name: Create manifest list
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+            $(printf "$FULL_IMAGE_NAME@sha256:%s " *)
 
   tap:
     name: Update Homebrew Tap
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [release]
     steps:
       - uses: SierraSoftworks/actions-tap@v1
         with:
           app-id: ${{ secrets.TAP_APP_ID }}
           private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ needs.release.outputs.tag }}
           aliases: major minor
