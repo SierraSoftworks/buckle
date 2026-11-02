@@ -100,7 +100,18 @@ pub(crate) enum Marker {
     /// `line` was appended or inserted.
     Added { line: String, created: bool },
     /// `original` was replaced by `line`.
-    Replaced { line: String, original: String },
+    Replaced {
+        line: String,
+        /// The replaced text; empty when it was stashed instead (sensitive files).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        original: String,
+        /// For sensitive files (`/etc/ssh/*`, `/etc/environment`, ...): the
+        /// digest of the replaced text, which is kept in a 0600 file under
+        /// `<state_dir>/stash/file.line/` rather than in state (which is
+        /// reported to the server).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stashed: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -176,6 +187,7 @@ pub(crate) fn edit(spec: &Spec, current: &str) -> Result<Edit> {
                     marker: Some(Marker::Replaced {
                         line: line.to_owned(),
                         original,
+                        stashed: None,
                     }),
                     summary: format!("replace line {} in {}", index + 1, spec.path.display()),
                 });
@@ -252,7 +264,7 @@ impl FileLine {
             } => {
                 let new_text = hostkit::join_lines(&lines);
                 Outcome::Change {
-                    diff: hostkit::text_diff(summary, &file.text, &new_text),
+                    diff: hostkit::text_diff(cx, &spec.path, summary, &file.text, &new_text),
                     new_text,
                     marker,
                     existing: Some(file),
@@ -341,7 +353,12 @@ impl Task for FileLine {
                 )
                 .await?;
                 let mut applied = Applied::changed(diff.summary().to_owned());
-                let marker = marker.map(|m| merge_marker(previous_marker(cx, &spec.path), m));
+                let mut marker = marker.map(|m| merge_marker(previous_marker(cx, &spec.path), m));
+                if hostkit::is_sensitive_path(&spec.path)
+                    && let Some(m) = marker.take()
+                {
+                    marker = Some(stash_original(cx, m).await?);
+                }
                 if let Some(marker) = marker {
                     applied = applied.with_artefact(Artefact::Line {
                         path: spec.path.clone(),
@@ -363,6 +380,14 @@ impl Task for FileLine {
         match line_artefact(record) {
             Some((path, Marker::Added { line, .. })) => {
                 format!("delete the line `{line}` from {}", path.display())
+            }
+            Some((
+                path,
+                Marker::Replaced {
+                    stashed: Some(_), ..
+                },
+            )) => {
+                format!("restore the original line in {}", path.display())
             }
             Some((path, Marker::Replaced { original, .. })) => {
                 format!("restore the line `{original}` in {}", path.display())
@@ -412,14 +437,29 @@ impl FileLine {
                     )));
                 }
             }
-            Marker::Replaced { line, original } => {
+            Marker::Replaced {
+                line,
+                original,
+                stashed,
+            } => {
                 let Some(index) = lines.iter().position(|l| l == line) else {
                     return Ok(Applied::skipped(format!(
                         "the line was changed outside Buckle in {}, left in place",
                         path.display()
                     )));
                 };
-                lines[index] = original.clone();
+                lines[index] = match stashed {
+                    None => original.clone(),
+                    Some(digest) => match unstash(cx, digest).await? {
+                        Some(text) => text,
+                        None => {
+                            return Ok(Applied::skipped(format!(
+                                "the original line of {} was not found in Buckle's stash, left as it is",
+                                path.display()
+                            )));
+                        }
+                    },
+                };
             }
         }
         hostkit::save_text(
@@ -431,6 +471,13 @@ impl FileLine {
             &FilePerms::default(),
         )
         .await?;
+        if let Marker::Replaced {
+            stashed: Some(digest),
+            ..
+        } = &marker
+        {
+            let _ = cx.system.remove(&stash_path(cx, digest), false).await;
+        }
         Ok(Applied::changed(format!(
             "reverted the edit in {}",
             path.display()
@@ -454,7 +501,7 @@ fn previous_marker(cx: &Cx, path: &std::path::Path) -> Option<Marker> {
 /// again still restores the original text.
 fn merge_marker(previous: Option<Marker>, now: Marker) -> Marker {
     match (previous, now) {
-        (Some(Marker::Added { line: old, created }), Marker::Replaced { line, original })
+        (Some(Marker::Added { line: old, created }), Marker::Replaced { line, original, .. })
             if original == old =>
         {
             Marker::Added { line, created }
@@ -463,14 +510,58 @@ fn merge_marker(previous: Option<Marker>, now: Marker) -> Marker {
             Some(Marker::Replaced {
                 line: old,
                 original: first,
+                stashed,
             }),
-            Marker::Replaced { line, original },
+            Marker::Replaced { line, original, .. },
         ) if original == old => Marker::Replaced {
             line,
             original: first,
+            stashed,
         },
         (_, now) => now,
     }
+}
+
+fn stash_path(cx: &Cx, digest: &str) -> PathBuf {
+    crate::tasks::sys_exec::state_dir(cx)
+        .join("stash")
+        .join("file.line")
+        .join(digest)
+}
+
+/// Keeps the replaced text of a sensitive file out of state: it goes to a
+/// root-only file on the host, and the marker records only its digest.
+async fn stash_original(cx: &Cx, marker: Marker) -> Result<Marker> {
+    let Marker::Replaced {
+        line,
+        original,
+        stashed: None,
+    } = marker
+    else {
+        return Ok(marker);
+    };
+    let digest = buckle_core::Digest::of(original.as_bytes());
+    let path = stash_path(cx, digest.as_str());
+    if let Some(dir) = path.parent() {
+        cx.system.mkdir_all(dir, &FilePerms::mode(0o700)).await?;
+    }
+    cx.system
+        .write_atomic(&path, original.as_bytes(), &FilePerms::mode(0o600))
+        .await?;
+    Ok(Marker::Replaced {
+        line,
+        original: String::new(),
+        stashed: Some(digest.as_str().to_owned()),
+    })
+}
+
+async fn unstash(cx: &Cx, digest: &str) -> Result<Option<String>> {
+    Ok(cx
+        .system
+        .read(&stash_path(cx, digest))
+        .await?
+        .filter(|b| buckle_core::Digest::of(b).as_str() == digest)
+        .and_then(|b| String::from_utf8(b).ok()))
 }
 
 fn line_artefact(record: &ResourceRecord) -> Option<(PathBuf, Marker)> {
@@ -758,5 +849,66 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(sys.file_string("/etc/conf").unwrap().lines().count(), 8);
+    }
+
+    #[tokio::test]
+    async fn sensitive_files_get_context_free_diffs_and_no_replaced_text_in_state() {
+        let sys = FakeSystem::new().with_file(
+            "/etc/environment",
+            "PATH=/usr/bin\nAPI_TOKEN=hand-placed-token\nLANG=C\n",
+            FilePerms::mode(0o644),
+        );
+        let s: Spec =
+            spec(json!({"path": "/etc/environment", "line": "API_TOKEN=", "regex": "^API_TOKEN="}));
+        let planned = FileLine.plan(&cx(&sys), &s).await.unwrap();
+        let Diff::Update {
+            unified: Some(u), ..
+        } = diff(&planned)
+        else {
+            panic!("{planned:?}")
+        };
+        assert!(
+            !u.get().contains("PATH=") && !u.get().contains("LANG="),
+            "no context: {}",
+            u.get()
+        );
+        let applied = apply(&FileLine, &cx(&sys), &s).await;
+        let state = serde_json::to_string(&applied).unwrap();
+        assert!(!state.contains("hand-placed-token"), "{state}");
+        // Removal still restores it, from the 0600 stash outside state.
+        FileLine
+            .remove(&cx(&sys), &record("file.line", "k", &applied))
+            .await
+            .unwrap();
+        assert_eq!(
+            sys.file_string("/etc/environment").unwrap(),
+            "PATH=/usr/bin\nAPI_TOKEN=hand-placed-token\nLANG=C\n"
+        );
+        assert!(
+            sys.paths()
+                .iter()
+                .all(|p| !p.starts_with("/var/lib/buckle/stash/file.line/")
+                    || p.as_os_str() == "/var/lib/buckle/stash/file.line")
+        );
+    }
+
+    #[tokio::test]
+    async fn diffs_are_scrubbed_of_known_secret_values() {
+        let sys =
+            FakeSystem::new().with_file("/etc/conf", "pw=s3cr3t-value\n", FilePerms::default());
+        let c = cx_secrets(
+            &sys,
+            buckle_core::testing::MemorySource::new(),
+            secrets("pw", "s3cr3t-value"),
+        );
+        let planned = FileLine
+            .plan(&c, &s(json!({"line": "pw=other", "regex": "^pw="})))
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(
+            !json.contains("s3cr3t-value") && json.contains("secret:pw@"),
+            "{json}"
+        );
     }
 }

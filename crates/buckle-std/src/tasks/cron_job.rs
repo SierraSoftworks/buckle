@@ -157,6 +157,8 @@ impl Task for CronJob {
                     Planned::NoOp
                 } else {
                     hostkit::text_diff_planned(
+                        cx,
+                        &file,
                         format!("update {}", file.display()),
                         &String::from_utf8_lossy(&bytes),
                         &wanted,

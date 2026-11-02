@@ -41,6 +41,13 @@ impl HealthCheck for FilterCheck {
 
     #[tracing::instrument(name = "health.filter", skip_all, fields(expr = %spec.expr))]
     async fn check(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
+        // Reasons can quote command output or response bodies: scrub known secrets.
+        super::redacted(cx, self.probe(cx, spec).await)
+    }
+}
+
+impl FilterCheck {
+    async fn probe(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
         let filter = match Filter::new(spec.expr.as_str()) {
             Ok(f) => f,
             Err(e) => {

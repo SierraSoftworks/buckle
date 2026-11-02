@@ -81,6 +81,13 @@ impl HealthCheck for HttpCheck {
 
     #[tracing::instrument(name = "health.http", skip_all, fields(url = %spec.url))]
     async fn check(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
+        // Reasons can quote command output or response bodies: scrub known secrets.
+        super::redacted(cx, self.probe(cx, spec).await)
+    }
+}
+
+impl HttpCheck {
+    async fn probe(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
         let method = spec.method.to_ascii_uppercase();
         let request = HttpRequest {
             method: method.clone(),

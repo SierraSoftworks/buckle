@@ -227,7 +227,10 @@ impl CommandRun {
         }
     }
 
-    fn record_output(spec: &Spec, command: &Command, out: &Output) {
+    /// Records the exit code and, when `capture` allows, the output on the
+    /// span. Output always goes through the secret scrubber first: a command
+    /// may print a secret it read from a file, not only from its environment.
+    fn record_output(cx: &Cx, spec: &Spec, command: &Command, out: &Output) {
         let allowed = match spec.capture {
             Capture::Never => false,
             Capture::Redacted => !command.sensitive_env,
@@ -238,13 +241,20 @@ impl CommandRun {
             span.record("exit_code", code);
         }
         if allowed {
+            let redactor = buckle_core::secrets::redact::Redactor::new(&cx.secrets);
             span.record(
                 "stdout",
-                hostkit::clip(out.stdout_str().trim(), OUTPUT_CAPTURE_LIMIT),
+                hostkit::clip(
+                    redactor.redact_bytes(&out.stdout).get().trim(),
+                    OUTPUT_CAPTURE_LIMIT,
+                ),
             );
             span.record(
                 "stderr",
-                hostkit::clip(out.stderr_str().trim(), OUTPUT_CAPTURE_LIMIT),
+                hostkit::clip(
+                    redactor.redact_bytes(&out.stderr).get().trim(),
+                    OUTPUT_CAPTURE_LIMIT,
+                ),
             );
         }
     }
@@ -306,11 +316,12 @@ impl Task for CommandRun {
         let line = command.display_line();
         let sensitive = command.sensitive_env;
         let out = cx.system.run(command.clone()).await?;
-        Self::record_output(spec, &command, &out);
+        Self::record_output(cx, spec, &command, &out);
         let tolerated =
             matches!(spec.changed_when, Some(ChangedWhen::Exit(code)) if out.code == Some(code));
         if !out.success() && !tolerated {
             return Err(hostkit::command_failed(
+                cx,
                 "The command",
                 &hostkit::clip(&line, 300),
                 &out,
@@ -787,5 +798,27 @@ mod tests {
             "{fields:?}"
         );
         assert!(fields.iter().any(|(k, v)| k == "exit_code" && v == "0"));
+    }
+
+    #[tokio::test]
+    async fn failure_messages_never_quote_a_known_secret() {
+        // The command reads the secret itself (not via env) and prints it.
+        let sys = FakeSystem::new().on_command_fail(
+            "deploy",
+            &[],
+            1,
+            "auth failed for token tok-123-secret",
+        );
+        let c = crate::tasks::hostkit::testkit::cx_secrets(
+            &sys,
+            buckle_core::testing::MemorySource::new(),
+            crate::tasks::hostkit::testkit::secrets("api", "tok-123-secret"),
+        );
+        let s: Spec =
+            serde_json::from_value(json!({"run": ["deploy"], "capture": "always"})).unwrap();
+        let err = CommandRun.apply(&c, &s, &Planned::NoOp).await.unwrap_err();
+        let text = format!("{} {:?}", err.description(), err);
+        assert!(!text.contains("tok-123-secret"), "{text}");
+        assert!(text.contains("secret:api@"), "{text}");
     }
 }

@@ -229,6 +229,20 @@ pub fn effective_perms(want: &FilePerms, existing: Option<&FileMeta>) -> FilePer
     }
 }
 
+/// [`effective_perms`] for content that may hold secrets: a new file whose
+/// mode is not given is created 0600 rather than with the default umask.
+pub fn effective_perms_sensitive(
+    want: &FilePerms,
+    existing: Option<&FileMeta>,
+    sensitive: bool,
+) -> FilePerms {
+    let mut perms = effective_perms(want, existing);
+    if sensitive && existing.is_none() && perms.mode.is_none() {
+        perms.mode = Some(0o600);
+    }
+    perms
+}
+
 /// The permissions an existing file already has, for rewriting it unchanged.
 pub fn perms_of(meta: &FileMeta) -> FilePerms {
     FilePerms {
@@ -291,11 +305,28 @@ pub async fn run_checked(cx: &Cx, command: Command, what: &str) -> Result<Output
     if out.success() {
         return Ok(out);
     }
-    Err(command_failed(what, &line, &out, sensitive))
+    Err(command_failed(cx, what, &line, &out, sensitive))
 }
 
-/// The error for a command that did not succeed.
-pub fn command_failed(what: &str, line: &str, out: &Output, sensitive: bool) -> buckle_core::Error {
+/// Scrubs every known secret value (and its common encodings) from `text`.
+pub fn scrub(cx: &Cx, text: &str) -> String {
+    if cx.secrets.is_empty() {
+        return text.to_owned();
+    }
+    buckle_core::secrets::redact::Redactor::new(&cx.secrets)
+        .redact(text)
+        .into_inner()
+}
+
+/// The error for a command that did not succeed. Its output is scrubbed of
+/// known secrets, and withheld entirely when `sensitive`.
+pub fn command_failed(
+    cx: &Cx,
+    what: &str,
+    line: &str,
+    out: &Output,
+    sensitive: bool,
+) -> buckle_core::Error {
     let status = if out.timed_out {
         "timed out".to_owned()
     } else {
@@ -307,8 +338,8 @@ pub fn command_failed(what: &str, line: &str, out: &Output, sensitive: bool) -> 
     let detail = if sensitive {
         "Its output is withheld because the command's environment carried secrets.".to_owned()
     } else {
-        let stderr = output_tail(&out.stderr);
-        let stdout = output_tail(&out.stdout);
+        let stderr = scrub(cx, &output_tail(&out.stderr));
+        let stdout = scrub(cx, &output_tail(&out.stdout));
         match (stderr.is_empty(), stdout.is_empty()) {
             (false, _) => format!("stderr: {stderr}"),
             (true, false) => format!("stdout: {stdout}"),
@@ -527,17 +558,91 @@ pub async fn save_text(
         .await
 }
 
-/// A diff between two texts of a host file: unified when small, else a summary.
-pub fn text_diff(summary: impl Into<String>, old: &str, new: &str) -> buckle_core::plan::Diff {
+/// The token prefix a redacted render uses for a secret (`«secret:NAME@fp»`).
+pub const SECRET_TOKEN: &str = "\u{ab}secret:";
+
+/// Files whose content commonly holds credentials or whose other lines are
+/// nobody's business in a plan: `/etc/environment`, `/etc/fstab`, sudoers,
+/// anything under `/etc/ssh` or `/etc/netplan`, `~/.ssh/*`, `/etc/shadow`.
+/// Their diffs carry no context lines and their replaced lines are never
+/// stored in state.
+pub fn is_sensitive_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    path == Path::new("/etc/environment")
+        || path == Path::new("/etc/fstab")
+        || path == Path::new("/etc/shadow")
+        || path == Path::new("/etc/gshadow")
+        || path == Path::new("/etc/sudoers")
+        || path.starts_with("/etc/sudoers.d")
+        || path.starts_with("/etc/ssh")
+        || path.starts_with("/etc/netplan")
+        || text.contains("/.ssh/")
+}
+
+/// Whether this resource's previous record shows that the file held secrets
+/// (its redacted shadow carries a secret token).
+pub fn ever_sensitive(cx: &Cx) -> bool {
+    cx.previous
+        .as_deref()
+        .and_then(|r| r.shadow.as_ref())
+        .is_some_and(|s| s.get().contains(SECRET_TOKEN))
+}
+
+/// Context lines for diffs of `path`: none for sensitive files, else three.
+pub fn diff_context(cx: &Cx, path: &Path) -> usize {
+    if is_sensitive_path(path) || ever_sensitive(cx) {
+        0
+    } else {
+        3
+    }
+}
+
+/// A unified diff (`current` → `planned`) with `context` lines, scrubbed of
+/// every known secret value.
+pub fn redacted_unified(
+    cx: &Cx,
+    summary: impl Into<String>,
+    old: &str,
+    new: &str,
+    context: usize,
+) -> buckle_core::plan::Diff {
+    let text = similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(context)
+        .header("current", "planned")
+        .to_string();
+    buckle_core::plan::Diff::Update {
+        summary: summary.into(),
+        unified: Some(buckle_core::secrets::redact::Redactor::new(&cx.secrets).redact(&text)),
+    }
+}
+
+/// A diff between the current text of host file `path` and its new text:
+/// unified when small (no context lines for sensitive files, scrubbed of
+/// known secrets), a summary when large, and without the old side at all
+/// when the file is known to have held secrets.
+pub fn text_diff(
+    cx: &Cx,
+    path: &Path,
+    summary: impl Into<String>,
+    old: &str,
+    new: &str,
+) -> buckle_core::plan::Diff {
+    let summary = summary.into();
+    if ever_sensitive(cx) {
+        return buckle_core::plan::Diff::Update {
+            summary: format!(
+                "{summary}: content changed ({}); the current content is not shown because the file has held secrets",
+                digest_change(&Digest::of(old.as_bytes()), &Digest::of(new.as_bytes()))
+            ),
+            unified: None,
+        };
+    }
     if old.len() <= SHADOW_LIMIT && new.len() <= SHADOW_LIMIT {
-        buckle_core::plan::Diff::unified(
-            summary,
-            &Redacted::plain(old.to_owned()),
-            &Redacted::plain(new.to_owned()),
-        )
+        redacted_unified(cx, summary, old, new, diff_context(cx, path))
     } else {
         buckle_core::plan::Diff::Update {
-            summary: summary.into(),
+            summary,
             unified: None,
         }
     }
@@ -674,8 +779,14 @@ pub fn find_version(text: &str) -> Option<String> {
 }
 
 /// `Planned::change` of [`text_diff`].
-pub fn text_diff_planned(summary: impl Into<String>, old: &str, new: &str) -> Planned {
-    Planned::change(text_diff(summary, old, new))
+pub fn text_diff_planned(
+    cx: &Cx,
+    path: &Path,
+    summary: impl Into<String>,
+    old: &str,
+    new: &str,
+) -> Planned {
+    Planned::change(text_diff(cx, path, summary, old, new))
 }
 
 #[cfg(test)]

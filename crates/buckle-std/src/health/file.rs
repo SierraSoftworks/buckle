@@ -72,6 +72,13 @@ impl HealthCheck for FileCheck {
 
     #[tracing::instrument(name = "health.file", skip_all, fields(path = %spec.path))]
     async fn check(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
+        // Reasons can quote command output or response bodies: scrub known secrets.
+        super::redacted(cx, self.probe(cx, spec).await)
+    }
+}
+
+impl FileCheck {
+    async fn probe(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
         let path = Path::new(&spec.path);
         let meta = match cx.system.stat(path).await {
             Ok(m) => m,

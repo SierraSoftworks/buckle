@@ -1,6 +1,6 @@
 //! `file.template`: render a Jinja template from the module and write it to the host.
 
-use super::hostkit::{self, describe_perms, diffable_text, digest_change, effective_perms};
+use super::hostkit::{self, describe_perms, diffable_text, digest_change};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::secrets::sinks::FileSink;
@@ -115,13 +115,36 @@ impl FileTemplate {
             if !perms.is_empty() {
                 summary.push_str(&format!(" (and {})", perms.join(", ")));
             }
-            // The old content is only shown when the new render is secret-free: a
-            // sensitive file that drifted would otherwise be read back into a plan.
-            match (&rendered, diffable_text(&current)) {
-                (Rendered::Plain(_), Some(old)) => Planned::change(Diff::unified(
+            // The file is known to hold secrets when the new render does, or
+            // when the shadow recorded last time does. Such a file is never read
+            // back into a plan: the old side is the previous redacted shadow (a
+            // rotated secret shows as a fingerprint change on exactly its line),
+            // provided the file is still what Buckle wrote; otherwise only the
+            // digest change is shown.
+            let previous = cx.previous.as_deref();
+            let sensitive = rendered.is_sensitive() || hostkit::ever_sensitive(cx);
+            let unchanged_since_written = previous
+                .and_then(|r| r.content_digest.as_ref())
+                .is_some_and(|d| *d == current_digest);
+            let context = if sensitive {
+                0
+            } else {
+                hostkit::diff_context(cx, &spec.dest)
+            };
+            match (
+                sensitive,
+                previous.and_then(|r| r.shadow.as_ref()),
+                diffable_text(&current),
+            ) {
+                (true, Some(shadow), _) if unchanged_since_written => Planned::change(
+                    hostkit::redacted_unified(cx, summary, shadow.get(), redacted.get(), context),
+                ),
+                (false, _, Some(old)) => Planned::change(hostkit::redacted_unified(
+                    cx,
                     summary,
-                    &Redacted::plain(old.to_owned()),
-                    &redacted,
+                    old,
+                    redacted.get(),
+                    context,
                 )),
                 _ => {
                     let preview = hostkit::truncate_redacted(redacted.clone())
@@ -213,7 +236,12 @@ impl Task for FileTemplate {
             {
                 hostkit::backup_file(cx, dest, meta, current).await?;
             }
-            let perms = effective_perms(&spec.perms, existing_meta);
+            // A new file with secrets in it is not world-readable unless asked.
+            let perms = hostkit::effective_perms_sensitive(
+                &spec.perms,
+                existing_meta,
+                inspection.rendered.is_sensitive(),
+            );
             FileSink
                 .write_rendered(&*cx.system, dest, &inspection.rendered, &perms)
                 .await?;
@@ -589,5 +617,110 @@ mod tests {
                 .unwrap()
                 .changed
         );
+    }
+
+    fn cx_with_previous(
+        sys: &FakeSystem,
+        value: &str,
+        previous: buckle_core::state::ResourceRecord,
+    ) -> Cx {
+        buckle_core::testing::CxBuilder::new(sys.clone())
+            .source(source_with_name())
+            .secrets(secrets("token", value))
+            .previous(previous)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn a_rotated_secret_shows_both_fingerprints_on_its_line_and_neither_value() {
+        const OLD: &str = "old-secret-value-1";
+        const NEW: &str = "new-secret-value-2";
+        let sys = FakeSystem::new();
+        let s: Spec = spec(json!({"src": "secret.conf.j2", "dest": "/etc/app.conf"}));
+        let first = apply(
+            &FileTemplate,
+            &cx_secrets(&sys, source_with_name(), secrets("token", OLD)),
+            &s,
+        )
+        .await;
+        let old_token = first
+            .shadow
+            .as_ref()
+            .unwrap()
+            .get()
+            .trim()
+            .trim_start_matches("token = ")
+            .to_owned();
+        let rotated = cx_with_previous(&sys, NEW, record("file.template", "/etc/app.conf", &first));
+        let planned = FileTemplate.plan(&rotated, &s).await.unwrap();
+        let Diff::Update {
+            unified: Some(u), ..
+        } = diff(&planned)
+        else {
+            panic!("{planned:?}")
+        };
+        let text = u.get();
+        let minus: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .collect();
+        let plus: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .collect();
+        assert_eq!(
+            minus,
+            vec![format!("-token = {old_token}").as_str()],
+            "{text}"
+        );
+        assert_eq!(plus.len(), 1, "{text}");
+        assert!(
+            plus[0].contains("\u{ab}secret:token@") && plus[0] != minus[0].replacen('-', "+", 1)
+        );
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(!json.contains(OLD) && !json.contains(NEW), "{json}");
+
+        // A sensitive file new on disk is created 0600 when no mode was given.
+        let meta = buckle_core::system::System::stat(&sys, std::path::Path::new("/etc/app.conf"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.mode, Some(0o600));
+    }
+
+    #[tokio::test]
+    async fn once_a_file_held_secrets_its_disk_content_is_never_diffed() {
+        // The template no longer uses the secret, but the file on disk still holds it.
+        const VALUE: &str = "still-on-disk-secret";
+        let sys = FakeSystem::new();
+        let s: Spec = spec(json!({"src": "secret.conf.j2", "dest": "/etc/app.conf"}));
+        let first = apply(
+            &FileTemplate,
+            &cx_secrets(&sys, source_with_name(), secrets("token", VALUE)),
+            &s,
+        )
+        .await;
+        let plain = buckle_core::testing::CxBuilder::new(sys.clone())
+            .source(MemorySource::new().with("secret.conf.j2", "token = none\n"))
+            .previous(record("file.template", "/etc/app.conf", &first))
+            .build();
+        let planned = FileTemplate.plan(&plain, &s).await.unwrap();
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(!json.contains(VALUE), "{json}");
+        assert!(
+            json.contains("secret:token@"),
+            "the old side is the redacted shadow: {json}"
+        );
+
+        // Drifted since Buckle wrote it: only a digest summary.
+        put(
+            &sys,
+            "/etc/app.conf",
+            &format!("token = {VALUE}\nextra = 1\n"),
+        )
+        .await;
+        let planned = FileTemplate.plan(&plain, &s).await.unwrap();
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(!json.contains(VALUE) && json.contains("digest"), "{json}");
     }
 }

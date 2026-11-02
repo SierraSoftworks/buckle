@@ -3,7 +3,6 @@
 use super::hostkit::{self, describe_perms, diffable_text, digest_change, effective_perms};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
-use buckle_core::secrets::Redacted;
 use buckle_core::state::ResourceRecord;
 use buckle_core::system::{FileKind, FileMeta, FilePerms};
 use buckle_core::task::{Applied, Cx, Task};
@@ -99,11 +98,12 @@ impl FileCopy {
                 summary.push_str(&format!(" (and {})", perms.join(", ")));
             }
             match (diffable_text(&current), diffable_text(&content)) {
-                (Some(old), Some(new)) => Planned::change(Diff::unified(
-                    summary,
-                    &Redacted::plain(old.to_owned()),
-                    &Redacted::plain(new.to_owned()),
-                )),
+                // The host's current content goes through the same rules as
+                // other editors: scrubbed, no context for sensitive files, and
+                // not shown at all when the file has held secrets.
+                (Some(old), Some(new)) => {
+                    Planned::change(hostkit::text_diff(cx, &spec.dest, summary, old, new))
+                }
                 _ => Planned::change(Diff::Update {
                     summary: format!(
                         "{summary}: content changed ({})",

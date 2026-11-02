@@ -210,6 +210,7 @@ impl Task for DockerImage {
             )))
         } else {
             Err(hostkit::command_failed(
+                cx,
                 "Removing the image",
                 &format!("docker image rm {name}"),
                 &out,

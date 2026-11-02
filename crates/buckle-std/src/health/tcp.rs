@@ -37,6 +37,13 @@ impl HealthCheck for TcpCheck {
 
     #[tracing::instrument(name = "health.tcp", skip_all, fields(address = %spec.address))]
     async fn check(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
+        // Reasons can quote command output or response bodies: scrub known secrets.
+        super::redacted(cx, self.probe(cx, spec).await)
+    }
+}
+
+impl TcpCheck {
+    async fn probe(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
         match cx.system.tcp_connect(&spec.address, spec.timeout).await {
             Ok(true) => HealthStatus::Pass,
             Ok(false) => HealthStatus::fail(format!(

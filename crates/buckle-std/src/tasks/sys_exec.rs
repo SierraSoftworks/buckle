@@ -32,7 +32,7 @@ pub(crate) async fn run_checked(cx: &Cx, command: Command) -> Result<Output> {
     if out.success() {
         return Ok(out);
     }
-    let detail = first_lines(&out.stderr_str(), &out.stdout_str(), 6);
+    let detail = super::hostkit::scrub(cx, &first_lines(&out.stderr_str(), &out.stdout_str(), 6));
     let how = if out.timed_out {
         "timed out".to_owned()
     } else {

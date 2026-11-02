@@ -200,7 +200,9 @@ impl FileBlock {
             Edit::Changed { lines, summary } => {
                 let new_text = hostkit::join_lines(&lines);
                 let diff = match &existing {
-                    Some(file) => hostkit::text_diff(summary, &file.text, &new_text),
+                    Some(file) => {
+                        hostkit::text_diff(cx, &spec.path, summary, &file.text, &new_text)
+                    }
                     None => Diff::Create {
                         summary: format!("create {} with the block", spec.path.display()),
                         preview: Some(buckle_core::secrets::Redacted::plain(new_text.clone())),

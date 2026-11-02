@@ -284,7 +284,13 @@ impl SshAuthorizedKey {
                 preview: Some(buckle_core::secrets::Redacted::plain(new_text.clone())),
             })
         } else if content_changed {
-            hostkit::text_diff_planned(format!("update {path}"), &old_text, &new_text)
+            hostkit::text_diff_planned(
+                cx,
+                &target.file,
+                format!("update {path}"),
+                &old_text,
+                &new_text,
+            )
         } else {
             Planned::change(Diff::Update {
                 summary: format!("{path}: {}", perm_notes.join(", ")),
