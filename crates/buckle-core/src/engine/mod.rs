@@ -275,11 +275,8 @@ impl Engine {
     /// plans every task and removal. Never mutates the host.
     pub async fn plan(inputs: &Inputs) -> crate::Result<(Plan, Facts)> {
         let span = tracing::info_span!("engine.plan", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id);
-        let (rich, facts) = tracing::Instrument::instrument(
-            planner::plan(inputs, &inputs.revision),
-            span,
-        )
-        .await?;
+        let (rich, facts) =
+            tracing::Instrument::instrument(planner::plan(inputs, &inputs.revision), span).await?;
         Ok((rich.plan, facts))
     }
 

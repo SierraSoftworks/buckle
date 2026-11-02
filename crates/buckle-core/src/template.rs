@@ -73,7 +73,10 @@ impl Templater {
     /// Compiles `source` without rendering it, reporting syntax errors.
     pub fn check(&self, source: &str) -> crate::Result<()> {
         use crate::error::HumanizableResult;
-        self.env.template_from_str(source).to_human_error().map(|_| ())
+        self.env
+            .template_from_str(source)
+            .to_human_error()
+            .map(|_| ())
     }
 
     /// The dotted variable paths a template reads from its context
@@ -130,7 +133,8 @@ impl Templater {
         ctx: &HostContext,
         view: SecretsView,
     ) -> crate::Result<String> {
-        use crate::error::HumanizableResult;
+        let mode = view.mode;
+        let touched = view.touched.clone();
         // The JSON context (host, vars, module, task) plus the secrets object.
         let mut map: std::collections::BTreeMap<String, Value> = match ctx.template_json() {
             serde_json::Value::Object(obj) => obj
@@ -142,7 +146,23 @@ impl Templater {
         map.insert("secrets".into(), Value::from_object(view));
         self.env
             .render_str(source, Value::from(minijinja::value::Serde(map)))
-            .to_human_error()
+            .map_err(|e| {
+                // minijinja's error Debug dumps the referenced variables, which
+                // would include secret values: scrub through the secrets module.
+                let err = crate::secrets::redact::template_error(e, &ctx.secrets);
+                if mode == RenderMode::Plain && touched.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::error::wrap_user(
+                        err,
+                        "The template references a secret's value, but this field only accepts plain values.",
+                        &[
+                            "Use the secret in a file template, or in a task field that is declared as secret-capable.",
+                            "`secrets.NAME.present` and `secrets.NAME.fingerprint` are always allowed.",
+                        ],
+                    )
+                } else {
+                    err
+                }
+            })
     }
 }
 

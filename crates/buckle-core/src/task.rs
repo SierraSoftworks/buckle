@@ -136,6 +136,10 @@ pub struct Cx {
     pub secrets: Arc<SecretStore>,
     /// Checks waived for this run (module/check names), for `continue` after a failure.
     pub waived_checks: Arc<Vec<String>>,
+    /// The resource's existing record from state, so a task knows what Buckle
+    /// itself installed, enabled or wrote before (and can diff against the
+    /// previous shadow). `None` when the resource is new, and for handlers.
+    pub previous: Option<Arc<ResourceRecord>>,
 }
 
 impl Cx {

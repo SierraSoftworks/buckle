@@ -5,7 +5,7 @@
 
 use super::{Revision, graph::Graph};
 use crate::facts::Facts;
-use crate::model::{ModuleConfig, TaskDecl};
+use crate::model::TaskDecl;
 use crate::selectors::HostIdentity;
 use crate::template::Templater;
 use serde::{Deserialize, Serialize};
@@ -149,9 +149,13 @@ fn yaml_strings<'a>(value: &'a serde_yaml::Value, out: &mut Vec<&'a str>) {
 pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
     let mut report = ValidationReport::default();
     let templater = Templater::new();
-    let declared_secrets: BTreeSet<&str> = revision.fleet.secrets.keys().map(String::as_str).collect();
+    let declared_secrets: BTreeSet<&str> =
+        revision.fleet.secrets.keys().map(String::as_str).collect();
 
-    let mut check_secrets = |report: &mut ValidationReport, module: Option<&str>, location: &str, text: &str| {
+    let check_secrets = |report: &mut ValidationReport,
+                         module: Option<&str>,
+                         location: &str,
+                         text: &str| {
         for name in secret_references(text) {
             if !declared_secrets.contains(name.as_str()) {
                 report.error(
@@ -162,17 +166,27 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             }
         }
     };
-    let check_template = |report: &mut ValidationReport, module: Option<&str>, location: &str, text: &str| {
-        if Templater::needs_render(text)
-            && let Err(e) = templater.check(text)
-        {
-            report.error(module, location, format!("template does not compile: {}", e.message()));
-        }
-    };
+    let check_template =
+        |report: &mut ValidationReport, module: Option<&str>, location: &str, text: &str| {
+            if Templater::needs_render(text)
+                && let Err(e) = templater.check(text)
+            {
+                report.error(
+                    module,
+                    location,
+                    format!("template does not compile: {}", e.message()),
+                );
+            }
+        };
 
     // Fleet-level text.
     for (name, selector) in &revision.fleet.fleet.groups {
-        check_secrets(&mut report, None, &format!("buckle.yaml fleet.groups.{name}"), selector.raw());
+        check_secrets(
+            &mut report,
+            None,
+            &format!("buckle.yaml fleet.groups.{name}"),
+            selector.raw(),
+        );
     }
     for (i, overlay) in revision.fleet.vars.iter().enumerate() {
         let location = format!("buckle.yaml vars[{i}]");
@@ -180,7 +194,11 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             check_secrets(&mut report, None, &location, when.raw());
         }
         if overlay.file.is_none() && overlay.values.is_empty() {
-            report.warning(None, &location, "overlay has neither `file` nor `values` and does nothing");
+            report.warning(
+                None,
+                &location,
+                "overlay has neither `file` nor `values` and does nothing",
+            );
         }
         for (k, v) in &overlay.values {
             let mut strings = Vec::new();
@@ -209,7 +227,13 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
     }
     for (name, count) in &seen {
         if *count > 1 {
-            report.error(Some(name), module_file(name), format!("the module name '{name}' is used {count} times; module names must be unique"));
+            report.error(
+                Some(name),
+                module_file(name),
+                format!(
+                    "the module name '{name}' is used {count} times; module names must be unique"
+                ),
+            );
         }
     }
     let mut graph = Graph::new();
@@ -224,7 +248,11 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
                 );
             }
             if need == &m.config.name {
-                report.error(Some(&m.config.name), module_file(&m.config.name), "a module cannot need itself");
+                report.error(
+                    Some(&m.config.name),
+                    module_file(&m.config.name),
+                    "a module cannot need itself",
+                );
             }
         }
     }
@@ -240,7 +268,12 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
     let handler_names: HashMap<&str, BTreeSet<&str>> = revision
         .modules
         .iter()
-        .map(|m| (m.config.name.as_str(), m.config.handlers.keys().map(String::as_str).collect()))
+        .map(|m| {
+            (
+                m.config.name.as_str(),
+                m.config.handlers.keys().map(String::as_str).collect(),
+            )
+        })
         .collect();
     for m in &revision.modules {
         let name = m.config.name.as_str();
@@ -259,12 +292,20 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
         }
         for provider in &m.config.facts.provides {
             if !crate::facts::registry().contains_key(provider.as_str()) {
-                report.warning(Some(name), format!("{file} facts.provides"), format!("the fact provider '{provider}' is not built into this Buckle"));
+                report.warning(
+                    Some(name),
+                    format!("{file} facts.provides"),
+                    format!("the fact provider '{provider}' is not built into this Buckle"),
+                );
             }
         }
-        let mut check_decl = |report: &mut ValidationReport, decl: &TaskDecl, location: &str| {
+        let check_decl = |report: &mut ValidationReport, decl: &TaskDecl, location: &str| {
             if crate::task::registry().get(decl.kind.as_str()).is_none() {
-                report.error(Some(name), location, format!("'{}' is not a task kind this Buckle knows about", decl.kind));
+                report.error(
+                    Some(name),
+                    location,
+                    format!("'{}' is not a task kind this Buckle knows about", decl.kind),
+                );
             }
             let mut strings = Vec::new();
             yaml_strings(&decl.spec, &mut strings);
@@ -292,15 +333,33 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             }
         };
         for (i, decl) in m.config.tasks.iter().enumerate() {
-            check_decl(&mut report, decl, &format!("{file} tasks[{i}] ({})", decl.kind));
+            check_decl(
+                &mut report,
+                decl,
+                &format!("{file} tasks[{i}] ({})", decl.kind),
+            );
         }
         for (hname, decl) in &m.config.handlers {
-            check_decl(&mut report, decl, &format!("{file} handlers.{hname} ({})", decl.kind));
+            check_decl(
+                &mut report,
+                decl,
+                &format!("{file} handlers.{hname} ({})", decl.kind),
+            );
         }
         for (i, h) in m.config.health.iter().enumerate() {
             let location = format!("{file} health[{i}] ({})", h.display_name());
-            if crate::health::registry().get(h.check.kind.as_str()).is_none() {
-                report.error(Some(name), &location, format!("'{}' is not a health check kind this Buckle knows about", h.check.kind));
+            if crate::health::registry()
+                .get(h.check.kind.as_str())
+                .is_none()
+            {
+                report.error(
+                    Some(name),
+                    &location,
+                    format!(
+                        "'{}' is not a health check kind this Buckle knows about",
+                        h.check.kind
+                    ),
+                );
             }
             let mut strings = Vec::new();
             yaml_strings(&h.check.spec, &mut strings);
@@ -313,7 +372,11 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             let location = format!("modules/{name}/files/{}", path.display());
             check_secrets(&mut report, Some(name), &location, source);
             if let Err(e) = templater.check(source) {
-                report.error(Some(name), &location, format!("template does not compile: {}", e.message()));
+                report.error(
+                    Some(name),
+                    &location,
+                    format!("template does not compile: {}", e.message()),
+                );
             }
         }
     }
@@ -344,13 +407,4 @@ pub async fn validate_with_facts(
 /// Looks up the kind for `decl`, as a validation-friendly error.
 pub(super) fn kind_of(decl: &TaskDecl) -> crate::Result<&'static dyn crate::task::DynTask> {
     crate::task::lookup(&decl.kind)
-}
-
-/// The module names a module's `needs` close over, for error messages.
-pub(super) fn describe_module(config: &ModuleConfig) -> String {
-    if config.needs.is_empty() {
-        config.name.clone()
-    } else {
-        format!("{} (needs {})", config.name, config.needs.join(", "))
-    }
 }

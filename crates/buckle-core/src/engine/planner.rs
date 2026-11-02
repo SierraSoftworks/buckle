@@ -31,13 +31,18 @@ pub(super) fn build_templater(revision: &Revision) -> crate::Result<Templater> {
                 module.config.name,
                 path.to_string_lossy().replace('\\', "/")
             );
-            templater.add_template(name.clone(), source.clone()).map_err(|e| {
-                crate::error::wrap_user(
-                    e,
-                    format!("The template {name} in module '{}' does not compile.", module.config.name),
-                    &["Fix the template syntax; the internal error names the line."],
-                )
-            })?;
+            templater
+                .add_template(name.clone(), source.clone())
+                .map_err(|e| {
+                    crate::error::wrap_user(
+                        e,
+                        format!(
+                            "The template {name} in module '{}' does not compile.",
+                            module.config.name
+                        ),
+                        &["Fix the template syntax; the internal error names the line."],
+                    )
+                })?;
         }
     }
     Ok(templater)
@@ -139,23 +144,81 @@ pub(super) struct Planner<'a> {
     pub waived: Arc<Vec<String>>,
     pub agent_vars: &'a Vars,
     pub templater: Arc<Templater>,
+    /// JSON schemas by task kind, for secret-field aware spec rendering.
+    schemas: Mutex<HashMap<&'static str, Arc<serde_json::Value>>>,
 }
 
 impl<'a> Planner<'a> {
-    pub fn from_inputs(inputs: &'a Inputs, revision: &'a Revision) -> crate::Result<Self> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        revision: &'a Revision,
+        host: HostIdentity,
+        system: Arc<dyn System>,
+        secrets: Arc<SecretStore>,
+        select: Option<&'a crate::Filter>,
+        waived: Arc<Vec<String>>,
+        agent_vars: &'a Vars,
+    ) -> crate::Result<Self> {
         Ok(Self {
             revision,
-            host: HostIdentity {
+            host,
+            system,
+            secrets,
+            select,
+            waived,
+            agent_vars,
+            templater: Arc::new(build_templater(revision)?),
+            schemas: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn from_inputs(inputs: &'a Inputs, revision: &'a Revision) -> crate::Result<Self> {
+        Self::new(
+            revision,
+            HostIdentity {
                 id: inputs.host.id.clone(),
                 labels: inputs.labels(),
             },
-            system: inputs.system.clone(),
-            secrets: inputs.secrets.clone(),
-            select: inputs.select.as_ref(),
-            waived: Arc::new(inputs.waived_checks.clone()),
-            agent_vars: &inputs.agent_vars,
-            templater: Arc::new(build_templater(revision)?),
-        })
+            inputs.system.clone(),
+            inputs.secrets.clone(),
+            inputs.select.as_ref(),
+            Arc::new(inputs.waived_checks.clone()),
+            &inputs.agent_vars,
+        )
+    }
+
+    fn schema_of(&self, task: &'static dyn DynTask) -> Arc<serde_json::Value> {
+        if let Some(s) = self
+            .schemas
+            .lock()
+            .ok()
+            .and_then(|c| c.get(task.kind()).cloned())
+        {
+            return s;
+        }
+        let schema = Arc::new(serde_json::to_value(task.schema()).unwrap_or_default());
+        if let Ok(mut cache) = self.schemas.lock() {
+            cache.insert(task.kind(), schema.clone());
+        }
+        schema
+    }
+
+    /// Renders the template strings of a task spec with [`Templater::render_plain`],
+    /// except fields the kind's schema marks as secret-capable
+    /// (`x-buckle-secret`), which keep their raw template so the task can
+    /// resolve them through a sink.
+    pub fn render_spec(
+        &self,
+        task: &'static dyn DynTask,
+        spec: &serde_yaml::Value,
+        ctx: &HostContext,
+    ) -> crate::Result<serde_json::Value> {
+        let mut json = context::yaml_to_json(spec);
+        let schema = self.schema_of(task);
+        crate::secrets::field::render_spec_strings(&mut json, &schema, &mut |s| {
+            self.templater.render_plain(s, ctx)
+        })?;
+        Ok(json)
     }
 
     pub fn cx(&self, module: &str, source: Arc<dyn Source>, host: HostContext, mode: Mode) -> Cx {
@@ -168,6 +231,7 @@ impl<'a> Planner<'a> {
             module: module.to_owned(),
             secrets: self.secrets.clone(),
             waived_checks: self.waived.clone(),
+            previous: None,
         }
     }
 
@@ -177,15 +241,18 @@ impl<'a> Planner<'a> {
         self.cx("facts", Arc::new(EmptySource), host, Mode::Plan)
     }
 
-    /// A context for removing a resource of `module`, which may no longer exist.
-    pub fn removal_cx(&self, contexts: &Contexts, module: &str) -> Cx {
+    /// A context for removing `record`, whose module may no longer exist.
+    pub fn removal_cx(&self, contexts: &Contexts, record: &ResourceRecord) -> Cx {
+        let module = record.key.module.as_str();
         let source: Arc<dyn Source> = self
             .revision
             .module(module)
             .map(|m| m.source.clone())
             .unwrap_or_else(|| Arc::new(EmptySource));
         let host = contexts.base.in_module(module, &[]);
-        self.cx(module, source, host, Mode::Apply)
+        let mut cx = self.cx(module, source, host, Mode::Apply);
+        cx.previous = Some(Arc::new(record.clone()));
+        cx
     }
 
     /// Labels, groups, facts and secrets for one facts snapshot.
@@ -299,6 +366,7 @@ impl<'a> Planner<'a> {
         module: &LoadedModule,
         ctx: Arc<HostContext>,
         honour_select: bool,
+        state: &State,
     ) -> crate::Result<PreparedModule> {
         let name = module.config.name.as_str();
         let mut tasks: Vec<PreparedTask> = Vec::new();
@@ -306,22 +374,26 @@ impl<'a> Planner<'a> {
         for (index, decl) in module.config.tasks.iter().enumerate() {
             let label = task_label(name, index, decl);
             let task = super::validate::kind_of(decl).map_err(|e| {
-                crate::error::wrap_user(e, format!("{label} uses an unknown task kind."), &[
-                    "Run `buckle catalog` to list the task kinds this Buckle knows about.",
-                ])
+                crate::error::wrap_user(
+                    e,
+                    format!("{label} uses an unknown task kind."),
+                    &["Run `buckle catalog` to list the task kinds this Buckle knows about."],
+                )
             })?;
             let provisional = decl.id.clone().unwrap_or_default();
             let render_ctx = ctx.in_task(&decl.kind, &provisional, &decl.tags);
-            let json = context::render_value(&decl.spec, &self.templater, &render_ctx).map_err(|e| {
+            let json = self.render_spec(task, &decl.spec, &render_ctx).map_err(|e| {
                 crate::error::wrap_user(e, format!("{label} has a field that could not be rendered."), &[
                     "Check the template expressions in the task's fields against the host's facts and vars.",
                     "Secrets cannot be used in task fields; reference them from a file template instead.",
                 ])
             })?;
             let spec = task.parse(json).map_err(|e| {
-                crate::error::wrap_user(e, format!("{label} is invalid."), &[
-                    "Compare the task's fields against `buckle catalog`.",
-                ])
+                crate::error::wrap_user(
+                    e,
+                    format!("{label} is invalid."),
+                    &["Compare the task's fields against `buckle catalog`."],
+                )
             })?;
             let key = crate::task::resource_key(name, task, &spec, decl.id.as_deref());
             let task_ctx = ctx.in_task(&decl.kind, &key.key, &decl.tags);
@@ -345,7 +417,8 @@ impl<'a> Planner<'a> {
                 ));
             }
             let selected = !honour_select || self.select.is_none_or(|f| task_ctx.matches(f));
-            let cx = self.cx(name, module.source.clone(), task_ctx, Mode::Plan);
+            let mut cx = self.cx(name, module.source.clone(), task_ctx, Mode::Plan);
+            cx.previous = state.get(&key).cloned().map(Arc::new);
             tasks.push(PreparedTask {
                 decl: decl.clone(),
                 task,
@@ -494,26 +567,45 @@ impl<'a> Planner<'a> {
                 self.module_context(contexts, &owner.config)?
             };
             let label = format!("The handler '{handler}' of module '{owner_name}'");
-            let task = super::validate::kind_of(decl)
-                .map_err(|e| crate::error::wrap_user(e, format!("{label} uses an unknown task kind."), &["Run `buckle catalog` to list the task kinds this Buckle knows about."]))?;
-            let task_ctx = owner_ctx.in_task(&decl.kind, &handler, &decl.tags);
-            let json = context::render_value(&decl.spec, &self.templater, &task_ctx).map_err(|e| {
-                crate::error::wrap_user(e, format!("{label} has a field that could not be rendered."), &["Check the template expressions in the handler's fields."])
+            let task = super::validate::kind_of(decl).map_err(|e| {
+                crate::error::wrap_user(
+                    e,
+                    format!("{label} uses an unknown task kind."),
+                    &["Run `buckle catalog` to list the task kinds this Buckle knows about."],
+                )
             })?;
-            let spec = task
-                .parse(json)
-                .map_err(|e| crate::error::wrap_user(e, format!("{label} is invalid."), &["Compare the handler's fields against `buckle catalog`."]))?;
+            let task_ctx = owner_ctx.in_task(&decl.kind, &handler, &decl.tags);
+            let json = self.render_spec(task, &decl.spec, &task_ctx).map_err(|e| {
+                crate::error::wrap_user(
+                    e,
+                    format!("{label} has a field that could not be rendered."),
+                    &["Check the template expressions in the handler's fields."],
+                )
+            })?;
+            let spec = task.parse(json).map_err(|e| {
+                crate::error::wrap_user(
+                    e,
+                    format!("{label} is invalid."),
+                    &["Compare the handler's fields against `buckle catalog`."],
+                )
+            })?;
             if let Some(when) = &decl.when
                 && !task_ctx.matches(when)
             {
                 continue;
             }
-            let unit = ["name", "unit"]
-                .iter()
-                .find_map(|f| spec.json.get(*f).and_then(|v| v.as_str()).map(str::to_owned));
+            let unit = ["name", "unit"].iter().find_map(|f| {
+                spec.json
+                    .get(*f)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            });
             let cx = self.cx(&owner_name, owner.source.clone(), task_ctx, Mode::Plan);
             let planned = if !task.platforms().contains(platform) {
-                Planned::blocked(format!("the {} task kind does not support {platform}", decl.kind))
+                Planned::blocked(format!(
+                    "the {} task kind does not support {platform}",
+                    decl.kind
+                ))
             } else {
                 task.plan(&cx, &spec)
                     .instrument(tracing::info_span!("task.plan", buckle.module = %owner_name, buckle.task.kind = %decl.kind, buckle.task.key = %handler))
@@ -549,7 +641,8 @@ impl<'a> Planner<'a> {
             .filter_map(|e| e.unit.clone())
             .collect();
         entries.retain(|e| {
-            !(e.run.kind == "systemd.reload" && e.unit.as_ref().is_some_and(|u| restarted.contains(u)))
+            !(e.run.kind == "systemd.reload"
+                && e.unit.as_ref().is_some_and(|u| restarted.contains(u)))
         });
         entries.sort_by_key(|e| (handler_priority(&e.run.kind), e.index));
         Ok(entries.into_iter().map(|e| (e.run, e.rich)).unzip())
@@ -562,6 +655,7 @@ impl<'a> Planner<'a> {
         &self,
         name: &str,
         facts: &Facts,
+        state: &State,
         honour_select: bool,
     ) -> crate::Result<RichModulePlan> {
         let module = self.revision.module(name).ok_or_else(|| {
@@ -572,7 +666,7 @@ impl<'a> Planner<'a> {
         })?;
         let contexts = self.contexts(facts);
         let ctx = self.module_context(&contexts, &module.config)?;
-        let prepared = self.prepare(module, ctx, honour_select)?;
+        let prepared = self.prepare(module, ctx, honour_select, state)?;
         self.plan_module(prepared, &contexts).await
     }
 
@@ -650,7 +744,11 @@ fn handler_priority(kind: &str) -> u8 {
 
 fn task_label(module: &str, index: usize, decl: &TaskDecl) -> String {
     match &decl.name {
-        Some(n) => format!("task #{} '{n}' ({}) of module '{module}'", index + 1, decl.kind),
+        Some(n) => format!(
+            "task #{} '{n}' ({}) of module '{module}'",
+            index + 1,
+            decl.kind
+        ),
         None => format!("task #{} ({}) of module '{module}'", index + 1, decl.kind),
     }
 }
@@ -689,17 +787,21 @@ pub(super) async fn plan_with(
     let mut prepared = Vec::with_capacity(selection.order.len());
     for module in &selection.order {
         let ctx = planner.module_context(&contexts, &module.config)?;
-        prepared.push(planner.prepare(module, ctx, true)?);
+        prepared.push(planner.prepare(module, ctx, true, state)?);
     }
     let desired: Vec<ResourceKey> = prepared
         .iter()
         .flat_map(|p| p.desired_keys().cloned())
         .collect();
     let order: Vec<String> = prepared.iter().map(|p| p.name.clone()).collect();
-    let needs: HashMap<String, Vec<String>> =
-        prepared.iter().map(|p| (p.name.clone(), p.needs.clone())).collect();
-    let provides: HashMap<String, Vec<String>> =
-        prepared.iter().map(|p| (p.name.clone(), p.provides.clone())).collect();
+    let needs: HashMap<String, Vec<String>> = prepared
+        .iter()
+        .map(|p| (p.name.clone(), p.needs.clone()))
+        .collect();
+    let provides: HashMap<String, Vec<String>> = prepared
+        .iter()
+        .map(|p| (p.name.clone(), p.provides.clone()))
+        .collect();
 
     let mut planned: Vec<RichModulePlan> = Vec::new();
     let mut deferred: Vec<Deferred> = Vec::new();
@@ -731,8 +833,10 @@ pub(super) async fn plan_with(
     }
 
     let exclude: BTreeSet<String> = deferred.iter().map(|d| d.module.clone()).collect();
-    let (removals, rich_removals): (Vec<Removal>, Vec<RichRemoval>) =
-        planner.removals(state, &desired, &exclude).into_iter().unzip();
+    let (removals, rich_removals): (Vec<Removal>, Vec<RichRemoval>) = planner
+        .removals(state, &desired, &exclude)
+        .into_iter()
+        .unzip();
 
     let module_plans: Vec<ModulePlan> = planned.iter().map(|m| m.plan.clone()).collect();
     let mut plan = Plan::new(
@@ -789,28 +893,31 @@ pub(super) async fn dry_run(
     let mut secrets = SecretStore::new();
     let key = crate::secrets::InstallKey::from_bytes([0u8; 32]);
     for name in revision.fleet.secrets.keys() {
-        secrets.insert(crate::secrets::Secret::new(name.clone(), "placeholder".into(), &key));
+        secrets.insert(crate::secrets::Secret::new(
+            name.clone(),
+            "placeholder".into(),
+            &key,
+        ));
     }
     let agent_vars = Vars::new();
-    let planner = Planner {
+    let planner = Planner::new(
         revision,
-        host: host.clone(),
-        system: Arc::new(crate::system::RealSystem::new()),
-        secrets: Arc::new(secrets),
-        select: None,
-        waived: Arc::new(Vec::new()),
-        agent_vars: &agent_vars,
-        templater: Arc::new(build_templater(revision)?),
-    };
+        host.clone(),
+        Arc::new(crate::system::RealSystem::new()),
+        Arc::new(secrets),
+        None,
+        Arc::new(Vec::new()),
+        &agent_vars,
+    )?;
     let contexts = planner.contexts(facts);
     let selection = planner.select(&contexts)?;
     for module in &selection.order {
         let ctx = planner.module_context(&contexts, &module.config)?;
-        planner.prepare(module, ctx, false)?;
+        planner.prepare(module, ctx.clone(), false, &State::default())?;
         for (name, decl) in &module.config.handlers {
             let task = super::validate::kind_of(decl)?;
             let task_ctx = ctx.in_task(&decl.kind, name, &decl.tags);
-            let json = context::render_value(&decl.spec, &planner.templater, &task_ctx).map_err(|e| {
+            let json = planner.render_spec(task, &decl.spec, &task_ctx).map_err(|e| {
                 crate::error::wrap_user(
                     e,
                     format!("The handler '{name}' of module '{}' has a field that could not be rendered.", module.config.name),

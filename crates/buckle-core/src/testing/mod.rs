@@ -48,6 +48,8 @@ struct Inner {
     platform: Platform,
     hostname: String,
     now: chrono::DateTime<chrono::Utc>,
+    /// Explicit modification times; paths absent here report `now`.
+    mtimes: BTreeMap<PathBuf, chrono::DateTime<chrono::Utc>>,
 }
 
 /// An in-memory host. Clone it freely; clones share the same state.
@@ -111,6 +113,22 @@ impl FakeSystem {
 
     pub fn with_dir(self, path: impl AsRef<Path>, perms: FilePerms) -> Self {
         self.ensure_dir(path.as_ref(), perms);
+        self
+    }
+
+    /// Sets the modification time `stat` reports for an existing path. Paths
+    /// without an explicit time report the fake clock's `now`; writing a file
+    /// through the system clears its explicit time.
+    pub fn with_file_mtime(
+        self,
+        path: impl AsRef<Path>,
+        modified: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .mtimes
+            .insert(path.as_ref().to_path_buf(), modified);
         self
     }
 
@@ -261,11 +279,11 @@ impl FakeSystem {
         if let Some(parent) = path.parent() {
             self.ensure_dir(parent, FilePerms::mode(0o755));
         }
-        self.inner
-            .lock()
-            .unwrap()
+        let mut inner = self.inner.lock().unwrap();
+        inner
             .fs
             .insert(path.to_path_buf(), Node::File { bytes, perms });
+        inner.mtimes.remove(path);
     }
 
     fn ensure_dir(&self, path: &Path, perms: FilePerms) {
@@ -292,7 +310,7 @@ pub fn ok_output(stdout: &str) -> Output {
     }
 }
 
-fn meta_for(node: &Node, inner: &Inner) -> FileMeta {
+fn meta_for(path: &Path, node: &Node, inner: &Inner) -> FileMeta {
     let (kind, size, perms) = match node {
         Node::File { bytes, perms } => (FileKind::File, bytes.len() as u64, Some(perms)),
         Node::Dir { perms } => (FileKind::Directory, 0, Some(perms)),
@@ -324,7 +342,7 @@ fn meta_for(node: &Node, inner: &Inner) -> FileMeta {
             .or(Some(0)),
         owner,
         group,
-        modified: Some(inner.now),
+        modified: Some(inner.mtimes.get(path).copied().unwrap_or(inner.now)),
     }
 }
 
@@ -348,7 +366,7 @@ impl System for FakeSystem {
 
     async fn stat(&self, path: &Path) -> Result<Option<FileMeta>> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.fs.get(path).map(|n| meta_for(n, &inner)))
+        Ok(inner.fs.get(path).map(|n| meta_for(path, n, &inner)))
     }
 
     async fn write_atomic(&self, path: &Path, bytes: &[u8], perms: &FilePerms) -> Result<()> {
@@ -425,9 +443,11 @@ impl System for FakeSystem {
             }
             for c in children {
                 inner.fs.remove(&c);
+                inner.mtimes.remove(&c);
             }
         }
         inner.fs.remove(path);
+        inner.mtimes.remove(path);
         Ok(true)
     }
 
@@ -475,6 +495,9 @@ impl System for FakeSystem {
             )
         })?;
         inner.fs.insert(to.to_path_buf(), node);
+        if let Some(mtime) = inner.mtimes.remove(from) {
+            inner.mtimes.insert(to.to_path_buf(), mtime);
+        }
         Ok(())
     }
 
@@ -595,6 +618,7 @@ pub struct CxBuilder {
     host: HostContext,
     mode: Mode,
     module: String,
+    previous: Option<Arc<crate::state::ResourceRecord>>,
 }
 
 impl CxBuilder {
@@ -608,7 +632,14 @@ impl CxBuilder {
             }),
             mode: Mode::Apply,
             module: "test".into(),
+            previous: None,
         }
+    }
+
+    /// The resource's existing record, as the engine would pass it.
+    pub fn previous(mut self, record: crate::state::ResourceRecord) -> Self {
+        self.previous = Some(Arc::new(record));
+        self
     }
 
     pub fn source(mut self, source: MemorySource) -> Self {
@@ -647,6 +678,7 @@ impl CxBuilder {
             module: self.module,
             secrets,
             waived_checks: Arc::new(Vec::new()),
+            previous: self.previous,
         }
     }
 }
@@ -691,6 +723,31 @@ mod tests {
         );
         assert!(sys.remove(Path::new("/etc"), true).await.unwrap());
         assert!(!sys.exists("/etc/a.conf"));
+    }
+
+    #[tokio::test]
+    async fn explicit_mtimes_are_reported_until_the_file_is_rewritten() {
+        let old = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sys = FakeSystem::new()
+            .with_file("/var/cache/stamp", "x", FilePerms::mode(0o644))
+            .with_file_mtime("/var/cache/stamp", old);
+        let meta = sys
+            .stat(Path::new("/var/cache/stamp"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.modified, Some(old));
+        sys.write_atomic(Path::new("/var/cache/stamp"), b"y", &FilePerms::default())
+            .await
+            .unwrap();
+        let meta = sys
+            .stat(Path::new("/var/cache/stamp"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.modified, Some(sys.now()));
     }
 
     #[tokio::test]

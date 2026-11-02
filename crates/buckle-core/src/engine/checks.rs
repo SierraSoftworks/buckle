@@ -15,11 +15,12 @@ use tracing::Instrument;
 /// `Fail` or `Unknown` status with a reason.
 async fn run_check(
     planner: &Planner<'_>,
-    module: &str,
-    ctx: &Arc<HostContext>,
-    source: &Arc<dyn Source>,
+    checks: &ModuleChecks<'_>,
     decl: &HealthDecl,
 ) -> HealthResult {
+    let module = checks.module;
+    let ctx = checks.ctx;
+    let source = checks.source;
     let name = decl.display_name().to_owned();
     let kind = decl.check.kind.clone();
     let started = tokio::time::Instant::now();
@@ -48,8 +49,8 @@ async fn run_check(
         match tokio::time::timeout(decl.timeout, check.check(&cx, &spec)).await {
             Ok(status) => status,
             Err(_) => HealthStatus::fail(format!(
-                "timed out after {}",
-                humantime::format_duration(decl.timeout)
+                "timed out after {:?}",
+                decl.timeout
             )),
         }
     }
@@ -66,17 +67,22 @@ async fn run_check(
     }
 }
 
+/// The checks of one module and the context they run in.
+pub(super) struct ModuleChecks<'a> {
+    pub module: &'a str,
+    pub decls: &'a [HealthDecl],
+    pub ctx: &'a Arc<HostContext>,
+    pub source: &'a Arc<dyn Source>,
+}
+
 /// Runs every check of a module once.
 pub(super) async fn run_once(
     planner: &Planner<'_>,
-    module: &str,
-    decls: &[HealthDecl],
-    ctx: &Arc<HostContext>,
-    source: &Arc<dyn Source>,
+    checks: &ModuleChecks<'_>,
 ) -> Vec<HealthResult> {
-    let mut results = Vec::with_capacity(decls.len());
-    for decl in decls {
-        results.push(run_check(planner, module, ctx, source, decl).await);
+    let mut results = Vec::with_capacity(checks.decls.len());
+    for decl in checks.decls {
+        results.push(run_check(planner, checks, decl).await);
     }
     results
 }
@@ -87,20 +93,19 @@ pub(super) async fn run_once(
 /// healthy.
 pub(super) async fn run_settled(
     planner: &Planner<'_>,
-    module: &str,
-    decls: &[HealthDecl],
-    ctx: &Arc<HostContext>,
-    source: &Arc<dyn Source>,
+    checks: &ModuleChecks<'_>,
     settle: Duration,
     waived: &[String],
     events: &tokio::sync::mpsc::Sender<ApplyEvent>,
 ) -> (Vec<HealthResult>, bool) {
+    let module = checks.module;
+    let decls = checks.decls;
     if decls.is_empty() {
         return (Vec::new(), true);
     }
     let mut first_failure: Option<tokio::time::Instant> = None;
     loop {
-        let results = run_once(planner, module, decls, ctx, source).await;
+        let results = run_once(planner, checks).await;
         for r in &results {
             let reason = match &r.status {
                 HealthStatus::Pass => None,
@@ -180,10 +185,12 @@ pub(super) async fn run_scope(
         results.extend(
             run_once(
                 &planner,
-                &module.config.name,
-                &module.config.health,
-                &ctx,
-                &module.source,
+                &ModuleChecks {
+                    module: &module.config.name,
+                    decls: &module.config.health,
+                    ctx: &ctx,
+                    source: &module.source,
+                },
             )
             .await,
         );

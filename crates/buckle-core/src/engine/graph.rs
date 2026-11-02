@@ -19,10 +19,6 @@ impl Graph {
         self.needs.insert(name.to_owned(), needs.to_vec());
     }
 
-    pub fn contains(&self, name: &str) -> bool {
-        self.needs.contains_key(name)
-    }
-
     pub fn needs(&self, name: &str) -> &[String] {
         self.needs.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -105,18 +101,6 @@ impl Graph {
         }
         None
     }
-
-    /// Every node reachable through `needs` from `name` (not including `name`).
-    pub fn transitive_needs(&self, name: &str) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        let mut stack: Vec<&str> = self.known_needs(name).map(String::as_str).collect();
-        while let Some(n) = stack.pop() {
-            if out.insert(n.to_owned()) {
-                stack.extend(self.known_needs(n).map(String::as_str));
-            }
-        }
-        out
-    }
 }
 
 #[cfg(test)]
@@ -159,9 +143,5 @@ mod tests {
     fn unknown_dependencies_are_ignored_for_ordering() {
         let g = graph(&[("a", &["missing"]), ("b", &["a"])]);
         assert_eq!(g.topo_order().unwrap(), vec!["a", "b"]);
-        assert_eq!(
-            g.transitive_needs("b"),
-            BTreeSet::from(["a".to_string()])
-        );
     }
 }
