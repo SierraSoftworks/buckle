@@ -256,6 +256,10 @@ fn failed_outcome(plan: &Plan, error: &buckle_core::Error, started: Instant) -> 
         not_started: plan.modules.iter().map(|m| m.module.clone()).collect(),
         health: None,
         error: Some(error.description()),
+        error_detail: Some(buckle_core::error::ErrorReport::of(error)),
+        removals_run: Vec::new(),
+        started_at: None,
+        finished_at: None,
     }
 }
 

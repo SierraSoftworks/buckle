@@ -463,11 +463,9 @@ mod tests {
         assert!(!needs_attention(&outcome));
         outcome.succeeded = false;
         outcome.module_results = vec![ModuleOutcome {
-            module: "m".into(),
-            status: ModuleStatus::Blocked,
-            changes: 0,
             duration_ms: 1,
             error: Some("waiting on a lock".into()),
+            ..ModuleOutcome::new("m", ModuleStatus::Blocked)
         }];
         let report = Report::ApplyResult {
             report_id: 1,
@@ -495,11 +493,13 @@ mod tests {
                 module: "nomad".into(),
                 reason: "var 'dc' is undefined".into(),
                 plan_error: true,
+                error_detail: None,
             },
             buckle_core::plan::Indeterminate {
                 module: "docker".into(),
                 reason: "facts missing".into(),
                 plan_error: false,
+                error_detail: None,
             },
         ];
         match report_to_proto(&Report::Plan(plan)).msg {

@@ -216,6 +216,7 @@ pub fn render_event(event: &ApplyEvent) -> String {
             module,
             task_id,
             kind,
+            ..
         } => {
             format!("  … {module}/{kind}[{task_id}]")
         }
@@ -225,6 +226,7 @@ pub fn render_event(event: &ApplyEvent) -> String {
             kind,
             changed,
             summary,
+            ..
         } => format!(
             "  {} {module}/{kind}[{task_id}]  {summary}",
             if *changed { "~" } else { "✓" }
@@ -234,7 +236,14 @@ pub fn render_event(event: &ApplyEvent) -> String {
             task_id,
             kind,
             error,
+            ..
         } => format!("  ✗ {module}/{kind}[{task_id}]  {error}"),
+        ApplyEvent::StepBlocked {
+            module, id, reason, ..
+        } => format!("  ! {module}/{id}  blocked: {reason}"),
+        ApplyEvent::StepSkipped {
+            module, id, reason, ..
+        } => format!("  · {module}/{id}  skipped: {reason}"),
         ApplyEvent::HandlerRun { module, handler } => format!("  ↻ handler {module}:{handler}"),
         ApplyEvent::ModuleFinished { module, status } => {
             format!("{module}  {}", status_word(*status))
@@ -481,6 +490,7 @@ mod tests {
         let line = render_event(&ApplyEvent::StepFinished {
             module: "m".into(),
             task_id: "/x".into(),
+            id: "file.copy[/x]".into(),
             kind: "file.copy".into(),
             changed: true,
             summary: "wrote /x".into(),

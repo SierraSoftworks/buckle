@@ -91,11 +91,13 @@ async fn assign_plan_apply_reports_the_plan_coalesced_events_and_the_result() {
         events.push(ApplyEvent::StepStarted {
             module: "m".into(),
             task_id: format!("t{i}"),
+            id: format!("file.copy[t{i}]"),
             kind: "file.copy".into(),
         });
         events.push(ApplyEvent::StepFinished {
             module: "m".into(),
             task_id: format!("t{i}"),
+            id: format!("file.copy[t{i}]"),
             kind: "file.copy".into(),
             changed: true,
             summary: "wrote".into(),

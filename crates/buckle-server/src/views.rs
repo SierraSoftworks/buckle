@@ -409,6 +409,7 @@ pub(crate) mod tests {
             module: "caddy".into(),
             reason: "reads facts.caddy, which failed".into(),
             plan_error: true,
+            error_detail: None,
         }])
         .with_rehomed(vec![Rehome {
             from: ResourceKey::new("old", "file.copy", "/etc/x"),

@@ -33,6 +33,12 @@ pub fn coalesce_key(event: &ApplyEvent) -> String {
         }
         | ApplyEvent::StepFailed {
             module, task_id, ..
+        }
+        | ApplyEvent::StepBlocked {
+            module, task_id, ..
+        }
+        | ApplyEvent::StepSkipped {
+            module, task_id, ..
         } => format!("step:{module}/{task_id}"),
         ApplyEvent::HandlerRun { module, handler } => format!("handler:{module}/{handler}"),
         ApplyEvent::RemovalRun { resource, .. } => format!("removal:{resource}"),
@@ -136,6 +142,7 @@ mod tests {
             ApplyEvent::StepFinished {
                 module: "m".into(),
                 task_id: format!("t{i}"),
+                id: format!("file.copy[t{i}]"),
                 kind: "file.copy".into(),
                 changed: true,
                 summary: "wrote".into(),
@@ -144,6 +151,7 @@ mod tests {
             ApplyEvent::StepStarted {
                 module: "m".into(),
                 task_id: format!("t{i}"),
+                id: format!("file.copy[t{i}]"),
                 kind: "file.copy".into(),
             }
         }

@@ -13,8 +13,12 @@ use super::planner::{
     Contexts, DeferredPlan, Planner, RichHandler, RichModulePlan, RichPlan, RichStep,
     collect_facts, plan_with,
 };
-use super::{ApplyEvent, ApplyOutcome, Inputs, ModuleOutcome, ModuleStatus};
+use super::{
+    ApplyEvent, ApplyOutcome, Inputs, ModuleOutcome, ModuleStatus, RemovalOutcome, StepOutcome,
+    StepState,
+};
 use crate::Digest;
+use crate::error::ErrorReport;
 use crate::facts::Facts;
 use crate::health::{HealthReport, HealthResult, HealthScope};
 use crate::model::{RemovalPolicy, RetryPolicy};
@@ -86,7 +90,7 @@ struct Executor<'a> {
     scheduled: Mutex<HashSet<String>>,
     /// State saves that failed during the run (reported, never fatal: the
     /// host was changed either way).
-    save_errors: Mutex<Vec<String>>,
+    save_errors: Mutex<Vec<ErrorReport>>,
     /// Cross-module handlers waiting for their owner module to finish:
     /// owner → `(owner, handler)` pairs.
     pending_handlers: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -142,6 +146,11 @@ impl<'a> Executor<'a> {
         let _ = self.events.send(event).await;
     }
 
+    /// `err` as a structured report, every field redacted.
+    fn report(&self, err: &crate::Error) -> ErrorReport {
+        ErrorReport::of(err).map_text(|t| self.scrub(t))
+    }
+
     fn scrub(&self, text: &str) -> String {
         if self.redactor.is_empty() {
             text.to_owned()
@@ -186,10 +195,10 @@ impl<'a> Executor<'a> {
     /// in flight); a failure is remembered for the outcome, not fatal.
     fn checkpoint(&self) {
         if let Err(e) = self.save_state() {
-            let message = format!("state could not be saved: {}", e.message());
+            let report = self.report(&e).prefixed("state could not be saved");
             let mut errors = self.save_errors.lock().unwrap_or_else(|p| p.into_inner());
-            if errors.last() != Some(&message) {
-                errors.push(message);
+            if errors.last() != Some(&report) {
+                errors.push(report);
             }
         }
     }
@@ -277,7 +286,7 @@ impl<'a> Executor<'a> {
     }
 
     /// Applies one changing step under its locks, with retries, and records the
-    /// resource. `Err` carries the scrubbed error message.
+    /// resource. `Err` carries the scrubbed, structured error.
     async fn apply_step(
         &self,
         module: &str,
@@ -286,10 +295,12 @@ impl<'a> Executor<'a> {
         planned: &Planned,
         revision: &RevisionId,
         span: &tracing::Span,
-    ) -> Result<Applied, String> {
+    ) -> Result<Applied, ErrorReport> {
+        let id = super::step_id(&step.resource);
         self.emit(ApplyEvent::StepStarted {
             module: module.to_owned(),
             task_id: step.task.id.clone(),
+            id: id.clone(),
             kind: step.task.kind.clone(),
         })
         .await;
@@ -324,6 +335,7 @@ impl<'a> Executor<'a> {
                 self.emit(ApplyEvent::StepFinished {
                     module: module.to_owned(),
                     task_id: step.task.id.clone(),
+                    id,
                     kind: step.task.kind.clone(),
                     changed: applied.changed,
                     summary: self.scrub(&applied.summary),
@@ -332,16 +344,18 @@ impl<'a> Executor<'a> {
                 Ok(applied)
             }
             Err(err) => {
-                let message = self.scrub(&err.message());
-                tracing::error!(parent: span, error = %message, "task failed");
+                let report = self.report(&err);
+                tracing::error!(parent: span, error = %report.message, causes = ?report.causes, "task failed");
                 self.emit(ApplyEvent::StepFailed {
                     module: module.to_owned(),
                     task_id: step.task.id.clone(),
+                    id,
                     kind: step.task.kind.clone(),
-                    error: message.clone(),
+                    error: report.one_line(),
+                    error_detail: Some(report.clone()),
                 })
                 .await;
-                Err(message)
+                Err(report)
             }
         }
     }
@@ -364,7 +378,9 @@ impl<'a> Executor<'a> {
             .unwrap_or_default()
     }
 
-    /// Plans (deduplicated and ordered) and runs the notified handlers.
+    /// Plans (deduplicated and ordered) and runs the notified handlers. Returns
+    /// what happened to each handler and, when one failed (or they could not
+    /// be planned), the error.
     async fn run_notified(
         &self,
         planner: &Planner<'_>,
@@ -372,34 +388,60 @@ impl<'a> Executor<'a> {
         ctx: Option<&Arc<crate::selectors::HostContext>>,
         notified: &[(String, String)],
         contexts: &Contexts,
-    ) -> Result<(), String> {
+    ) -> (Vec<StepOutcome>, Result<(), ErrorReport>) {
         if notified.is_empty() {
-            return Ok(());
+            return (Vec::new(), Ok(()));
         }
-        let (runs, handlers) = planner
-            .plan_notified(module, ctx, notified, contexts)
-            .await
-            .map_err(|e| format!("planning handlers failed: {}", self.scrub(&e.message())))?;
+        let (runs, handlers) = match planner.plan_notified(module, ctx, notified, contexts).await {
+            Ok(planned) => planned,
+            Err(e) => {
+                return (
+                    Vec::new(),
+                    Err(self.report(&e).prefixed("planning handlers failed")),
+                );
+            }
+        };
+        let mut outcomes = Vec::with_capacity(runs.len());
         for (run, rh) in runs.iter().zip(handlers.iter()) {
-            self.run_handler(module, run, rh).await?;
+            let outcome = self.run_handler(module, run, rh).await;
+            let failed = outcome.state == StepState::Failed;
+            let error = outcome.error_detail.clone();
+            outcomes.push(outcome);
+            if failed {
+                // The handlers after the failing one never run.
+                for later in runs.iter().skip(outcomes.len()) {
+                    outcomes.push(StepOutcome::planned_handler(later, StepState::NotRun));
+                }
+                let error = error
+                    .unwrap_or_else(|| ErrorReport::system("the handler failed"))
+                    .prefixed(&format!("handler {}:{} failed", run.module, run.handler));
+                return (outcomes, Err(error));
+            }
         }
-        Ok(())
+        (outcomes, Ok(()))
     }
 
-    /// Runs one handler (when its plan is a change) and emits the event.
-    async fn run_handler(
-        &self,
-        module: &str,
-        run: &HandlerRun,
-        rh: &RichHandler,
-    ) -> Result<(), String> {
+    /// Runs one handler (when its plan is a change) and emits its events.
+    async fn run_handler(&self, module: &str, run: &HandlerRun, rh: &RichHandler) -> StepOutcome {
         let span = tracing::info_span!(
             "handler.run",
             buckle.module = %run.module,
             buckle.handler = %run.handler,
             buckle.task.kind = %run.kind,
         );
+        let id = super::handler_id(&run.module, &run.handler);
+        let mut outcome = StepOutcome::planned_handler(run, StepState::Unchanged);
+        let started_at = self.inputs.system.now();
+        let clock = tokio::time::Instant::now();
+        outcome.started_at = Some(started_at);
         if rh.planned.is_change() {
+            self.emit(ApplyEvent::StepStarted {
+                module: module.to_owned(),
+                task_id: id.clone(),
+                id: id.clone(),
+                kind: run.kind.clone(),
+            })
+            .await;
             let mut cx = rh.cx.clone();
             cx.mode = Mode::Apply;
             cx.system = self.inputs.system.clone();
@@ -418,28 +460,55 @@ impl<'a> Executor<'a> {
             }
             .instrument(span.clone())
             .await;
-            if let Err(err) = result {
-                let message = self.scrub(&err.message());
-                tracing::error!(parent: &span, error = %message, "handler failed");
-                self.emit(ApplyEvent::StepFailed {
-                    module: module.to_owned(),
-                    task_id: format!("{}:{}", run.module, run.handler),
-                    kind: run.kind.clone(),
-                    error: message.clone(),
-                })
-                .await;
-                return Err(format!(
-                    "handler {}:{} failed: {message}",
-                    run.module, run.handler
-                ));
+            outcome.finished_at = Some(self.inputs.system.now());
+            outcome.duration_ms = Some(clock.elapsed().as_millis() as u64);
+            match result {
+                Err(err) => {
+                    let report = self.report(&err);
+                    tracing::error!(parent: &span, error = %report.message, causes = ?report.causes, "handler failed");
+                    self.emit(ApplyEvent::StepFailed {
+                        module: module.to_owned(),
+                        task_id: id.clone(),
+                        id,
+                        kind: run.kind.clone(),
+                        error: report.one_line(),
+                        error_detail: Some(report.clone()),
+                    })
+                    .await;
+                    outcome.state = StepState::Failed;
+                    outcome.error_detail = Some(report);
+                    return outcome;
+                }
+                Ok(applied) => {
+                    let summary = self.scrub(&applied.summary);
+                    outcome.state = if applied.changed {
+                        StepState::Changed
+                    } else {
+                        StepState::Unchanged
+                    };
+                    self.emit(ApplyEvent::StepFinished {
+                        module: module.to_owned(),
+                        task_id: id.clone(),
+                        id: id.clone(),
+                        kind: run.kind.clone(),
+                        changed: applied.changed,
+                        summary: summary.clone(),
+                    })
+                    .await;
+                    outcome.result = Some(summary);
+                }
             }
+        } else {
+            outcome.finished_at = Some(started_at);
+            outcome.duration_ms = Some(0);
+            outcome.result = Some("no change".to_owned());
         }
         self.emit(ApplyEvent::HandlerRun {
             module: run.module.clone(),
             handler: run.handler.clone(),
         })
         .await;
-        Ok(())
+        outcome
     }
 
     /// Runs one module: steps in order, then handlers, then (optionally) the
@@ -462,6 +531,7 @@ impl<'a> Executor<'a> {
     ) -> ModuleRun {
         let module = rich.plan.module.clone();
         let started = tokio::time::Instant::now();
+        let started_at = self.inputs.system.now();
         self.emit(ApplyEvent::ModuleStarted {
             module: module.clone(),
         })
@@ -471,12 +541,22 @@ impl<'a> Executor<'a> {
         // Steps whose apply really changed something: only they notify.
         let mut changed_steps: Vec<Step> = Vec::new();
         let mut blocked: Vec<String> = Vec::new();
+        // Every planned step, `not_run` until it is reached.
+        let mut steps: Vec<StepOutcome> = rich
+            .plan
+            .steps
+            .iter()
+            .map(|s| StepOutcome::planned(s, StepState::NotRun))
+            .collect();
+        let mut handlers: Vec<StepOutcome> = Vec::new();
 
         let finish = |status: ModuleStatus,
-                      error: Option<String>,
+                      error: Option<ErrorReport>,
                       changes: usize,
                       health: Vec<HealthResult>,
-                      blocked: Vec<String>| ModuleRun {
+                      blocked: Vec<String>,
+                      steps: Vec<StepOutcome>,
+                      handlers: Vec<StepOutcome>| ModuleRun {
             failed: matches!(status, ModuleStatus::Failed | ModuleStatus::Unhealthy),
             blocked,
             outcome: ModuleOutcome {
@@ -484,13 +564,19 @@ impl<'a> Executor<'a> {
                 status,
                 changes,
                 duration_ms: started.elapsed().as_millis() as u64,
-                error,
+                error: error.as_ref().map(ErrorReport::one_line),
+                error_detail: error,
+                steps,
+                handlers,
+                started_at: Some(started_at),
+                finished_at: Some(self.inputs.system.now()),
             },
             health,
         };
 
         for (index, step) in rich.plan.steps.iter().enumerate() {
             let rs = &rich.steps[index];
+            let id = super::step_id(&step.resource);
             let span = tracing::info_span!(
                 "task.apply",
                 buckle.module = %module,
@@ -498,6 +584,8 @@ impl<'a> Executor<'a> {
                 buckle.task.key = %step.resource.key,
                 buckle.changed = tracing::field::Empty,
             );
+            let step_started_at = self.inputs.system.now();
+            let step_clock = tokio::time::Instant::now();
             let replanned: Option<Planned> = match &step.planned {
                 Planned::Blocked { .. } if self.changed_so_far.load(Ordering::Relaxed) > 0 => {
                     let mut cx = rs.cx.clone();
@@ -527,7 +615,7 @@ impl<'a> Executor<'a> {
                             Some(planned)
                         }
                         Err(err) => {
-                            tracing::warn!(parent: &span, error = %self.scrub(&err.message()), "planning the blocked step again failed; leaving it blocked");
+                            tracing::warn!(parent: &span, error = %self.scrub(&err.description()), "planning the blocked step again failed; leaving it blocked");
                             None
                         }
                     }
@@ -535,16 +623,20 @@ impl<'a> Executor<'a> {
                 _ => None,
             };
             let planned = replanned.as_ref().unwrap_or(&step.planned);
+            let outcome = &mut steps[index];
+            outcome.started_at = Some(step_started_at);
             match planned {
                 Planned::Blocked { reason } => {
                     span.record("buckle.changed", false);
                     blocked.push(format!("{} is blocked: {reason}", step.resource));
-                    self.emit(ApplyEvent::StepFinished {
+                    outcome.state = StepState::Blocked;
+                    outcome.result = Some(format!("blocked: {reason}"));
+                    self.emit(ApplyEvent::StepBlocked {
                         module: module.clone(),
                         task_id: step.task.id.clone(),
+                        id,
                         kind: step.task.kind.clone(),
-                        changed: false,
-                        summary: format!("blocked: {reason}"),
+                        reason: reason.clone(),
                     })
                     .await;
                 }
@@ -552,9 +644,12 @@ impl<'a> Executor<'a> {
                     span.record("buckle.changed", false);
                     self.record_step(step, rs, None, revision);
                     self.checkpoint();
+                    outcome.state = StepState::Unchanged;
+                    outcome.result = Some("no change".to_owned());
                     self.emit(ApplyEvent::StepFinished {
                         module: module.clone(),
                         task_id: step.task.id.clone(),
+                        id,
                         kind: step.task.kind.clone(),
                         changed: false,
                         summary: "no change".to_owned(),
@@ -567,6 +662,13 @@ impl<'a> Executor<'a> {
                         .await
                     {
                         Ok(applied) => {
+                            let outcome = &mut steps[index];
+                            outcome.state = if applied.changed {
+                                StepState::Changed
+                            } else {
+                                StepState::Unchanged
+                            };
+                            outcome.result = Some(self.scrub(&applied.summary));
                             if applied.changed {
                                 changes += 1;
                                 if !step.notifies.is_empty() {
@@ -574,7 +676,19 @@ impl<'a> Executor<'a> {
                                 }
                             }
                         }
-                        Err(message) => {
+                        Err(report) => {
+                            let outcome = &mut steps[index];
+                            outcome.state = StepState::Failed;
+                            outcome.finished_at = Some(self.inputs.system.now());
+                            outcome.duration_ms = Some(step_clock.elapsed().as_millis() as u64);
+                            outcome.error_detail = Some(report.clone());
+                            // The handlers it would have notified never run.
+                            handlers.extend(
+                                rich.plan
+                                    .handlers
+                                    .iter()
+                                    .map(|h| StepOutcome::planned_handler(h, StepState::NotRun)),
+                            );
                             self.emit(ApplyEvent::ModuleFinished {
                                 module: module.clone(),
                                 status: ModuleStatus::Failed,
@@ -582,15 +696,20 @@ impl<'a> Executor<'a> {
                             .await;
                             return finish(
                                 ModuleStatus::Failed,
-                                Some(format!("{} failed: {message}", step.resource)),
+                                Some(report.prefixed(&format!("{} failed", step.resource))),
                                 changes,
                                 health,
                                 blocked,
+                                steps,
+                                handlers,
                             );
                         }
                     }
                 }
             }
+            let outcome = &mut steps[index];
+            outcome.finished_at = Some(self.inputs.system.now());
+            outcome.duration_ms = Some(step_clock.elapsed().as_millis() as u64);
         }
 
         // Handlers notified by the steps that really changed, plus those other
@@ -614,10 +733,38 @@ impl<'a> Executor<'a> {
                 local.push(n);
             }
         }
-        if let Err(message) = self
+        let (ran, result) = self
             .run_notified(planner, &module, Some(&rich.ctx), &local, contexts)
-            .await
-        {
+            .await;
+        handlers.extend(ran);
+        // Planned handlers that nothing notified in the end (the steps that
+        // notify them changed nothing): skipped, and said so.
+        for planned in &rich.plan.handlers {
+            let id = super::handler_id(&planned.module, &planned.handler);
+            if handlers.iter().any(|h| h.id == id) {
+                continue;
+            }
+            let state = if result.is_err() {
+                StepState::NotRun
+            } else {
+                StepState::Skipped
+            };
+            let mut outcome = StepOutcome::planned_handler(planned, state);
+            if state == StepState::Skipped {
+                let reason = "not notified: the steps that notify it changed nothing".to_owned();
+                self.emit(ApplyEvent::StepSkipped {
+                    module: module.clone(),
+                    task_id: id.clone(),
+                    id,
+                    kind: planned.kind.clone(),
+                    reason: reason.clone(),
+                })
+                .await;
+                outcome.result = Some(reason);
+            }
+            handlers.push(outcome);
+        }
+        if let Err(report) = result {
             self.emit(ApplyEvent::ModuleFinished {
                 module: module.clone(),
                 status: ModuleStatus::Failed,
@@ -625,10 +772,12 @@ impl<'a> Executor<'a> {
             .await;
             return finish(
                 ModuleStatus::Failed,
-                Some(message),
+                Some(report),
                 changes,
                 health,
                 blocked,
+                steps,
+                handlers,
             );
         }
 
@@ -639,8 +788,11 @@ impl<'a> Executor<'a> {
         } else {
             ModuleStatus::Unchanged
         };
-        let mut error =
-            (!blocked.is_empty()).then(|| format!("needs attention: {}", blocked.join("; ")));
+        let mut error = (!blocked.is_empty()).then(|| {
+            ErrorReport::user(format!("needs attention: {}", blocked.join("; "))).with_advice([
+                    "Install or enable what the blocked steps are missing, then apply again; a blocked step is planned again once earlier steps have changed something.",
+                ])
+        });
         let config = planner.revision.module(&module).map(|m| &m.config);
         // Providers the module declares re-run now, so that its own health
         // checks (and the modules planned after it) see what it changed.
@@ -676,7 +828,7 @@ impl<'a> Executor<'a> {
                     status,
                 })
                 .await;
-                return finish(status, error, changes, health, blocked);
+                return finish(status, error, changes, health, blocked, steps, handlers);
             }
             let (results, healthy) = checks::run_settled(
                 planner,
@@ -698,10 +850,15 @@ impl<'a> Executor<'a> {
                     })
                     .collect();
                 status = ModuleStatus::Unhealthy;
-                error = Some(format!(
-                    "required health checks still failing after the settle window: {}",
-                    failing.join(", ")
-                ));
+                error = Some(
+                    ErrorReport::user(format!(
+                        "required health checks still failing after the settle window: {}",
+                        failing.join(", ")
+                    ))
+                    .with_advice([
+                        "Look at the failing checks on the host; the module was rolled back where a stable revision was available.",
+                    ]),
+                );
             }
             health = results;
         }
@@ -710,7 +867,7 @@ impl<'a> Executor<'a> {
             status,
         })
         .await;
-        finish(status, error, changes, health, blocked)
+        finish(status, error, changes, health, blocked, steps, handlers)
     }
 
     /// Rolls `module` back to the stable revision with the current facts:
@@ -780,13 +937,7 @@ impl<'a> Executor<'a> {
             // The stable revision does not select the module here: rolling
             // back means removing what the failed revision put in place.
             None => ModuleRun {
-                outcome: ModuleOutcome {
-                    module: module.to_owned(),
-                    status: ModuleStatus::RolledBack,
-                    changes: 0,
-                    duration_ms: 0,
-                    error: None,
-                },
+                outcome: ModuleOutcome::new(module, ModuleStatus::RolledBack),
                 health: Vec::new(),
                 failed: false,
                 blocked: Vec::new(),
@@ -807,14 +958,16 @@ impl<'a> Executor<'a> {
             });
         }
         let (plans, riches): (Vec<_>, Vec<_>) = removals.into_iter().unzip();
-        let (_, errors) = self
+        let (_, errors, _) = self
             .run_removals(&planner, &contexts, &plans, &riches)
             .instrument(span)
             .await;
         if !errors.is_empty() {
             run.failed = true;
             run.outcome.status = ModuleStatus::Failed;
-            run.outcome.error = Some(errors.join("; "));
+            let error = combine(errors).unwrap_or_else(|| ErrorReport::system("removals failed"));
+            run.outcome.error = Some(error.one_line());
+            run.outcome.error_detail = Some(error);
             return Ok(Some(run));
         }
         run.outcome.status = ModuleStatus::RolledBack;
@@ -822,20 +975,22 @@ impl<'a> Executor<'a> {
         Ok(Some(run))
     }
 
-    /// Runs removals in order. Returns how many succeeded and the errors.
+    /// Runs removals in order. Returns how many succeeded, the errors and
+    /// what happened to each removal.
     async fn run_removals(
         &self,
         planner: &Planner<'_>,
         contexts: &Contexts,
         removals: &[crate::plan::Removal],
         rich: &[super::planner::RichRemoval],
-    ) -> (usize, Vec<String>) {
+    ) -> (usize, Vec<ErrorReport>, Vec<RemovalOutcome>) {
         let mut removed = 0usize;
         let mut errors = Vec::new();
+        let mut outcomes = Vec::with_capacity(removals.len());
         let mut notified: Vec<(String, String)> = Vec::new();
         for (removal, rr) in removals.iter().zip(rich) {
             let span = tracing::info_span!("removal.run", buckle.resource = %removal.resource, buckle.policy = ?removal.policy);
-            let outcome: Result<(String, bool), String> = async {
+            let outcome: Result<(String, bool), ErrorReport> = async {
                 match (removal.policy, rr.task) {
                     (RemovalPolicy::Leave, _) => Ok(("released: left in place (policy leave)".to_owned(), false)),
                     (RemovalPolicy::Cleanup, None) => Ok((format!(
@@ -848,7 +1003,7 @@ impl<'a> Executor<'a> {
                         task.remove(&cx, &rr.record)
                             .await
                             .map(|a| (self.scrub(&a.summary), a.changed))
-                            .map_err(|e| self.scrub(&e.message()))
+                            .map_err(|e| self.report(&e))
                     }
                 }
             }
@@ -877,30 +1032,50 @@ impl<'a> Executor<'a> {
                         }
                     }
                     removed += 1;
+                    outcomes.push(RemovalOutcome {
+                        resource: removal.resource.to_string(),
+                        kind: removal.resource.kind.clone(),
+                        summary: summary.clone(),
+                        state: if changed {
+                            StepState::Changed
+                        } else {
+                            StepState::Unchanged
+                        },
+                        caution: removal.caution,
+                        error_detail: None,
+                    });
                     self.emit(ApplyEvent::RemovalRun {
                         resource: removal.resource.to_string(),
                         summary,
                     })
                     .await;
                 }
-                Err(message) => {
-                    errors.push(format!("removing {} failed: {message}", removal.resource));
+                Err(report) => {
                     self.emit(ApplyEvent::RemovalRun {
                         resource: removal.resource.to_string(),
-                        summary: format!("failed: {message}"),
+                        summary: format!("failed: {}", report.one_line()),
                     })
                     .await;
+                    outcomes.push(RemovalOutcome {
+                        resource: removal.resource.to_string(),
+                        kind: removal.resource.kind.clone(),
+                        summary: removal.summary.clone(),
+                        state: StepState::Failed,
+                        caution: removal.caution,
+                        error_detail: Some(report.clone()),
+                    });
+                    errors.push(report.prefixed(&format!("removing {} failed", removal.resource)));
                 }
             }
         }
         // The handlers the removed tasks notified run once, after the removals.
-        if let Err(message) = self
+        if let (_, Err(report)) = self
             .run_notified(planner, "removals", None, &notified, contexts)
             .await
         {
-            errors.push(message);
+            errors.push(report);
         }
-        (removed, errors)
+        (removed, errors, outcomes)
     }
 
     async fn run(
@@ -950,7 +1125,7 @@ impl<'a> Executor<'a> {
         let mut failed: Vec<String> = Vec::new();
         let mut halted = false;
         let mut total_changes = 0usize;
-        let mut errors: Vec<String> = Vec::new();
+        let mut errors: Vec<ErrorReport> = Vec::new();
         // Modules that are selected but could not be planned fail the run
         // without halting it (nothing of theirs ran); indeterminate ones are
         // reported and left alone.
@@ -961,21 +1136,19 @@ impl<'a> Executor<'a> {
         let mut late_removals: Vec<(crate::plan::Removal, super::planner::RichRemoval)> =
             Vec::new();
         for i in &rich.plan.indeterminate {
-            results.push(ModuleOutcome {
-                module: i.module.clone(),
-                status: if i.plan_error {
-                    ModuleStatus::Failed
-                } else {
-                    ModuleStatus::Indeterminate
-                },
-                changes: 0,
-                duration_ms: 0,
-                error: Some(if i.plan_error {
-                    format!("planning failed: {}", i.reason)
-                } else {
-                    i.reason.clone()
-                }),
-            });
+            let (status, error) = if i.plan_error {
+                let detail = i
+                    .error_detail
+                    .clone()
+                    .unwrap_or_else(|| ErrorReport::user(i.reason.clone()));
+                (ModuleStatus::Failed, detail.prefixed("planning failed"))
+            } else {
+                (
+                    ModuleStatus::Indeterminate,
+                    ErrorReport::user(i.reason.clone()),
+                )
+            };
+            results.push(ModuleOutcome::new(&i.module, status).with_error(error));
             if i.plan_error {
                 plan_errors.push(i.module.clone());
                 self.with_state(|s| {
@@ -1014,39 +1187,27 @@ impl<'a> Executor<'a> {
                                 // orphans; its dependents cannot run.
                                 started_modules.insert(name.clone());
                                 late_removals.extend(orphans);
-                                results.push(ModuleOutcome {
-                                    module: name.clone(),
-                                    status: ModuleStatus::Skipped,
-                                    changes: 0,
-                                    duration_ms: 0,
-                                    error: None,
-                                });
+                                results.push(ModuleOutcome::new(name, ModuleStatus::Skipped));
                                 continue;
                             }
                             Ok((DeferredPlan::Indeterminate(reason), _)) => {
                                 started_modules.insert(name.clone());
-                                results.push(ModuleOutcome {
-                                    module: name.clone(),
-                                    status: ModuleStatus::Indeterminate,
-                                    changes: 0,
-                                    duration_ms: 0,
-                                    error: Some(reason),
-                                });
+                                results.push(
+                                    ModuleOutcome::new(name, ModuleStatus::Indeterminate)
+                                        .with_error(ErrorReport::user(reason)),
+                                );
                                 continue;
                             }
                             Err(err) => {
-                                let message = self.scrub(&err.message());
-                                tracing::error!(buckle.module = %name, error = %message, "planning the deferred module failed");
+                                let report = self.report(&err);
+                                tracing::error!(buckle.module = %name, error = %report.message, causes = ?report.causes, "planning the deferred module failed");
                                 // Nothing of it ran, so there is nothing to
                                 // roll back; its dependents never become ready.
                                 started_modules.insert(name.clone());
-                                results.push(ModuleOutcome {
-                                    module: name.clone(),
-                                    status: ModuleStatus::Failed,
-                                    changes: 0,
-                                    duration_ms: 0,
-                                    error: Some(format!("planning failed: {message}")),
-                                });
+                                results.push(
+                                    ModuleOutcome::new(name, ModuleStatus::Failed)
+                                        .with_error(report.prefixed("planning failed")),
+                                );
                                 plan_errors.push(name.clone());
                                 self.with_state(|s| {
                                     s.failed_modules.insert(name.clone(), revision.clone());
@@ -1116,25 +1277,47 @@ impl<'a> Executor<'a> {
                             });
                         }
                     } else {
-                        errors.push(format!(
-                            "rolling back '{name}' failed: {}",
-                            run.outcome.error.clone().unwrap_or_default()
-                        ));
+                        errors.push(
+                            run.outcome
+                                .error_detail
+                                .clone()
+                                .unwrap_or_else(|| ErrorReport::system("the rollback failed"))
+                                .prefixed(&format!("rolling back '{name}' failed")),
+                        );
                     }
                     if let Some(existing) = results.iter_mut().find(|r| &r.module == name) {
                         let original_error = existing.error.take();
                         existing.status = run.outcome.status;
-                        existing.error = match (original_error, run.outcome.error) {
+                        existing.error = match (original_error, run.outcome.error.clone()) {
                             (Some(o), Some(r)) => Some(format!("{o}; rollback: {r}")),
                             (o, r) => o.or(r),
                         };
+                        existing.error_detail =
+                            match (existing.error_detail.take(), run.outcome.error_detail) {
+                                (Some(o), Some(r)) => {
+                                    Some(o.with_causes([format!("rollback: {}", r.message)]))
+                                }
+                                (o, r) => o.or(r),
+                            };
+                        if run.outcome.status == ModuleStatus::RolledBack {
+                            // What this run applied of the module was undone.
+                            for step in existing
+                                .steps
+                                .iter_mut()
+                                .chain(existing.handlers.iter_mut())
+                            {
+                                if matches!(step.state, StepState::Changed | StepState::Unchanged) {
+                                    step.state = StepState::RolledBack;
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(None) => {}
-                Err(err) => errors.push(format!(
-                    "rolling back '{name}' failed: {}",
-                    self.scrub(&err.message())
-                )),
+                Err(err) => errors.push(
+                    self.report(&err)
+                        .prefixed(&format!("rolling back '{name}' failed")),
+                ),
             }
             self.checkpoint();
         }
@@ -1162,11 +1345,14 @@ impl<'a> Executor<'a> {
         if !leftovers.is_empty() {
             let contexts = planner.contexts(&self.facts());
             for (owner, notes) in leftovers {
-                if let Err(message) = self
+                let (ran, result) = self
                     .run_notified(planner, &owner, None, &notes, &contexts)
-                    .await
-                {
-                    errors.push(message);
+                    .await;
+                if let Some(existing) = results.iter_mut().find(|r| r.module == owner) {
+                    existing.handlers.extend(ran);
+                }
+                if let Err(report) = result {
+                    errors.push(report);
                 }
             }
         }
@@ -1177,16 +1363,50 @@ impl<'a> Executor<'a> {
             .cloned()
             .collect();
         for name in &not_started {
-            results.push(ModuleOutcome {
-                module: name.clone(),
-                status: ModuleStatus::NotStarted,
-                changes: 0,
-                duration_ms: 0,
-                error: None,
-            });
+            let mut outcome = ModuleOutcome::new(name, ModuleStatus::NotStarted);
+            // Its planned steps never ran (a deferred module has none yet).
+            if let Some(plan) = module_plans.get(name) {
+                outcome.steps = plan
+                    .plan
+                    .steps
+                    .iter()
+                    .map(|s| StepOutcome::planned(s, StepState::NotRun))
+                    .collect();
+                outcome.handlers = plan
+                    .plan
+                    .handlers
+                    .iter()
+                    .map(|h| StepOutcome::planned_handler(h, StepState::NotRun))
+                    .collect();
+            }
+            results.push(outcome);
         }
 
         let mut removed = 0usize;
+        // What happens to each planned removal: run, or left alone (the run
+        // halted, or removals are disabled for it).
+        let mut removals_run: Vec<RemovalOutcome> = Vec::new();
+        if halted || !self.inputs.removals {
+            let state = if halted {
+                StepState::NotRun
+            } else {
+                StepState::Skipped
+            };
+            removals_run.extend(
+                rich.plan
+                    .removals
+                    .iter()
+                    .chain(late_removals.iter().map(|(r, _)| r))
+                    .map(|r| RemovalOutcome {
+                        resource: r.resource.to_string(),
+                        kind: r.resource.kind.clone(),
+                        summary: r.summary.clone(),
+                        state,
+                        caution: r.caution,
+                        error_detail: None,
+                    }),
+            );
+        }
         if !halted && !self.inputs.removals && !rich.plan.removals.is_empty() {
             tracing::info!(
                 skipped = rich.plan.removals.len(),
@@ -1195,17 +1415,19 @@ impl<'a> Executor<'a> {
         }
         if !halted && self.inputs.removals {
             let contexts = planner.contexts(&self.facts());
-            let (count, removal_errors) = self
+            let (count, removal_errors, ran) = self
                 .run_removals(planner, &contexts, &rich.plan.removals, &rich.removals)
                 .await;
             removed = count;
             errors.extend(removal_errors);
+            removals_run.extend(ran);
             let (plans, riches): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut late_removals).into_iter().unzip();
-            let (count, removal_errors) =
+            let (count, removal_errors, ran) =
                 self.run_removals(planner, &contexts, &plans, &riches).await;
             removed += count;
             errors.extend(removal_errors);
+            removals_run.extend(ran);
         }
 
         let succeeded =
@@ -1225,7 +1447,7 @@ impl<'a> Executor<'a> {
                         .map(|e| format!("module '{}': {e}", r.module))
                 })
                 .collect();
-            parts.extend(errors.iter().cloned());
+            parts.extend(errors.iter().map(ErrorReport::one_line));
             if parts.is_empty() {
                 None
             } else {
@@ -1282,13 +1504,20 @@ impl<'a> Executor<'a> {
         let error = if save_errors.is_empty() {
             error
         } else {
-            let saves = save_errors.join("; ");
+            let saves = save_errors
+                .iter()
+                .map(ErrorReport::one_line)
+                .collect::<Vec<_>>()
+                .join("; ");
             tracing::error!(error = %saves, "the state file could not be saved");
             Some(match error {
                 Some(e) => format!("{e}; {saves}"),
                 None => saves,
             })
         };
+        // The run-level error: what no single module accounts for.
+        errors.extend(save_errors);
+        let error_detail = combine(errors);
 
         let deferred_names: BTreeSet<&String> = deferred.iter().collect();
         tracing::info!(
@@ -1313,6 +1542,50 @@ impl<'a> Executor<'a> {
                 results: health,
             }),
             error,
+            error_detail,
+            removals_run,
+            started_at: Some(started_at),
+            finished_at: Some(finished_at),
         })
     }
+}
+
+/// Several errors as one report: their messages joined, every cause and
+/// piece of advice once. `None` when there are none; the error itself when
+/// there is one.
+fn combine(errors: Vec<ErrorReport>) -> Option<ErrorReport> {
+    if errors.len() <= 1 {
+        return errors.into_iter().next();
+    }
+    let kind = if errors
+        .iter()
+        .any(|e| e.kind == crate::error::ErrorKind::System)
+    {
+        crate::error::ErrorKind::System
+    } else {
+        crate::error::ErrorKind::User
+    };
+    let mut combined = ErrorReport {
+        kind,
+        message: errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+        causes: Vec::new(),
+        advice: Vec::new(),
+    };
+    for e in errors {
+        for c in e.causes {
+            if !combined.causes.contains(&c) {
+                combined.causes.push(c);
+            }
+        }
+        for a in e.advice {
+            if !combined.advice.contains(&a) {
+                combined.advice.push(a);
+            }
+        }
+    }
+    Some(combined)
 }
