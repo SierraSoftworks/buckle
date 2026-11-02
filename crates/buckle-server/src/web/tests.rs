@@ -1122,3 +1122,123 @@ async fn an_empty_webhook_secret_verifies_nothing() {
     let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
     assert!(!crate::source::verify_webhook_signature("", b"body", &sig));
 }
+
+// ------------------------------------------------------------ trace links
+
+fn finished_rollout(id: &str, trace_id: Option<&str>) -> crate::store::RolloutRecord {
+    crate::store::RolloutRecord {
+        id: id.into(),
+        revision: "r1".into(),
+        state: buckle_api::RolloutState::Completed,
+        policy: Default::default(),
+        started_at: chrono::Utc::now(),
+        finished_at: Some(chrono::Utc::now()),
+        triggered_by: "controller".into(),
+        runtime: crate::rollout::model::RolloutRuntime {
+            trace_id: trace_id.map(str::to_owned),
+            ..Default::default()
+        },
+    }
+}
+
+#[actix_web::test]
+async fn trace_ids_come_with_links_when_a_template_is_configured() {
+    let e = env_with(WebConfig::default(), |s| {
+        s.trace_url_template = Some("https://ui.example/trace?trace_id={trace_id}".into());
+    })
+    .await;
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    let (traced, untraced) = (
+        finished_rollout("7", Some("00af7651")),
+        finished_rollout("8", None),
+    );
+    let run = crate::store::RunRecord {
+        host: "pi-1".into(),
+        rollout: None,
+        revision: "r1".into(),
+        plan_digest: "d".into(),
+        started_at: chrono::Utc::now(),
+        finished_at: chrono::Utc::now(),
+        outcome: "succeeded".into(),
+        changes: 1,
+        removals: 0,
+        error: None,
+        trace_id: Some("feed01".into()),
+    };
+    e.store
+        .call(move |db| {
+            db.rollouts().save(&traced)?;
+            db.rollouts().save(&untraced)?;
+            db.runs().add(&run)
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let get = |uri: &'static str| test::TestRequest::get().uri(uri).to_request();
+
+    let list: buckle_api::Page<buckle_api::RolloutSummary> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/rollouts")).await).await;
+    let link = |id: &str| {
+        list.items
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.trace_url.clone())
+    };
+    assert_eq!(
+        link("7").as_deref(),
+        Some("https://ui.example/trace?trace_id=00af7651")
+    );
+    assert_eq!(link("8"), None, "no trace id, no link");
+    let detail: buckle_api::RolloutDetail =
+        test::read_body_json(test::call_service(&app, get("/api/v1/rollouts/7")).await).await;
+    assert_eq!(
+        detail.summary.trace_url.as_deref(),
+        Some("https://ui.example/trace?trace_id=00af7651")
+    );
+    let host: buckle_api::HostDetail =
+        test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1")).await).await;
+    assert_eq!(
+        host.recent_runs[0].trace_url.as_deref(),
+        Some("https://ui.example/trace?trace_id=feed01")
+    );
+    let runs: Vec<buckle_api::RunSummary> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1/runs")).await).await;
+    assert_eq!(runs[0].trace_url, host.recent_runs[0].trace_url);
+
+    // The controller publishes rollouts without links; the stream adds them.
+    let resp = test::call_service(&app, get("/api/v1/events")).await;
+    let mut body = resp.into_body().boxed();
+    assert!(next_chunk(&mut body).await.contains("connected"));
+    e.state
+        .events
+        .publish(buckle_api::LiveEvent::RolloutChanged {
+            rollout: crate::rollout::view::summary(&finished_rollout("7", Some("00af7651")), &[]),
+        });
+    let frame = next_chunk(&mut body).await;
+    assert!(
+        frame.contains(r#""trace_url":"https://ui.example/trace?trace_id=00af7651""#),
+        "{frame}"
+    );
+}
+
+#[actix_web::test]
+async fn without_a_template_trace_ids_stay_text() {
+    let e = env(WebConfig::default()).await;
+    e.store
+        .call(|db| db.rollouts().save(&finished_rollout("7", Some("00af7651"))))
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let detail: buckle_api::RolloutDetail = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/rollouts/7")
+                .to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(detail.summary.trace_id.as_deref(), Some("00af7651"));
+    assert_eq!(detail.summary.trace_url, None);
+}

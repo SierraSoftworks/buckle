@@ -73,6 +73,18 @@ impl ServerConfig {
                 ],
             ));
         }
+        if let Some(template) = &self.telemetry.trace_url_template
+            && !template.contains(TRACE_ID_PLACEHOLDER)
+        {
+            return Err(buckle_core::error::user(
+                format!(
+                    "`telemetry.trace_url_template` ('{template}') has no `{TRACE_ID_PLACEHOLDER}` placeholder, so every link would open the same page."
+                ),
+                &[
+                    "Put {trace_id} where the trace id goes, e.g. https://ui.honeycomb.io/<team>/environments/<env>/trace?trace_id={trace_id}.",
+                ],
+            ));
+        }
         if self.web.oidc.is_some() && self.web.base_url.is_none() {
             return Err(buckle_core::error::user(
                 "`web.base_url` is required when OIDC is configured, so the callback URL can be built.",
@@ -581,6 +593,7 @@ pub struct ExecProviderConfig {
 /// telemetry:
 ///   otlp_endpoint: http://otel-collector.example.internal:4317
 ///   otlp_headers: { x-honeycomb-team: "${{ env.HONEYCOMB_KEY }}" }
+///   trace_url_template: https://ui.honeycomb.io/acme/environments/prod/trace?trace_id={trace_id}
 /// ```
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -590,6 +603,21 @@ pub struct TelemetryConfig {
     /// Extra OTLP headers (often an API key); values are redacted in logs.
     #[serde(default)]
     pub otlp_headers: IndexMap<String, String>,
+    /// A link to one trace in the tracing UI, with `{trace_id}` where the
+    /// id goes. When set, the API fills `trace_url` beside every `trace_id`
+    /// it serves (rollouts and runs), and the UI links to it.
+    #[serde(default)]
+    pub trace_url_template: Option<String>,
+}
+
+/// The placeholder [`TelemetryConfig::trace_url_template`] substitutes.
+pub const TRACE_ID_PLACEHOLDER: &str = "{trace_id}";
+
+/// `template` with its `{trace_id}` replaced by `trace_id`, percent-encoded
+/// (a W3C trace id is hex, but whatever arrives cannot break the link).
+pub fn trace_url(template: &str, trace_id: &str) -> String {
+    let id: String = url::form_urlencoded::byte_serialize(trace_id.as_bytes()).collect();
+    template.replace(TRACE_ID_PLACEHOLDER, &id)
 }
 
 impl TelemetryConfig {
@@ -613,6 +641,7 @@ impl std::fmt::Debug for TelemetryConfig {
                 "otlp_headers",
                 &self.otlp_headers.keys().collect::<Vec<_>>(),
             )
+            .field("trace_url_template", &self.trace_url_template)
             .finish()
     }
 }
@@ -820,6 +849,28 @@ secrets:
         for (w, e) in warnings.iter().zip(expected) {
             assert!(w.contains(e), "{w:?} should mention {e:?}");
         }
+    }
+
+    #[test]
+    fn a_trace_url_template_needs_the_placeholder_and_fills_it() {
+        let yaml = format!(
+            "{EXAMPLE}telemetry:\n  trace_url_template: https://ui.honeycomb.io/acme/trace?trace_id={{trace_id}}\n"
+        );
+        let cfg = with_env(&yaml).unwrap();
+        let template = cfg.telemetry.trace_url_template.as_deref().unwrap();
+        assert_eq!(
+            trace_url(template, "00af7651"),
+            "https://ui.honeycomb.io/acme/trace?trace_id=00af7651"
+        );
+        assert_eq!(
+            trace_url(template, "a&b"),
+            "https://ui.honeycomb.io/acme/trace?trace_id=a%26b"
+        );
+        let missing = format!(
+            "{EXAMPLE}telemetry:\n  trace_url_template: https://ui.honeycomb.io/acme/trace\n"
+        );
+        let err = with_env(&missing).unwrap_err();
+        assert!(err.description().contains("trace_url_template"), "{err}");
     }
 
     #[test]

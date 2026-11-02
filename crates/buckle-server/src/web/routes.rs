@@ -492,8 +492,9 @@ fn resources(row: Option<crate::store::RolloutHostRecord>) -> Vec<ResourceSummar
         .collect()
 }
 
-fn run_dto(r: crate::store::RunRecord) -> RunSummary {
+fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
     RunSummary {
+        trace_url: state.trace_url(r.trace_id.as_deref()),
         revision: r.revision,
         plan_digest: r.plan_digest,
         started_at: r.started_at,
@@ -503,7 +504,6 @@ fn run_dto(r: crate::store::RunRecord) -> RunSummary {
         removals: r.removals,
         error: r.error,
         trace_id: r.trace_id,
-        trace_url: None,
     }
 }
 
@@ -545,7 +545,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         resources: resources(row),
         // Drift diffs are not persisted per item yet; the UI tolerates an empty list.
         drift: Vec::new(),
-        recent_runs: runs.into_iter().map(run_dto).collect(),
+        recent_runs: runs.into_iter().map(|r| run_dto(&state, r)).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
     }))
 }
@@ -587,7 +587,11 @@ async fn host_runs(state: Data, _: Authenticated, path: web::Path<String>) -> Ap
         .store
         .call(move |db| db.runs().for_host(&id, 50))
         .await?;
-    Ok(HttpResponse::Ok().json(rows.into_iter().map(run_dto).collect::<Vec<_>>()))
+    Ok(HttpResponse::Ok().json(
+        rows.into_iter()
+            .map(|r| run_dto(&state, r))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 async fn host_changed(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {
@@ -826,7 +830,9 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
         .await?;
     let (r, hosts, approvals, audit) =
         found.ok_or_else(|| ApiError::not_found(format!("No rollout '{id}'.")))?;
-    Ok(view::detail(&r, &hosts, &approvals, &audit))
+    let mut detail = view::detail(&r, &hosts, &approvals, &audit);
+    detail.summary = state.link_rollout(detail.summary);
+    Ok(detail)
 }
 
 async fn rollouts(state: Data, _: Authenticated, q: web::Query<PageQuery>) -> ApiResult {
@@ -843,6 +849,7 @@ async fn rollouts(state: Data, _: Authenticated, q: web::Query<PageQuery>) -> Ap
             Ok((out, db.rollouts().count()?))
         })
         .await?;
+    let items: Vec<_> = items.into_iter().map(|r| state.link_rollout(r)).collect();
     let next = ((offset as u64 + items.len() as u64) < total)
         .then(|| (offset + items.len() as u32).to_string());
     Ok(HttpResponse::Ok().json(Page { items, next, total }))
@@ -959,6 +966,17 @@ async fn rollout_continue(
 
 // ------------------------------------------------------------------ events, catalog, audit, webhook
 
+/// An event as a client sees it: links filled in where the server knows
+/// them (the controller publishes rollouts without).
+fn for_client(state: &AppState, event: LiveEvent) -> LiveEvent {
+    match event {
+        LiveEvent::RolloutChanged { rollout } => LiveEvent::RolloutChanged {
+            rollout: state.link_rollout(rollout),
+        },
+        other => other,
+    }
+}
+
 fn sse_frame(event: &LiveEvent) -> web::Bytes {
     let json = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
     let kind = serde_json::to_value(event)
@@ -1009,7 +1027,7 @@ async fn events(state: Data, req: HttpRequest, _: Authenticated) -> HttpResponse
         }
         let wait = keepalive.min(s.next_check.saturating_duration_since(now));
         let frame = match tokio::time::timeout(wait, s.rx.recv()).await {
-            Ok(Ok(ev)) => sse_frame(&ev),
+            Ok(Ok(ev)) => sse_frame(&for_client(&s.state, ev)),
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                 web::Bytes::from_static(b"event: lagged\ndata: {}\n\n")
             }

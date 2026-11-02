@@ -201,6 +201,7 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         VERSION.to_owned(),
     );
     state.agent_sessions = guard.sessions.clone();
+    state.trace_url_template = config.telemetry.trace_url_template.clone();
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
 
     let mut failed = false;
