@@ -226,7 +226,30 @@ impl FileStateStore {
             return;
         };
         crate::system::remove_temp_leftovers(dir, &self.temp_prefix());
+        crate::system::remove_temp_leftovers(dir, LAST_RUN_TEMP_PREFIX);
     }
+}
+
+/// The temp file name prefix of `last-run.json` writes (`<prefix><pid>`).
+const LAST_RUN_TEMP_PREFIX: &str = ".last-run.json.buckle-tmp-";
+
+/// Writes `bytes` to `tmp` (created `0600`), fsyncs it, renames it over
+/// `target` and fsyncs the directory.
+fn write_private(tmp: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp, target)?;
+    sync_dir(target.parent())
 }
 
 /// fsyncs a directory so that a rename inside it is durable (no-op where
@@ -275,22 +298,7 @@ impl StateStore for FileStateStore {
                 &["This is a bug; please report it."],
             )
         })?;
-        let written = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&tmp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp, &self.path)?;
-            sync_dir(self.path.parent())
-        })();
+        let written = write_private(&tmp, &self.path, &bytes);
         if written.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -299,10 +307,18 @@ impl StateStore for FileStateStore {
 
     fn save_last_run(&self, outcome: &crate::engine::ApplyOutcome) -> crate::Result<()> {
         use crate::error::HumanizableResult;
+        // The outcome names resource paths, diff summaries and error text:
+        // written like the state file (0600 temp, fsync, rename); `load`
+        // cleans up a temp file a crash left behind.
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).to_human_error()?;
+        }
         let path = self.last_run_path();
-        let tmp = path.with_file_name(format!(".last-run.json.buckle-tmp-{}", std::process::id()));
+        let tmp = self
+            .path
+            .with_file_name(format!("{LAST_RUN_TEMP_PREFIX}{}", std::process::id()));
         let bytes = serde_json::to_vec(outcome).to_human_error()?;
-        let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        let written = write_private(&tmp, &path, &bytes);
         if written.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -384,8 +400,29 @@ mod tests {
             "rolled_back_modules": [], "not_started": [], "health": null, "error": null
         }))
         .unwrap();
+        // A temp file a crashed write left behind is cleaned up on load.
+        // (A pid no process has.)
+        let leftover = dir.path().join(".last-run.json.buckle-tmp-2147483000");
+        std::fs::write(&leftover, b"partial").unwrap();
+        store.load().unwrap();
+        assert!(!leftover.exists(), "leftover temp files are removed");
         store.save_last_run(&outcome).unwrap();
-        assert!(dir.path().join("last-run.json").is_file());
+        let written = dir.path().join("last-run.json");
+        assert!(written.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&written).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the outcome is private to the agent");
+        }
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains("buckle-tmp")),
+            "no temp file is left: {names:?}"
+        );
         let back = store.load_last_run().unwrap().unwrap();
         assert_eq!(back.plan_digest, outcome.plan_digest);
     }
