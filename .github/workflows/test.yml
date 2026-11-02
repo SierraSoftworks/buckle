@@ -105,3 +105,5 @@ jobs:
             set -euo pipefail
             if [ -x /src/scripts/container-test.sh ]; then /src/scripts/container-test.sh; else echo "container test script not present yet"; fi
           '
+      - name: Apply tests/fixtures/container-fleet inside ${{ matrix.image }}
+        run: scripts/container-apply.sh "${{ matrix.image }}" target/x86_64-unknown-linux-musl/release/buckle
