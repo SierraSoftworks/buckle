@@ -6,10 +6,12 @@ pub mod clock;
 pub mod config;
 pub mod events;
 pub mod fleet;
+pub mod grpc;
 pub mod rollout;
 pub mod secrets;
 pub mod source;
 pub mod store;
+pub mod views;
 
 pub use config::ServerConfig;
 

@@ -684,6 +684,7 @@ dependencies = [
  "include_dir",
  "indexmap",
  "jsonwebtoken",
+ "minijinja",
  "notify",
  "pretty_assertions",
  "prost-types",
