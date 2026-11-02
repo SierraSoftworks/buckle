@@ -178,8 +178,25 @@ impl FleetService {
                             false,
                         ));
                     }
+                    // Whois says who the peer is, not that it belongs to the
+                    // fleet: nodes shared in from other tailnets reach us too.
+                    let trust = &self.agents.tailscale;
+                    let admitted = trust.admits(&identity.tags, identity.user.as_deref());
+                    if trust.is_configured() && !admitted {
+                        return Err((
+                            format!(
+                                "The tailnet node '{}' is not trusted as an agent; give it one of agents.tailscale.allowed_tags or have one of agents.tailscale.allowed_users own it.",
+                                identity.node
+                            ),
+                            false,
+                        ));
+                    }
                     let id = identity.node.clone();
-                    let status = self.initial_status();
+                    let status = if admitted {
+                        self.initial_status()
+                    } else {
+                        HostStatus::Pending
+                    };
                     let now = self.now();
                     let created = self
                         .store
@@ -339,6 +356,12 @@ impl FleetService {
             && whois.covers(&peer)
             && let Ok(Some(identity)) = whois.whois(&peer).await
         {
+            let trust = &self.agents.tailscale;
+            if trust.is_configured() && !trust.admits(&identity.tags, identity.user.as_deref()) {
+                return Err(Status::permission_denied(
+                    "this tailnet node is not trusted as an agent",
+                ));
+            }
             return Ok(identity.node);
         }
         let token = request

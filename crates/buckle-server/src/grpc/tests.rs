@@ -22,7 +22,27 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-struct FakeWhois;
+/// Says every peer is `tail-1`, carrying `tags` and owned by `user`.
+struct FakeWhois {
+    tags: Vec<String>,
+    user: Option<String>,
+}
+
+impl FakeWhois {
+    fn tagged(tag: &str) -> Arc<dyn Whois> {
+        Arc::new(Self {
+            tags: vec![tag.into()],
+            user: None,
+        })
+    }
+
+    fn owned_by(user: &str) -> Arc<dyn Whois> {
+        Arc::new(Self {
+            tags: vec![],
+            user: Some(user.into()),
+        })
+    }
+}
 
 #[async_trait]
 impl Whois for FakeWhois {
@@ -32,8 +52,16 @@ impl Whois for FakeWhois {
     async fn whois(&self, _peer: &SocketAddr) -> buckle_core::Result<Option<WhoisIdentity>> {
         Ok(Some(WhoisIdentity {
             node: "tail-1".into(),
-            user: None,
+            user: self.user.clone(),
+            tags: self.tags.clone(),
         }))
+    }
+}
+
+fn trusting(tags: &[&str], users: &[&str]) -> crate::config::TailscaleConfig {
+    crate::config::TailscaleConfig {
+        allowed_tags: tags.iter().map(|s| s.to_string()).collect(),
+        allowed_users: users.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -65,6 +93,23 @@ async fn server_with(
     whois: Option<Arc<dyn Whois>>,
     auth: Vec<AgentAuth>,
     guard: SessionGuard,
+) -> Server {
+    server_full(
+        registration,
+        whois,
+        auth,
+        guard,
+        trusting(&["tag:buckle"], &[]),
+    )
+    .await
+}
+
+async fn server_full(
+    registration: Registration,
+    whois: Option<Arc<dyn Whois>>,
+    auth: Vec<AgentAuth>,
+    guard: SessionGuard,
+    tailscale: crate::config::TailscaleConfig,
 ) -> Server {
     let guard = Arc::new(guard);
     let data = tempfile::tempdir().unwrap();
@@ -101,6 +146,7 @@ async fn server_with(
             bootstrap_token: Some("boot".into()),
             registration,
             minimum_agent_version: Some("2.0.0".into()),
+            tailscale,
             ..Default::default()
         },
         whois,
@@ -425,7 +471,7 @@ async fn only_active_hosts_fetch_and_only_revisions_meant_for_them() {
 async fn whois_authenticates_by_node_name() {
     let s = server(
         Registration::Auto,
-        Some(Arc::new(FakeWhois)),
+        Some(FakeWhois::tagged("tag:buckle")),
         vec![AgentAuth::Tailscale, AgentAuth::Token],
     )
     .await;
@@ -440,6 +486,37 @@ async fn whois_authenticates_by_node_name() {
     assert_eq!(host.auth_method.as_deref(), Some("tailscale"));
     let (_tx, _stream, reply) = open(s.addr, hello("impostor", "", "2.0.0")).await;
     assert!(expect_rejected(reply).reason.contains("tail-1"));
+}
+
+#[rstest::rstest]
+#[case::tag_without_prefix(FakeWhois::tagged("tag:buckle"), trusting(&["buckle"], &[]), Some("active"))]
+#[case::listed_owner(FakeWhois::owned_by("ada@example.com"), trusting(&[], &["ada@example.com"]), Some("active"))]
+#[case::other_tag(FakeWhois::tagged("tag:laptop"), trusting(&["tag:buckle"], &[]), None)]
+#[case::shared_in_user(FakeWhois::owned_by("eve@elsewhere.example"), trusting(&["tag:buckle"], &["ada@example.com"]), None)]
+#[case::nothing_configured(FakeWhois::tagged("tag:buckle"), trusting(&[], &[]), Some("pending"))]
+#[tokio::test]
+async fn tailnet_nodes_are_trusted_only_by_tag_or_owner(
+    #[case] whois: Arc<dyn Whois>,
+    #[case] trust: crate::config::TailscaleConfig,
+    #[case] expected: Option<&str>,
+) {
+    let s = server_full(
+        Registration::Auto,
+        Some(whois),
+        vec![AgentAuth::Tailscale],
+        SessionGuard::default(),
+        trust,
+    )
+    .await;
+    let (_tx, _stream, reply) = open(s.addr, hello("tail-1", "", "2.0.0")).await;
+    match expected {
+        Some(status) => assert_eq!(expect_welcome(reply).status, status),
+        None => {
+            assert!(expect_rejected(reply).reason.contains("not trusted"));
+            let host = s.store.call(|db| db.hosts().get("tail-1")).await.unwrap();
+            assert!(host.is_none(), "an untrusted node is not registered");
+        }
+    }
 }
 
 #[tokio::test]

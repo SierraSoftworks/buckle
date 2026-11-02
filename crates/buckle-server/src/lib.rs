@@ -132,6 +132,14 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         }
         None => tracing::warn!("the gRPC listener is plaintext (listen.tls.mode: none)"),
     }
+    if config.agents.auth.contains(&config::AgentAuth::Tailscale)
+        && config.agents.registration == config::Registration::Auto
+        && !config.agents.tailscale.is_configured()
+    {
+        tracing::warn!(
+            "agents.tailscale lists no allowed_tags or allowed_users: new tailnet nodes register as pending and wait for an admin"
+        );
+    }
     let whois: Option<Arc<dyn grpc::Whois>> = config
         .agents
         .auth

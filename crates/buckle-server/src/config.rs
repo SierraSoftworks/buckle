@@ -247,6 +247,9 @@ pub struct AgentsConfig {
     pub auth: Vec<AgentAuth>,
     #[serde(default)]
     pub bootstrap_token: Option<String>,
+    /// What happens to a host the server has never seen: `auto` makes it
+    /// active at once, `approve` leaves it pending for an admin. Under
+    /// Tailscale auth, `auto` only activates nodes that `tailscale` admits.
     #[serde(default)]
     pub registration: Registration,
     #[serde(default)]
@@ -256,6 +259,9 @@ pub struct AgentsConfig {
     /// Path to the tailscaled LocalAPI socket for whois.
     #[serde(default = "AgentsConfig::default_tailscale_socket")]
     pub tailscale_socket: PathBuf,
+    /// Which tailnet nodes are trusted as agents (design §02, §08).
+    #[serde(default)]
+    pub tailscale: TailscaleConfig,
     /// How long a host may stay disconnected in the middle of its wave
     /// before the rollout counts it as failed.
     #[serde(
@@ -277,6 +283,7 @@ impl std::fmt::Debug for AgentsConfig {
             .field("minimum_agent_version", &self.minimum_agent_version)
             .field("desired_version", &self.desired_version)
             .field("tailscale_socket", &self.tailscale_socket)
+            .field("tailscale", &self.tailscale)
             .field("disconnect_timeout", &self.disconnect_timeout)
             .finish()
     }
@@ -304,8 +311,61 @@ impl Default for AgentsConfig {
             minimum_agent_version: None,
             desired_version: None,
             tailscale_socket: Self::default_tailscale_socket(),
+            tailscale: TailscaleConfig::default(),
             disconnect_timeout: Self::default_disconnect_timeout(),
         }
+    }
+}
+
+/// `agents.tailscale`: which tailnet nodes are trusted as agents.
+///
+/// Every node on the tailnet can reach the gRPC listener, including nodes
+/// shared in from other tailnets, so whois alone proves *who* a peer is, not
+/// that it belongs to the fleet. A node is admitted when it carries one of
+/// `allowed_tags` (ACL tags such as `tag:buckle`; the `tag:` prefix is
+/// optional here) or is owned by one of `allowed_users` (exact login names
+/// such as `ada@example.com`).
+///
+/// ```yaml
+/// agents:
+///   registration: auto
+///   tailscale:
+///     allowed_tags: ["tag:buckle"]
+///     allowed_users: ["ops@example.com"]
+/// ```
+///
+/// * With at least one entry, a node that matches neither list is refused,
+///   whether or not it is already registered, and a matching new node is
+///   registered according to `registration`.
+/// * With both lists empty (the default), nothing is trusted to activate
+///   itself: under `registration: auto` a new tailnet node is registered as
+///   *pending* and waits for an admin, exactly as under `approve`. The server
+///   warns at start-up when this is the case.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TailscaleConfig {
+    #[serde(default)]
+    pub allowed_tags: Vec<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+impl TailscaleConfig {
+    /// Whether any node is restricted at all (some tag or user is listed).
+    pub fn is_configured(&self) -> bool {
+        !self.allowed_tags.is_empty() || !self.allowed_users.is_empty()
+    }
+
+    /// Whether a node with these tags and owner is admitted.
+    pub fn admits(&self, tags: &[String], user: Option<&str>) -> bool {
+        fn norm(t: &str) -> &str {
+            t.strip_prefix("tag:").unwrap_or(t)
+        }
+        let tagged = tags
+            .iter()
+            .any(|t| self.allowed_tags.iter().any(|a| norm(a) == norm(t)));
+        let owned = user.is_some_and(|u| self.allowed_users.iter().any(|a| a == u));
+        tagged || owned
     }
 }
 
@@ -450,6 +510,9 @@ agents:
   bootstrap_token: "${{ env.BUCKLE_BOOTSTRAP_TOKEN }}"
   registration: approve
   minimum_agent_version: "2.0.0"
+  tailscale:
+    allowed_tags: ["tag:buckle"]
+    allowed_users: [ops@example.com]
 web:
   base_url: https://buckle.example.ts.net
   user_acl: 'claims.email endswith "@example.com"'
@@ -503,6 +566,9 @@ secrets:
             cfg.agents.auth,
             vec![AgentAuth::Tailscale, AgentAuth::Token]
         );
+        assert!(cfg.agents.tailscale.admits(&["tag:buckle".into()], None));
+        assert!(cfg.agents.tailscale.admits(&[], Some("ops@example.com")));
+        assert!(!cfg.agents.tailscale.admits(&[], Some("eve@example.com")));
         assert_eq!(cfg.web.oidc.as_ref().unwrap().client_secret, "shh");
         assert!(cfg.web.admin_acl.is_some());
         assert_eq!(cfg.listen.tls.mode, TlsMode::Auto);

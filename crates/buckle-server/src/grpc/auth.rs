@@ -13,6 +13,8 @@ pub struct WhoisIdentity {
     pub node: String,
     /// The owning user's login, when the node is user-owned.
     pub user: Option<String>,
+    /// The node's ACL tags (`tag:…`); empty for a user-owned node.
+    pub tags: Vec<String>,
 }
 
 /// Resolves tailnet peers to node identities.
@@ -71,9 +73,23 @@ pub fn parse_whois(body: &[u8]) -> Option<WhoisIdentity> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
         })?;
+    let tags = node["Tags"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(WhoisIdentity {
         node: name,
-        user: v["UserProfile"]["LoginName"].as_str().map(str::to_owned),
+        // Tagged nodes report a placeholder profile; only a user-owned node
+        // has an owner worth matching.
+        user: v["UserProfile"]["LoginName"]
+            .as_str()
+            .filter(|_| node["Tags"].as_array().is_none_or(|a| a.is_empty()))
+            .map(str::to_owned),
+        tags,
     })
 }
 
@@ -225,11 +241,16 @@ mod tests {
             parse_whois(body),
             Some(WhoisIdentity {
                 node: "pi-1".into(),
-                user: Some("ada@example.com".into())
+                user: Some("ada@example.com".into()),
+                tags: vec![],
             })
         );
-        let tagged = br#"{"Node":{"Name":"oci-1.tail1234.ts.net."}}"#;
-        assert_eq!(parse_whois(tagged).unwrap().node, "oci-1");
+        let unnamed = br#"{"Node":{"Name":"oci-1.tail1234.ts.net."}}"#;
+        assert_eq!(parse_whois(unnamed).unwrap().node, "oci-1");
+        let tagged = br#"{"Node":{"Name":"oci-1.tail1234.ts.net.","Tags":["tag:buckle"]},"UserProfile":{"LoginName":"tagged-devices"}}"#;
+        let id = parse_whois(tagged).unwrap();
+        assert_eq!(id.tags, vec!["tag:buckle".to_string()]);
+        assert_eq!(id.user, None, "a tagged node has no owner to match");
         assert_eq!(parse_whois(b"nope"), None);
     }
 
