@@ -45,6 +45,10 @@ pub struct ControllerOptions {
 /// run it before the host is failed instead.
 const MAX_APPLY_RESENDS: u32 = 3;
 
+/// The task selector of every RequestPlan (rollouts plan whole revisions),
+/// echoed in the Apply so the agent re-plans exactly what was approved.
+const PLAN_SELECT: &str = "";
+
 impl Default for ControllerOptions {
     fn default() -> Self {
         Self {
@@ -1936,6 +1940,7 @@ impl Controller {
             phase,
             force: h.runtime.force,
             traceparent: traceparent_of(&span).unwrap_or_default(),
+            select: PLAN_SELECT.to_owned(),
         }
     }
 
@@ -2951,7 +2956,7 @@ impl Controller {
             host,
             msg(server_message::Msg::Plan(RequestPlan {
                 revision: revision.to_owned(),
-                select: String::new(),
+                select: PLAN_SELECT.to_owned(),
             })),
         );
         assigned && planned

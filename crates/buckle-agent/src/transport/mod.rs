@@ -155,6 +155,12 @@ pub enum Instruction {
         force: bool,
         /// W3C trace context of the span driving the apply.
         traceparent: Option<String>,
+        /// The selector the approved plan was made with.
+        select: Option<String>,
+        /// The rollout driving the apply, for tracing.
+        rollout_id: Option<String>,
+        /// The rollout phase, for tracing.
+        phase: Option<String>,
     },
     /// Apply this (older) revision now.
     Rollback {

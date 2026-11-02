@@ -625,3 +625,119 @@ async fn a_host_paused_while_connected_stops_correcting_drift() {
     assert_eq!(fake.applies().len(), 1);
     h.stop().await.expect("clean exit");
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_engine_stale_plan_is_reported_as_a_stale_plan_not_a_failure() {
+    let fake = FakeRunner::new();
+    let approved = plan_with_changes(&rev("rev1"), 1);
+    let fresh = plan_with_changes(&rev("rev1"), 2);
+    // RequestPlan and the apply's own re-plan see the approved plan; the
+    // engine's check then finds the host changed; the re-plan after it sees
+    // the fresh one.
+    fake.with_plans(
+        &rev("rev1"),
+        vec![approved.clone(), approved.clone(), fresh.clone()],
+    );
+    let (planned, now) = (approved.digest.clone(), fresh.digest.clone());
+    fake.with_apply_error(move |_| {
+        Some(buckle_core::error::wrap_user(
+            buckle_core::engine::StalePlan {
+                planned: planned.clone(),
+                fresh: now.clone(),
+            },
+            "The plan is stale.",
+            &[],
+        ))
+    });
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    session.send(request_plan("rev1")).await;
+    session.expect(plan_result).await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            approved.digest.as_str(),
+        )))
+        .await;
+    let received = session
+        .collect_until(|m| plan_result(m).is_some_and(|p| p.error.starts_with("stale plan")))
+        .await;
+    let stale = plan_result(&received.last().expect("a report").1).expect("a plan result");
+    assert_eq!(stale.digest, fresh.digest.to_string());
+    assert!(
+        received.iter().all(|(_, m)| apply_result(m).is_none()),
+        "no failed ApplyResult"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let state = Store::new(h.state_dir()).load_agent_state();
+    assert!(
+        state.unacked_reports.is_empty(),
+        "nothing durable to report"
+    );
+    assert_eq!(state.watchdog, None);
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_apply_re_plans_with_the_select_of_the_approved_plan() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    let select = "task.tags contains \"network\"";
+    session
+        .send(pb::server_message::Msg::Plan(pb::RequestPlan {
+            revision: "rev1".into(),
+            select: select.into(),
+        }))
+        .await;
+    session.expect(plan_result).await;
+    // An older server does not echo the select: the agent remembers it.
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    assert!(session.expect(apply_result).await.succeeded);
+    // A server that echoes it is followed.
+    session
+        .send(pb::server_message::Msg::Apply(pb::Apply {
+            select: "module.name == \"m\"".into(),
+            ..apply("rev1", plan.digest.as_str())
+        }))
+        .await;
+    assert!(session.expect(apply_result).await.succeeded);
+    let selects: Vec<Option<String>> = fake
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Plan { select, .. } => Some(select),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        selects,
+        vec![
+            Some(select.to_owned()),
+            Some(select.to_owned()),
+            Some("module.name == \"m\"".to_owned())
+        ]
+    );
+    h.stop().await.expect("clean exit");
+}

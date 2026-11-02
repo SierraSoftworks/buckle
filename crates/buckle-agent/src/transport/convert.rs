@@ -105,6 +105,9 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             waived_checks: a.waived_checks,
             force: a.force,
             traceparent: non_empty(a.traceparent),
+            select: non_empty(a.select),
+            rollout_id: non_empty(a.rollout_id),
+            phase: non_empty(a.phase),
         },
         Msg::Rollback(r) => Instruction::Rollback {
             revision: RevisionId(r.revision),

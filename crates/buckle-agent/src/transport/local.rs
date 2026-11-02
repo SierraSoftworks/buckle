@@ -130,6 +130,9 @@ fn assignment(revision: RevisionId) -> [Instruction; 3] {
             waived_checks: Vec::new(),
             force: false,
             traceparent: None,
+            select: None,
+            rollout_id: None,
+            phase: None,
         },
     ]
 }

@@ -104,6 +104,9 @@ enum Op {
         waived_checks: Vec<String>,
         force: bool,
         traceparent: Option<String>,
+        select: Option<String>,
+        rollout_id: Option<String>,
+        phase: Option<String>,
     },
     Rollback {
         revision: RevisionId,
@@ -159,6 +162,9 @@ struct Data {
     /// Persisted in agent.json: applied and stable revision, facts, …
     agent: AgentState,
     assigned: Option<RevisionId>,
+    /// The selector each recent plan digest was made with (only selected
+    /// plans are remembered).
+    selects: HashMap<String, String>,
 }
 
 struct Shared {
@@ -860,11 +866,22 @@ impl Shared {
                 waived_checks,
                 force,
                 traceparent,
+                select,
+                rollout_id,
+                phase,
             } => {
-                let span = tracing::info_span!("agent.apply", revision = %revision.short(), force);
+                let span = tracing::info_span!(
+                    "agent.apply",
+                    buckle.host = %self.host_id,
+                    buckle.revision = %revision.0,
+                    buckle.plan.digest = plan_digest.as_deref().unwrap_or(""),
+                    buckle.rollout = rollout_id.as_deref().unwrap_or(""),
+                    buckle.phase = phase.as_deref().unwrap_or(""),
+                    force
+                );
                 set_parent_from_traceparent(&span, traceparent.as_deref());
                 self.set_applying(Some(revision.clone()));
-                self.apply(revision, plan_digest, waived_checks, force)
+                self.apply(revision, plan_digest, select, waived_checks, force)
                     .instrument(span)
                     .await;
                 self.set_applying(None);
@@ -1162,12 +1179,21 @@ impl Shared {
     async fn plan(&self, revision: RevisionId, select: Option<String>) {
         let result = async {
             let rev = self.ensure_revision(&revision, None).await?;
-            let ctx = self.context(&revision, select, Vec::new(), false).await;
+            let ctx = self
+                .context(&revision, select.clone(), Vec::new(), false)
+                .await;
             self.runner.plan(rev, &ctx).await
         }
         .await;
         match result {
             Ok((plan, facts)) => {
+                if let Some(select) = &select {
+                    let mut data = self.data.lock().await;
+                    if data.selects.len() >= 64 {
+                        data.selects.clear();
+                    }
+                    data.selects.insert(plan.digest.to_string(), select.clone());
+                }
                 self.remember_facts(facts).await;
                 self.remember_plan(&plan).await;
                 tracing::info!(digest = %plan.digest.short(), changes = plan.changes(), "planned");
@@ -1216,6 +1242,16 @@ impl Shared {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(err) => {
+                if let Some(stale) = buckle_core::engine::StalePlan::find(&err) {
+                    // The host changed between the agent's plan and the
+                    // engine's own check: nothing was applied. Report the
+                    // fresh plan for re-approval, as for a digest mismatch.
+                    tracing::warn!(approved = %stale.planned, fresh = %stale.fresh, "the engine refused a stale plan");
+                    if report {
+                        self.report_stale(rev.clone(), ctx, plan).await;
+                    }
+                    return failed_outcome(plan, &err, started);
+                }
                 tracing::error!(error = %err.description(), "the apply failed");
                 failed_outcome(plan, &err, started)
             }
@@ -1250,14 +1286,25 @@ impl Shared {
         &self,
         revision: RevisionId,
         plan_digest: Option<String>,
+        select: Option<String>,
         waived_checks: Vec<String>,
         force: bool,
     ) {
         let connected_before = self.connected.load(Ordering::SeqCst);
+        // The approved plan was made with the RequestPlan's selector: the
+        // server echoes it; older servers do not, so fall back to the one
+        // this agent remembers planning that digest with.
+        let select = match select {
+            Some(select) => Some(select),
+            None => match &plan_digest {
+                Some(digest) => self.data.lock().await.selects.get(digest).cloned(),
+                None => None,
+            },
+        };
         let prepared = async {
             let rev = self.ensure_revision(&revision, None).await?;
             let ctx = self
-                .context(&revision, None, waived_checks.clone(), force)
+                .context(&revision, select.clone(), waived_checks.clone(), force)
                 .await;
             let (plan, facts) = self.runner.plan(rev.clone(), &ctx).await?;
             Ok::<_, buckle_core::Error>((rev, ctx, plan, facts))
@@ -1298,8 +1345,35 @@ impl Shared {
             changes = outcome.changes,
             "apply finished"
         );
-        self.maybe_arm_watchdog(&rev, connected_before, waived_checks)
-            .await;
+        // An apply the engine refused outright (a stale plan) changed nothing.
+        if outcome.succeeded || !outcome.module_results.is_empty() {
+            self.maybe_arm_watchdog(&rev, connected_before, waived_checks)
+                .await;
+        }
+    }
+
+    /// Re-plans and reports the fresh plan as stale against `approved`.
+    async fn report_stale(&self, rev: Arc<Revision>, ctx: &RunContext, approved: &Plan) {
+        match self.runner.plan(rev.clone(), ctx).await {
+            Ok((fresh, facts)) => {
+                self.remember_facts(facts).await;
+                self.remember_plan(&fresh).await;
+                self.sink
+                    .send(Report::StalePlan {
+                        plan: fresh,
+                        approved_digest: approved.digest.to_string(),
+                    })
+                    .await;
+            }
+            Err(err) => {
+                self.sink
+                    .send(Report::PlanFailed {
+                        revision: rev.id.clone(),
+                        error: err.description(),
+                    })
+                    .await;
+            }
+        }
     }
 
     async fn maybe_arm_watchdog(
@@ -1922,12 +1996,18 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             waived_checks,
             force,
             traceparent,
+            select,
+            rollout_id,
+            phase,
         } => Op::Apply {
             revision,
             plan_digest,
             waived_checks,
             force,
             traceparent,
+            select,
+            rollout_id,
+            phase,
         },
         Instruction::Rollback {
             revision,

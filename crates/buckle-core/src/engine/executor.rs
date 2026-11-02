@@ -92,7 +92,11 @@ pub(super) async fn apply(
     let state = inputs.state.load()?;
     let rich = plan_with(&planner, &facts, &state).await?;
     if rich.plan.digest != plan.digest {
-        return Err(crate::error::user(
+        return Err(crate::error::wrap_user(
+            super::StalePlan {
+                planned: plan.digest.clone(),
+                fresh: rich.plan.digest.clone(),
+            },
             format!(
                 "The plan is stale: it was computed as {} but this host now plans as {}.",
                 plan.digest.short(),

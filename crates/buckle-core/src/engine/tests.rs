@@ -1714,6 +1714,10 @@ async fn stale_plans_are_refused_with_both_digests() {
     let msg = err.message();
     assert!(msg.contains("stale"), "{msg}");
     assert!(msg.contains(old.digest.short()), "{msg}");
+    let stale = super::StalePlan::find(&err).expect("a typed stale-plan marker");
+    assert_eq!(stale.planned, old.digest);
+    assert_ne!(stale.fresh, old.digest);
+    assert!(super::StalePlan::find(&crate::error::user("other", &[])).is_none());
     assert!(!calls("stale1").iter().any(|c| c.starts_with("apply")));
 }
 

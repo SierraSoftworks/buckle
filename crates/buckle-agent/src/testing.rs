@@ -140,11 +140,13 @@ pub enum Call {
 
 type HealthFn = Box<dyn Fn(&RevisionId, HealthScope) -> HealthReport + Send + Sync>;
 type OutcomeFn = Box<dyn Fn(&Plan) -> ApplyOutcome + Send + Sync>;
+type ApplyErrorFn = Box<dyn Fn(&Plan) -> Option<buckle_core::Error> + Send + Sync>;
 
 /// A scripted runner that records every call.
 pub struct FakeRunner {
     plans: Mutex<HashMap<RevisionId, VecDeque<Plan>>>,
     outcome: Mutex<OutcomeFn>,
+    apply_error: Mutex<Option<ApplyErrorFn>>,
     health: Mutex<HealthFn>,
     events_per_apply: Mutex<Vec<ApplyEvent>>,
     facts: Mutex<Facts>,
@@ -157,6 +159,7 @@ impl Default for FakeRunner {
         Self {
             plans: Mutex::new(HashMap::new()),
             outcome: Mutex::new(Box::new(succeeded)),
+            apply_error: Mutex::new(None),
             health: Mutex::new(Box::new(|_, scope| health(scope, true))),
             events_per_apply: Mutex::new(Vec::new()),
             facts: Mutex::new(Facts::new()),
@@ -185,6 +188,16 @@ impl FakeRunner {
     /// Computes apply outcomes with `f`.
     pub fn with_outcome(&self, f: impl Fn(&Plan) -> ApplyOutcome + Send + Sync + 'static) -> &Self {
         *lock(&self.outcome) = Box::new(f);
+        self
+    }
+
+    /// Makes `apply` fail with the error `f` returns (when it returns one),
+    /// after recording the call.
+    pub fn with_apply_error(
+        &self,
+        f: impl Fn(&Plan) -> Option<buckle_core::Error> + Send + Sync + 'static,
+    ) -> &Self {
+        *lock(&self.apply_error) = Some(Box::new(f));
         self
     }
 
@@ -287,6 +300,11 @@ impl Runner for FakeRunner {
             waived_checks: ctx.waived_checks.clone(),
             force: ctx.force,
         });
+        if let Some(f) = lock(&self.apply_error).as_ref()
+            && let Some(err) = f(plan)
+        {
+            return Err(err);
+        }
         let scripted = lock(&self.events_per_apply).clone();
         for event in scripted {
             let _ = events.send(event).await;

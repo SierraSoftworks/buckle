@@ -259,6 +259,9 @@ message Apply {
   // W3C trace context of the rollout span driving this apply; the agent's
   // `agent.apply` span uses it as its parent. Empty when not traced.
   string traceparent = 8;
+  // The task selector of the RequestPlan whose plan was approved; the agent
+  // re-plans with it so the digest can match. Empty: the whole revision.
+  string select = 9;
 }
 
 message Rollback {
