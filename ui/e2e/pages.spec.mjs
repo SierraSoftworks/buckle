@@ -1,0 +1,158 @@
+// Every page renders in demo mode, with its loading, empty and error states
+// and its admin controls only for admins.
+
+import { describe, test } from "node:test";
+import { assert, eventually, heading, open } from "./helpers.mjs";
+
+describe("every page renders in demo mode", () => {
+  test("overview rolls the fleet up with reading ages", async () => {
+    const { page, close } = await open("/");
+    assert.equal(await heading(page), "Overview");
+    const tiles = page.locator(".tile[data-state]");
+    await tiles.first().waitFor();
+    const labels = await page.locator(".tile .tile__label").allTextContents();
+    for (const want of ["Healthy", "Failing", "Held", "Offline", "Drifted"]) assert.ok(labels.includes(want), want);
+    assert.match(await page.locator('.tile[data-state="healthy"] .tile__age').textContent(), /old/);
+    // The active rollout as a pipeline, the attention list, recent revisions.
+    await page.locator(".pipeline--compact a.block").first().waitFor();
+    assert.match(await page.locator(".attention").textContent(), /awaiting registration approval/);
+    assert.match(await page.locator(".attention").textContent(), /expected 2\.0\.0-dev\.5/);
+    assert.equal(await page.locator(".revlist__item").count(), 5);
+    await close();
+  });
+
+  test("rollouts list every rollout with its state", async () => {
+    const { page, close } = await open("/rollouts");
+    assert.equal(await heading(page), "Rollouts");
+    await page.locator("tbody tr").first().waitFor();
+    assert.equal(await page.locator("tbody tr").count(), 4);
+    const text = await page.locator("tbody").textContent();
+    for (const s of ["rolling", "completed", "rolled back", "aborted"]) assert.ok(text.includes(s), s);
+    // In-app navigation, no reload: the live store and demo mode survive.
+    await page.getByRole("link", { name: "#42" }).click();
+    assert.equal(await heading(page), "Rollout #42");
+    assert.match(page.url(), /\/rollouts\/42$/);
+    await close();
+  });
+
+  test("hosts table lists pending registrations first and filters", async () => {
+    const { page, close } = await open("/hosts");
+    assert.equal(await heading(page), "Hosts");
+    await page.getByTestId("hosts-table").waitFor();
+    assert.equal(await page.locator("tbody tr").first().getAttribute("data-host"), "rpi-new");
+    assert.equal(await page.locator("tbody tr").count(), 27);
+    await page.getByRole("button", { name: /^Failing/ }).click();
+    await eventually(async () => assert.equal(await page.locator("tbody tr").count(), 2));
+    assert.match(page.url(), /show=failing/);
+    await page.getByRole("searchbox", { name: "Search hosts" }).fill("hz-");
+    await eventually(async () => assert.equal(await page.locator("tbody tr").count(), 1));
+    await close();
+  });
+
+  test("a host shows facts, owned resources, health per scope, drift and runs", async () => {
+    const { page, close } = await open("/hosts/hz-3");
+    assert.equal(await heading(page), "hz-3");
+    for (const panel of ["Summary", "Labels", "Notes", "Health", "Drift", "Owned resources", "Recent runs", "Facts"]) {
+      await page.getByRole("heading", { name: panel, exact: true }).waitFor();
+    }
+    // Secrets are only ever tokens.
+    const drift = await page.locator(".drift").last().textContent();
+    assert.match(drift, /«secret:nomad_server@3f9a»/);
+    await page.locator(".tree summary", { hasText: "os" }).click();
+    assert.match(await page.locator(".tree").textContent(), /distribution/);
+    await close();
+  });
+
+  test("revisions show validation errors for a rejected commit", async () => {
+    const { page, close } = await open("/revisions");
+    assert.equal(await heading(page), "Revisions");
+    const rejected = page.locator(".gitlog__item--rejected");
+    await rejected.waitFor();
+    assert.match(await rejected.textContent(), /unknown field `tag`/);
+    // A rejected commit offers nothing to do; an older valid one offers a rollback.
+    assert.equal(await rejected.getByRole("button").count(), 0);
+    await page.getByRole("button", { name: "Roll back fleet to this…" }).first().waitFor();
+    await close();
+  });
+
+  test("audit filters with a checked filt-rs expression kept in the URL", async () => {
+    const { page, close } = await open("/audit");
+    assert.equal(await heading(page), "Audit");
+    await page.getByTestId("audit-table").waitFor();
+    const all = await page.locator("tbody tr").count();
+    assert.ok(all >= 10);
+    const box = page.getByTestId("audit-filter");
+    await box.fill('actor == "alice" &&');
+    await page.getByTestId("filter-error").waitFor();
+    await box.fill('action startswith "rollout."');
+    await eventually(async () =>
+      assert.equal(new URL(page.url()).searchParams.get("filter"), 'action startswith "rollout."'),
+    );
+    await eventually(async () => {
+      const actions = await page.locator("tbody tr td:nth-child(3)").allTextContents();
+      assert.ok(actions.length > 0 && actions.length < all);
+      assert.ok(actions.every((a) => a.startsWith("rollout.")), actions.join());
+    });
+    // A click on a value narrows the filter by it.
+    await page.locator("tbody tr td:nth-child(2) button", { hasText: "bob" }).first().click();
+    await eventually(async () => assert.equal(await box.inputValue(), 'action startswith "rollout." && actor == "bob"'));
+    await close();
+  });
+
+  test("reference renders kinds from their schemas with secret fields marked", async () => {
+    const { page, close } = await open("/reference");
+    assert.equal(await heading(page), "Reference");
+    const template = page.locator("#kind-file\\.template");
+    await template.waitFor();
+    assert.match(await template.textContent(), /dest \*/);
+    assert.equal(await template.locator("tr.is-secret").count(), 1);
+    await page.getByRole("tab", { name: /Health checks/ }).click();
+    await page.locator("#kind-http").waitFor();
+    await close();
+  });
+
+  test("an unknown address is the not-found page, and deep links load directly", async () => {
+    const { page, close } = await open("/no/such/page");
+    await page.getByText("Nothing here").waitFor();
+    await close();
+    const deep = await open("/hosts/pi-5");
+    assert.equal(await heading(deep.page), "pi-5");
+    await deep.close();
+  });
+});
+
+describe("empty and not-permitted states", () => {
+  test("an empty fleet says what to do next on every page", async () => {
+    for (const [path, text] of [
+      ["/", "No rollout in progress"],
+      ["/hosts", "No hosts have enrolled"],
+      ["/rollouts", "No rollouts yet"],
+      ["/revisions", "No revisions yet"],
+      ["/audit", "Nothing audited yet"],
+    ]) {
+      const { page, close } = await open(path, { flags: "empty" });
+      await page.getByText(text).waitFor();
+      await close();
+    }
+  });
+
+  test("a read-only user sees no admin actions", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "role=viewer" });
+    await page.getByText("Approving needs an administrator").waitFor();
+    for (const name of ["Review and approve…", "Pause", "Abort…"]) {
+      assert.equal(await page.getByRole("button", { name }).count(), 0, name);
+    }
+    await page.goto(page.url().replace("/rollouts/42", "/hosts/pi-1"));
+    await page.getByRole("heading", { name: "Labels" }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "Forget…" }).count(), 0);
+    assert.equal(await page.getByRole("button", { name: "Add label" }).count(), 0);
+    await close();
+  });
+
+  test("loading states show while the server answers", async () => {
+    const { page, close } = await open("/hosts", { flags: "slow" });
+    await page.getByText("Loading hosts…").waitFor();
+    await page.getByTestId("hosts-table").waitFor();
+    await close();
+  });
+});

@@ -1,19 +1,29 @@
-//! Buckle UI entry point. Lane 9 (UI) builds the application here.
+//! The Buckle web UI (design §12).
+//!
+//! A Yew application compiled to WebAssembly with Trunk and embedded in the
+//! server. It talks to `/api/v1` and nothing else, so the same bundle works
+//! behind any host name.
+//!
+//! # Demo mode
+//!
+//! Appending `?demo` to any URL serves every API call from the fixtures in
+//! [`fixtures`] (debug builds only), which is how the UI is reviewed without a
+//! server and how the end-to-end tests drive it.
 
-use yew::prelude::*;
-
-#[function_component(App)]
-fn app() -> Html {
-    html! {
-        <main style="padding: 2rem">
-            <h1>{ "Buckle" }</h1>
-            <p>{ "The UI is being built." }</p>
-        </main>
-    }
-}
+mod api;
+mod app;
+mod auth;
+mod components;
+mod fixtures;
+mod hooks;
+mod logic;
+mod pages;
+mod store;
+mod util;
 
 fn main() {
     console_error_panic_hook::set_once();
     wasm_logger::init(wasm_logger::Config::default());
-    yew::Renderer::<App>::new().render();
+    components::theme::apply(components::theme::current());
+    yew::Renderer::<app::App>::new().render();
 }

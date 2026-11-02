@@ -38,16 +38,42 @@ jobs:
   ui:
     name: UI
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ui
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm trunk
+      # The UI is excluded from the workspace (it targets wasm32), so the
+      # workspace lint job never sees it.
+      - name: Lint
+        working-directory: ui
+        run: |
+          cargo fmt --check
+          cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # The logic modules touch no DOM, so they run on the host target.
+      - name: Unit tests
+        working-directory: ui
+        run: cargo test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      # Demo mode is compiled out of release bundles, so the suite builds a
+      # debug bundle of its own into ui/dist-e2e and drives it with ?demo.
+      - name: End-to-end tests
+        working-directory: ui
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run e2e
       - run: cd ui && trunk build --release
       - uses: actions/upload-artifact@v4
         with:

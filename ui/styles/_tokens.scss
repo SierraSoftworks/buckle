@@ -1,0 +1,116 @@
+// Design tokens. Every colour a component uses is one of these custom
+// properties, so the light theme is the same rules with different values
+// (design §12). The names in the first block are the contract the original
+// stub declared; the rest extend it.
+
+@mixin dark {
+  --bg: #0f141a;
+  --surface: #161c24;
+  --surface-2: #1e2630;
+  --surface-3: #27313d;
+  --fg: #e4e9ef;
+  --fg-2: #98a4b3;
+  --fg-3: #6b7685;
+  --line: #2c3642;
+  --line-strong: #3d4957;
+  --brand: #d9a24a;
+  --brand-strong: #b9852f;
+  --on-brand: #15110a;
+
+  --ok: #4cbf7f;
+  --warn: #e0a93a;
+  --danger: #ef6b63;
+  --info: #7aaef0;
+  // In flight: applying and baking.
+  --active: #5fb7e8;
+  // Undone on purpose: rolled back.
+  --mute: #a98bf0;
+  --neutral: #7d8896;
+
+  --ok-soft: rgba(76, 191, 127, 0.14);
+  --warn-soft: rgba(224, 169, 58, 0.15);
+  --danger-soft: rgba(239, 107, 99, 0.15);
+  --info-soft: rgba(122, 174, 240, 0.15);
+  --active-soft: rgba(95, 183, 232, 0.16);
+  --mute-soft: rgba(169, 139, 240, 0.16);
+  --neutral-soft: rgba(125, 136, 150, 0.16);
+  --brand-soft: rgba(217, 162, 74, 0.14);
+
+  --diff-add: rgba(76, 191, 127, 0.13);
+  --diff-del: rgba(239, 107, 99, 0.14);
+  --scrim: rgba(0, 0, 0, 0.55);
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+}
+
+@mixin light {
+  --bg: #f2f4f7;
+  --surface: #ffffff;
+  --surface-2: #e9edf2;
+  --surface-3: #dde3ea;
+  --fg: #141a22;
+  --fg-2: #5a6675;
+  --fg-3: #7b8694;
+  --line: #cfd6df;
+  --line-strong: #b4bec9;
+  --brand: #9a6a1f;
+  --brand-strong: #7d5414;
+  --on-brand: #ffffff;
+
+  --ok: #1d8a4f;
+  --warn: #9a6a00;
+  --danger: #c4372e;
+  --info: #2f6bc0;
+  --active: #1677b3;
+  --mute: #6b4fc4;
+  --neutral: #6a7482;
+
+  --ok-soft: rgba(29, 138, 79, 0.12);
+  --warn-soft: rgba(176, 122, 0, 0.13);
+  --danger-soft: rgba(196, 55, 46, 0.11);
+  --info-soft: rgba(47, 107, 192, 0.11);
+  --active-soft: rgba(22, 119, 179, 0.12);
+  --mute-soft: rgba(107, 79, 196, 0.12);
+  --neutral-soft: rgba(106, 116, 130, 0.12);
+  --brand-soft: rgba(154, 106, 31, 0.12);
+
+  --diff-add: rgba(29, 138, 79, 0.12);
+  --diff-del: rgba(196, 55, 46, 0.1);
+  --scrim: rgba(20, 26, 34, 0.35);
+  --shadow: 0 16px 40px rgba(20, 26, 34, 0.18);
+  color-scheme: light;
+}
+
+:root {
+  @include dark;
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 9px;
+  --bar-h: 48px;
+  --sidebar-w: 220px;
+  --block: 18px;
+  --block-gap: 4px;
+  --transition: 120ms ease;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "SFMono-Regular", ui-monospace, Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+:root[data-theme="light"] {
+  @include light;
+}
+
+// Before the bundle has run (and so before `data-theme` is set), follow the
+// system. `index.html` sets the stored choice even earlier.
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    @include light;
+  }
+}
+
+$narrow: 860px;
+$small: 560px;
+
+@mixin focus-ring {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
