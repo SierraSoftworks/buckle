@@ -10,7 +10,7 @@ use actix_web::{HttpMessage, HttpRequest, HttpResponse, web};
 use buckle_api::{
     ActionRequest, ApproveRequest, ContinueRequest, CsrfToken, Fleet, FleetCounts, HealthResultDto,
     HealthSummary, HostDetail, HostPatch, HostPreview, HostStatus, LiveEvent, Me, Page,
-    ResourceSummary, RunSummary, StartRollout,
+    RejectRequest, ResourceSummary, RolloutState, RunSummary, StartRollout,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -47,6 +47,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/rollouts/{id}", web::get().to(rollout))
             .route("/rollouts/{id}/plans", web::get().to(rollout_plans))
             .route("/rollouts/{id}/approve", web::post().to(rollout_approve))
+            .route("/rollouts/{id}/reject", web::post().to(rollout_reject))
             .route(
                 "/rollouts/{id}/hosts/{host}/continue",
                 web::post().to(rollout_continue),
@@ -86,6 +87,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("GET", "/api/v1/rollouts/r"),
     ("GET", "/api/v1/rollouts/r/plans"),
     ("POST", "/api/v1/rollouts/r/approve"),
+    ("POST", "/api/v1/rollouts/r/reject"),
     ("POST", "/api/v1/rollouts/r/pause"),
     ("POST", "/api/v1/rollouts/r/resume"),
     ("POST", "/api/v1/rollouts/r/rollback"),
@@ -883,6 +885,63 @@ async fn rollout_approve(
             },
         )
         .await?;
+    Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))
+}
+
+/// `POST /rollouts/{id}/reject`: valid only while the rollout awaits
+/// approval (409 otherwise). The controller has no reject transition of its
+/// own, so this is its abort command with the reason as the note, followed
+/// by a `rollout.reject` audit entry carrying the reason; the rollout ends
+/// `aborted`.
+async fn rollout_reject(
+    state: Data,
+    admin: Administrative,
+    path: web::Path<String>,
+    body: web::Json<RejectRequest>,
+) -> ApiResult {
+    let id = path.into_inner();
+    let reason = body.into_inner().reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err(ApiError::bad_request(
+            "Say why the rollout is rejected: the reason is recorded in the audit log.",
+        ));
+    }
+    let i2 = id.clone();
+    let record = state
+        .store
+        .call(move |db| db.rollouts().get(&i2))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("No rollout '{id}'.")))?;
+    if record.state != RolloutState::AwaitingApproval {
+        return Err(ApiError::conflict(format!(
+            "Rollout {id} is not awaiting approval, so there is nothing to reject; abort it instead."
+        )));
+    }
+    let phase = record
+        .runtime
+        .phases
+        .get(record.runtime.current_phase)
+        .map(|p| p.name.clone());
+    let actor = admin.0.actor();
+    state
+        .controller
+        .command(
+            &actor,
+            Command::Abort {
+                rollout: id.clone(),
+                note: format!("Rejected: {reason}"),
+            },
+        )
+        .await?;
+    audit_action(
+        &state,
+        &actor,
+        "rollout.reject",
+        &id,
+        format!("{actor} rejected the rollout: {reason}"),
+        Some(serde_json::json!({ "reason": reason, "phase": phase })),
+    )
+    .await;
     Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))
 }
 

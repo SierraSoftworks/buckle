@@ -125,6 +125,29 @@ describe("approving a phase", () => {
     await close();
   });
 
+  test("rejecting a rollout held at a gate needs a reason and ends it", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
+    await page.locator(".page-head .pill", { hasText: "awaiting approval" }).waitFor();
+    await page.getByRole("button", { name: "Reject…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Reject rollout #42" });
+    const confirm = dialog.getByRole("button", { name: "Reject rollout" });
+    await dialog.getByRole("textbox", { name: /Type/ }).fill("#42");
+    assert.ok(await confirm.isDisabled(), "a reason is required");
+    await dialog.getByRole("textbox", { name: /Reason/ }).fill("grey's removal takes the agent token too early");
+    await confirm.click();
+    await page.locator(".page-head .pill", { hasText: "aborted" }).waitFor();
+    await page.locator(".timeline__kind", { hasText: "rollout.reject" }).first().waitFor();
+    await close();
+  });
+
+  test("a running rollout offers no reject, only abort", async () => {
+    const { page, close } = await open("/rollouts/42");
+    await page.getByRole("button", { name: "Review and approve…" }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "Reject…" }).count(), 0);
+    await page.getByRole("button", { name: "Abort…" }).waitFor();
+    await close();
+  });
+
   test("a failed host can continue with its failing checks waived", async () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });

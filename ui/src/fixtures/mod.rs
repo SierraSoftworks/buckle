@@ -15,6 +15,7 @@
 //! | `auth=expired` | `/me` answers 401 and the refresh fails, so the UI sends you to sign in |
 //! | `slow` | every call takes 700 ms, to see the loading states |
 //! | `live` | the active rollout moves on by itself through the live event path |
+//! | `awaiting` | the active rollout has finished its home phase and is held at the cloud gate, awaiting approval (so it can be rejected) |
 //! | `empty` | an empty fleet with no rollouts, to see the empty states |
 //!
 //! The choice is remembered for the tab (`sessionStorage`), so a reload or a

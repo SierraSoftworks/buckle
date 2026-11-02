@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use buckle_api::{
     ActionRequest, ApproveRequest, AuditEntry, Catalog, ContinueRequest, CsrfToken, ErrorBody,
     Fleet, HealthResultDto, HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup,
-    RevisionSummary, RolloutDetail, RolloutSummary, StartRollout,
+    RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, StartRollout,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -346,6 +346,21 @@ pub async fn approve(id: &str, request: &ApproveRequest) -> Result<RolloutDetail
         Method::Post,
         &format!("/rollouts/{}/approve", enc(id)),
         Some(request),
+    )
+    .await
+}
+
+/// Turns down a rollout that is awaiting approval; it ends aborted, with
+/// `reason` in the audit log.
+pub async fn reject(id: &str, reason: &str) -> Result<RolloutDetail, ApiError> {
+    demo!(demo_store::reject(id, reason));
+    let body = RejectRequest {
+        reason: reason.into(),
+    };
+    write(
+        Method::Post,
+        &format!("/rollouts/{}/reject", enc(id)),
+        Some(&body),
     )
     .await
 }

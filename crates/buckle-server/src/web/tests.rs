@@ -51,6 +51,8 @@ struct Env {
     _data: tempfile::TempDir,
     store: Store,
     state: web::Data<AppState>,
+    /// The controller's links to agents, for fake hosts.
+    sessions: Arc<Sessions>,
 }
 
 async fn env(web_config: WebConfig) -> Env {
@@ -62,10 +64,11 @@ async fn env_with(web_config: WebConfig, adjust: impl FnOnce(&mut AppState)) -> 
     let store = Store::in_memory().await.unwrap();
     let revisions = Arc::new(RevisionCache::new(data.path()));
     let events = EventBus::default();
+    let sessions = Arc::new(Sessions::new());
     let (controller, _task) = crate::rollout::spawn(
         ControllerDeps {
             store: store.clone(),
-            link: Arc::new(Sessions::new()),
+            link: sessions.clone(),
             clock: Arc::new(TokioClock::new()),
             events: events.clone(),
             revisions: revisions.clone(),
@@ -93,6 +96,7 @@ async fn env_with(web_config: WebConfig, adjust: impl FnOnce(&mut AppState)) -> 
         _data: data,
         store,
         state,
+        sessions,
     }
 }
 
@@ -1282,4 +1286,190 @@ async fn a_host_serves_the_drift_its_last_report_found() {
         test::read_body_json(test::call_service(&app, get()).await).await;
     assert!(!host.summary.drifted);
     assert!(host.drift.is_empty());
+}
+
+// ------------------------------------------------------------ reject
+
+/// Stores a valid revision `id` whose fleet config is `buckle_yaml`.
+async fn revision(e: &Env, id: &str, buckle_yaml: &str) {
+    let dir = e.state.revisions.dir(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("buckle.yaml"), buckle_yaml).unwrap();
+    let rec = crate::store::RevisionRecord {
+        id: id.into(),
+        commit: id.into(),
+        author: "a".into(),
+        message: format!("revision {id}"),
+        committed_at: chrono::Utc::now(),
+        created_at: chrono::Utc::now(),
+        tarball_digest: Some("t".into()),
+        status: buckle_api::RevisionStatus::Valid,
+        errors: vec![],
+        module_count: 0,
+        source: "path".into(),
+    };
+    e.store
+        .call(move |db| db.revisions().upsert(&rec))
+        .await
+        .unwrap();
+}
+
+/// A connected host whose agent answers every plan request with `digest`.
+fn fake_agent(e: &Env, host: &str, digest: &str) {
+    use buckle_proto::v1::{PlanResult, agent_message::Msg as AMsg, server_message::Msg as SMsg};
+    let (_, mut rx) = e.sessions.attach(host);
+    let (controller, name, digest) = (
+        e.state.controller.clone(),
+        host.to_owned(),
+        digest.to_owned(),
+    );
+    tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            if let Some(SMsg::Plan(p)) = m.msg {
+                controller.agent_message(
+                    &name,
+                    AMsg::Plan(PlanResult {
+                        revision: p.revision,
+                        digest: digest.clone(),
+                        changes: 1,
+                        plan_json: b"{}".to_vec(),
+                        ..Default::default()
+                    }),
+                );
+            }
+        }
+    });
+    e.state.controller.connected(crate::rollout::Connected {
+        host: host.to_owned(),
+        applied_revision: None,
+        last_plan_digest: None,
+    });
+}
+
+async fn wait_for_state(e: &Env, id: &str, state: buckle_api::RolloutState) {
+    for _ in 0..200 {
+        let i = id.to_owned();
+        let r = e.store.call(move |db| db.rollouts().get(&i)).await.unwrap();
+        if r.is_some_and(|r| r.state == state) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("rollout {id} never reached {state:?}");
+}
+
+#[actix_web::test]
+async fn rejecting_a_rollout_awaiting_approval_aborts_it_with_the_reason_audited() {
+    let e = env(WebConfig::default()).await;
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    revision(
+        &e,
+        "r1",
+        "version: 2\nrollout:\n  phases:\n    - { name: canary, select: 'true', approval: required }\n",
+    )
+    .await;
+    fake_agent(&e, "pi-1", "plan-a");
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    let post = |uri: String, body: serde_json::Value| {
+        test::TestRequest::post()
+            .uri(&uri)
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(body)
+            .to_request()
+    };
+    let started: buckle_api::RolloutSummary = test::read_body_json(
+        test::call_service(
+            &app,
+            post("/api/v1/revisions/r1/rollout".into(), serde_json::json!({})),
+        )
+        .await,
+    )
+    .await;
+    let id = started.id;
+    wait_for_state(&e, &id, buckle_api::RolloutState::AwaitingApproval).await;
+
+    let reject = |reason: &str| {
+        post(
+            format!("/api/v1/rollouts/{id}/reject"),
+            serde_json::json!({ "reason": reason }),
+        )
+    };
+    let blank = test::call_service(&app, reject("  ")).await;
+    assert_eq!(
+        blank.status(),
+        StatusCode::BAD_REQUEST,
+        "a reason is required"
+    );
+
+    let resp = test::call_service(&app, reject("the nomad diff rotates the wrong secret")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail: buckle_api::RolloutDetail = test::read_body_json(resp).await;
+    assert_eq!(detail.summary.state, buckle_api::RolloutState::Aborted);
+    let rejected = detail
+        .events
+        .iter()
+        .find(|ev| ev.kind == "rollout.reject")
+        .expect("a reject entry on the timeline");
+    assert!(
+        rejected
+            .message
+            .contains("the nomad diff rotates the wrong secret")
+    );
+    assert_eq!(rejected.phase.as_deref(), Some("canary"));
+
+    let page: buckle_api::Page<buckle_api::AuditEntry> = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/audit?filter=action%20%3D%3D%20%22rollout.reject%22")
+                .to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.total, 1);
+    let entry = &page.items[0];
+    assert_eq!(entry.subject.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        entry.detail.as_ref().unwrap()["reason"],
+        "the nomad diff rotates the wrong secret"
+    );
+
+    let again = test::call_service(&app, reject("twice")).await;
+    assert_eq!(
+        again.status(),
+        StatusCode::CONFLICT,
+        "only while awaiting approval"
+    );
+}
+
+#[actix_web::test]
+async fn reject_is_409_unless_awaiting_approval_and_404_for_no_rollout() {
+    let e = env(WebConfig::default()).await;
+    e.store
+        .call(|db| db.rollouts().save(&finished_rollout("7", None)))
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    for (uri, expected) in [
+        ("/api/v1/rollouts/7/reject", StatusCode::CONFLICT),
+        ("/api/v1/rollouts/99/reject", StatusCode::NOT_FOUND),
+    ] {
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(uri)
+                .cookie(cookie.clone())
+                .insert_header((auth::CSRF_HEADER, token.clone()))
+                .set_json(buckle_api::RejectRequest {
+                    reason: "no".into(),
+                })
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), expected, "{uri}");
+    }
 }

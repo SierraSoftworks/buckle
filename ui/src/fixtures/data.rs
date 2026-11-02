@@ -571,6 +571,41 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
     }
 }
 
+/// `?demo&awaiting`: the home phase has finished, so the rollout is held at
+/// the cloud gate waiting for an approval (and can be rejected).
+pub fn hold_at_cloud_gate(detail: &mut RolloutDetail, now: DateTime<Utc>) {
+    for phase in &mut detail.phases {
+        if phase.name == "home" {
+            phase.state = PhaseState::Done;
+            for h in &mut phase.hosts {
+                if matches!(h.state, S::Baking | S::Applying | S::Held) {
+                    h.state = S::Healthy;
+                    h.bake_until = None;
+                    h.error = None;
+                    h.failed_checks.clear();
+                }
+            }
+        }
+    }
+    detail.summary.state = RolloutState::AwaitingApproval;
+    detail.summary.current_phase = Some("cloud".into());
+    detail.summary.hosts_done = detail
+        .phases
+        .iter()
+        .flat_map(|p| &p.hosts)
+        .filter(|h| h.state == S::Healthy)
+        .count() as u32;
+    detail.events.push(ev(
+        now,
+        0,
+        "rollout.phase.done",
+        "phase 'home' done; pre-phase gate passed",
+        None,
+        Some("home"),
+        Some("controller"),
+    ));
+}
+
 fn ev(
     now: DateTime<Utc>,
     mins_ago: i64,

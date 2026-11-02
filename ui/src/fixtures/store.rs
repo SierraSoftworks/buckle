@@ -36,10 +36,16 @@ impl State {
         let empty = flag("empty").is_some();
         let hosts = if empty { vec![] } else { data::hosts(now) };
         let details = hosts.iter().map(|h| data::host_detail(h, now)).collect();
+        let mut rollouts = if empty { vec![] } else { data::rollouts(now) };
+        if flag("awaiting").is_some()
+            && let Some(active) = rollouts.iter_mut().find(|r| r.summary.id == "42")
+        {
+            data::hold_at_cloud_gate(active, now);
+        }
         Self {
             hosts,
             details,
-            rollouts: if empty { vec![] } else { data::rollouts(now) },
+            rollouts,
             revisions: if empty { vec![] } else { data::revisions(now) },
             audit: if empty { vec![] } else { data::audit(now) },
             outbox: Vec::new(),
@@ -504,6 +510,50 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
             &format!("rollout.{action}"),
             id,
             format!("{} {action} rollout {id}. {note}", actor()),
+        );
+        Ok(snapshot)
+    })
+}
+
+pub fn reject(id: &str, reason: &str) -> Result<RolloutDetail, ApiError> {
+    admin()?;
+    if reason.trim().is_empty() {
+        return Err(ApiError::Server(
+            "Say why the rollout is rejected: the reason is recorded in the audit log.".into(),
+        ));
+    }
+    with(|s| {
+        let detail = s.rollout_mut(id)?;
+        if detail.summary.state != RolloutState::AwaitingApproval {
+            return Err(ApiError::Conflict(format!(
+                "Rollout {id} is not awaiting approval, so there is nothing to reject; abort it instead."
+            )));
+        }
+        let phase = detail.summary.current_phase.clone();
+        detail.summary.state = RolloutState::Aborted;
+        detail.summary.finished_at = Some(Utc::now());
+        detail.summary.current_phase = None;
+        detail.events.push(event(
+            "rollout.abort",
+            format!("{} aborted the rollout. Rejected: {reason}", actor()),
+            None,
+            None,
+        ));
+        detail.events.push(event(
+            "rollout.reject",
+            format!("{} rejected the rollout: {reason}", actor()),
+            None,
+            phase.as_deref(),
+        ));
+        let snapshot = detail.clone();
+        s.outbox.push(LiveEvent::RolloutChanged {
+            rollout: snapshot.summary.clone(),
+        });
+        s.record(
+            &actor(),
+            "rollout.reject",
+            id,
+            format!("{} rejected the rollout: {reason}", actor()),
         );
         Ok(snapshot)
     })

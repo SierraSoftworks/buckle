@@ -164,8 +164,8 @@ pub fn rollout_page(props: &Props) -> Html {
                         ),
                     ),
                     Ask::Reject => (
-                        api::rollout_action(&id, "abort", &note).await,
-                        format!("Rollout #{id} rejected and aborted."),
+                        api::reject(&id, &note).await,
+                        format!("Rollout #{id} rejected."),
                     ),
                     Ask::Action(action) => (
                         api::rollout_action(&id, action, &note).await,
@@ -281,6 +281,7 @@ pub fn rollout_page(props: &Props) -> Html {
             &d,
             &plan_groups,
             admin,
+            s.state == RolloutState::AwaitingApproval,
             &open,
             &focus_phase,
         ),
@@ -341,12 +342,15 @@ fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalScope {
     approval_scope(&approval_hosts(phase), plans)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn approval_pane(
     phase: &RolloutPhase,
     wanting: &[&RolloutPhase],
     d: &RolloutDetail,
     plans: &[PlanGroup],
     admin: bool,
+    // The rollout is held at a gate: rejecting it is possible (only then).
+    rejectable: bool,
     open: &Callback<Ask>,
     focus: &UseStateHandle<Option<String>>,
 ) -> Html {
@@ -425,7 +429,9 @@ fn approval_pane(
                     <Button kind={Kind::Primary} onclick={approve} disabled={scope.digests.is_empty()}>
                         { "Review and approve…" }
                     </Button>
-                    <Button kind={Kind::Danger} onclick={reject}>{ "Reject…" }</Button>
+                    if rejectable {
+                        <Button kind={Kind::Danger} onclick={reject}>{ "Reject…" }</Button>
+                    }
                     <span class="muted small">{ format!("Binds {} for {}. A host whose plan changes after approval asks again.",
                         count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</span>
                 } else {
@@ -514,9 +520,10 @@ fn dialog(
             }
         }
         Ask::Reject => html! {
-            <Confirm title={format!("Reject rollout #{id}")} confirm_label="Reject and abort" danger=true note=true
+            <Confirm title={format!("Reject rollout #{id}")} confirm_label="Reject rollout" danger=true note_required=true
+                note_placeholder="What is wrong with these plans"
                 type_to_confirm={AttrValue::from(format!("#{id}"))} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
-                <p>{ "Rejecting aborts the rollout where it stands. Hosts already updated keep the new revision until a later rollout or a rollback changes them." }</p>
+                <p>{ "Rejecting ends the rollout here: nothing in the waiting phase is applied, and the rollout is recorded as aborted with your reason. Hosts updated in earlier phases keep the new revision until a later rollout or a rollback changes them." }</p>
             </Confirm>
         },
         Ask::Action(action) => {

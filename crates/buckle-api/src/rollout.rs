@@ -163,6 +163,14 @@ pub struct ApproveRequest {
     pub note: String,
 }
 
+/// `POST /api/v1/rollouts/{id}/reject`: turns a rollout down while it waits
+/// for approval. It ends aborted, with the reason in the audit log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectRequest {
+    /// Why; required, and recorded with the `rollout.reject` audit entry.
+    pub reason: String,
+}
+
 /// `POST /api/v1/rollouts/{id}/hosts/{host}/continue`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinueRequest {
