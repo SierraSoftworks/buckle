@@ -97,6 +97,9 @@ struct FileSpec {
     /// Plan (and apply) deleting the path instead of writing it.
     #[serde(default)]
     delete: bool,
+    /// Plan a change but find nothing to do at apply time.
+    #[serde(default)]
+    unchanged: bool,
 }
 
 async fn plan_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Planned> {
@@ -150,6 +153,12 @@ async fn apply_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Applied> {
             format!("transient failure #{attempt} writing {}", spec.path),
             &["Try again."],
         ));
+    }
+    if spec.unchanged {
+        return Ok(Applied::unchanged(format!(
+            "{} was already right",
+            spec.path
+        )));
     }
     if spec.delete {
         cx.system.remove(Path::new(&spec.path), false).await?;
@@ -1537,6 +1546,134 @@ async fn handlers_dedupe_order_and_subsume_and_may_belong_to_other_modules() {
         "{:?}",
         state.resources.keys()
     );
+}
+
+fn handler_calls(run: &str) -> Vec<String> {
+    calls(run)
+        .into_iter()
+        .filter(|c| c.starts_with("handler") || c.starts_with("apply:end"))
+        .collect()
+}
+
+#[tokio::test]
+async fn handlers_run_only_when_a_notifying_step_really_changed() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /hc/a, run: hand3, unchanged: true }\n    notify: [restart]\nhandlers:\n  restart: { systemd.restart: { name: m, run: hand3 } }\n",
+        )],
+    );
+    let (outcome, events) = apply(&inputs(rev, &FakeSystem::new())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert!(handler_calls("hand3").is_empty(), "{:?}", calls("hand3"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::HandlerRun { .. }))
+    );
+}
+
+#[tokio::test]
+async fn handlers_dedupe_by_kind_and_target_across_declarations() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: nomad\ntasks:\n  - test.file: { path: /hd/a, run: hand4 }\n    notify: [restart, docker:restart-nomad]\nhandlers:\n  restart: { systemd.restart: { name: nomad, run: hand4 } }\n",
+            ),
+            module(
+                "name: docker\nhandlers:\n  restart-nomad: { systemd.restart: { name: nomad, run: hand4 } }\n",
+            ),
+        ],
+    );
+    let (outcome, _) = apply(&inputs(rev, &FakeSystem::new())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    let restarts: Vec<String> = calls("hand4")
+        .into_iter()
+        .filter(|c| c.starts_with("handler"))
+        .collect();
+    assert_eq!(restarts, vec!["handler nomad:systemd.restart nomad"]);
+}
+
+#[tokio::test]
+async fn a_handler_of_a_later_module_runs_once_at_the_end_of_that_module() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: common\ntasks:\n  - test.file: { path: /hl/common, run: hand5 }\n    notify: [nomad:restart]\n",
+            ),
+            module(
+                "name: nomad\nneeds: [common]\ntasks:\n  - test.file: { path: /hl/nomad, run: hand5 }\n    notify: [restart]\nhandlers:\n  restart: { systemd.restart: { name: nomad, run: hand5 } }\n",
+            ),
+        ],
+    );
+    let inputs = inputs(rev, &FakeSystem::new());
+    let plan = plan(&inputs).await;
+    let common = plan.modules.iter().find(|m| m.module == "common").unwrap();
+    let nomad = plan.modules.iter().find(|m| m.module == "nomad").unwrap();
+    assert!(common.handlers.is_empty(), "{:#?}", common.handlers);
+    assert_eq!(nomad.handlers.len(), 1, "{:#?}", nomad.handlers);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(
+        handler_calls("hand5"),
+        vec![
+            "apply:end common//hl/common",
+            "apply:end nomad//hl/nomad",
+            "handler nomad:systemd.restart nomad",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn removing_a_task_runs_the_handlers_it_notified() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let handlers = "handlers:\n  restart: { systemd.restart: { name: svc, run: hand6 } }\n";
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(&format!(
+            "name: m\ntasks:\n  - test.file: {{ path: /hr/conf, run: hand6 }}\n    notify: [restart]\n{handlers}"
+        ))],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .notifies_of(&ResourceKey::new("m", "test.file", "/hr/conf")),
+        &["m:restart".to_string()]
+    );
+    let before = calls("hand6")
+        .iter()
+        .filter(|c| c.starts_with("handler"))
+        .count();
+
+    let r2 = revision("r2", FLEET, vec![module(&format!("name: m\n{handlers}"))]);
+    let (outcome, events) = apply(&inputs_with_store(r2, &sys, store.clone())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(outcome.removals, 1);
+    assert!(!sys.exists("/hr/conf"));
+    assert_eq!(
+        calls("hand6")
+            .iter()
+            .filter(|c| c.starts_with("handler"))
+            .count(),
+        before + 1,
+        "the removal ran the handler its task notified"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::HandlerRun { handler, .. } if handler == "restart"))
+    );
+    assert!(store.load().unwrap().notifies.is_empty());
 }
 
 #[tokio::test]

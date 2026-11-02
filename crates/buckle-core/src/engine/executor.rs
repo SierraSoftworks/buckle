@@ -82,6 +82,11 @@ struct Executor<'a> {
     changed_so_far: AtomicUsize,
     /// The facts as refreshed so far in this run.
     facts: Mutex<Facts>,
+    /// Modules of this run that have not started yet.
+    scheduled: Mutex<HashSet<String>>,
+    /// Cross-module handlers waiting for their owner module to finish:
+    /// owner → `(owner, handler)` pairs.
+    pending_handlers: Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
 /// `Engine::apply`.
@@ -117,6 +122,8 @@ pub(super) async fn apply(
         redactor: Redactor::new(&inputs.secrets),
         changed_so_far: AtomicUsize::new(0),
         facts: Mutex::new(facts),
+        scheduled: Mutex::new(rich.order.iter().cloned().collect()),
+        pending_handlers: Mutex::new(HashMap::new()),
     };
     let outcome = executor.run(&planner, rich, started, started_at).await?;
     Ok(outcome)
@@ -208,6 +215,19 @@ impl<'a> Executor<'a> {
     ) {
         let now = self.inputs.system.now();
         self.with_state(|state| {
+            let notifies: Vec<String> = step
+                .notifies
+                .iter()
+                .map(|n| {
+                    let (m, h) = super::planner::qualify_handler(&step.task.module, n);
+                    format!("{m}:{h}")
+                })
+                .collect();
+            if notifies.is_empty() {
+                state.notifies.remove(&step.resource.to_string());
+            } else {
+                state.notifies.insert(step.resource.to_string(), notifies);
+            }
             let existing = state.get(&step.resource).cloned();
             state.record(ResourceRecord {
                 key: step.resource.clone(),
@@ -303,6 +323,46 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Whether `owner` is a module of this run that has not started and needs
+    /// `notifier` (so it certainly runs after it).
+    fn runs_later(&self, planner: &Planner<'_>, owner: &str, notifier: &str) -> bool {
+        self.scheduled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(owner)
+            && super::planner::ancestors(planner.revision, owner).contains(notifier)
+    }
+
+    fn take_pending(&self, owner: &str) -> Vec<(String, String)> {
+        self.pending_handlers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(owner)
+            .unwrap_or_default()
+    }
+
+    /// Plans (deduplicated and ordered) and runs the notified handlers.
+    async fn run_notified(
+        &self,
+        planner: &Planner<'_>,
+        module: &str,
+        ctx: Option<&Arc<crate::selectors::HostContext>>,
+        notified: &[(String, String)],
+        contexts: &Contexts,
+    ) -> Result<(), String> {
+        if notified.is_empty() {
+            return Ok(());
+        }
+        let (runs, handlers) = planner
+            .plan_notified(module, ctx, notified, contexts)
+            .await
+            .map_err(|e| format!("planning handlers failed: {}", self.scrub(&e.message())))?;
+        for (run, rh) in runs.iter().zip(handlers.iter()) {
+            self.run_handler(module, run, rh).await?;
+        }
+        Ok(())
+    }
+
     /// Runs one handler (when its plan is a change) and emits the event.
     async fn run_handler(
         &self,
@@ -384,7 +444,8 @@ impl<'a> Executor<'a> {
         .await;
         let mut changes = 0usize;
         let mut health = Vec::new();
-        let mut late_changes: Vec<Step> = Vec::new();
+        // Steps whose apply really changed something: only they notify.
+        let mut changed_steps: Vec<Step> = Vec::new();
         let mut blocked: Vec<String> = Vec::new();
 
         let finish = |status: ModuleStatus,
@@ -483,11 +544,8 @@ impl<'a> Executor<'a> {
                         Ok(applied) => {
                             if applied.changed {
                                 changes += 1;
-                                if replanned.is_some() && !step.notifies.is_empty() {
-                                    late_changes.push(Step {
-                                        planned: planned.clone(),
-                                        ..step.clone()
-                                    });
+                                if !step.notifies.is_empty() {
+                                    changed_steps.push(step.clone());
                                 }
                             }
                         }
@@ -510,65 +568,43 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Handlers: the planned ones, then those notified only by steps that
-        // were blocked at plan time and changed once planned again.
-        let mut extra: Vec<(HandlerRun, RichHandler)> = Vec::new();
-        if !late_changes.is_empty() {
-            match planner
-                .plan_handlers(&module, &rich.ctx, &late_changes, contexts)
-                .await
-            {
-                Ok((runs, handlers)) => {
-                    extra = runs
-                        .into_iter()
-                        .zip(handlers)
-                        .filter(|(r, _)| {
-                            !rich
-                                .plan
-                                .handlers
-                                .iter()
-                                .any(|h| h.module == r.module && h.handler == r.handler)
-                        })
-                        .collect();
-                }
-                Err(err) => {
-                    let message = self.scrub(&err.message());
-                    self.emit(ApplyEvent::ModuleFinished {
-                        module: module.clone(),
-                        status: ModuleStatus::Failed,
-                    })
-                    .await;
-                    return finish(
-                        ModuleStatus::Failed,
-                        Some(format!("planning handlers failed: {message}")),
-                        changes,
-                        health,
-                        blocked,
-                    );
-                }
+        // Handlers notified by the steps that really changed, plus those other
+        // modules left for this one; a handler of a module that runs later in
+        // this apply (it needs this one) waits for the end of that module.
+        let mut local: Vec<(String, String)> = Vec::new();
+        for (owner, handler) in super::planner::notifications(&module, changed_steps.iter()) {
+            if owner != module && self.runs_later(planner, &owner, &module) {
+                self.pending_handlers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .entry(owner.clone())
+                    .or_default()
+                    .push((owner, handler));
+            } else if !local.contains(&(owner.clone(), handler.clone())) {
+                local.push((owner, handler));
             }
         }
-        let handlers = rich
-            .plan
-            .handlers
-            .iter()
-            .zip(rich.handlers.iter())
-            .chain(extra.iter().map(|(r, h)| (r, h)));
-        for (run, rh) in handlers {
-            if let Err(message) = self.run_handler(&module, run, rh).await {
-                self.emit(ApplyEvent::ModuleFinished {
-                    module: module.clone(),
-                    status: ModuleStatus::Failed,
-                })
-                .await;
-                return finish(
-                    ModuleStatus::Failed,
-                    Some(message),
-                    changes,
-                    health,
-                    blocked,
-                );
+        for n in self.take_pending(&module) {
+            if !local.contains(&n) {
+                local.push(n);
             }
+        }
+        if let Err(message) = self
+            .run_notified(planner, &module, Some(&rich.ctx), &local, contexts)
+            .await
+        {
+            self.emit(ApplyEvent::ModuleFinished {
+                module: module.clone(),
+                status: ModuleStatus::Failed,
+            })
+            .await;
+            return finish(
+                ModuleStatus::Failed,
+                Some(message),
+                changes,
+                health,
+                blocked,
+            );
         }
 
         let mut status = if !blocked.is_empty() {
@@ -771,21 +807,22 @@ impl<'a> Executor<'a> {
     ) -> (usize, Vec<String>) {
         let mut removed = 0usize;
         let mut errors = Vec::new();
+        let mut notified: Vec<(String, String)> = Vec::new();
         for (removal, rr) in removals.iter().zip(rich) {
             let span = tracing::info_span!("removal.run", buckle.resource = %removal.resource, buckle.policy = ?removal.policy);
-            let outcome: Result<String, String> = async {
+            let outcome: Result<(String, bool), String> = async {
                 match (removal.policy, rr.task) {
-                    (RemovalPolicy::Leave, _) => Ok("released: left in place (policy leave)".to_owned()),
-                    (RemovalPolicy::Cleanup, None) => Ok(format!(
+                    (RemovalPolicy::Leave, _) => Ok(("released: left in place (policy leave)".to_owned(), false)),
+                    (RemovalPolicy::Cleanup, None) => Ok((format!(
                         "forgotten: the task kind '{}' is no longer available, nothing was cleaned up",
                         removal.resource.kind
-                    )),
+                    ), false)),
                     (RemovalPolicy::Cleanup, Some(task)) => {
                         let cx = planner.removal_cx(contexts, &rr.record);
                         let _guards = self.locks.acquire(&task.locks().iter().map(|l| l.to_string()).collect::<Vec<_>>()).await;
                         task.remove(&cx, &rr.record)
                             .await
-                            .map(|a| self.scrub(&a.summary))
+                            .map(|a| (self.scrub(&a.summary), a.changed))
                             .map_err(|e| self.scrub(&e.message()))
                     }
                 }
@@ -793,10 +830,26 @@ impl<'a> Executor<'a> {
             .instrument(span)
             .await;
             match outcome {
-                Ok(summary) => {
-                    self.with_state(|s| {
+                Ok((summary, changed)) => {
+                    let notes = self.with_state(|s| {
+                        let notes = s.notifies_of(&removal.resource).to_vec();
                         s.forget(&removal.resource);
+                        notes
                     });
+                    if changed {
+                        for note in notes {
+                            let (m, h) =
+                                super::planner::qualify_handler(&removal.resource.module, &note);
+                            // Handlers of a module that left the revision are gone.
+                            let exists = planner
+                                .revision
+                                .module(&m)
+                                .is_some_and(|owner| owner.config.handlers.contains_key(&h));
+                            if exists && !notified.contains(&(m.clone(), h.clone())) {
+                                notified.push((m, h));
+                            }
+                        }
+                    }
                     removed += 1;
                     self.emit(ApplyEvent::RemovalRun {
                         resource: removal.resource.to_string(),
@@ -813,6 +866,13 @@ impl<'a> Executor<'a> {
                     .await;
                 }
             }
+        }
+        // The handlers the removed tasks notified run once, after the removals.
+        if let Err(message) = self
+            .run_notified(planner, "removals", None, &notified, contexts)
+            .await
+        {
+            errors.push(message);
         }
         (removed, errors)
     }
@@ -973,6 +1033,10 @@ impl<'a> Executor<'a> {
                         continue;
                     };
                     started_modules.insert(name.clone());
+                    self.scheduled
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(name);
                     let rev = revision.clone();
                     let contexts = Arc::new(planner.contexts(&self.facts()));
                     let span = tracing::info_span!("module.apply", buckle.module = %name);
@@ -1050,6 +1114,38 @@ impl<'a> Executor<'a> {
             }
             if let Err(e) = self.save_state() {
                 errors.push(format!("state could not be saved: {}", e.message()));
+            }
+        }
+
+        // Handlers left for modules that never ran (the run halted, or they
+        // turned out unselected) still run: the changes that notified them
+        // were made.
+        let leftovers: Vec<(String, Vec<(String, String)>)> = {
+            let mut map = std::mem::take(
+                &mut *self
+                    .pending_handlers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
+            let mut owners: Vec<String> = map.keys().cloned().collect();
+            owners.sort();
+            owners
+                .into_iter()
+                .map(|o| {
+                    let notes = map.remove(&o).unwrap_or_default();
+                    (o, notes)
+                })
+                .collect()
+        };
+        if !leftovers.is_empty() {
+            let contexts = planner.contexts(&self.facts());
+            for (owner, notes) in leftovers {
+                if let Err(message) = self
+                    .run_notified(planner, &owner, None, &notes, &contexts)
+                    .await
+                {
+                    errors.push(message);
+                }
             }
         }
 

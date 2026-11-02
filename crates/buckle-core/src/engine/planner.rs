@@ -156,8 +156,6 @@ pub(super) struct RichModulePlan {
     pub plan: ModulePlan,
     /// Parallel to `plan.steps`.
     pub steps: Vec<RichStep>,
-    /// Parallel to `plan.handlers`.
-    pub handlers: Vec<RichHandler>,
     pub ctx: Arc<HostContext>,
     pub source: Arc<dyn Source>,
     /// Resources of tasks not planned (excluded by `--select`, or with an
@@ -738,7 +736,7 @@ impl<'a> Planner<'a> {
                 retry: pt.decl.retry.clone(),
             });
         }
-        let (handler_runs, handlers) = self
+        let (handler_runs, _) = self
             .plan_handlers(&module, &prepared.ctx, &steps, contexts)
             .await?;
         Ok(RichModulePlan {
@@ -750,7 +748,6 @@ impl<'a> Planner<'a> {
                 provides_facts: prepared.provides,
             },
             steps: rich,
-            handlers,
             ctx: prepared.ctx,
             source: prepared.source,
             unselected,
@@ -768,18 +765,25 @@ impl<'a> Planner<'a> {
         steps: &[Step],
         contexts: &Contexts,
     ) -> crate::Result<(Vec<HandlerRun>, Vec<RichHandler>)> {
-        let mut notified: Vec<(String, String)> = Vec::new();
-        for step in steps.iter().filter(|s| s.planned.is_change()) {
-            for notify in &step.notifies {
-                let target = match notify.split_once(':') {
-                    Some((m, h)) => (m.to_owned(), h.to_owned()),
-                    None => (module.to_owned(), notify.clone()),
-                };
-                if !notified.contains(&target) {
-                    notified.push(target);
-                }
-            }
-        }
+        let changing: Vec<&Step> = steps.iter().filter(|s| s.planned.is_change()).collect();
+        let notified = notifications(module, changing.into_iter());
+        self.plan_notified(module, Some(module_ctx), &notified, contexts)
+            .await
+    }
+
+    /// Renders, plans, deduplicates (by kind and target, design §04) and
+    /// orders the handlers in `notified` (`(owner module, handler)` pairs).
+    /// `notifier` names the module (or phase) asking, for messages; handlers
+    /// it owns use `notifier_ctx` when given.
+    pub async fn plan_notified(
+        &self,
+        notifier: &str,
+        notifier_ctx: Option<&Arc<HostContext>>,
+        notified: &[(String, String)],
+        contexts: &Contexts,
+    ) -> crate::Result<(Vec<HandlerRun>, Vec<RichHandler>)> {
+        let module = notifier;
+        let notified: Vec<(String, String)> = notified.to_vec();
         if notified.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -788,6 +792,7 @@ impl<'a> Planner<'a> {
             run: HandlerRun,
             rich: RichHandler,
             unit: Option<String>,
+            target: String,
             index: usize,
         }
         let mut entries: Vec<Entry> = Vec::new();
@@ -804,10 +809,9 @@ impl<'a> Planner<'a> {
                     &["Declare the handler under `handlers:` in the owning module."],
                 )
             })?;
-            let owner_ctx = if owner_name == module {
-                module_ctx.clone()
-            } else {
-                self.module_context(contexts, &owner.config)?
+            let owner_ctx = match notifier_ctx {
+                Some(ctx) if owner_name == module => ctx.clone(),
+                _ => self.module_context(contexts, &owner.config)?,
             };
             let label = format!("The handler '{handler}' of module '{owner_name}'");
             let task = super::validate::kind_of(decl).map_err(|e| {
@@ -858,7 +862,17 @@ impl<'a> Planner<'a> {
                 Planned::NoOp => format!("{} (no change)", task.describe(&spec)),
                 Planned::Blocked { reason } => format!("blocked: {reason}"),
             };
+            let target = task.key(&spec);
+            if entries
+                .iter()
+                .any(|e| e.run.kind == decl.kind && e.target == target)
+            {
+                // Deduplicated by (kind, target): restarting a unit twice at
+                // the end of one module is one restart.
+                continue;
+            }
             entries.push(Entry {
+                target,
                 run: HandlerRun {
                     module: owner_name.clone(),
                     handler: handler.clone(),
@@ -1121,6 +1135,32 @@ fn removal_policy(
     task.or(module).unwrap_or_else(|| kind.removal_default())
 }
 
+/// The handlers (`(owner module, handler)`) the given steps notify, in
+/// notification order without duplicates; a bare name is `module`'s own.
+pub(super) fn notifications<'s>(
+    module: &str,
+    steps: impl Iterator<Item = &'s Step>,
+) -> Vec<(String, String)> {
+    let mut notified: Vec<(String, String)> = Vec::new();
+    for step in steps {
+        for notify in &step.notifies {
+            let target = qualify_handler(module, notify);
+            if !notified.contains(&target) {
+                notified.push(target);
+            }
+        }
+    }
+    notified
+}
+
+/// `module:handler` for a notify entry of `module` (a bare name is its own).
+pub(super) fn qualify_handler(module: &str, notify: &str) -> (String, String) {
+    match notify.split_once(':') {
+        Some((m, h)) => (m.to_owned(), h.to_owned()),
+        None => (module.to_owned(), notify.to_owned()),
+    }
+}
+
 fn handler_priority(kind: &str) -> u8 {
     match kind {
         "systemd.daemon_reload" => 0,
@@ -1374,6 +1414,32 @@ pub(super) async fn plan_with(
             }),
         }
     }
+    // A cross-module handler whose owner runs later (it needs the notifying
+    // module) runs at the end of the owner, once; show it there.
+    let names: Vec<String> = planned.iter().map(|m| m.plan.module.clone()).collect();
+    for i in 0..planned.len() {
+        let notifier = names[i].clone();
+        let (later, here): (Vec<HandlerRun>, Vec<HandlerRun>) =
+            std::mem::take(&mut planned[i].plan.handlers)
+                .into_iter()
+                .partition(|h| {
+                    h.module != notifier
+                        && names.contains(&h.module)
+                        && ancestors(revision, &h.module).contains(&notifier)
+                });
+        planned[i].plan.handlers = here;
+        for h in later {
+            if let Some(owner) = planned.iter_mut().find(|m| m.plan.module == h.module)
+                && !owner
+                    .plan
+                    .handlers
+                    .iter()
+                    .any(|x| x.handler == h.handler && x.module == h.module)
+            {
+                owner.plan.handlers.push(h);
+            }
+        }
+    }
     // Modules whose `when` reads facts a changing provider produces are
     // decided after that provider applies; otherwise they are skipped.
     let mut skipped = selection.skipped;
@@ -1478,7 +1544,7 @@ pub(super) async fn plan_with(
 }
 
 /// Every module `name` needs, directly or transitively.
-fn ancestors(revision: &Revision, name: &str) -> BTreeSet<String> {
+pub(super) fn ancestors(revision: &Revision, name: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut stack = vec![name.to_owned()];
     while let Some(current) = stack.pop() {

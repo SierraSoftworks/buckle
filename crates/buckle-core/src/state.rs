@@ -96,6 +96,10 @@ pub struct State {
     /// on; cleared when the module next applies successfully.
     #[serde(default)]
     pub failed_modules: BTreeMap<String, RevisionId>,
+    /// The handlers (`module:handler`) each resource's task notified, keyed
+    /// like `resources`; a removal runs them (design §04).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub notifies: BTreeMap<String, Vec<String>>,
 }
 
 impl State {
@@ -108,7 +112,16 @@ impl State {
     }
 
     pub fn forget(&mut self, key: &ResourceKey) -> Option<ResourceRecord> {
+        self.notifies.remove(&key.to_string());
         self.resources.remove(&key.to_string())
+    }
+
+    /// The handlers (`module:handler`) the task of `key` notified.
+    pub fn notifies_of(&self, key: &ResourceKey) -> &[String] {
+        self.notifies
+            .get(&key.to_string())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Resources in state that are not in `desired`.
