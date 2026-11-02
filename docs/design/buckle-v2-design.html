@@ -631,29 +631,37 @@ pub enum Diff {
 
 <pre><code class="language-rust"><span class="fname">buckle-core/src/task.rs</span>/// A typed, idempotent operation. Implementations are unit structs registered with `register_task!`.
 pub trait Task: Send + Sync + 'static {
-    /// Deserialised from the YAML under the task's kind key. Must be `JsonSchema`
-    /// so `buckle validate` and editors get a schema for free.
-    type Spec: DeserializeOwned + Serialize + JsonSchema + Send + Sync;
+    /// Deserialised from the YAML under the task's kind key, after the engine has rendered its string
+    /// scalars. Must be `JsonSchema` (it feeds `buckle catalog`, the schema-driven coercion of rendered
+    /// fields and the marking of secret-capable fields); every spec also rejects unknown fields.
+    type Spec: DeserializeOwned + Serialize + JsonSchema + Send + Sync + 'static;
 
     const KIND: &amp;'static str;                       // "file.template"
-    const LOCKS: &amp;'static [&amp;'static str] = &amp;[];      // "apt", "systemd", "dpkg"
-    const REMOVAL_DEFAULT: RemovalPolicy = RemovalPolicy::Cleanup;   // every kind; authors opt out with `removal: leave`
-    const REMOVAL_CAUTION: bool = false;                            // true for apt.package, user.*: plan flags the removal as high impact
+    const LOCKS: &amp;'static [&amp;'static str] = &amp;[];      // "apt", "systemd", "ufw"
     const PLATFORMS: Platforms = Platforms::ALL;    // Linux | MacOs | Windows bitset
+    const REMOVAL_DEFAULT: RemovalPolicy = RemovalPolicy::Cleanup;   // Leave for the handler-style kinds; authors opt out with `removal: leave`
+    const REMOVAL_CAUTION: bool = false;            // true for apt.package, user.*: plan flags the removal as high impact
+    const DESCRIPTION: &amp;'static str = "";           // one line, shown by `buckle catalog`
 
     /// Stable identity for state tracking and removal: "/etc/nomad.d/nomad.hcl", "nomad", "net.ipv4.ip_forward".
     fn key(spec: &amp;Self::Spec) -> String;
+    /// A human summary of the desired state, for plans.
+    fn describe(spec: &amp;Self::Spec) -> String { Self::key(spec) }
+    /// The locks this spec needs; by default `LOCKS`.
+    fn locks(spec: &amp;Self::Spec) -> Vec&lt;String&gt;;
+    /// True for a task with no idempotency guard (command.run without creates, unless or changed_when).
+    fn always_runs(spec: &amp;Self::Spec) -> bool { false }
 
-    /// Inspect the system. Pure: no writes. Returns NoOp, Change(diff) or Blocked(reason).
-    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec) -> Result&lt;Planned, Error&gt;;
+    /// Inspect the system. Pure: no writes (the plan-mode guard enforces it). Returns NoOp, Change(diff) or Blocked(reason).
+    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec) -> Result&lt;Planned&gt;;
 
-    /// Make it so. Only called when `plan` returned Change. Returns the artefacts to record.
-    async fn apply(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec, planned: &amp;Planned) -> Result&lt;Applied, Error&gt;;
+    /// Make it so. Only called when `plan` returned Change. Returns what to record: artefacts, shadow, content digest.
+    async fn apply(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec, planned: &amp;Planned) -> Result&lt;Applied&gt;;
 
-    /// Undo a previously applied resource. Default: nothing to do.
-    async fn remove(&amp;self, cx: &amp;Cx, record: &amp;ResourceRecord) -> Result&lt;Applied, Error&gt; {
-        let _ = (cx, record);
-        Ok(Applied::skipped("this task kind does not support removal"))
+    /// What `remove` would do for a recorded resource (shown as a plan warning), and doing it.
+    fn describe_removal(&amp;self, record: &amp;ResourceRecord) -> String;
+    async fn remove(&amp;self, cx: &amp;Cx, record: &amp;ResourceRecord) -> Result&lt;Applied&gt; {
+        Ok(Applied::skipped("this task kind does not define a cleanup"))
     }
 }
 
@@ -662,11 +670,20 @@ pub trait Task: Send + Sync + 'static {
 pub trait DynTask: Send + Sync {
     fn kind(&amp;self) -> &amp;'static str;
     fn locks(&amp;self) -> &amp;'static [&amp;'static str];
+    fn platforms(&amp;self) -> Platforms;
+    fn removal_default(&amp;self) -> RemovalPolicy;
+    fn removal_caution(&amp;self) -> bool;
+    fn description(&amp;self) -> &amp;'static str;
     fn schema(&amp;self) -> schemars::Schema;
-    fn parse(&amp;self, raw: serde_yaml::Value, tpl: &amp;Templater) -> Result&lt;Box&lt;dyn ErasedSpec&gt;, Error&gt;;
-    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;dyn ErasedSpec) -> Result&lt;Planned, Error&gt;;
-    async fn apply(&amp;self, cx: &amp;Cx, spec: &amp;dyn ErasedSpec, planned: &amp;Planned) -> Result&lt;Applied, Error&gt;;
-    async fn remove(&amp;self, cx: &amp;Cx, record: &amp;ResourceRecord) -> Result&lt;Applied, Error&gt;;
+    fn parse(&amp;self, raw: serde_json::Value) -> Result&lt;ErasedSpec&gt;;   // errors name the kind and the field
+    fn key(&amp;self, spec: &amp;ErasedSpec) -> String;
+    fn describe(&amp;self, spec: &amp;ErasedSpec) -> String;
+    fn locks_for(&amp;self, spec: &amp;ErasedSpec) -> Vec&lt;String&gt;;
+    fn always_runs(&amp;self, spec: &amp;ErasedSpec) -> bool;
+    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;ErasedSpec) -> Result&lt;Planned&gt;;
+    async fn apply(&amp;self, cx: &amp;Cx, spec: &amp;ErasedSpec, planned: &amp;Planned) -> Result&lt;Applied&gt;;
+    fn describe_removal(&amp;self, record: &amp;ResourceRecord) -> String;
+    async fn remove(&amp;self, cx: &amp;Cx, record: &amp;ResourceRecord) -> Result&lt;Applied&gt;;
 }
 
 pub struct TaskRegistration(&amp;'static dyn DynTask);
@@ -690,15 +707,17 @@ pub fn registry() -> &amp;'static HashMap&lt;&amp;'static str, &amp;'static dyn 
 }
 </code></pre>
 
-<pre><code class="language-rust"><span class="fname">buckle-std/src/tasks/systemd/unit.rs  (registration site)</span>pub struct SystemdUnit;
+<pre><code class="language-rust"><span class="fname">buckle-std/src/tasks/systemd_unit.rs  (registration site, condensed)</span>pub struct SystemdUnit;
 buckle_core::register_task!(SystemdUnit);
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
     #[serde(default)] pub enabled: Option&lt;bool&gt;,
     #[serde(default)] pub active: Option&lt;bool&gt;,
     #[serde(default)] pub masked: Option&lt;bool&gt;,
+    #[serde(default)] pub daemon_reload: bool,
 }
 
 impl Task for SystemdUnit {
@@ -710,73 +729,103 @@ impl Task for SystemdUnit {
     fn key(spec: &amp;Spec) -> String { spec.name.clone() }
 
     #[instrument(name = "task.systemd.unit.plan", skip_all, fields(unit = %spec.name))]
-    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;Spec) -> Result&lt;Planned, Error&gt; {
-        let state = cx.sys().systemctl_show(&amp;spec.name).await?;      // via the mockable System trait
-        let mut changes = vec![];
-        if let Some(enabled) = spec.enabled &amp;&amp; state.enabled != enabled { changes.push(format!("enabled: {} → {enabled}", state.enabled)); }
-        if let Some(active) = spec.active &amp;&amp; state.active != active   { changes.push(format!("active: {} → {active}", state.active)); }
-        Ok(if changes.is_empty() { Planned::NoOp } else { Planned::change(Diff::Opaque { summary: changes.join(", ") }) })
+    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;Spec) -> Result&lt;Planned&gt; {
+        // `systemctl show` through the mockable System trait. No systemctl, or systemd not running as PID 1
+        // (a container), is Blocked with the reason, not an error.
+        let status = match show_for_plan(cx, &amp;spec.name).await? { Ok(status) =&gt; status, Err(blocked) =&gt; return Ok(blocked) };
+        match steps(spec, &amp;status) {                      // enable / start / mask / … for the fields the spec sets
+            Err(reason) =&gt; Ok(Planned::blocked(reason)),
+            Ok(steps) if steps.is_empty() =&gt; Ok(Planned::NoOp),
+            Ok(steps) =&gt; Ok(Planned::change(Diff::Opaque { summary: describe(&amp;steps, &amp;status) })),
+        }
     }
-    // apply(), remove() omitted
+    // apply() runs the steps and records Artefact::Unit { enabled, started } for what Buckle itself did; remove() undoes only that
 }
 </code></pre>
 
-<p>The <code>Cx</code> context carries the <code>System</code> trait object (filesystem, processes, package manager probes), the templater, the secret sinks, the facts snapshot and the span. Tests implement <code>System</code> in memory, which is how the v1 <code>Launcher</code>/<code>FileWriter</code> mocks grow up. Fact providers and health checks use the same registration shape:</p>
+<p>The <code>Cx</code> context carries the mode (plan or apply), the <code>System</code> trait object (files, processes, HTTP, users, the clock; in plan mode the write-guarded view), the host context (labels, groups, facts, vars, secret metadata), the templater, the module's <code>files/</code> source, the host's secrets, the waived checks and the resource's previous record from state, so a task knows what Buckle itself installed, enabled or wrote before. Tests implement <code>System</code> in memory, which is how the v1 <code>Launcher</code>/<code>FileWriter</code> mocks grow up. Fact providers and health checks use the same registration shape:</p>
 
 <pre><code class="language-rust"><span class="fname">buckle-core/src/facts.rs · buckle-core/src/health.rs</span>pub trait FactProvider: Send + Sync + 'static {
-    const NAME: &amp;'static str;                    // "os", "tailscale", "cloud.oci"
+    const NAME: &amp;'static str;                    // mount point under host.facts: "os", "tailscale", "cloud" (dots nest; mounts may not overlap)
     const TTL: Duration = Duration::from_secs(300);
     const PLATFORMS: Platforms = Platforms::ALL;
-    /// Returns a JSON tree mounted at host.facts.&lt;NAME&gt;. Failure yields Null, never aborts a run.
-    async fn collect(&amp;self, cx: &amp;Cx) -> Result&lt;serde_json::Value, Error&gt;;
+    const DESCRIPTION: &amp;'static str = "";
+    /// Returns a JSON tree mounted at host.facts.&lt;NAME&gt;. An error keeps the last good value and marks the
+    /// provider stale, never aborting a run; a provider that has never succeeded is "unavailable", which makes
+    /// the selectors that read it uncertain (section 04).
+    async fn collect(&amp;self, cx: &amp;Cx) -> Result&lt;serde_json::Value&gt;;
 }
 buckle_core::register_facts!(TailscaleFacts);
 
 pub trait HealthCheck: Send + Sync + 'static {
-    type Spec: DeserializeOwned + JsonSchema + Send + Sync;
-    const KIND: &amp;'static str;                    // "http", "tcp", "systemd", "command", "filter"
-    async fn check(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec) -> HealthResult;   // Pass | Fail { reason } | Unknown
+    type Spec: DeserializeOwned + Serialize + JsonSchema + Send + Sync + 'static;
+    const KIND: &amp;'static str;                    // "http", "tcp", "systemd", "command", "filter", "file"
+    const PLATFORMS: Platforms = Platforms::ALL;
+    const DESCRIPTION: &amp;'static str = "";
+    async fn check(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec) -> HealthStatus;   // Pass | Fail { reason } | Unknown { reason }
 }
 buckle_core::register_health!(HttpCheck);
 </code></pre>
 
 <h3>Standard library: tasks</h3>
-<p>Derived from the 211 module invocations in infra-ansible. Everything the live roles use maps onto one of these; Ansible names are shown for orientation.</p>
+<p>Thirty kinds, derived from the 211 module invocations in infra-ansible: everything the live roles use maps onto one of these, and Ansible names are shown for orientation. <code>buckle catalog</code> prints the same list from the binary (<code>--json</code> adds each kind's JSON schema) and <code>GET /api/v1/catalog</code> serves it to the UI. Every kind accepts the common keys <code>id</code>, <code>name</code>, <code>when</code>, <code>notify</code>, <code>tags</code>, <code>removal</code> and <code>retry</code> (<code>{ limit, delay }</code>) beside its own fields, and <strong>every spec rejects unknown fields</strong>, so a misspelt key is an error naming the kind and the field. <code>mode</code>, <code>owner</code> and <code>group</code> sit directly in the spec of the kinds that write files (mode as an octal string such as <code>"0644"</code>; a field left out is not changed). Defaults are in parentheses; a field with none is optional and unset, or required for the kinds that list it first.</p>
+<p>A task whose tool is missing at plan time (<code>apt-get</code>, <code>systemctl</code> as PID 1, <code>docker</code>, <code>hostnamectl</code> and <code>hostname</code>, an explicit <code>validate</code> program) plans as <em>Blocked</em> with the reason rather than failing, so a plan can be read on a minimal image; blocked steps are planned again at apply once earlier steps have changed something (section <a href="#engine">04</a>). The automatic <code>visudo</code> and <code>sshd</code> validators are skipped when those programs are not installed; an explicit validator is required.</p>
 <div class="scroll"><table>
-<thead><tr><th>Kind</th><th>Replaces</th><th>Notes</th></tr></thead>
+<thead><tr><th>Kind</th><th>Replaces</th><th>Platforms · locks · removal</th><th>Spec fields</th><th>Behaviour</th></tr></thead>
 <tbody>
-<tr><td><code>file.copy</code>, <code>file.template</code></td><td>copy, template</td><td>owner/group/mode, <code>validate</code> command with <code>{path}</code>, backup-on-change option; template renders are secret-aware</td></tr>
-<tr><td><code>file.directory</code>, <code>file.absent</code>, <code>file.symlink</code></td><td>file</td><td>recursive mode, idempotent removal</td></tr>
-<tr><td><code>file.line</code>, <code>file.block</code></td><td>lineinfile, blockinfile</td><td><code>regex</code> replace-or-append, <code>absent</code>, <code>insert_after</code>, marker blocks; removal reverts the edit</td></tr>
-<tr><td><code>file.download</code></td><td>get_url</td><td><code>checksum</code> (sha256 or URL to .sha256), <code>etag</code> cache, atomic write</td></tr>
-<tr><td><code>archive.extract</code></td><td>unarchive</td><td>tar.gz/zip, from URL or path, <code>include</code> filter, strip components</td></tr>
-<tr><td><code>github.release</code></td><td>uri + set_fact + get_url + command probes</td><td>Resolves <code>latest</code> through the API (with optional token), maps arch via a per-task table, compares an installed-version probe, downloads with checksum, installs to a path. One task replaces 6 to 8 Ansible tasks per binary</td></tr>
-<tr><td><code>apt.repository</code>, <code>apt.package</code>, <code>apt.update</code></td><td>deb822_repository, get_url (keys), apt, package</td><td>deb822 sources with keyring download, package present/absent/version/latest, <code>.deb</code> from URL; shared <code>apt</code> lock</td></tr>
-<tr><td><code>systemd.unit</code>, <code>systemd.dropin</code>, <code>systemd.daemon_reload</code>, <code>systemd.restart</code>, <code>systemd.reload</code></td><td>systemd, service</td><td>handlers are just tasks; dropin writes <code>*.service.d/*.conf</code> and implies daemon-reload</td></tr>
-<tr><td><code>user.account</code>, <code>user.group</code>, <code>ssh.authorized_key</code></td><td>user, group, authorized_key</td><td>password hashes are <code>Secret</code>; groups append; <code>system</code> users</td></tr>
-<tr><td><code>sysctl.param</code></td><td>sysctl</td><td>writes <code>/etc/sysctl.d/90-buckle-&lt;module&gt;.conf</code> and applies live</td></tr>
-<tr><td><code>ufw.default</code>, <code>ufw.rule</code>, <code>ufw.state</code></td><td>ufw</td><td>rules keyed by (direction, proto, port, from, to, interface); removal deletes the rule</td></tr>
-<tr><td><code>hostname.set</code>, <code>swap.file</code>, <code>cron.job</code></td><td>hostname, dd+mkswap+fstab, cron</td><td><code>swap.file</code> owns the file, fstab line and <code>swapon</code> as one resource</td></tr>
-<tr><td><code>command.run</code></td><td>command</td><td><code>creates</code> / <code>unless</code> / <code>changed_when</code> / <code>remove</code>; env from vars and secrets through the process sink; stdout/stderr captured to the span</td></tr>
-<tr><td><code>docker.image</code></td><td>command docker pull</td><td>pull with digest comparison; needed for the eBPF profiler unit</td></tr>
+<tr><th colspan="5">Files, downloads and archives</th></tr>
+<tr><td><code>file.copy</code></td><td>copy</td><td>all · no lock · cleanup</td><td><code>src</code>, <code>dest</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>backup</code> (<code>false</code>), <code>validate</code></td><td>Atomic write; unified diff for text, a digest change for binary files. <code>src</code> is relative to the module's <code>files/</code>. <code>validate</code> is an argv containing <code>{path}</code>, run against a private copy under <code>&lt;state_dir&gt;/tmp</code> before the file is replaced (a failure leaves the destination untouched); without it, <code>/etc/sudoers</code>, <code>/etc/sudoers.d/*</code> and files named <code>sshd_config</code> are checked with <code>visudo -cf</code> and <code>sshd -t -f</code> when those tools are installed, and <code>validate: []</code> turns that off. Removal deletes <code>dest</code> only while its content still matches what Buckle wrote.</td></tr>
+<tr><td><code>file.template</code></td><td>template</td><td>all · no lock · cleanup</td><td><code>src</code>, <code>dest</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>validate</code>, <code>backup</code> (<code>false</code>)</td><td>Secret-aware double render (section <a href="#secrets">06</a>). A new file whose render touched a secret and that has no <code>mode</code> is created 0600; the validator's output is withheld when the file contains secrets. Same <code>validate</code> rules as <code>file.copy</code>. Removal deletes <code>dest</code> only while its content still matches.</td></tr>
+<tr><td><code>file.directory</code></td><td>file</td><td>all · no lock · cleanup</td><td><code>path</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>recurse</code> (<code>false</code>)</td><td>Creates missing parents. <code>recurse</code> applies the permissions to existing contents and affects permissions only, never removal (the mode applies to files too, so prefer <code>owner</code> and <code>group</code>). Removal deletes the directory only if Buckle created it and it is empty; a pre-existing directory whose permissions Buckle adjusted is recorded as <em>adopted</em> and never deleted.</td></tr>
+<tr><td><code>file.absent</code></td><td>file (state: absent)</td><td>all · no lock · cleanup</td><td><code>path</code>, <code>recursive</code> (<code>false</code>)</td><td>Idempotent. A symlink is removed as a link; a non-empty directory is blocked unless <code>recursive</code>, and a recursive delete is refused for <code>/</code>, any top-level directory, well-known system directories, paths containing <code>..</code> and empty or whitespace-padded paths. Nothing to undo on removal.</td></tr>
+<tr><td><code>file.symlink</code></td><td>file (state: link)</td><td>unix · no lock · cleanup</td><td><code>path</code>, <code>target</code>, <code>force</code> (<code>false</code>)</td><td>A link pointing elsewhere is replaced; anything else at <code>path</code> blocks unless <code>force</code> (a file or empty directory only). Removal deletes the link if it still points where Buckle pointed it.</td></tr>
+<tr><td><code>file.line</code></td><td>lineinfile</td><td>all · per-path edit lock · cleanup</td><td><code>path</code>, <code>line</code>, <code>regex</code>, <code>state</code> (<code>present</code>), <code>insert_after</code>, <code>insert_before</code>, <code>create</code> (<code>false</code>), <code>backup</code> (<code>false</code>), <code>validate</code></td><td>Replaces the <em>last</em> line matching <code>regex</code>, else appends <code>line</code> unless it is already present; <code>state: absent</code> deletes every match. The resource is keyed by <code>path</code> and <code>regex</code> when a <code>regex</code> is given (else <code>path</code> and <code>line</code>), so changing <code>line</code> updates the same line in place and removal still restores the text from before Buckle's first edit. Removal reverts the edit: an added line is deleted once, a replaced line restored, a file Buckle created deleted if left empty. Sensitive paths (<code>/etc/ssh</code>, <code>/etc/environment</code>, <code>/etc/fstab</code>, sudoers, <code>~/.ssh</code>, shadow files) get zero-context diffs, and the replaced text is kept in a 0600 file under <code>&lt;state_dir&gt;/stash/file.line/</code> instead of in state. Same <code>validate</code> rules as <code>file.copy</code>.</td></tr>
+<tr><td><code>file.block</code></td><td>blockinfile</td><td>all · per-path edit lock · cleanup</td><td><code>path</code>, <code>block</code>, <code>marker</code> (<code># {mark} BUCKLE MANAGED BLOCK</code>), <code>state</code> (<code>present</code>), <code>insert_after</code>, <code>insert_before</code>, <code>create</code> (<code>false</code>), <code>backup</code> (<code>false</code>), <code>validate</code></td><td>The marker lines delimit what Buckle owns, so removal deletes everything between them (and a file Buckle created, if that leaves it empty); two blocks in one file need different markers. <code>insert_after</code> / <code>insert_before</code> take a pattern or <code>EOF</code> / <code>BOF</code> and matter only on first insertion. Same <code>validate</code> rules as <code>file.copy</code>.</td></tr>
+<tr><td><code>file.download</code></td><td>get_url</td><td>all · no lock · cleanup</td><td><code>url</code>, <code>dest</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>checksum</code>, <code>headers</code>, <code>force</code> (<code>false</code>)</td><td><code>checksum</code> is <code>sha256:&lt;hex&gt;</code>, a bare digest or the URL of a <code>.sha256</code> / <code>SHA256SUMS</code> file; the download is verified before anything is written. Without a checksum an existing <code>dest</code> is never re-downloaded unless <code>force</code>. <code>headers</code> values may reference secrets. Removal deletes <code>dest</code> only while it still matches.</td></tr>
+<tr><td><code>archive.extract</code></td><td>unarchive</td><td>all · no lock · cleanup</td><td><code>src</code>, <code>dest</code>, <code>strip_components</code> (<code>0</code>), <code>include</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>creates</code>, <code>force</code> (<code>false</code>)</td><td><code>.tar</code>, <code>.tar.gz</code>/<code>.tgz</code>, <code>.zip</code> from a URL, an absolute host path or a module file; the format is detected from the content. Entries escaping <code>dest</code> and writes beneath a symlink the archive created are rejected; the archive is held in memory (1 GiB cap). Give remote archives a <code>creates</code> path (relative to <code>dest</code>) so plans do not download them. A symlink entry never replaces an existing file, directory or foreign symlink unless <code>force</code> (otherwise the plan is blocked). Removal deletes the extracted files only if every one is still as extracted.</td></tr>
+<tr><td><code>github.release</code></td><td>uri + set_fact + get_url + probes</td><td>all · no lock · cleanup</td><td><code>repo</code>, <code>version</code> (<code>latest</code>), <code>asset</code>, <code>arch_map</code>, <code>dest</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>probe</code>, <code>probe_regex</code>, <code>checksum_asset</code>, <code>token_env</code>, <code>extract</code></td><td><code>asset</code> may use <code>{version}</code>, <code>{tag}</code>, <code>{arch}</code>, <code>{os}</code>; <code>arch_map</code> extends the defaults <code>x86_64: amd64</code>, <code>aarch64: arm64</code>, and an unmapped architecture is <em>blocked</em>, not failed. The plan compares the version <code>probe</code> prints with the wanted release; <code>latest</code> asks the GitHub API on every plan (60 requests an hour without the token named by <code>token_env</code>). Archive assets need <code>extract</code>. One task replaces 6 to 8 Ansible tasks per binary.</td></tr>
+<tr><th colspan="5">Packages, services and kernel</th></tr>
+<tr><td><code>apt.repository</code></td><td>deb822_repository, get_url (keys)</td><td>linux · <code>apt</code> · cleanup</td><td><code>name</code>, <code>uri</code>, <code>uris</code>, <code>suites</code>, <code>components</code> (<code>[main]</code>), <code>signed_by</code>, <code>architectures</code> (all), <code>types</code> (<code>[deb]</code>), <code>enabled</code> (<code>true</code>), <code>auth</code></td><td>Writes <code>/etc/apt/sources.list.d/&lt;name&gt;.sources</code> and downloads the key (<code>signed_by.url</code> armoured, <code>signed_by.keyring_url</code> binary, or <code>signed_by.path</code> for a keyring already on the host). <code>auth</code> (<code>login</code>, <code>password</code>, which may reference secrets) writes <code>/etc/apt/auth.conf.d/&lt;name&gt;.conf</code> mode 0600 for private repositories and never appears in plans. Runs <code>apt-get update</code> once on apply; removal deletes both files (keeping a sources file edited by hand) and updates.</td></tr>
+<tr><td><code>apt.package</code></td><td>apt, package</td><td>linux · <code>apt</code> · cleanup, <em>caution</em></td><td><code>name</code>, <code>names</code>, <code>state</code> (<code>present</code>), <code>version</code>, <code>deb</code>, <code>update_cache</code> (<code>false</code>), <code>install_recommends</code> (<code>true</code>), <code>remove_dependents</code> (<code>false</code>)</td><td><code>state</code> is <code>present</code>, <code>latest</code> or <code>absent</code>; <code>version</code> accepts <code>*</code> wildcards; <code>deb</code> installs a <code>.deb</code> from a URL and needs <code>name</code>. Held packages are blocked, not changed. Removing (by <code>state: absent</code> or on removal) is first simulated with <code>apt-get -s remove</code>; if apt would take other packages along, the task is blocked with the list (and a removal is skipped) unless <code>remove_dependents: true</code>. Removal removes only the packages this resource installed itself.</td></tr>
+<tr><td><code>apt.update</code></td><td>apt (update_cache)</td><td>linux · <code>apt</code> · <em>leave</em></td><td><code>max_age</code> (<code>1h</code>)</td><td>Runs <code>apt-get update</code> when the index is older than <code>max_age</code> (the newest of the lists directory, apt's success stamp and Buckle's own stamp); <code>0s</code> refreshes on every run.</td></tr>
+<tr><td><code>systemd.unit</code></td><td>systemd, service</td><td>linux · <code>systemd</code> · cleanup</td><td><code>name</code>, <code>enabled</code>, <code>active</code>, <code>masked</code>, <code>daemon_reload</code> (<code>false</code>)</td><td>Each of <code>enabled</code>, <code>active</code>, <code>masked</code> is optional and unmanaged when omitted (<code>masked</code> cannot be combined with <code>enabled: true</code> or <code>active: true</code>). A unit whose file an earlier task writes is treated as disabled and inactive. Removal undoes only what Buckle did: stops the unit if Buckle started it, disables it if Buckle enabled it, unmasks it if Buckle masked it.</td></tr>
+<tr><td><code>systemd.dropin</code></td><td>systemd drop-in files</td><td>linux · <code>systemd</code> · cleanup</td><td><code>unit</code>, <code>name</code> (<code>override.conf</code>), <code>content</code>, <code>perms</code> (<code>{mode, owner, group}; 0644</code>)</td><td>Writes <code>/etc/systemd/system/&lt;unit&gt;.d/&lt;name&gt;</code> (<code>content</code> is a template, no secrets) and runs <code>daemon-reload</code>; the unit is not restarted (notify a <code>systemd.restart</code> handler). Removal deletes the drop-in unless it was edited by hand, then reloads.</td></tr>
+<tr><td><code>systemd.daemon_reload</code></td><td>handler</td><td>linux · <code>systemd</code> · <em>leave</em></td><td>no fields</td><td>Always plans a change; the engine runs it once per module, before restarts and reloads.</td></tr>
+<tr><td><code>systemd.restart</code></td><td>handler</td><td>linux · <code>systemd</code> · <em>leave</em></td><td><code>name</code></td><td><code>systemctl restart</code>; a restart subsumes a reload of the same unit in the same module.</td></tr>
+<tr><td><code>systemd.reload</code></td><td>handler</td><td>linux · <code>systemd</code> · <em>leave</em></td><td><code>name</code></td><td><code>systemctl reload-or-restart</code>: the unit re-reads its configuration, or restarts if it cannot reload.</td></tr>
+<tr><td><code>sysctl.param</code></td><td>sysctl</td><td>linux · <code>sysctl</code> · cleanup</td><td><code>name</code>, <code>value</code>, <code>persist</code> (<code>true</code>), <code>file</code> (<code>/etc/sysctl.d/90-buckle-&lt;module&gt;.conf</code>)</td><td><code>value</code> may be a string, number or boolean. Applies live (<code>sysctl -w</code>) and persists; the plan reads the live value from <code>/proc/sys</code>, so planning needs no <code>sysctl</code> binary. Every <code>sysctl.param</code> of a module shares the file. Removal deletes the line (and the file when only comments remain) but cannot restore the live value.</td></tr>
+<tr><td><code>ufw.default</code></td><td>ufw</td><td>linux · <code>ufw</code> · cleanup</td><td><code>direction</code>, <code>policy</code>, <code>allow_lockout</code> (<code>false</code>)</td><td><code>direction</code> is <code>incoming</code>, <code>outgoing</code> or <code>routed</code>; <code>policy</code> is <code>allow</code>, <code>deny</code> or <code>reject</code>. Setting <code>incoming</code> to deny/reject on an active firewall is blocked unless a rule on the host, or a <code>ufw.rule</code> earlier in the same plan, allows or limits incoming SSH or all traffic on a management interface such as <code>tailscale0</code>; <code>allow_lockout: true</code> overrides. Removal restores the policy that was in place before Buckle changed it.</td></tr>
+<tr><td><code>ufw.rule</code></td><td>ufw</td><td>linux · <code>ufw</code> · cleanup</td><td><code>rule</code>, <code>direction</code> (<code>in</code>), <code>to_port</code>, <code>proto</code>, <code>from_ip</code>, <code>to_ip</code>, <code>interface</code>, <code>comment</code></td><td><code>rule</code> is <code>allow</code>, <code>deny</code>, <code>reject</code> or <code>limit</code>. At least one selector is required, so a rule cannot accidentally open everything; a list or range of ports needs <code>proto</code>. Identified by direction, protocol, port, addresses and interface (not action or comment); a rule with the same selectors but another action is replaced. Removal deletes exactly this rule (v4 and v6) and restores any rule it replaced.</td></tr>
+<tr><td><code>ufw.state</code></td><td>ufw</td><td>linux · <code>ufw</code> · cleanup</td><td><code>enabled</code>, <code>logging</code>, <code>allow_lockout</code> (<code>false</code>)</td><td><code>ufw --force enable</code>. Enabling is blocked unless a rule on the host, or a <code>ufw.rule</code> earlier in the same plan, allows or limits incoming SSH (the <code>Port</code>s of sshd_config, default 22/tcp) or all traffic on a management interface; <code>allow_lockout: true</code> overrides. <code>logging</code> is <code>off</code>, <code>on</code>, <code>low</code>, <code>medium</code>, <code>high</code> or <code>full</code>. Removal disables ufw if Buckle enabled it and restores the previous logging level.</td></tr>
+<tr><th colspan="5">Users, host settings and commands</th></tr>
+<tr><td><code>user.group</code></td><td>group</td><td>linux · <code>users</code> · cleanup, <em>caution</em></td><td><code>name</code>, <code>gid</code>, <code>system</code> (<code>false</code>), <code>state</code> (<code>present</code>)</td><td>Removal deletes the group, only if Buckle created it.</td></tr>
+<tr><td><code>user.account</code></td><td>user</td><td>linux · <code>users</code> · cleanup, <em>caution</em></td><td><code>name</code>, <code>uid</code>, <code>group</code>, <code>groups</code>, <code>shell</code>, <code>home</code>, <code>create_home</code> (<code>true; false for system accounts</code>), <code>system</code> (<code>false</code>), <code>password</code>, <code>comment</code>, <code>state</code> (<code>present</code>), <code>remove_home</code> (<code>false</code>)</td><td><code>groups</code> are appended and never removed. <code>password</code> is a pre-hashed crypt value that may reference secrets; it is applied with <code>chpasswd -e</code> over stdin through the secret sink and compared with <code>/etc/shadow</code> by digest, never shown. Removal runs <code>userdel</code> (with <code>-r</code> only when <code>remove_home</code>) if Buckle created the account.</td></tr>
+<tr><td><code>ssh.authorized_key</code></td><td>authorized_key</td><td>unix · per-path edit lock · cleanup</td><td><code>user</code>, <code>key</code>, <code>state</code> (<code>present</code>), <code>exclusive</code> (<code>false</code>)</td><td><code>key</code> is one or more <code>authorized_keys</code> lines; a key is identified by type and body, so changing its options or comment updates the line. <code>exclusive</code> removes every other key. Keeps <code>.ssh</code> at 0700 and the file at 0600, owned by the user. Removal deletes the lines Buckle added.</td></tr>
+<tr><td><code>hostname.set</code></td><td>hostname</td><td>linux · no lock · cleanup</td><td><code>name</code></td><td>Compares the kernel hostname and <code>/etc/hostname</code>; applies with <code>hostnamectl</code> (falling back to <code>hostname</code>). Blocked when neither tool exists. Removal does nothing: the previous name is unknown.</td></tr>
+<tr><td><code>swap.file</code></td><td>dd + mkswap + fstab</td><td>linux · <code>fstab</code> · cleanup</td><td><code>path</code>, <code>size_mb</code>, <code>swappiness</code></td><td>One resource owns the file, its <code>/etc/fstab</code> line and the <code>swapon</code> state; a file of the wrong size is swapped off and recreated. A data file at the path is blocked, not formatted. <code>swappiness</code> is applied live and persisted in <code>/etc/sysctl.d/99-buckle-swap.conf</code>. Removal runs <code>swapoff</code> and deletes the line and the file, but only for a swap file Buckle created.</td></tr>
+<tr><td><code>cron.job</code></td><td>cron</td><td>unix · no lock · cleanup</td><td><code>name</code>, <code>user</code> (<code>root</code>), <code>schedule</code>, <code>command</code>, <code>state</code> (<code>present</code>)</td><td>Owns the file <code>/etc/cron.d/&lt;name&gt;</code> (mode 0644); <code>schedule</code> is five fields or an <code>@</code> alias; unescaped <code>%</code> in <code>command</code> is escaped for you.</td></tr>
+<tr><td><code>command.run</code></td><td>command</td><td>all · no lock · cleanup (a <code>remove</code> command, else <em>no cleanup defined</em>)</td><td><code>run</code>, <code>creates</code>, <code>unless</code>, <code>only_if</code>, <code>changed_when</code> (<code>always</code>), <code>env</code>, <code>cwd</code>, <code>timeout</code>, <code>remove</code>, <code>capture</code> (<code>redacted</code>)</td><td><code>run</code>, <code>unless</code>, <code>only_if</code> and <code>remove</code> are an argv list or a string run with <code>sh -c</code>. <code>unless</code> and <code>only_if</code> probes run in plan mode and must be read-only. <code>changed_when</code> is <code>always</code>, <code>never</code>, <code>output_contains:&lt;text&gt;</code> or <code>exit:&lt;code&gt;</code>. <code>env</code> values may reference secrets and are handed over through the process-environment sink; when one does, output is not captured unless <code>capture: always</code> (otherwise stdout and stderr, scrubbed of known secrets, go to the span, 4 KiB each; <code>never</code> records nothing). A task with <code>remove:</code> must carry an explicit <code>id</code>. A command with no guard is flagged <em>always runs</em>.</td></tr>
+<tr><td><code>docker.image</code></td><td>command docker pull</td><td>all · <code>docker</code> · cleanup</td><td><code>name</code>, <code>pull</code> (<code>missing</code>), <code>state</code> (<code>present</code>)</td><td><code>pull: always</code> refreshes a moving tag on every apply and reports a change only if the digests differ, but always appears as pending in plans. Blocked when <code>docker</code> is not on the PATH. Removal runs <code>docker image rm</code> for an image Buckle pulled; an image in use is left.</td></tr>
 </tbody></table></div>
-<p>Later platforms add <code>brew.package</code>, <code>launchd.service</code>, <code>winget.package</code>, <code>windows.service</code>, <code>registry.value</code>; the file, command, download, archive and github tasks are already cross-platform.</p>
+<p>Handler-style kinds (<code>systemd.daemon_reload</code>, <code>systemd.restart</code>, <code>systemd.reload</code>) and <code>apt.update</code> default to <em>leave</em>; every other kind defaults to <em>cleanup</em>. The removal of <code>apt.package</code>, <code>user.account</code> and <code>user.group</code> is flagged with a caution. Later platforms add <code>brew.package</code>, <code>launchd.service</code>, <code>winget.package</code>, <code>windows.service</code>, <code>registry.value</code>; the file, command, download, archive and github tasks are already cross-platform.</p>
 
 <h3>Standard library: facts</h3>
+<p>Ten providers, each mounted at <code>host.facts.&lt;name&gt;</code> and refreshed per TTL. Providers read the host only through the <code>System</code> trait and tolerate missing tools: a missing source yields <code>null</code> for that key, not an error.</p>
 <div class="scroll"><table>
-<thead><tr><th>Provider</th><th>Keys</th><th>Source</th></tr></thead>
+<thead><tr><th>Provider</th><th>Keys</th><th>Platforms · TTL</th><th>Source</th></tr></thead>
 <tbody>
-<tr><td><code>os</code></td><td>family, id, codename, version, kernel</td><td><code>/etc/os-release</code>, <code>uname</code>; <code>os_info</code> on macOS/Windows</td></tr>
-<tr><td><code>hardware</code></td><td>arch, cpus, mem.total_mb, swap.total_mb, disks[]</td><td><code>sysinfo</code></td></tr>
-<tr><td><code>net</code></td><td>hostname, fqdn, interfaces[], default_route</td><td>netlink / getifaddrs</td></tr>
-<tr><td><code>tailscale</code></td><td>hostname, ips, tags, online</td><td><code>tailscale status --json</code>, LocalAPI if present</td></tr>
-<tr><td><code>cloud.oci</code>, <code>cloud.azure</code></td><td>provider, region, shape/sku, id, fault_domain</td><td>IMDS, 2 s timeout, cached 1 h</td></tr>
-<tr><td><code>users</code></td><td>accounts[{name, uid, gid, home, shell}]</td><td>getent passwd</td></tr>
-<tr><td><code>systemd</code></td><td>units[{name, active, enabled}]</td><td><code>systemctl list-units</code>, used by health and plans</td></tr>
-<tr><td><code>nomad</code>, <code>docker</code></td><td>version, eligibility, images[]</td><td>only when the binary exists</td></tr>
-<tr><td><code>script.&lt;name&gt;</code></td><td>whatever the script prints</td><td>Executable JSON emitters in <code>facts.d/</code> of a module; the v1 config-script idea, typed</td></tr>
+<tr><td><code>os</code></td><td><code>family</code> (debian, rhel, alpine, arch, macos, windows, unknown), <code>id</code>, <code>codename</code>, <code>version</code>, <code>pretty_name</code>, <code>kernel</code></td><td>all · 1 h</td><td><code>/etc/os-release</code> and <code>uname -r</code>; <code>sw_vers</code> on macOS</td></tr>
+<tr><td><code>hardware</code></td><td><code>arch</code>, <code>cpus</code>, <code>mem.total_mb</code>, <code>swap.total_mb</code>, <code>disks[]</code> (<code>mount</code>, <code>fstype</code>, <code>total_mb</code>, <code>free_mb</code>, <code>free_percent</code>) and the flat <code>disk.&lt;name&gt;.*</code> with the same fields (<code>root</code> for <code>/</code>, otherwise the mount path with separators turned into <code>_</code>)</td><td>linux · 5 min</td><td><code>uname -m</code>, <code>/proc/cpuinfo</code>, <code>/proc/meminfo</code>, <code>df -P -k -T</code> (pseudo filesystems left out)</td></tr>
+<tr><td><code>net</code></td><td><code>hostname</code>, <code>fqdn</code>, <code>interfaces[]</code> (<code>name</code>, <code>state</code>, <code>mac</code>, <code>mtu</code>, <code>addresses[]</code>), <code>addresses</code> (global-scope, flat), <code>default_route</code></td><td>linux · 5 min</td><td><code>hostname -f</code>, <code>ip -j addr</code>, <code>ip -j route show default</code></td></tr>
+<tr><td><code>tailscale</code></td><td><code>hostname</code>, <code>ips</code>, <code>tags</code>, <code>online</code>, <code>backend_state</code>, <code>tailnet</code>; <code>null</code> when not installed</td><td>all · 5 min</td><td><code>tailscale status --json</code></td></tr>
+<tr><td><code>cloud</code></td><td>OCI: <code>provider</code>, <code>region</code>, <code>shape</code>, <code>id</code>, <code>fault_domain</code>, <code>display_name</code>; Azure: <code>provider</code>, <code>region</code>, <code>sku</code>, <code>id</code>, <code>name</code>, <code>zone</code>; <code>null</code> elsewhere</td><td>all · 1 h</td><td>link-local IMDS at 169.254.169.254, 2 s timeout per probe; one provider covers both clouds</td></tr>
+<tr><td><code>users</code></td><td><code>accounts[]</code> (<code>name</code>, <code>uid</code>, <code>gid</code>, <code>home</code>, <code>shell</code>), <code>names</code> (flat, for <code>contains</code>)</td><td>all · 10 min</td><td>the local user database through <code>System</code></td></tr>
+<tr><td><code>systemd</code></td><td><code>version</code>, <code>units[]</code> (<code>name</code>, <code>load</code>, <code>active</code>, <code>sub</code>), flat <code>active</code> and <code>failed</code> name lists; <code>null</code> without systemd</td><td>linux · 1 min</td><td><code>systemctl --version</code>, <code>systemctl list-units --all</code></td></tr>
+<tr><td><code>nomad</code></td><td><code>version</code>, <code>eligibility</code>, <code>drain</code>, <code>status</code>; <code>null</code> unless <code>nomad</code> is on the PATH</td><td>all · 1 min</td><td><code>nomad version</code>, <code>nomad node status -self -json</code></td></tr>
+<tr><td><code>docker</code></td><td><code>version</code>, <code>running</code>; <code>null</code> unless <code>docker</code> is on the PATH</td><td>all · 1 min</td><td><code>docker version --format</code></td></tr>
+<tr><td><code>script.&lt;name&gt;</code></td><td>whatever the script prints (JSON)</td><td>unix · 5 min</td><td>every executable in <code>&lt;state_dir&gt;/facts.d/</code> (a host-level directory, not a module's), 10 s timeout; a failing script contributes <code>null</code> and a warning</td></tr>
 </tbody></table></div>
-<div class="card decision"><div class="tag">Decision</div><p><b>Fact providers never fail a run.</b> A provider error yields <code>null</code> under its key and a warning span; selectors that depend on it evaluate to false. This keeps a broken IMDS endpoint from blocking an unrelated apply, at the cost that the author must write <code>host.facts.cloud.provider == "oci"</code> rather than relying on presence.</p></div>
+<div class="card decision"><div class="tag">Decision</div><p><b>Fact providers never fail a run, and a guess is never a removal.</b> A provider error keeps its last good value and marks the provider stale, with a warning span; a provider that has never produced a value is <em>unavailable</em>. Selectors that read an unavailable provider are uncertain, so the modules that depend on them are <em>indeterminate</em> (section <a href="#engine">04</a>): not applied, and their resources kept, rather than silently unselected and removed. A provider that answers successfully with <code>null</code> (no cloud, no Tailscale, no Nomad) is a normal fact, so the author still writes <code>host.facts.cloud.provider == "oci"</code>, which is false there.</p></div>
 </section>
 
 <!-- ============ 6. SECRETS ============ -->
@@ -819,11 +868,11 @@ buckle_core::register_health!(HttpCheck);
 
 <pre><code class="language-rust"><span class="fname">buckle-core/src/secrets/mod.rs</span>pub struct Secret {
     name: Arc&lt;str&gt;,
-    fingerprint: Fingerprint,           // first 8 hex of HMAC-SHA256(install_key, value)
-    value: secrecy::SecretBox&lt;str&gt;,     // zeroised on drop
+    fingerprint: Fingerprint,           // first 4 bytes (8 hex) of HMAC-SHA256(install_key, value)
+    value: Arc&lt;secrecy::SecretString&gt;, // zeroised on drop
 }
 
-impl fmt::Debug for Secret { fn fmt(&amp;self, f: &amp;mut fmt::Formatter) -> fmt::Result { write!(f, "secret:{}@{}", self.name, self.fingerprint) } }
+impl fmt::Debug for Secret { fn fmt(&amp;self, f: &amp;mut fmt::Formatter) -> fmt::Result { write!(f, "«secret:{}@{}»", self.name, self.fingerprint) } }
 impl fmt::Display for Secret { /* same */ }
 impl Serialize for Secret { /* serialises the reference token, never the value */ }
 // deliberately NOT implemented: Clone into String, Deref&lt;Target=str&gt;, AsRef&lt;str&gt;, Into&lt;String&gt;, PartialEq&lt;str&gt;
@@ -838,18 +887,16 @@ impl Secret {
 
 pub mod sinks {
     pub struct Witness(());                            // cannot be built outside this module
-    pub struct Sensitive&lt;T&gt;(T);                        // output that contained a secret; also unprintable
-    impl Sensitive&lt;String&gt; {
-        pub fn write_atomic(self, path: &amp;Path, mode: u32) -> io::Result&lt;()&gt; { /* temp file + rename */ }
-        pub fn digest(&amp;self) -> Digest { /* sha256 of the real bytes, safe to store and compare */ }
-    }
-    pub trait Sink { fn witness(&amp;self) -> Witness { Witness(()) } }   // only implementors defined here
-    pub struct FileSink; pub struct ProcessEnvSink;
-}
+    pub struct Sensitive&lt;T&gt;(T);                        // output that contained a secret; also unprintable, comparable by digest
+    pub trait Sink { fn witness(&amp;self) -&gt; Witness { Witness(()) } }   // sealed: only the implementors defined here
+    pub struct FileSink;         // render → atomic write with a mode (also a validator's private copy)
+    pub struct ProcessEnvSink;   // a child process's environment and stdin
+    pub struct TransportSink;    // server → agent assignment, and the agent's secret cache at rest
+}   // the template renderer and the output scrubber hold a Witness too; all of them are greppable by it
 </code></pre>
 
 <h3>Rendering templates twice</h3>
-<p>minijinja sees secrets as a custom object. In <code>Mode::Redacted</code> the object renders as <code>«secret:nomad_server@3f9a»</code>; in <code>Mode::Real</code> the renderer, which is itself a sink, reveals the value. The real render is returned as <code>Sensitive&lt;String&gt;</code>, which can only be written to disk or compared by digest. The redacted render is a plain <code>Redacted&lt;String&gt;</code> and becomes the shadow in state and the text shown in plans. Vars that are derived from secrets through templates (a URL with a token in it) inherit sensitivity: any template that touched a secret produces <code>Sensitive</code>, so the taint cannot be laundered through an intermediate var.</p>
+<p>minijinja sees secrets as a custom object. In <code>Mode::Redacted</code> the object renders as <code>«secret:nomad_server@3f9a»</code>; in <code>Mode::Real</code> the renderer, which is itself a sink, reveals the value. The real render is returned as <code>Sensitive&lt;String&gt;</code>, which can only be written to disk or compared by digest. The redacted render is a plain <code>Redacted&lt;String&gt;</code> and becomes the shadow in state and the text shown in plans. A template that touched a secret always yields <code>Sensitive</code> output, and the taint cannot be laundered through an intermediate var because there is no way in: secrets are refused in vars and in ordinary task fields (a plain render that reaches one is an error). Only the few fields typed as <code>SecretField</code> keep their raw template through spec rendering (the schema marks them <code>x-buckle-secret</code>) and are opened by the task itself through a sink: the values of <code>command.run</code> <code>env</code>, <code>user.account</code> <code>password</code>, <code>file.download</code> and <code>http</code> check <code>headers</code>, and <code>apt.repository</code> <code>auth.password</code>.</p>
 
 <h3>What the operator sees</h3>
 <div class="diff"><span class="del">- servers = ["«secret:nomad_server@3f9a»"]</span>
@@ -857,11 +904,29 @@ pub mod sinks {
   datacenter = "dc1"
 <span class="del">- node_class = "cloud"</span>
 <span class="add">+ node_class = "rpi"</span></div>
-<p>A rotated secret shows up as a fingerprint change on exactly the lines that use it; everything else in the diff is real. A file that contains a secret and has drifted on disk shows <em>content changed outside Buckle (digest 9a1f… → 02c7…)</em> rather than the hand edit, because reading the file back would mean handling plaintext outside a sink.</p>
+<p>A rotated secret shows up as a fingerprint change on exactly the lines that use it; everything else in the diff is real. That holds while the file on disk is still what Buckle wrote (its digest equals the one recorded at write time). A file that contains a secret and has drifted on disk shows <em>content changed (digest 9a1f… → 02c7…)</em> with a redacted preview of the new content rather than the hand edit, because reading the file back would mean handling plaintext outside a sink.</p>
 
-<div class="card decision"><div class="tag">Decision</div><p><b>Secrets are resolved on the server and delivered per host, scoped to the modules the host selects.</b> Agents hold no provider credentials. The server evaluates each host's module selection with the host's last reported facts, collects the secret references those modules use, resolves them and sends values inside the assignment over the Tailscale-encrypted stream. If an agent's local evaluation selects a module the server did not predict (facts changed), it asks for the missing names and the server checks the request against the revision before answering. In local mode (<code>--source DIR</code>) the agent resolves with its own providers.</p></div>
+<div class="card decision"><div class="tag">Decision</div><p><b>Secrets are resolved on the server and delivered per host, scoped to the modules the host selects.</b> Agents hold no provider credentials. The server evaluates each host's module selection with the host's last reported facts, collects the secret references those modules use, resolves them and sends values inside the assignment over the Tailscale-encrypted stream. If an agent's local evaluation selects a module the server did not predict (facts changed), it asks for the missing names and the server checks the request against the revision before answering. In local mode (<code>source: DIR</code> in agent.yaml) the agent resolves with its own providers.</p></div>
 <div class="card decision"><div class="tag">Decision · agreed</div><p><b>Filters see secrets as filt-rs <code>Secret</code> values.</b> Authors are trusted, so <code>secrets.NAME == "x"</code> and the other comparisons work in <code>when</code> expressions; filt-rs's <code>secrecy</code> feature renders the value as <code>[REDACTED]</code> on Display and Debug, so a selector that ends up in a log or a plan cannot carry it. <code>secrets.NAME.present</code> and <code>secrets.NAME.fingerprint</code> remain for the common "is it configured" and "did it rotate" cases. Filter error messages contain only filter text, never target values, so a bad expression is safe to show in the UI.</p></div>
-<div class="card decision"><div class="tag">Decision · agreed</div><p><b>Providers for v2.0 are <code>file</code> and <code>env</code>; Nomad delivers the values.</b> The server's Nomad job uses <code>template</code> stanzas over Nomad Variables (or Vault) to render one file per secret into the task's secrets directory, or <code>env = true</code> to inject them as environment variables; <code>buckle.yaml</code> references them with <code>{ file: /secrets/NAME }</code> or <code>{ env: NAME }</code>. Nomad re-renders on variable change and can signal the task, so rotation needs no Buckle-side integration. The <code>file</code> provider re-reads on each resolution (no caching), and values are trimmed of a single trailing newline. <code>exec</code> exists only behind an explicit allowlist in server config for local development, where <code>op read</code> is convenient; it is off by default and not part of the production story. Agents resolve nothing themselves in server mode.</p></div>
+<div class="card decision"><div class="tag">Decision · agreed</div><p><b>Providers for v2.0 are <code>file</code> and <code>env</code>; Nomad delivers the values.</b> The server's Nomad job uses <code>template</code> stanzas over Nomad Variables (or Vault) to render one file per secret into the task's secrets directory, or <code>env = true</code> to inject them as environment variables; <code>buckle.yaml</code> references them with <code>{ file: /secrets/NAME }</code> or <code>{ env: NAME }</code>. Nomad re-renders on variable change and can signal the task, so rotation needs no Buckle-side integration. The <code>file</code> provider re-reads on each resolution (no caching), and values are trimmed of a single trailing newline. <code>exec</code> exists only behind an explicit allowlist for local development, where <code>op read</code> is convenient: <code>secrets.providers.exec.allow</code> in server config, or <code>--allow-secret-exec PROGRAM</code> on a local-mode agent. It is off by default and not part of the production story. Agents resolve nothing themselves in server mode.</p></div>
+
+<h3>Every other place a value could surface</h3>
+<ul>
+<li><b>Host diffs.</b> When a task diffs a text file on the host (<code>file.copy</code>, <code>file.template</code>, <code>file.line</code>, <code>file.block</code>, <code>cron.job</code>, <code>ssh.authorized_key</code>), the unified diff is first run through the scrubber, which knows every secret value the host holds and searches for each in its plain, JSON-escaped, URL-encoded and base64 forms (base64 only where the secret starts the encoded block; hex and shell quoting are not recognised), so a secret already sitting in the file shows as its token. Files that are sensitive by path (<code>/etc/environment</code>, <code>/etc/fstab</code>, the shadow files, sudoers, anything under <code>/etc/ssh</code> or <code>/etc/netplan</code>, <code>~/.ssh/*</code>) get <em>zero-context</em> diffs, changed lines only, and a file whose recorded shadow ever held a secret token never has its current content shown.</li>
+<li><b>The <code>file.line</code> stash.</b> The text a line edit replaces in a sensitive file is not kept in agent state, which is reported to the server: it goes to a 0600 file named by its digest under <code>&lt;state_dir&gt;/stash/file.line/</code>, and the record keeps only the digest, so removal can still restore the original line.</li>
+<li><b>Command output.</b> What <code>command.run</code> prints is scrubbed before it reaches a span, an error or a plan, and when its environment carried a secret it is not captured at all unless the task sets <code>capture: always</code>. A <code>validate</code> command's output is withheld when the file under test contains secrets.</li>
+<li><b>Health reasons.</b> A failing check's reason (a command's stdout, an HTTP body that echoes a secret) goes through the same scrubber before it leaves the check, so neither the UI, the server's health events nor the logs carry it.</li>
+<li><b>At rest on the agent.</b> The state directory is mode 0700 (on Windows an ACL restricted to Administrators and SYSTEM); the per-host token, the install key and <code>agent.json</code> are 0600; the cached secrets are 0600 CBOR with an HMAC tag that detects truncation or substitution. The cached stable revision's tree is verified against <code>stable_tree_digest</code>, the digest of the stable tarball that <code>Welcome</code> and <code>HostUpdate</code> carry, and so is every re-fetch of it, so a damaged or swapped cache is fetched again rather than applied.</li>
+</ul>
+
+<h3>Providers and delivery</h3>
+<ul>
+<li><b><code>file</code> confinement.</b> With <code>secrets.providers.file.root</code> set, relative paths resolve under it and anything that leaves it is refused: an absolute path elsewhere, a <code>..</code> component, or a symlink that resolves outside the (canonicalised) root. Without a root the server warns at start-up that fleet secrets may read any file it can.</li>
+<li><b><code>env</code> allow and deny lists.</b> <code>secrets.providers.env.allow</code> (when set, the only variables that may be read) and <code>deny</code> take exact names or a prefix ending in <code>*</code>, and deny wins. The server never hands out its own credentials whatever the lists say: <code>BUCKLE_*</code>, <code>OIDC_CLIENT_SECRET</code>, <code>GIT_TOKEN</code>, <code>GIT_WEBHOOK_SECRET</code>, the <code>OTEL_EXPORTER_OTLP_*HEADERS</code> variables, and every variable server.yaml itself interpolates with <code>${{ env.NAME }}</code>.</li>
+<li><b>Scoped delivery and <code>FetchSecrets</code>.</b> Each host receives only the secrets referenced by the modules its labels, facts and groups select (their task specs, handlers and templates) and by the vars overlays that match it. A <code>when</code> that tests a secret is evaluated on the server with the resolved value, so a module's secrets go only to the hosts the module selects. <code>FetchSecrets</code> (like <code>FetchRevision</code> and <code>FetchBlob</code>) answers only for an active host and only for the stable revision or a revision one of its rollouts assigns it; it returns just the requested names that the revision declares <em>and</em> that the host's own selection references, and silently grants nothing else. The fingerprint travels with each value, so a rotation yields the same plan digest on every host that uses the secret.</li>
+<li><b>Local mode.</b> <code>buckle plan</code> and <code>buckle apply</code> resolve <code>secrets:</code> with the <code>env</code> and <code>file</code> providers of the invoking process. An agent that watches a local directory resolves with the same two, and with <code>exec</code> only for the programs named on its command line, <code>buckle agent --allow-secret-exec op</code> (repeatable; refused for an agent that talks to a server, and never read from agent.yaml). An <code>exec</code> reference runs the exact allow-listed program with stdin closed, a 30 s timeout, and quotes only stderr in an error.</li>
+</ul>
+
 </section>
 
 <!-- ============ 7. HEALTH ============ -->
@@ -870,22 +935,23 @@ pub mod sinks {
 <p class="lede">Health is part of the module, not a separate monitoring system. Checks run when a rollout needs an answer (was this host healthy before we touched it, did the change leave it working, are the hosts we already changed still fine before we go further) and once alongside each periodic drift check, so the server always holds a recent baseline for the whole fleet. There is no separate health loop; uptime monitoring stays with Grey.</p>
 <div class="grid3">
 <div class="card"><h4>1 · Baseline, before apply</h4><p>When a host's wave is due, the server sends <code>RunHealth { scope: baseline }</code> and the agent runs the checks of the modules it currently has applied. A failing baseline holds the host: the rollout does not touch an already-unhealthy host unless an operator forces it (<em>force apply</em> in the UI, audited). This separates "the change broke it" from "it was already broken".</p></div>
-<div class="card"><h4>2 · Bake, after apply</h4><p>Once <code>ApplyResult</code> arrives, checks for every applied module run at their <code>interval</code> (default 30 s) for the phase's <code>bake</code> duration, then stop. A <code>required</code> check that stays failing for longer than <code>settle</code> (default 2 m, flap tolerance for services restarting mid-rollout) marks the host <em>unhealthy</em>, counts against <code>max_failures</code>, and pauses the rollout on breach; a check that recovers inside the settle window is recorded as a flap, not a failure. <code>min_uptime</code> on the <code>systemd</code> check catches crash loops inside the window.</p></div>
+<div class="card"><h4>2 · Bake, after apply</h4><p>Once <code>ApplyResult</code> arrives, checks for every applied module run at their <code>interval</code> (default 30 s) for the phase's <code>bake</code> duration, then stop (a required check that is still failing keeps being sampled past the window until it recovers or fails past <code>settle</code>). A <code>required</code> check that stays failing for longer than <code>settle</code> (default 2 m, flap tolerance for services restarting mid-rollout) marks the host <em>unhealthy</em>, counts against <code>max_failures</code>, and pauses the rollout on breach; a check that recovers inside the settle window is recorded as a flap, not a failure. The agent does not wait for the server: the same failure rolls that module back to the cached stable revision on the host (section <a href="#engine">04</a>) and is reported as a durable module rollback. <code>min_uptime</code> on the <code>systemd</code> check catches crash loops inside the window.</p></div>
 <div class="card"><h4>3 · Pre-phase, before advancing</h4><p>Before the next phase starts, the server sends <code>RunHealth { scope: rollout }</code> to every host this rollout has already updated and waits for all results. A regression anywhere pauses the rollout instead of advancing, so a slow-burning failure in the canary is caught before the fleet follows.</p></div>
-<div class="card"><h4>4 · With each drift check</h4><p>Every <code>drift.interval</code> (default 15 m) the agent already re-plans its assigned revision; it now also runs the checks of its applied modules once and sends <code>HealthReport { scope: drift }</code> with the <code>Drift</code> message. This is the fleet's baseline health between rollouts: it drives the Overview roll-up, lets the UI show a host as unhealthy before anyone starts a rollout, and lets the controller pre-flag hosts that will be held at baseline. The pre-apply baseline check still runs fresh when the wave is due; the drift report is a recent reading, not a substitute.</p></div>
+<div class="card"><h4>4 · With each drift check</h4><p>Every <code>drift.interval</code> (default 15 m) the agent already re-plans the revision it has applied; it now also runs the checks of its applied modules once and sends <code>HealthReport { scope: drift }</code> with the <code>Drift</code> message. This is the fleet's baseline health between rollouts: it drives the Overview roll-up, lets the UI show a host as unhealthy before anyone starts a rollout, and lets the controller pre-flag hosts that will be held at baseline. The pre-apply baseline check still runs fresh when the wave is due; the drift report is a recent reading, not a substitute.</p></div>
 </div>
 <h3>Check kinds</h3>
+<p>A declaration is one kind key beside <code>name</code>, <code>interval</code> (30 s, the repeat cadence inside the bake window), <code>timeout</code> (10 s; a check that exceeds it fails) and <code>required</code> (true). Every spec rejects unknown fields, and a check returns <code>pass</code>, <code>fail</code> or <code>unknown</code>; <em>unknown</em> means the check itself could not run (a missing tool, an unsupported platform, an expression that does not parse) and never fails a run.</p>
 <div class="scroll"><table>
-<thead><tr><th>Kind</th><th>Spec</th><th>Use</th></tr></thead>
+<thead><tr><th>Kind</th><th>Spec (defaults)</th><th>Platforms</th><th>Use</th></tr></thead>
 <tbody>
-<tr><td><code>http</code></td><td>url, method, headers, expect.status, expect.body_contains, tls.insecure</td><td>Nomad agent health, Caddy admin, otelcol health extension</td></tr>
-<tr><td><code>tcp</code></td><td>address</td><td>a port is listening</td></tr>
-<tr><td><code>systemd</code></td><td>unit, state (active/inactive), min_uptime</td><td>unit came up and stayed up; <code>min_uptime: 30s</code> catches crash loops</td></tr>
-<tr><td><code>command</code></td><td>run, expect.exit, expect.stdout_matches</td><td><code>tailscale status</code>, <code>rustic snapshots</code></td></tr>
-<tr><td><code>filter</code></td><td>a filt-rs expression over refreshed facts</td><td><code>host.facts.disk["/"].free_percent > 10</code> is not expressible (no indexing), so facts expose flat keys: <code>host.facts.disk.root.free_percent &gt; 10</code></td></tr>
-<tr><td><code>file</code></td><td>path, exists, max_age</td><td>a backup marker was written recently</td></tr>
+<tr><td><code>http</code></td><td><code>url</code>, <code>method</code> (<code>GET</code>), <code>headers</code> (values may reference secrets), <code>expect.status</code> (any 2xx), <code>expect.body_contains</code>, <code>tls.insecure</code> (false), <code>timeout</code> (10s)</td><td>all</td><td>Nomad agent health, Caddy admin, otelcol health extension; a connection error or timeout fails</td></tr>
+<tr><td><code>tcp</code></td><td><code>address</code> (<code>host:port</code>), <code>timeout</code> (5s)</td><td>all</td><td>a port is listening</td></tr>
+<tr><td><code>systemd</code></td><td><code>unit</code>, <code>state</code> (<code>active</code> or <code>inactive</code>; default active), <code>min_uptime</code></td><td>linux</td><td>unit came up and stayed up; <code>min_uptime: 30s</code> catches crash loops ("restarted 4s ago"); unknown without <code>systemctl</code></td></tr>
+<tr><td><code>command</code></td><td><code>run</code> (argv list, or a string run with <code>sh -c</code>), <code>expect.exit</code> (0), <code>expect.stdout_matches</code> (regex), <code>timeout</code> (30s)</td><td>all</td><td><code>tailscale status</code>, <code>rustic snapshots</code>; a program that cannot start is unknown, not failed</td></tr>
+<tr><td><code>filter</code></td><td><code>expr</code>: a filt-rs expression over the host's facts, labels, groups and vars</td><td>all</td><td>indexing is not expressible, so facts expose flat keys: <code>host.facts.hardware.disk.root.free_percent &gt; 10</code>. It reads the facts already in the context (refreshed by the module's <code>facts.provides</code> after an apply, collected by TTL otherwise); a missing fact makes a comparison false, so the check fails</td></tr>
+<tr><td><code>file</code></td><td><code>path</code>, <code>exists</code> (true), <code>max_age</code>, <code>contains</code></td><td>all</td><td>a backup marker was written recently; <code>contains</code> reads the whole file, so keep it for small files</td></tr>
 </tbody></table></div>
-<p>Checks have <code>required: true</code> by default; an <code>informational</code> check reports but never fails a run. Results carry a reason string and are exported as the <code>buckle.health.status</code> metric with <code>module</code>, <code>check</code> and <code>scope</code> (baseline, bake, rollout, drift) attributes whenever they run, so Honeycomb and Grafana get the same signal the server does. Locally, <code>buckle apply</code> runs the bake-scope checks once after applying and <code>buckle health</code> runs them on demand.</p>
+<p><code>required: false</code> makes a check informational: it reports but never fails a run. A waived check (an operator's <em>continue</em>) still runs and reports but no longer counts. Results carry a reason string, scrubbed of known secret values before it leaves the check, reach the server as <code>HealthReport</code> messages and are kept as health events with their scope (baseline, bake, rollout, drift); exporting them as an OTLP gauge is not implemented yet (section <a href="#observability">13</a>). Locally, <code>buckle apply</code> runs the checks after applying (with settle, for modules that changed) and <code>buckle health</code> runs them on demand, exiting 1 when a required check fails.</p>
 <div class="card note"><p>Health checks are intentionally shallow. Grey already does deep uptime monitoring across the estate; Buckle's checks answer "did my change break the thing I changed" and feed that answer into rollout control. The <code>http</code> check could later point at Grey's API to use a richer signal as a rollout gate.</p></div>
 </section>
 
