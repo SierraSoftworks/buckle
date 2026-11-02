@@ -126,6 +126,10 @@ pub struct FactSamples {
     pub distinct: u32,
     /// Up to a handful of hosts' values, distinct values first.
     pub samples: Vec<FactSample>,
+    /// Every planned host's value, to render a change as one host sees it
+    /// ([`FleetPlan::render_step`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +312,43 @@ impl FleetPlan {
         self.hosts.iter().all(|h| hosts.contains(h))
     }
 
+    /// `text` as `host` renders it: each fact token replaced by the host's
+    /// value (tokens the host has no value for are left in place).
+    pub fn render(&self, host: &str, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find(FACT_TOKEN_PREFIX) {
+            let body = &rest[start + FACT_TOKEN_PREFIX.len()..];
+            let Some(end) = body.find(CLOSE) else {
+                break;
+            };
+            let path = &body[..end];
+            out.push_str(&rest[..start]);
+            match self.fact(path).and_then(|f| f.values.get(host)) {
+                Some(v) => out.push_str(v),
+                None => out.push_str(
+                    &rest[start..start + FACT_TOKEN_PREFIX.len() + end + CLOSE.len_utf8()],
+                ),
+            }
+            rest = &body[end + CLOSE.len_utf8()..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// A (tokenised) step as `host` planned it.
+    pub fn render_step(&self, host: &str, step: &StepView) -> StepView {
+        let r = |t: &String| self.render(host, t);
+        StepView {
+            key: r(&step.key),
+            name: step.name.as_ref().map(r),
+            summary: r(&step.summary),
+            unified: step.unified.as_ref().map(r),
+            preview: step.preview.as_ref().map(r),
+            ..step.clone()
+        }
+    }
+
     /// The exemplars of a fact token's path.
     pub fn fact(&self, path: &str) -> Option<&FactSamples> {
         self.facts.iter().find(|f| f.path == path)
@@ -360,6 +401,10 @@ fn samples(path: &str, hosts: &[FleetHost], leaves: &[Vec<(String, String)>]) ->
             });
         }
     }
+    let values = all
+        .iter()
+        .map(|s| (s.host.clone(), s.value.clone()))
+        .collect();
     let distinct: BTreeSet<&str> = all.iter().map(|s| s.value.as_str()).collect();
     let distinct = distinct.len() as u32;
     // Distinct values first, then repeats, keeping host order within each.
@@ -370,6 +415,7 @@ fn samples(path: &str, hosts: &[FleetHost], leaves: &[Vec<(String, String)>]) ->
         path: path.to_owned(),
         distinct,
         samples: first.into_iter().chain(rest).take(SAMPLES).collect(),
+        values,
     }
 }
 
@@ -578,6 +624,15 @@ mod tests {
         let id = plan.fact("host.id").unwrap();
         assert_eq!(id.distinct, 2);
         assert_eq!(id.samples.len(), 2);
+
+        // Each host's own render comes back from the merged change.
+        let own = plan.render_step("prophet", &step.variants[0].value);
+        assert_eq!(own.key, "/etc/nomad.d/prophet.hcl");
+        assert_eq!(
+            own.unified.as_deref(),
+            Some(conf("prophet", "10.0.0.2").as_str())
+        );
+        assert_eq!(plan.render("nobody", &step.key), step.key);
     }
 
     #[test]
