@@ -6,9 +6,9 @@
 
 use crate::config::SecretsConfig;
 use buckle_core::engine::Revision;
-use buckle_core::secrets::providers::{EnvProvider, FileProvider};
-use buckle_core::secrets::sinks::Sink;
-use buckle_core::secrets::{InstallKey, Resolver};
+use buckle_core::secrets::providers::{EnvProvider, ExecProvider, FileProvider};
+use buckle_core::secrets::sinks::TransportSink;
+use buckle_core::secrets::{InstallKey, Resolver, SecretStore};
 use buckle_core::selectors::HostContext;
 use buckle_proto::v1::{SecretBundle, SecretValue};
 use regex::Regex;
@@ -17,12 +17,6 @@ use std::sync::{Arc, LazyLock};
 
 static SECRET_REF: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"secrets\.([A-Za-z0-9_]+)").ok());
-
-/// The sink that hands secret values to the gRPC stream bound for the one
-/// host that needs them. Every reveal on the server goes through here.
-struct TransportSink;
-
-impl Sink for TransportSink {}
 
 /// Resolves and scopes secrets for hosts.
 #[derive(Clone)]
@@ -48,10 +42,12 @@ impl ServerSecrets {
         if config.providers.env.is_some() {
             resolver = resolver.with_provider(EnvProvider);
         }
-        if config.providers.exec.is_some() {
+        if let Some(exec) = &config.providers.exec {
             tracing::warn!(
-                "secrets.providers.exec is configured, but this build has no exec provider; exec secret references will not resolve"
+                allow = ?exec.allow,
+                "the exec secret provider is enabled; it is meant for local development only"
             );
+            resolver = resolver.with_provider(ExecProvider::new(exec.allow.clone()));
         }
         Self {
             resolver: Arc::new(resolver),
@@ -115,23 +111,29 @@ impl ServerSecrets {
     /// Resolves `names` (which must be declared by the revision) into a bundle.
     /// Secrets that fail to resolve are left out and logged by name.
     pub async fn bundle(&self, revision: &Revision, names: &BTreeSet<String>) -> SecretBundle {
-        let mut out = SecretBundle::default();
+        let mut store = SecretStore::new();
         for name in names {
             let Some(reference) = revision.fleet.secrets.get(name) else {
                 continue;
             };
             match self.resolver.resolve_one(name, reference).await {
-                Ok(secret) => out.secrets.push(SecretValue {
-                    name: name.clone(),
-                    value: secret.reveal(TransportSink.witness()).as_bytes().to_vec(),
-                    fingerprint: secret.fingerprint().as_hex(),
-                }),
+                Ok(secret) => store.insert(secret),
                 Err(e) => {
                     tracing::warn!(secret = %name, error = %e, "a secret could not be resolved")
                 }
             }
         }
-        out
+        SecretBundle {
+            secrets: store
+                .export(&TransportSink)
+                .into_iter()
+                .map(|(name, fingerprint, value)| SecretValue {
+                    name,
+                    value,
+                    fingerprint: fingerprint.as_hex(),
+                })
+                .collect(),
+        }
     }
 
     /// The bundle a host's Welcome/Assign carries for `revision`.
