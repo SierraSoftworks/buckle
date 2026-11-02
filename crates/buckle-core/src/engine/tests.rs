@@ -166,6 +166,17 @@ async fn remove_file(cx: &Cx, record: &ResourceRecord) -> crate::Result<Applied>
 
 macro_rules! file_kind {
     ($name:ident, $kind:literal, locks = $locks:expr, platforms = $platforms:expr, caution = $caution:expr, always = $always:expr) => {
+        file_kind!(
+            $name,
+            $kind,
+            locks = $locks,
+            platforms = $platforms,
+            caution = $caution,
+            always = $always,
+            removal = RemovalPolicy::Cleanup
+        );
+    };
+    ($name:ident, $kind:literal, locks = $locks:expr, platforms = $platforms:expr, caution = $caution:expr, always = $always:expr, removal = $removal:expr) => {
         struct $name;
 
         #[async_trait]
@@ -175,6 +186,7 @@ macro_rules! file_kind {
             const LOCKS: &'static [&'static str] = $locks;
             const PLATFORMS: Platforms = $platforms;
             const REMOVAL_CAUTION: bool = $caution;
+            const REMOVAL_DEFAULT: RemovalPolicy = $removal;
 
             fn key(spec: &FileSpec) -> String {
                 spec.path.clone()
@@ -247,6 +259,15 @@ file_kind!(
     platforms = Platforms::LINUX,
     caution = false,
     always = false
+);
+file_kind!(
+    TestKept,
+    "test.kept",
+    locks = &[],
+    platforms = Platforms::ALL,
+    caution = false,
+    always = false,
+    removal = RemovalPolicy::Leave
 );
 file_kind!(
     TestAlways,
@@ -1872,6 +1893,52 @@ async fn orphans_become_removals_with_policy_caution_and_origin() {
             .count(),
         4
     );
+}
+
+#[rstest]
+#[case::kind_default(None, None, "test.file", RemovalPolicy::Cleanup)]
+#[case::module_policy_beats_kind(Some("leave"), None, "test.file", RemovalPolicy::Leave)]
+#[case::task_beats_module(Some("leave"), Some("cleanup"), "test.file", RemovalPolicy::Cleanup)]
+#[case::kind_default_leave(None, None, "test.kept", RemovalPolicy::Leave)]
+#[case::module_cleanup_beats_kind_leave(Some("cleanup"), None, "test.kept", RemovalPolicy::Cleanup)]
+#[tokio::test]
+async fn removal_policy_is_task_then_module_then_kind(
+    #[case] module_policy: Option<&str>,
+    #[case] task_policy: Option<&str>,
+    #[case] kind: &str,
+    #[case] expected: RemovalPolicy,
+) {
+    let module_removal = module_policy
+        .map(|p| format!("removal: {{ policy: {p} }}\n"))
+        .unwrap_or_default();
+    let task_removal = task_policy
+        .map(|p| format!("    removal: {p}\n"))
+        .unwrap_or_default();
+    let yaml =
+        format!("name: m\n{module_removal}tasks:\n  - {kind}: {{ path: /pol/x }}\n{task_removal}");
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let inputs = inputs_with_store(
+        revision("r1", FLEET, vec![module(&yaml)]),
+        &sys,
+        store.clone(),
+    );
+    let plan = plan(&inputs).await;
+    assert_eq!(step(&plan, "m", "/pol/x").removal, expected);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+
+    // Dropping the task removes or releases the file according to the policy.
+    let inputs = inputs_with_store(
+        revision("r2", FLEET, vec![module("name: m\n")]),
+        &sys,
+        store,
+    );
+    let plan = self::plan(&inputs).await;
+    assert_eq!(plan.removals[0].policy, expected);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert_eq!(sys.exists("/pol/x"), expected == RemovalPolicy::Leave);
 }
 
 #[tokio::test]

@@ -411,8 +411,11 @@ pub struct ModuleFacts {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemovalConfig {
+    /// The module's default for its tasks. Precedence: a task's own `removal`,
+    /// then this, then the task kind's default. Absent means "use the kind's
+    /// default" (cleanup for every kind except handler-style kinds).
     #[serde(default)]
-    pub policy: RemovalPolicy,
+    pub policy: Option<RemovalPolicy>,
 }
 
 /// What happens to a resource when it leaves the desired set.

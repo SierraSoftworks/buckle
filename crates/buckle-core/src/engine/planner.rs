@@ -126,6 +126,8 @@ pub(super) struct PreparedModule {
     pub provides: Vec<String>,
     /// Tasks whose `when` could not be decided (kept, not planned).
     pub warnings: Vec<String>,
+    /// The module's `removal.policy`, if it sets one.
+    pub removal: Option<RemovalPolicy>,
 }
 
 impl PreparedModule {
@@ -588,6 +590,7 @@ impl<'a> Planner<'a> {
             tasks,
             provides: module.config.facts.provides.clone(),
             warnings,
+            removal: module.config.removal.policy,
         })
     }
 
@@ -641,7 +644,7 @@ impl<'a> Planner<'a> {
                 locks: pt.task.locks().iter().map(|l| l.to_string()).collect(),
                 notifies: pt.decl.notify.clone(),
                 always_runs: pt.task.always_runs(&pt.spec),
-                removal: pt.decl.removal.unwrap_or(pt.task.removal_default()),
+                removal: removal_policy(pt.decl.removal, prepared.removal, pt.task),
             });
             rich.push(RichStep {
                 task: pt.task,
@@ -886,6 +889,16 @@ impl<'a> Planner<'a> {
             })
             .collect()
     }
+}
+
+/// A task's removal policy: its own `removal`, else the module's
+/// `removal.policy`, else the kind's default.
+fn removal_policy(
+    task: Option<RemovalPolicy>,
+    module: Option<RemovalPolicy>,
+    kind: &'static dyn DynTask,
+) -> RemovalPolicy {
+    task.or(module).unwrap_or_else(|| kind.removal_default())
 }
 
 fn handler_priority(kind: &str) -> u8 {
