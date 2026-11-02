@@ -565,7 +565,9 @@ dependencies = [
 name = "buckle-core"
 version = "2.0.0-dev"
 dependencies = [
+ "aho-corasick",
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "filt-rs",
@@ -578,6 +580,7 @@ dependencies = [
  "inventory",
  "minijinja",
  "nix",
+ "percent-encoding",
  "pretty_assertions",
  "rand 0.10.3",
  "regex",
