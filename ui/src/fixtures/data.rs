@@ -375,6 +375,7 @@ fn entry(
         updated_at: now - Duration::minutes(mins_ago),
         bake_until: None,
         needs_approval: false,
+        needs_attention: false,
     }
 }
 
