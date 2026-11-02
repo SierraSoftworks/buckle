@@ -44,8 +44,9 @@ nomad-cluster/
 ## Try it
 
 ```sh
-# static checks: parse, kinds, graph, templates
-buckle validate --config examples/nomad-cluster
+# static checks (parse, kinds, graph, templates), then a dry plan per facts file
+buckle validate --config examples/nomad-cluster \
+  --facts fixtures/facts/debian-arm64.json --facts fixtures/facts/ubuntu-amd64.json
 
 # what would change on this machine, as if it were a Pi canary?
 buckle plan --config examples/nomad-cluster \
@@ -53,4 +54,4 @@ buckle plan --config examples/nomad-cluster \
   --facts fixtures/facts/debian-arm64.json
 ```
 
-`plan` needs the secrets resolvable: create files under `/secrets/` named after the `file:` providers in `buckle.yaml` and export `RUSTIC_PASSWORD` (`scripts/container-test.sh` stubs all four). Release versions and asset names in `terminal` and `rustic` are illustrative; check them against the upstream releases before applying.
+In a container without systemd, leave out what cannot be inspected there with `--select '!(task.kind like "systemd.*")'`; add `&& !(task.tags contains "network")` to skip tasks that call GitHub. `plan` needs the secrets resolvable: create files under `/secrets/` named after the `file:` providers in `buckle.yaml` and export `RUSTIC_PASSWORD` (`scripts/container-test.sh` stubs all four). Release versions and asset names in `terminal` and `rustic` are illustrative; check them against the upstream releases before applying.

@@ -14,12 +14,14 @@ name = "buckle"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 buckle-core.workspace = true
 buckle-std.workspace = true
 buckle-agent.workspace = true
 buckle-server.workspace = true
 clap.workspace = true
 human-errors.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -30,5 +32,8 @@ buckle-api.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 rstest.workspace = true
+schemars.workspace = true
+serde.workspace = true
 tempfile.workspace = true

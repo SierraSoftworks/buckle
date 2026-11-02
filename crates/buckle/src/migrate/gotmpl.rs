@@ -21,7 +21,13 @@ pub fn identifier(raw: &str) -> String {
     let mut name: String = raw
         .trim()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
         name.insert(0, '_');
@@ -103,7 +109,9 @@ fn convert_action(
         return format!("{{{{{open} {scope}.{name} {close}}}}}");
     }
 
-    todos.push(format!("the Go template action `{{{{{raw}}}}}` was kept as written"));
+    todos.push(format!(
+        "the Go template action `{{{{{raw}}}}}` was kept as written"
+    ));
     format!("{{{{{raw}}}}}")
 }
 
@@ -131,7 +139,7 @@ mod tests {
     #[case("{{ .TOKEN }}", "{{ secrets.TOKEN }}")]
     #[case("{{/* note */}}x", "{# note #}x")]
     #[case("plain text, no actions", "plain text, no actions")]
-    #[case("${#array[@]} {% raw %}", "${{{ '{#' }}array[@]} {{ '{%' }} raw %}")]
+    #[case("${#array[@]} {% raw %}", "${{ '{#' }}array[@]} {{ '{%' }} raw %}")]
     fn simple_actions_are_rewritten(#[case] go: &str, #[case] jinja: &str) {
         let converted = convert(go, &set(&["TOKEN"]), &set(&["enabled", "A", "B"]));
         assert_eq!(converted.text, jinja);
@@ -147,7 +155,10 @@ mod tests {
     #[case("{{ unterminated")]
     fn other_actions_are_kept_and_reported(#[case] go: &str) {
         let converted = convert(go, &set(&[]), &set(&["A"]));
-        assert_eq!(converted.text, go, "unconverted actions are kept as written");
+        assert_eq!(
+            converted.text, go,
+            "unconverted actions are kept as written"
+        );
         assert!(!converted.todos.is_empty(), "and reported");
     }
 

@@ -1,7 +1,11 @@
 name: otel-ebpf-profiler
 description: A continuous eBPF profiler for the cloud hosts, run as a container under systemd.
-when: 'host.groups contains "cloud"'
-needs: [docker]                  # docker is selected on every nomad client, a superset of the cloud group
+# Cloud Nomad clients only. `needs: [docker]` requires docker to be selected on
+# every host this module is, and docker is selected on Nomad clients, so the
+# `when` has to be at least that narrow ("cloud" alone would also match a cloud
+# machine that is not a client and has no engine).
+when: 'host.groups contains "cloud" && host.groups contains "nomad-clients"'
+needs: [docker]
 tags: [observability]
 vars:
   profiler_image: ghcr.io/example/otel-ebpf-profiler:1.0.0

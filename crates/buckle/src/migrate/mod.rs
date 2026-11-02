@@ -28,7 +28,11 @@ impl Migration {
     pub fn todo_count(&self) -> usize {
         self.files
             .values()
-            .map(|bytes| String::from_utf8_lossy(bytes).matches("TODO(migrate)").count())
+            .map(|bytes| {
+                String::from_utf8_lossy(bytes)
+                    .matches("TODO(migrate)")
+                    .count()
+            })
             .sum()
     }
 }
@@ -138,7 +142,10 @@ pub fn run(args: crate::commands::MigrateArgs) -> error::Result<i32> {
     }
     for path in &migration.ignored {
         let shown = path.strip_prefix(&args.v1_dir).unwrap_or(path);
-        println!("Not migrated (Buckle 1.x did not read it either): {}", shown.display());
+        println!(
+            "Not migrated (Buckle 1.x did not read it either): {}",
+            shown.display()
+        );
     }
     let todos = migration.todo_count();
     if todos > 0 {

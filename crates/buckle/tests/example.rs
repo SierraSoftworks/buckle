@@ -253,10 +253,16 @@ fn all_tasks(module: &LoadedModule) -> impl Iterator<Item = &TaskDecl> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_cli_validates_the_example() {
+fn the_cli_validates_the_example_against_every_facts_fixture() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_buckle"))
         .args(["validate", "--config"])
         .arg(example_dir())
+        .args(["--facts"])
+        .arg(repo_root().join("fixtures/facts/debian-arm64.json"))
+        .args(["--facts"])
+        .arg(repo_root().join("fixtures/facts/ubuntu-arm64.json"))
+        .args(["--facts"])
+        .arg(repo_root().join("fixtures/facts/ubuntu-amd64.json"))
         .output()
         .expect("the buckle binary runs");
     assert!(
@@ -550,6 +556,40 @@ fn vars_resolve_by_the_documented_precedence(
     let scoped = host.in_module(&module.config.name, &module.config.tags);
     let vars = example.vars_for(module, &scoped);
     assert_eq!(vars.get(var), Some(&expected), "{var} on {}", host.host.id);
+}
+
+/// The engine's own dry planning (vars, selection, spec rendering and parsing,
+/// resource keys) for each host with the labels its agent would report.
+#[rstest]
+fn the_engine_dry_plans_each_host(
+    example: Example,
+    #[values("pi-1", "pi-4", "oci-1", "oci-2", "az-1")] host: &str,
+) {
+    let (fixture, labels) = host_description(host);
+    let tree: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join(format!("fixtures/facts/{fixture}.json")))
+            .expect("the facts fixture exists"),
+    )
+    .expect("the facts fixture is JSON");
+    let facts = buckle_core::facts::Facts {
+        tree,
+        collected_at: Default::default(),
+    };
+    let identity = HostIdentity {
+        id: host.to_owned(),
+        labels: serde_json::from_value(labels).expect("labels are a flat map"),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime starts");
+    let report = runtime
+        .block_on(buckle_core::engine::validate_with_facts(
+            &example.revision,
+            &identity,
+            &facts,
+        ))
+        .expect("validation runs");
+    assert!(report.is_ok(), "{host}: {report}");
 }
 
 #[rstest]

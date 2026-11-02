@@ -702,10 +702,9 @@ fn malformed_fingerprints_are_user_errors(#[case] input: &str) {
 
 /// minijinja's error `Debug` dumps the referenced variables, which renders
 /// secrets (revealing them in a real render, failing the formatter in a plain
-/// one). Fixed by the `template_error` hook in `Templater::render_with_view`
-/// (see `redact::template_error`); un-ignore once the integrator applies it.
+/// one). `Templater::render_with_view` maps every render error through
+/// `redact::template_error`, which this test guards.
 #[rstest]
-#[ignore = "needs the template.rs hook: map render errors with secrets::redact::template_error"]
 fn template_error_debug_never_shows_values(
     #[values(Awkward::Simple, Awkward::Newlines, Awkward::Unicode)] v: Awkward,
 ) {

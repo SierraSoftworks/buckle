@@ -87,7 +87,8 @@ impl StringOrArgv {
 
 /// A user error for a path that must be absolute.
 pub fn require_absolute(path: &Path, field: &str) -> Result<()> {
-    if path.is_absolute() {
+    // `has_root` accepts `/etc/example.conf` on Windows too, where `is_absolute` wants a drive.
+    if path.is_absolute() || path.has_root() {
         Ok(())
     } else {
         Err(error::user(

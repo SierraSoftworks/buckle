@@ -9,7 +9,7 @@ use buckle_core::facts::Facts;
 use buckle_core::health::{HealthReport, HealthScope};
 use buckle_core::plan::Plan;
 use buckle_core::secrets::SecretStore;
-use buckle_core::selectors::{HostIdentity, Labels};
+use buckle_core::selectors::{HostIdentity, Labels, Vars};
 use buckle_core::state::StateStore;
 use buckle_core::system::System;
 use std::sync::Arc;
@@ -32,6 +32,11 @@ pub struct RunContext {
     pub waived_checks: Vec<String>,
     /// The operator forced the run despite a failing baseline.
     pub force: bool,
+    /// The cached stable revision the engine re-applies module by module when
+    /// a module fails (design §04). `None` disables module-scoped rollback.
+    pub stable_revision: Option<Arc<Revision>>,
+    /// Agent-local var overrides from `agent.yaml`, the last vars layer (design §03).
+    pub vars: Vars,
 }
 
 /// Plans, applies, checks health and collects facts for the agent.
@@ -96,18 +101,20 @@ impl EngineRunner {
             })?),
             None => None,
         };
-        Ok(Inputs {
+        Ok(Inputs::new(
             revision,
-            host: ctx.host.clone(),
-            server_labels: ctx.server_labels.clone(),
-            system: self.system.clone(),
-            secrets: ctx.secrets.clone(),
-            state: self.state.clone(),
-            facts: ctx.facts.clone(),
-            select,
-            waived_checks: ctx.waived_checks.clone(),
-            parallelism: self.parallelism,
-        })
+            ctx.host.clone(),
+            self.system.clone(),
+            ctx.secrets.clone(),
+            self.state.clone(),
+        )
+        .with_server_labels(ctx.server_labels.clone())
+        .with_facts(ctx.facts.clone())
+        .with_select(select)
+        .with_waived_checks(ctx.waived_checks.clone())
+        .with_parallelism(self.parallelism)
+        .with_stable_revision(ctx.stable_revision.clone())
+        .with_agent_vars(ctx.vars.clone()))
     }
 }
 
@@ -123,6 +130,7 @@ impl Runner for EngineRunner {
             module: String::new(),
             secrets: Arc::new(SecretStore::new()),
             waived_checks: Arc::new(Vec::new()),
+            previous: None,
         };
         let mut facts = previous.clone();
         if facts.tree.is_null() {

@@ -90,7 +90,10 @@ jobs:
           files: target/${{ matrix.target }}/release/buckle${{ matrix.extension }}
       - name: Report binary size
         shell: bash
-        run: ls -l target/${{ matrix.target }}/release/buckle${{ matrix.extension }} | awk '{ printf "buckle-${{ matrix.os }}-${{ matrix.arch }}: %.1f MB\n", $5/1048576 }' | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          ls -l target/${{ matrix.target }}/release/buckle${{ matrix.extension }} \
+            | awk '{ printf "buckle-${{ matrix.os }}-${{ matrix.arch }}: %.1f MB\n", $5/1048576 }' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Prepare release artifacts
         shell: bash
         run: |

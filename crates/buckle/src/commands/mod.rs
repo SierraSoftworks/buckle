@@ -89,13 +89,6 @@ pub async fn run(cli: Cli) -> buckle_core::Result<i32> {
     }
 }
 
-fn not_yet(what: &str) -> buckle_core::Error {
-    buckle_core::error::system(
-        format!("{what} is not implemented yet."),
-        &["This part of Buckle is still being built."],
-    )
-}
-
 /// A cancellation token that trips on SIGINT or SIGTERM.
 pub fn shutdown_token() -> tokio_util::sync::CancellationToken {
     let token = tokio_util::sync::CancellationToken::new();

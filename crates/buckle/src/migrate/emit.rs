@@ -41,7 +41,10 @@ fn q(s: &str) -> String {
 
 /// A mapping key: plain when it is a safe identifier, quoted otherwise.
 fn key(k: &str) -> String {
-    let plain = k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    let plain = k
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !matches!(
             k.to_ascii_lowercase().as_str(),
@@ -105,7 +108,10 @@ pub fn emit(v1: &V1, v1_dir: &Path) -> error::Result<Emitted> {
     for file in &v1.config.env_files {
         let stem = file.name.trim_end_matches(".env");
         let path = format!("vars/{stem}.yaml");
-        let mut text = format!("# Migrated from config/{}. Values are strings, as in v1.\n", file.name);
+        let mut text = format!(
+            "# Migrated from config/{}. Values are strings, as in v1.\n",
+            file.name
+        );
         let mut seen = BTreeSet::new();
         let mut body = String::new();
         // The last occurrence of a key in the file wins, as in v1.
@@ -120,7 +126,12 @@ pub fn emit(v1: &V1, v1_dir: &Path) -> error::Result<Emitted> {
                 text.push_str(&todo("", &format!("`{raw}` and another key in this file both became `{name}`; check which value you want.")));
             }
             if &name != raw {
-                text.push_str(&todo("", &format!("`{raw}` was renamed to `{name}`: template names must be identifiers.")));
+                text.push_str(&todo(
+                    "",
+                    &format!(
+                        "`{raw}` was renamed to `{name}`: template names must be identifiers."
+                    ),
+                ));
             }
             let _ = writeln!(body, "{}: {}", key(&name), q(value));
         }
@@ -131,7 +142,12 @@ pub fn emit(v1: &V1, v1_dir: &Path) -> error::Result<Emitted> {
             .map(|(k, _)| k.trim().to_owned())
             .collect::<BTreeSet<_>>();
         for raw in repeats {
-            text.push_str(&todo("", &format!("`{raw}` is set more than once in this file; the last value is kept, as in v1.")));
+            text.push_str(&todo(
+                "",
+                &format!(
+                    "`{raw}` is set more than once in this file; the last value is kept, as in v1."
+                ),
+            ));
         }
         if body.is_empty() {
             body.push_str("{}\n");
@@ -218,13 +234,25 @@ pub fn emit(v1: &V1, v1_dir: &Path) -> error::Result<Emitted> {
     // ---- modules -------------------------------------------------------------
     let mut scoped_overlays = String::new();
     for package in &v1.packages {
-        let module = emit_module(package, &global, &global_secrets, &secret_keys(&package.secrets))?;
-        put(format!("modules/{}/module.yaml", package.id), module.yaml.into_bytes());
+        let module = emit_module(
+            package,
+            &global,
+            &global_secrets,
+            &secret_keys(&package.secrets),
+        )?;
+        put(
+            format!("modules/{}/module.yaml", package.id),
+            module.yaml.into_bytes(),
+        );
         for (path, contents) in module.files {
             put(format!("modules/{}/files/{path}", package.id), contents);
         }
         if !module.overrides.is_empty() {
-            let _ = writeln!(scoped_overlays, "  - when: {}", q(&format!("module.name == {}", q(&package.id))));
+            let _ = writeln!(
+                scoped_overlays,
+                "  - when: {}",
+                q(&format!("module.name == {}", q(&package.id)))
+            );
             scoped_overlays.push_str("    values:\n");
             for (name, value) in &module.overrides {
                 let _ = writeln!(scoped_overlays, "      {}: {}", key(name), q(value));
@@ -268,7 +296,12 @@ pub fn emit(v1: &V1, v1_dir: &Path) -> error::Result<Emitted> {
                     origins.join(" and ")
                 )));
             }
-            let _ = writeln!(yaml, "  {}: {{ file: {} }}", key(name), q(&format!("/secrets/{name}")));
+            let _ = writeln!(
+                yaml,
+                "  {}: {{ file: {} }}",
+                key(name),
+                q(&format!("/secrets/{name}"))
+            );
         }
     }
     put("buckle.yaml".to_owned(), yaml.into_bytes());
@@ -309,7 +342,10 @@ fn emit_module(
         let _ = writeln!(yaml, "needs: [{}]", needs.join(", "));
     }
     if !package.unknown_keys.is_empty() {
-        yaml.push_str(&todo("", "package.yml had keys Buckle 1.x ignored. They are kept here for reference only:"));
+        yaml.push_str(&todo(
+            "",
+            "package.yml had keys Buckle 1.x ignored. They are kept here for reference only:",
+        ));
         for (k, v) in &package.unknown_keys {
             let _ = writeln!(yaml, "#   {k}: {v}");
         }
@@ -322,7 +358,12 @@ fn emit_module(
         for (raw, value) in &own.values {
             let name = gotmpl::identifier(raw);
             if &name != raw {
-                yaml.push_str(&todo("  ", &format!("`{raw}` was renamed to `{name}`: template names must be identifiers.")));
+                yaml.push_str(&todo(
+                    "  ",
+                    &format!(
+                        "`{raw}` was renamed to `{name}`: template names must be identifiers."
+                    ),
+                ));
             }
             if own.repeated.contains(raw) {
                 yaml.push_str(&todo("  ", &format!("`{raw}` is set to different values by several config files; the file that sorts last wins here (v1 used directory order).")));
@@ -338,8 +379,15 @@ fn emit_module(
     let mut tasks = String::new();
     let mut dests: BTreeMap<String, usize> = BTreeMap::new();
     for file in &package.files {
-        let target = package.file_targets.get(&file.group).map(String::as_str).unwrap_or("/");
-        let dest = Path::new(target).join(&file.rel).to_string_lossy().replace('\\', "/");
+        let target = package
+            .file_targets
+            .get(&file.group)
+            .map(String::as_str)
+            .unwrap_or("/");
+        let dest = Path::new(target)
+            .join(&file.rel)
+            .to_string_lossy()
+            .replace('\\', "/");
         let n = dests.entry(dest.clone()).or_insert(0);
         *n += 1;
         let duplicate = *n > 1;
@@ -372,7 +420,12 @@ fn emit_module(
                 tasks.push_str(&todo("  ", &format!("{} has Go template syntax that was not converted (see the comment at the top of the template).", src)));
                 format!(
                     "{{# TODO(migrate): fix these, then delete this comment:\n{}\n#}}{}",
-                    converted.todos.iter().map(|t| format!("  - {t}")).collect::<Vec<_>>().join("\n"),
+                    converted
+                        .todos
+                        .iter()
+                        .map(|t| format!("  - {t}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     converted.text
                 )
             };
@@ -385,7 +438,11 @@ fn emit_module(
             files.insert(src, contents.into_bytes());
         } else {
             let src = format!("{}/{}", file.group, file.rel);
-            let mode = if file.executable { "      mode: \"0755\"\n" } else { "" };
+            let mode = if file.executable {
+                "      mode: \"0755\"\n"
+            } else {
+                ""
+            };
             let _ = write!(
                 tasks,
                 "  - file.copy:\n      src: {}\n      dest: {}\n{mode}{id}",
@@ -436,7 +493,11 @@ fn emit_module(
             }
         }
         if let Some(retry) = package.retry.as_ref().filter(|r| r.limit > 0) {
-            let _ = writeln!(tasks, "    retry: {{ limit: {}, delay: {}ms }}", retry.limit, retry.delay_ms);
+            let _ = writeln!(
+                tasks,
+                "    retry: {{ limit: {}, delay: {}ms }}",
+                retry.limit, retry.delay_ms
+            );
         }
     }
 
@@ -452,7 +513,11 @@ fn emit_module(
         yaml.push_str("tasks:\n");
         yaml.push_str(&tasks);
     }
-    Ok(Module { yaml, files, overrides })
+    Ok(Module {
+        yaml,
+        files,
+        overrides,
+    })
 }
 
 /// The environment v1 gave every script of a package: config, overlaid by the
@@ -462,7 +527,11 @@ fn script_env(defined: &BTreeSet<String>, secrets: &BTreeSet<String>) -> BTreeMa
         .iter()
         .map(|raw| {
             let name = gotmpl::identifier(raw);
-            let scope = if secrets.contains(raw) { "secrets" } else { "vars" };
+            let scope = if secrets.contains(raw) {
+                "secrets"
+            } else {
+                "vars"
+            };
             (raw.clone(), format!("{{{{ {scope}.{name} }}}}"))
         })
         .collect()

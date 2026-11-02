@@ -279,7 +279,12 @@ fn included(patterns: &[String], original: &Path, stripped: &Path) -> bool {
     if patterns.is_empty() {
         return true;
     }
-    let candidates = [original.to_string_lossy(), stripped.to_string_lossy()];
+    // Archive entry names always use `/`; `stripped` was rebuilt from components, so on
+    // Windows it carries `\` and must be normalised before matching.
+    let candidates = [
+        original.to_string_lossy().replace('\\', "/"),
+        stripped.to_string_lossy().replace('\\', "/"),
+    ];
     patterns.iter().any(|pattern| {
         let pattern = pattern.trim_start_matches("./").trim_end_matches('/');
         candidates.iter().any(|c| {
@@ -396,7 +401,7 @@ async fn fetch(cx: &Cx, src: &str) -> Result<Vec<u8>> {
 fn creates_path(spec: &Spec) -> Option<PathBuf> {
     spec.creates.as_ref().map(|c| {
         let p = Path::new(c);
-        if p.is_absolute() {
+        if p.is_absolute() || p.has_root() {
             p.to_path_buf()
         } else {
             spec.dest.join(p)
@@ -801,7 +806,7 @@ mod tests {
             .paths()
             .into_iter()
             .filter(|p| p.starts_with("/opt/tool") && sys.file(p).is_some())
-            .map(|p| p.display().to_string())
+            .map(|p| p.display().to_string().replace('\\', "/"))
             .collect();
         assert_eq!(files, expected);
     }

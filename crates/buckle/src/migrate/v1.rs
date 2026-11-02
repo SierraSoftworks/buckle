@@ -221,7 +221,8 @@ fn read_package(dir: &Path, ignored: &mut Vec<PathBuf>) -> error::Result<Package
                     .to_owned()
             }
             "needs" => {
-                package.needs = serde_yaml::from_value(value).map_err(|_| bad("expected a list of package names"))?
+                package.needs = serde_yaml::from_value(value)
+                    .map_err(|_| bad("expected a list of package names"))?
             }
             "files" => {
                 package.file_targets = serde_yaml::from_value(value)
@@ -429,14 +430,19 @@ pub fn read(dir: &Path) -> error::Result<V1> {
                         "The package '{}' needs '{need}', which does not exist.",
                         package.id
                     ),
-                    &["Buckle 1.x refused to run this configuration too; fix the `needs` list first."],
+                    &[
+                        "Buckle 1.x refused to run this configuration too; fix the `needs` list first.",
+                    ],
                 ));
             }
         }
     }
     if let Some(cycle) = find_cycle(&v1.packages) {
         return Err(error::user(
-            format!("The package dependencies form a cycle: {}.", cycle.join(" -> ")),
+            format!(
+                "The package dependencies form a cycle: {}.",
+                cycle.join(" -> ")
+            ),
             &["Remove one of the `needs` entries."],
         ));
     }
