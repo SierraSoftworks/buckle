@@ -37,6 +37,9 @@ pub struct AgentState {
     /// The fleet's stable revision as last told by the server.
     #[serde(default)]
     pub stable_revision: Option<RevisionId>,
+    /// The tarball digest the server named for the stable revision.
+    #[serde(default)]
+    pub stable_tree_digest: Option<String>,
     /// The facts collected so far, with their collection times.
     #[serde(default)]
     pub facts: buckle_core::facts::Facts,

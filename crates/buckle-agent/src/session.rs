@@ -64,6 +64,9 @@ pub struct AgentOptions {
     pub event_spacing: Duration,
     /// How long shutdown waits for a running operation.
     pub shutdown_grace: Duration,
+    /// How long a new session may go without a Welcome before the agent
+    /// gives up on it and reconnects with backoff (30 s).
+    pub welcome_timeout: Duration,
 }
 
 impl Default for AgentOptions {
@@ -78,6 +81,7 @@ impl Default for AgentOptions {
             rejected_backoff_max: Duration::from_secs(3600),
             event_spacing: coalesce::EVENT_SPACING,
             shutdown_grace: Duration::from_secs(60),
+            welcome_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -167,6 +171,9 @@ struct Data {
     selects: HashMap<String, String>,
     /// The facts tree last reported to a server.
     reported_facts: Option<serde_json::Value>,
+    /// Tarball digests the server named for revisions (Assign, Welcome):
+    /// every fetch of those revisions is verified against them.
+    tree_digests: HashMap<RevisionId, String>,
 }
 
 struct Shared {
@@ -619,10 +626,16 @@ impl Shared {
             self.options.facts_interval,
         );
         facts.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let welcome_deadline = tokio::time::sleep(self.options.welcome_timeout);
+        tokio::pin!(welcome_deadline);
 
         let end = loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break SessionEnd::Shutdown,
+                _ = &mut welcome_deadline, if !welcomed => {
+                    tracing::warn!(timeout = ?self.options.welcome_timeout, "the server sent no Welcome; reconnecting");
+                    break SessionEnd::Closed { welcomed: false };
+                }
                 _ = self.stop.cancelled() => break SessionEnd::Shutdown,
                 instruction = session.instructions.recv() => match instruction {
                     None => break SessionEnd::Closed { welcomed },
@@ -708,6 +721,7 @@ impl Shared {
                 &welcome.status,
                 &welcome.labels,
                 welcome.stable_revision.as_ref(),
+                welcome.stable_tree_digest.as_deref(),
                 &welcome.secrets,
                 queue,
             );
@@ -741,19 +755,28 @@ impl Shared {
     /// Takes on what the server says about this host (from Welcome or a
     /// HostUpdate): status, effective labels, the stable revision and its
     /// secrets (fetching the stable tree if it is not cached).
+    #[allow(clippy::too_many_arguments)]
     fn adopt_host(
         &self,
         data: &mut Data,
         status: &str,
         labels: &indexmap::IndexMap<String, String>,
         stable: Option<&RevisionId>,
+        stable_tree_digest: Option<&str>,
         secrets: &[WireSecret],
         queue: &Queue,
     ) {
         data.agent.labels = labels.clone();
         data.agent.status = Some(status.to_owned()).filter(|s| !s.is_empty());
         if let Some(stable) = stable {
+            if data.agent.stable_revision.as_ref() != Some(stable) {
+                data.agent.stable_tree_digest = None;
+            }
             data.agent.stable_revision = Some(stable.clone());
+            if let Some(digest) = stable_tree_digest {
+                data.agent.stable_tree_digest = Some(digest.to_owned());
+                data.tree_digests.insert(stable.clone(), digest.to_owned());
+            }
             if !secrets.is_empty() {
                 self.cache_secrets(data, stable, secrets);
             }
@@ -763,7 +786,7 @@ impl Shared {
                         revision: stable.clone(),
                         stable: true,
                         secrets: Vec::new(),
-                        tree_digest: None,
+                        tree_digest: stable_tree_digest.map(str::to_owned),
                         desired: false,
                     },
                     None,
@@ -780,6 +803,7 @@ impl Shared {
             &update.status,
             &update.labels,
             update.stable_revision.as_ref(),
+            update.stable_tree_digest.as_deref(),
             &update.secrets,
             queue,
         );
@@ -1013,9 +1037,25 @@ impl Shared {
         revision: &RevisionId,
         tree_digest: Option<&str>,
     ) -> buckle_core::Result<Arc<Revision>> {
-        if let Some(r) = self.data.lock().await.revisions.get(revision) {
-            return Ok(r.clone());
-        }
+        let tree_digest: Option<String> = {
+            let mut data = self.data.lock().await;
+            if let Some(r) = data.revisions.get(revision) {
+                return Ok(r.clone());
+            }
+            match tree_digest {
+                Some(digest) => {
+                    data.tree_digests
+                        .insert(revision.clone(), digest.to_owned());
+                    Some(digest.to_owned())
+                }
+                None => data.tree_digests.get(revision).cloned().or_else(|| {
+                    (data.agent.stable_revision.as_ref() == Some(revision))
+                        .then(|| data.agent.stable_tree_digest.clone())
+                        .flatten()
+                }),
+            }
+        };
+        let tree_digest = tree_digest.as_deref();
         let dir = if self.store.has_revision(revision) {
             self.store.revision_dir(revision)?
         } else {

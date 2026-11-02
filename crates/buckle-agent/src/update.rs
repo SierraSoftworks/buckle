@@ -117,8 +117,15 @@ pub fn choose_release<'a>(releases: &'a [Release], wanted: Option<&str>) -> Opti
 #[async_trait]
 impl Updater for GitHubUpdater {
     async fn update(&self, version: Option<&str>) -> buckle_core::Result<UpdateOutcome> {
+        // A span guard held across awaits would attach whatever else runs on
+        // this thread to the update span; instrument the future instead.
         let span = tracing::info_span!("agent.update", version = version.unwrap_or("latest"));
-        let _guard = span.enter();
+        tracing::Instrument::instrument(self.update_in_span(version), span).await
+    }
+}
+
+impl GitHubUpdater {
+    async fn update_in_span(&self, version: Option<&str>) -> buckle_core::Result<UpdateOutcome> {
         let releases = self.source.get_releases().await?;
         let release = choose_release(&releases, version).ok_or_else(|| {
             buckle_core::error::user(

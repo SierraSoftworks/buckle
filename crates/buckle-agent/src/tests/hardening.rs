@@ -513,9 +513,8 @@ async fn a_final_rejection_keeps_the_agent_running_with_a_slow_backoff() {
     }
     tokio::time::sleep(Duration::from_secs(3700)).await;
     let attempts = h.fleet.attempts();
-    assert_eq!(attempts.len(), 14);
-    let last = attempts[attempts.len() - 1] - attempts[attempts.len() - 2];
-    assert_eq!(last, Duration::from_secs(3600));
+    assert!(attempts.len() >= 14);
+    assert_eq!(attempts[13] - attempts[12], Duration::from_secs(3600));
     h.stop().await.expect("clean exit");
 }
 
@@ -835,6 +834,55 @@ async fn facts_refreshed_while_planning_are_reported_and_top_up_secrets() {
             .iter()
             .all(|(_, m)| !matches!(m, pb::agent_message::Msg::Facts(_))),
         "unchanged facts are not re-sent"
+    );
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stable_revision_that_does_not_match_its_named_digest_is_not_cached() {
+    let mut h = Harness::start(Setup::default()).await;
+    let digest = h.fleet.add_revision("stable1", bundle(FLEET_YAML));
+    let wrong = format!("sha256:{}", crate::bundle::sha256_hex(b"something else"));
+    let mut session = h.sessions.accept().await;
+    session
+        .send(pb::server_message::Msg::Welcome(pb::Welcome {
+            stable_revision: "stable1".into(),
+            stable_tree_digest: wrong,
+            status: "active".into(),
+            ..Default::default()
+        }))
+        .await;
+    let failed = session.expect(plan_result).await;
+    assert_eq!(failed.revision, "stable1");
+    assert!(!failed.error.is_empty());
+    assert!(!h.state_dir().join("revisions/stable1").exists());
+    session.close();
+
+    let session = h.sessions.accept().await;
+    session
+        .send(pb::server_message::Msg::Welcome(pb::Welcome {
+            stable_revision: "stable1".into(),
+            stable_tree_digest: digest,
+            status: "active".into(),
+            ..Default::default()
+        }))
+        .await;
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.has_revision(&rev("stable1"))).await;
+    assert!(store.load_agent_state().stable_tree_digest.is_some());
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_without_a_welcome_times_out_and_reconnects() {
+    let mut h = Harness::start(Setup::default()).await;
+    let _silent = h.sessions.accept().await;
+    let opened = tokio::time::Instant::now();
+    let _next = h.sessions.accept().await;
+    let waited = tokio::time::Instant::now() - opened;
+    assert!(
+        waited >= Duration::from_secs(30) && waited < Duration::from_secs(40),
+        "{waited:?}"
     );
     h.stop().await.expect("clean exit");
 }

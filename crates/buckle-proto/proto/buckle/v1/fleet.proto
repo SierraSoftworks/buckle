@@ -209,6 +209,8 @@ message HostUpdate {
   // (sent when the host is active), as in Welcome.
   string stable_revision = 3;
   SecretBundle secrets = 4;
+  // Digest of the stable revision's tarball, as in Welcome.
+  string stable_tree_digest = 5;
 }
 
 // The server stored these durable reports (ApplyResult, LocalRollback) in a
@@ -229,6 +231,9 @@ message Welcome {
   // Host status as the server sees it: pending, active, paused.
   string status = 6;
   SecretBundle secrets = 7;
+  // Digest of the stable revision's tarball; the agent verifies the tree it
+  // caches for local rollback (and every re-fetch) against it.
+  string stable_tree_digest = 8;
 }
 
 message Assign {

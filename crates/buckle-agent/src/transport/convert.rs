@@ -64,10 +64,12 @@ pub fn secrets_from_proto(bundle: Option<pb::SecretBundle>) -> Vec<WireSecret> {
         .map(|b| {
             b.secrets
                 .into_iter()
-                .map(|s| WireSecret {
-                    name: s.name,
-                    value: s.value,
-                    fingerprint: s.fingerprint,
+                .map(|mut s| WireSecret {
+                    name: std::mem::take(&mut s.name),
+                    // Moved, not copied: the wire buffer becomes the
+                    // WireSecret's, which zeroes it on drop.
+                    value: std::mem::take(&mut s.value),
+                    fingerprint: std::mem::take(&mut s.fingerprint),
                 })
                 .collect()
         })
@@ -86,6 +88,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             labels: w.labels.into_iter().collect(),
             status: w.status,
             secrets: secrets_from_proto(w.secrets),
+            stable_tree_digest: non_empty(w.stable_tree_digest),
         }),
         Msg::Assign(a) => Instruction::Assign {
             revision: RevisionId(a.revision),
@@ -135,6 +138,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             labels: u.labels.into_iter().collect(),
             stable_revision: non_empty(u.stable_revision).map(RevisionId),
             secrets: secrets_from_proto(u.secrets),
+            stable_tree_digest: non_empty(u.stable_tree_digest),
         }),
         Msg::Ack(a) => Instruction::Ack {
             report_ids: a.report_ids,
@@ -431,5 +435,28 @@ mod tests {
         let shown = format!("{s:?}");
         assert!(shown.contains("db"));
         assert!(!shown.contains("hunter2"));
+    }
+
+    #[test]
+    fn welcome_debug_hides_the_issued_token_and_secret_values() {
+        let message = pb::ServerMessage {
+            msg: Some(pb::server_message::Msg::Welcome(pb::Welcome {
+                issued_token: "per-host-token-value".into(),
+                secrets: Some(pb::SecretBundle {
+                    secrets: vec![pb::SecretValue {
+                        name: "db".into(),
+                        value: b"hunter2".to_vec(),
+                        fingerprint: "0a1b2c3d".into(),
+                    }],
+                }),
+                ..Default::default()
+            })),
+        };
+        let instruction = instruction_from_proto(message).expect("welcome");
+        let shown = format!("{instruction:?}");
+        assert!(!shown.contains("per-host-token-value"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("0a1b2c3d"), "{shown}");
     }
 }

@@ -1199,6 +1199,14 @@ impl Controller {
         };
         if let Some(stable) = self.stable.clone() {
             update.stable_revision = stable.clone();
+            let id = stable.clone();
+            update.stable_tree_digest = self
+                .store
+                .call(move |db| Ok(db.revisions().get(&id)?.and_then(|r| r.tarball_digest)))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             if record.status == HostStatus::Active
                 && let Ok(rev) = self.revisions.load(&stable).await
             {

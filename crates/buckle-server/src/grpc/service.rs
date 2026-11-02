@@ -375,7 +375,20 @@ impl FleetService {
             }
             _ => Some(SecretBundle::default()),
         };
+        let stable_tree_digest = match &stable {
+            Some(rev) => {
+                let id = rev.id.0.clone();
+                self.store
+                    .call(move |db| Ok(db.revisions().get(&id)?.and_then(|r| r.tarball_digest)))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            }
+            None => String::new(),
+        };
         Welcome {
+            stable_tree_digest,
             server_version: self.server_version.clone(),
             session_id: session_id.to_string(),
             stable_revision: stable.map(|r| r.id.0.clone()).unwrap_or_default(),

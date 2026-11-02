@@ -67,8 +67,9 @@ impl std::fmt::Debug for Hello {
 }
 
 /// A secret value as delivered by the server, before it is sealed into a
-/// [`buckle_core::secrets::Secret`]. Its `Debug` never shows the value.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// [`buckle_core::secrets::Secret`]. Its `Debug` never shows the value, it
+/// is not serialisable, and its buffer is zeroed when it is dropped.
+#[derive(Clone, PartialEq, Eq)]
 pub struct WireSecret {
     /// The secret's name as referenced by modules.
     pub name: String,
@@ -76,6 +77,12 @@ pub struct WireSecret {
     pub value: Vec<u8>,
     /// The server's fingerprint of the value, for display.
     pub fingerprint: String,
+}
+
+impl Drop for WireSecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.value);
+    }
 }
 
 impl std::fmt::Debug for WireSecret {
@@ -87,8 +94,8 @@ impl std::fmt::Debug for WireSecret {
     }
 }
 
-/// The server's answer to [`Hello`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The server's answer to [`Hello`]. Its `Debug` hides the issued token.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Welcome {
     /// The server's version.
     pub server_version: String,
@@ -104,6 +111,26 @@ pub struct Welcome {
     pub status: String,
     /// Secrets for the stable revision, scoped to this host.
     pub secrets: Vec<WireSecret>,
+    /// Digest of the stable revision's tarball, to verify the cached tree.
+    pub stable_tree_digest: Option<String>,
+}
+
+impl std::fmt::Debug for Welcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Welcome")
+            .field("server_version", &self.server_version)
+            .field("session_id", &self.session_id)
+            .field("stable_revision", &self.stable_revision)
+            .field(
+                "issued_token",
+                &self.issued_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("labels", &self.labels)
+            .field("status", &self.status)
+            .field("secrets", &self.secrets)
+            .field("stable_tree_digest", &self.stable_tree_digest)
+            .finish()
+    }
 }
 
 /// What changed about the host, pushed while connected.
@@ -117,6 +144,8 @@ pub struct HostUpdate {
     pub stable_revision: Option<RevisionId>,
     /// Secrets for the stable revision, scoped to this host.
     pub secrets: Vec<WireSecret>,
+    /// Digest of the stable revision's tarball.
+    pub stable_tree_digest: Option<String>,
 }
 
 /// What the control plane tells the agent to do.
