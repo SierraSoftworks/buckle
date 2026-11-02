@@ -86,6 +86,9 @@ jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_c
 rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
 notify = "9.0.0-rc.7"
 base64 = "0.23.1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+tar = "0.4.44"
+flate2 = "1.1"
 
 # CLI
 clap = { version = "4.6", features = ["derive", "env", "string", "cargo"] }
@@ -98,6 +101,7 @@ tempfile = "3.27"
 wiremock = "0.6.5"
 tracing-subscriber = "0.3.23"
 pretty_assertions = "1.4"
+rsa = "0.9"
 
 [profile.release]
 lto = "fat"

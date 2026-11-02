@@ -107,6 +107,9 @@ message ApplyResult {
   bytes outcome_json = 12;
   // Checks that failed (module/check), for the operator's continue decision.
   repeated string failed_checks = 13;
+  // The agent refused to apply because its fresh plan digest differed from
+  // the approved one; the server re-requests a plan instead of counting a failure.
+  bool stale_plan = 14;
 }
 
 enum HealthScope {
@@ -201,6 +204,8 @@ message RequestPlan {
   string revision = 1;
   // Optional task selector (filt-rs) to restrict the plan.
   string select = 2;
+  // W3C trace context of the rollout span that asked for this plan.
+  string traceparent = 3;
 }
 
 message Apply {
@@ -214,12 +219,18 @@ message Apply {
   string phase = 6;
   // Operator forced an apply despite a failing baseline.
   bool force = 7;
+  // W3C trace context of the rollout span that issued this apply, so the
+  // agent's apply span joins the rollout trace (a bidirectional stream has no
+  // per-message gRPC metadata).
+  string traceparent = 8;
 }
 
 message Rollback {
   string revision = 1;
   string reason = 2;
   string rollout_id = 3;
+  // W3C trace context of the rollout span that issued this rollback.
+  string traceparent = 4;
 }
 
 message RunHealth {
@@ -229,6 +240,8 @@ message RunHealth {
   repeated string modules = 3;
   // For bake: repeat until this instant.
   google.protobuf.Timestamp until = 4;
+  // W3C trace context of the rollout span that asked for these checks.
+  string traceparent = 5;
 }
 
 message Ping {

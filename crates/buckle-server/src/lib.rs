@@ -1,11 +1,15 @@
 //! The Buckle server: watches a Git repository, turns commits into revisions,
 //! orchestrates phased rollouts across the fleet, speaks gRPC to agents and
 //! serves the HTTP API and the embedded UI to operators.
-//!
-//! Lane 4 (server) owns this crate. The skeleton fixes the configuration file
-//! format and the entry point the binary calls.
 
+pub mod clock;
 pub mod config;
+pub mod events;
+pub mod fleet;
+pub mod rollout;
+pub mod secrets;
+pub mod source;
+pub mod store;
 
 pub use config::ServerConfig;
 
