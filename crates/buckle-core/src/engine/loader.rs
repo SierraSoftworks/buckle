@@ -9,13 +9,26 @@ use crate::task::DirSource;
 use std::path::Path;
 use std::sync::Arc;
 
+/// A path as operators see it in errors: relative to the revision root, with `/`
+/// separators on every platform, so messages never carry the server's temp layout.
+fn shown(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 /// Reads `buckle.yaml`, every `modules/*/module.yaml` and the `vars` files.
 pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
     let fleet_path = root.join("buckle.yaml");
     let fleet_yaml = std::fs::read_to_string(&fleet_path).map_err(|e| {
         crate::error::wrap_user(
             e,
-            format!("Could not read {}.", fleet_path.display()),
+            format!(
+                "Could not read {} in {}.",
+                shown(root, &fleet_path),
+                root.display()
+            ),
             &["Point Buckle at a configuration directory containing buckle.yaml."],
         )
     })?;
@@ -39,7 +52,7 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
             let config = ModuleConfig::parse(&yaml).map_err(|e| {
                 crate::error::wrap_user(
                     e,
-                    format!("The module at {} is invalid.", module_yaml.display()),
+                    format!("The module at {} is invalid.", shown(root, &module_yaml)),
                     &["Fix the module.yaml and run `buckle validate` again."],
                 )
             })?;
@@ -83,7 +96,7 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
             let yaml = std::fs::read_to_string(&path).map_err(|e| {
                 crate::error::wrap_user(
                     e,
-                    format!("The vars file {} could not be read.", path.display()),
+                    format!("The vars file {} could not be read.", shown(root, &path)),
                     &["Check the `vars` list in buckle.yaml."],
                 )
             })?;
