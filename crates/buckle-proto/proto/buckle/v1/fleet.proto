@@ -85,6 +85,10 @@ message PlanResult {
   repeated string deferred_modules = 7;
   // Set when planning itself failed.
   string error = 8;
+  // Modules that are selected but could not be planned ("module: reason").
+  // The plan is still valid: applying it reports those modules as failed and
+  // runs the others.
+  repeated string module_errors = 9;
 }
 
 message ApplyEvent {
@@ -115,6 +119,9 @@ message ApplyResult {
   // acknowledges this id (Ack) and re-sends it after every Welcome; the
   // server stores it once per (host, report_id). 0 from older agents.
   uint64 report_id = 14;
+  // Nothing failed outright but steps stayed blocked: the revision is not
+  // fully applied and nothing was rolled back; an operator must look.
+  bool needs_attention = 15;
 }
 
 enum HealthScope {

@@ -852,9 +852,11 @@ async fn a_stable_revision_that_does_not_match_its_named_digest_is_not_cached() 
             ..Default::default()
         }))
         .await;
-    let failed = session.expect(plan_result).await;
-    assert_eq!(failed.revision, "stable1");
-    assert!(!failed.error.is_empty());
+    // A background cache, not an assignment: no plan failure is reported.
+    let until_beat = session
+        .collect_until(|m| matches!(m, pb::agent_message::Msg::Heartbeat(_)))
+        .await;
+    assert!(until_beat.iter().all(|(_, m)| plan_result(m).is_none()));
     assert!(!h.state_dir().join("revisions/stable1").exists());
     session.close();
 
@@ -1181,5 +1183,80 @@ async fn a_check_failing_at_the_end_of_the_bake_is_followed_through_settle() {
         "settle (2m) after the first failing sample: {elapsed:?}"
     );
     assert_eq!(rollback.modules, vec!["m".to_string()]);
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn drift_passes_plan_and_correct_in_drift_mode() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 2);
+    let drift = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone(), drift]);
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        yaml: "drift: { interval: 10m, correct: true }\n".into(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    assert!(session.expect(apply_result).await.succeeded);
+    let reported = session
+        .expect(|m| match m {
+            pb::agent_message::Msg::Drift(d) => Some(d.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(reported.corrected);
+    let flags = fake.drift_flags();
+    // The approved apply: a normal plan and apply.
+    assert_eq!(flags[0], ("plan", rev("rev1"), false));
+    assert_eq!(flags[1], ("apply", rev("rev1"), false));
+    // The drift pass: both its plan and its correction in drift mode (which
+    // the engine runner turns into no removals).
+    assert_eq!(
+        &flags[2..4],
+        &[("plan", rev("rev1"), true), ("apply", rev("rev1"), true)]
+    );
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pending_host_caches_the_stable_revision_only_once_it_is_active() {
+    let mut h = Harness::start(Setup::default()).await;
+    h.fleet.add_revision("stable1", bundle(FLEET_YAML));
+    let mut session = h.sessions.accept().await;
+    session
+        .send(pb::server_message::Msg::Welcome(pb::Welcome {
+            stable_revision: "stable1".into(),
+            status: "pending".into(),
+            ..Default::default()
+        }))
+        .await;
+    let until_beat = session
+        .collect_until(|m| matches!(m, pb::agent_message::Msg::Heartbeat(_)))
+        .await;
+    assert!(until_beat.iter().all(|(_, m)| plan_result(m).is_none()));
+    let store = Store::new(h.state_dir());
+    assert!(
+        !store.has_revision(&rev("stable1")),
+        "a pending host fetches nothing"
+    );
+    session
+        .send(pb::server_message::Msg::HostUpdate(pb::HostUpdate {
+            status: "active".into(),
+            stable_revision: "stable1".into(),
+            ..Default::default()
+        }))
+        .await;
+    wait_until(|| store.has_revision(&rev("stable1"))).await;
     h.stop().await.expect("clean exit");
 }

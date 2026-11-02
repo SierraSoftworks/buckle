@@ -8,6 +8,7 @@
 //! | `agent.json` | the agent's own bookkeeping: applied and stable revision, cached facts, last plan digest, labels, the local rollback watchdog, unacknowledged reports (0600) |
 //! | `revisions/<id>/` | extracted revision trees (the stable one is kept for local rollback) |
 //! | `secrets/<id>.cbor` | the secrets scoped to this host for a revision (0600) |
+//! | `tmp/` | scratch space planning may write to |
 
 use crate::transport::{DurableReport, LocalRollbackRecord};
 use crate::watchdog::WatchdogState;
@@ -214,6 +215,7 @@ impl Store {
             self.root.clone(),
             self.root.join("revisions"),
             self.root.join("secrets"),
+            self.scratch_dir(),
         ] {
             std::fs::create_dir_all(&dir).map_err(|e| {
                 buckle_core::error::wrap_user(
@@ -235,6 +237,12 @@ impl Store {
         // (tokens, install key, secrets) to Administrators and SYSTEM.
         crate::install::restrict_windows_acl(&self.root, true)?;
         Ok(())
+    }
+
+    /// The directory planning may write to (the engine's plan guard refuses
+    /// any other write in plan mode).
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.root.join("tmp")
     }
 
     /// Where the per-host token lives.

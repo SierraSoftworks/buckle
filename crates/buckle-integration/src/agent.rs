@@ -262,8 +262,12 @@ impl RunningAgent {
             inner: GrpcTransport::new(&config).expect("the transport builds"),
             reports: reports.clone(),
         });
-        let state = Arc::new(Store::new(state_dir).state_store());
-        let runner = Arc::new(EngineRunner::new(Arc::new(spec.system.clone()), state));
+        let store = Store::new(state_dir);
+        let state = Arc::new(store.state_store());
+        let runner = Arc::new(
+            EngineRunner::new(Arc::new(spec.system.clone()), state)
+                .with_scratch_dir(store.scratch_dir()),
+        );
         let options = AgentOptions {
             agent_version: "2.0.0".into(),
             heartbeat: Duration::from_secs(1),

@@ -152,6 +152,7 @@ pub struct FakeRunner {
     facts: Mutex<Facts>,
     plan_facts: Mutex<Option<Facts>>,
     applied_secrets: Mutex<Vec<(RevisionId, Vec<String>)>>,
+    drift_flags: Mutex<Vec<(&'static str, RevisionId, bool)>>,
     calls: Mutex<Vec<Call>>,
     changed: Notify,
 }
@@ -167,6 +168,7 @@ impl Default for FakeRunner {
             facts: Mutex::new(Facts::new()),
             plan_facts: Mutex::new(None),
             applied_secrets: Mutex::new(Vec::new()),
+            drift_flags: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             changed: Notify::new(),
         }
@@ -238,6 +240,11 @@ impl FakeRunner {
         lock(&self.calls).clone()
     }
 
+    /// Whether each plan and apply ran in drift mode: (`plan`|`apply`, revision, drift).
+    pub fn drift_flags(&self) -> Vec<(&'static str, RevisionId, bool)> {
+        lock(&self.drift_flags).clone()
+    }
+
     /// The names of the secrets each apply was given, in order.
     pub fn applied_secrets(&self) -> Vec<(RevisionId, Vec<String>)> {
         lock(&self.applied_secrets).clone()
@@ -300,6 +307,7 @@ impl Runner for FakeRunner {
             waived_checks: ctx.waived_checks.clone(),
             force: ctx.force,
         });
+        lock(&self.drift_flags).push(("plan", revision.id.clone(), ctx.drift));
         let facts = lock(&self.plan_facts)
             .clone()
             .unwrap_or_else(|| ctx.facts.clone());
@@ -319,6 +327,7 @@ impl Runner for FakeRunner {
             waived_checks: ctx.waived_checks.clone(),
             force: ctx.force,
         });
+        lock(&self.drift_flags).push(("apply", revision.id.clone(), ctx.drift));
         {
             let mut names: Vec<String> = ctx.secrets.iter().map(|s| s.name().to_owned()).collect();
             names.sort();

@@ -884,7 +884,14 @@ impl Controller {
                 h.runtime.plan_changes = Some(plan.changes);
                 h.runtime.plan_removals = Some(plan.removals);
                 h.runtime.destructive = plan.destructive;
-                h.runtime.error = None;
+                // A valid plan with modules that could not be planned: shown
+                // on the host; applying it fails those modules only.
+                h.runtime.error = (!plan.module_errors.is_empty()).then(|| {
+                    format!(
+                        "modules that could not be planned: {}",
+                        plan.module_errors.join("; ")
+                    )
+                });
             }
             self.touch_host(ri, hi);
             self.set_host_state(ri, hi, HostPhase::Planned, "plan received");
@@ -911,10 +918,18 @@ impl Controller {
                             h.runtime.failed_module = (!result.failed_module.is_empty())
                                 .then(|| result.failed_module.clone());
                             h.runtime.failed_checks = result.failed_checks.clone();
-                            h.runtime.error = Some(if result.error.is_empty() {
-                                "apply failed".into()
+                            let detail = if result.error.is_empty() {
+                                "apply failed".to_owned()
                             } else {
                                 result.error.clone()
+                            };
+                            // Blocked steps: failed for the rollout, but
+                            // nothing was rolled back; an operator must look.
+                            h.runtime.needs_attention = result.needs_attention;
+                            h.runtime.error = Some(if result.needs_attention {
+                                format!("needs attention: steps stayed blocked: {detail}")
+                            } else {
+                                detail
                             });
                         }
                         let why = self.live[ri].hosts[hi]

@@ -79,8 +79,11 @@ pub async fn run_with_system(
         }
         None => Arc::new(transport::grpc::GrpcTransport::new(&config)?),
     };
-    let state = Arc::new(store::Store::new(&config.state_dir).state_store());
-    let runner = Arc::new(runner::EngineRunner::new(system, state));
+    let store = store::Store::new(&config.state_dir);
+    store.ensure()?;
+    let state = Arc::new(store.state_store());
+    let runner =
+        Arc::new(runner::EngineRunner::new(system, state).with_scratch_dir(store.scratch_dir()));
     let updater = Arc::new(update::GitHubUpdater::new(agent_version));
     let options = AgentOptions {
         agent_version: agent_version.to_owned(),

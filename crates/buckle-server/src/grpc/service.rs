@@ -593,7 +593,14 @@ impl FleetService {
                     plan_digest: r.plan_digest.clone(),
                     started_at: now - duration,
                     finished_at: now,
-                    outcome: if r.succeeded { "succeeded" } else { "failed" }.into(),
+                    outcome: if r.succeeded {
+                        "succeeded"
+                    } else if r.needs_attention {
+                        "needs_attention"
+                    } else {
+                        "failed"
+                    }
+                    .into(),
                     changes: r.changes,
                     removals: r.removals,
                     error: (!r.error.is_empty()).then(|| r.error.clone()),

@@ -215,8 +215,33 @@ pub fn health_report_to_proto(
     }
 }
 
+/// Whether an unsuccessful outcome is the engine's "needs attention": no
+/// module failed or rolled back, but some stayed blocked.
+pub fn needs_attention(outcome: &buckle_core::engine::ApplyOutcome) -> bool {
+    use buckle_core::engine::ModuleStatus;
+    !outcome.succeeded
+        && outcome.failed_module.is_none()
+        && outcome.rolled_back_modules.is_empty()
+        && outcome
+            .module_results
+            .iter()
+            .any(|m| m.status == ModuleStatus::Blocked)
+        && !outcome.module_results.iter().any(|m| {
+            matches!(
+                m.status,
+                ModuleStatus::Failed | ModuleStatus::Unhealthy | ModuleStatus::RolledBack
+            )
+        })
+}
+
 fn plan_result(plan: &buckle_core::plan::Plan, error: String) -> pb::PlanResult {
     pb::PlanResult {
+        module_errors: plan
+            .indeterminate
+            .iter()
+            .filter(|i| i.plan_error)
+            .map(|i| format!("{}: {}", i.module, i.reason))
+            .collect(),
         revision: plan.revision.0.clone(),
         digest: plan.digest.to_string(),
         plan_json: json_bytes(plan),
@@ -301,6 +326,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             applied_revision,
         } => Msg::Result(pb::ApplyResult {
             report_id: *report_id,
+            needs_attention: needs_attention(outcome),
             revision: revision.0.clone(),
             plan_digest: outcome.plan_digest.to_string(),
             succeeded: outcome.succeeded,
@@ -427,6 +453,65 @@ mod tests {
         assert_eq!(fail.reason, "down");
         let unknown = health_result_to_proto(&mk(HealthStatus::unknown("no curl")));
         assert!(!unknown.passed && unknown.unknown);
+    }
+
+    #[test]
+    fn blocked_modules_without_failures_need_attention() {
+        use buckle_core::engine::{ModuleOutcome, ModuleStatus};
+        let plan = crate::testing::plan_with_changes(&RevisionId::new("r"), 1);
+        let mut outcome = crate::testing::succeeded(&plan);
+        assert!(!needs_attention(&outcome));
+        outcome.succeeded = false;
+        outcome.module_results = vec![ModuleOutcome {
+            module: "m".into(),
+            status: ModuleStatus::Blocked,
+            changes: 0,
+            duration_ms: 1,
+            error: Some("waiting on a lock".into()),
+        }];
+        let report = Report::ApplyResult {
+            report_id: 1,
+            revision: RevisionId::new("r"),
+            outcome: outcome.clone(),
+            applied_revision: None,
+        };
+        match report_to_proto(&report).msg {
+            Some(pb::agent_message::Msg::Result(r)) => {
+                assert!(r.needs_attention);
+                assert!(!r.succeeded);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        outcome.failed_module = Some("m".into());
+        outcome.module_results[0].status = ModuleStatus::Failed;
+        assert!(!needs_attention(&outcome), "a failure is a failure");
+    }
+
+    #[test]
+    fn module_plan_errors_travel_with_the_plan() {
+        let mut plan = crate::testing::plan_with_changes(&RevisionId::new("r"), 1);
+        plan.indeterminate = vec![
+            buckle_core::plan::Indeterminate {
+                module: "nomad".into(),
+                reason: "var 'dc' is undefined".into(),
+                plan_error: true,
+            },
+            buckle_core::plan::Indeterminate {
+                module: "docker".into(),
+                reason: "facts missing".into(),
+                plan_error: false,
+            },
+        ];
+        match report_to_proto(&Report::Plan(plan)).msg {
+            Some(pb::agent_message::Msg::Plan(p)) => {
+                assert_eq!(p.error, "", "the plan itself is valid");
+                assert_eq!(
+                    p.module_errors,
+                    vec!["nomad: var 'dc' is undefined".to_string()]
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

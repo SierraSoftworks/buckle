@@ -809,7 +809,9 @@ impl Shared {
             if !secrets.is_empty() {
                 self.cache_secrets(data, stable, secrets);
             }
-            if !self.store.has_revision(stable) {
+            // Only an active host may fetch revisions; a pending or paused
+            // one caches the stable tree once it is active (HostUpdate).
+            if status == "active" && !self.store.has_revision(stable) {
                 queue.push(
                     Op::Assign {
                         revision: stable.clone(),
@@ -1197,6 +1199,7 @@ impl Shared {
             force,
             stable_revision,
             vars: vars_json(&self.config.vars),
+            drift: false,
         }
     }
 
@@ -1331,6 +1334,13 @@ impl Shared {
         match fetched {
             Ok(_) => {
                 tracing::info!(revision = %revision.short(), stable, "revision assigned");
+            }
+            Err(err) if !desired => {
+                // Caching the stable revision for local rollback is the
+                // agent's own business: a failure is retried with the next
+                // Welcome or HostUpdate, and is not a plan failure of a
+                // revision the server assigned.
+                tracing::warn!(revision = %revision.short(), error = %err.description(), "could not cache the stable revision");
             }
             Err(err) => {
                 tracing::error!(revision = %revision.short(), error = %err.description(), "could not fetch the assigned revision");
@@ -1907,10 +1917,16 @@ impl Shared {
                 return;
             }
         };
-        let ctx = self.context(&revision, None, Vec::new(), false).await;
+        // Drift mode for the plan and its correction alike: uncertain
+        // selections are held (plan.held), and removals never run.
+        let mut ctx = self.context(&revision, None, Vec::new(), false).await;
+        ctx.drift = true;
         match self.runner.plan(rev.clone(), &ctx).await {
             Ok((plan, facts)) => {
                 self.remember_facts(facts).await;
+                if !plan.held.is_empty() {
+                    tracing::warn!(held = ?plan.held.iter().map(|h| h.module.as_str()).collect::<Vec<_>>(), "drift held modules whose selection is uncertain");
+                }
                 let drifted = !plan.is_empty();
                 let mut corrected = false;
                 if drifted {

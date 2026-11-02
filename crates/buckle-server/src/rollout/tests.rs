@@ -38,6 +38,8 @@ struct Script {
     silent_baseline: bool,
     /// The bake rollback is module-scoped (these modules).
     rollback_modules: Vec<String>,
+    /// The apply ends with blocked steps (needs attention).
+    apply_blocked: bool,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -278,6 +280,17 @@ impl Harness {
                                     "stale plan: the approved plan was {} but the host now plans {fresh}",
                                     a.plan_digest
                                 ),
+                                ..Default::default()
+                            }));
+                            continue;
+                        }
+                        if s.apply_blocked {
+                            reply(AMsg::Result(ApplyResult {
+                                revision: a.revision.clone(),
+                                plan_digest: a.plan_digest,
+                                succeeded: false,
+                                needs_attention: true,
+                                error: "module 'web': step waits for a lock".into(),
                                 ..Default::default()
                             }));
                             continue;
@@ -1439,4 +1452,36 @@ async fn approving_pausing_and_relabelling_reach_a_connected_agent() {
         .pop()
         .unwrap();
     assert!(matches!(last.2, SMsg::HostUpdate(u) if u.status == "active"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_steps_fail_the_host_as_needing_attention_without_a_rollback() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', max_failures: 0 }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.apply_blocked = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Failed);
+    assert!(a.runtime.needs_attention);
+    assert!(
+        a.runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("needs attention"),
+        "{:?}",
+        a.runtime.error
+    );
+    assert_eq!(r.runtime.pause.unwrap().kind, "failure_budget");
+    assert!(
+        h.sent(|_, m| matches!(m, SMsg::Rollback(_))).is_empty(),
+        "nothing rolled back"
+    );
 }

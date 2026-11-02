@@ -37,6 +37,10 @@ pub struct RunContext {
     pub stable_revision: Option<Arc<Revision>>,
     /// Agent-local var overrides from `agent.yaml`, the last vars layer (design §03).
     pub vars: Vars,
+    /// A drift pass: plan (and correct) in drift mode, never running
+    /// removals (an unattended pass must not remove on an uncertain
+    /// selection; held modules are listed in `plan.held`).
+    pub drift: bool,
 }
 
 /// Plans, applies, checks health and collects facts for the agent.
@@ -76,6 +80,7 @@ pub struct EngineRunner {
     system: Arc<dyn System>,
     state: Arc<dyn StateStore>,
     parallelism: usize,
+    scratch_dir: Option<std::path::PathBuf>,
 }
 
 impl EngineRunner {
@@ -87,7 +92,15 @@ impl EngineRunner {
             parallelism: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
+            scratch_dir: None,
         }
+    }
+
+    /// The directory planning may write to (`<state_dir>/tmp`); every other
+    /// write in plan mode is refused by the engine's plan guard.
+    pub fn with_scratch_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.scratch_dir = Some(dir.into());
+        self
     }
 
     fn inputs(&self, revision: Arc<Revision>, ctx: &RunContext) -> buckle_core::Result<Inputs> {
@@ -101,20 +114,26 @@ impl EngineRunner {
             })?),
             None => None,
         };
-        Ok(Inputs::new(
+        let mut inputs = Inputs::new(
             revision,
             ctx.host.clone(),
             self.system.clone(),
             ctx.secrets.clone(),
             self.state.clone(),
-        )
-        .with_server_labels(ctx.server_labels.clone())
-        .with_facts(ctx.facts.clone())
-        .with_select(select)
-        .with_waived_checks(ctx.waived_checks.clone())
-        .with_parallelism(self.parallelism)
-        .with_stable_revision(ctx.stable_revision.clone())
-        .with_agent_vars(ctx.vars.clone()))
+        );
+        if let Some(dir) = &self.scratch_dir {
+            inputs = inputs.with_scratch_dir(dir.clone());
+        }
+        Ok(inputs
+            .with_server_labels(ctx.server_labels.clone())
+            .with_facts(ctx.facts.clone())
+            .with_select(select)
+            .with_waived_checks(ctx.waived_checks.clone())
+            .with_parallelism(self.parallelism)
+            .with_stable_revision(ctx.stable_revision.clone())
+            .with_agent_vars(ctx.vars.clone())
+            .with_drift(ctx.drift)
+            .with_removals(!ctx.drift))
     }
 }
 
@@ -147,7 +166,12 @@ impl Runner for EngineRunner {
         revision: Arc<Revision>,
         ctx: &RunContext,
     ) -> buckle_core::Result<(Plan, Facts)> {
-        Engine::plan(&self.inputs(revision, ctx)?).await
+        let inputs = self.inputs(revision, ctx)?;
+        if ctx.drift {
+            Engine::drift(&inputs).await
+        } else {
+            Engine::plan(&inputs).await
+        }
     }
 
     async fn apply(
@@ -168,5 +192,46 @@ impl Runner for EngineRunner {
         modules: Option<&[String]>,
     ) -> buckle_core::Result<HealthReport> {
         Engine::health(&self.inputs(revision, ctx)?, scope, modules).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drift_runs_never_remove_and_planning_may_only_write_the_scratch_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("buckle.yaml"), "version: 2\n").expect("write");
+        let revision = Arc::new(
+            buckle_core::engine::loader::load_dir(
+                dir.path(),
+                buckle_core::plan::RevisionId::new("r"),
+            )
+            .expect("loads"),
+        );
+        let runner = EngineRunner::new(
+            Arc::new(buckle_core::system::RealSystem::new()),
+            Arc::new(buckle_core::state::MemoryStateStore::default()),
+        )
+        .with_scratch_dir(dir.path().join("tmp"));
+        let drift = runner
+            .inputs(
+                revision.clone(),
+                &RunContext {
+                    drift: true,
+                    ..Default::default()
+                },
+            )
+            .expect("inputs");
+        assert!(drift.drift);
+        assert!(!drift.removals, "drift correction never removes");
+        assert_eq!(drift.scratch_dirs, vec![dir.path().join("tmp")]);
+        let assigned = runner
+            .inputs(revision, &RunContext::default())
+            .expect("inputs");
+        assert!(!assigned.drift);
+        assert!(assigned.removals);
+        assert_eq!(assigned.scratch_dirs, vec![dir.path().join("tmp")]);
     }
 }

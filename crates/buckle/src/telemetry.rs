@@ -41,7 +41,8 @@ fn otlp_target(
 pub fn session(cli: &crate::commands::Cli) -> Session {
     let (endpoint, headers) = match &cli.command {
         crate::commands::Command::Server(args) => {
-            let file = buckle_server::config::TelemetryConfig::peek(&args.config).unwrap_or_default();
+            let file =
+                buckle_server::config::TelemetryConfig::peek(&args.config).unwrap_or_default();
             (
                 cli.otel_endpoint
                     .clone()
