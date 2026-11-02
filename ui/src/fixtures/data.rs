@@ -581,6 +581,7 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
     RolloutDetail {
         summary: RolloutSummary {
             id: "42".into(),
+            name: None,
             revision: NEW_REV.into(),
             revision_message: "nomad 1.9.3, rotate nomad_server".into(),
             state: RolloutState::Rolling,
@@ -1273,6 +1274,7 @@ fn finished(
     RolloutDetail {
         summary: RolloutSummary {
             id: id.into(),
+            name: None,
             revision: rev.into(),
             revision_message: message.into(),
             state,

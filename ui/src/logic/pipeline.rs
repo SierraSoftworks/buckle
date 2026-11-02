@@ -324,6 +324,7 @@ mod tests {
         RolloutDetail {
             summary: RolloutSummary {
                 id: "42".into(),
+                name: None,
                 revision: "7c2e1f0".into(),
                 revision_message: "m".into(),
                 state: RolloutState::Rolling,
