@@ -108,12 +108,14 @@ impl Task for AptUpdate {
         {
             return Ok(blocked);
         }
+        // The summary is part of the plan digest, so it names the threshold
+        // rather than the index's age: an age ticks on with the clock, and
+        // every re-plan (an approved apply re-plans) would differ.
         match age {
             Some(age) if age < spec.max_age => Ok(Planned::NoOp),
-            Some(age) => Ok(Planned::change(Diff::Opaque {
+            Some(_) => Ok(Planned::change(Diff::Opaque {
                 summary: format!(
-                    "apt-get update (index is {} old, max {})",
-                    format_duration(Duration::from_secs(age.as_secs())),
+                    "apt-get update (index is older than {})",
                     format_duration(spec.max_age)
                 ),
             })),
@@ -180,6 +182,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(planned.is_change(), change, "{planned:?}");
+    }
+
+    /// A stale index plans the same change however much later the host
+    /// re-plans, so an approved plan is not refused as stale on apply.
+    #[rstest]
+    #[case::seconds_later(Duration::from_secs(1))]
+    #[case::minutes_later(Duration::from_secs(5 * 60))]
+    #[case::hours_later(Duration::from_secs(3 * 3600))]
+    #[tokio::test]
+    async fn stale_index_plans_the_same_change_as_time_passes(#[case] later: Duration) {
+        let at = |now: DateTime<Utc>| {
+            host().with_now(now).with_file(
+                "/var/lib/buckle/apt-update.stamp",
+                "2025-12-31T20:00:00Z",
+                FilePerms::default(),
+            )
+        };
+        let now: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let s = spec(json!({"max_age": "1h"}));
+        let (first, second) = (at(now), at(now + later));
+        let a = AptUpdate.plan(&cx(&first), &s).await.unwrap();
+        let b = AptUpdate.plan(&cx(&second), &s).await.unwrap();
+        assert!(a.is_change(), "{a:?}");
+        assert_eq!(a, b);
     }
 
     #[tokio::test]
