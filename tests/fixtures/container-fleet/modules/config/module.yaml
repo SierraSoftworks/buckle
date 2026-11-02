@@ -1,0 +1,26 @@
+name: config
+description: Files, a line edit, a cron job and a guarded command.
+needs: [users]
+tasks:
+  - file.copy: { src: motd, dest: /etc/motd, mode: "0644" }
+  - file.template:
+      src: demo.conf.j2
+      dest: /etc/buckle-demo/demo.conf
+      mode: "0640"
+      owner: root
+      group: buckle-demo
+  - file.line:
+      path: /etc/default/buckle-demo
+      line: BUCKLE_DEMO_ENABLED=yes
+      regex: '^BUCKLE_DEMO_ENABLED='
+      create: true
+  - cron.job:
+      name: buckle-demo
+      schedule: "*/{{ vars.sweep_minutes }} * * * *"
+      command: /usr/bin/test -f /etc/buckle-demo/demo.conf
+  - command.run:
+      run: mkdir -p /var/lib/buckle-demo && date -u > /var/lib/buckle-demo/initialised
+      creates: /var/lib/buckle-demo/initialised
+health:
+  - name: demo-conf
+    file: { path: /etc/buckle-demo/demo.conf, contains: hello from buckle }
