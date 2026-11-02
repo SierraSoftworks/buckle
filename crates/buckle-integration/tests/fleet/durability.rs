@@ -114,13 +114,10 @@ async fn a_rollout_restarted_mid_bake_resumes_where_it_was_and_completes() {
 
 /// Design §10: a restart resumes mid-rollout; the in-memory part (timers and
 /// connected streams) is rebuilt from the database and the reconnecting
-/// agents. Today the controller drives its phases as soon as it loads, before
-/// any agent has reconnected: every planned host counts as offline, so each
-/// phase finishes with its hosts `missed`, the revision is promoted without
-/// the canary's required approval, and the stragglers stage (approval auto)
-/// then applies it everywhere, the canary included.
+/// agents. Hosts still to plan or apply are not taken for offline (missed)
+/// until they reconnect or the disconnect timeout passes, so a phase awaiting
+/// approval keeps awaiting it and nothing is promoted unapproved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "design violation: a restart while awaiting approval promotes the revision unapproved (rollout/controller.rs drive_phases `done` counts not-yet-reconnected hosts as missed)"]
 async fn a_rollout_restarted_while_awaiting_approval_still_awaits_it() {
     let (mut world, _v2, id) = fleet_with_rollout().await;
     let before = world

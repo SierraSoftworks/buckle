@@ -25,7 +25,7 @@ use buckle_proto::v1::{
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -143,6 +143,12 @@ pub enum Command {
         host: String,
         note: String,
     },
+    /// Turn down a rollout awaiting approval: it ends aborted with the
+    /// reason (design §10 "AwaitingApproval → Aborted: rejected").
+    Reject {
+        rollout: String,
+        reason: String,
+    },
 }
 
 impl Command {
@@ -158,6 +164,7 @@ impl Command {
             Command::Skip { .. } => "rollout.host.skip",
             Command::Continue { .. } => "rollout.host.continue",
             Command::Force { .. } => "rollout.host.force",
+            Command::Reject { .. } => "rollout.reject",
         }
     }
 }
@@ -220,6 +227,16 @@ enum Input {
     Agent(String, agent_message::Msg),
     RevisionAdded(String),
     HostChanged(String),
+    HostRegistered(String),
+    /// A durable agent report (ApplyResult, LocalRollback) the gRPC layer
+    /// stored as pending; `done` is told once the controller's reaction is
+    /// persisted (and the pending copy removed), so the report can be acked.
+    Durable {
+        host: String,
+        report_id: u64,
+        msg: agent_message::Msg,
+        done: Option<oneshot::Sender<bool>>,
+    },
     Command {
         actor: String,
         command: Command,
@@ -265,6 +282,34 @@ impl ControllerHandle {
         let _ = self.tx.send(Input::HostChanged(host.to_owned()));
     }
 
+    /// A durable agent report the gRPC layer stored as pending (see
+    /// [`pending_report_key`]). The returned receiver resolves to `true` once
+    /// the controller has persisted its reaction and removed the pending
+    /// copy: only then may the report be acknowledged to the agent. It
+    /// resolves to `false` (or is dropped) when the controller stops first.
+    pub fn durable_report(
+        &self,
+        host: &str,
+        report_id: u64,
+        msg: agent_message::Msg,
+    ) -> oneshot::Receiver<bool> {
+        let (done, rx) = oneshot::channel();
+        let _ = self.tx.send(Input::Durable {
+            host: host.to_owned(),
+            report_id,
+            msg,
+            done: Some(done),
+        });
+        rx
+    }
+
+    /// A host row was created by registration or enrolment (possibly a
+    /// forgotten host coming back): refresh whether it is excluded. Its
+    /// session's Welcome tells the agent its status, so nothing is pushed.
+    pub fn host_registered(&self, host: &str) {
+        let _ = self.tx.send(Input::HostRegistered(host.to_owned()));
+    }
+
     /// Runs an operator command and returns the rollout id it concerned.
     pub async fn command(&self, actor: &str, command: Command) -> Result<String, CommandError> {
         let (reply, rx) = oneshot::channel();
@@ -279,11 +324,47 @@ impl ControllerHandle {
     }
 }
 
+fn not_saved() -> buckle_core::Error {
+    buckle_core::error::system(
+        "The rollout controller accepted the change but could not save it yet.",
+        &[
+            "The controller keeps retrying and the change takes effect once it is saved; check the server logs for the database error.",
+        ],
+    )
+}
+
 fn stopped() -> buckle_core::Error {
     buckle_core::error::system(
         "The rollout controller is not running.",
         &["The server is shutting down or the controller crashed; check the server logs."],
     )
+}
+
+/// The kv key under which the gRPC layer keeps a durable report until the
+/// controller has persisted its reaction to it.
+pub fn pending_report_key(host: &str, report_id: u64) -> String {
+    format!("{}{host}/{report_id}", keys::PENDING_REPORT_PREFIX)
+}
+
+/// The kv value of a pending durable report: the agent message, encoded.
+pub fn encode_pending_report(host: &str, report_id: u64, msg: &agent_message::Msg) -> String {
+    use prost::Message;
+    let bytes = pb::AgentMessage {
+        msg: Some(msg.clone()),
+    }
+    .encode_to_vec();
+    serde_json::json!({"host": host, "report_id": report_id, "message": hex::encode(bytes)})
+        .to_string()
+}
+
+fn decode_pending_report(value: &str) -> Option<(String, u64, agent_message::Msg)> {
+    use prost::Message;
+    let v: serde_json::Value = serde_json::from_str(value).ok()?;
+    let host = v.get("host")?.as_str()?.to_owned();
+    let report_id = v.get("report_id")?.as_u64()?;
+    let bytes = hex::decode(v.get("message")?.as_str()?).ok()?;
+    let msg = pb::AgentMessage::decode(bytes.as_slice()).ok()?.msg?;
+    Some((host, report_id, msg))
 }
 
 /// The HMAC approval token the Apply message carries.
@@ -304,6 +385,20 @@ pub async fn spawn(
     let mut controller = Controller::load(deps).await?;
     let handle = ControllerHandle { tx };
     let task = tokio::spawn(async move {
+        // Durable reports the gRPC layer stored but whose reaction was not
+        // saved before the server stopped (they were never acked: the ack
+        // waits for that checkpoint). Replay them before any other input.
+        for (host, report_id, msg) in std::mem::take(&mut controller.replay) {
+            tracing::info!(buckle.host = %host, report = report_id, "replaying a durable report stored before a restart");
+            controller
+                .handle(Input::Durable {
+                    host,
+                    report_id,
+                    msg,
+                    done: None,
+                })
+                .await;
+        }
         controller.drive().await;
         controller.flush().await;
         controller.run(rx, cancel).await;
@@ -367,6 +462,21 @@ struct Controller {
     stable: Option<String>,
     stable_dirty: bool,
     excluded: HashSet<String>,
+    /// Each host's status and effective labels as last seen, so a host
+    /// update that changes neither (e.g. notes) is not acted on.
+    host_seen: HashMap<String, (HostStatus, BTreeMap<String, String>)>,
+    /// The last checkpoint failed: retry it at this time.
+    flush_retry: Option<DateTime<Utc>>,
+    /// Consecutive failed checkpoints (for the retry backoff).
+    flush_failures: u32,
+    /// Durable reports already reacted to by this process, by (host, id).
+    consumed: HashSet<(String, u64)>,
+    /// Pending-report keys to delete with the next checkpoint.
+    pending_clear: Vec<String>,
+    /// Waiting for the next successful checkpoint to ack their reports.
+    ack_waiters: Vec<oneshot::Sender<bool>>,
+    /// Pending durable reports found on load, replayed before any input.
+    replay: Vec<(String, u64, agent_message::Msg)>,
 }
 
 fn msg(m: server_message::Msg) -> ServerMessage {
@@ -391,6 +501,22 @@ fn check_name(r: &pb::HealthResult) -> String {
 /// A required, failing (not unknown), non-waived check.
 fn is_failure(r: &pb::HealthResult, waived: &[String]) -> bool {
     r.required && !r.passed && !r.unknown && !waived.contains(&check_name(r))
+}
+
+/// A host a rollback applies the previous stable revision to: one this
+/// rollout sent an Apply, unless an operator excluded (skipped) it.
+fn rollback_target(h: &RolloutHostRecord) -> bool {
+    h.runtime.applied && h.state != HostPhase::Skipped
+}
+
+/// Host states that wait on the agent after a server restart: the
+/// disconnect clock starts for them on load.
+fn awaits_reconnect(state: HostPhase) -> bool {
+    state.in_flight()
+        || matches!(
+            state,
+            HostPhase::RollingBack | HostPhase::PlanPending | HostPhase::Planned
+        )
 }
 
 fn traceparent_of(span: &Span) -> Option<String> {
@@ -432,31 +558,84 @@ impl Controller {
                     let approvals = db.approvals().for_rollout(&r.id)?;
                     out.push((r, hosts, approvals));
                 }
-                let excluded: HashSet<String> = db
-                    .hosts()
-                    .list()?
-                    .into_iter()
+                let all = db.hosts().list()?;
+                let excluded: HashSet<String> = all
+                    .iter()
                     .filter(|h| h.status != HostStatus::Active)
-                    .map(|h| h.id)
+                    .map(|h| h.id.clone())
                     .collect();
-                Ok((out, db.kv().get(keys::STABLE_REVISION)?, excluded))
+                let seen: HashMap<String, (HostStatus, BTreeMap<String, String>)> = all
+                    .iter()
+                    .map(|h| (h.id.clone(), (h.status, h.effective_labels())))
+                    .collect();
+                let pending = db.kv().with_prefix(keys::PENDING_REPORT_PREFIX)?;
+                Ok((
+                    out,
+                    db.kv().get(keys::STABLE_REVISION)?,
+                    (excluded, seen, pending),
+                ))
             })
             .await?;
+        let (excluded, host_seen, pending) = excluded;
+        let mut replay = Vec::new();
+        for (key, value) in pending {
+            match decode_pending_report(&value) {
+                Some(r) => replay.push(r),
+                None => {
+                    tracing::warn!(key = %key, "a pending durable report could not be decoded; ignoring it")
+                }
+            }
+        }
+        // Oldest first (report ids are monotonic per agent).
+        replay.sort_by_key(|(_, id, _)| *id);
         let now = deps.clock.now();
         let mut live = Vec::new();
-        for (record, mut hosts, approvals) in records {
+        let mut unloadable: Vec<(RolloutRecord, NewAudit)> = Vec::new();
+        for (mut record, mut hosts, approvals) in records {
             let revision = match deps.revisions.load(&record.revision).await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::error!(rollout = %record.id, error = %e, "a live rollout's revision could not be loaded; leaving it as it is");
+                    // It can never make progress: end it, saying why, rather
+                    // than leaving it looking live for ever.
+                    tracing::error!(rollout = %record.id, error = %e, "a live rollout's revision could not be loaded; aborting it");
+                    let why = format!(
+                        "revision {} could not be loaded at start-up: {}",
+                        short(&record.revision),
+                        e.description()
+                    );
+                    let from = crate::store::rollouts::state_str(record.state);
+                    record.state = RolloutState::Aborted;
+                    record.finished_at = Some(now);
+                    record.runtime.stragglers_open = false;
+                    record.runtime.end_reason = Some(why.clone());
+                    let audit = NewAudit {
+                        at: now,
+                        actor: "controller".into(),
+                        action: "rollout.aborted".into(),
+                        outcome: "ok".into(),
+                        subject: Some(record.id.clone()),
+                        message: format!("rollout {from} → aborted: {why}"),
+                        detail: Some(serde_json::json!({"from": from, "to": "aborted"})),
+                        trace_id: record.runtime.trace_id.clone(),
+                    };
+                    unloadable.push((record, audit));
                     continue;
                 }
             };
             // Every session is gone after a restart: start the disconnect clock
-            // for hosts that are waiting on an agent.
+            // for hosts that are waiting on an agent, and for hosts still to
+            // plan or apply, so they are not taken for offline (and missed)
+            // before their agents had a chance to reconnect.
             let mut dirty_hosts = BTreeSet::new();
+            let gate_pending: HashSet<String> = record
+                .runtime
+                .phases
+                .iter()
+                .filter_map(|p| p.gate.as_ref())
+                .flat_map(|g| g.pending.keys().cloned())
+                .collect();
             for (i, h) in hosts.iter_mut().enumerate() {
-                if (h.state.in_flight() || h.state == HostPhase::RollingBack)
+                if (awaits_reconnect(h.state) || gate_pending.contains(&h.host))
                     && h.runtime.disconnected_at.is_none()
                 {
                     h.runtime.disconnected_at = Some(now);
@@ -480,6 +659,17 @@ impl Controller {
                 dirty_hosts,
             });
         }
+        if !unloadable.is_empty() {
+            deps.store
+                .transaction(move |db| {
+                    for (r, a) in &unloadable {
+                        db.rollouts().save(r)?;
+                        db.audit().add(a)?;
+                    }
+                    Ok(())
+                })
+                .await?;
+        }
         Ok(Self {
             store: deps.store,
             link: deps.link,
@@ -495,6 +685,13 @@ impl Controller {
             stable,
             stable_dirty: false,
             excluded,
+            host_seen,
+            flush_retry: None,
+            flush_failures: 0,
+            consumed: HashSet::new(),
+            pending_clear: Vec::new(),
+            ack_waiters: Vec::new(),
+            replay,
         })
     }
 
@@ -534,6 +731,15 @@ impl Controller {
         self.connected(host) && !self.excluded.contains(host)
     }
 
+    /// Whether a host still to plan or apply counts as missing its phase:
+    /// excluded, or disconnected and not inside a reconnect grace (after a
+    /// restart every host is disconnected until its agent comes back; the
+    /// disconnect clock started by [`Controller::load`] bounds the wait).
+    fn offline_for_phase(&self, h: &RolloutHostRecord) -> bool {
+        self.excluded.contains(&h.host)
+            || (!self.connected(&h.host) && h.runtime.disconnected_at.is_none())
+    }
+
     /// Whether host `hi` may be sent an Apply (or a baseline check leading
     /// to one) now: the rollout is running (not paused, rolling back or
     /// finished), or the host is in the open stragglers stage, and the host
@@ -543,9 +749,22 @@ impl Controller {
         let open = if self.is_virtual(ri, hi) {
             record.runtime.stragglers_open
         } else {
-            record.is_running()
+            record.is_running() || self.released_while_paused(ri, hi)
         };
         open && self.eligible(&self.live[ri].hosts[hi].host)
+    }
+
+    /// An operator released host `hi` (retry, continue) while the rollout is
+    /// paused by a failure: it proceeds although nothing else starts.
+    fn released_while_paused(&self, ri: usize, hi: usize) -> bool {
+        let record = &self.live[ri].record;
+        record.state == RolloutState::Paused
+            && self.live[ri].hosts[hi].runtime.released
+            && record
+                .runtime
+                .pause
+                .as_ref()
+                .is_none_or(|p| p.kind != "operator")
     }
 
     /// Returns a host whose baseline check or apply cannot go ahead (the
@@ -616,6 +835,7 @@ impl Controller {
         self.touch_host(ri, hi);
         if state.finished() || state == HostPhase::Held {
             self.live[ri].host_spans.remove(&host);
+            self.live[ri].hosts[hi].runtime.released = false;
         }
         let message = if why.is_empty() {
             format!("{host}: {} → {}", from.as_str(), state.as_str())
@@ -623,9 +843,16 @@ impl Controller {
             format!("{host}: {} → {} ({why})", from.as_str(), state.as_str())
         };
         tracing::info!(buckle.rollout = %rollout, buckle.host = %host, buckle.phase = %phase, from = from.as_str(), to = state.as_str(), "rollout host transition");
+        // Ordinary progress (planned, applying, baking, ...) reaches the UI
+        // as a live host event from the checkpoint; only outcomes (healthy,
+        // failed, held, skipped, rolled back, missed) go to the audit log.
+        let action = format!("rollout.host.{}", state.as_str());
+        if buckle_api::is_progress_action("controller", &action) {
+            return;
+        }
         self.audit(
             "controller",
-            &format!("rollout.host.{}", state.as_str()),
+            &action,
             &rollout,
             message,
             serde_json::json!({"host": host, "phase": phase, "from": from.as_str(), "to": state.as_str()}),
@@ -636,6 +863,20 @@ impl Controller {
     fn set_rollout_state(&mut self, ri: usize, state: RolloutState, actor: &str, why: &str) {
         let live = &mut self.live[ri];
         if live.record.state == state {
+            return;
+        }
+        // The display moving between planning, rolling and baking as waves
+        // come and go is progress: live events only, not the audit log.
+        let progress = |s: RolloutState| {
+            matches!(
+                s,
+                RolloutState::Planning | RolloutState::Rolling | RolloutState::Baking
+            )
+        };
+        if why.is_empty() && progress(live.record.state) && progress(state) {
+            tracing::debug!(buckle.rollout = %live.record.id, from = ?live.record.state, to = ?state, "rollout progress");
+            live.record.state = state;
+            live.dirty = true;
             return;
         }
         let from = live.record.state;
@@ -701,6 +942,29 @@ impl Controller {
             },
             Input::RevisionAdded(id) => self.on_revision_added(&id).await,
             Input::HostChanged(host) => self.on_host_changed(&host).await,
+            Input::HostRegistered(host) => self.on_host_registered(&host).await,
+            Input::Durable {
+                host,
+                report_id,
+                msg,
+                done,
+            } => {
+                let key = (host.clone(), report_id);
+                if self.consumed.insert(key) {
+                    match msg {
+                        agent_message::Msg::Result(r) => self.on_apply_result(&host, r),
+                        agent_message::Msg::Rollback(r) => self.on_local_rollback(&host, r),
+                        _ => {}
+                    }
+                }
+                // Removed with the checkpoint that holds the reaction (again,
+                // harmlessly, for a report already consumed).
+                self.pending_clear
+                    .push(pending_report_key(&host, report_id));
+                if let Some(done) = done {
+                    self.ack_waiters.push(done);
+                }
+            }
             Input::Command {
                 actor,
                 command,
@@ -722,7 +986,11 @@ impl Controller {
                 }
                 // Flush before replying so the caller observes the new state.
                 self.drive().await;
-                self.flush().await;
+                let saved = self.flush().await;
+                let result = match result {
+                    Ok(_) if !saved => Err(CommandError::internal(not_saved())),
+                    other => other,
+                };
                 let _ = reply.send(result);
             }
         }
@@ -786,10 +1054,18 @@ impl Controller {
                         self.resend_apply(ri, hi);
                     }
                 }
-                HostPhase::Baking => {
+                HostPhase::Baking if self.bake_seconds(ri, hi) > 0 => {
+                    // Resume the bake. Past its window, a host that was away
+                    // reports afresh before it counts as baked, and a check
+                    // still failing is followed through settle.
                     let until = self.live[ri].hosts[hi].runtime.bake_until.unwrap_or(now);
                     if until > now {
                         self.send_bake_request(ri, hi, until);
+                    } else if c.new_session {
+                        let h = &mut self.live[ri].hosts[hi];
+                        h.runtime.bake_reports = 0;
+                        h.runtime.bake_until = Some(now);
+                        self.send_bake_request(ri, hi, now);
                     }
                 }
                 HostPhase::RollingBack => {
@@ -856,6 +1132,23 @@ impl Controller {
                 continue;
             };
             let h = &self.live[ri].hosts[hi];
+            // The agent could not plan the rollback (it reports a failed
+            // plan for the previous stable revision): the rollback failed.
+            if h.state == HostPhase::RollingBack
+                && !plan.error.is_empty()
+                && self.live[ri].record.runtime.previous_stable.as_deref()
+                    == Some(plan.revision.as_str())
+            {
+                self.live[ri].hosts[hi].runtime.error =
+                    Some(format!("rollback failed: planning failed: {}", plan.error));
+                self.set_host_state(
+                    ri,
+                    hi,
+                    HostPhase::Failed,
+                    "rollback failed; needs attention",
+                );
+                continue;
+            }
             if h.runtime.revision != plan.revision {
                 continue;
             }
@@ -873,7 +1166,14 @@ impl Controller {
             if !plan.error.is_empty() && !stale {
                 let error = format!("planning failed: {}", plan.error);
                 self.live[ri].hosts[hi].runtime.error = Some(error.clone());
-                self.fail_host(ri, hi, &error);
+                if self.later_phase(ri, hi) {
+                    // Shown now, charged to its phase's budget once that
+                    // phase starts (drive_phases), so an earlier phase is
+                    // not paused for it.
+                    self.set_host_state(ri, hi, HostPhase::Failed, &error);
+                } else {
+                    self.fail_host(ri, hi, &error);
+                }
                 continue;
             }
             let plan_json: Option<serde_json::Value> = serde_json::from_slice(&plan.plan_json).ok();
@@ -884,6 +1184,10 @@ impl Controller {
                 h.runtime.plan_changes = Some(plan.changes);
                 h.runtime.plan_removals = Some(plan.removals);
                 h.runtime.destructive = plan.destructive;
+                h.runtime.deferred_modules = plan.deferred_modules.clone();
+                // A new plan: what failed before no longer describes it.
+                h.runtime.failed_checks.clear();
+                h.runtime.failed_module = None;
                 // A valid plan with modules that could not be planned: shown
                 // on the host; applying it fails those modules only.
                 h.runtime.error = (!plan.module_errors.is_empty()).then(|| {
@@ -907,7 +1211,12 @@ impl Controller {
             let target = self.live[ri].hosts[hi].runtime.revision.clone();
             let prev = self.live[ri].record.runtime.previous_stable.clone();
             match state {
-                HostPhase::Applying if result.revision == target => {
+                HostPhase::Applying
+                    if result.revision == target
+                        && (result.plan_digest.is_empty()
+                            || self.live[ri].hosts[hi].plan_digest.as_deref()
+                                == Some(result.plan_digest.as_str())) =>
+                {
                     self.live[ri].hosts[hi].result =
                         serde_json::to_value(ResultView::from(&result)).ok();
                     if result.succeeded {
@@ -940,10 +1249,10 @@ impl Controller {
                         self.fail_host(ri, hi, &why);
                     }
                 }
-                HostPhase::RollingBack
-                    if prev.as_deref() == Some(result.revision.as_str())
-                        || prev.as_deref() == Some(result.applied_revision.as_str()) =>
-                {
+                // Only the result of applying the previous stable revision is
+                // the rollback's: a forward result that failed and left the
+                // host on that revision (applied_revision) is not.
+                HostPhase::RollingBack if prev.as_deref() == Some(result.revision.as_str()) => {
                     if result.succeeded {
                         self.set_host_state(
                             ri,
@@ -970,6 +1279,7 @@ impl Controller {
     fn on_health(&mut self, host: &str, report: HealthReport) {
         let scope = HealthScope::try_from(report.scope).unwrap_or(HealthScope::Unspecified);
         let now = self.now();
+        tracing::debug!(buckle.host = %host, scope = ?scope, request = %report.request_id, revision = %report.revision, results = report.results.len(), "health report");
         for ri in 0..self.live.len() {
             // Pre-phase gate answers.
             let gate_phase = self.live[ri].record.runtime.phases.iter().position(|p| {
@@ -1000,21 +1310,16 @@ impl Controller {
                     }
                     self.live[ri].dirty = true;
                 } else {
-                    self.live[ri].record.runtime.phases[pi].gate = None;
-                    self.live[ri].dirty = true;
-                    if let Some(hi) = self.live[ri].find(host) {
-                        self.live[ri].hosts[hi].runtime.failed_checks = failures.clone();
-                        self.touch_host(ri, hi);
-                    }
-                    self.pause(
-                        ri,
-                        "gate",
-                        format!(
-                            "pre-phase gate after '{phase_name}': {host} is failing {}",
-                            failures.join(", ")
-                        ),
-                        Some(host.to_owned()),
+                    let why = format!(
+                        "pre-phase gate after '{phase_name}': failing {}",
+                        failures.join(", ")
                     );
+                    if let Some(hi) = self.live[ri].find(host) {
+                        self.live[ri].hosts[hi].health =
+                            serde_json::to_value(HealthView::from(&report)).ok();
+                        self.live[ri].hosts[hi].runtime.failed_checks = failures.clone();
+                    }
+                    self.fail_gate(ri, pi, host, &why);
                 }
                 continue;
             }
@@ -1045,6 +1350,7 @@ impl Controller {
                         match self.live[ri].record.policy.health.baseline {
                             BaselinePolicy::Hold => {
                                 self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                                self.live[ri].hosts[hi].runtime.held_at_baseline = true;
                                 self.set_host_state(ri, hi, HostPhase::Held, &why);
                             }
                             BaselinePolicy::Skip => {
@@ -1055,10 +1361,21 @@ impl Controller {
                         }
                     }
                 }
-                (HealthScope::Bake, HostPhase::Baking) => {
+                // A bake report belongs to this rollout's bake of the host:
+                // its revision and request (when the agent names them).
+                (HealthScope::Bake, HostPhase::Baking)
+                    if (report.revision.is_empty()
+                        || report.revision == self.live[ri].hosts[hi].runtime.revision)
+                        && (report.request_id.is_empty()
+                            || self.live[ri].hosts[hi]
+                                .runtime
+                                .bake_requests
+                                .contains(&report.request_id)) =>
+                {
                     self.live[ri].hosts[hi].health =
                         serde_json::to_value(HealthView::from(&report)).ok();
                     let h = &mut self.live[ri].hosts[hi];
+                    h.runtime.bake_reports = h.runtime.bake_reports.saturating_add(1);
                     for r in &report.results {
                         let name = check_name(r);
                         if is_failure(r, &waived) {
@@ -1168,6 +1485,26 @@ impl Controller {
         }
     }
 
+    async fn on_host_registered(&mut self, host: &str) {
+        let h = host.to_owned();
+        let Some(record) = self
+            .store
+            .call(move |db| db.hosts().get(&h))
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        if record.status == HostStatus::Active {
+            self.excluded.remove(host);
+        } else {
+            self.excluded.insert(host.to_owned());
+        }
+        self.host_seen
+            .insert(host.to_owned(), (record.status, record.effective_labels()));
+    }
+
     async fn on_host_changed(&mut self, host: &str) {
         let h = host.to_owned();
         let record = self
@@ -1184,6 +1521,21 @@ impl Controller {
                 self.excluded.insert(host.to_owned());
             }
         }
+        if record.is_none() {
+            self.host_seen.remove(host);
+            self.forget_host(host);
+            return;
+        }
+        // Only a change the agent and the rollout care about (status or
+        // effective labels; not notes) is pushed and re-sends in-flight work.
+        let seen = record
+            .as_ref()
+            .map(|r| (r.status, r.effective_labels()))
+            .expect("checked above");
+        if self.host_seen.get(host) == Some(&seen) {
+            return;
+        }
+        self.host_seen.insert(host.to_owned(), seen);
         if let Some(r) = &record
             && self.connected(host)
         {
@@ -1200,6 +1552,39 @@ impl Controller {
                 ..Default::default()
             })
             .await;
+        }
+    }
+
+    /// A forgotten host leaves every live rollout it has not finished:
+    /// skipped (it no longer exists, so it is neither waited for nor counted
+    /// as a failure) and dropped from pending gates.
+    fn forget_host(&mut self, host: &str) {
+        for ri in 0..self.live.len() {
+            let mut gated = false;
+            for p in &mut self.live[ri].record.runtime.phases {
+                if let Some(g) = p.gate.as_mut() {
+                    gated |= g.pending.remove(host).is_some();
+                }
+            }
+            self.live[ri].dirty |= gated;
+            let Some(hi) = self.live[ri].find(host) else {
+                continue;
+            };
+            let state = self.live[ri].hosts[hi].state;
+            if matches!(
+                state,
+                HostPhase::Healthy | HostPhase::Skipped | HostPhase::RolledBack
+            ) {
+                continue;
+            }
+            {
+                let h = &mut self.live[ri].hosts[hi];
+                h.runtime.error = Some("the host was forgotten".into());
+                h.runtime.disconnected_at = None;
+                h.runtime.request_id = None;
+            }
+            self.set_host_state(ri, hi, HostPhase::Skipped, "the host was forgotten");
+            self.unpause_if_cleared(ri, "controller");
         }
     }
 
@@ -1304,18 +1689,19 @@ impl Controller {
                         &["Check the rollout's state."],
                     ));
                 }
-                // Accept the failures that caused the pause.
-                let p = self.live[ri].record.runtime.current_phase;
-                if p < self.live[ri].record.runtime.phases.len() {
-                    let hosts = self.live[ri].phase_hosts(p);
-                    let failures = hosts
-                        .iter()
-                        .filter(|&&i| self.live[ri].hosts[i].state == HostPhase::Failed)
-                        .count() as u32;
-                    let phase = &mut self.live[ri].record.runtime.phases[p];
-                    let budget = phase.failure_budget(hosts.len());
+                // Accept the failures that caused the pause, in the current
+                // phase and in earlier ones (a pre-phase gate can fail a host
+                // of an earlier phase).
+                let current = self.live[ri].record.runtime.current_phase;
+                for p in 0..self.live[ri].record.runtime.phases.len() {
+                    if p > current || self.live[ri].record.runtime.phases[p].virtual_stage {
+                        continue;
+                    }
+                    let (failures, budget) = self.phase_failures(ri, p);
                     if failures > budget {
-                        phase.accepted_failures += failures - budget;
+                        self.live[ri].record.runtime.phases[p].accepted_failures +=
+                            failures - budget;
+                        self.live[ri].dirty = true;
                     }
                 }
                 self.command_audit(
@@ -1354,6 +1740,44 @@ impl Controller {
                     serde_json::json!({"note": note}),
                 );
                 self.begin_rollback(ri, actor);
+                Ok(rollout)
+            }
+            Command::Reject { rollout, reason } => {
+                let ri = self.find_rollout(&rollout)?;
+                let reason = reason.trim().to_owned();
+                if reason.is_empty() {
+                    return Err(CommandError::invalid(
+                        "Say why the rollout is rejected.",
+                        &["The reason is recorded in the audit log."],
+                    ));
+                }
+                if self.live[ri].record.state != RolloutState::AwaitingApproval {
+                    return Err(CommandError::conflict(
+                        format!(
+                            "Rollout '{rollout}' is not awaiting approval, so there is nothing to reject."
+                        ),
+                        &["Abort it instead."],
+                    ));
+                }
+                let phase = self.live[ri]
+                    .record
+                    .runtime
+                    .phases
+                    .get(self.live[ri].record.runtime.current_phase)
+                    .map(|p| p.name.clone());
+                self.command_audit(
+                    actor,
+                    "rollout.reject",
+                    ri,
+                    format!("{actor} rejected the rollout: {reason}"),
+                    serde_json::json!({"reason": reason, "phase": phase}),
+                );
+                self.finish(
+                    ri,
+                    RolloutState::Aborted,
+                    actor,
+                    &format!("rejected by {actor}: {reason}"),
+                );
                 Ok(rollout)
             }
             Command::Abort { rollout, note } => {
@@ -1427,6 +1851,24 @@ impl Controller {
                 if waive.is_empty() {
                     return Err(CommandError::invalid(
                         "Name at least one check (module/check) to waive.",
+                        &["Pass the failed checks shown on the host."],
+                    ));
+                }
+                let unknown: Vec<&String> = waive
+                    .iter()
+                    .filter(|w| !h.runtime.failed_checks.contains(w))
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(CommandError::invalid(
+                        format!(
+                            "Host '{host}' did not fail {}; only its failed checks ({}) can be waived.",
+                            unknown
+                                .iter()
+                                .map(|w| w.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            h.runtime.failed_checks.join(", ")
+                        ),
                         &["Pass the failed checks shown on the host."],
                     ));
                 }
@@ -1772,6 +2214,8 @@ impl Controller {
         live.record.started_at = now;
         let mut untargeted = Vec::new();
         for (host, facts) in hosts {
+            self.host_seen
+                .insert(host.id.clone(), (host.status, host.effective_labels()));
             if host.status != HostStatus::Active {
                 continue;
             }
@@ -1835,6 +2279,7 @@ impl Controller {
             h.runtime.request_id = None;
             h.runtime.bake_until = None;
             h.runtime.attempts += 1;
+            h.runtime.released = true;
             h.plan_digest = None;
         }
         self.set_host_state(ri, hi, HostPhase::PlanPending, "re-planning");
@@ -1865,11 +2310,85 @@ impl Controller {
     }
 
     /// Operator decisions on a host resume a paused rollout (design: "Paused
-    /// → Rolling: resume or retry host"); a failure-budget breach that still
-    /// stands will pause it again on the next failure.
+    /// → Rolling: resume or retry host") once what paused it is cleared: never
+    /// an operator's own pause, never while a failure budget is still breached,
+    /// and for a gate or local-rollback pause only once the host it named is
+    /// no longer failed.
     fn unpause_if_cleared(&mut self, ri: usize, actor: &str) {
-        if self.live[ri].record.state == RolloutState::Paused {
+        if self.live[ri].record.state == RolloutState::Paused && self.pause_cleared(ri) {
             self.unpause(ri, actor);
+        }
+    }
+
+    fn pause_cleared(&self, ri: usize) -> bool {
+        let live = &self.live[ri];
+        let Some(pause) = &live.record.runtime.pause else {
+            return true;
+        };
+        if pause.kind == "operator" || self.breach(ri).is_some() {
+            return false;
+        }
+        match pause.kind.as_str() {
+            "failure_budget" => true,
+            "gate" | "local_rollback" => pause.host.as_ref().is_none_or(|h| {
+                live.find(h).is_none_or(|i| {
+                    !matches!(live.hosts[i].state, HostPhase::Failed | HostPhase::Held)
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    /// Failed hosts in phase `p` and the failures it tolerates.
+    fn phase_failures(&self, ri: usize, p: usize) -> (u32, u32) {
+        let hosts = self.live[ri].phase_hosts(p);
+        let failures = hosts
+            .iter()
+            .filter(|&&i| self.live[ri].hosts[i].state == HostPhase::Failed)
+            .count() as u32;
+        let budget = self.live[ri].record.runtime.phases[p].failure_budget(hosts.len());
+        (failures, budget)
+    }
+
+    /// The first phase up to the current one whose failures exceed its
+    /// budget, as (phase, failures, budget), unless `on_failure: continue`.
+    fn breach(&self, ri: usize) -> Option<(usize, u32, u32)> {
+        let record = &self.live[ri].record;
+        if record.policy.on_failure == FailurePolicy::Continue {
+            return None;
+        }
+        let current = record.runtime.current_phase;
+        (0..record.runtime.phases.len())
+            .filter(|&p| p <= current && !record.runtime.phases[p].virtual_stage)
+            .find_map(|p| {
+                let (failures, budget) = self.phase_failures(ri, p);
+                (failures > budget).then_some((p, failures, budget))
+            })
+    }
+
+    /// Acts on a standing failure-budget breach per `on_failure`.
+    fn on_breach(&mut self, ri: usize, p: usize, failures: u32, latest: Option<(String, String)>) {
+        let phase = &self.live[ri].record.runtime.phases[p];
+        let reason = match &latest {
+            Some((host, why)) => format!(
+                "phase '{}': {failures} failed host(s) exceed max_failures {} (latest: {host}: {why})",
+                phase.name,
+                view::parallel_str(phase.max_failures)
+            ),
+            None => format!(
+                "phase '{}': {failures} failed host(s) exceed max_failures {}",
+                phase.name,
+                view::parallel_str(phase.max_failures)
+            ),
+        };
+        let host = latest.map(|(h, _)| h);
+        match self.live[ri].record.policy.on_failure {
+            FailurePolicy::Pause => self.pause(ri, "failure_budget", reason, host),
+            FailurePolicy::Rollback if self.live[ri].record.runtime.previous_stable.is_some() => {
+                self.begin_rollback(ri, "controller")
+            }
+            FailurePolicy::Rollback => self.pause(ri, "failure_budget", reason, host),
+            FailurePolicy::Continue => {}
         }
     }
 
@@ -1888,7 +2407,7 @@ impl Controller {
         let last = self.live[ri]
             .hosts
             .iter()
-            .filter(|h| h.runtime.applied)
+            .filter(|h| rollback_target(h))
             .filter_map(|h| h.runtime.phase_index)
             .max();
         self.live[ri].record.runtime.rollback_phase = last;
@@ -2034,6 +2553,8 @@ impl Controller {
             let h = &mut self.live[ri].hosts[hi];
             h.runtime.bake_until = Some(until);
             h.runtime.failing_since.clear();
+            h.runtime.bake_reports = 0;
+            h.runtime.bake_requests.clear();
         }
         self.set_host_state(ri, hi, HostPhase::Baking, "applied; baking");
         if bake > 0 {
@@ -2041,13 +2562,41 @@ impl Controller {
         }
     }
 
+    /// The bake window of host `hi`'s phase, in seconds.
+    fn bake_seconds(&self, ri: usize, hi: usize) -> u64 {
+        self.live[ri].hosts[hi]
+            .runtime
+            .phase_index
+            .and_then(|i| self.live[ri].record.runtime.phases.get(i))
+            .map(|p| p.bake_seconds)
+            .unwrap_or(0)
+    }
+
+    /// How long after its bake window a connected host that never sent a
+    /// bake report is given before it fails.
+    fn bake_report_grace(&self, ri: usize) -> chrono::Duration {
+        let settle =
+            chrono::Duration::from_std(self.live[ri].record.policy.settle).unwrap_or_default();
+        settle.max(chrono::Duration::minutes(1))
+    }
+
     fn send_bake_request(&mut self, ri: usize, hi: usize, until: DateTime<Utc>) {
         let span = self.host_span(ri, hi);
         let host = self.live[ri].hosts[hi].host.clone();
+        let request_id = new_id();
+        {
+            let requests = &mut self.live[ri].hosts[hi].runtime.bake_requests;
+            requests.push(request_id.clone());
+            // A handful is plenty (one per reconnect).
+            if requests.len() > 8 {
+                requests.remove(0);
+            }
+        }
+        self.touch_host(ri, hi);
         self.send(
             &host,
             server_message::Msg::Health(RunHealth {
-                request_id: new_id(),
+                request_id,
                 scope: HealthScope::Bake as i32,
                 modules: vec![],
                 until: Some(timestamp(until)),
@@ -2074,6 +2623,15 @@ impl Controller {
         );
     }
 
+    /// Host `hi` belongs to a phase after the one being worked on.
+    fn later_phase(&self, ri: usize, hi: usize) -> bool {
+        !self.is_virtual(ri, hi)
+            && self.live[ri].hosts[hi]
+                .runtime
+                .phase_index
+                .is_some_and(|p| p > self.live[ri].record.runtime.current_phase)
+    }
+
     fn is_virtual(&self, ri: usize, hi: usize) -> bool {
         self.live[ri].hosts[hi]
             .runtime
@@ -2093,35 +2651,18 @@ impl Controller {
         let Some(pi) = self.live[ri].hosts[hi].runtime.phase_index else {
             return;
         };
-        let hosts = self.live[ri].phase_hosts(pi);
-        let failures = hosts
-            .iter()
-            .filter(|&&i| self.live[ri].hosts[i].state == HostPhase::Failed)
-            .count() as u32;
-        let phase = &self.live[ri].record.runtime.phases[pi];
-        let budget = phase.failure_budget(hosts.len());
+        let (failures, budget) = self.phase_failures(ri, pi);
         if failures <= budget {
             return;
         }
         let host = self.live[ri].hosts[hi].host.clone();
-        let reason = format!(
-            "phase '{}': {failures} failed host(s) exceed max_failures {} (latest: {host}: {why})",
-            phase.name,
-            view::parallel_str(phase.max_failures)
-        );
-        match self.live[ri].record.policy.on_failure {
-            FailurePolicy::Pause => self.pause(ri, "failure_budget", reason, Some(host)),
-            FailurePolicy::Rollback if self.live[ri].record.runtime.previous_stable.is_some() => {
-                self.begin_rollback(ri, "controller")
-            }
-            FailurePolicy::Rollback => self.pause(ri, "failure_budget", reason, Some(host)),
-            FailurePolicy::Continue => {}
-        }
+        self.on_breach(ri, pi, failures, Some((host, why.to_owned())));
     }
 
     // ------------------------------------------------------------ timers
 
     fn next_deadline(&self) -> Option<DateTime<Utc>> {
+        let now = self.now();
         let settle =
             |l: &Live| chrono::Duration::from_std(l.record.policy.settle).unwrap_or_default();
         let timeout =
@@ -2132,14 +2673,37 @@ impl Controller {
         let mut consider = |t: DateTime<Utc>| {
             next = Some(next.map_or(t, |n| n.min(t)));
         };
+        if let Some(t) = self.flush_retry {
+            consider(t);
+        }
         for l in &self.live {
             for h in &l.hosts {
                 if h.state == HostPhase::Baking {
                     for since in h.runtime.failing_since.values() {
                         consider(*since + settle(l));
                     }
+                    // A window already past is a deadline only when it can
+                    // complete the host now; while a check is followed through
+                    // settle it would spin (settle is the deadline then), and
+                    // a host that has not reported is waited for a grace.
+                    let window = h
+                        .runtime
+                        .phase_index
+                        .and_then(|i| l.record.runtime.phases.get(i))
+                        .is_some_and(|p| p.bake_seconds > 0);
                     if let Some(u) = h.runtime.bake_until {
-                        consider(u);
+                        if u > now
+                            || (h.runtime.failing_since.is_empty()
+                                && (!window
+                                    || (h.runtime.bake_reports > 0 && self.connected(&h.host))))
+                        {
+                            consider(u);
+                        } else if window && h.runtime.bake_reports == 0 {
+                            let grace = settle(l).max(chrono::Duration::minutes(1));
+                            if u + grace > now {
+                                consider(u + grace);
+                            }
+                        }
                     }
                 }
                 if let Some(d) = h.runtime.disconnected_at {
@@ -2187,11 +2751,28 @@ impl Controller {
                         self.fail_host(ri, hi, &why);
                         continue;
                     }
-                    if h.runtime.bake_until.is_some_and(|u| u <= now)
+                    // Baked: the window passed without a required check
+                    // failing, and the host is connected and has reported
+                    // (when it has a window at all).
+                    let window = self.bake_seconds(ri, hi) > 0;
+                    let reported = !window || h.runtime.bake_reports > 0;
+                    let ended = h.runtime.bake_until.filter(|u| *u <= now);
+                    if let Some(until) = ended
                         && h.runtime.failing_since.is_empty()
                     {
-                        self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
-                        continue;
+                        if reported && (!window || self.connected(&host)) {
+                            self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
+                            continue;
+                        }
+                        if !reported
+                            && self.connected(&host)
+                            && until + self.bake_report_grace(ri) <= now
+                        {
+                            let why = "sent no health report during its bake".to_owned();
+                            self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                            self.fail_host(ri, hi, &why);
+                            continue;
+                        }
                     }
                 }
                 let h = &self.live[ri].hosts[hi];
@@ -2204,6 +2785,18 @@ impl Controller {
                     let why = format!("no apply result within {mins}m");
                     self.live[ri].hosts[hi].runtime.error = Some(why.clone());
                     self.fail_host(ri, hi, &why);
+                    continue;
+                }
+                let h = &self.live[ri].hosts[hi];
+                if h.runtime
+                    .disconnected_at
+                    .is_some_and(|d| d + timeout <= now)
+                    && self.connected(&host)
+                {
+                    // Back (its reconnect was handled elsewhere): not a
+                    // deadline any more.
+                    self.live[ri].hosts[hi].runtime.disconnected_at = None;
+                    self.touch_host(ri, hi);
                     continue;
                 }
                 let h = &self.live[ri].hosts[hi];
@@ -2236,14 +2829,9 @@ impl Controller {
                     });
                     if let Some(pi) = gate {
                         let name = self.live[ri].record.runtime.phases[pi].name.clone();
-                        self.live[ri].record.runtime.phases[pi].gate = None;
-                        self.live[ri].dirty = true;
-                        self.pause(
-                            ri,
-                            "gate",
-                            format!("pre-phase gate after '{name}': {host} {why}"),
-                            Some(host.clone()),
-                        );
+                        self.live[ri].hosts[hi].runtime.failed_checks.clear();
+                        let why = format!("pre-phase gate after '{name}': {why}");
+                        self.fail_gate(ri, pi, &host, &why);
                     }
                 }
             }
@@ -2260,7 +2848,17 @@ impl Controller {
                 let state = self.live[ri].record.state;
                 if self.live[ri].record.is_running() {
                     changed |= self.drive_phases(ri).await;
-                } else if state == RolloutState::RollingBack {
+                }
+                if matches!(
+                    self.live[ri].record.state,
+                    RolloutState::Paused
+                        | RolloutState::Rolling
+                        | RolloutState::Baking
+                        | RolloutState::AwaitingApproval
+                ) {
+                    changed |= self.drive_released(ri);
+                }
+                if state == RolloutState::RollingBack {
                     changed |= self.drive_rollback(ri);
                 }
                 if self.live[ri].record.runtime.stragglers_open {
@@ -2348,6 +2946,13 @@ impl Controller {
             if !self.live[ri].record.is_running() {
                 return changed;
             }
+            // A standing failure-budget breach (failures charged once their
+            // phase started, or left after an operator acted on another
+            // host) stops the phase before anything else starts.
+            if let Some((bp, failures, _)) = self.breach(ri) {
+                self.on_breach(ri, bp, failures, None);
+                return true;
+            }
             let hosts = self.live[ri].phase_hosts(p);
             let cap = self.live[ri].record.runtime.phases[p]
                 .parallel
@@ -2356,28 +2961,42 @@ impl Controller {
                 .iter()
                 .filter(|&&i| self.live[ri].hosts[i].state.in_flight())
                 .count();
+            let busy = self.busy_elsewhere(ri);
             for &hi in &hosts {
                 if inflight >= cap {
                     break;
                 }
                 let h = &self.live[ri].hosts[hi];
-                if h.state == HostPhase::Planned && self.eligible(&h.host) && self.approved(ri, hi)
+                if h.state == HostPhase::Planned
+                    && self.eligible(&h.host)
+                    && !busy.contains(&h.host)
+                    && self.approved(ri, hi)
                 {
                     self.start_baseline(ri, hi);
                     inflight += 1;
                     changed = true;
                 }
             }
-            let done = hosts.iter().all(|&i| {
+            // The phase is done when its hosts, and hosts of earlier phases an
+            // operator retried, have finished (or missed it).
+            let upto: Vec<usize> = (0..self.live[ri].hosts.len())
+                .filter(|&i| {
+                    self.live[ri].hosts[i]
+                        .runtime
+                        .phase_index
+                        .is_some_and(|q| q <= p)
+                })
+                .collect();
+            let done = upto.iter().all(|&i| {
                 let h = &self.live[ri].hosts[i];
                 h.state.finished()
                     || (matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
-                        && !self.eligible(&h.host))
+                        && self.offline_for_phase(h))
             });
             if !done {
                 return changed;
             }
-            for &hi in &hosts {
+            for &hi in &upto {
                 if matches!(
                     self.live[ri].hosts[hi].state,
                     HostPhase::PlanPending | HostPhase::Planned
@@ -2393,6 +3012,75 @@ impl Controller {
             self.start_gate(ri, p);
             changed = true;
         }
+    }
+
+    /// Starts hosts an operator retried or continued, in whichever phase
+    /// (the current phase's are also started by [`Controller::drive_phases`]),
+    /// including while the rollout is paused by a failure.
+    fn drive_released(&mut self, ri: usize) -> bool {
+        let mut changed = false;
+        let busy = self.busy_elsewhere(ri);
+        for hi in 0..self.live[ri].hosts.len() {
+            let h = &self.live[ri].hosts[hi];
+            if !h.runtime.released
+                || busy.contains(&h.host)
+                || h.state != HostPhase::Planned
+                || self.is_virtual(ri, hi)
+                || self.later_phase(ri, hi)
+                || !self.may_apply(ri, hi)
+                || !self.approved(ri, hi)
+            {
+                continue;
+            }
+            let Some(pi) = h.runtime.phase_index else {
+                continue;
+            };
+            let hosts = self.live[ri].phase_hosts(pi);
+            let cap = self.live[ri].record.runtime.phases[pi]
+                .parallel
+                .resolve(hosts.len());
+            let inflight = hosts
+                .iter()
+                .filter(|&&i| self.live[ri].hosts[i].state.in_flight())
+                .count();
+            if inflight < cap {
+                self.start_baseline(ri, hi);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// A host failed (or never answered) the pre-phase gate of phase `p`: it
+    /// is failed with the gate's checks, so retry, continue and skip apply to
+    /// it and a resume does not re-run the same gate on it, and the rollout
+    /// pauses naming it.
+    fn fail_gate(&mut self, ri: usize, p: usize, host: &str, why: &str) {
+        self.live[ri].record.runtime.phases[p].gate = None;
+        self.live[ri].dirty = true;
+        if let Some(hi) = self.live[ri].find(host) {
+            self.live[ri].hosts[hi].runtime.error = Some(why.to_owned());
+            self.live[ri].hosts[hi].runtime.disconnected_at = None;
+            self.set_host_state(ri, hi, HostPhase::Failed, why);
+        }
+        self.pause(ri, "gate", format!("{host}: {why}"), Some(host.to_owned()));
+    }
+
+    /// Hosts another live rollout (another rollout's phases, or an open
+    /// stragglers stage) is working on: they are not started here until it
+    /// is done with them.
+    fn busy_elsewhere(&self, ri: usize) -> HashSet<String> {
+        self.live
+            .iter()
+            .enumerate()
+            .filter(|(rj, _)| *rj != ri)
+            .flat_map(|(_, l)| {
+                l.hosts
+                    .iter()
+                    .filter(|h| h.state.in_flight() || h.state == HostPhase::RollingBack)
+                    .map(|h| h.host.clone())
+            })
+            .collect()
     }
 
     fn start_gate(&mut self, ri: usize, p: usize) {
@@ -2511,10 +3199,17 @@ impl Controller {
         self.live[ri].record.runtime.stragglers_open = true;
         self.live[ri].dirty = true;
         for hi in 0..self.live[ri].hosts.len() {
-            if matches!(
-                self.live[ri].hosts[hi].state,
-                HostPhase::Missed | HostPhase::PlanPending | HostPhase::Planned
-            ) {
+            let h = &self.live[ri].hosts[hi];
+            // Hosts not updated during their phase: missed, still planning,
+            // held at baseline, or released from a baseline hold by an
+            // operator's skip (`baseline: skip` excludes a host for good).
+            let not_updated = matches!(
+                h.state,
+                HostPhase::Missed | HostPhase::PlanPending | HostPhase::Planned | HostPhase::Held
+            ) || (h.state == HostPhase::Skipped
+                && h.runtime.held_at_baseline
+                && !h.runtime.applied);
+            if not_updated {
                 self.move_to_stragglers(ri, hi, si);
             }
         }
@@ -2560,6 +3255,9 @@ impl Controller {
             h.runtime.phase_index = Some(si);
             h.plan_digest = None;
             h.wave = None;
+            h.runtime.held_at_baseline = false;
+            h.runtime.error = None;
+            h.runtime.failed_checks.clear();
         }
         self.live[ri].hosts[hi].state = HostPhase::Missed;
         self.set_host_state(
@@ -2711,7 +3409,7 @@ impl Controller {
             let targets: Vec<usize> = self.live[ri]
                 .phase_hosts(p)
                 .into_iter()
-                .filter(|&i| self.live[ri].hosts[i].runtime.applied)
+                .filter(|&i| rollback_target(&self.live[ri].hosts[i]))
                 .collect();
             for &hi in &targets {
                 let state = self.live[ri].hosts[hi].state;
@@ -2747,7 +3445,7 @@ impl Controller {
                 self.live[ri]
                     .phase_hosts(q)
                     .iter()
-                    .any(|&i| self.live[ri].hosts[i].runtime.applied)
+                    .any(|&i| rollback_target(&self.live[ri].hosts[i]))
             });
             self.live[ri].dirty = true;
             changed = true;
@@ -2835,7 +3533,14 @@ impl Controller {
 
     // ------------------------------------------------------------ persistence
 
-    async fn flush(&mut self) {
+    /// Writes the checkpoint (dirty rollouts and hosts, the stable revision,
+    /// audit rows) in one transaction, then publishes live events and sends
+    /// the queued messages. Returns whether the checkpoint was written.
+    ///
+    /// When the transaction fails nothing is lost or sent ahead of its
+    /// state: the audit rows and the outbox are kept, finished rollouts stay
+    /// live, and a retry is armed with a backoff.
+    async fn flush(&mut self) -> bool {
         let mut rollouts = Vec::new();
         let mut hosts = Vec::new();
         for l in &self.live {
@@ -2850,8 +3555,14 @@ impl Controller {
         }
         let audits = std::mem::take(&mut self.audits);
         let stable = self.stable_dirty.then(|| self.stable.clone()).flatten();
-        if !(rollouts.is_empty() && hosts.is_empty() && audits.is_empty() && stable.is_none()) {
-            let (r2, h2) = (rollouts.clone(), hosts.clone());
+        let cleared = self.pending_clear.clone();
+        if !(rollouts.is_empty()
+            && hosts.is_empty()
+            && audits.is_empty()
+            && stable.is_none()
+            && cleared.is_empty())
+        {
+            let (r2, h2, a2) = (rollouts.clone(), hosts.clone(), audits.clone());
             let result = self
                 .store
                 .transaction(move |db| {
@@ -2864,8 +3575,11 @@ impl Controller {
                     if let Some(s) = &stable {
                         db.kv().set(keys::STABLE_REVISION, s)?;
                     }
+                    for key in &cleared {
+                        db.kv().delete(key)?;
+                    }
                     let mut entries = Vec::new();
-                    for a in &audits {
+                    for a in &a2 {
                         entries.push(db.audit().add(a)?);
                     }
                     Ok(entries)
@@ -2873,6 +3587,9 @@ impl Controller {
                 .await;
             match result {
                 Ok(entries) => {
+                    self.flush_retry = None;
+                    self.flush_failures = 0;
+                    self.pending_clear.clear();
                     self.stable_dirty = false;
                     for l in &mut self.live {
                         l.dirty = false;
@@ -2905,7 +3622,16 @@ impl Controller {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "the rollout checkpoint could not be written; will retry");
+                    // Keep the audit rows (ahead of any recorded since) and
+                    // the outbox: nothing is sent before its state is saved.
+                    let mut kept = audits;
+                    kept.append(&mut self.audits);
+                    self.audits = kept;
+                    self.flush_failures = self.flush_failures.saturating_add(1);
+                    let backoff = 1i64 << self.flush_failures.min(5);
+                    self.flush_retry = Some(self.now() + chrono::Duration::seconds(backoff));
+                    tracing::error!(error = %e, failures = self.flush_failures, retry_in_s = backoff, "the rollout checkpoint could not be written; will retry");
+                    return false;
                 }
             }
         }
@@ -2936,9 +3662,19 @@ impl Controller {
             tracing::debug!(host = %host, "a message could not be delivered; treating the host as disconnected");
             self.on_disconnected(&host);
         }
-        // Forget finished rollouts (they stay in the store).
-        self.live
-            .retain(|l| !l.record.is_terminal() || l.record.runtime.stragglers_open);
+        // The reactions to these durable reports are saved: they may be acked.
+        for done in std::mem::take(&mut self.ack_waiters) {
+            let _ = done.send(true);
+        }
+        // Forget finished rollouts once their final state is written (they
+        // stay in the store).
+        self.live.retain(|l| {
+            !l.record.is_terminal()
+                || l.record.runtime.stragglers_open
+                || l.dirty
+                || !l.dirty_hosts.is_empty()
+        });
+        true
     }
 
     /// Sends Assign and RequestPlan; `false` when the host has no session.

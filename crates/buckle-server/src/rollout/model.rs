@@ -284,6 +284,27 @@ pub struct HostRuntime {
     /// How often the Apply was re-sent after reconnects without being run.
     #[serde(default)]
     pub apply_resends: u32,
+    /// An operator retried or continued this host: it may proceed while the
+    /// rollout is paused by a failure (never under an operator's pause).
+    /// Cleared when the host finishes.
+    #[serde(default)]
+    pub released: bool,
+    /// Bake health reports received since the bake (re)started; a host with
+    /// a bake window completes only once it has reported.
+    #[serde(default)]
+    pub bake_reports: u32,
+    /// The bake requests sent during this bake (reports answering others,
+    /// e.g. another rollout's, are not this bake's).
+    #[serde(default)]
+    pub bake_requests: Vec<String>,
+    /// Modules the plan defers to apply time (their plan is unknown yet).
+    #[serde(default)]
+    pub deferred_modules: Vec<String>,
+    /// The host was held at baseline (`baseline: hold`); if it was never
+    /// applied (still held, or released by an operator's skip) it moves to
+    /// the stragglers stage on promotion.
+    #[serde(default)]
+    pub held_at_baseline: bool,
 }
 
 /// One `rollout_hosts` row.
