@@ -46,6 +46,7 @@ flate2.workspace = true
 tar.workspace = true
 rcgen.workspace = true
 regex.workspace = true
+minijinja.workspace = true
 tracing-batteries.workspace = true
 secrecy.workspace = true
 
