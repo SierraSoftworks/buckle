@@ -135,6 +135,7 @@ impl Templater {
     ) -> crate::Result<String> {
         let mode = view.mode;
         let touched = view.touched.clone();
+        let missing = view.missing.clone();
         // The JSON context (host, vars, module, task) plus the secrets object.
         let mut map: std::collections::BTreeMap<String, Value> = match ctx.template_json() {
             serde_json::Value::Object(obj) => obj
@@ -150,7 +151,30 @@ impl Templater {
                 // minijinja's error Debug dumps the referenced variables, which
                 // would include secret values: scrub through the secrets module.
                 let err = crate::secrets::redact::template_error(e, &ctx.secrets);
-                if mode == RenderMode::Plain && touched.load(std::sync::atomic::Ordering::Relaxed) {
+                let missing = missing.lock().map(|m| m.clone()).unwrap_or_default();
+                if !missing.is_empty() {
+                    let names = missing
+                        .iter()
+                        .map(|n| format!("'{n}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let held: Vec<&str> = ctx.secrets.names().collect();
+                    crate::error::wrap_user(
+                        err,
+                        format!(
+                            "The template reads the secret {names}, which this host does not hold{}.",
+                            if held.is_empty() {
+                                " (it holds no secrets)".to_owned()
+                            } else {
+                                format!(" (it holds {})", held.join(", "))
+                            }
+                        ),
+                        &[
+                            "Declare the secret under `secrets:` in buckle.yaml and check that the server (or, in local mode, this host) can resolve its value.",
+                            "In server mode a host receives only the secrets the modules selected for it reference; if the server's view of this host's facts is stale, the agent fetches the missing ones before planning.",
+                        ],
+                    )
+                } else if mode == RenderMode::Plain && touched.load(std::sync::atomic::Ordering::Relaxed) {
                     crate::error::wrap_user(
                         err,
                         "The template references a secret's value, but this field only accepts plain values.",
@@ -172,6 +196,9 @@ struct SecretsView {
     store: Arc<SecretStore>,
     mode: RenderMode,
     touched: Arc<std::sync::atomic::AtomicBool>,
+    /// Names the template asked for that the store does not hold, so the
+    /// resulting "undefined value" can be explained.
+    missing: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl SecretsView {
@@ -180,6 +207,7 @@ impl SecretsView {
             store,
             mode,
             touched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            missing: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -187,7 +215,14 @@ impl SecretsView {
 impl Object for SecretsView {
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
         let name = key.as_str()?;
-        let secret = self.store.get(name)?.clone();
+        let Some(secret) = self.store.get(name).cloned() else {
+            if let Ok(mut missing) = self.missing.lock()
+                && !missing.iter().any(|m| m == name)
+            {
+                missing.push(name.to_owned());
+            }
+            return None;
+        };
         Some(Value::from_object(SecretValue {
             secret,
             mode: self.mode,
@@ -390,6 +425,30 @@ mod tests {
             .unwrap_err();
         assert!(err.is(crate::error::Kind::User));
         assert!(!err.message().contains("hunter2"));
+    }
+
+    #[test]
+    fn a_missing_secret_is_named_in_the_error() {
+        let key = InstallKey::from_bytes([7u8; 32]);
+        let mut store = SecretStore::new();
+        store.insert(Secret::new("held", "s3cr3t-held".into(), &key));
+        let ctx = HostContext::new(HostIdentity::default()).with_secrets(Arc::new(store));
+        let err = Templater::new()
+            .render_sensitive("{{ secrets.ABSENT }}", &ctx)
+            .unwrap_err();
+        let message = err.message();
+        assert!(message.contains("'ABSENT'"), "{message}");
+        assert!(message.contains("does not hold"), "{message}");
+        assert!(message.contains("held"), "{message}");
+        assert!(
+            !crate::error::pretty(&err).to_string().contains("s3cr3t"),
+            "values stay out of the error"
+        );
+        // A plain-mode render of an absent secret says the same, not "plain values only".
+        let err = Templater::new()
+            .render_plain("{{ secrets.ABSENT }}", &ctx)
+            .unwrap_err();
+        assert!(err.message().contains("'ABSENT'"), "{}", err.message());
     }
 
     #[test]

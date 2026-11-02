@@ -199,10 +199,14 @@ fn load_revision(config: &Path) -> buckle_core::Result<Arc<Revision>> {
     Ok(Arc::new(revision))
 }
 
-fn real_system() -> buckle_core::Result<Arc<dyn System>> {
-    Ok(Arc::new(
-        RealSystem::new().with_http(Arc::new(crate::http::ReqwestClient::new())),
-    ))
+/// The real host, keeping Buckle's files under `state_dir` when the command
+/// has one (otherwise `BUCKLE_STATE_DIR` or `/var/lib/buckle`).
+fn real_system(state_dir: Option<&Path>) -> buckle_core::Result<Arc<dyn System>> {
+    let mut system = RealSystem::new().with_http(Arc::new(crate::http::ReqwestClient::new()));
+    if let Some(dir) = state_dir {
+        system = system.with_state_dir(dir);
+    }
+    Ok(Arc::new(system))
 }
 
 /// The install key fingerprints secrets. When the state directory is not
@@ -230,7 +234,7 @@ struct Local {
 impl Local {
     async fn load(args: &LocalArgs) -> buckle_core::Result<Self> {
         let revision = load_revision(&args.config)?;
-        let system = real_system()?;
+        let system = real_system(Some(&args.state_dir))?;
         let host = HostIdentity {
             id: args.host_id.clone().unwrap_or_else(|| system.hostname()),
             labels: args
@@ -256,9 +260,12 @@ impl Local {
             })?),
             None => None,
         };
+        // Planning may write validator candidates under `<state_dir>/tmp`
+        // and nowhere else (the same scratch directory the agent uses).
         let mut inputs = Inputs::new(revision.clone(), host, system, Arc::new(secrets), store)
             .with_select(select)
-            .with_facts(cached_facts);
+            .with_facts(cached_facts)
+            .with_scratch_dir(args.state_dir.join("tmp"));
         if let Some(path) = &args.facts {
             inputs = inputs.with_frozen_facts(load_facts_file(path)?);
         }
@@ -458,7 +465,7 @@ pub async fn facts(args: FactsArgs) -> buckle_core::Result<i32> {
 
 pub(crate) async fn facts_to(args: FactsArgs, out: &mut dyn Write) -> buckle_core::Result<i32> {
     buckle_std::ensure_linked();
-    let system = real_system()?;
+    let system = real_system(None)?;
     let cx = Cx {
         mode: Mode::Plan,
         host: Arc::new(HostContext::new(HostIdentity {

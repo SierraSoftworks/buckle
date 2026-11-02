@@ -16,13 +16,10 @@ use buckle_core::task::Cx;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Where Buckle keeps its own files on the host (`BUCKLE_STATE_DIR`, default `/var/lib/buckle`).
+/// Where Buckle keeps its own files on the host (the agent's or command's
+/// `state_dir`; see [`buckle_core::system::System::state_dir`]).
 pub(crate) fn state_dir(cx: &Cx) -> PathBuf {
-    cx.system
-        .env_var("BUCKLE_STATE_DIR")
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/buckle"))
+    cx.system.state_dir()
 }
 
 /// Runs a command and fails with its stderr unless it exits 0.

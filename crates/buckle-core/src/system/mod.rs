@@ -426,6 +426,17 @@ pub trait System: Send + Sync {
     fn temp_dir(&self) -> PathBuf {
         std::env::temp_dir()
     }
+
+    /// Where Buckle keeps its own files on this host: ledgers, stashes,
+    /// downloads and the `tmp` scratch directory planning may write to. The
+    /// agent and the local commands set it from their `state_dir`; the
+    /// default reads `BUCKLE_STATE_DIR` and falls back to `/var/lib/buckle`.
+    fn state_dir(&self) -> PathBuf {
+        self.env_var("BUCKLE_STATE_DIR")
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/buckle"))
+    }
 }
 
 #[cfg(test)]
