@@ -639,6 +639,30 @@ impl<'a> Executor<'a> {
         let mut halted = false;
         let mut total_changes = 0usize;
         let mut errors: Vec<String> = Vec::new();
+        // Modules that are selected but could not be planned fail the run
+        // without halting it (nothing of theirs ran); indeterminate ones are
+        // reported and left alone.
+        let mut plan_errors: Vec<String> = Vec::new();
+        for i in &rich.plan.indeterminate {
+            results.push(ModuleOutcome {
+                module: i.module.clone(),
+                status: if i.plan_error {
+                    ModuleStatus::Failed
+                } else {
+                    ModuleStatus::Indeterminate
+                },
+                changes: 0,
+                duration_ms: 0,
+                error: Some(if i.plan_error {
+                    format!("planning failed: {}", i.reason)
+                } else {
+                    i.reason.clone()
+                }),
+            });
+            if i.plan_error {
+                plan_errors.push(i.module.clone());
+            }
+        }
 
         loop {
             if !halted {
@@ -770,7 +794,13 @@ impl<'a> Executor<'a> {
         }
 
         let mut removed = 0usize;
-        if !halted {
+        if !halted && !self.inputs.removals && !rich.plan.removals.is_empty() {
+            tracing::info!(
+                skipped = rich.plan.removals.len(),
+                "removals are disabled for this run; the planned removals were left in place"
+            );
+        }
+        if !halted && self.inputs.removals {
             let contexts = planner.contexts(facts);
             for (index, removal) in rich.plan.removals.iter().enumerate() {
                 let rr = &rich.removals[index];
@@ -818,12 +848,12 @@ impl<'a> Executor<'a> {
             }
         }
 
-        let succeeded = !halted && errors.is_empty();
-        let failed_module = failed.first().cloned();
+        let succeeded = !halted && errors.is_empty() && plan_errors.is_empty();
+        let failed_module = failed.first().or(plan_errors.first()).cloned();
         let error = {
             let mut parts: Vec<String> = results
                 .iter()
-                .filter(|r| failed.contains(&r.module))
+                .filter(|r| failed.contains(&r.module) || plan_errors.contains(&r.module))
                 .filter_map(|r| {
                     r.error
                         .clone()

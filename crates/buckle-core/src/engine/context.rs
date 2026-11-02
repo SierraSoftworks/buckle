@@ -3,11 +3,13 @@
 //! agent-local overrides), rendered lazily with cycle detection.
 
 use super::Revision;
+use crate::facts::Facts;
 use crate::model::ModuleConfig;
 use crate::selectors::{HostContext, Labels, Vars};
 use crate::template::Templater;
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 
 /// The agent's labels with the server's overlaid; the server wins on conflicts.
 pub fn merged_labels(agent: &Labels, server: &Labels) -> Labels {
@@ -19,16 +21,76 @@ pub fn merged_labels(agent: &Labels, server: &Labels) -> Labels {
 }
 
 /// Evaluates the fleet's group selectors against `ctx` (labels and facts; no
-/// groups yet). Groups keep their declaration order.
-pub fn evaluate_groups(revision: &Revision, ctx: &HostContext) -> Vec<String> {
-    revision
-        .fleet
-        .fleet
-        .groups
-        .iter()
-        .filter(|(_, selector)| ctx.matches(selector))
-        .map(|(name, _)| name.clone())
+/// groups yet), keeping declaration order. Also returns the groups whose
+/// membership is uncertain: their selector could not be evaluated, or reads
+/// facts that are unavailable in `facts`.
+pub fn evaluate_groups_checked(
+    revision: &Revision,
+    ctx: &HostContext,
+    facts: &Facts,
+) -> (Vec<String>, Vec<String>) {
+    let mut member = Vec::new();
+    let mut uncertain = Vec::new();
+    for (name, selector) in &revision.fleet.fleet.groups {
+        match ctx.try_matches(selector) {
+            Ok(true) => member.push(name.clone()),
+            Ok(false) => {}
+            Err(_) => {
+                uncertain.push(name.clone());
+                continue;
+            }
+        }
+        if selector_uncertainty(selector.raw(), facts, &[]).is_some() {
+            uncertain.push(name.clone());
+        }
+    }
+    (member, uncertain)
+}
+
+static FACT_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bhost\.facts\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)")
+        .expect("static regex compiles")
+});
+static GROUPS_REF: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\bhost\.groups\b").expect("static regex compiles"));
+static VARS_REF: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\bvars\.").expect("static regex compiles"));
+
+/// The fact paths (below `host.facts.`) a selector or template mentions.
+pub fn fact_references(text: &str) -> Vec<String> {
+    FACT_REF
+        .captures_iter(text)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_owned()))
         .collect()
+}
+
+/// Whether a selector mentions `vars.*`.
+pub fn reads_vars(text: &str) -> bool {
+    VARS_REF.is_match(text)
+}
+
+/// Why a selector's result cannot be trusted on this host, if it cannot: it
+/// reads facts of a provider that failed without an earlier value, or reads
+/// `host.groups` while some group's membership is uncertain.
+pub fn selector_uncertainty(
+    raw: &str,
+    facts: &Facts,
+    uncertain_groups: &[String],
+) -> Option<String> {
+    for path in fact_references(raw) {
+        if facts.is_unavailable_path(&path) {
+            return Some(format!(
+                "it reads host.facts.{path}, but that fact provider failed and has no earlier value"
+            ));
+        }
+    }
+    if GROUPS_REF.is_match(raw) && !uncertain_groups.is_empty() {
+        return Some(format!(
+            "it reads host.groups, and the membership of {} is uncertain because a fact provider failed",
+            uncertain_groups.join(", ")
+        ));
+    }
+    None
 }
 
 /// Converts a YAML value into JSON. Non-string mapping keys are stringified.

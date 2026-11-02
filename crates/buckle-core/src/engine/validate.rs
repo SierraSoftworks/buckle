@@ -220,6 +220,14 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
         }
     }
 
+    for name in &revision.unloaded {
+        report.warning(
+            Some(name),
+            format!("modules/{name}"),
+            "the directory has no module.yaml: nothing is planned for it, and resources Buckle recorded for a module of this name are kept rather than removed",
+        );
+    }
+
     // Module names and graph.
     let mut seen: HashMap<&str, usize> = HashMap::new();
     for m in &revision.modules {

@@ -8,7 +8,8 @@ use super::{Inputs, LoadedModule, Revision};
 use crate::facts::Facts;
 use crate::model::{ModuleConfig, RemovalPolicy, RetryPolicy, TaskDecl};
 use crate::plan::{
-    Deferred, HandlerRun, ModulePlan, Plan, Planned, Removal, ResourceKey, Step, TaskRef,
+    Deferred, HandlerRun, Indeterminate, ModulePlan, Plan, Planned, Removal, ResourceKey, Step,
+    TaskRef,
 };
 use crate::secrets::SecretStore;
 use crate::selectors::{HostContext, HostIdentity, Vars};
@@ -53,6 +54,54 @@ pub(super) fn build_templater(revision: &Revision) -> crate::Result<Templater> {
 pub(super) struct Contexts {
     pub base: Arc<HostContext>,
     cache: Mutex<HashMap<String, Arc<HostContext>>>,
+    /// The snapshot the contexts were built from (for unavailable providers).
+    facts: Arc<Facts>,
+    /// Groups whose membership could not be decided (see
+    /// [`context::evaluate_groups_checked`]).
+    uncertain_groups: Vec<String>,
+}
+
+/// Whether a selector selects, given what is known about the host.
+pub(super) enum Decision {
+    Yes,
+    No,
+    /// The selector cannot be decided; the reason says why.
+    Unknown(String),
+    /// The module is selected but its vars could not be rendered.
+    Broken(String),
+}
+
+impl Contexts {
+    /// Why `selector` cannot be trusted on this host, if it cannot.
+    pub fn uncertainty(&self, selector: &crate::Filter) -> Option<String> {
+        let raw = selector.raw();
+        let groups: Vec<String> = self
+            .uncertain_groups
+            .iter()
+            .filter(|g| {
+                regex::Regex::new(&format!(r"\b{}\b", regex::escape(g)))
+                    .map(|re| re.is_match(raw))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        context::selector_uncertainty(raw, &self.facts, &groups)
+    }
+
+    /// Decides a `when` (absent means yes) in `ctx`, refusing to guess.
+    pub fn decide(&self, when: Option<&crate::Filter>, ctx: &HostContext) -> Decision {
+        let Some(when) = when else {
+            return Decision::Yes;
+        };
+        if let Some(reason) = self.uncertainty(when) {
+            return Decision::Unknown(format!("its `when` cannot be decided: {reason}"));
+        }
+        match ctx.try_matches(when) {
+            Ok(true) => Decision::Yes,
+            Ok(false) => Decision::No,
+            Err(e) => Decision::Unknown(e),
+        }
+    }
 }
 
 /// A task after rendering and parsing but before `plan`.
@@ -75,6 +124,8 @@ pub(super) struct PreparedModule {
     pub source: Arc<dyn Source>,
     pub tasks: Vec<PreparedTask>,
     pub provides: Vec<String>,
+    /// Tasks whose `when` could not be decided (kept, not planned).
+    pub warnings: Vec<String>,
 }
 
 impl PreparedModule {
@@ -134,6 +185,9 @@ pub(super) struct Selection<'a> {
     /// Selected modules in dependency order.
     pub order: Vec<&'a LoadedModule>,
     pub skipped: Vec<String>,
+    /// Modules whose selection could not be decided or that could not be
+    /// planned, sorted by name.
+    pub indeterminate: Vec<Indeterminate>,
 }
 
 /// Plans one revision for one host. Built from [`Inputs`] (or, for rollback,
@@ -263,10 +317,13 @@ impl<'a> Planner<'a> {
         let base = HostContext::new(self.host.clone())
             .with_facts(facts.tree.clone())
             .with_secrets(self.secrets.clone());
-        let groups = context::evaluate_groups(self.revision, &base);
+        let (groups, uncertain_groups) =
+            context::evaluate_groups_checked(self.revision, &base, facts);
         Contexts {
             base: Arc::new(base.with_groups(groups)),
             cache: Mutex::new(HashMap::new()),
+            facts: Arc::new(facts.clone()),
+            uncertain_groups,
         }
     }
 
@@ -299,31 +356,105 @@ impl<'a> Planner<'a> {
         Ok(ctx)
     }
 
+    /// Hides secret values in text that ends up in a plan.
+    pub fn scrub(&self, text: &str) -> String {
+        let redactor = crate::secrets::redact::Redactor::new(&self.secrets);
+        if redactor.is_empty() {
+            text.to_owned()
+        } else {
+            redactor.redact(text).into_inner()
+        }
+    }
+
     /// Evaluates every module's `when`, checks that selected modules only need
-    /// selected modules, and orders them along the DAG.
+    /// selected modules, and orders them along the DAG. A module whose
+    /// selection cannot be decided (its `when` errs or reads unavailable facts,
+    /// its vars fail to render, its directory has no module.yaml, or it needs
+    /// such a module) is indeterminate, never "unselected".
     pub fn select(&self, contexts: &Contexts) -> crate::Result<Selection<'a>> {
         let mut selected: HashMap<&str, &'a LoadedModule> = HashMap::new();
         let mut skipped = Vec::new();
+        let mut indeterminate: Vec<Indeterminate> = self
+            .revision
+            .unloaded
+            .iter()
+            .map(|name| Indeterminate {
+                module: name.clone(),
+                reason: format!("the directory modules/{name} has no module.yaml"),
+                plan_error: false,
+            })
+            .collect();
         for module in &self.revision.modules {
             let cfg = &module.config;
-            let matches = match self.module_context(contexts, cfg) {
-                Ok(ctx) => cfg.when.as_ref().is_none_or(|w| ctx.matches(w)),
+            let decision = match self.module_context(contexts, cfg) {
+                Ok(ctx) => contexts.decide(cfg.when.as_ref(), &ctx),
                 Err(err) => {
-                    // Vars failed to resolve. That only matters if the module
-                    // is selected; evaluate `when` without vars to find out.
-                    let bare = contexts.base.in_module(&cfg.name, &cfg.tags);
-                    if cfg.when.as_ref().is_none_or(|w| bare.matches(w)) {
-                        return Err(err);
+                    let reason = format!(
+                        "its vars could not be rendered: {}",
+                        self.scrub(&err.message())
+                    );
+                    match &cfg.when {
+                        Some(w) if context::reads_vars(w.raw()) => {
+                            Decision::Unknown(format!("its `when` reads vars, and {reason}"))
+                        }
+                        when => {
+                            let bare = contexts.base.in_module(&cfg.name, &cfg.tags);
+                            match contexts.decide(when.as_ref(), &bare) {
+                                Decision::Yes => Decision::Broken(reason),
+                                other => other,
+                            }
+                        }
                     }
-                    false
                 }
             };
-            if matches {
-                selected.insert(cfg.name.as_str(), module);
-            } else {
-                skipped.push(cfg.name.clone());
+            match decision {
+                Decision::Yes => {
+                    selected.insert(cfg.name.as_str(), module);
+                }
+                Decision::No => skipped.push(cfg.name.clone()),
+                Decision::Unknown(reason) => indeterminate.push(Indeterminate {
+                    module: cfg.name.clone(),
+                    reason,
+                    plan_error: false,
+                }),
+                Decision::Broken(reason) => indeterminate.push(Indeterminate {
+                    module: cfg.name.clone(),
+                    reason,
+                    plan_error: true,
+                }),
             }
         }
+        // A module that needs an indeterminate module cannot run either.
+        loop {
+            let mut blocked: Vec<(&str, String)> = selected
+                .iter()
+                .filter_map(|(name, m)| {
+                    m.config.needs.iter().find_map(|need| {
+                        indeterminate.iter().find(|i| &i.module == need).map(|i| {
+                            let what = if i.plan_error {
+                                "could not be planned"
+                            } else {
+                                "is indeterminate"
+                            };
+                            (*name, format!("it needs '{need}', which {what}"))
+                        })
+                    })
+                })
+                .collect();
+            if blocked.is_empty() {
+                break;
+            }
+            blocked.sort();
+            for (name, reason) in blocked {
+                selected.remove(name);
+                indeterminate.push(Indeterminate {
+                    module: name.to_owned(),
+                    reason,
+                    plan_error: false,
+                });
+            }
+        }
+        indeterminate.sort_by(|a, b| a.module.cmp(&b.module));
         let mut graph = Graph::new();
         for (name, module) in &selected {
             for need in &module.config.needs {
@@ -359,6 +490,7 @@ impl<'a> Planner<'a> {
                 .filter_map(|n| selected.get(n.as_str()).copied())
                 .collect(),
             skipped,
+            indeterminate,
         })
     }
 
@@ -368,11 +500,13 @@ impl<'a> Planner<'a> {
         &self,
         module: &LoadedModule,
         ctx: Arc<HostContext>,
+        contexts: &Contexts,
         honour_select: bool,
         state: &State,
     ) -> crate::Result<PreparedModule> {
         let name = module.config.name.as_str();
         let mut tasks: Vec<PreparedTask> = Vec::new();
+        let mut warnings = Vec::new();
         let mut seen: HashMap<ResourceKey, usize> = HashMap::new();
         for (index, decl) in module.config.tasks.iter().enumerate() {
             let label = task_label(name, index, decl);
@@ -400,10 +534,24 @@ impl<'a> Planner<'a> {
             })?;
             let key = crate::task::resource_key(name, task, &spec, decl.id.as_deref());
             let task_ctx = ctx.in_task(&decl.kind, &key.key, &decl.tags);
-            if let Some(when) = &decl.when
-                && !task_ctx.matches(when)
-            {
-                continue;
+            // A `when` that cannot be decided keeps the resource (it stays in
+            // the desired set) without planning it.
+            let mut undecided = false;
+            if let Some(when) = &decl.when {
+                let doubt = contexts
+                    .uncertainty(when)
+                    .map(Err)
+                    .unwrap_or_else(|| task_ctx.try_matches(when));
+                match doubt {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(reason) => {
+                        warnings.push(format!(
+                            "{key} is kept but not planned: its `when` cannot be decided ({reason})"
+                        ));
+                        undecided = true;
+                    }
+                }
             }
             if let Some(previous) = seen.insert(key.clone(), index) {
                 let other = &module.config.tasks[previous];
@@ -419,7 +567,8 @@ impl<'a> Planner<'a> {
                     ],
                 ));
             }
-            let selected = !honour_select || self.select.is_none_or(|f| task_ctx.matches(f));
+            let selected =
+                !undecided && (!honour_select || self.select.is_none_or(|f| task_ctx.matches(f)));
             let mut cx = self.cx(name, module.source.clone(), task_ctx, Mode::Plan);
             cx.previous = state.get(&key).cloned().map(Arc::new);
             tasks.push(PreparedTask {
@@ -438,6 +587,7 @@ impl<'a> Planner<'a> {
             source: module.source.clone(),
             tasks,
             provides: module.config.facts.provides.clone(),
+            warnings,
         })
     }
 
@@ -671,7 +821,7 @@ impl<'a> Planner<'a> {
         })?;
         let contexts = self.contexts(facts);
         let ctx = self.module_context(&contexts, &module.config)?;
-        let prepared = self.prepare(module, ctx, honour_select, state)?;
+        let prepared = self.prepare(module, ctx, &contexts, honour_select, state)?;
         self.plan_module(prepared, &contexts).await
     }
 
@@ -792,13 +942,17 @@ pub(super) async fn plan_with(
     let mut prepared = Vec::with_capacity(selection.order.len());
     for module in &selection.order {
         let ctx = planner.module_context(&contexts, &module.config)?;
-        prepared.push(planner.prepare(module, ctx, true, state)?);
+        prepared.push(planner.prepare(module, ctx, &contexts, true, state)?);
     }
     let desired: Vec<ResourceKey> = prepared
         .iter()
         .flat_map(|p| p.desired_keys().cloned())
         .collect();
     let order: Vec<String> = prepared.iter().map(|p| p.name.clone()).collect();
+    let prepared_warnings: Vec<String> = prepared
+        .iter()
+        .flat_map(|p| p.warnings.iter().cloned())
+        .collect();
     let needs: HashMap<String, Vec<String>> = prepared
         .iter()
         .map(|p| (p.name.clone(), p.needs.clone()))
@@ -837,12 +991,17 @@ pub(super) async fn plan_with(
         planned.push(planner.plan_module(module, &contexts).await?);
     }
 
-    let exclude: BTreeSet<String> = deferred.iter().map(|d| d.module.clone()).collect();
+    let exclude: BTreeSet<String> = deferred
+        .iter()
+        .map(|d| d.module.clone())
+        .chain(selection.indeterminate.iter().map(|i| i.module.clone()))
+        .collect();
     let (removals, rich_removals): (Vec<Removal>, Vec<RichRemoval>) = planner
         .removals(state, &desired, &exclude)
         .into_iter()
         .unzip();
 
+    let task_warnings: Vec<String> = prepared_warnings;
     let module_plans: Vec<ModulePlan> = planned.iter().map(|m| m.plan.clone()).collect();
     let mut plan = Plan::new(
         planner.revision.id.clone(),
@@ -858,7 +1017,9 @@ pub(super) async fn plan_with(
         .filter(|(_, rs)| rs.platform_blocked)
         .map(|(s, _)| s.resource.clone())
         .collect();
+    let mut plan = plan.with_indeterminate(selection.indeterminate);
     plan.warnings = warnings(&plan, &platform_blocked);
+    plan.warnings.extend(task_warnings);
     Ok(RichPlan {
         plan,
         modules: planned,
@@ -869,9 +1030,23 @@ pub(super) async fn plan_with(
     })
 }
 
-/// Operator-facing warnings: removals, always-run steps, blocked steps.
+/// Operator-facing warnings: indeterminate modules, removals, always-run
+/// steps, blocked steps.
 pub(super) fn warnings(plan: &Plan, platform_blocked: &BTreeSet<ResourceKey>) -> Vec<String> {
     let mut out = Vec::new();
+    for i in &plan.indeterminate {
+        if i.plan_error {
+            out.push(format!(
+                "module '{}' could not be planned: {}; it will not be applied and its resources are kept",
+                i.module, i.reason
+            ));
+        } else {
+            out.push(format!(
+                "module '{}' is indeterminate: {}; it will not be applied and its resources are kept",
+                i.module, i.reason
+            ));
+        }
+    }
     for r in &plan.removals {
         let caution = if r.caution {
             " (caution: removing this can take unrelated things down)"
@@ -931,7 +1106,7 @@ pub(super) async fn dry_run(
     let selection = planner.select(&contexts)?;
     for module in &selection.order {
         let ctx = planner.module_context(&contexts, &module.config)?;
-        planner.prepare(module, ctx.clone(), false, &State::default())?;
+        planner.prepare(module, ctx.clone(), &contexts, false, &State::default())?;
         for (name, decl) in &module.config.handlers {
             let task = super::validate::kind_of(decl)?;
             let task_ctx = ctx.in_task(&decl.kind, name, &decl.tags);

@@ -222,6 +222,23 @@ pub struct Deferred {
     pub reason: String,
 }
 
+/// A module whose selection or plan could not be determined on this host: its
+/// `when` could not be evaluated or reads facts a provider failed to collect,
+/// its vars or fields could not be rendered, its directory has no
+/// `module.yaml`, or it needs such a module. An indeterminate module is never
+/// applied and its recorded resources are never treated as orphans, so an
+/// uncertain selection cannot remove anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Indeterminate {
+    pub module: String,
+    pub reason: String,
+    /// The module is selected but could not be planned: a plan error for that
+    /// module (design §03). Applying the plan reports the module as failed;
+    /// other modules still run.
+    #[serde(default)]
+    pub plan_error: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub revision: RevisionId,
@@ -239,6 +256,9 @@ pub struct Plan {
     /// Warnings worth showing the operator (always-run commands, cautionary removals, …).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Modules whose selection or plan is uncertain; see [`Indeterminate`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indeterminate: Vec<Indeterminate>,
 }
 
 impl Plan {
@@ -260,9 +280,18 @@ impl Plan {
             deferred,
             skipped: Vec::new(),
             warnings: Vec::new(),
+            indeterminate: Vec::new(),
         };
         plan.digest = plan.compute_digest();
         plan
+    }
+
+    /// Sets the indeterminate modules and recomputes the digest (they change
+    /// what an apply does).
+    pub fn with_indeterminate(mut self, indeterminate: Vec<Indeterminate>) -> Self {
+        self.indeterminate = indeterminate;
+        self.digest = self.compute_digest();
+        self
     }
 
     pub fn compute_digest(&self) -> Digest {
@@ -271,11 +300,14 @@ impl Plan {
             modules: &'a [ModulePlan],
             removals: &'a [Removal],
             deferred: &'a [Deferred],
+            #[serde(skip_serializing_if = "<[Indeterminate]>::is_empty")]
+            indeterminate: &'a [Indeterminate],
         }
         Digest::of_json(&Content {
             modules: &self.modules,
             removals: &self.removals,
             deferred: &self.deferred,
+            indeterminate: &self.indeterminate,
         })
     }
 

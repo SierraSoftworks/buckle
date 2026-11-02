@@ -177,6 +177,7 @@ fn load_facts_file(path: &Path) -> buckle_core::Result<Facts> {
     Ok(Facts {
         tree,
         collected_at: Default::default(),
+        stale: Default::default(),
     })
 }
 

@@ -117,10 +117,22 @@ impl HostContext {
         c
     }
 
-    /// Evaluates a selector against this host. Evaluation itself cannot fail;
-    /// parse errors were reported when the filter was built.
+    /// Evaluates a selector against this host, treating an evaluation error as
+    /// "no match". Use [`HostContext::try_matches`] where an error must not be
+    /// mistaken for a definite `false` (module selection, which drives removal).
     pub fn matches(&self, filter: &crate::Filter) -> bool {
-        filter.matches(self).unwrap_or(false)
+        self.try_matches(filter).unwrap_or(false)
+    }
+
+    /// Evaluates a selector against this host, reporting evaluation errors.
+    /// The error text names the filter, never the values it compared.
+    pub fn try_matches(&self, filter: &crate::Filter) -> Result<bool, String> {
+        filter.matches(self).map_err(|e| {
+            format!(
+                "the selector `{}` could not be evaluated: {e}",
+                filter.raw()
+            )
+        })
     }
 
     /// The template context (`host`, `vars`, `module`, `task`) as JSON. Secrets

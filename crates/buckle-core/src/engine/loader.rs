@@ -35,6 +35,7 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
     let fleet = FleetConfig::parse(&fleet_yaml)?;
 
     let mut modules = Vec::new();
+    let mut unloaded = Vec::new();
     let modules_dir = root.join("modules");
     if modules_dir.is_dir() {
         let mut entries: Vec<_> = std::fs::read_dir(&modules_dir)
@@ -44,8 +45,13 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let dir = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !dir.is_dir() || name.starts_with('.') {
+                continue;
+            }
             let module_yaml = dir.join("module.yaml");
             if !module_yaml.is_file() {
+                unloaded.push(name);
                 continue;
             }
             let yaml = std::fs::read_to_string(&module_yaml).to_human_error()?;
@@ -110,6 +116,7 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
         fleet,
         modules,
         var_files,
+        unloaded,
     })
 }
 
@@ -152,6 +159,20 @@ mod tests {
                 .any(|(p, _)| p.ends_with("motd.j2"))
         );
         assert_eq!(rev.var_files.len(), 1);
+    }
+
+    #[test]
+    fn module_directories_without_module_yaml_are_recorded_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("buckle.yaml"), "version: 2\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/a")).unwrap();
+        std::fs::write(dir.path().join("modules/a/module.yaml"), "name: a\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/half/files")).unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/.hidden")).unwrap();
+        std::fs::write(dir.path().join("modules/README.md"), "notes").unwrap();
+        let rev = load_dir(dir.path(), RevisionId::new("t")).unwrap();
+        assert_eq!(rev.modules.len(), 1);
+        assert_eq!(rev.unloaded, vec!["half"]);
     }
 
     #[test]

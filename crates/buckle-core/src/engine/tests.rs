@@ -467,6 +467,28 @@ impl crate::facts::FactProvider for CounterFacts {
 
 crate::register_facts!(CounterFacts);
 
+/// Mounts `host.facts.test.imds.provider` from `/facts/imds`; fails while that
+/// file says `fail` (an IMDS endpoint timing out).
+struct ImdsFacts;
+
+#[async_trait]
+impl crate::facts::FactProvider for ImdsFacts {
+    const NAME: &'static str = "test.imds";
+
+    async fn collect(&self, cx: &Cx) -> crate::Result<serde_json::Value> {
+        match cx.system.read(Path::new("/facts/imds")).await? {
+            Some(b) if b == b"fail" => Err(crate::error::system(
+                "the metadata endpoint timed out",
+                &["Retry later."],
+            )),
+            Some(b) => Ok(serde_json::json!({ "provider": String::from_utf8_lossy(&b) })),
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+}
+
+crate::register_facts!(ImdsFacts);
+
 // ---------------------------------------------------------------------------
 // Builders
 // ---------------------------------------------------------------------------
@@ -512,6 +534,7 @@ fn revision_with_vars(
         fleet,
         modules,
         var_files: files,
+        unloaded: Vec::new(),
     })
 }
 
@@ -519,6 +542,7 @@ fn facts(tree: serde_json::Value) -> Facts {
     Facts {
         tree,
         collected_at: HashMap::new(),
+        stale: Default::default(),
     }
 }
 
@@ -593,6 +617,13 @@ fn step<'a>(plan: &'a Plan, module: &str, key: &str) -> &'a Step {
     plan.steps()
         .find(|s| s.task.module == module && s.resource.key == key)
         .unwrap_or_else(|| panic!("no step {module}/{key} in {plan:#?}"))
+}
+
+fn indeterminate<'a>(plan: &'a Plan, module: &str) -> &'a crate::plan::Indeterminate {
+    plan.indeterminate
+        .iter()
+        .find(|i| i.module == module)
+        .unwrap_or_else(|| panic!("{module} is not indeterminate in {plan:#?}"))
 }
 
 fn module_names(plan: &Plan) -> Vec<&str> {
@@ -734,11 +765,19 @@ async fn var_reference_cycles_are_user_errors_naming_the_cycle() {
             "name: m\nvars: { a: '{{ vars.b }}', b: '{{ vars.c }}', c: '{{ vars.a }}' }\ntasks: [ { test.file: { path: /x, content: '{{ vars.a }}' } } ]\n",
         )],
     );
-    let err = plan_err(&inputs(rev, &FakeSystem::new())).await;
-    assert!(err.is(crate::error::Kind::User));
-    let msg = err.message();
-    assert!(msg.contains("cycle"), "{msg}");
-    assert!(msg.contains("a -> b -> c -> a"), "{msg}");
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    let broken = indeterminate(&plan, "m");
+    assert!(
+        broken.plan_error,
+        "a selected module with broken vars is a plan error for that module"
+    );
+    assert!(broken.reason.contains("cycle"), "{}", broken.reason);
+    assert!(
+        broken.reason.contains("a -> b -> c -> a"),
+        "{}",
+        broken.reason
+    );
+    assert!(plan.modules.is_empty());
 }
 
 #[tokio::test]
@@ -750,8 +789,10 @@ async fn undefined_var_and_secret_references_in_vars_are_user_errors() {
             "name: m\nvars: { a: '{{ vars.nope }}' }\ntasks: [ { test.file: { path: /x } } ]\n",
         )],
     );
-    let err = plan_err(&inputs(rev, &FakeSystem::new())).await;
-    assert!(err.message().contains("vars.nope"), "{}", err.message());
+    let plan = self::plan(&inputs(rev, &FakeSystem::new())).await;
+    let broken = indeterminate(&plan, "m");
+    assert!(broken.plan_error);
+    assert!(broken.reason.contains("vars.nope"), "{}", broken.reason);
 
     let rev = revision(
         "r1",
@@ -768,14 +809,21 @@ async fn undefined_var_and_secret_references_in_vars_are_user_errors() {
         &InstallKey::from_bytes([1; 32]),
     ));
     inputs.secrets = Arc::new(store);
-    let err = plan_err(&inputs).await;
-    assert!(err.is(crate::error::Kind::User));
-    assert!(!err.message().contains("hunter2-vars"), "{}", err.message());
+    let plan = self::plan(&inputs).await;
+    let broken = indeterminate(&plan, "m");
+    assert!(broken.plan_error);
+    let json = serde_json::to_string(&plan).unwrap();
+    assert!(!json.contains("hunter2-vars"), "{json}");
     assert!(
-        err.message().contains("could not be rendered"),
+        broken.reason.contains("could not be rendered"),
         "{}",
-        err.message()
+        broken.reason
     );
+    // Applying reports the module as failed without running anything.
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(!outcome.succeeded);
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Failed);
+    assert_eq!(outcome.failed_module.as_deref(), Some("m"));
 }
 
 #[tokio::test]
@@ -837,6 +885,245 @@ async fn server_labels_override_agent_labels_in_selection() {
     inputs.server_labels = labels(&[("role", serde_json::json!("worker"))]);
     let plan = plan(&inputs).await;
     assert_eq!(module_names(&plan), vec!["workers"]);
+}
+
+// ---------------------------------------------------------------------------
+// Uncertain selection never removes anything
+// ---------------------------------------------------------------------------
+
+/// A host whose IMDS provider fails, with records for every module below.
+fn uncertain_inputs(rev: Arc<Revision>, sys: &FakeSystem, modules: &[&str]) -> Inputs {
+    let mut state = State::default();
+    for m in modules {
+        state.record(record_for(
+            m,
+            "test.file",
+            &format!("/unc/{m}"),
+            RemovalPolicy::Cleanup,
+            "r0",
+        ));
+        let _ = sys
+            .clone()
+            .with_file(format!("/unc/{m}"), "", FilePerms::mode(0o644));
+    }
+    let mut inputs = inputs_with_store(rev, sys, Arc::new(MemoryStateStore::with(state)));
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    inputs
+}
+
+#[tokio::test]
+async fn a_failing_fact_provider_makes_dependent_selection_indeterminate_not_unselected() {
+    let rev = revision(
+        "r1",
+        r#"
+version: 2
+fleet:
+  groups:
+    cloud: 'host.facts.test.imds.provider == "oci"'
+    home: 'host.labels.site == "home"'
+"#,
+        vec![
+            module(
+                "name: oci\nwhen: 'host.facts.test.imds.provider == \"oci\"'\ntasks: [ { test.file: { path: /unc/oci } } ]\n",
+            ),
+            module(
+                "name: cloud\nwhen: 'host.groups contains \"cloud\"'\ntasks: [ { test.file: { path: /unc/cloud } } ]\n",
+            ),
+            module(
+                "name: home\nwhen: 'host.groups contains \"home\"'\ntasks: [ { test.file: { path: /unc/home } } ]\n",
+            ),
+            module("name: after\nneeds: [oci]\ntasks: [ { test.file: { path: /unc/after } } ]\n"),
+        ],
+    );
+    let sys = FakeSystem::new().with_file("/facts/imds", "fail", FilePerms::mode(0o644));
+    let inputs = uncertain_inputs(rev, &sys, &["oci", "cloud", "home", "after"]);
+    let (plan, facts) = Engine::plan(&inputs).await.unwrap();
+    assert!(facts.stale.contains("test.imds"));
+    let names: Vec<&str> = plan
+        .indeterminate
+        .iter()
+        .map(|i| i.module.as_str())
+        .collect();
+    assert_eq!(names, vec!["after", "cloud", "oci"]);
+    assert!(plan.indeterminate.iter().all(|i| !i.plan_error));
+    assert!(
+        indeterminate(&plan, "oci")
+            .reason
+            .contains("host.facts.test.imds"),
+        "{plan:#?}"
+    );
+    assert!(
+        indeterminate(&plan, "cloud").reason.contains("cloud"),
+        "{plan:#?}"
+    );
+    assert!(
+        indeterminate(&plan, "after").reason.contains("needs 'oci'"),
+        "{plan:#?}"
+    );
+    assert_eq!(
+        plan.skipped,
+        vec!["home"],
+        "a decidable selector is still decided"
+    );
+    let removed: Vec<String> = plan
+        .removals
+        .iter()
+        .map(|r| r.resource.to_string())
+        .collect();
+    assert_eq!(removed, vec!["home/test.file[/unc/home]"]);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("'oci' is indeterminate")),
+        "{:?}",
+        plan.warnings
+    );
+
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(
+        outcome.succeeded,
+        "indeterminate modules are reported, not failed: {outcome:#?}"
+    );
+    assert_eq!(status_of(&outcome, "oci"), ModuleStatus::Indeterminate);
+    assert!(sys.exists("/unc/oci") && sys.exists("/unc/cloud") && sys.exists("/unc/after"));
+    let state = inputs.state.load().unwrap();
+    for m in ["oci", "cloud", "after"] {
+        assert!(
+            state
+                .get(&ResourceKey::new(m, "test.file", format!("/unc/{m}")))
+                .is_some(),
+            "{m} keeps its record"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_provider_failure_after_a_good_collection_keeps_selecting_on_the_last_value() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: oci\nwhen: 'host.facts.test.imds.provider == \"oci\"'\ntasks: [ { test.file: { path: /unc/oci } } ]\n",
+        )],
+    );
+    let sys = FakeSystem::new().with_file("/facts/imds", "fail", FilePerms::mode(0o644));
+    let mut inputs = uncertain_inputs(rev, &sys, &["oci"]);
+    let mut seeded = Facts::new();
+    seeded.mount(
+        "test.imds",
+        serde_json::json!({"provider": "oci"}),
+        sys.now() - chrono::Duration::days(1),
+    );
+    inputs.facts = seeded;
+    let (plan, facts) = Engine::plan(&inputs).await.unwrap();
+    assert!(facts.stale.contains("test.imds"));
+    assert_eq!(facts.tree["test"]["imds"]["provider"], "oci");
+    assert!(plan.indeterminate.is_empty(), "{plan:#?}");
+    assert_eq!(module_names(&plan), vec!["oci"]);
+    assert!(plan.removals.is_empty());
+}
+
+#[tokio::test]
+async fn a_task_when_reading_unavailable_facts_keeps_the_resource_unplanned() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /unc/m }\n    when: 'host.facts.test.imds.provider == \"oci\"'\n  - test.file: { path: /unc/plain }\n",
+        )],
+    );
+    let sys = FakeSystem::new().with_file("/facts/imds", "fail", FilePerms::mode(0o644));
+    let inputs = uncertain_inputs(rev, &sys, &["m"]);
+    let plan = plan(&inputs).await;
+    let keys: Vec<&str> = plan.steps().map(|s| s.resource.key.as_str()).collect();
+    assert_eq!(keys, vec!["/unc/plain"]);
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("/unc/m") && w.contains("cannot be decided")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+#[rstest]
+#[case::bare_when_true(None, true)]
+#[case::when_reads_vars(Some("vars.enabled == true"), false)]
+#[tokio::test]
+async fn a_module_whose_vars_fail_to_render_keeps_its_resources(
+    #[case] when: Option<&str>,
+    #[case] plan_error: bool,
+) {
+    let when = when.map(|w| format!("when: '{w}'\n")).unwrap_or_default();
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(&format!(
+                "name: m\n{when}vars: {{ enabled: true, a: '{{{{ vars.nope }}}}' }}\ntasks: [ {{ test.file: {{ path: /unc/m }} }} ]\n"
+            )),
+            module("name: n\nneeds: [m]\ntasks: [ { test.file: { path: /unc/n } } ]\n"),
+        ],
+    );
+    let sys = FakeSystem::new();
+    let mut inputs = uncertain_inputs(rev, &sys, &["m", "n"]);
+    inputs.facts_frozen = true;
+    let plan = plan(&inputs).await;
+    assert_eq!(
+        indeterminate(&plan, "m").plan_error,
+        plan_error,
+        "{plan:#?}"
+    );
+    assert!(indeterminate(&plan, "n").reason.contains("needs 'm'"));
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert_eq!(outcome.succeeded, !plan_error, "{outcome:#?}");
+    assert!(sys.exists("/unc/m") && sys.exists("/unc/n"));
+    assert_eq!(inputs.state.load().unwrap().resources.len(), 2);
+}
+
+#[tokio::test]
+async fn a_module_directory_without_module_yaml_keeps_its_resources() {
+    let mut rev = Arc::try_unwrap(revision("r1", FLEET, vec![module("name: other\n")])).unwrap();
+    rev.unloaded = vec!["half".into()];
+    let rev = Arc::new(rev);
+    let sys = FakeSystem::new();
+    let mut inputs = uncertain_inputs(rev, &sys, &["half"]);
+    inputs.facts_frozen = true;
+    let plan = plan(&inputs).await;
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert!(indeterminate(&plan, "half").reason.contains("module.yaml"));
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert!(sys.exists("/unc/half"));
+}
+
+#[tokio::test]
+async fn removals_can_be_listed_but_not_applied() {
+    let rev = revision("r1", FLEET, vec![module("name: other\n")]);
+    let sys = FakeSystem::new();
+    let mut inputs = uncertain_inputs(rev, &sys, &["gone"]);
+    inputs.facts_frozen = true;
+    let inputs = inputs.with_removals(false);
+    let plan = plan(&inputs).await;
+    assert_eq!(plan.removals.len(), 1);
+    let (outcome, events) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(outcome.removals, 0);
+    assert!(sys.exists("/unc/gone"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::RemovalRun { .. }))
+    );
+    assert_eq!(inputs.state.load().unwrap().resources.len(), 1);
+    // The same plan applied with removals enabled removes it.
+    let inputs = inputs.with_removals(true);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert_eq!(outcome.removals, 1);
+    assert!(!sys.exists("/unc/gone"));
 }
 
 // ---------------------------------------------------------------------------

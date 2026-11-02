@@ -264,6 +264,7 @@ fn status_word(status: ModuleStatus) -> &'static str {
         ModuleStatus::RolledBack => "rolled back",
         ModuleStatus::NotStarted => "not started",
         ModuleStatus::Deferred => "deferred",
+        ModuleStatus::Indeterminate => "indeterminate",
     }
 }
 

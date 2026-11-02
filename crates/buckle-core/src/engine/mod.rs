@@ -49,6 +49,10 @@ pub struct Revision {
     pub modules: Vec<LoadedModule>,
     /// Raw contents of every `vars` overlay file referenced by the fleet config.
     pub var_files: indexmap::IndexMap<PathBuf, serde_yaml::Value>,
+    /// Directories under `modules/` that have no `module.yaml`. Their module
+    /// is indeterminate: resources recorded under that name are never treated
+    /// as orphans, because the directory may be a module mid-edit.
+    pub unloaded: Vec<String>,
 }
 
 impl Revision {
@@ -101,6 +105,11 @@ pub struct Inputs {
     /// When set, `facts` is used as-is and no provider runs: for tests and
     /// `--facts` fixtures.
     pub facts_frozen: bool,
+    /// Whether apply runs the plan's removals. When false the plan still lists
+    /// them (and its digest is unchanged) but apply leaves the resources and
+    /// their records alone: the agent's unattended drift correction passes
+    /// false so that only an operator-approved apply removes anything.
+    pub removals: bool,
 }
 
 impl Inputs {
@@ -129,7 +138,15 @@ impl Inputs {
             stable_revision: None,
             agent_vars: Vars::new(),
             facts_frozen: false,
+            removals: true,
         }
+    }
+
+    /// Whether apply runs the plan's removals (default true). Plans list
+    /// removals either way.
+    pub fn with_removals(mut self, removals: bool) -> Self {
+        self.removals = removals;
+        self
     }
 
     /// Labels managed on the server, overlaid on the agent's own.
@@ -225,6 +242,9 @@ pub enum ModuleStatus {
     RolledBack,
     NotStarted,
     Deferred,
+    /// The module's selection could not be decided on this host (see
+    /// [`crate::plan::Indeterminate`]); it was not applied.
+    Indeterminate,
 }
 
 /// Progress events emitted during apply, for the agent to stream to the server.
