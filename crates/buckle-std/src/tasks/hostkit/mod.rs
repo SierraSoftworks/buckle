@@ -385,11 +385,6 @@ pub fn file_artefact(path: &Path) -> Artefact {
     }
 }
 
-/// Whether `meta` describes a regular file.
-pub fn is_file(meta: &FileMeta) -> bool {
-    meta.kind == FileKind::File
-}
-
 /// A path next to `dest` with a name that directory-globbing consumers ignore.
 pub fn sibling_temp(dest: &Path, suffix: &str) -> PathBuf {
     let name = dest
@@ -649,4 +644,135 @@ pub fn find_version(text: &str) -> Option<String> {
         .captures(text)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_owned())
+}
+
+/// `Planned::change` of [`text_diff`].
+pub fn text_diff_planned(summary: impl Into<String>, old: &str, new: &str) -> Planned {
+    Planned::change(text_diff(summary, old, new))
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use buckle_core::task::{lookup, registry};
+    use serde_json::json;
+
+    fn samples() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "file.copy",
+                json!({"src": "a", "dest": "/b", "mode": "0644", "owner": "root", "group": "root", "backup": true}),
+            ),
+            (
+                "file.template",
+                json!({"src": "a.j2", "dest": "/b", "mode": "0600", "validate": ["x", "{path}"]}),
+            ),
+            (
+                "file.directory",
+                json!({"path": "/d", "mode": "0750", "recurse": true}),
+            ),
+            ("file.absent", json!({"path": "/d", "recursive": true})),
+            (
+                "file.symlink",
+                json!({"path": "/l", "target": "/t", "force": true}),
+            ),
+            (
+                "file.line",
+                json!({"path": "/f", "line": "x", "regex": "^x", "insert_after": "EOF", "create": true}),
+            ),
+            (
+                "file.block",
+                json!({"path": "/f", "block": "x\ny", "marker": "# {mark} x", "state": "absent"}),
+            ),
+            (
+                "file.download",
+                json!({"url": "https://x/y", "dest": "/y", "checksum": "sha256:abc", "headers": {"A": "b"}, "force": true}),
+            ),
+            (
+                "archive.extract",
+                json!({"src": "https://x/y.tgz", "dest": "/o", "strip_components": 1, "include": ["a"], "creates": "a", "mode": "0755"}),
+            ),
+            (
+                "github.release",
+                json!({"repo": "o/n", "asset": "a-{arch}", "dest": "/b", "arch_map": {"armv7l": "armv7"}, "probe": ["b", "-V"], "token_env": "T"}),
+            ),
+            (
+                "command.run",
+                json!({"run": "echo hi", "unless": ["true"], "changed_when": "exit:2", "env": {"A": "{{ secrets.s }}"}, "timeout": "5m", "capture": "never"}),
+            ),
+            (
+                "user.account",
+                json!({"name": "u", "groups": ["g"], "password": "{{ secrets.p }}", "create_home": false}),
+            ),
+            (
+                "user.group",
+                json!({"name": "g", "gid": 10, "system": true}),
+            ),
+            (
+                "ssh.authorized_key",
+                json!({"user": "u", "key": "ssh-ed25519 AAAA c", "exclusive": true}),
+            ),
+            ("hostname.set", json!({"name": "h"})),
+            (
+                "swap.file",
+                json!({"path": "/s", "size_mb": 10, "swappiness": 5}),
+            ),
+            (
+                "cron.job",
+                json!({"name": "j", "schedule": "@daily", "command": "x"}),
+            ),
+            ("docker.image", json!({"name": "i:1", "pull": "always"})),
+        ]
+    }
+
+    #[test]
+    fn every_kind_is_registered_parses_its_documented_fields_and_has_a_schema() {
+        for (kind, raw) in samples() {
+            let task = lookup(kind).unwrap_or_else(|e| panic!("{kind}: {}", e.description()));
+            let spec = task
+                .parse(raw)
+                .unwrap_or_else(|e| panic!("{kind}: {}", e.description()));
+            assert!(!task.key(&spec).is_empty(), "{kind} has a key");
+            assert!(!task.describe(&spec).is_empty(), "{kind} has a description");
+            assert!(!task.description().is_empty(), "{kind} documents itself");
+            let schema = serde_json::to_value(task.schema()).unwrap();
+            assert!(schema["properties"].is_object(), "{kind} has a schema");
+            assert!(registry().contains_key(kind));
+        }
+    }
+
+    #[test]
+    fn locks_platforms_and_cautions_match_the_catalogue() {
+        let get = |k| lookup(k).unwrap();
+        assert_eq!(get("swap.file").locks(), &["fstab"]);
+        assert_eq!(get("docker.image").locks(), &["docker"]);
+        for kind in ["user.account", "user.group"] {
+            assert!(get(kind).removal_caution(), "{kind}");
+            assert!(get(kind).platforms().contains(buckle_core::Platform::Linux));
+            assert!(!get(kind).platforms().contains(buckle_core::Platform::MacOs));
+        }
+        assert!(!get("docker.image").removal_caution());
+        assert!(
+            !get("swap.file")
+                .platforms()
+                .contains(buckle_core::Platform::Windows)
+        );
+        for (kind, _) in samples() {
+            assert_eq!(
+                get(kind).removal_default(),
+                buckle_core::model::RemovalPolicy::Cleanup,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_capable_fields_are_marked_in_the_schema() {
+        for (kind, pointer) in [
+            ("command.run", "/properties/env/additionalProperties"),
+            ("user.account", "/properties/password"),
+        ] {
+            let schema = serde_json::to_string(&lookup(kind).unwrap().schema()).unwrap();
+            assert!(schema.contains("x-buckle-secret"), "{kind}: {pointer}");
+        }
+    }
 }

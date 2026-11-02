@@ -752,8 +752,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
         let _ = sys;
         CommandRun.apply(&c, &spec, &Planned::NoOp).await.unwrap();
-        let fields = log.0.lock().unwrap().clone();
-        fields
+        log.0.lock().unwrap().clone()
     }
 
     #[rstest]

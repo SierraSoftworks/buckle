@@ -183,6 +183,7 @@ pub(crate) fn edit(spec: &Spec, current: &str) -> Result<Edit> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Outcome {
     NoOp,
     Blocked(String),

@@ -286,7 +286,6 @@ mod tests {
             "app",
             &apply(&UserGroup, &c, &spec(json!({"name": "app"}))).await,
         );
-        assert!(UserGroup::REMOVAL_CAUTION);
         assert!(UserGroup.remove(&c, &created).await.unwrap().changed);
         assert!(sys.command_lines().iter().any(|l| l == "groupdel app"));
 

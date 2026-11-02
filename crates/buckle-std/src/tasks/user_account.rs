@@ -674,7 +674,6 @@ mod tests {
             "alice",
             &apply(&UserAccount, &c, &s(json!({"remove_home": true}))).await,
         );
-        assert!(UserAccount::REMOVAL_CAUTION);
         assert!(
             UserAccount
                 .describe_removal(&created)
