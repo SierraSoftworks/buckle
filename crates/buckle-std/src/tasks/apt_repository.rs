@@ -4,7 +4,8 @@ use super::apt_common::apt_get;
 use super::sys_exec::{file_matches_digest, run_checked};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
-use buckle_core::secrets::Redacted;
+use buckle_core::secrets::sinks::FileSink;
+use buckle_core::secrets::{Redacted, Rendered, SecretField};
 use buckle_core::state::ResourceRecord;
 use buckle_core::system::{FilePerms, HttpRequest};
 use buckle_core::task::{Applied, Artefact, Cx, Task};
@@ -28,6 +29,10 @@ use std::time::Duration;
 /// distributions (`bookworm`, `stable`, or a flat-repository path ending in
 /// `/`), and `components` default to `main`. `types` defaults to `[deb]`.
 /// `enabled: false` writes the file with `Enabled: no`.
+///
+/// `auth` (a `login` and a `password`, which may reference secrets) writes
+/// `/etc/apt/auth.conf.d/<name>.conf` (mode 0600) with a `machine` line for
+/// each URI, for private repositories; its content never appears in plans.
 ///
 /// Plans diff the rendered sources file; a missing key file is also a change
 /// (the key's contents are not compared). Applying runs `apt-get update` once.
@@ -63,6 +68,19 @@ pub struct Spec {
     /// Write the source disabled (`Enabled: no`).
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Credentials for a private repository, written to apt's auth.conf.d.
+    #[serde(default)]
+    pub auth: Option<Auth>,
+}
+
+/// `machine`/`login`/`password` for `/etc/apt/auth.conf.d/<name>.conf`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    /// The user name (or token name) apt sends.
+    pub login: String,
+    /// The password or token; may reference secrets (`{{ secrets.repo_token }}`).
+    pub password: SecretField,
 }
 
 fn default_components() -> Vec<String> {
@@ -172,6 +190,39 @@ impl Spec {
         })
     }
 
+    fn auth_path(&self) -> PathBuf {
+        PathBuf::from(format!("/etc/apt/auth.conf.d/{}.conf", self.name))
+    }
+
+    /// The auth.conf content (real values, through the secret sink).
+    fn render_auth(&self, cx: &Cx) -> Result<Option<Rendered>> {
+        let Some(auth) = &self.auth else {
+            return Ok(None);
+        };
+        if auth.login.contains(char::is_whitespace) {
+            return Err(Self::invalid(
+                "`auth.login` may not contain whitespace.".into(),
+            ));
+        }
+        // One template so the secret is only ever revealed by the file sink.
+        let mut template = String::from("# Managed by Buckle.\n");
+        for uri in self.all_uris() {
+            let machine = uri
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(uri)
+                .trim_end_matches('/');
+            template.push_str(&format!(
+                "machine {machine} login {} password {}\n",
+                auth.login,
+                auth.password.raw()
+            ));
+        }
+        SecretField::new(template)
+            .resolve(&cx.templater, &cx.host)
+            .map(Some)
+    }
+
     /// The deb822 stanza Buckle writes.
     fn render(&self) -> String {
         let mut out = String::from("# Managed by Buckle. Local changes will be overwritten.\n");
@@ -234,6 +285,13 @@ impl Task for AptRepository {
             }
             _ => false,
         };
+        let auth_changed = match spec.render_auth(cx)? {
+            Some(rendered) => {
+                file_matches_digest(cx, &spec.auth_path(), Some(&rendered.digest())).await?
+                    != Some(true)
+            }
+            None => false,
+        };
         let summary = format!("apt repository {} -> {}", spec.name, path.display());
         match current {
             None => Ok(Planned::change(Diff::Create {
@@ -247,6 +305,13 @@ impl Task for AptRepository {
             ))),
             Some(_) if key_missing => Ok(Planned::change(Diff::Opaque {
                 summary: format!("download the signing key for apt repository {}", spec.name),
+            })),
+            Some(_) if auth_changed => Ok(Planned::change(Diff::Opaque {
+                summary: format!(
+                    "write the credentials for apt repository {} to {} (content not shown)",
+                    spec.name,
+                    spec.auth_path().display()
+                ),
             })),
             Some(_) => Ok(Planned::NoOp),
         }
@@ -282,6 +347,16 @@ impl Task for AptRepository {
                 )
                 .await?;
             artefacts.push(Artefact::File { path: path.into() });
+        }
+        if let Some(rendered) = spec.render_auth(cx)? {
+            let path = spec.auth_path();
+            if let Some(dir) = path.parent() {
+                cx.system.mkdir_all(dir, &FilePerms::mode(0o755)).await?;
+            }
+            FileSink
+                .write_rendered(&*cx.system, &path, &rendered, &FilePerms::mode(0o600))
+                .await?;
+            artefacts.push(Artefact::File { path });
         }
         let content = spec.render();
         let sources = spec.sources_path();
@@ -601,4 +676,67 @@ mod tests {
     }
 
     use buckle_core::system::System as _;
+
+    #[tokio::test]
+    async fn private_repository_credentials_go_to_auth_conf_and_never_into_plans() {
+        let sys = host();
+        let c = crate::tasks::hostkit::testkit::cx_secrets(
+            &sys,
+            buckle_core::testing::MemorySource::new(),
+            crate::tasks::hostkit::testkit::secrets("repo_token", "tok-very-private"),
+        );
+        let mut raw = hashicorp();
+        raw["auth"] = json!({"login": "ci", "password": "{{ secrets.repo_token }}"});
+        let s: Spec = spec(raw);
+        assert!(lookup_schema_marks_password());
+        let planned = AptRepository.plan(&c, &s).await.unwrap();
+        let applied = AptRepository.apply(&c, &s, &planned).await.unwrap();
+        let text = sys
+            .file_string("/etc/apt/auth.conf.d/hashicorp.conf")
+            .unwrap();
+        assert!(
+            text.contains("machine apt.releases.hashicorp.com login ci password tok-very-private"),
+            "{text}"
+        );
+        let meta = buckle_core::system::System::stat(
+            &sys,
+            std::path::Path::new("/etc/apt/auth.conf.d/hashicorp.conf"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(meta.mode, Some(0o600));
+        let everything = format!(
+            "{} {} {planned:?} {applied:?}",
+            serde_json::to_string(&planned).unwrap(),
+            serde_json::to_string(&applied).unwrap()
+        );
+        assert!(!everything.contains("tok-very-private"), "{everything}");
+        assert_eq!(AptRepository.plan(&c, &s).await.unwrap(), Planned::NoOp);
+        // Rotating the token is a change, still without the value.
+        let rotated = crate::tasks::hostkit::testkit::cx_secrets(
+            &sys,
+            buckle_core::testing::MemorySource::new(),
+            crate::tasks::hostkit::testkit::secrets("repo_token", "tok-rotated"),
+        );
+        let planned = AptRepository.plan(&rotated, &s).await.unwrap();
+        assert!(planned.is_change());
+        assert!(!serde_json::to_string(&planned).unwrap().contains("tok-"));
+        // Removal deletes the credentials file with the source.
+        AptRepository
+            .remove(&c, &record_of("apt.repository", "hashicorp", &applied))
+            .await
+            .unwrap();
+        assert!(!sys.exists("/etc/apt/auth.conf.d/hashicorp.conf"));
+    }
+
+    fn lookup_schema_marks_password() -> bool {
+        serde_json::to_string(
+            &buckle_core::task::lookup("apt.repository")
+                .unwrap()
+                .schema(),
+        )
+        .unwrap()
+        .contains("x-buckle-secret")
+    }
 }

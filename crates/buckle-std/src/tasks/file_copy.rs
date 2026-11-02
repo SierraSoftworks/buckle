@@ -36,6 +36,7 @@ use tracing::instrument;
 /// `visudo -cf {path}` and `sshd -t -f {path}` (when those tools are
 /// installed); `validate: []` turns that off.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Source path, relative to the module's `files/` directory.
     pub src: String,

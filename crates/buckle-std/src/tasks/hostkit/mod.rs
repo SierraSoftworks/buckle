@@ -684,6 +684,32 @@ pub fn insertion_index(
 /// How long a download may take before it is abandoned.
 pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Resolves request headers whose values may reference secrets
+/// (`Authorization: "Bearer {{ secrets.token }}"`) into the pairs to send.
+///
+/// buckle-core has no HTTP sink yet, so a sensitive value is opened here with
+/// the transport sink's witness: an HTTP request header is a transport of the
+/// secret to the server that needs it. This is the only place in buckle-std
+/// that does so; the resolved pairs go straight into the request and are
+/// never logged (requests are not formatted anywhere in this crate).
+pub fn resolve_headers(
+    cx: &Cx,
+    headers: &std::collections::BTreeMap<String, buckle_core::secrets::SecretField>,
+) -> Result<Vec<(String, String)>> {
+    use buckle_core::secrets::Rendered;
+    use buckle_core::secrets::sinks::{Sink, TransportSink};
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = match value.resolve(&cx.templater, &cx.host)? {
+                Rendered::Plain(text) => text,
+                Rendered::Sensitive(secret) => secret.expose(TransportSink.witness()).clone(),
+            };
+            Ok((name.clone(), value))
+        })
+        .collect()
+}
+
 /// GETs `url` and returns the body, turning transport and status failures into
 /// user errors that name the URL.
 pub async fn http_get(cx: &Cx, url: &str, headers: &[(String, String)]) -> Result<Vec<u8>> {
@@ -878,6 +904,86 @@ mod registry_tests {
         }
     }
 
+    /// Minimal specs for the kinds whose samples live in `sys_exec`'s tests.
+    fn system_samples() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "apt.repository",
+                json!({"name": "x", "uri": "https://x.example", "suites": ["s"]}),
+            ),
+            ("apt.package", json!({"name": "nginx"})),
+            ("apt.update", json!({})),
+            ("systemd.unit", json!({"name": "nomad", "enabled": true})),
+            (
+                "systemd.dropin",
+                json!({"unit": "nomad.service", "content": "[Service]\n"}),
+            ),
+            ("systemd.daemon_reload", json!({})),
+            ("systemd.restart", json!({"name": "nomad"})),
+            ("systemd.reload", json!({"name": "nomad"})),
+            (
+                "sysctl.param",
+                json!({"name": "vm.swappiness", "value": 10}),
+            ),
+            (
+                "ufw.default",
+                json!({"direction": "incoming", "policy": "deny"}),
+            ),
+            ("ufw.rule", json!({"rule": "allow", "to_port": 22})),
+            ("ufw.state", json!({"enabled": true})),
+        ]
+    }
+
+    #[test]
+    fn every_kind_rejects_an_unknown_field_naming_it() {
+        let all: Vec<_> = samples().into_iter().chain(system_samples()).collect();
+        let mut covered: Vec<&str> = all.iter().map(|(k, _)| *k).collect();
+        covered.sort_unstable();
+        let mut registered: Vec<&str> = registry()
+            .keys()
+            .copied()
+            .filter(|k| !k.starts_with("test."))
+            .collect();
+        registered.sort_unstable();
+        assert_eq!(covered, registered, "every registered kind has a sample");
+        for (kind, mut raw) in all {
+            let task = lookup(kind).unwrap();
+            task.parse(raw.clone())
+                .unwrap_or_else(|e| panic!("{kind}: the sample parses: {}", e.description()));
+            raw.as_object_mut()
+                .unwrap()
+                .insert("bogus_field".into(), json!("x"));
+            let err = match task.parse(raw) {
+                Ok(_) => panic!("{kind} accepted an unknown field"),
+                Err(e) => e,
+            };
+            let text = format!("{} {err:?}", err.description());
+            assert!(text.contains(kind), "{kind}: {text}");
+            assert!(text.contains("bogus_field"), "{kind}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_typo_in_a_flattened_permission_field_is_rejected() {
+        for kind in [
+            "file.copy",
+            "file.template",
+            "file.directory",
+            "file.download",
+            "archive.extract",
+            "github.release",
+        ] {
+            let (_, mut raw) = samples().into_iter().find(|(k, _)| *k == kind).unwrap();
+            raw.as_object_mut()
+                .unwrap()
+                .insert("onwer".into(), json!("root"));
+            assert!(
+                lookup(kind).unwrap().parse(raw).is_err(),
+                "{kind} accepted `onwer`"
+            );
+        }
+    }
+
     #[test]
     fn locks_platforms_and_cautions_match_the_catalogue() {
         let get = |k| lookup(k).unwrap();
@@ -908,6 +1014,8 @@ mod registry_tests {
         for (kind, pointer) in [
             ("command.run", "/properties/env/additionalProperties"),
             ("user.account", "/properties/password"),
+            ("file.download", "/properties/headers/additionalProperties"),
+            ("apt.repository", "/$defs/Auth/properties/password"),
         ] {
             let schema = serde_json::to_string(&lookup(kind).unwrap().schema()).unwrap();
             assert!(schema.contains("x-buckle-secret"), "{kind}: {pointer}");

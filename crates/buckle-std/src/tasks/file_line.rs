@@ -61,6 +61,7 @@ use tracing::instrument;
 /// the same line in place and removal still restores the text from before
 /// Buckle's first edit. Edits of one file are serialised across modules.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the file to edit.
     pub path: PathBuf,

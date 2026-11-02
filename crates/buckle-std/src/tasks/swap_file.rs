@@ -39,6 +39,7 @@ use tracing::instrument;
 /// Removal runs `swapoff`, deletes the fstab line and the file, but only for a
 /// swap file that Buckle created. It holds the `fstab` lock.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the swap file.
     pub path: PathBuf,

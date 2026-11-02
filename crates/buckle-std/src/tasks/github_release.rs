@@ -53,6 +53,7 @@ use tracing::instrument;
 /// anything is written. Removal deletes `dest` only if it still matches what
 /// Buckle installed.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// `owner/name` of the repository.
     pub repo: String,

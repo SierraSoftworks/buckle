@@ -46,6 +46,7 @@ use tracing::instrument;
 ///
 /// Removal deletes `dest` only if its content still matches what Buckle wrote.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Template path, relative to the module's `files/` directory.
     pub src: String,

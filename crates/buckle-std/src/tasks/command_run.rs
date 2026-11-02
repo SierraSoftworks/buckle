@@ -55,6 +55,7 @@ use tracing::instrument;
 /// the configuration (in the same `cwd`, with the non-secret `env`). Without it
 /// the removal is reported as "no cleanup defined".
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// The command: an argv list, or a string run with `sh -c`.
     pub run: StringOrArgv,

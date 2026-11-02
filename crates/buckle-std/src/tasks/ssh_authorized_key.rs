@@ -36,6 +36,7 @@ use tracing::instrument;
 /// `/home/<user>` (`/root` for root). Removal deletes the key lines Buckle
 /// added and leaves the rest of the file, including an emptied file, alone.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub user: String,
     /// One or more public key lines.

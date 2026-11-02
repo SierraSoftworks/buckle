@@ -46,6 +46,7 @@ use tracing::instrument;
 /// with `-r` only when `remove_home: true`) if Buckle created it, and is
 /// flagged as a cautionary removal.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
     #[serde(default)]

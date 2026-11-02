@@ -31,6 +31,7 @@ use tracing::instrument;
 /// runs `docker image rm` for an image Buckle pulled; an image still used by a
 /// container is left in place. It holds the `docker` lock.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
     #[serde(default)]

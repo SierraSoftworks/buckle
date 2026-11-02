@@ -26,6 +26,7 @@ use tracing::instrument;
 /// characters. Removal does nothing: Buckle does not know what the previous
 /// hostname should be, so a hostname is released rather than reverted.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
 }

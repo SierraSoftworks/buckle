@@ -25,6 +25,7 @@ use tracing::instrument;
 /// cautionary change: when the task leaves the configuration the group is
 /// deleted, but only if Buckle created it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
     #[serde(default)]

@@ -52,6 +52,7 @@ use tracing::instrument;
 /// already in `dest` before Buckle first extracted over them are not Buckle's
 /// and are never deleted.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// URL, absolute host path, or path relative to the module's `files/` directory.
     pub src: String,

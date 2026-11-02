@@ -34,6 +34,7 @@ use tracing::instrument;
 /// as the data a service keeps in `/var/lib/nomad`, are never deleted, and a
 /// directory that existed before Buckle managed it is never deleted.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the directory.
     pub path: PathBuf,

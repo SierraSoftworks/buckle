@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use buckle_core::health::{HealthCheck, HealthStatus};
+use buckle_core::secrets::SecretField;
 use buckle_core::system::HttpRequest;
 use buckle_core::task::Cx;
 use schemars::JsonSchema;
@@ -30,9 +31,9 @@ pub struct Spec {
     /// The HTTP method; defaults to `GET`.
     #[serde(default = "default_method")]
     pub method: String,
-    /// Request headers.
+    /// Request headers. Values may reference secrets (`{{ secrets.token }}`).
     #[serde(default)]
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, SecretField>,
     /// What the response must look like.
     #[serde(default)]
     pub expect: Expect,
@@ -89,14 +90,19 @@ impl HealthCheck for HttpCheck {
 impl HttpCheck {
     async fn probe(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
         let method = spec.method.to_ascii_uppercase();
+        let headers = match crate::tasks::hostkit::resolve_headers(cx, &spec.headers) {
+            Ok(h) => h,
+            Err(e) => {
+                return HealthStatus::unknown(format!(
+                    "the request headers could not be rendered: {}",
+                    e.description()
+                ));
+            }
+        };
         let request = HttpRequest {
             method: method.clone(),
             url: spec.url.clone(),
-            headers: spec
-                .headers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            headers,
             body: None,
             timeout: Some(spec.timeout),
             insecure: spec.tls.insecure,

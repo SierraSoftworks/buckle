@@ -26,6 +26,7 @@ use tracing::instrument;
 /// delete a directory that has contents. Removal deletes the link if it still
 /// points where Buckle pointed it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the link.
     pub path: PathBuf,

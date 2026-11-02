@@ -28,6 +28,7 @@ use tracing::instrument;
 /// cron would otherwise treat them as newlines. `command` must be one line.
 /// Removal deletes the file if it still has the content Buckle wrote.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
     #[serde(default = "root")]

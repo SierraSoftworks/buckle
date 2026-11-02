@@ -45,6 +45,7 @@ use tracing::instrument;
 /// `visudo -cf {path}` and `sshd -t -f {path}` (when those tools are
 /// installed); `validate: []` turns that off.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the file to edit.
     pub path: PathBuf,

@@ -30,6 +30,7 @@ use tracing::instrument;
 /// deleted something that was not its own, there is nothing to undo when the
 /// task is later removed from the configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path to delete.
     pub path: PathBuf,
