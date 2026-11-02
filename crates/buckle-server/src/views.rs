@@ -252,6 +252,27 @@ pub fn required_checks<'a>(
         .collect()
 }
 
+/// An audit entry about a rollout as its timeline shows it: the host and
+/// phase come from the entry's detail. (`rollout::view::detail` maps the
+/// stored trail the same way; a test keeps the two in step.)
+pub fn rollout_event(e: &buckle_api::AuditEntry) -> buckle_api::RolloutEvent {
+    let detail = |key: &str| {
+        e.detail
+            .as_ref()
+            .and_then(|d| d.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    };
+    buckle_api::RolloutEvent {
+        at: e.at,
+        kind: e.action.clone(),
+        message: e.message.clone(),
+        host: detail("host"),
+        phase: detail("phase"),
+        actor: Some(e.actor.clone()),
+    }
+}
+
 /// Loads and summarises one host.
 pub async fn load_summary(
     store: &Store,
@@ -458,6 +479,42 @@ pub(crate) mod tests {
         assert_eq!(view.rehomed[0].from, "old/file.copy[/etc/x]");
         assert_eq!(view.warnings.len(), 1);
         assert_eq!(view.skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_live_timeline_entry_reads_like_the_stored_trail() {
+        let entry = buckle_api::AuditEntry {
+            id: 9,
+            at: chrono::Utc::now(),
+            actor: "controller".into(),
+            action: "rollout.host.failed".into(),
+            outcome: "ok".into(),
+            subject: Some("7".into()),
+            message: "pi-5 failed nomad/api".into(),
+            detail: Some(serde_json::json!({"host": "pi-5", "phase": "home", "n": 1})),
+            trace_id: None,
+        };
+        let record = crate::store::RolloutRecord {
+            id: "7".into(),
+            revision: "r1".into(),
+            state: buckle_api::RolloutState::Paused,
+            policy: Default::default(),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            triggered_by: "controller".into(),
+            runtime: Default::default(),
+        };
+        let stored = crate::rollout::view::detail(&record, &[], &[], std::slice::from_ref(&entry));
+        assert_eq!(stored.events, vec![rollout_event(&entry)]);
+        let live = rollout_event(&entry);
+        assert_eq!(
+            (
+                live.host.as_deref(),
+                live.phase.as_deref(),
+                live.actor.as_deref()
+            ),
+            (Some("pi-5"), Some("home"), Some("controller"))
+        );
     }
 
     #[test]

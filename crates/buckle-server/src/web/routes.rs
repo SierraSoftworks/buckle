@@ -834,6 +834,9 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
         found.ok_or_else(|| ApiError::not_found(format!("No rollout '{id}'.")))?;
     let mut detail = view::detail(&r, &hosts, &approvals, &audit);
     detail.summary = state.link_rollout(detail.summary);
+    // The audit trail comes newest first; the timeline reads oldest first,
+    // so live entries append.
+    detail.events.reverse();
     // A group takes its first host's copy of the plan; when that host holds
     // none, any other host with the digest will do.
     for g in detail.plans.iter_mut().filter(|g| g.plan.is_none()) {

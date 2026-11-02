@@ -71,11 +71,23 @@ pub fn apply_host_detail(detail: &mut HostDetail, event: &LiveEvent) {
     }
 }
 
-/// Applies a rollout or rollout-host change to a rollout's detail. A host
-/// whose entry now names another phase moves there, so it is still drawn in
-/// exactly one stage.
+/// Applies a rollout or rollout-host change, or a new timeline entry, to a
+/// rollout's detail. A host whose entry now names another phase moves
+/// there, so it is still drawn in exactly one stage. A timeline entry the
+/// detail already has (the fetch saw it) is not added twice; the timeline
+/// stays oldest first.
 pub fn apply_rollout(detail: &mut RolloutDetail, event: &LiveEvent) {
     match event {
+        LiveEvent::RolloutTimeline { rollout_id, event } if *rollout_id == detail.summary.id => {
+            if !detail.events.contains(event) {
+                let at = detail
+                    .events
+                    .iter()
+                    .rposition(|e| e.at <= event.at)
+                    .map_or(0, |i| i + 1);
+                detail.events.insert(at, event.clone());
+            }
+        }
         LiveEvent::RolloutChanged { rollout } if rollout.id == detail.summary.id => {
             detail.summary = rollout.clone();
         }
@@ -154,6 +166,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "host_changed",
     "rollout_changed",
     "rollout_host_changed",
+    "rollout_timeline",
     "revision_added",
     "audit",
     "lagged",
@@ -438,6 +451,43 @@ mod tests {
         paused.pause_reason = Some("pi-5 failed nomad/api".into());
         apply_rollout(&mut detail, &LiveEvent::RolloutChanged { rollout: paused });
         assert_eq!(detail.summary.state, RolloutState::Paused);
+    }
+
+    #[test]
+    fn timeline_entries_are_appended_once_in_time_order() {
+        let at = |secs: i64| Utc::now() - chrono::Duration::seconds(secs);
+        let ev = |kind: &str, when| buckle_api::RolloutEvent {
+            at: when,
+            kind: kind.into(),
+            message: kind.into(),
+            host: None,
+            phase: None,
+            actor: Some("controller".into()),
+        };
+        let started = ev("rollout.started", at(60));
+        let mut detail = RolloutDetail {
+            summary: summary("42", RolloutState::Rolling),
+            phases: vec![],
+            plans: vec![],
+            events: vec![started.clone()],
+        };
+        let live = |rollout: &str, event: &buckle_api::RolloutEvent| LiveEvent::RolloutTimeline {
+            rollout_id: rollout.into(),
+            event: event.clone(),
+        };
+        let done = ev("rollout.phase.done", at(10));
+        apply_rollout(&mut detail, &live("42", &done));
+        apply_rollout(&mut detail, &live("42", &done)); // twice is once
+        apply_rollout(&mut detail, &live("42", &started)); // the fetch had it
+        apply_rollout(&mut detail, &live("41", &ev("rollout.aborted", at(5))));
+        // A late arrival lands where its time puts it.
+        let approved = ev("rollout.approve", at(30));
+        apply_rollout(&mut detail, &live("42", &approved));
+        let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["rollout.started", "rollout.approve", "rollout.phase.done"]
+        );
     }
 
     #[test]

@@ -135,6 +135,8 @@ pub struct RolloutDetail {
     pub phases: Vec<RolloutPhase>,
     /// Distinct plans across hosts, for review.
     pub plans: Vec<PlanGroup>,
+    /// The timeline, oldest first (the newest 200 entries); later entries
+    /// arrive as [`LiveEvent::RolloutTimeline`].
     pub events: Vec<RolloutEvent>,
 }
 
@@ -211,6 +213,11 @@ pub enum LiveEvent {
     RolloutHostChanged {
         rollout_id: String,
         host: RolloutHost,
+    },
+    /// An entry was added to a rollout's timeline (`RolloutDetail.events`).
+    RolloutTimeline {
+        rollout_id: String,
+        event: RolloutEvent,
     },
     RevisionAdded {
         revision: RevisionSummary,

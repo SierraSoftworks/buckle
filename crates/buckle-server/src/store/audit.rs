@@ -249,6 +249,15 @@ impl<'c> Audit<'c> {
 }
 
 impl Audit<'_> {
+    /// Entry `id` when it belongs to a rollout's timeline: its subject is a
+    /// rollout and it is not about a host's registration (`host.*`).
+    pub fn rollout_entry(&self, id: u64) -> Result<Option<AuditEntry>> {
+        let only = format!(
+            " AND id = {id} AND subject IN (SELECT id FROM rollouts) AND action NOT LIKE 'host.%'"
+        );
+        Ok(self.rows(&only, id as i64 + 1, 1)?.pop())
+    }
+
     /// Entries about one subject (e.g. a rollout id), newest first.
     pub fn for_subject(&self, subject: &str, limit: u32) -> Result<Vec<AuditEntry>> {
         let mut stmt = self

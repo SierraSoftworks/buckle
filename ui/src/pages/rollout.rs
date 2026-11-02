@@ -54,10 +54,11 @@ pub fn rollout_page(props: &Props) -> Html {
         props.id.clone(),
         |id| async move { api::rollout(&id).await },
     );
+    // Host entries, the summary and timeline entries arrive on the stream
+    // and are applied as they come. Phase states and approvals do not: when
+    // the rollout itself changes, its detail is fetched again once the burst
+    // of events has settled.
     let live = use_live_value(&detail, apply_rollout);
-    // The stream carries host and rollout state, not timeline entries: when
-    // this rollout changes, its detail (and timeline) is fetched again once
-    // the burst of events has settled.
     let store = use_live();
     let touched = detail
         .data
@@ -66,11 +67,7 @@ pub fn rollout_page(props: &Props) -> Html {
         .map(|events| {
             events
                 .iter()
-                .filter(|e| match &***e {
-                    LiveEvent::RolloutChanged { rollout } => rollout.id == props.id,
-                    LiveEvent::RolloutHostChanged { rollout_id, .. } => *rollout_id == props.id,
-                    _ => false,
-                })
+                .filter(|e| matches!(&***e, LiveEvent::RolloutChanged { rollout } if rollout.id == props.id))
                 .count()
         })
         .unwrap_or(0);

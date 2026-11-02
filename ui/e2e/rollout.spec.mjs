@@ -193,4 +193,15 @@ describe("live updates", () => {
     await eventually(async () => assert.equal(await block.getAttribute("data-state"), "baking"), 15_000);
     await close();
   });
+
+  test("timeline entries are appended as they arrive", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "live" });
+    await page.getByRole("button", { name: "Details for pi-4" }).click();
+    const timeline = page.locator(".host-row .timeline");
+    await timeline.waitFor();
+    const before = await timeline.locator(".timeline__item").count();
+    await timeline.locator(".timeline__kind", { hasText: "host.bake_started" }).waitFor({ timeout: 15_000 });
+    assert.equal(await timeline.locator(".timeline__item").count(), before + 1, "appended once");
+    await close();
+  });
 });

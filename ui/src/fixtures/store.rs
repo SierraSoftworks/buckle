@@ -382,10 +382,23 @@ fn event(kind: &str, message: String, host: Option<&str>, phase: Option<&str>) -
     }
 }
 
+/// The timeline entries a demo action added (from index `before`), as the
+/// server's stream would deliver them.
+pub(super) fn timeline(detail: &RolloutDetail, before: usize) -> Vec<LiveEvent> {
+    detail.events[before.min(detail.events.len())..]
+        .iter()
+        .map(|event| LiveEvent::RolloutTimeline {
+            rollout_id: detail.summary.id.clone(),
+            event: event.clone(),
+        })
+        .collect()
+}
+
 pub fn approve(id: &str, request: &ApproveRequest) -> Result<RolloutDetail, ApiError> {
     admin()?;
     with(|s| {
         let detail = s.rollout_mut(id)?;
+        let before = detail.events.len();
         let phase = detail
             .phases
             .iter_mut()
@@ -423,6 +436,7 @@ pub fn approve(id: &str, request: &ApproveRequest) -> Result<RolloutDetail, ApiE
             .push(event("phase.approved", message.clone(), None, Some(&name)));
         let summary = detail.summary.clone();
         let snapshot = detail.clone();
+        s.outbox.extend(timeline(&snapshot, before));
         for h in changed {
             s.outbox.push(LiveEvent::RolloutHostChanged {
                 rollout_id: id.into(),
@@ -449,6 +463,7 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
     admin()?;
     with(|s| {
         let detail = s.rollout_mut(id)?;
+        let before = detail.events.len();
         let state = detail.summary.state;
         let next = match (action, state) {
             (
@@ -502,6 +517,7 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
             None,
         ));
         let snapshot = detail.clone();
+        s.outbox.extend(timeline(&snapshot, before));
         s.outbox.push(LiveEvent::RolloutChanged {
             rollout: snapshot.summary.clone(),
         });
@@ -524,6 +540,7 @@ pub fn reject(id: &str, reason: &str) -> Result<RolloutDetail, ApiError> {
     }
     with(|s| {
         let detail = s.rollout_mut(id)?;
+        let before = detail.events.len();
         if detail.summary.state != RolloutState::AwaitingApproval {
             return Err(ApiError::Conflict(format!(
                 "Rollout {id} is not awaiting approval, so there is nothing to reject; abort it instead."
@@ -546,6 +563,7 @@ pub fn reject(id: &str, reason: &str) -> Result<RolloutDetail, ApiError> {
             phase.as_deref(),
         ));
         let snapshot = detail.clone();
+        s.outbox.extend(timeline(&snapshot, before));
         s.outbox.push(LiveEvent::RolloutChanged {
             rollout: snapshot.summary.clone(),
         });
@@ -566,6 +584,7 @@ fn host_entry(
     f: impl FnOnce(&mut buckle_api::RolloutHost) -> Result<String, ApiError>,
 ) -> Result<RolloutDetail, ApiError> {
     let detail = s.rollout_mut(id)?;
+    let before = detail.events.len();
     let entry = detail
         .phases
         .iter_mut()
@@ -586,6 +605,7 @@ fn host_entry(
         rollout_id: id.into(),
         host: changed,
     });
+    s.outbox.extend(timeline(&snapshot, before));
     s.record(&actor(), "rollout.host", host, message);
     Ok(snapshot)
 }

@@ -7,6 +7,7 @@ mod error;
 pub mod logger;
 pub mod oidc;
 mod routes;
+pub mod timeline;
 mod ui;
 
 pub use error::ApiError;
@@ -163,6 +164,7 @@ pub async fn serve(
     for warning in state.web.startup_warnings() {
         tracing::warn!("{warning}");
     }
+    let relay = timeline::spawn(state.store.clone(), state.events.clone(), cancel.clone());
     let state = web::Data::new(state);
     let server = actix_web::HttpServer::new(move || app(state.clone()))
         .disable_signals()
@@ -181,7 +183,9 @@ pub async fn serve(
         cancel.cancelled().await;
         handle.stop(true).await;
     });
-    server.await.map_err(|e| {
+    let served = server.await;
+    relay.abort();
+    served.map_err(|e| {
         buckle_core::error::wrap_system(
             e,
             "The HTTP server stopped unexpectedly.",

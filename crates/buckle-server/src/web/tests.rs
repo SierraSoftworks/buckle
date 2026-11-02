@@ -1672,3 +1672,125 @@ async fn each_phase_names_the_required_checks_of_the_modules_its_hosts_apply() {
         "from pi-2's labels; informational checks do not gate"
     );
 }
+
+// ------------------------------------------------------------ live timeline
+
+async fn audit_row(
+    e: &Env,
+    action: &str,
+    subject: &str,
+    detail: serde_json::Value,
+) -> buckle_api::AuditEntry {
+    let row = crate::store::NewAudit {
+        at: chrono::Utc::now(),
+        actor: "controller".into(),
+        action: action.into(),
+        outcome: "ok".into(),
+        subject: Some(subject.into()),
+        message: format!("{action} of {subject}"),
+        detail: Some(detail),
+        trace_id: None,
+    };
+    e.store.call(move |db| db.audit().add(&row)).await.unwrap()
+}
+
+async fn next_timeline(
+    rx: &mut tokio::sync::broadcast::Receiver<buckle_api::LiveEvent>,
+) -> Option<(String, buckle_api::RolloutEvent)> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(buckle_api::LiveEvent::RolloutTimeline { rollout_id, event })) => {
+                return Some((rollout_id, event));
+            }
+            Ok(Ok(_)) => continue,
+            _ => return None,
+        }
+    }
+}
+
+#[actix_web::test]
+async fn rollout_audit_entries_are_relayed_as_timeline_events() {
+    let e = env(WebConfig::default()).await;
+    e.store
+        .call(|db| db.rollouts().save(&finished_rollout("7", None)))
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let relay = super::timeline::spawn(e.store.clone(), e.state.events.clone(), cancel.clone());
+    let mut rx = e.state.events.subscribe();
+    let publish = |entry: &buckle_api::AuditEntry| {
+        e.state.events.publish(buckle_api::LiveEvent::Audit {
+            entry: buckle_api::AuditEntryRef {
+                id: entry.id,
+                at: entry.at,
+                action: entry.action.clone(),
+                message: entry.message.clone(),
+            },
+        })
+    };
+
+    let paused = audit_row(
+        &e,
+        "rollout.host.failed",
+        "7",
+        serde_json::json!({"host": "pi-5", "phase": "home"}),
+    )
+    .await;
+    publish(&paused);
+    let (rollout, event) = next_timeline(&mut rx).await.expect("a timeline event");
+    assert_eq!(rollout, "7");
+    assert_eq!(event.host.as_deref(), Some("pi-5"));
+    // Exactly the entry GET /rollouts/7 serves (stored time precision
+    // included), so a page that has it already can tell.
+    let app = test::init_service(app(e.state.clone())).await;
+    let detail: buckle_api::RolloutDetail = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/rollouts/7")
+                .to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(detail.events, vec![event]);
+
+    // Not a rollout's timeline: a host's registration, another subject.
+    for (action, subject) in [("host.approve", "7"), ("revision.valid", "abc1234")] {
+        let row = audit_row(&e, action, subject, serde_json::json!({})).await;
+        publish(&row);
+        assert_eq!(next_timeline(&mut rx).await, None, "{action} on {subject}");
+    }
+    cancel.cancel();
+    relay.await.unwrap();
+}
+
+#[actix_web::test]
+async fn a_rollout_timeline_reads_oldest_first() {
+    let e = env(WebConfig::default()).await;
+    e.store
+        .call(|db| db.rollouts().save(&finished_rollout("7", None)))
+        .await
+        .unwrap();
+    for action in ["rollout.started", "rollout.phase.done", "rollout.completed"] {
+        audit_row(&e, action, "7", serde_json::json!({})).await;
+    }
+    let app = test::init_service(app(e.state.clone())).await;
+    let detail: buckle_api::RolloutDetail = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/rollouts/7")
+                .to_request(),
+        )
+        .await,
+    )
+    .await;
+    let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["rollout.started", "rollout.phase.done", "rollout.completed"]
+    );
+}
