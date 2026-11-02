@@ -25,6 +25,8 @@ jobs:
   version:
     name: Start Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
@@ -45,6 +47,18 @@ jobs:
           tag="v$major.$minor.$patch"
           echo "Releasing $tag (previous: $latest)" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      # GITHUB_TOKEN may only create a release whose tag does not exist yet when
+      # the target commit is still a branch head, and main usually moves on
+      # during the 20-minute build (v2.0.1 failed that way: "Resource not
+      # accessible by integration"). Creating the tag now, while this commit is
+      # the head, sidesteps that: the release later merely attaches to an
+      # existing tag. A tag left behind by a failed run is moved to this commit;
+      # one locked by a published immutable release makes the push fail, which
+      # is the right outcome since the tag was derived from the latest release.
+      - name: Create the release tag
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: git push --force origin "$GITHUB_SHA:refs/tags/$TAG"
       - name: Set Package Version
         env:
           TAG: ${{ steps.tag.outputs.tag }}
