@@ -2393,6 +2393,121 @@ async fn a_failing_module_is_rolled_back_from_the_stable_revision_and_the_run_ha
 }
 
 #[tokio::test]
+async fn rollback_reapplies_the_stable_module_and_removes_what_the_failed_revision_added() {
+    let sys = FakeSystem::new();
+    let stable = revision(
+        "r0",
+        FLEET,
+        vec![module(
+            "name: b\ntasks: [ { test.file: { path: /rb2/b, content: stable, run: rb5 } } ]\n",
+        )],
+    );
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: b\ntasks:\n  - test.file: { path: /rb2/extra, content: x, run: rb5 }\n  - test.file: { path: /rb2/b, content: new, run: rb5, fail_times: 99 }\n",
+        )],
+    );
+    let store = Arc::new(MemoryStateStore::default());
+    let inputs = inputs_with_store(r1, &sys, store.clone()).with_stable_revision(Some(stable));
+    let (outcome, _) = apply(&inputs).await;
+    assert_eq!(outcome.rolled_back_modules, vec!["b"], "{outcome:#?}");
+    assert_eq!(sys.file_string("/rb2/b").as_deref(), Some("stable"));
+    assert!(
+        !sys.exists("/rb2/extra"),
+        "the resource only the failed revision wanted is removed by the rollback"
+    );
+    let state = store.load().unwrap();
+    let keys: Vec<&String> = state.resources.keys().collect();
+    assert_eq!(keys, vec!["b/test.file[/rb2/b]"]);
+    assert_eq!(state.module_revisions["b"], RevisionId::new("r0"));
+}
+
+#[tokio::test]
+async fn rollback_follows_the_stable_revisions_selection() {
+    let sys = FakeSystem::new();
+    // In the stable revision the module did not apply to this host at all.
+    let stable = revision(
+        "r0",
+        FLEET,
+        vec![module(
+            "name: b\nwhen: 'host.labels.role == \"other\"'\ntasks: [ { test.file: { path: /rb3/stable-only, content: s, run: rb6 } } ]\n",
+        )],
+    );
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: b\ntasks:\n  - test.file: { path: /rb3/new, content: n, run: rb6 }\n  - test.file: { path: /rb3/boom, run: rb6, fail_times: 99 }\n",
+        )],
+    );
+    let store = Arc::new(MemoryStateStore::default());
+    let inputs = inputs_with_store(r1, &sys, store.clone()).with_stable_revision(Some(stable));
+    let (outcome, _) = apply(&inputs).await;
+    assert_eq!(
+        status_of(&outcome, "b"),
+        ModuleStatus::RolledBack,
+        "{outcome:#?}"
+    );
+    assert!(
+        !sys.exists("/rb3/stable-only"),
+        "a module the stable revision does not select is not installed by its rollback"
+    );
+    assert!(
+        !sys.exists("/rb3/new"),
+        "what the failed revision added is removed"
+    );
+    assert!(store.load().unwrap().resources.is_empty());
+}
+
+#[tokio::test]
+async fn a_deferred_module_whose_planning_fails_is_not_rolled_back() {
+    let sys = FakeSystem::new();
+    let provider = "name: p\nfacts: { provides: [test.counter] }\ntasks: [ { test.file: { path: /facts/counter, content: \"7\", run: rb7 } } ]\n";
+    let stable = revision(
+        "r0",
+        FLEET,
+        vec![
+            module(provider),
+            module(
+                "name: q\nneeds: [p]\ntasks: [ { test.file: { path: /rb4/q, content: stable, run: rb7 } } ]\n",
+            ),
+        ],
+    );
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(provider),
+            module(
+                "name: q\nneeds: [p]\ntasks: [ { test.render: { src: missing.j2, dest: /rb4/q } } ]\n",
+            ),
+            module("name: z\nneeds: [q]\ntasks: [ { test.file: { path: /rb4/z, run: rb7 } } ]\n"),
+        ],
+    );
+    let mut inputs = inputs(r1, &sys).with_stable_revision(Some(stable));
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let plan = plan(&inputs).await;
+    assert_eq!(plan.deferred.len(), 2, "{plan:#?}");
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(!outcome.succeeded);
+    assert_eq!(status_of(&outcome, "q"), ModuleStatus::Failed);
+    assert!(outcome.rolled_back_modules.is_empty(), "{outcome:#?}");
+    assert!(!sys.exists("/rb4/q"), "the stable q never ran");
+    assert_eq!(status_of(&outcome, "z"), ModuleStatus::NotStarted);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("planning failed"),
+        "{outcome:#?}"
+    );
+}
+
+#[tokio::test]
 async fn without_a_stable_revision_a_failing_module_stays_failed() {
     let sys = FakeSystem::new();
     signal("rb2-release");

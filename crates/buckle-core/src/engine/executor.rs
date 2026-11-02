@@ -576,31 +576,168 @@ impl<'a> Executor<'a> {
         finish(status, error, changes, health)
     }
 
-    /// Re-plans and re-applies `module` from the stable revision with the
-    /// current facts. `Ok(outcome)` carries `RolledBack` on success.
+    /// Rolls `module` back to the stable revision with the current facts:
+    /// evaluates the stable revision's selection for this host, re-applies
+    /// the module from it when the stable revision selects it, and removes the
+    /// module's resources that the stable revision does not want (unless a
+    /// resource of the stable revision took them over, or removals are
+    /// disabled). `Ok(None)` when there is no stable revision or the stable
+    /// selection of the module is indeterminate.
     async fn rollback(&self, module: &str, facts: &Facts) -> crate::Result<Option<ModuleRun>> {
         let Some(stable) = self.inputs.stable_revision.as_ref() else {
             return Ok(None);
         };
-        if stable.module(module).is_none() {
-            tracing::warn!(
-                buckle.module = module,
-                "the stable revision has no such module; nothing to roll back to"
-            );
+        let started = tokio::time::Instant::now();
+        let mut planner = Planner::from_inputs(self.inputs, stable)?;
+        planner.drift = false;
+        let state = self.with_state(|s| s.clone());
+        let contexts = planner.contexts(facts);
+        let selection = planner.select(&contexts)?;
+        if let Some(i) = selection.indeterminate.iter().find(|i| i.module == module) {
+            tracing::warn!(buckle.module = module, reason = %i.reason, "the stable revision's selection of the module is indeterminate; not rolling back");
             return Ok(None);
         }
-        let planner = Planner::from_inputs(self.inputs, stable)?;
-        let state = self.with_state(|s| s.clone());
-        let rich = planner.plan_one(module, facts, &state, false).await?;
-        let contexts = planner.contexts(facts);
-        let mut run = self
-            .run_module(&planner, Arc::new(rich), &contexts, &stable.id, true)
-            .instrument(tracing::info_span!("module.rollback", buckle.module = %module, buckle.revision = %stable.id))
-            .await;
-        if !run.failed {
-            run.outcome.status = ModuleStatus::RolledBack;
+        // The whole stable selection's desired set, so that a resource another
+        // module of the stable revision owns is never removed.
+        let mut prepared = Vec::new();
+        let mut complete = true;
+        for m in &selection.order {
+            let attempt = planner
+                .module_context(&contexts, &m.config)
+                .and_then(|ctx| planner.prepare(m, ctx, &contexts, false, &state));
+            match attempt {
+                Ok(p) => prepared.push(p),
+                Err(err) if m.config.name == module => return Err(err),
+                Err(err) => {
+                    tracing::warn!(buckle.module = %m.config.name, error = %self.scrub(&err.message()), "a module of the stable revision could not be prepared; the rollback removes nothing");
+                    complete = false;
+                }
+            }
         }
+        let others: BTreeSet<String> = state
+            .resources
+            .values()
+            .map(|r| r.key.module.clone())
+            .filter(|m| m != module)
+            .collect();
+        let rehomed = planner.rehomes(&state, &mut prepared, &others);
+        let skip: BTreeSet<_> = rehomed.iter().map(|r| r.from.clone()).collect();
+        let desired: Vec<_> = prepared
+            .iter()
+            .flat_map(|p| p.desired_keys().cloned())
+            .collect();
+        let removals: Vec<_> = if complete && self.inputs.removals {
+            planner.removals(&state, &desired, &others, &skip)
+        } else {
+            Vec::new()
+        };
+
+        let span = tracing::info_span!("module.rollback", buckle.module = %module, buckle.revision = %stable.id);
+        let mut run = match prepared.into_iter().find(|p| p.name == module) {
+            Some(target) => {
+                let rich = planner.plan_module(target, &contexts).await?;
+                self.run_module(&planner, Arc::new(rich), &contexts, &stable.id, true)
+                    .instrument(span.clone())
+                    .await
+            }
+            // The stable revision does not select the module here: rolling
+            // back means removing what the failed revision put in place.
+            None => ModuleRun {
+                outcome: ModuleOutcome {
+                    module: module.to_owned(),
+                    status: ModuleStatus::RolledBack,
+                    changes: 0,
+                    duration_ms: 0,
+                    error: None,
+                },
+                health: Vec::new(),
+                failed: false,
+            },
+        };
+        if run.failed {
+            return Ok(Some(run));
+        }
+        for r in &rehomed {
+            self.with_state(|s| {
+                if let Some(mut record) = s.forget(&r.from)
+                    && r.kind == crate::plan::RehomeKind::Moved
+                    && s.get(&r.to).is_none()
+                {
+                    record.key = r.to.clone();
+                    s.record(record);
+                }
+            });
+        }
+        let (plans, riches): (Vec<_>, Vec<_>) = removals.into_iter().unzip();
+        let (_, errors) = self
+            .run_removals(&planner, &contexts, &plans, &riches)
+            .instrument(span)
+            .await;
+        if !errors.is_empty() {
+            run.failed = true;
+            run.outcome.status = ModuleStatus::Failed;
+            run.outcome.error = Some(errors.join("; "));
+            return Ok(Some(run));
+        }
+        run.outcome.status = ModuleStatus::RolledBack;
+        run.outcome.duration_ms = started.elapsed().as_millis() as u64;
         Ok(Some(run))
+    }
+
+    /// Runs removals in order. Returns how many succeeded and the errors.
+    async fn run_removals(
+        &self,
+        planner: &Planner<'_>,
+        contexts: &Contexts,
+        removals: &[crate::plan::Removal],
+        rich: &[super::planner::RichRemoval],
+    ) -> (usize, Vec<String>) {
+        let mut removed = 0usize;
+        let mut errors = Vec::new();
+        for (removal, rr) in removals.iter().zip(rich) {
+            let span = tracing::info_span!("removal.run", buckle.resource = %removal.resource, buckle.policy = ?removal.policy);
+            let outcome: Result<String, String> = async {
+                match (removal.policy, rr.task) {
+                    (RemovalPolicy::Leave, _) => Ok("released: left in place (policy leave)".to_owned()),
+                    (RemovalPolicy::Cleanup, None) => Ok(format!(
+                        "forgotten: the task kind '{}' is no longer available, nothing was cleaned up",
+                        removal.resource.kind
+                    )),
+                    (RemovalPolicy::Cleanup, Some(task)) => {
+                        let cx = planner.removal_cx(contexts, &rr.record);
+                        let _guards = self.locks.acquire(&task.locks().iter().map(|l| l.to_string()).collect::<Vec<_>>()).await;
+                        task.remove(&cx, &rr.record)
+                            .await
+                            .map(|a| self.scrub(&a.summary))
+                            .map_err(|e| self.scrub(&e.message()))
+                    }
+                }
+            }
+            .instrument(span)
+            .await;
+            match outcome {
+                Ok(summary) => {
+                    self.with_state(|s| {
+                        s.forget(&removal.resource);
+                    });
+                    removed += 1;
+                    self.emit(ApplyEvent::RemovalRun {
+                        resource: removal.resource.to_string(),
+                        summary,
+                    })
+                    .await;
+                }
+                Err(message) => {
+                    errors.push(format!("removing {} failed: {message}", removal.resource));
+                    self.emit(ApplyEvent::RemovalRun {
+                        resource: removal.resource.to_string(),
+                        summary: format!("failed: {message}"),
+                    })
+                    .await;
+                }
+            }
+        }
+        (removed, errors)
     }
 
     async fn run(
@@ -705,8 +842,9 @@ impl<'a> Executor<'a> {
                             Err(err) => {
                                 let message = self.scrub(&err.message());
                                 tracing::error!(buckle.module = %name, error = %message, "planning the deferred module failed");
+                                // Nothing of it ran, so there is nothing to
+                                // roll back; its dependents never become ready.
                                 started_modules.insert(name.clone());
-                                done.insert(name.clone());
                                 results.push(ModuleOutcome {
                                     module: name.clone(),
                                     status: ModuleStatus::Failed,
@@ -714,9 +852,11 @@ impl<'a> Executor<'a> {
                                     duration_ms: 0,
                                     error: Some(format!("planning failed: {message}")),
                                 });
-                                failed.push(name.clone());
-                                halted = true;
-                                break;
+                                plan_errors.push(name.clone());
+                                self.with_state(|s| {
+                                    s.failed_modules.insert(name.clone(), revision.clone());
+                                });
+                                continue;
                             }
                         }
                     }
@@ -810,7 +950,7 @@ impl<'a> Executor<'a> {
 
         let not_started: Vec<String> = order
             .iter()
-            .filter(|n| !done.contains(*n))
+            .filter(|n| !done.contains(*n) && !results.iter().any(|r| &r.module == *n))
             .cloned()
             .collect();
         for name in &not_started {
@@ -832,50 +972,11 @@ impl<'a> Executor<'a> {
         }
         if !halted && self.inputs.removals {
             let contexts = planner.contexts(facts);
-            for (index, removal) in rich.plan.removals.iter().enumerate() {
-                let rr = &rich.removals[index];
-                let span = tracing::info_span!("removal.run", buckle.resource = %removal.resource, buckle.policy = ?removal.policy);
-                let outcome: Result<String, String> = async {
-                    match (removal.policy, rr.task) {
-                        (RemovalPolicy::Leave, _) => Ok("released: left in place (policy leave)".to_owned()),
-                        (RemovalPolicy::Cleanup, None) => Ok(format!(
-                            "forgotten: the task kind '{}' is no longer available, nothing was cleaned up",
-                            removal.resource.kind
-                        )),
-                        (RemovalPolicy::Cleanup, Some(task)) => {
-                            let cx = planner.removal_cx(&contexts, &rr.record);
-                            let _guards = self.locks.acquire(&task.locks().iter().map(|l| l.to_string()).collect::<Vec<_>>()).await;
-                            task.remove(&cx, &rr.record)
-                                .await
-                                .map(|a| self.scrub(&a.summary))
-                                .map_err(|e| self.scrub(&e.message()))
-                        }
-                    }
-                }
-                .instrument(span)
+            let (count, removal_errors) = self
+                .run_removals(planner, &contexts, &rich.plan.removals, &rich.removals)
                 .await;
-                match outcome {
-                    Ok(summary) => {
-                        self.with_state(|s| {
-                            s.forget(&removal.resource);
-                        });
-                        removed += 1;
-                        self.emit(ApplyEvent::RemovalRun {
-                            resource: removal.resource.to_string(),
-                            summary,
-                        })
-                        .await;
-                    }
-                    Err(message) => {
-                        errors.push(format!("removing {} failed: {message}", removal.resource));
-                        self.emit(ApplyEvent::RemovalRun {
-                            resource: removal.resource.to_string(),
-                            summary: format!("failed: {message}"),
-                        })
-                        .await;
-                    }
-                }
-            }
+            removed = count;
+            errors.extend(removal_errors);
         }
 
         let succeeded = !halted && errors.is_empty() && plan_errors.is_empty();
