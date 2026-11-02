@@ -42,6 +42,8 @@ struct Script {
     apply_blocked: bool,
     /// Never answer pre-phase gate checks.
     silent_gate: bool,
+    /// Never answer bake checks.
+    silent_bake: bool,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -226,6 +228,7 @@ impl Harness {
                         let scope = HealthScope::try_from(h.scope).unwrap();
                         if scope == HealthScope::Baseline && s.silent_baseline
                             || scope == HealthScope::Rollout && s.silent_gate
+                            || scope == HealthScope::Bake && s.silent_bake
                         {
                             continue;
                         }
@@ -1908,4 +1911,148 @@ async fn a_failed_checkpoint_keeps_its_audit_outbox_and_finished_rollout() {
         .await
         .unwrap();
     assert_eq!(stable.as_deref(), Some("r1"));
+}
+
+fn bake_report(passed: bool) -> AMsg {
+    AMsg::Health(HealthReport {
+        scope: HealthScope::Bake as i32,
+        request_id: String::new(),
+        revision: String::new(),
+        results: vec![pb::HealthResult {
+            module: "web".into(),
+            check: "http".into(),
+            required: true,
+            passed,
+            ..Default::default()
+        }],
+    })
+}
+
+/// A connected host that never sends a bake report does not bake healthy:
+/// it fails once a grace after its window has passed.
+#[tokio::test(start_paused = true)]
+async fn a_bake_without_a_report_does_not_complete_healthy() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  settle: 2m\n  health: { bake: 1m }\n  phases:\n    - { name: web, select: 'true', max_failures: 0 }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.silent_bake = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "baking", |_, hs| {
+        host(hs, "a").state == HostPhase::Baking
+    })
+    .await;
+    h.idle(90).await;
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(
+        host(&hosts, "a").state,
+        HostPhase::Baking,
+        "no report, not baked"
+    );
+    let (_, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Failed);
+    assert!(
+        a.runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("no health report")
+    );
+}
+
+/// A host away when its bake window closes is not taken as baked: when it
+/// comes back it is asked again, and its fresh report completes it.
+#[tokio::test(start_paused = true)]
+async fn a_host_away_at_the_end_of_its_bake_reports_afresh_before_it_counts() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 1m }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "baking with a report", |_, hs| {
+        let a = host(hs, "a");
+        a.state == HostPhase::Baking && a.runtime.bake_reports > 0
+    })
+    .await;
+    h.disconnect("a");
+    h.idle(180).await;
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(
+        host(&hosts, "a").state,
+        HostPhase::Baking,
+        "away, not baked"
+    );
+    let bakes_before = h
+        .sent(|x, m| {
+            x == "a" && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Bake as i32)
+        })
+        .len();
+    h.connect("a", Some("r1"));
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Healthy);
+    let bakes_after = h
+        .sent(|x, m| {
+            x == "a" && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Bake as i32)
+        })
+        .len();
+    assert_eq!(bakes_after, bakes_before + 1, "asked afresh on reconnect");
+}
+
+/// A required check that starts failing in the last part of the bake is
+/// followed through settle past the window (the agent keeps sampling): it
+/// either recovers, and the host is healthy, or fails past settle. The window
+/// already past is not a deadline (no busy spin while waiting).
+#[rstest::rstest]
+#[case::recovers(true)]
+#[case::stays_failing(false)]
+#[tokio::test(start_paused = true)]
+async fn a_check_failing_late_in_the_bake_is_followed_through_settle(#[case] recovers: bool) {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  settle: 2m\n  health: { bake: 1m }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "baking", |_, hs| {
+        let a = host(hs, "a");
+        a.state == HostPhase::Baking && a.runtime.bake_reports > 0
+    })
+    .await;
+    h.idle(40).await;
+    h.handle.agent_message("a", bake_report(false));
+    h.idle(60).await;
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(
+        host(&hosts, "a").state,
+        HostPhase::Baking,
+        "past the window, inside settle"
+    );
+    if recovers {
+        h.handle.agent_message("a", bake_report(true));
+        let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+        assert_eq!(host(&hosts, "a").runtime.flaps, vec!["web/http"]);
+    } else {
+        let (_, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+        let a = host(&hosts, "a");
+        assert_eq!(a.state, HostPhase::Failed);
+        assert!(
+            a.runtime
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("bake regression")
+        );
+    }
 }

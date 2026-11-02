@@ -847,10 +847,18 @@ impl Controller {
                         self.resend_apply(ri, hi);
                     }
                 }
-                HostPhase::Baking => {
+                HostPhase::Baking if self.bake_seconds(ri, hi) > 0 => {
+                    // Resume the bake. Past its window, a host that was away
+                    // reports afresh before it counts as baked, and a check
+                    // still failing is followed through settle.
                     let until = self.live[ri].hosts[hi].runtime.bake_until.unwrap_or(now);
                     if until > now {
                         self.send_bake_request(ri, hi, until);
+                    } else if c.new_session {
+                        let h = &mut self.live[ri].hosts[hi];
+                        h.runtime.bake_reports = 0;
+                        h.runtime.bake_until = Some(now);
+                        self.send_bake_request(ri, hi, now);
                     }
                 }
                 HostPhase::RollingBack => {
@@ -1031,6 +1039,7 @@ impl Controller {
     fn on_health(&mut self, host: &str, report: HealthReport) {
         let scope = HealthScope::try_from(report.scope).unwrap_or(HealthScope::Unspecified);
         let now = self.now();
+        tracing::debug!(buckle.host = %host, scope = ?scope, request = %report.request_id, revision = %report.revision, results = report.results.len(), "health report");
         for ri in 0..self.live.len() {
             // Pre-phase gate answers.
             let gate_phase = self.live[ri].record.runtime.phases.iter().position(|p| {
@@ -1115,6 +1124,7 @@ impl Controller {
                     self.live[ri].hosts[hi].health =
                         serde_json::to_value(HealthView::from(&report)).ok();
                     let h = &mut self.live[ri].hosts[hi];
+                    h.runtime.bake_reports = h.runtime.bake_reports.saturating_add(1);
                     for r in &report.results {
                         let name = check_name(r);
                         if is_failure(r, &waived) {
@@ -2166,11 +2176,30 @@ impl Controller {
             let h = &mut self.live[ri].hosts[hi];
             h.runtime.bake_until = Some(until);
             h.runtime.failing_since.clear();
+            h.runtime.bake_reports = 0;
         }
         self.set_host_state(ri, hi, HostPhase::Baking, "applied; baking");
         if bake > 0 {
             self.send_bake_request(ri, hi, until);
         }
+    }
+
+    /// The bake window of host `hi`'s phase, in seconds.
+    fn bake_seconds(&self, ri: usize, hi: usize) -> u64 {
+        self.live[ri].hosts[hi]
+            .runtime
+            .phase_index
+            .and_then(|i| self.live[ri].record.runtime.phases.get(i))
+            .map(|p| p.bake_seconds)
+            .unwrap_or(0)
+    }
+
+    /// How long after its bake window a connected host that never sent a
+    /// bake report is given before it fails.
+    fn bake_report_grace(&self, ri: usize) -> chrono::Duration {
+        let settle =
+            chrono::Duration::from_std(self.live[ri].record.policy.settle).unwrap_or_default();
+        settle.max(chrono::Duration::minutes(1))
     }
 
     fn send_bake_request(&mut self, ri: usize, hi: usize, until: DateTime<Utc>) {
@@ -2236,6 +2265,7 @@ impl Controller {
     // ------------------------------------------------------------ timers
 
     fn next_deadline(&self) -> Option<DateTime<Utc>> {
+        let now = self.now();
         let settle =
             |l: &Live| chrono::Duration::from_std(l.record.policy.settle).unwrap_or_default();
         let timeout =
@@ -2255,8 +2285,28 @@ impl Controller {
                     for since in h.runtime.failing_since.values() {
                         consider(*since + settle(l));
                     }
+                    // A window already past is a deadline only when it can
+                    // complete the host now; while a check is followed through
+                    // settle it would spin (settle is the deadline then), and
+                    // a host that has not reported is waited for a grace.
+                    let window = h
+                        .runtime
+                        .phase_index
+                        .and_then(|i| l.record.runtime.phases.get(i))
+                        .is_some_and(|p| p.bake_seconds > 0);
                     if let Some(u) = h.runtime.bake_until {
-                        consider(u);
+                        if u > now
+                            || (h.runtime.failing_since.is_empty()
+                                && (!window
+                                    || (h.runtime.bake_reports > 0 && self.connected(&h.host))))
+                        {
+                            consider(u);
+                        } else if window && h.runtime.bake_reports == 0 {
+                            let grace = settle(l).max(chrono::Duration::minutes(1));
+                            if u + grace > now {
+                                consider(u + grace);
+                            }
+                        }
                     }
                 }
                 if let Some(d) = h.runtime.disconnected_at {
@@ -2304,11 +2354,28 @@ impl Controller {
                         self.fail_host(ri, hi, &why);
                         continue;
                     }
-                    if h.runtime.bake_until.is_some_and(|u| u <= now)
+                    // Baked: the window passed without a required check
+                    // failing, and the host is connected and has reported
+                    // (when it has a window at all).
+                    let window = self.bake_seconds(ri, hi) > 0;
+                    let reported = !window || h.runtime.bake_reports > 0;
+                    let ended = h.runtime.bake_until.filter(|u| *u <= now);
+                    if let Some(until) = ended
                         && h.runtime.failing_since.is_empty()
                     {
-                        self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
-                        continue;
+                        if reported && (!window || self.connected(&host)) {
+                            self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
+                            continue;
+                        }
+                        if !reported
+                            && self.connected(&host)
+                            && until + self.bake_report_grace(ri) <= now
+                        {
+                            let why = "sent no health report during its bake".to_owned();
+                            self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                            self.fail_host(ri, hi, &why);
+                            continue;
+                        }
                     }
                 }
                 let h = &self.live[ri].hosts[hi];
@@ -2321,6 +2388,18 @@ impl Controller {
                     let why = format!("no apply result within {mins}m");
                     self.live[ri].hosts[hi].runtime.error = Some(why.clone());
                     self.fail_host(ri, hi, &why);
+                    continue;
+                }
+                let h = &self.live[ri].hosts[hi];
+                if h.runtime
+                    .disconnected_at
+                    .is_some_and(|d| d + timeout <= now)
+                    && self.connected(&host)
+                {
+                    // Back (its reconnect was handled elsewhere): not a
+                    // deadline any more.
+                    self.live[ri].hosts[hi].runtime.disconnected_at = None;
+                    self.touch_host(ri, hi);
                     continue;
                 }
                 let h = &self.live[ri].hosts[hi];

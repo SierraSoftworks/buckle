@@ -289,6 +289,10 @@ pub struct HostRuntime {
     /// Cleared when the host finishes.
     #[serde(default)]
     pub released: bool,
+    /// Bake health reports received since the bake (re)started; a host with
+    /// a bake window completes only once it has reported.
+    #[serde(default)]
+    pub bake_reports: u32,
 }
 
 /// One `rollout_hosts` row.
