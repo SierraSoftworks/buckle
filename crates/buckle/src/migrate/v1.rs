@@ -141,7 +141,7 @@ fn read_scope(dir: &Path, what: &str) -> error::Result<Scope> {
         let path = entry.path();
         match path.extension().and_then(|e| e.to_str()) {
             Some("env") => {
-                let text = io(std::fs::read_to_string(&path), "read", &path)?;
+                let text = io(std::fs::read_to_string(&path), "read", &path)?.replace("\r\n", "\n");
                 scope.env_files.push(EnvFile {
                     name,
                     entries: parse_env(&text),

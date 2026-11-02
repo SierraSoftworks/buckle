@@ -560,3 +560,43 @@ fn an_output_path_that_is_a_file_is_refused() {
     std::fs::write(&file, "x").unwrap();
     assert!(!migrate(&fixture("minimal"), &file, &[]).ok);
 }
+
+/// Copies a fixture, rewriting text files to CRLF, as a Windows checkout with
+/// `core.autocrlf` would produce them.
+fn copy_with_crlf(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).expect("readable").flatten() {
+        let path = entry.path();
+        let dest = to.join(entry.file_name());
+        if path.is_dir() {
+            std::fs::create_dir_all(&dest).unwrap();
+            copy_with_crlf(&path, &dest);
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let bytes = match std::str::from_utf8(&bytes) {
+            Ok(text) => text
+                .replace("\r\n", "\n")
+                .replace('\n', "\r\n")
+                .into_bytes(),
+            Err(_) => bytes,
+        };
+        std::fs::write(&dest, bytes).unwrap();
+    }
+}
+
+#[test]
+fn crlf_sources_migrate_like_lf_sources() {
+    let src = tempfile::tempdir().expect("a temp dir");
+    copy_with_crlf(&fixture("files"), src.path());
+    let out = tempfile::tempdir().expect("a temp dir");
+    let ran = migrate(src.path(), out.path(), &[]);
+    assert!(ran.ok, "migrating a CRLF checkout failed:\n{}", ran.stderr);
+    let revision = load(out.path());
+    let rendered = render(
+        module(&revision, "web"),
+        "conf.d/site.conf.j2",
+        json!({"SITE": "example.com"}),
+        &[],
+    );
+    assert_eq!(rendered, "server_name = example.com\n");
+}

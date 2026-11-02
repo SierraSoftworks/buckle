@@ -412,6 +412,9 @@ fn emit_module(
                     &["Buckle 1.x could not render it either; fix the file and migrate again."],
                 )
             })?;
+            // v1 rendered templates byte for byte; Jinja output is line based, so
+            // Windows checkouts (CRLF) must migrate to the same template as LF ones.
+            let text = text.replace("\r\n", "\n");
             let converted = gotmpl::convert(&text, &secrets, &defined);
             let src = format!("{}/{}.j2", file.group, file.rel);
             let contents = if converted.todos.is_empty() {
