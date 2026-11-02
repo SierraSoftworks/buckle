@@ -151,6 +151,22 @@ impl Facts {
         self.stale.remove(name);
     }
 
+    /// Copies the named providers' results (values, collection times and
+    /// failures) from `other`, leaving every other provider alone, so that
+    /// concurrent refreshes of different providers do not overwrite each other.
+    pub fn merge_providers(&mut self, other: &Facts, names: &[String]) {
+        for name in names {
+            if other.stale.contains(name) {
+                self.mark_failed(name);
+            } else if let Some(at) = other.collected_at.get(name) {
+                let value = crate::selectors::lookup_path(&other.tree, name)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                self.mount(name, value, *at);
+            }
+        }
+    }
+
     /// Whether a provider's subtree is older than its TTL (or missing).
     pub fn is_stale(&self, name: &str, ttl: Duration, now: chrono::DateTime<chrono::Utc>) -> bool {
         match self.collected_at.get(name) {

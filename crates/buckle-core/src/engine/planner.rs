@@ -179,7 +179,6 @@ pub(super) struct RichPlan {
     /// Every selected module (planned or deferred) in dependency order.
     pub order: Vec<String>,
     pub needs: HashMap<String, Vec<String>>,
-    pub provides: HashMap<String, Vec<String>>,
 }
 
 /// Module selection for a host.
@@ -1198,7 +1197,6 @@ pub(super) async fn plan_with(
         removals: rich_removals,
         order,
         needs,
-        provides,
     })
 }
 

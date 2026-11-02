@@ -77,6 +77,8 @@ struct Executor<'a> {
     redactor: Redactor,
     /// Steps that changed something so far in this run; gates re-planning of blocked steps.
     changed_so_far: AtomicUsize,
+    /// The facts as refreshed so far in this run.
+    facts: Mutex<Facts>,
 }
 
 /// `Engine::apply`.
@@ -88,7 +90,7 @@ pub(super) async fn apply(
     let started = tokio::time::Instant::now();
     let started_at = inputs.system.now();
     let planner = Planner::from_inputs(inputs, &inputs.revision)?;
-    let mut facts = collect_facts(inputs, &planner).await;
+    let facts = collect_facts(inputs, &planner).await;
     let state = inputs.state.load()?;
     let rich = plan_with(&planner, &facts, &state).await?;
     if rich.plan.digest != plan.digest {
@@ -111,10 +113,9 @@ pub(super) async fn apply(
         state: Arc::new(Mutex::new(state)),
         redactor: Redactor::new(&inputs.secrets),
         changed_so_far: AtomicUsize::new(0),
+        facts: Mutex::new(facts),
     };
-    let outcome = executor
-        .run(&planner, rich, &mut facts, started, started_at)
-        .await?;
+    let outcome = executor.run(&planner, rich, started, started_at).await?;
     Ok(outcome)
 }
 
@@ -129,6 +130,28 @@ impl<'a> Executor<'a> {
         } else {
             self.redactor.redact(text).into_inner()
         }
+    }
+
+    /// A snapshot of the facts as refreshed so far.
+    fn facts(&self) -> Facts {
+        self.facts.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Force-collects `providers` and merges their results into the run's
+    /// facts (unless the facts are frozen), then reports the refresh.
+    async fn refresh_facts(&self, planner: &Planner<'_>, providers: &[String]) {
+        if !self.inputs.facts_frozen {
+            let mut fresh = self.facts();
+            crate::facts::collect(&planner.facts_cx(), &mut fresh, Some(providers), true).await;
+            self.facts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .merge_providers(&fresh, providers);
+        }
+        self.emit(ApplyEvent::FactsRefreshed {
+            providers: providers.to_vec(),
+        })
+        .await;
     }
 
     fn with_state<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
@@ -532,18 +555,46 @@ impl<'a> Executor<'a> {
             ModuleStatus::Unchanged
         };
         let mut error = None;
+        let config = planner.revision.module(&module).map(|m| &m.config);
+        // Providers the module declares re-run now, so that its own health
+        // checks (and the modules planned after it) see what it changed.
+        if let Some(config) = config
+            && !config.facts.provides.is_empty()
+        {
+            self.refresh_facts(planner, &config.facts.provides).await;
+        }
         if run_health
-            && let Some(config) = planner.revision.module(&module).map(|m| &m.config)
+            && let Some(config) = config
             && !config.health.is_empty()
         {
+            // Checks evaluate against the facts as refreshed so far, not the
+            // plan-time snapshot.
+            let contexts = planner.contexts(&self.facts());
+            let ctx = planner
+                .module_context(&contexts, config)
+                .unwrap_or_else(|_| rich.ctx.clone());
+            let module_checks = checks::ModuleChecks {
+                module: &module,
+                decls: &config.health,
+                ctx: &ctx,
+                source: &rich.source,
+            };
+            if changes == 0 {
+                // Nothing changed, so nothing this run did can have broken
+                // the module: report its checks without gating on them.
+                let results = checks::run_once(planner, &module_checks).await;
+                checks::report(&module, &results, &self.events).await;
+                health = results;
+                self.emit(ApplyEvent::ModuleFinished {
+                    module: module.clone(),
+                    status,
+                })
+                .await;
+                return finish(status, error, changes, health);
+            }
             let (results, healthy) = checks::run_settled(
                 planner,
-                &checks::ModuleChecks {
-                    module: &module,
-                    decls: &config.health,
-                    ctx: &rich.ctx,
-                    source: &rich.source,
-                },
+                &module_checks,
                 planner.revision.fleet.rollout.settle,
                 &self.inputs.waived_checks,
                 &self.events,
@@ -744,7 +795,6 @@ impl<'a> Executor<'a> {
         &self,
         planner: &Planner<'_>,
         rich: RichPlan,
-        facts: &mut Facts,
         started: tokio::time::Instant,
         started_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::Result<ApplyOutcome> {
@@ -779,7 +829,6 @@ impl<'a> Executor<'a> {
             .collect();
         let order = rich.order.clone();
         let needs = rich.needs.clone();
-        let provides = rich.provides.clone();
 
         let mut started_modules: HashSet<String> = HashSet::new();
         let mut done: HashSet<String> = HashSet::new();
@@ -835,7 +884,7 @@ impl<'a> Executor<'a> {
                     }
                     if !module_plans.contains_key(name) && deferred.contains(name) {
                         let state = self.with_state(|s| s.clone());
-                        match planner.plan_one(name, facts, &state, true).await {
+                        match planner.plan_one(name, &self.facts(), &state, true).await {
                             Ok(planned) => {
                                 module_plans.insert(name.clone(), Arc::new(planned));
                             }
@@ -865,7 +914,7 @@ impl<'a> Executor<'a> {
                     };
                     started_modules.insert(name.clone());
                     let rev = revision.clone();
-                    let contexts = Arc::new(planner.contexts(facts));
+                    let contexts = Arc::new(planner.contexts(&self.facts()));
                     let span = tracing::info_span!("module.apply", buckle.module = %name);
                     running.push(Box::pin(
                         async move {
@@ -894,16 +943,10 @@ impl<'a> Executor<'a> {
             if run.failed {
                 failed.push(name.clone());
                 halted = true;
-            } else if let Some(providers) = provides.get(&name).filter(|p| !p.is_empty()) {
-                let cx = planner.facts_cx();
-                crate::facts::collect(&cx, facts, Some(providers), true).await;
-                self.emit(ApplyEvent::FactsRefreshed {
-                    providers: providers.clone(),
-                })
-                .await;
             }
             results.push(run.outcome);
-            self.with_state(|s| s.facts = facts.clone());
+            let facts = self.facts();
+            self.with_state(|s| s.facts = facts);
             if let Err(e) = self.save_state() {
                 errors.push(format!("state could not be saved: {}", e.message()));
             }
@@ -912,7 +955,7 @@ impl<'a> Executor<'a> {
         // Module-scoped rollback of whatever failed, after in-flight modules drained.
         let mut rolled_back = Vec::new();
         for name in &failed {
-            match self.rollback(name, facts).await {
+            match self.rollback(name, &self.facts()).await {
                 Ok(Some(run)) => {
                     health.extend(run.health);
                     if run.outcome.status == ModuleStatus::RolledBack {
@@ -971,7 +1014,7 @@ impl<'a> Executor<'a> {
             );
         }
         if !halted && self.inputs.removals {
-            let contexts = planner.contexts(facts);
+            let contexts = planner.contexts(&self.facts());
             let (count, removal_errors) = self
                 .run_removals(planner, &contexts, &rich.plan.removals, &rich.removals)
                 .await;
@@ -1011,8 +1054,9 @@ impl<'a> Executor<'a> {
             RunOutcome::Failed
         };
         let finished_at = self.inputs.system.now();
+        let facts = self.facts();
         self.with_state(|s| {
-            s.facts = facts.clone();
+            s.facts = facts;
             if succeeded {
                 s.applied_revision = Some(revision.clone());
                 // Forget modules that are neither selected nor own anything.

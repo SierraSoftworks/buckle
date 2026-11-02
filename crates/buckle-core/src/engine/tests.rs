@@ -518,6 +518,31 @@ impl crate::health::HealthCheck for Flaky {
 
 crate::register_health!(Flaky);
 
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct FilterSpec {
+    expr: String,
+}
+
+/// Like the standard `filter` check: a filt-rs expression over the host.
+struct FilterCheck;
+
+#[async_trait]
+impl crate::health::HealthCheck for FilterCheck {
+    type Spec = FilterSpec;
+    const KIND: &'static str = "test.filter";
+
+    async fn check(&self, cx: &Cx, spec: &FilterSpec) -> crate::health::HealthStatus {
+        let filter = Filter::new(spec.expr.as_str()).unwrap();
+        match cx.host.try_matches(&filter) {
+            Ok(true) => crate::health::HealthStatus::Pass,
+            Ok(false) => crate::health::HealthStatus::fail(format!("`{}` is false", spec.expr)),
+            Err(e) => crate::health::HealthStatus::unknown(e),
+        }
+    }
+}
+
+crate::register_health!(FilterCheck);
+
 /// Mounts `host.facts.test.counter.value` from the fake file `/facts/counter`.
 struct CounterFacts;
 
@@ -2687,6 +2712,82 @@ async fn health_checks_failing_past_settle_make_the_module_unhealthy() {
         "t=0s, 1s, 2s"
     );
     assert!(!outcome.health.unwrap().healthy(&[]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn health_checks_see_the_facts_their_module_just_refreshed() {
+    let rev = revision(
+        "r1",
+        "version: 2\nrollout: { settle: 5s }\n",
+        vec![module(
+            r#"
+name: nomad
+facts: { provides: [test.counter] }
+tasks: [ { test.file: { path: /facts/counter, content: eligible, run: hf1 } } ]
+health:
+  - name: eligible
+    test.filter: { expr: 'host.facts.test.counter.value == "eligible"' }
+    interval: 1s
+"#,
+        )],
+    );
+    let sys = FakeSystem::new();
+    let mut inputs = inputs(rev, &sys);
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let (outcome, events) = apply(&inputs).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(status_of(&outcome, "nomad"), ModuleStatus::Applied);
+    let checked: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            ApplyEvent::HealthChecked { passed, .. } => Some(*passed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checked,
+        vec![true],
+        "passes at once against the refreshed facts"
+    );
+    let refreshed = events
+        .iter()
+        .position(|e| matches!(e, ApplyEvent::FactsRefreshed { .. }))
+        .unwrap();
+    let checked_at = events
+        .iter()
+        .position(|e| matches!(e, ApplyEvent::HealthChecked { .. }))
+        .unwrap();
+    assert!(refreshed < checked_at);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_checks_of_an_unchanged_module_are_reported_but_do_not_gate() {
+    let rev = revision(
+        "r1",
+        "version: 2\nrollout: { settle: 10s }\n",
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /hng/x, content: same, run: hng1 } } ]\nhealth:\n  - name: flaky\n    test.flaky: { run: hng1, pass_after: 100 }\n    interval: 1s\n",
+        )],
+    );
+    let sys = FakeSystem::new().with_file("/hng/x", "same", FilePerms::mode(0o644));
+    let stable = revision("r0", FLEET, vec![module("name: m\n")]);
+    let inputs = inputs(rev, &sys).with_stable_revision(Some(stable));
+    let (outcome, _) = apply(&inputs).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Unchanged);
+    assert!(outcome.rolled_back_modules.is_empty());
+    assert!(sys.exists("/hng/x"));
+    let report = outcome.health.unwrap();
+    assert!(!report.healthy(&[]), "the failing check is still reported");
+    assert_eq!(
+        calls("hng1")
+            .iter()
+            .filter(|c| c.starts_with("health attempt"))
+            .count(),
+        1,
+        "no settle loop for a module this run did not change"
+    );
 }
 
 #[tokio::test(start_paused = true)]

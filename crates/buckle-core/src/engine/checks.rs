@@ -87,6 +87,30 @@ pub(super) async fn run_once(
     results
 }
 
+/// Emits a `HealthChecked` event per result.
+pub(super) async fn report(
+    module: &str,
+    results: &[HealthResult],
+    events: &tokio::sync::mpsc::Sender<ApplyEvent>,
+) {
+    for r in results {
+        let reason = match &r.status {
+            HealthStatus::Pass => None,
+            HealthStatus::Fail { reason } | HealthStatus::Unknown { reason } => {
+                Some(reason.clone())
+            }
+        };
+        let _ = events
+            .send(ApplyEvent::HealthChecked {
+                module: module.to_owned(),
+                check: r.check.clone(),
+                passed: r.status.is_pass(),
+                reason,
+            })
+            .await;
+    }
+}
+
 /// Runs the checks, and while a required (non-waived) check fails and less than
 /// `settle` has elapsed since the first failure, re-runs them every `interval`
 /// of the failing checks. Returns the final results and whether the module is
@@ -106,22 +130,7 @@ pub(super) async fn run_settled(
     let mut first_failure: Option<tokio::time::Instant> = None;
     loop {
         let results = run_once(planner, checks).await;
-        for r in &results {
-            let reason = match &r.status {
-                HealthStatus::Pass => None,
-                HealthStatus::Fail { reason } | HealthStatus::Unknown { reason } => {
-                    Some(reason.clone())
-                }
-            };
-            let _ = events
-                .send(ApplyEvent::HealthChecked {
-                    module: module.to_owned(),
-                    check: r.check.clone(),
-                    passed: r.status.is_pass(),
-                    reason,
-                })
-                .await;
-        }
+        report(module, &results, events).await;
         let failing: Vec<&HealthResult> = results
             .iter()
             .filter(|r| r.counts_as_failure(waived))
