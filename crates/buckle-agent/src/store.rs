@@ -231,6 +231,9 @@ impl Store {
                     .to_human_error()?;
             }
         }
+        // Windows has no mode bits: restrict the whole state directory
+        // (tokens, install key, secrets) to Administrators and SYSTEM.
+        crate::install::restrict_windows_acl(&self.root, true)?;
         Ok(())
     }
 

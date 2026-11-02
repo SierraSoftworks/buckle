@@ -189,14 +189,22 @@ impl GitHubUpdater {
             std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
                 .to_human_error()?;
         }
+        // Windows cannot replace a running executable, but it can rename it:
+        // move it aside first, and put it back if the swap fails so the
+        // service still has a binary to start.
         #[cfg(windows)]
-        {
+        let aside = {
             let aside = target.with_extension("old.exe");
             let _ = std::fs::remove_file(&aside);
             std::fs::rename(&target, &aside).to_human_error()?;
-        }
+            aside
+        };
         if let Err(err) = std::fs::rename(&staging, &target) {
             let _ = std::fs::remove_file(&staging);
+            #[cfg(windows)]
+            if let Err(restore) = std::fs::rename(&aside, &target) {
+                tracing::error!(error = %restore, "could not restore the previous binary after a failed update");
+            }
             return Err(err).to_human_error();
         }
         tracing::info!(version = %release.version, path = %target.display(), "installed a new Buckle binary");

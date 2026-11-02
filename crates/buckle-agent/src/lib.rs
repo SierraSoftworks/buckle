@@ -28,7 +28,7 @@ pub mod testing;
 mod tests;
 
 pub use config::AgentConfig;
-pub use install::InstallOptions;
+pub use install::{InstallOptions, InstallOutcome};
 pub use runner::{RunContext, Runner};
 pub use session::{Agent, AgentOptions};
 
@@ -83,6 +83,6 @@ pub async fn install(
     config: &AgentConfig,
     config_path: &Path,
     options: &InstallOptions,
-) -> buckle_core::Result<()> {
+) -> buckle_core::Result<InstallOutcome> {
     install::install(config, config_path, options).await
 }
