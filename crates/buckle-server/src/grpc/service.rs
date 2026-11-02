@@ -227,7 +227,7 @@ impl FleetService {
                     if created.1 {
                         // A forgotten host registering afresh: the controller
                         // still excludes it until told.
-                        self.controller.host_changed(&identity.node);
+                        self.controller.host_registered(&identity.node);
                         self.audit(
                             "controller",
                             "host.registered",
@@ -355,7 +355,7 @@ impl FleetService {
             Ok(status) => {
                 // A forgotten host enrolling afresh: the controller still
                 // excludes it until told.
-                self.controller.host_changed(&hello.host_id);
+                self.controller.host_registered(&hello.host_id);
                 self.audit(
                     "controller",
                     "host.enrolled",

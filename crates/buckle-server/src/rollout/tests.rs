@@ -2589,3 +2589,195 @@ async fn deferred_modules_need_approval_under_if_destructive() {
     .unwrap();
     h.wait_state(&id, RolloutState::Completed).await;
 }
+
+impl Harness {
+    /// Restarts the controller with an empty revision cache (it re-reads
+    /// revisions from disk).
+    async fn restart_with_fresh_cache(&mut self) {
+        self.revisions = Arc::new(RevisionCache::new(self._data.path()));
+        self.restart().await;
+    }
+}
+
+/// A host update that changes neither status nor effective labels (a notes
+/// edit) re-sends nothing; a label change pushes the update and re-sends
+/// what is in flight.
+#[tokio::test(start_paused = true)]
+async fn a_host_update_resends_in_flight_work_only_when_labels_or_status_change() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 5m }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "baking", |_, hs| {
+        host(hs, "a").state == HostPhase::Baking
+    })
+    .await;
+    let count = |h: &Harness| {
+        h.sent(|x, m| {
+            x == "a" && matches!(m, SMsg::HostUpdate(_) | SMsg::Health(_) | SMsg::Plan(_))
+        })
+        .len()
+    };
+    let before = count(&h);
+    h.store
+        .call(|db| db.hosts().set_notes("a", "rack 4").map(|_| ()))
+        .await
+        .unwrap();
+    h.handle.host_changed("a");
+    h.idle(2).await;
+    assert_eq!(count(&h), before, "a notes edit re-sends nothing");
+
+    h.store
+        .call(|db| {
+            let mut labels = BTreeMap::new();
+            labels.insert("tier".to_string(), "web".to_string());
+            labels.insert("rack".to_string(), "4".to_string());
+            db.hosts().set_labels("a", &labels).map(|_| ())
+        })
+        .await
+        .unwrap();
+    h.handle.host_changed("a");
+    for _ in 0..60 {
+        if count(&h) > before {
+            break;
+        }
+        h.idle(1).await;
+    }
+    let updates = h.sent(|x, m| x == "a" && matches!(m, SMsg::HostUpdate(_)));
+    assert_eq!(updates.len(), 1, "the label change reaches the agent");
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Healthy);
+}
+
+/// A live rollout whose revision cannot be loaded at start-up is ended as
+/// aborted, with the reason, instead of being left looking live.
+#[tokio::test(start_paused = true)]
+async fn a_rollout_whose_revision_cannot_load_at_start_up_is_aborted_with_a_reason() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  phases:\n    - { name: web, select: 'true', approval: required }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+    std::fs::remove_dir_all(h.revisions.dir("r1")).unwrap();
+    h.restart_with_fresh_cache().await;
+    let (r, _) = h.snapshot(&id).await;
+    assert_eq!(r.state, RolloutState::Aborted);
+    assert!(r.finished_at.is_some());
+    let reason = r.runtime.end_reason.unwrap();
+    assert!(reason.contains("could not be loaded"), "{reason}");
+    assert!(
+        h.audit_actions(&id)
+            .await
+            .contains(&"rollout.aborted".to_owned())
+    );
+}
+
+/// A host released from a baseline hold by a skip was never updated: on
+/// promotion it moves to the stragglers stage and converges there.
+#[tokio::test(start_paused = true)]
+async fn a_host_skipped_at_baseline_moves_to_the_stragglers_on_promotion() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.enrol("b", "web").await;
+    h.script("a", |s| s.baseline_fail = true);
+    h.connect("a", None);
+    h.connect("b", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "a held", |_, hs| {
+        host(hs, "a").state == HostPhase::Held
+    })
+    .await;
+    // It recovers soon after; the operator releases the phase from it.
+    h.script("a", |s| s.baseline_fail = false);
+    h.command(Command::Skip {
+        rollout: id.clone(),
+        host: "a".into(),
+        note: "fix it later".into(),
+    })
+    .await
+    .unwrap();
+    h.wait_state(&id, RolloutState::Completed).await;
+    let (_, hosts) = h
+        .wait(&id, "a healthy in stragglers", |_, hs| {
+            host(hs, "a").state == HostPhase::Healthy
+        })
+        .await;
+    assert_eq!(host(&hosts, "a").phase, STRAGGLERS);
+}
+
+/// Reject ends a rollout awaiting approval as aborted, with the reason,
+/// audited; anything else is refused.
+#[tokio::test(start_paused = true)]
+async fn reject_aborts_a_rollout_awaiting_approval() {
+    let mut h = Harness::new().await;
+    h.revision("r1", TWO_PHASES).await;
+    h.enrol("c1", "canary").await;
+    h.connect("c1", None);
+    let id = h.start("r1").await;
+    let empty = h
+        .command(Command::Reject {
+            rollout: id.clone(),
+            reason: "  ".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(empty.kind, CommandErrorKind::Invalid);
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+    h.command(Command::Reject {
+        rollout: id.clone(),
+        reason: "wrong window".into(),
+    })
+    .await
+    .unwrap();
+    let (r, _) = h.snapshot(&id).await;
+    assert_eq!(r.state, RolloutState::Aborted);
+    assert!(r.runtime.end_reason.unwrap().contains("wrong window"));
+    assert!(h.applies().is_empty());
+    let actions = h.audit_actions(&id).await;
+    assert!(
+        actions.contains(&"rollout.reject".to_owned()),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&"rollout.aborted".to_owned()),
+        "{actions:?}"
+    );
+
+    // Not awaiting approval: refused.
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 5m }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "baking", |_, hs| {
+        host(hs, "a").state == HostPhase::Baking
+    })
+    .await;
+    let refused = h
+        .command(Command::Reject {
+            rollout: id.clone(),
+            reason: "no".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind, CommandErrorKind::Conflict);
+}

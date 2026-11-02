@@ -980,10 +980,9 @@ async fn rollout_approve(
 }
 
 /// `POST /rollouts/{id}/reject`: valid only while the rollout awaits
-/// approval (409 otherwise). The controller has no reject transition of its
-/// own, so this is its abort command with the reason as the note, followed
-/// by a `rollout.reject` audit entry carrying the reason; the rollout ends
-/// `aborted`.
+/// approval (409 otherwise). The controller's reject command checks the
+/// state and ends the rollout `aborted` with the reason in one step (no
+/// check-then-abort race), auditing `rollout.reject` with the reason.
 async fn rollout_reject(
     state: Data,
     admin: Administrative,
@@ -1003,36 +1002,23 @@ async fn rollout_reject(
         .call(move |db| db.rollouts().get(&i2))
         .await?
         .ok_or_else(|| ApiError::not_found(format!("No rollout '{id}'.")))?;
+    // A finished rollout is not live in the controller (it would answer 404);
+    // the controller re-checks the state atomically.
     if record.state != RolloutState::AwaitingApproval {
         return Err(ApiError::conflict(format!(
             "Rollout {id} is not awaiting approval, so there is nothing to reject; abort it instead."
         )));
     }
-    let phase = record
-        .runtime
-        .phases
-        .get(record.runtime.current_phase)
-        .map(|p| p.name.clone());
-    let actor = admin.0.actor();
     state
         .controller
         .command(
-            &actor,
-            Command::Abort {
+            &admin.0.actor(),
+            Command::Reject {
                 rollout: id.clone(),
-                note: format!("Rejected: {reason}"),
+                reason,
             },
         )
         .await?;
-    audit_action(
-        &state,
-        &actor,
-        "rollout.reject",
-        &id,
-        format!("{actor} rejected the rollout: {reason}"),
-        Some(serde_json::json!({ "reason": reason, "phase": phase })),
-    )
-    .await;
     Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))
 }
 
