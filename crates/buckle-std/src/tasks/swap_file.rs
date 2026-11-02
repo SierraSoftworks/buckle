@@ -214,10 +214,10 @@ impl Task for SwapFile {
         hostkit::require_absolute(&spec.path, "path")?;
         let seen = observe(cx, spec).await?;
         if seen.settled(spec) {
-            return Ok(Applied::unchanged(format!(
-                "{} already active",
-                spec.path.display()
-            )));
+            return Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("{} already active", spec.path.display())),
+            ));
         }
         let path = spec.path.display().to_string();
         let mut applied = Applied::changed(format!("configured swap file {path}"));
@@ -325,7 +325,8 @@ impl Task for SwapFile {
                 description: format!("{SYSCTL_MARKER}: {SYSCTL_FILE}"),
             });
         }
-        Ok(applied)
+        // The file, fstab line and sysctl file Buckle created on earlier applies stay its own.
+        Ok(hostkit::ownership::carry_forward(cx, applied))
     }
 
     fn describe_removal(&self, record: &ResourceRecord) -> String {
@@ -721,6 +722,33 @@ mod tests {
                 .plan(&cx(&sys), &s(json!({"path": "swapfile"})))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_swappiness_change_keeps_everything_buckle_created() {
+        let sys = host();
+        let first = apply(&SwapFile, &cx(&sys), &s(json!({}))).await;
+        assert!(
+            first
+                .artefacts
+                .iter()
+                .any(|a| matches!(a, Artefact::File { .. }))
+        );
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .previous(record("swap.file", "/swapfile", &first))
+            .build();
+        let second = apply(&SwapFile, &c, &s(json!({"swappiness": 10}))).await;
+        for artefact in &first.artefacts {
+            assert!(second.artefacts.contains(artefact), "{artefact:?} kept");
+        }
+        assert!(
+            SwapFile
+                .remove(&cx(&sys), &record("swap.file", "/swapfile", &second))
+                .await
+                .unwrap()
+                .summary
+                .contains("deleted the swap file")
         );
     }
 }

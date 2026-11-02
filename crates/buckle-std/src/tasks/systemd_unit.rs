@@ -1,6 +1,7 @@
 //! `systemd.unit`: enable, start, stop, mask a unit.
 
-use super::sys_exec::{Ledger, run_checked};
+use super::hostkit::ownership::previous_artefacts;
+use super::sys_exec::run_checked;
 use super::systemd_common::{UnitStatus, show, systemctl};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
@@ -120,6 +121,44 @@ fn steps(spec: &Spec, status: &UnitStatus) -> std::result::Result<Vec<Step>, Str
     Ok(out)
 }
 
+const MASKED_PREFIX: &str = "systemd: masked ";
+
+/// What this resource's earlier applies did to the unit.
+#[derive(Debug, Default)]
+struct Owned {
+    enabled: bool,
+    started: bool,
+    masked: bool,
+    unit_file: Option<std::path::PathBuf>,
+}
+
+impl Owned {
+    fn from_previous(cx: &Cx, name: &str) -> Self {
+        let mut owned = Owned::default();
+        for artefact in previous_artefacts(cx) {
+            match artefact {
+                Artefact::Unit {
+                    name: n,
+                    enabled,
+                    started,
+                    unit_file,
+                } if n == name => {
+                    owned.enabled |= *enabled;
+                    owned.started |= *started;
+                    owned.unit_file = owned.unit_file.take().or_else(|| unit_file.clone());
+                }
+                Artefact::Other { description }
+                    if description.strip_prefix(MASKED_PREFIX) == Some(name) =>
+                {
+                    owned.masked = true;
+                }
+                _ => {}
+            }
+        }
+        owned
+    }
+}
+
 #[async_trait]
 impl Task for SystemdUnit {
     type Spec = Spec;
@@ -183,30 +222,22 @@ impl Task for SystemdUnit {
                 &["Set `masked: false` on the task, or unmask the unit by hand."],
             )
         })?;
-        let mut ledger = Ledger::open(cx, "systemd.unit").await?;
-        let (k_enabled, k_started, k_masked) = (
-            format!("enabled:{name}"),
-            format!("started:{name}"),
-            format!("masked:{name}"),
-        );
+        // What this resource did on earlier applies (never what another module did).
+        let mut owned = Owned::from_previous(cx, name);
+        // A unit someone else enabled is theirs to run: starting it does not make
+        // Buckle responsible for stopping it again on removal.
+        let enabled_elsewhere = status.is_enabled() && !owned.enabled;
         for step in &todo {
             run_checked(cx, systemctl(&[step.verb(), name])).await?;
             match step {
-                Step::Enable => ledger.insert(&k_enabled, "1"),
-                Step::Start => ledger.insert(&k_started, "1"),
-                Step::Mask => ledger.insert(&k_masked, "1"),
-                Step::Disable => {
-                    ledger.remove(&k_enabled);
-                }
-                Step::Stop => {
-                    ledger.remove(&k_started);
-                }
-                Step::Unmask => {
-                    ledger.remove(&k_masked);
-                }
+                Step::Enable => owned.enabled = true,
+                Step::Start => owned.started |= !enabled_elsewhere,
+                Step::Mask => owned.masked = true,
+                Step::Disable => owned.enabled = false,
+                Step::Stop => owned.started = false,
+                Step::Unmask => owned.masked = false,
             }
         }
-        ledger.save(cx).await?;
 
         let mut applied = Applied::unchanged(format!("{name} already in the desired state"));
         if !todo.is_empty() {
@@ -217,13 +248,13 @@ impl Task for SystemdUnit {
         }
         applied = applied.with_artefact(Artefact::Unit {
             name: name.to_owned(),
-            enabled: ledger.contains(&k_enabled),
-            started: ledger.contains(&k_started),
-            unit_file: None,
+            enabled: owned.enabled,
+            started: owned.started,
+            unit_file: owned.unit_file,
         });
-        if ledger.contains(&k_masked) {
+        if owned.masked {
             applied = applied.with_artefact(Artefact::Other {
-                description: format!("systemd: masked {name}"),
+                description: format!("{MASKED_PREFIX}{name}"),
             });
         }
         Ok(applied)
@@ -247,12 +278,7 @@ impl Task for SystemdUnit {
     #[tracing::instrument(name = "task.systemd.unit.remove", skip_all, fields(resource = %record.key))]
     async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
         let plan = removal_plan(record);
-        let mut ledger = Ledger::open(cx, "systemd.unit").await?;
         let name = record.key.key.clone();
-        for key in ["enabled", "started", "masked"] {
-            ledger.remove(&format!("{key}:{name}"));
-        }
-        ledger.save(cx).await?;
         if plan.is_empty() {
             return Ok(Applied::skipped(format!(
                 "Buckle did not enable, start or mask {name}; left as it is"
@@ -304,7 +330,7 @@ buckle_core::register_task!(SystemdUnit);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::sys_exec::testkit::{cx, record_of, spec};
+    use crate::tasks::sys_exec::testkit::{cx, cx_after, record_of, spec};
     use crate::tasks::systemd_common::testkit::{Systemd, Unit};
     use buckle_core::testing::FakeSystem;
     use rstest::rstest;
@@ -516,16 +542,17 @@ mod tests {
     #[tokio::test]
     async fn ownership_survives_a_later_edit_of_the_spec() {
         let world = Systemd::new().unit("nomad", Unit::new(false, false));
-        let (_sys, cx) = host(&world);
+        let (sys, cx) = host(&world);
         let first: Spec = spec(json!({"name": "nomad", "enabled": true}));
-        SystemdUnit
+        let applied = SystemdUnit
             .apply(&cx, &first, &Planned::NoOp)
             .await
             .unwrap();
         // Later the author also asks for it to be running; enabling is still Buckle's doing.
         let second: Spec = spec(json!({"name": "nomad", "enabled": true, "active": true}));
+        let again = cx_after(&sys, record_of("systemd.unit", "nomad", &applied));
         let applied = SystemdUnit
-            .apply(&cx, &second, &Planned::NoOp)
+            .apply(&again, &second, &Planned::NoOp)
             .await
             .unwrap();
         assert_eq!(
@@ -537,6 +564,68 @@ mod tests {
                 unit_file: None
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn starting_a_unit_someone_else_enabled_does_not_claim_it() {
+        // A package enabled nomad; it is stopped when Buckle asks for it to run.
+        let world = Systemd::new().unit("nomad", Unit::new(true, false));
+        let (_sys, cx) = host(&world);
+        let applied = SystemdUnit
+            .apply(
+                &cx,
+                &spec(json!({"name": "nomad", "enabled": true, "active": true})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        assert_eq!(world.get("nomad").unwrap(), Unit::new(true, true));
+        assert_eq!(
+            applied.artefacts,
+            vec![Artefact::Unit {
+                name: "nomad".into(),
+                enabled: false,
+                started: false,
+                unit_file: None
+            }]
+        );
+        let rec = record_of("systemd.unit", "nomad", &applied);
+        assert!(!SystemdUnit.remove(&cx, &rec).await.unwrap().changed);
+        assert_eq!(world.get("nomad").unwrap(), Unit::new(true, true));
+    }
+
+    #[tokio::test]
+    async fn another_module_does_not_inherit_what_this_one_did() {
+        let world = Systemd::new().unit("nomad", Unit::new(false, false));
+        let (sys, cx) = host(&world);
+        SystemdUnit
+            .apply(
+                &cx,
+                &spec(json!({"name": "nomad", "enabled": true, "active": true})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        // A second resource (no previous record) managing the same unit owns nothing.
+        let other = buckle_core::testing::CxBuilder::new(sys.clone())
+            .module("other")
+            .build();
+        let applied = SystemdUnit
+            .apply(
+                &other,
+                &spec(json!({"name": "nomad", "active": true})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            applied.artefacts.as_slice(),
+            [Artefact::Unit {
+                enabled: false,
+                started: false,
+                ..
+            }]
+        ));
     }
 
     #[tokio::test]

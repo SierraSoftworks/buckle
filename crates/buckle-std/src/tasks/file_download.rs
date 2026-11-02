@@ -221,9 +221,11 @@ impl Task for FileDownload {
         let inspection = self.inspect(cx, spec).await?;
         if !inspection.planned.is_change() {
             let current = cx.system.read(&spec.dest).await?.unwrap_or_default();
-            return Ok(hostkit::written(
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("{} already up to date", spec.dest.display()),
                 &spec.dest,
+                false,
                 Digest::of(&current),
                 None,
                 false,
@@ -232,9 +234,12 @@ impl Task for FileDownload {
         if inspection.perms_only {
             cx.system.set_perms(&spec.dest, &spec.perms).await?;
             let current = cx.system.read(&spec.dest).await?.unwrap_or_default();
-            return Ok(hostkit::written(
+            // A file Buckle did not download is adopted, not claimed.
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("updated permissions of {}", spec.dest.display()),
                 &spec.dest,
+                false,
                 Digest::of(&current),
                 None,
                 true,

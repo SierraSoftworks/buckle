@@ -4,6 +4,7 @@
 //! make their behaviour uniform: the same permission comparison, the same
 //! previews, the same "changed outside Buckle, left in place" removal rule.
 
+pub(crate) mod ownership;
 #[cfg(test)]
 pub(crate) mod testkit;
 
@@ -329,6 +330,12 @@ pub async fn remove_recorded_file(cx: &Cx, record: &ResourceRecord) -> Result<Ap
         Artefact::File { path } => Some(path.clone()),
         _ => None,
     }) else {
+        if ownership::any_adopted(&record.artefacts) {
+            return Ok(Applied::skipped(format!(
+                "{} existed before Buckle managed it (only its permissions were set), left in place",
+                record.key.key
+            )));
+        }
         return Ok(Applied::skipped("nothing recorded to remove"));
     };
     let Some(bytes) = cx.system.read(&path).await? else {

@@ -142,15 +142,16 @@ impl Task for UserGroup {
                         .arg(gid.to_string())
                         .arg(&spec.name);
                     hostkit::run_checked(cx, cmd, "Changing the group's gid").await?;
-                    Ok(Applied::changed(format!(
-                        "changed the gid of group {}",
-                        spec.name
-                    )))
+                    // A group Buckle created stays Buckle's after a gid change.
+                    Ok(hostkit::ownership::carry_forward(
+                        cx,
+                        Applied::changed(format!("changed the gid of group {}", spec.name)),
+                    ))
                 }
-                _ => Ok(Applied::unchanged(format!(
-                    "group {} already up to date",
-                    spec.name
-                ))),
+                _ => Ok(hostkit::ownership::carry_forward(
+                    cx,
+                    Applied::unchanged(format!("group {} already up to date", spec.name)),
+                )),
             },
             (Ensure::Absent, Some(_)) => {
                 hostkit::require_tool(cx, "groupdel", "install the `passwd` package").await?;

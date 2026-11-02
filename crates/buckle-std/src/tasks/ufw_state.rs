@@ -1,6 +1,6 @@
 //! `ufw.state`: enable or disable the firewall and set its logging level.
 
-use super::sys_exec::{Ledger, run_checked};
+use super::sys_exec::{legacy_ledger, run_checked};
 use super::ufw_common::{installed, read_status, ufw};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
@@ -119,7 +119,17 @@ impl Task for UfwState {
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         validate(spec)?;
         let status = read_status(cx, false).await?;
-        let mut ledger = Ledger::open(cx, "ufw").await?;
+        // What was there before Buckle first changed it: from this resource's
+        // record, else (records written before the ledger was retired) from
+        // the legacy ledger.
+        let (mut was_enabled, mut was_logging) =
+            cx.previous.as_deref().map(previous).unwrap_or_default();
+        if cx.previous.is_some() && (was_enabled.is_none() || was_logging.is_none()) {
+            let legacy = legacy_ledger(cx, "ufw").await?;
+            was_enabled =
+                was_enabled.or_else(|| legacy.get("state.enabled").and_then(|v| v.parse().ok()));
+            was_logging = was_logging.or_else(|| legacy.get("state.logging").cloned());
+        }
         let mut done = Vec::new();
 
         if let Some(wanted) = &spec.logging
@@ -128,17 +138,15 @@ impl Task for UfwState {
                 .as_deref()
                 .is_some_and(|c| logging_matches(c, wanted))
         {
-            if !ledger.contains("state.logging")
-                && let Some(current) = &status.logging
-            {
-                ledger.insert("state.logging", current.clone());
+            if was_logging.is_none() {
+                was_logging = status.logging.clone();
             }
             run_checked(cx, ufw(&["logging", wanted])).await?;
             done.push(format!("logging {wanted}"));
         }
         if status.active != spec.enabled {
-            if !ledger.contains("state.enabled") {
-                ledger.insert("state.enabled", status.active.to_string());
+            if was_enabled.is_none() {
+                was_enabled = Some(status.active);
             }
             if spec.enabled {
                 run_checked(cx, ufw(&["--force", "enable"])).await?;
@@ -148,19 +156,17 @@ impl Task for UfwState {
                 done.push("disabled ufw".into());
             }
         }
-        ledger.save(cx).await?;
-
         let mut applied = if done.is_empty() {
             Applied::unchanged("ufw already in the desired state")
         } else {
             Applied::changed(done.join(", "))
         };
-        if let Some(prev) = ledger.get("state.enabled") {
+        if let Some(prev) = was_enabled {
             applied = applied.with_artefact(Artefact::Other {
                 description: format!("{ENABLED_PREFIX}{prev}"),
             });
         }
-        if let Some(prev) = ledger.get("state.logging") {
+        if let Some(prev) = was_logging {
             applied = applied.with_artefact(Artefact::Other {
                 description: format!("{LOGGING_PREFIX}{prev}"),
             });
@@ -187,10 +193,6 @@ impl Task for UfwState {
     #[tracing::instrument(name = "task.ufw.state.remove", skip_all, fields(resource = %record.key))]
     async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
         let (enabled, logging) = previous(record);
-        let mut ledger = Ledger::open(cx, "ufw").await?;
-        ledger.remove("state.enabled");
-        ledger.remove("state.logging");
-        ledger.save(cx).await?;
         let mut done = Vec::new();
         if let Some(l) = logging {
             run_checked(cx, ufw(&["logging", &l])).await?;

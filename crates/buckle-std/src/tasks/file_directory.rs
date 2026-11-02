@@ -161,10 +161,10 @@ impl Task for FileDirectory {
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         let inspection = self.inspect(cx, spec).await?;
         if !inspection.planned.is_change() {
-            return Ok(Applied::unchanged(format!(
-                "{} already up to date",
-                spec.path.display()
-            )));
+            return Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("{} already up to date", spec.path.display())),
+            ));
         }
         let mut applied;
         if inspection.exists.is_none() {
@@ -180,7 +180,11 @@ impl Task for FileDirectory {
             }
         } else {
             cx.system.set_perms(&spec.path, &spec.perms).await?;
-            applied = Applied::changed(format!("updated {}", spec.path.display()));
+            // A directory Buckle created earlier stays Buckle's after a permission change.
+            applied = hostkit::ownership::carry_forward(
+                cx,
+                Applied::changed(format!("updated {}", spec.path.display())),
+            );
         }
         for (path, _) in &inspection.drifted {
             cx.system.set_perms(path, &spec.perms).await?;
@@ -370,5 +374,31 @@ mod tests {
         let out = FileDirectory.remove(&c, &rec).await.unwrap();
         assert!(!out.changed);
         assert!(sys.exists("/srv/app"));
+    }
+
+    #[tokio::test]
+    async fn a_permission_update_keeps_the_directory_buckle_created() {
+        let sys = FakeSystem::new();
+        let created = apply(
+            &FileDirectory,
+            &cx(&sys),
+            &spec(json!({"path": "/srv/app"})),
+        )
+        .await;
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .previous(record("file.directory", "/srv/app", &created))
+            .build();
+        let updated = apply(
+            &FileDirectory,
+            &c,
+            &spec(json!({"path": "/srv/app", "mode": "0700"})),
+        )
+        .await;
+        assert!(updated.artefacts.contains(&Artefact::Directory {
+            path: "/srv/app".into()
+        }));
+        let rec = record("file.directory", "/srv/app", &updated);
+        assert!(FileDirectory.remove(&cx(&sys), &rec).await.unwrap().changed);
+        assert!(!sys.exists("/srv/app"));
     }
 }

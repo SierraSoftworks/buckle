@@ -1,7 +1,8 @@
 //! `apt.package`: install, upgrade or remove Debian packages.
 
 use super::apt_common::{PkgState, apt_get, query_package, query_policy, version_matches};
-use super::sys_exec::{Ledger, run_checked, state_dir};
+use super::hostkit;
+use super::sys_exec::{run_checked, state_dir};
 use async_trait::async_trait;
 use buckle_core::Platforms;
 use buckle_core::Result;
@@ -200,7 +201,10 @@ impl Task for AptPackage {
     #[tracing::instrument(name = "task.apt.package.apply", skip_all, fields(packages = %Self::key(spec)))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         let pkgs = spec.packages()?;
-        let mut ledger = Ledger::open(cx, "apt.package").await?;
+        // Packages this resource installed on an earlier apply. Never another
+        // resource's: a module that finds a package already installed (by
+        // another module, or by hand) does not own it.
+        let owned = installed_by_buckle_list(hostkit::ownership::previous_artefacts(cx));
 
         if spec.state == State::Absent {
             let mut installed = Vec::new();
@@ -219,10 +223,6 @@ impl Task for AptPackage {
                 )));
             }
             run_checked(cx, apt_get("remove", true).args(installed.clone())).await?;
-            for p in &installed {
-                ledger.remove(p);
-            }
-            ledger.save(cx).await?;
             return Ok(Applied::changed(format!(
                 "removed {}",
                 installed.join(", ")
@@ -266,15 +266,13 @@ impl Task for AptPackage {
 
         let mut applied = Applied::changed(format!("installed {}", pkgs.join(", ")));
         for (p, existed) in pkgs.iter().zip(was_installed) {
-            if !existed || ledger.contains(p) {
-                ledger.insert(p.clone(), "installed");
+            if !existed || owned.contains(p) {
                 applied = applied.with_artefact(Artefact::Package {
                     manager: "apt".into(),
                     name: p.clone(),
                 });
             }
         }
-        ledger.save(cx).await?;
         Ok(applied)
     }
 
@@ -293,7 +291,6 @@ impl Task for AptPackage {
     #[tracing::instrument(name = "task.apt.package.remove", skip_all, fields(resource = %record.key))]
     async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
         let names = installed_by_buckle(record);
-        let mut ledger = Ledger::open(cx, "apt.package").await?;
         if names.is_empty() {
             return Ok(Applied::skipped(
                 "Buckle did not install any package for this resource; nothing was removed",
@@ -305,10 +302,6 @@ impl Task for AptPackage {
                 present.push(n.clone());
             }
         }
-        for n in &names {
-            ledger.remove(n);
-        }
-        ledger.save(cx).await?;
         if present.is_empty() {
             return Ok(Applied::unchanged(format!(
                 "{} was already removed",
@@ -321,8 +314,11 @@ impl Task for AptPackage {
 }
 
 fn installed_by_buckle(record: &ResourceRecord) -> Vec<String> {
-    record
-        .artefacts
+    installed_by_buckle_list(&record.artefacts)
+}
+
+fn installed_by_buckle_list(artefacts: &[Artefact]) -> Vec<String> {
+    artefacts
         .iter()
         .filter_map(|a| match a {
             Artefact::Package { manager, name } if manager == "apt" => Some(name.clone()),
@@ -378,7 +374,8 @@ buckle_core::register_task!(AptPackage);
 mod tests {
     use super::*;
     use crate::tasks::apt_common::testkit::Apt;
-    use crate::tasks::sys_exec::testkit::{cx, record_of, spec};
+    use crate::tasks::hostkit::testkit::put;
+    use crate::tasks::sys_exec::testkit::{cx, cx_after, record_of, spec};
     use buckle_core::system::HttpResponse;
     use buckle_core::testing::FakeSystem;
     use rstest::rstest;
@@ -603,16 +600,63 @@ mod tests {
     #[tokio::test]
     async fn ownership_survives_a_later_version_bump() {
         let apt = Apt::new().candidate("nomad", "1.7.5-1");
-        let (_sys, cx) = host(&apt);
+        let (sys, cx) = host(&apt);
         let v1: Spec = spec(json!({"name": "nomad"}));
         let first = AptPackage.apply(&cx, &v1, &Planned::NoOp).await.unwrap();
         assert_eq!(first.artefacts.len(), 1);
         // The author later pins a different version: the package is already
         // installed when the second apply runs, but Buckle still owns it.
         let v2: Spec = spec(json!({"name": "nomad", "version": "1.8.0-1"}));
-        let second = AptPackage.apply(&cx, &v2, &Planned::NoOp).await.unwrap();
+        let again = cx_after(&sys, record_of("apt.package", "nomad", &first));
+        let second = AptPackage.apply(&again, &v2, &Planned::NoOp).await.unwrap();
         assert_eq!(second.artefacts, first.artefacts);
         assert_eq!(apt.version_of("nomad").as_deref(), Some("1.8.0-1"));
+    }
+
+    #[tokio::test]
+    async fn another_module_cannot_claim_a_package_this_one_installed() {
+        let apt = Apt::new().candidate("nomad", "1.7.5-1");
+        let (sys, cx) = host(&apt);
+        let a = AptPackage
+            .apply(&cx, &spec(json!({"name": "nomad"})), &Planned::NoOp)
+            .await
+            .unwrap();
+        assert_eq!(a.artefacts.len(), 1, "module A installed it");
+        // Module B (a new resource, no previous record) finds it installed.
+        let b = AptPackage
+            .apply(
+                &cx_of_module(&sys, "other"),
+                &spec(json!({"name": "nomad", "version": "1.8.0-1"})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        assert!(b.artefacts.is_empty(), "module B does not own it");
+        let b_record = record_of("apt.package", "nomad", &b);
+        assert!(!AptPackage.remove(&cx, &b_record).await.unwrap().changed);
+        assert!(apt.is_installed("nomad"));
+        // A leftover legacy ledger naming the package is ignored too.
+        put(
+            &sys,
+            "/var/lib/buckle/ledger/apt.package.json",
+            r#"{"nomad":"installed"}"#,
+        )
+        .await;
+        let b = AptPackage
+            .apply(
+                &cx_of_module(&sys, "other"),
+                &spec(json!({"name": "nomad", "version": "1.7.5-1"})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        assert!(b.artefacts.is_empty());
+    }
+
+    fn cx_of_module(sys: &FakeSystem, module: &str) -> Cx {
+        buckle_core::testing::CxBuilder::new(sys.clone())
+            .module(module)
+            .build()
     }
 
     #[tokio::test]

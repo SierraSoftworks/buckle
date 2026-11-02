@@ -142,9 +142,11 @@ impl Task for FileCopy {
         let shadow = hostkit::shadow_of(&inspection.content);
         let dest = &spec.dest;
         if !inspection.planned.is_change() {
-            return Ok(hostkit::written(
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("{} already up to date", dest.display()),
                 dest,
+                false,
                 digest,
                 shadow,
                 false,
@@ -171,9 +173,16 @@ impl Task for FileCopy {
                     .await?;
             }
         }
-        Ok(hostkit::written(
-            format!("wrote {}", dest.display()),
+        // A permission change on a file Buckle never wrote adopts it rather than claiming it.
+        Ok(hostkit::ownership::file_written(
+            cx,
+            if content_differs {
+                format!("wrote {}", dest.display())
+            } else {
+                format!("updated permissions of {}", dest.display())
+            },
             dest,
+            content_differs,
             digest,
             shadow,
             true,

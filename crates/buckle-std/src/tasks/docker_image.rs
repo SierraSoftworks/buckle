@@ -144,10 +144,10 @@ impl Task for DockerImage {
             }
             Ensure::Present => {
                 if before.is_some() && spec.pull == Pull::Missing {
-                    return Ok(Applied::unchanged(format!(
-                        "image {} is already present",
-                        spec.name
-                    )));
+                    return Ok(hostkit::ownership::carry_forward(
+                        cx,
+                        Applied::unchanged(format!("image {} is already present", spec.name)),
+                    ));
                 }
                 hostkit::run_checked(
                     cx,
@@ -167,7 +167,8 @@ impl Task for DockerImage {
                         description: format!("{ARTEFACT_PREFIX}{}", spec.name),
                     });
                 }
-                Ok(applied)
+                // An image Buckle pulled first stays Buckle's when a later pull updates it.
+                Ok(hostkit::ownership::carry_forward(cx, applied))
             }
         }
     }

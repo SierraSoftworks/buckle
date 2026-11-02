@@ -243,15 +243,18 @@ impl Task for FileTemplate {
         let shadow = (inspection.redacted.get().len() <= hostkit::SHADOW_LIMIT)
             .then(|| inspection.redacted.clone());
         if !inspection.planned.is_change() {
-            return Ok(hostkit::written(
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("{} already up to date", dest.display()),
                 dest,
+                false,
                 digest,
                 shadow,
                 false,
             ));
         }
-        if content_changes(&inspection) {
+        let wrote_content = content_changes(&inspection);
+        if wrote_content {
             self.validate(cx, spec, &inspection.rendered).await?;
             let existing_meta = inspection.existing.as_ref().map(|(m, _)| m);
             if spec.backup
@@ -266,9 +269,17 @@ impl Task for FileTemplate {
         } else {
             cx.system.set_perms(dest, &spec.perms).await?;
         }
-        Ok(hostkit::written(
-            format!("wrote {}", dest.display()),
+        // A permission change on a file Buckle never wrote adopts it rather than
+        // claiming it, so that removal does not delete a file Buckle did not create.
+        Ok(hostkit::ownership::file_written(
+            cx,
+            if wrote_content {
+                format!("wrote {}", dest.display())
+            } else {
+                format!("updated permissions of {}", dest.display())
+            },
             dest,
+            wrote_content,
             digest,
             shadow,
             true,
@@ -575,5 +586,57 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_mode_only_change_adopts_a_preexisting_file_and_removal_leaves_it() {
+        let sys =
+            FakeSystem::new().with_file("/etc/app.conf", "name = nomad\n", FilePerms::mode(0o644));
+        let c = vars_cx(&sys, source());
+        let s600 =
+            spec::<Spec>(json!({"src": "app.conf.j2", "dest": "/etc/app.conf", "mode": "0600"}));
+        let applied = apply(&FileTemplate, &c, &s600).await;
+        assert!(
+            !applied
+                .artefacts
+                .iter()
+                .any(|a| matches!(a, buckle_core::task::Artefact::File { .. })),
+            "Buckle did not write the file, so it does not own it: {:?}",
+            applied.artefacts
+        );
+        let rec = record("file.template", "/etc/app.conf", &applied);
+        let out = FileTemplate.remove(&c, &rec).await.unwrap();
+        assert!(
+            !out.changed && out.summary.contains("existed before"),
+            "{}",
+            out.summary
+        );
+        assert!(sys.exists("/etc/app.conf"));
+
+        // A file Buckle wrote stays its own after a later mode-only change.
+        let sys = FakeSystem::new();
+        let c = vars_cx(&sys, source());
+        let wrote = apply(&FileTemplate, &c, &s600).await;
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .source(source())
+            .host((*c.host).clone())
+            .previous(record("file.template", "/etc/app.conf", &wrote))
+            .build();
+        let spec_0640 =
+            spec::<Spec>(json!({"src": "app.conf.j2", "dest": "/etc/app.conf", "mode": "0640"}));
+        let again = apply(&FileTemplate, &c, &spec_0640).await;
+        assert!(
+            again
+                .artefacts
+                .iter()
+                .any(|a| matches!(a, buckle_core::task::Artefact::File { .. }))
+        );
+        assert!(
+            FileTemplate
+                .remove(&c, &record("file.template", "/etc/app.conf", &again))
+                .await
+                .unwrap()
+                .changed
+        );
     }
 }
