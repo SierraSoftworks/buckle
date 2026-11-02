@@ -1,0 +1,18 @@
+# {{ buckle_managed }}
+client {
+  enabled           = true
+  node_class        = "{{ vars.nomad_node_class }}"
+  network_interface = "tailscale0"
+  cni_path          = "/opt/cni/bin"
+
+  # Keep a tenth of the machine's memory away from workloads.
+  reserved {
+    memory = {{ (host.facts.hardware.mem.total_mb / 10) | int }}
+  }
+
+  meta {
+    arch    = "{{ host.facts.hardware.arch }}"
+    site    = "{{ host.labels.site | default('unknown') }}"
+    tailnet = "{{ host.facts.tailscale.hostname }}"
+  }
+}

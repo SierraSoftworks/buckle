@@ -1,0 +1,25 @@
+name: packages
+description: Baseline apt packages and unattended security upgrades.
+when: 'host.facts.os.family == "debian"'
+tags: [base]
+tasks:
+  # Refresh the index at most every six hours instead of on every apply.
+  - apt.update: { max_age: 6h }
+
+  - apt.package:
+      names:
+        - ca-certificates
+        - curl
+        - git
+        - gnupg
+        - htop
+        - jq
+        - sudo
+        - unattended-upgrades
+        - apt-listchanges
+      install_recommends: false
+
+  - file.copy:
+      src: apt/20auto-upgrades
+      dest: /etc/apt/apt.conf.d/20auto-upgrades
+      mode: "0644"

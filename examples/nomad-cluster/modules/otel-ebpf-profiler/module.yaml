@@ -1,0 +1,34 @@
+name: otel-ebpf-profiler
+description: A continuous eBPF profiler for the cloud hosts, run as a container under systemd.
+when: 'host.groups contains "cloud"'
+needs: [docker]                  # docker is selected on every nomad client, a superset of the cloud group
+tags: [observability]
+vars:
+  profiler_image: ghcr.io/example/otel-ebpf-profiler:1.0.0
+  profiler_otlp_endpoint: 'otlp.{{ vars.fleet_domain }}:4317'
+tasks:
+  # `missing` pulls only when the image is not on the host; the pinned tag
+  # changes (and so does the pull) when the version above does.
+  - docker.image: { name: '{{ vars.profiler_image }}', pull: missing }
+    tags: [network]
+    notify: [restart]
+
+  - file.template:
+      src: otel-ebpf-profiler.service.j2
+      dest: /etc/systemd/system/otel-ebpf-profiler.service
+      mode: "0644"
+    notify: [daemon-reload, restart]
+
+  - systemd.unit:
+      name: otel-ebpf-profiler
+      enabled: true
+      active: true
+      daemon_reload: true
+
+handlers:
+  daemon-reload: { systemd.daemon_reload: {} }
+  restart:       { systemd.restart: { name: otel-ebpf-profiler } }
+
+health:
+  - name: unit
+    systemd: { unit: otel-ebpf-profiler, state: active, min_uptime: 30s }

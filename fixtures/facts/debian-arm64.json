@@ -1,7 +1,7 @@
 {
   "os": { "family": "debian", "id": "debian", "codename": "bookworm", "version": "12", "kernel": "6.6.0" },
   "arch": "aarch64",
-  "hardware": { "cpus": 4, "mem": { "total_mb": 8192 }, "swap": { "total_mb": 0 } },
+  "hardware": { "arch": "aarch64", "cpus": 4, "mem": { "total_mb": 8192 }, "swap": { "total_mb": 0 } },
   "net": { "hostname": "pi-1", "fqdn": "pi-1.example.ts.net" },
   "tailscale": { "hostname": "pi-1.example.ts.net", "ips": ["100.64.0.21"], "tags": ["tag:worker"], "online": true },
   "cloud": null

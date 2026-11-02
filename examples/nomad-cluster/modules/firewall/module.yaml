@@ -1,0 +1,36 @@
+name: firewall
+description: ufw with default-deny inbound; the tailnet and ssh are allowed before the firewall is switched on.
+when: 'host.facts.os.family == "debian"'
+# tailscale first: the tailscale0 interface (and its address) must exist before
+# a rule names it, and facts.provides makes the dependants plan afterwards.
+needs: [tailscale]
+tags: [network]
+vars:
+  firewall_lan_cidr: 192.168.0.0/24    # the home LAN; only the Pis are on it
+tasks:
+  - apt.package: { name: ufw }
+
+  - ufw.default: { direction: incoming, policy: deny }
+  - ufw.default: { direction: outgoing, policy: allow }
+
+  # Everything that keeps this host reachable comes first...
+  - ufw.rule:
+      rule: allow
+      interface: tailscale0
+      comment: tailnet traffic (ssh, Nomad, Consul, metrics)
+  - ufw.rule:
+      rule: allow
+      to_port: 41641
+      proto: udp
+      comment: tailscale direct connections
+  - ufw.rule:
+      rule: limit
+      to_port: 22
+      proto: tcp
+      from_ip: '{{ vars.firewall_lan_cidr }}'
+      comment: ssh from the home LAN, rate limited
+    when: 'host.groups contains "pis"'
+
+  # ...and switching the firewall on is the last task, so a failure above
+  # leaves ufw disabled instead of default-deny with no way in.
+  - ufw.state: { enabled: true, logging: low }
