@@ -1,0 +1,20 @@
+# {{ buckle_managed }}
+[Unit]
+Description=OpenTelemetry eBPF profiler on {{ host.id }}
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm --force otel-ebpf-profiler
+ExecStart=/usr/bin/docker run --rm --name otel-ebpf-profiler \
+  --privileged --pid=host \
+  --volume /sys/kernel/debug:/sys/kernel/debug:ro \
+  --env OTLP_ENDPOINT={{ vars.profiler_otlp_endpoint }} \
+  --env HOST_ID={{ host.id }} \
+  {{ vars.profiler_image }}
+ExecStop=/usr/bin/docker stop otel-ebpf-profiler
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

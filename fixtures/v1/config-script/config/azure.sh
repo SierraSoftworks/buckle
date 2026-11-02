@@ -1,0 +1,1 @@
+echo "LOCATION=westeurope"

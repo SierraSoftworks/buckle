@@ -1,0 +1,47 @@
+name: tailscale
+description: Tailscale from its apt repository, joined to the tailnet with a tagged auth key.
+when: 'host.facts.os.family == "debian"'
+tags: [network]
+# Re-run the `tailscale` fact provider once this module has applied. Modules that
+# need tailscale (firewall, nomad) are planned afterwards, so they see the
+# tailnet hostname and addresses instead of a stale null.
+facts:
+  provides: [tailscale]
+tasks:
+  # Tailscale names the node after the system hostname, so set that first.
+  - hostname.set: { name: '{{ host.id }}' }
+
+  - apt.repository:
+      name: tailscale
+      uri: 'https://pkgs.tailscale.com/stable/{{ vars.apt_distro }}'
+      suites: ['{{ host.facts.os.codename }}']
+      components: [main]
+      signed_by:
+        keyring_url: 'https://pkgs.tailscale.com/stable/{{ vars.apt_distro }}/{{ host.facts.os.codename }}.noarmor.gpg'
+    tags: [network]
+
+  - apt.package: { name: tailscale }
+
+  - systemd.unit: { name: tailscaled, enabled: true, active: true }
+
+  - command.run:
+      # The shell expands $TS_AUTHKEY; the key itself is only ever in the
+      # process environment, never on a command line or in the plan.
+      run: 'tailscale up --auth-key="$TS_AUTHKEY" --hostname={{ host.id }} --advertise-tags={{ vars.tailscale_tags }} --accept-dns=false'
+      # A probe that also runs in plan mode. It is a shell string rather than an
+      # argv list so that a host without tailscale yet (the very first plan)
+      # sees exit 127 and plans the change, instead of failing to start the probe.
+      unless: "tailscale ip -4 >/dev/null 2>&1"
+      env:
+        TS_AUTHKEY: '{{ secrets.TAILSCALE_AUTHKEY }}'
+      timeout: 2m
+    # `tailscale up` has no inverse worth automating (a logout would cut this
+    # host off the tailnet), so the task leaves nothing to clean up either way.
+    removal: leave
+    retry: { limit: 3, delay: 10s }
+
+health:
+  - name: connected
+    command:
+      run: ["tailscale", "ip", "-4"]
+      expect: { exit: 0 }

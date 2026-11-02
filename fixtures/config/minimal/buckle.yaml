@@ -1,0 +1,12 @@
+version: 2
+fleet:
+  groups:
+    home: 'host.labels.site == "home"'
+vars:
+  - file: vars/defaults.yaml
+  - when: 'host.groups contains "home"'
+    values: { motd_greeting: "welcome home" }
+rollout:
+  phases:
+    - { name: canary, select: 'host.labels.canary == true', parallel: 1, approval: required }
+    - { name: rest, select: 'true', parallel: 50% }

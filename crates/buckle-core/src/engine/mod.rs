@@ -1,0 +1,416 @@
+//! The engine: load a revision, collect facts, select modules, resolve vars and
+//! secrets, plan, apply, remove, and run health checks.
+//!
+//! The pipeline has a pure half and a mutating half (design §04):
+//!
+//! * [`Engine::plan`] reads the host and produces a [`Plan`]. It never writes.
+//! * [`Engine::apply`] re-plans, refuses when the digest no longer matches the
+//!   plan it was handed (a stale plan), and then drives the host from the fresh
+//!   plan: modules concurrently along the `needs` DAG, tasks in order, resource
+//!   locks across modules, handlers, per-module health with settle, facts
+//!   refresh and deferred re-planning, module-scoped rollback and halt, and
+//!   finally removals of orphaned resources.
+//! * [`Engine::health`] runs module health checks once for a scope.
+//!
+//! Internals are split into [`context`] (labels, groups, vars), [`graph`]
+//! (module DAG), [`planner`], [`checks`] and [`executor`].
+
+mod checks;
+mod context;
+mod executor;
+mod graph;
+pub mod loader;
+mod planner;
+pub mod validate;
+
+#[cfg(test)]
+mod tests;
+
+pub use validate::{
+    HostSummary, ValidationIssue, ValidationReport, validate, validate_host, validate_with_facts,
+};
+
+use crate::facts::Facts;
+use crate::health::{HealthReport, HealthScope};
+use crate::model::FleetConfig;
+use crate::plan::{Plan, RevisionId};
+use crate::secrets::SecretStore;
+use crate::selectors::{HostIdentity, Labels, Vars};
+use crate::state::StateStore;
+use crate::system::System;
+use crate::task::Source;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// A loaded revision: the fleet config plus every module and its files.
+#[derive(Debug)]
+pub struct Revision {
+    pub id: RevisionId,
+    pub fleet: FleetConfig,
+    pub modules: Vec<LoadedModule>,
+    /// Raw contents of every `vars` overlay file referenced by the fleet config.
+    pub var_files: indexmap::IndexMap<PathBuf, serde_yaml::Value>,
+    /// Directories under `modules/` that have no `module.yaml`. Their module
+    /// is indeterminate: resources recorded under that name are never treated
+    /// as orphans, because the directory may be a module mid-edit.
+    pub unloaded: Vec<String>,
+}
+
+impl Revision {
+    /// The module with this name, if the revision has one.
+    pub fn module(&self, name: &str) -> Option<&LoadedModule> {
+        self.modules.iter().find(|m| m.config.name == name)
+    }
+}
+
+impl std::fmt::Debug for LoadedModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedModule")
+            .field("module", &self.config.name)
+            .field("templates", &self.templates.len())
+            .finish()
+    }
+}
+
+/// One module of a revision: its parsed `module.yaml`, a reader for its
+/// `files/` directory and the templates found there.
+pub struct LoadedModule {
+    pub config: crate::model::ModuleConfig,
+    pub source: Arc<dyn Source>,
+    /// Templates under `files/` keyed by relative path, for includes.
+    pub templates: Vec<(PathBuf, String)>,
+}
+
+/// Inputs to a plan or apply for one host.
+pub struct Inputs {
+    pub revision: Arc<Revision>,
+    pub host: HostIdentity,
+    /// Labels managed on the server, overlaid on the agent's own.
+    pub server_labels: Labels,
+    pub system: Arc<dyn System>,
+    pub secrets: Arc<SecretStore>,
+    pub state: Arc<dyn StateStore>,
+    /// Previously collected facts, refreshed per provider TTL.
+    pub facts: Facts,
+    /// Restrict to tasks matching this selector (e.g. `task.tags contains "network"`).
+    pub select: Option<crate::Filter>,
+    /// Checks waived for this run: `module/check`.
+    pub waived_checks: Vec<String>,
+    pub parallelism: usize,
+    /// The last known-good revision, used to re-apply a module that fails
+    /// (module-scoped rollback, design §04). `None` disables rollback.
+    pub stable_revision: Option<Arc<Revision>>,
+    /// Agent-local var overrides (`vars:` in agent.yaml); the last layer of the
+    /// vars precedence (design §03).
+    pub agent_vars: Vars,
+    /// When set, `facts` is used as-is and no provider runs: for tests and
+    /// `--facts` fixtures.
+    pub facts_frozen: bool,
+    /// Whether apply runs the plan's removals. When false the plan still lists
+    /// them (and its digest is unchanged) but apply leaves the resources and
+    /// their records alone: the agent's unattended drift correction passes
+    /// false so that only an operator-approved apply removes anything.
+    pub removals: bool,
+    /// Drift mode: plan only the modules this host has applied at
+    /// `revision` (per [`crate::state::State::module_at`]) and never treat a
+    /// resource recorded at another revision as an orphan. Modules that moved
+    /// on to a newer revision, failed, or never ran are reported in
+    /// [`Plan::held`] and left alone. Set it on the inputs of both the plan
+    /// and the apply (the apply re-plans and compares digests).
+    pub drift: bool,
+    /// Directories planning may write to besides the system's temp dir (the
+    /// agent passes `<state_dir>/tmp`). Any other mutation while planning is
+    /// refused (see [`crate::system::PlanGuard`]).
+    pub scratch_dirs: Vec<PathBuf>,
+}
+
+impl Inputs {
+    /// Inputs with sensible defaults: no server labels, no cached facts, no
+    /// selector, no waivers, parallelism from the CPU count, no stable revision.
+    pub fn new(
+        revision: Arc<Revision>,
+        host: HostIdentity,
+        system: Arc<dyn System>,
+        secrets: Arc<SecretStore>,
+        state: Arc<dyn StateStore>,
+    ) -> Self {
+        Self {
+            revision,
+            host,
+            server_labels: Labels::new(),
+            system,
+            secrets,
+            state,
+            facts: Facts::new(),
+            select: None,
+            waived_checks: Vec::new(),
+            parallelism: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+            stable_revision: None,
+            agent_vars: Vars::new(),
+            facts_frozen: false,
+            removals: true,
+            drift: false,
+            scratch_dirs: Vec::new(),
+        }
+    }
+
+    /// A directory planning may write to (e.g. `<state_dir>/tmp`).
+    pub fn with_scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch_dirs.push(dir.into());
+        self
+    }
+
+    /// Drift mode; see [`Inputs::drift`].
+    pub fn with_drift(mut self, drift: bool) -> Self {
+        self.drift = drift;
+        self
+    }
+
+    /// Whether apply runs the plan's removals (default true). Plans list
+    /// removals either way.
+    pub fn with_removals(mut self, removals: bool) -> Self {
+        self.removals = removals;
+        self
+    }
+
+    /// Labels managed on the server, overlaid on the agent's own.
+    pub fn with_server_labels(mut self, labels: Labels) -> Self {
+        self.server_labels = labels;
+        self
+    }
+
+    /// Seeds the facts cache; providers whose TTL expired still re-run.
+    pub fn with_facts(mut self, facts: Facts) -> Self {
+        self.facts = facts;
+        self
+    }
+
+    /// Uses `facts` verbatim and runs no provider.
+    pub fn with_frozen_facts(mut self, facts: Facts) -> Self {
+        self.facts = facts;
+        self.facts_frozen = true;
+        self
+    }
+
+    /// Restricts the run to tasks matching a selector over the task scope.
+    pub fn with_select(mut self, select: Option<crate::Filter>) -> Self {
+        self.select = select;
+        self
+    }
+
+    /// Health checks (`module/check`) that may fail without failing the run.
+    pub fn with_waived_checks(mut self, waived: Vec<String>) -> Self {
+        self.waived_checks = waived;
+        self
+    }
+
+    /// How many modules may apply at once (at least one).
+    pub fn with_parallelism(mut self, parallelism: usize) -> Self {
+        self.parallelism = parallelism.max(1);
+        self
+    }
+
+    /// The known-good revision a failing module is re-applied from.
+    pub fn with_stable_revision(mut self, stable: Option<Arc<Revision>>) -> Self {
+        self.stable_revision = stable;
+        self
+    }
+
+    /// Agent-local var overrides, the last layer of the vars precedence.
+    pub fn with_agent_vars(mut self, vars: Vars) -> Self {
+        self.agent_vars = vars;
+        self
+    }
+
+    /// The agent's labels with the server's overlaid (server wins).
+    pub fn labels(&self) -> Labels {
+        context::merged_labels(&self.host.labels, &self.server_labels)
+    }
+}
+
+/// The cause [`Engine::apply`] attaches to its stale-plan error: the host now
+/// plans differently from the plan it was handed (design §04 "a changed
+/// system between plan and apply … surfaces as a stale plan error"). Callers
+/// find it with [`StalePlan::find`] instead of matching the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalePlan {
+    /// The digest of the plan handed to apply.
+    pub planned: crate::Digest,
+    /// The digest the host plans as now.
+    pub fresh: crate::Digest,
+}
+
+impl std::fmt::Display for StalePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "planned {} but the host now plans {}",
+            self.planned, self.fresh
+        )
+    }
+}
+
+impl std::error::Error for StalePlan {}
+
+impl StalePlan {
+    /// The stale-plan marker in `err`'s cause chain, if it is one.
+    pub fn find(err: &crate::Error) -> Option<&StalePlan> {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+        while let Some(e) = cause {
+            if let Some(stale) = e.downcast_ref::<StalePlan>() {
+                return Some(stale);
+            }
+            cause = e.source();
+        }
+        None
+    }
+}
+
+/// Result of an apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyOutcome {
+    pub plan_digest: crate::Digest,
+    pub succeeded: bool,
+    pub changes: usize,
+    pub removals: usize,
+    pub duration_ms: u64,
+    pub module_results: Vec<ModuleOutcome>,
+    /// The module whose failure halted the run, if any.
+    pub failed_module: Option<String>,
+    /// Modules re-applied from the stable revision because they failed.
+    pub rolled_back_modules: Vec<String>,
+    /// Modules not started because the run halted.
+    pub not_started: Vec<String>,
+    pub health: Option<HealthReport>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleOutcome {
+    pub module: String,
+    pub status: ModuleStatus,
+    pub changes: usize,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleStatus {
+    Applied,
+    Unchanged,
+    Failed,
+    Unhealthy,
+    RolledBack,
+    NotStarted,
+    Deferred,
+    /// The module's selection could not be decided on this host (see
+    /// [`crate::plan::Indeterminate`]); it was not applied.
+    Indeterminate,
+    /// The module applied what it could but some steps stayed blocked; the
+    /// run needs attention (it does not count as a success).
+    Blocked,
+    /// The module was deferred, and its `when` turned out false against the
+    /// refreshed facts: not applied, its resources removed as orphans.
+    Skipped,
+}
+
+/// Progress events emitted during apply, for the agent to stream to the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ApplyEvent {
+    ModuleStarted {
+        module: String,
+    },
+    StepStarted {
+        module: String,
+        task_id: String,
+        kind: String,
+    },
+    StepFinished {
+        module: String,
+        task_id: String,
+        kind: String,
+        changed: bool,
+        summary: String,
+    },
+    StepFailed {
+        module: String,
+        task_id: String,
+        kind: String,
+        error: String,
+    },
+    HandlerRun {
+        module: String,
+        handler: String,
+    },
+    ModuleFinished {
+        module: String,
+        status: ModuleStatus,
+    },
+    RemovalRun {
+        resource: String,
+        summary: String,
+    },
+    HealthChecked {
+        module: String,
+        check: String,
+        passed: bool,
+        reason: Option<String>,
+    },
+    FactsRefreshed {
+        providers: Vec<String>,
+    },
+}
+
+/// The engine entry points.
+pub struct Engine;
+
+impl Engine {
+    /// Pure: collects facts (respecting TTLs), selects modules, resolves vars,
+    /// plans every task and removal. Never mutates the host.
+    pub async fn plan(inputs: &Inputs) -> crate::Result<(Plan, Facts)> {
+        let span = tracing::info_span!("engine.plan", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id);
+        let (rich, facts) =
+            tracing::Instrument::instrument(planner::plan(inputs, &inputs.revision), span).await?;
+        Ok((rich.plan, facts))
+    }
+
+    /// [`Engine::plan`] in drift mode (see [`Inputs::drift`]) whatever
+    /// `inputs.drift` says. To correct the drift, apply the plan with inputs
+    /// that have [`Inputs::with_drift`]`(true)` (and, unattended,
+    /// [`Inputs::with_removals`]`(false)`).
+    pub async fn drift(inputs: &Inputs) -> crate::Result<(Plan, Facts)> {
+        let span = tracing::info_span!("engine.drift", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id);
+        let (rich, facts) = tracing::Instrument::instrument(
+            planner::plan_mode(inputs, &inputs.revision, true),
+            span,
+        )
+        .await?;
+        Ok((rich.plan, facts))
+    }
+
+    /// Applies a previously produced plan. Refuses when the host's fresh plan
+    /// digest no longer matches (stale plan).
+    pub async fn apply(
+        inputs: &Inputs,
+        plan: &Plan,
+        events: tokio::sync::mpsc::Sender<ApplyEvent>,
+    ) -> crate::Result<ApplyOutcome> {
+        let span = tracing::info_span!("engine.apply", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id, buckle.plan.digest = %plan.digest.short());
+        tracing::Instrument::instrument(executor::apply(inputs, plan, events), span).await
+    }
+
+    /// Runs the health checks of the given modules (or all modules selected on
+    /// this host when `None`) once, with the given scope.
+    pub async fn health(
+        inputs: &Inputs,
+        scope: HealthScope,
+        modules: Option<&[String]>,
+    ) -> crate::Result<HealthReport> {
+        checks::run_scope(inputs, scope, modules).await
+    }
+}

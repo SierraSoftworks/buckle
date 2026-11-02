@@ -1,0 +1,12 @@
+# Base layer: applies to every host. Module `vars:` are each module's own
+# defaults and sit below this file; anything set here overrides them.
+fleet_domain: example.com
+tailnet: example.ts.net
+apt_distro: debian            # the apt repositories of Docker and Tailscale are per distribution
+cni_arch: amd64               # the CNI plugin tarballs are per architecture
+tailscale_tags: "tag:worker"
+nomad_datacenter: dc1
+nomad_region: global
+nomad_node_class: general
+nomad_log_level: INFO
+nomad_eligible: true

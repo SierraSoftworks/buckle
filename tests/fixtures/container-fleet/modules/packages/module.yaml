@@ -1,0 +1,8 @@
+name: packages
+description: A tiny package from the distribution's repositories.
+tasks:
+  - apt.update: { max_age: 1h }
+  - apt.package: { name: jq, install_recommends: false }
+health:
+  - name: jq
+    command: { run: [jq, --version] }

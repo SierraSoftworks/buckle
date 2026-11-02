@@ -1,0 +1,67 @@
+[package]
+name = "buckle-ui"
+description = "The Buckle web UI, compiled to WebAssembly with Trunk and embedded into the server."
+version = "2.0.0-dev"
+edition = "2024"
+authors = ["Benjamin Pannell <benjamin@pannell.dev>"]
+license = "MIT"
+publish = false
+
+# Standalone: the UI is excluded from the workspace because it targets wasm32,
+# so every version below is pinned here rather than inherited.
+[workspace]
+
+[[bin]]
+name = "buckle-ui"
+path = "src/main.rs"
+
+[dependencies]
+buckle-api = { path = "../crates/buckle-api" }
+yew = { version = "0.23", features = ["csr"] }
+yew-router = "0.20"
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json", "eventsource"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "History",
+    "Storage",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlDocument",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "EventSource",
+    "MessageEvent",
+    "KeyboardEvent",
+    "FocusEvent",
+    "MediaQueryList",
+    "UrlSearchParams",
+    "Node",
+    "NodeList",
+    "Navigator",
+    "Clipboard",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind", "serde"] }
+# The same expression language the server evaluates `GET /audit?filter=` with,
+# so the filter box can point at a mistake before anything is sent. Without the
+# `regex` feature (a large dependency for one operator): a filter that uses
+# `matches` is left for the server to judge.
+filt-rs = { version = "1.1.3", default-features = false, features = ["chrono"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+log = "0.4"
+wasm-logger = "0.2"
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

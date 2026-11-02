@@ -1,0 +1,214 @@
+// Plans under review (design §11): distinct plans, their steps and diffs,
+// destructive steps and removals called out.
+@use 'tokens' as *;
+
+.plans {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.plan {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius);
+  background: var(--bg);
+
+  &--destructive {
+    border-left-color: var(--danger);
+  }
+
+  &__summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.8rem;
+    padding: 0.55rem 0.75rem;
+    cursor: pointer;
+    list-style-position: inside;
+  }
+
+  &__digest {
+    font-weight: 600;
+  }
+
+  &__hosts {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--fg);
+  }
+
+  &__counts {
+    color: var(--fg-2);
+    font-size: 0.8rem;
+  }
+
+  &__body {
+    padding: 0 0.75rem 0.75rem;
+  }
+
+  &__warnings {
+    list-style: none;
+    margin: 0.4rem 0;
+
+    li {
+      display: flex;
+      gap: 0.4rem;
+      color: var(--warn);
+    }
+  }
+}
+
+.plan-module {
+  margin-top: 0.6rem;
+
+  &__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding-bottom: 0.25rem;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.8rem;
+  }
+
+  &__name {
+    font-size: 0.85rem;
+  }
+
+  &--removals .plan-module__head {
+    border-bottom-color: color-mix(in srgb, var(--danger) 50%, var(--line));
+  }
+}
+
+.steps {
+  list-style: none;
+}
+
+.step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.3rem 0.6rem;
+  padding: 0.35rem 0.4rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.84rem;
+
+  &:last-child {
+    border-bottom: none;
+  }
+
+  &__glyph {
+    width: 1rem;
+    color: var(--warn);
+    font-family: var(--font-mono);
+    font-weight: 700;
+    text-align: center;
+  }
+
+  &__resource {
+    color: var(--fg);
+  }
+
+  &__summary {
+    color: var(--fg-2);
+  }
+
+  &__preview {
+    flex-basis: 100%;
+    margin: 0.3rem 0 0;
+    padding: 0.5rem;
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    white-space: pre-wrap;
+    font-size: 0.78rem;
+  }
+
+  > .diff {
+    flex-basis: 100%;
+  }
+
+  &--destructive {
+    background: var(--danger-soft);
+
+    .step__glyph {
+      color: var(--danger);
+    }
+  }
+
+  &--forget .step__glyph,
+  &--handler .step__glyph,
+  &--deferred .step__glyph {
+    color: var(--fg-3);
+  }
+
+  &--blocked .step__glyph {
+    color: var(--danger);
+  }
+}
+
+.diff {
+  margin: 0.35rem 0;
+
+  &__stats {
+    margin: 0 0 0.2rem;
+    font-family: var(--font-mono);
+  }
+
+  &__note {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    margin: 0 0 0.3rem;
+    color: var(--brand);
+    font-size: 0.8rem;
+  }
+
+  &__body {
+    margin: 0;
+    padding: 0.4rem 0;
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    font-size: 0.78rem;
+    line-height: 1.55;
+  }
+
+  &__line {
+    display: block;
+    padding: 0 0.6rem;
+    white-space: pre;
+
+    &--add {
+      background: var(--diff-add);
+      color: var(--fg);
+    }
+
+    &--del {
+      background: var(--diff-del);
+      color: var(--fg);
+    }
+
+    &--hunk {
+      color: var(--info);
+    }
+
+    &--file,
+    &--meta {
+      color: var(--fg-3);
+    }
+
+    &--context {
+      color: var(--fg-2);
+    }
+  }
+}
+
+.approval__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.9rem;
+}

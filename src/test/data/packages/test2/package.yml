@@ -1,4 +1,0 @@
-description: The second test package.
-needs:
-  - test1
-

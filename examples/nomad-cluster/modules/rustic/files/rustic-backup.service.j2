@@ -1,0 +1,12 @@
+# {{ buckle_managed }}
+[Unit]
+Description=Back up {{ host.id }} with rustic
+RequiresMountsFor={{ vars.rustic_mount }}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rustic backup
+ExecStart=/usr/local/bin/rustic forget --prune
+ExecStartPost=/usr/bin/install -D -m 0644 /dev/null /var/lib/rustic/last-backup
+Nice=10
+IOSchedulingClass=idle

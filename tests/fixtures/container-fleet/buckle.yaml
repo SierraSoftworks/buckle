@@ -1,0 +1,8 @@
+# A small fleet that applies cleanly inside debian:bookworm and ubuntu:24.04
+# containers (no systemd), for scripts/container-apply.sh and the CI
+# `containers` job. Every task kind here must plan as a no-op on a second run.
+version: 2
+vars:
+  - values:
+      greeting: "hello from buckle"
+      sweep_minutes: 15

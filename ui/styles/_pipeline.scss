@@ -1,0 +1,421 @@
+// The rollout pipeline (design §10, §12): stages as columns, hosts as
+// rounded blocks, gates as barriers between them.
+@use 'tokens' as *;
+
+.pipeline {
+  &__track {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 0.5rem 0;
+  }
+
+  // A gate and the stage behind it wrap onto a new row together.
+  &__step {
+    display: flex;
+    align-items: stretch;
+  }
+
+  &__note {
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+  }
+
+  &--compact {
+    --block: 14px;
+    --block-gap: 3px;
+
+    .stage__meta + .stage__meta {
+      display: none;
+    }
+  }
+}
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  min-width: 150px;
+  padding: 0.6rem 0.7rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg);
+
+  &--virtual {
+    border-style: dashed;
+    background: transparent;
+  }
+
+  &__head {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+
+  &__title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  &__name {
+    font-size: 0.88rem;
+  }
+
+  &__meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.15rem 0.6rem;
+    font-size: 0.75rem;
+    color: var(--fg-2);
+  }
+
+  &__blocks {
+    display: grid;
+    grid-template-columns: repeat(var(--per-row, 4), var(--block));
+    gap: var(--block-gap);
+  }
+
+  &__empty {
+    font-size: 0.8rem;
+  }
+}
+
+.gate {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  width: 34px;
+  color: var(--fg-3);
+
+  &__bar {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    left: 50%;
+    width: 0;
+    border-left: 2px dashed var(--line-strong);
+    transform: translateX(-1px);
+  }
+
+  &__icon {
+    position: relative;
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border: 1px solid var(--line-strong);
+    border-radius: 50%;
+    background: var(--surface);
+
+    .icon {
+      width: 13px;
+      height: 13px;
+    }
+  }
+
+  &__label {
+    position: relative;
+    padding: 0.2rem 0;
+    background: var(--surface);
+    font-size: 0.66rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    white-space: nowrap;
+  }
+
+  &--open {
+    color: var(--ok);
+
+    .gate__bar {
+      border-left-style: solid;
+      border-color: color-mix(in srgb, var(--ok) 60%, transparent);
+    }
+  }
+
+  &--approved {
+    color: var(--ok);
+  }
+
+  &--closed {
+    .gate__bar {
+      border-left-width: 4px;
+      border-left-style: solid;
+      transform: translateX(-2px);
+    }
+  }
+
+  &--awaiting {
+    color: var(--info);
+
+    .gate__bar {
+      border-color: var(--info);
+    }
+
+    .gate__icon {
+      border-color: var(--info);
+      background: var(--info-soft);
+    }
+  }
+
+  &--blocked {
+    color: var(--warn);
+
+    .gate__bar {
+      border-color: var(--warn);
+    }
+
+    .gate__icon {
+      border-color: var(--warn);
+    }
+  }
+}
+
+.block {
+  position: relative;
+  display: block;
+  width: var(--block);
+  height: var(--block);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--neutral-soft);
+  text-decoration: none;
+  transition: transform var(--transition);
+
+  &:hover,
+  &:focus-visible {
+    transform: scale(1.18);
+    z-index: 5;
+  }
+
+  &--pending {
+    background: transparent;
+    border-color: var(--line-strong);
+  }
+
+  &--plan-pending {
+    background: transparent;
+    border: 1px dashed var(--neutral);
+  }
+
+  &--planned {
+    background: var(--info-soft);
+    border-color: color-mix(in srgb, var(--info) 70%, transparent);
+  }
+
+  &--held {
+    background: var(--warn);
+  }
+
+  &--applying {
+    background: var(--active);
+  }
+
+  &--baking {
+    background: var(--active);
+    animation: bake 1.8s ease-in-out infinite;
+  }
+
+  &--healthy {
+    background: var(--ok);
+  }
+
+  &--failed {
+    background: var(--danger);
+  }
+
+  &--rolled-back {
+    background: var(--mute);
+  }
+
+  &--skipped {
+    background: repeating-linear-gradient(
+      135deg,
+      var(--neutral-soft) 0 3px,
+      transparent 3px 6px
+    );
+    border-color: var(--line-strong);
+  }
+
+  // A plan waiting for its approval: a dot in the block, so a stage full
+  // of them still reads as a grid rather than a tangle of outlines.
+  &--needs-approval::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--info);
+  }
+
+  &--regressed {
+    box-shadow: inset 0 0 0 3px var(--danger);
+  }
+
+  // Its own rollback failed: ringed outside, so it stands out from a
+  // plain failure.
+  &--attention {
+    outline: 2px solid var(--danger);
+    outline-offset: 2px;
+  }
+
+  &--offline {
+    opacity: 0.5;
+  }
+
+  &--waived::after {
+    content: "";
+    position: absolute;
+    right: -1px;
+    top: -1px;
+    border-style: solid;
+    border-width: 0 7px 7px 0;
+    border-color: transparent var(--warn) transparent transparent;
+  }
+
+  &--legend {
+    --block: 12px;
+    display: inline-block;
+    animation: none;
+
+    &:hover {
+      transform: none;
+    }
+  }
+
+  &__tip {
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 8px);
+    z-index: 20;
+    display: none;
+    flex-direction: column;
+    gap: 0.1rem;
+    width: max-content;
+    max-width: min(280px, 70vw);
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    color: var(--fg);
+    font-size: 0.78rem;
+    line-height: 1.4;
+    transform: translateX(-50%) scale(0.85);
+    pointer-events: none;
+  }
+
+  &:hover &__tip,
+  &:focus-visible &__tip {
+    display: flex;
+  }
+
+  &__name {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+  }
+
+  &__state {
+    color: var(--fg-2);
+  }
+
+  &__error {
+    color: var(--danger);
+  }
+}
+
+@keyframes bake {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  margin-top: 0.85rem;
+  list-style: none;
+  color: var(--fg-2);
+  font-size: 0.76rem;
+
+  &__item {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+}
+
+.rollout-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.75rem;
+  margin-bottom: 0.75rem;
+
+  &__title {
+    font-weight: 650;
+  }
+
+  &__message {
+    color: var(--fg-2);
+  }
+}
+
+@media (max-width: $narrow) {
+  .pipeline__track,
+  .pipeline__step {
+    flex-direction: column;
+  }
+
+  .gate {
+    flex-direction: row;
+    width: auto;
+    height: 30px;
+
+    &__bar {
+      top: 50%;
+      bottom: auto;
+      left: 6px;
+      right: 6px;
+      width: auto;
+      border-left: none;
+      border-top: 2px dashed var(--line-strong);
+    }
+
+    &__label {
+      writing-mode: horizontal-tb;
+      transform: none;
+      padding: 0 0.3rem;
+    }
+  }
+}
+
+// A phase's health gate: one chip per required check.
+.gate-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0.2rem 0 0;
+  padding: 0;
+  list-style: none;
+
+  .pill {
+    font-size: 0.72rem;
+  }
+}
+
+.approval__gate {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0.75rem 0;
+}

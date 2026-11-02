@@ -1,0 +1,12 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+watch = ["src", "styles", "styles.scss", "index.html"]
+
+[serve]
+port = 8081
+
+[[proxy]]
+backend = "http://127.0.0.1:7701/api/v1"

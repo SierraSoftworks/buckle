@@ -1,0 +1,11 @@
+# {{ buckle_managed }}
+[Unit]
+Description=Nightly rustic backup of {{ host.id }}
+
+[Timer]
+OnCalendar={{ vars.rustic_schedule }}
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

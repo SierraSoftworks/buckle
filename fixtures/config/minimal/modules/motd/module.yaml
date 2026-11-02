@@ -1,0 +1,9 @@
+name: motd
+description: Writes the message of the day.
+tasks:
+  - file.template:
+      src: motd.j2
+      dest: /etc/motd
+      mode: "0644"
+health:
+  - file: { path: /etc/motd, exists: true }

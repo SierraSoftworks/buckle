@@ -1,0 +1,42 @@
+[package]
+name = "buckle"
+description = "Lightweight fleet configuration with phased, health-gated rollouts. One binary: planner, agent and server."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+default-run = "buckle"
+
+[[bin]]
+name = "buckle"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+buckle-core.workspace = true
+buckle-std.workspace = true
+buckle-agent.workspace = true
+buckle-server.workspace = true
+clap.workspace = true
+human-errors.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-batteries.workspace = true
+buckle-api.workspace = true
+tokio-util.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+[dev-dependencies]
+chrono.workspace = true
+rstest.workspace = true
+schemars.workspace = true
+serde.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "buckle-proto"
+description = "The gRPC protocol spoken between Buckle agents and the Buckle server."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true

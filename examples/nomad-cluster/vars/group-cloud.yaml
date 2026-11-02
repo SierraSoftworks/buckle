@@ -1,0 +1,2 @@
+# Group layer: cloud instances. Wins over the arm64 platform layer for oci-1 and oci-2.
+nomad_node_class: cloud
