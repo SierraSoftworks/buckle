@@ -181,3 +181,121 @@ pub fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
     }
     writer.finish().unwrap().into_inner()
 }
+
+/// The value following `flag` in a command's arguments.
+pub fn flag_value(cmd: &buckle_core::system::Command, flag: &str) -> Option<String> {
+    cmd.args
+        .iter()
+        .position(|a| a == flag)
+        .and_then(|i| cmd.args.get(i + 1).cloned())
+}
+
+/// Scripts `useradd`, `usermod`, `groupadd`, `groupmod`, `chpasswd` and `sh` so
+/// that they update the fake host's user and group databases. (`userdel` and
+/// `groupdel` are scripted to succeed; the fake cannot forget entries, so tests
+/// assert the commands that ran.)
+pub fn with_account_tools(sys: FakeSystem) -> FakeSystem {
+    use buckle_core::system::{GroupInfo, UserInfo};
+    use buckle_core::testing::ok_output;
+    let host = sys.clone();
+    let on_useradd = {
+        let host = host.clone();
+        move |cmd: &buckle_core::system::Command| {
+            let name = cmd.args.last().cloned().unwrap_or_default();
+            let gid = flag_value(cmd, "-g").and_then(|g| g.parse().ok()).unwrap_or(1000);
+            let _ = host.clone().with_user(UserInfo {
+                uid: flag_value(cmd, "-u").and_then(|u| u.parse().ok()).unwrap_or(1000),
+                gid,
+                home: flag_value(cmd, "-d").map(Into::into).unwrap_or_else(|| format!("/home/{name}").into()),
+                shell: flag_value(cmd, "-s").unwrap_or_else(|| "/bin/sh".into()).into(),
+                gecos: flag_value(cmd, "-c").unwrap_or_default(),
+                name,
+            });
+            ok_output("")
+        }
+    };
+    let on_usermod = {
+        let host = host.clone();
+        move |cmd: &buckle_core::system::Command| {
+            let name = cmd.args.last().cloned().unwrap_or_default();
+            if let Some(mut user) = futures_lite_user(&host, &name) {
+                if let Some(uid) = flag_value(cmd, "-u").and_then(|u| u.parse().ok()) {
+                    user.uid = uid;
+                }
+                if let Some(shell) = flag_value(cmd, "-s") {
+                    user.shell = shell.into();
+                }
+                if let Some(home) = flag_value(cmd, "-d") {
+                    user.home = home.into();
+                }
+                if let Some(comment) = flag_value(cmd, "-c") {
+                    user.gecos = comment;
+                }
+                let _ = host.clone().with_user(user);
+            }
+            if let Some(groups) = flag_value(cmd, "-G") {
+                for g in groups.split(',') {
+                    let mut group = futures_lite_group(&host, g).unwrap_or(GroupInfo { name: g.into(), gid: 2000, members: vec![] });
+                    if !group.members.contains(&name) {
+                        group.members.push(name.clone());
+                    }
+                    let _ = host.clone().with_group(group);
+                }
+            }
+            ok_output("")
+        }
+    };
+    let on_groupadd = {
+        let host = host.clone();
+        move |cmd: &buckle_core::system::Command| {
+            let name = cmd.args.last().cloned().unwrap_or_default();
+            let _ = host.clone().with_group(GroupInfo {
+                gid: flag_value(cmd, "-g").and_then(|g| g.parse().ok()).unwrap_or(2000),
+                members: vec![],
+                name,
+            });
+            ok_output("")
+        }
+    };
+    let on_groupmod = {
+        let host = host.clone();
+        move |cmd: &buckle_core::system::Command| {
+            let name = cmd.args.last().cloned().unwrap_or_default();
+            if let (Some(mut group), Some(gid)) = (futures_lite_group(&host, &name), flag_value(cmd, "-g").and_then(|g| g.parse().ok())) {
+                group.gid = gid;
+                let _ = host.clone().with_group(group);
+            }
+            ok_output("")
+        }
+    };
+    sys.on_command("useradd", &[], on_useradd)
+        .on_command("usermod", &[], on_usermod)
+        .on_command("groupadd", &[], on_groupadd)
+        .on_command("groupmod", &[], on_groupmod)
+        .on_command_ok("userdel", &[], "")
+        .on_command_ok("groupdel", &[], "")
+        .on_command_ok("chpasswd", &[], "")
+}
+
+fn futures_lite_user(sys: &FakeSystem, name: &str) -> Option<buckle_core::system::UserInfo> {
+    // The fake's lookups are synchronous under the hood; poll them to completion.
+    use buckle_core::system::System;
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut fut = std::pin::pin!(sys.lookup_user(name));
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(Ok(u)) => u,
+        _ => None,
+    }
+}
+
+fn futures_lite_group(sys: &FakeSystem, name: &str) -> Option<buckle_core::system::GroupInfo> {
+    use buckle_core::system::System;
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut fut = std::pin::pin!(sys.lookup_group(name));
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(Ok(g)) => g,
+        _ => None,
+    }
+}
