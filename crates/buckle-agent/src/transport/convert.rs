@@ -130,9 +130,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
 }
 
 /// The core health scope for the protocol mirror type.
-pub fn scope_to_core(
-    scope: pb::buckle_health::HealthScope,
-) -> buckle_core::health::HealthScope {
+pub fn scope_to_core(scope: pb::buckle_health::HealthScope) -> buckle_core::health::HealthScope {
     use buckle_core::health::HealthScope as C;
     use pb::buckle_health::HealthScope as P;
     match scope {

@@ -9,10 +9,13 @@
 //! | `revisions/<id>/` | extracted revision trees (the stable one is kept for local rollback) |
 //! | `secrets/<id>.cbor` | the secrets scoped to this host for a revision (0600) |
 
-use crate::transport::{LocalRollbackRecord, WireSecret};
+use crate::transport::LocalRollbackRecord;
 use crate::watchdog::WatchdogState;
 use buckle_core::error::HumanizableResult;
 use buckle_core::plan::RevisionId;
+use buckle_core::secrets::cache::SecretCache;
+use buckle_core::secrets::sinks::TransportSink;
+use buckle_core::secrets::{InstallKey, SecretStore};
 use buckle_core::state::{FileStateStore, State, StateStore};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -91,7 +94,9 @@ pub fn validate_revision_id(id: &RevisionId) -> buckle_core::Result<()> {
     } else {
         Err(buckle_core::error::user(
             format!("'{}' is not a valid revision id.", id.0),
-            &["Revision ids are commit hashes or content digests: letters, digits, '-', '_' and '.'."],
+            &[
+                "Revision ids are commit hashes or content digests: letters, digits, '-', '_' and '.'.",
+            ],
         ))
     }
 }
@@ -179,7 +184,11 @@ impl Store {
     /// Saves `agent.json` (0600).
     pub fn save_agent_state(&self, state: &AgentState) -> buckle_core::Result<()> {
         let bytes = serde_json::to_vec_pretty(state).map_err(|e| {
-            buckle_core::error::wrap_system(e, "The agent could not serialise its session state.", &["This is a bug; please report it."])
+            buckle_core::error::wrap_system(
+                e,
+                "The agent could not serialise its session state.",
+                &["This is a bug; please report it."],
+            )
         })?;
         write_private(&self.agent_state_path(), &bytes)
     }
@@ -236,33 +245,29 @@ impl Store {
         Ok(self.root.join("secrets").join(format!("{}.cbor", id.0)))
     }
 
-    /// Caches a revision's secrets (0600).
-    pub fn write_secrets(&self, id: &RevisionId, secrets: &[WireSecret]) -> buckle_core::Result<()> {
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&secrets, &mut bytes).map_err(|e| {
-            buckle_core::error::wrap_system(e, "The agent could not serialise its secret cache.", &["This is a bug; please report it."])
-        })?;
-        write_private(&self.secrets_path(id)?, &bytes)
+    /// Caches a revision's secrets ([`SecretCache`]: CBOR, HMAC-tagged under
+    /// the install key, 0600, atomic).
+    pub fn save_secrets(
+        &self,
+        id: &RevisionId,
+        secrets: &SecretStore,
+        key: &InstallKey,
+    ) -> buckle_core::Result<()> {
+        SecretCache::save(&self.secrets_path(id)?, secrets, key, &TransportSink)
     }
 
     /// The cached secrets of a revision, if any.
-    pub fn read_secrets(&self, id: &RevisionId) -> buckle_core::Result<Option<Vec<WireSecret>>> {
-        match std::fs::read(self.secrets_path(id)?) {
-            Ok(bytes) => ciborium::from_reader(bytes.as_slice()).map(Some).map_err(|e| {
-                buckle_core::error::wrap_system(
-                    e,
-                    format!("The cached secrets for revision {} are corrupt.", id.short()),
-                    &["Delete the file under the state directory's secrets/ folder; the server sends them again on the next assignment."],
-                )
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).to_human_error(),
-        }
+    pub fn load_secrets(
+        &self,
+        id: &RevisionId,
+        key: &InstallKey,
+    ) -> buckle_core::Result<Option<SecretStore>> {
+        SecretCache::load(&self.secrets_path(id)?, key)
     }
 
     /// The install key used to fingerprint secrets (created on first use).
-    pub fn install_key(&self) -> buckle_core::Result<buckle_core::secrets::InstallKey> {
-        buckle_core::secrets::InstallKey::load_or_create(&self.root.join("install.key"))
+    pub fn install_key(&self) -> buckle_core::Result<InstallKey> {
+        InstallKey::load_or_create(&self.root.join("install.key"))
     }
 }
 
@@ -284,15 +289,26 @@ mod tests {
         store.ensure().expect("ensure");
         assert_eq!(store.read_token().expect("read"), None);
         store.write_token("host-token").expect("write");
-        assert_eq!(store.read_token().expect("read").as_deref(), Some("host-token"));
+        assert_eq!(
+            store.read_token().expect("read").as_deref(),
+            Some("host-token")
+        );
         let rev = RevisionId::new("abc123");
-        let secrets = vec![WireSecret {
-            name: "db".into(),
-            value: b"pw".to_vec(),
-            fingerprint: "f".into(),
-        }];
-        store.write_secrets(&rev, &secrets).expect("write");
-        assert_eq!(store.read_secrets(&rev).expect("read"), Some(secrets));
+        let key = store.install_key().expect("key");
+        let mut secrets = SecretStore::new();
+        secrets.insert(buckle_core::secrets::Secret::new("db", "pw".into(), &key));
+        store.save_secrets(&rev, &secrets, &key).expect("write");
+        let loaded = store
+            .load_secrets(&rev, &key)
+            .expect("read")
+            .expect("cached");
+        assert_eq!(loaded.get("db"), secrets.get("db"));
+        assert!(
+            store
+                .load_secrets(&RevisionId::new("other"), &key)
+                .expect("read")
+                .is_none()
+        );
         #[cfg(unix)]
         {
             assert_eq!(mode(&store.token_path()), 0o600);

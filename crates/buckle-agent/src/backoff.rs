@@ -65,7 +65,10 @@ mod tests {
     fn doubles_to_the_cap_and_resets() {
         let mut b = Backoff::default().without_jitter();
         let delays: Vec<u64> = (0..12).map(|_| b.next_delay().as_secs()).collect();
-        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
+        assert_eq!(
+            delays,
+            vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]
+        );
         b.reset();
         assert_eq!(b.next_delay(), Duration::from_secs(1));
     }
@@ -76,7 +79,10 @@ mod tests {
         for _ in 0..4 {
             let base = b.base();
             let d = b.next_delay();
-            assert!(d >= base.mul_f64(0.8) && d <= base.mul_f64(1.2), "{d:?} vs {base:?}");
+            assert!(
+                d >= base.mul_f64(0.8) && d <= base.mul_f64(1.2),
+                "{d:?} vs {base:?}"
+            );
         }
     }
 }

@@ -29,7 +29,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 /// The W3C `traceparent` of the current span, when it is part of a trace.
 pub fn current_traceparent() -> Option<String> {
-    use tracing_batteries::prelude::{OpenTelemetrySpanExt, TraceContextExt, get_text_map_propagator};
+    use tracing_batteries::prelude::{
+        OpenTelemetrySpanExt, TraceContextExt, get_text_map_propagator,
+    };
     let context = tracing::Span::current().context();
     if !context.span().span_context().is_valid() {
         return None;
@@ -41,7 +43,9 @@ pub fn current_traceparent() -> Option<String> {
 
 /// Makes `traceparent` (when present and valid) the parent of `span`.
 pub fn set_parent_from_traceparent(span: &tracing::Span, traceparent: Option<&str>) {
-    use tracing_batteries::prelude::{OpenTelemetrySpanExt, TraceContextExt, get_text_map_propagator};
+    use tracing_batteries::prelude::{
+        OpenTelemetrySpanExt, TraceContextExt, get_text_map_propagator,
+    };
     let Some(traceparent) = traceparent else {
         return;
     };
@@ -56,7 +60,10 @@ pub fn set_parent_from_traceparent(span: &tracing::Span, traceparent: Option<&st
     }
 }
 
-fn connection_error(err: impl std::error::Error + Send + Sync + 'static, what: &str) -> buckle_core::Error {
+fn connection_error(
+    err: impl std::error::Error + Send + Sync + 'static,
+    what: &str,
+) -> buckle_core::Error {
     buckle_core::error::wrap_user(
         err,
         format!("The agent could not {what}."),
@@ -72,14 +79,12 @@ fn status_error(status: tonic::Status, what: &str) -> buckle_core::Error {
         tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => &[
             "The server did not accept this host's token. Re-enrol with `buckle install agent --token <bootstrap>` or ask an admin to approve the host.",
         ],
-        tonic::Code::Unavailable => &["The server is unreachable; the agent keeps retrying with backoff."],
+        tonic::Code::Unavailable => {
+            &["The server is unreachable; the agent keeps retrying with backoff."]
+        }
         _ => &["Check the server's logs for details."],
     };
-    buckle_core::error::wrap_user(
-        status,
-        format!("The server refused to {what}."),
-        advice,
-    )
+    buckle_core::error::wrap_user(status, format!("The server refused to {what}."), advice)
 }
 
 /// Builds the endpoint for `config.server` with the configured TLS mode.
@@ -102,7 +107,9 @@ pub fn endpoint(config: &AgentConfig) -> buckle_core::Result<Endpoint> {
         "http" if tls.insecure_plaintext => true,
         "http" => {
             return Err(buckle_core::error::user(
-                format!("The server URL '{server}' is plaintext but `tls.insecure_plaintext` is not set."),
+                format!(
+                    "The server URL '{server}' is plaintext but `tls.insecure_plaintext` is not set."
+                ),
                 &[
                     "Use an https:// URL, or set `tls: { insecure_plaintext: true }` when the connection is protected another way (e.g. a tailnet).",
                 ],
@@ -211,8 +218,7 @@ impl GrpcTransport {
     }
 
     fn client(&self) -> FleetClient<Channel> {
-        FleetClient::new(self.channel.clone())
-            .max_decoding_message_size(64 * 1024 * 1024)
+        FleetClient::new(self.channel.clone()).max_decoding_message_size(64 * 1024 * 1024)
     }
 }
 
@@ -234,14 +240,23 @@ where
             total = Some(chunk.total);
             if chunk.total > MAX_BUNDLE_BYTES {
                 return Err(buckle_core::error::user(
-                    format!("Revision {} is {} bytes, more than the agent accepts.", revision.short(), chunk.total),
-                    &["Keep large files out of the configuration repository, or fetch them as blobs."],
+                    format!(
+                        "Revision {} is {} bytes, more than the agent accepts.",
+                        revision.short(),
+                        chunk.total
+                    ),
+                    &[
+                        "Keep large files out of the configuration repository, or fetch them as blobs.",
+                    ],
                 ));
             }
         }
         if data.len() as u64 + chunk.data.len() as u64 > MAX_BUNDLE_BYTES {
             return Err(buckle_core::error::user(
-                format!("Revision {} is larger than the agent accepts.", revision.short()),
+                format!(
+                    "Revision {} is larger than the agent accepts.",
+                    revision.short()
+                ),
                 &["Keep large files out of the configuration repository, or fetch them as blobs."],
             ));
         }
@@ -264,7 +279,10 @@ where
     }
     let digest = digest.ok_or_else(|| {
         buckle_core::error::user(
-            format!("The server sent revision {} without a digest, so it cannot be verified.", revision.short()),
+            format!(
+                "The server sent revision {} without a digest, so it cannot be verified.",
+                revision.short()
+            ),
             &["Upgrade the server; every FetchRevision stream ends with the payload digest."],
         )
     })?;
@@ -378,7 +396,8 @@ mod tests {
     use rstest::rstest;
 
     fn config(server: &str, plaintext: bool) -> AgentConfig {
-        let mut config: AgentConfig = serde_yaml::from_str(&format!("server: {server}\n")).expect("config");
+        let mut config: AgentConfig =
+            serde_yaml::from_str(&format!("server: {server}\n")).expect("config");
         config.tls.insecure_plaintext = plaintext;
         config
     }
@@ -389,7 +408,11 @@ mod tests {
     #[case("https://127.0.0.1:7700", true, true)]
     #[case("ftp://127.0.0.1:7700", true, false)]
     #[tokio::test]
-    async fn plaintext_must_be_explicit(#[case] server: &str, #[case] plaintext: bool, #[case] ok: bool) {
+    async fn plaintext_must_be_explicit(
+        #[case] server: &str,
+        #[case] plaintext: bool,
+        #[case] ok: bool,
+    ) {
         let built = endpoint(&config(server, plaintext));
         assert_eq!(built.is_ok(), ok);
         if let Ok(endpoint) = built {
@@ -406,7 +429,9 @@ mod tests {
         assert!(endpoint(&cfg).is_err());
     }
 
-    fn chunks(parts: Vec<pb::Chunk>) -> impl futures::Stream<Item = Result<pb::Chunk, tonic::Status>> + Unpin {
+    fn chunks(
+        parts: Vec<pb::Chunk>,
+    ) -> impl futures::Stream<Item = Result<pb::Chunk, tonic::Status>> + Unpin {
         futures::stream::iter(parts.into_iter().map(Ok))
     }
 
@@ -419,7 +444,11 @@ mod tests {
             .map(|(i, piece)| pb::Chunk {
                 data: piece.to_vec(),
                 total: if i == 0 { data.len() as u64 } else { 0 },
-                digest: if i == n - 1 { digest.to_owned() } else { String::new() },
+                digest: if i == n - 1 {
+                    digest.to_owned()
+                } else {
+                    String::new()
+                },
             })
             .collect()
     }
@@ -443,8 +472,16 @@ mod tests {
         assert!(collect_chunks(chunks(short), &rev, None).await.is_err());
 
         let other = format!("sha256:{}", crate::bundle::sha256_hex(b"other"));
-        assert!(collect_chunks(chunks(chunked(data, &digest)), &rev, Some(&other)).await.is_err());
+        assert!(
+            collect_chunks(chunks(chunked(data, &digest)), &rev, Some(&other))
+                .await
+                .is_err()
+        );
 
-        assert!(collect_chunks(chunks(chunked(data, "")), &rev, None).await.is_err());
+        assert!(
+            collect_chunks(chunks(chunked(data, "")), &rev, None)
+                .await
+                .is_err()
+        );
     }
 }

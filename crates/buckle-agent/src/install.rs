@@ -20,7 +20,8 @@ pub const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/buckle-agent.service";
 pub const LAUNCHD_LABEL: &str = "com.sierrasoftworks.buckle-agent";
 
 /// The launchd plist path.
-pub const LAUNCHD_PLIST_PATH: &str = "/Library/LaunchDaemons/com.sierrasoftworks.buckle-agent.plist";
+pub const LAUNCHD_PLIST_PATH: &str =
+    "/Library/LaunchDaemons/com.sierrasoftworks.buckle-agent.plist";
 
 /// How `install` should behave.
 #[derive(Debug, Clone, Default)]
@@ -33,7 +34,10 @@ pub struct InstallOptions {
 
 /// Quotes an argument for a systemd `ExecStart=` line.
 fn systemd_quote(arg: &str) -> String {
-    if arg.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\' || c == '\'') {
+    if arg
+        .chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\\' || c == '\'')
+    {
         format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
         arg.to_owned()
@@ -205,7 +209,11 @@ async fn install_service(exe: &Path, config_path: &Path) -> buckle_core::Result<
         .await;
         run(
             "launchctl",
-            &["bootstrap".into(), "system".into(), LAUNCHD_PLIST_PATH.into()],
+            &[
+                "bootstrap".into(),
+                "system".into(),
+                LAUNCHD_PLIST_PATH.into(),
+            ],
         )
         .await
     } else if cfg!(windows) {
@@ -216,7 +224,9 @@ async fn install_service(exe: &Path, config_path: &Path) -> buckle_core::Result<
     } else {
         Err(buckle_core::error::user(
             "Buckle does not know how to install a service on this platform.",
-            &["Re-run with --no-service and start `buckle agent --config <path>` with your init system."],
+            &[
+                "Re-run with --no-service and start `buckle agent --config <path>` with your init system.",
+            ],
         ))
     }
 }
@@ -258,7 +268,9 @@ mod tests {
             Path::new("/usr/local/bin/buckle"),
             Path::new("/etc/buckle/agent.yaml"),
         );
-        assert!(unit.contains("ExecStart=/usr/local/bin/buckle agent --config /etc/buckle/agent.yaml"));
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/buckle agent --config /etc/buckle/agent.yaml")
+        );
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("RestartSec=5"));
         assert!(unit.contains("After=network-online.target tailscaled.service"));
@@ -267,13 +279,19 @@ mod tests {
 
     #[test]
     fn systemd_paths_with_spaces_are_quoted() {
-        let unit = systemd_unit(Path::new("/opt/my tools/buckle"), Path::new("/etc/buckle/agent.yaml"));
+        let unit = systemd_unit(
+            Path::new("/opt/my tools/buckle"),
+            Path::new("/etc/buckle/agent.yaml"),
+        );
         assert!(unit.contains("ExecStart=\"/opt/my tools/buckle\" agent"));
     }
 
     #[test]
     fn the_launchd_plist_keeps_the_agent_alive() {
-        let plist = launchd_plist(Path::new("/usr/local/bin/buckle"), Path::new("/etc/buckle/a&b.yaml"));
+        let plist = launchd_plist(
+            Path::new("/usr/local/bin/buckle"),
+            Path::new("/etc/buckle/a&b.yaml"),
+        );
         assert!(plist.contains("<string>/usr/local/bin/buckle</string>"));
         assert!(plist.contains("<string>/etc/buckle/a&amp;b.yaml</string>"));
         assert!(plist.contains("<key>KeepAlive</key>\n  <true/>"));

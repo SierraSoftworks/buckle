@@ -5,10 +5,11 @@
 //! Operations (assign, plan, apply, rollback, health, drift, facts, upgrade,
 //! watchdog checks) run one at a time on a worker task, in the order they
 //! were queued, so the session keeps heartbeating while an apply runs and
-//! `busy` in the heartbeat reflects the worker. Operations queued by a
-//! session that has since ended are skipped (the server re-drives the host
-//! after it reconnects), except an apply that already started, which always
-//! runs to completion.
+//! `busy` in the heartbeat reflects the worker. Plan and health requests
+//! queued by a session that has since ended are skipped (the server asks again
+//! after the reconnect); approved applies (still bound to their plan digest),
+//! rollbacks, assignments and upgrades run regardless, and the next Hello
+//! tells the server what was applied.
 
 use crate::backoff::Backoff;
 use crate::coalesce;
@@ -18,8 +19,8 @@ use crate::sink::ReportSink;
 use crate::store::{AgentState, Store};
 use crate::transport::grpc::set_parent_from_traceparent;
 use crate::transport::{
-    Hello, Instruction, LocalRollbackRecord, Report, RevisionSource, Session, Transport,
-    Welcome, WireSecret,
+    Hello, Instruction, LocalRollbackRecord, Report, RevisionSource, Session, Transport, Welcome,
+    WireSecret,
 };
 use crate::update::{UpdateOutcome, Updater};
 use crate::watchdog::{Verdict, Watchdog};
@@ -27,7 +28,7 @@ use buckle_core::engine::{ApplyOutcome, Revision};
 use buckle_core::facts::Facts;
 use buckle_core::health::{HealthReport, HealthResult, HealthScope, HealthStatus};
 use buckle_core::plan::{Plan, RevisionId};
-use buckle_core::secrets::{InstallKey, Secret, SecretStore};
+use buckle_core::secrets::{Fingerprint, InstallKey, Secret, SecretStore};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -219,7 +220,10 @@ fn health_error_report(scope: HealthScope, error: &buckle_core::Error) -> Health
             check: "health".into(),
             kind: "agent".into(),
             required: true,
-            status: HealthStatus::unknown(format!("the checks could not run: {}", error.description())),
+            status: HealthStatus::unknown(format!(
+                "the checks could not run: {}",
+                error.description()
+            )),
             at: chrono::Utc::now(),
             duration_ms: 0,
         }],
@@ -295,7 +299,12 @@ impl Agent {
             queue.clone(),
             ticker_cancel.clone(),
         ));
-        queue.push(Op::Facts { force_report: false }, None);
+        queue.push(
+            Op::Facts {
+                force_report: false,
+            },
+            None,
+        );
 
         let mut backoff = Backoff::new(shared.options.backoff_min, shared.options.backoff_max);
         if !shared.options.backoff_jitter {
@@ -323,14 +332,22 @@ impl Agent {
                         .await
                     {
                         SessionEnd::Shutdown => break Ok(0),
-                        SessionEnd::Rejected { reason, retry: false } => {
+                        SessionEnd::Rejected {
+                            reason,
+                            retry: false,
+                        } => {
                             tracing::error!(%reason, "the server rejected this host; not retrying");
                             break Err(buckle_core::error::user(
                                 format!("The server rejected this host: {reason}"),
-                                &["Ask a Buckle admin to approve or re-enrol the host, then restart the agent."],
+                                &[
+                                    "Ask a Buckle admin to approve or re-enrol the host, then restart the agent.",
+                                ],
                             ));
                         }
-                        SessionEnd::Rejected { reason, retry: true } => {
+                        SessionEnd::Rejected {
+                            reason,
+                            retry: true,
+                        } => {
                             tracing::warn!(%reason, "the server rejected the session; retrying");
                         }
                         SessionEnd::Closed { welcomed } => {
@@ -432,12 +449,16 @@ impl Shared {
         }
         let mut welcomed = false;
         let start = Instant::now();
-        let mut heartbeat = tokio::time::interval_at(start + self.options.heartbeat, self.options.heartbeat);
+        let mut heartbeat =
+            tokio::time::interval_at(start + self.options.heartbeat, self.options.heartbeat);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let drift_every = self.config.drift.interval.max(Duration::from_secs(1));
         let mut drift = tokio::time::interval_at(start + drift_every, drift_every);
         drift.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut facts = tokio::time::interval_at(start + self.options.facts_interval, self.options.facts_interval);
+        let mut facts = tokio::time::interval_at(
+            start + self.options.facts_interval,
+            self.options.facts_interval,
+        );
         facts.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let end = loop {
@@ -456,7 +477,12 @@ impl Shared {
                     Some(Instruction::Ping) => {}
                     Some(other) => {
                         if let Some(op) = op_for(other) {
-                            queue.push(op, Some(generation));
+                            // Plans and health answers are only useful to the
+                            // session that asked; the server asks again after
+                            // a reconnect. Approved applies, rollbacks,
+                            // assignments and upgrades still run.
+                            let bound = matches!(op, Op::Plan { .. } | Op::Health { .. });
+                            queue.push(op, bound.then_some(generation));
                         }
                     }
                 },
@@ -494,7 +520,9 @@ impl Shared {
         if let Some(token) = &welcome.issued_token {
             match self.store.write_token(token) {
                 Ok(()) => tracing::info!("stored the per-host token issued by the server"),
-                Err(err) => tracing::error!(error = %err.description(), "could not store the per-host token"),
+                Err(err) => {
+                    tracing::error!(error = %err.description(), "could not store the per-host token")
+                }
             }
         }
         let pending = {
@@ -615,7 +643,8 @@ impl Shared {
                 until,
                 traceparent,
             } => {
-                let span = tracing::info_span!("agent.health", scope = ?scope, request = %request_id);
+                let span =
+                    tracing::info_span!("agent.health", scope = ?scope, request = %request_id);
                 set_parent_from_traceparent(&span, traceparent.as_deref());
                 self.health(request_id, scope, modules, until)
                     .instrument(span)
@@ -636,33 +665,69 @@ impl Shared {
 
     // ------------------------------------------------------------ revisions and secrets
 
-    fn build_secrets(&self, wire: &[WireSecret]) -> SecretStore {
+    /// Seals secrets from the wire, keeping the server's fingerprints so plan
+    /// digests agree across the fleet.
+    fn import_secrets(&self, wire: &[WireSecret]) -> SecretStore {
         let mut store = SecretStore::new();
         for secret in wire {
-            match String::from_utf8(secret.value.clone()) {
-                Ok(value) => store.insert(Secret::new(secret.name.clone(), value, &self.install_key)),
-                Err(_) => tracing::warn!(secret = %secret.name, "ignoring a secret whose value is not UTF-8"),
+            let imported = match Fingerprint::parse(&secret.fingerprint) {
+                Ok(fingerprint) => SecretStore::import_fingerprinted([(
+                    secret.name.clone(),
+                    fingerprint,
+                    secret.value.clone(),
+                )]),
+                Err(_) => {
+                    tracing::warn!(secret = %secret.name, "the server sent a secret without a valid fingerprint; fingerprinting it locally");
+                    String::from_utf8(secret.value.clone())
+                        .map(|value| {
+                            let mut one = SecretStore::new();
+                            one.insert(Secret::new(secret.name.clone(), value, &self.install_key));
+                            one
+                        })
+                        .map_err(|_| {
+                            buckle_core::error::user(
+                                format!("The secret '{}' is not UTF-8.", secret.name),
+                                &["Store secrets as text."],
+                            )
+                        })
+                }
+            };
+            match imported {
+                Ok(one) => {
+                    for s in one.iter() {
+                        store.insert(s.clone());
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(secret = %secret.name, error = %err.description(), "ignoring a secret that could not be imported")
+                }
             }
         }
         store
     }
 
     fn cache_secrets(&self, data: &mut Data, revision: &RevisionId, wire: &[WireSecret]) {
-        let mut merged: Vec<WireSecret> = self
-            .store
-            .read_secrets(revision)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        for secret in wire {
-            merged.retain(|s| s.name != secret.name);
-            merged.push(secret.clone());
+        let mut merged = match data.secrets.get(revision) {
+            Some(existing) => (**existing).clone(),
+            None => self
+                .store
+                .load_secrets(revision, &self.install_key)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(error = %err.description(), "discarding an unreadable secret cache");
+                    None
+                })
+                .unwrap_or_default(),
+        };
+        for secret in self.import_secrets(wire).iter() {
+            merged.insert(secret.clone());
         }
-        if let Err(err) = self.store.write_secrets(revision, &merged) {
+        if let Err(err) = self
+            .store
+            .save_secrets(revision, &merged, &self.install_key)
+        {
             tracing::error!(error = %err.description(), "could not cache secrets");
         }
-        data.secrets
-            .insert(revision.clone(), Arc::new(self.build_secrets(&merged)));
+        data.secrets.insert(revision.clone(), Arc::new(merged));
     }
 
     async fn secrets_for(&self, revision: &RevisionId) -> Arc<SecretStore> {
@@ -670,8 +735,8 @@ impl Shared {
         if let Some(s) = data.secrets.get(revision) {
             return s.clone();
         }
-        let store = match self.store.read_secrets(revision) {
-            Ok(Some(wire)) => Arc::new(self.build_secrets(&wire)),
+        let store = match self.store.load_secrets(revision, &self.install_key) {
+            Ok(Some(store)) => Arc::new(store),
             Ok(None) => Arc::new(SecretStore::new()),
             Err(err) => {
                 tracing::error!(error = %err.description(), "could not read cached secrets");
@@ -703,14 +768,20 @@ impl Shared {
                 }
             }
         };
-        let loaded = Arc::new(buckle_core::engine::loader::load_dir(&dir, revision.clone())?);
+        let loaded = Arc::new(buckle_core::engine::loader::load_dir(
+            &dir,
+            revision.clone(),
+        )?);
         let mut data = self.data.lock().await;
-        let keep: Vec<RevisionId> = [data.applied.clone(), data.stable.clone(), data.assigned.clone()]
-            .into_iter()
-            .flatten()
-            .collect();
-        data.revisions
-            .retain(|id, _| keep.contains(id));
+        let keep: Vec<RevisionId> = [
+            data.applied.clone(),
+            data.stable.clone(),
+            data.assigned.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        data.revisions.retain(|id, _| keep.contains(id));
         data.revisions.insert(revision.clone(), loaded.clone());
         Ok(loaded)
     }
@@ -778,7 +849,10 @@ impl Shared {
         {
             tracing::error!(error = %err.description(), "could not record the stable revision");
         }
-        match self.ensure_revision(&revision, tree_digest.as_deref()).await {
+        match self
+            .ensure_revision(&revision, tree_digest.as_deref())
+            .await
+        {
             Ok(_) => {
                 tracing::info!(revision = %revision.short(), stable, "revision assigned");
                 let data = self.data.lock().await;
@@ -932,7 +1006,11 @@ impl Shared {
             return;
         }
         let outcome = self.run_apply(rev.clone(), &ctx, &plan, true).await;
-        tracing::info!(succeeded = outcome.succeeded, changes = outcome.changes, "apply finished");
+        tracing::info!(
+            succeeded = outcome.succeeded,
+            changes = outcome.changes,
+            "apply finished"
+        );
         self.maybe_arm_watchdog(&rev, connected_before, waived_checks)
             .await;
     }
@@ -948,7 +1026,9 @@ impl Shared {
             return;
         }
         if !connected_before {
-            tracing::debug!("not arming the local rollback watchdog: there was no session before the apply");
+            tracing::debug!(
+                "not arming the local rollback watchdog: there was no session before the apply"
+            );
             return;
         }
         let mut data = self.data.lock().await;
@@ -1044,7 +1124,10 @@ impl Shared {
         let ctx = self.context(&revision, None, Vec::new(), false).await;
         let modules = (!modules.is_empty()).then_some(modules);
         let deadline = until.map(|until| {
-            Instant::now() + (until - chrono::Utc::now()).to_std().unwrap_or(Duration::ZERO)
+            Instant::now()
+                + (until - chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::ZERO)
         });
         let interval = health_interval(&rev);
         let cancel = self
@@ -1102,9 +1185,16 @@ impl Shared {
                 let drifted = !plan.is_empty();
                 let mut corrected = false;
                 if drifted {
-                    tracing::warn!(changes = plan.changes(), removals = plan.removals.len(), "drift detected");
+                    tracing::warn!(
+                        changes = plan.changes(),
+                        removals = plan.removals.len(),
+                        "drift detected"
+                    );
                     if self.config.drift.correct && !paused {
-                        corrected = self.run_apply(rev.clone(), &ctx, &plan, false).await.succeeded;
+                        corrected = self
+                            .run_apply(rev.clone(), &ctx, &plan, false)
+                            .await
+                            .succeeded;
                     }
                 }
                 self.sink
@@ -1190,7 +1280,9 @@ impl Shared {
                     self.cache_secrets(&mut data, &id, &wire);
                 }
                 Ok(_) => {}
-                Err(err) => tracing::warn!(error = %err.description(), "could not fetch additional secrets"),
+                Err(err) => {
+                    tracing::warn!(error = %err.description(), "could not fetch additional secrets")
+                }
             }
         }
     }
@@ -1255,14 +1347,23 @@ impl Shared {
             match self.ensure_revision(&watchdog.state.from, None).await {
                 Ok(rev) => {
                     let ctx = self
-                        .context(&watchdog.state.from, None, watchdog.state.waived_checks.clone(), false)
+                        .context(
+                            &watchdog.state.from,
+                            None,
+                            watchdog.state.waived_checks.clone(),
+                            false,
+                        )
                         .await;
                     match self.runner.health(rev, &ctx, HealthScope::Bake, None).await {
                         Ok(report) => watchdog.observe(&report, Instant::now()),
-                        Err(err) => tracing::warn!(error = %err.description(), "the watchdog could not run health checks"),
+                        Err(err) => {
+                            tracing::warn!(error = %err.description(), "the watchdog could not run health checks")
+                        }
                     }
                 }
-                Err(err) => tracing::warn!(error = %err.description(), "the watchdog could not load the applied revision"),
+                Err(err) => {
+                    tracing::warn!(error = %err.description(), "the watchdog could not load the applied revision")
+                }
             }
         }
         let verdict = watchdog.decide(self.connected.load(Ordering::SeqCst), Instant::now());
@@ -1316,7 +1417,10 @@ impl Shared {
             ),
             Err(err) => (
                 false,
-                format!("{reason}; the rollback could not run: {}", err.description()),
+                format!(
+                    "{reason}; the rollback could not run: {}",
+                    err.description()
+                ),
             ),
         };
         if !succeeded {

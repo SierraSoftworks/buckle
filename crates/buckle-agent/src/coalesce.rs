@@ -174,14 +174,8 @@ mod tests {
             tx.send(step(i, true)).await.expect("send");
         }
         drop(tx);
-        let (sent, dropped) = forward(
-            rx,
-            sink,
-            RevisionId::new("r"),
-            "d".into(),
-            EVENT_SPACING,
-        )
-        .await;
+        let (sent, dropped) =
+            forward(rx, sink, RevisionId::new("r"), "d".into(), EVENT_SPACING).await;
         assert_eq!(sent + dropped, 100);
         let mut times = Vec::new();
         while let Ok(report) = report_rx.try_recv() {
@@ -189,7 +183,10 @@ mod tests {
             times.push(Instant::now());
         }
         assert_eq!(times.len(), sent);
-        assert!(sent <= 11, "a burst is cut to about a second of events, got {sent}");
+        assert!(
+            sent <= 11,
+            "a burst is cut to about a second of events, got {sent}"
+        );
         assert!(Instant::now() - start <= Duration::from_millis(1100));
     }
 
@@ -205,12 +202,15 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         });
-        let (sent, dropped) = forward(rx, sink, RevisionId::new("r"), "d".into(), EVENT_SPACING).await;
+        let (sent, dropped) =
+            forward(rx, sink, RevisionId::new("r"), "d".into(), EVENT_SPACING).await;
         producer.await.expect("producer");
         assert_eq!((sent, dropped), (5, 0));
         let mut ids = Vec::new();
-        while let Ok(Report::ApplyEvent { event: ApplyEvent::StepFinished { task_id, .. }, .. }) =
-            report_rx.try_recv()
+        while let Ok(Report::ApplyEvent {
+            event: ApplyEvent::StepFinished { task_id, .. },
+            ..
+        }) = report_rx.try_recv()
         {
             ids.push(task_id);
         }

@@ -141,13 +141,20 @@ impl Updater for GitHubUpdater {
         }
         let variant = release.get_variant().ok_or_else(|| {
             buckle_core::error::user(
-                format!("Release {} has no binary for this platform ({}).", release.id, update_rs::naming::go("buckle")),
+                format!(
+                    "Release {} has no binary for this platform ({}).",
+                    release.id,
+                    update_rs::naming::go("buckle")
+                ),
                 &["Install Buckle for this platform from source, or pick another release."],
             )
         })?;
         if variant.sha256.is_none() {
             return Err(buckle_core::error::user(
-                format!("GitHub reports no SHA-256 digest for {} in release {}, so the download cannot be verified.", variant.name, release.id),
+                format!(
+                    "GitHub reports no SHA-256 digest for {} in release {}, so the download cannot be verified.",
+                    variant.name, release.id
+                ),
                 &["Download and verify the release manually."],
             ));
         }
@@ -223,7 +230,9 @@ mod tests {
             .await;
         for tag in ["v2.1.0", "v2.0.0"] {
             Mock::given(method("GET"))
-                .and(path(format!("/{RELEASE_REPOSITORY}/releases/download/{tag}/{ASSET}")))
+                .and(path(format!(
+                    "/{RELEASE_REPOSITORY}/releases/download/{tag}/{ASSET}"
+                )))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(binary.to_vec()))
                 .mount(&server)
                 .await;
@@ -250,17 +259,35 @@ mod tests {
             .update(None)
             .await
             .expect("update");
-        assert_eq!(outcome, UpdateOutcome::Updated { version: "2.1.0".into() });
+        assert_eq!(
+            outcome,
+            UpdateOutcome::Updated {
+                version: "2.1.0".into()
+            }
+        );
         assert_eq!(std::fs::read(&target).expect("read"), binary);
 
-        let again = updater(&server, "2.1.0", &target).update(None).await.expect("update");
-        assert_eq!(again, UpdateOutcome::UpToDate { version: "2.1.0".into() });
+        let again = updater(&server, "2.1.0", &target)
+            .update(None)
+            .await
+            .expect("update");
+        assert_eq!(
+            again,
+            UpdateOutcome::UpToDate {
+                version: "2.1.0".into()
+            }
+        );
 
         let pinned = updater(&server, "2.1.0", &target)
             .update(Some("v2.0.0"))
             .await
             .expect("update");
-        assert_eq!(pinned, UpdateOutcome::Updated { version: "2.0.0".into() });
+        assert_eq!(
+            pinned,
+            UpdateOutcome::Updated {
+                version: "2.0.0".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -270,7 +297,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("buckle");
         std::fs::write(&target, b"old").expect("write");
-        assert!(updater(&server, "2.0.0", &target).update(None).await.is_err());
+        assert!(
+            updater(&server, "2.0.0", &target)
+                .update(None)
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(&target).expect("read"), b"old");
         let leftovers = std::fs::read_dir(dir.path()).expect("list").count();
         assert_eq!(leftovers, 1, "the staging file is removed");
@@ -282,7 +314,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("buckle");
         std::fs::write(&target, b"old").expect("write");
-        assert!(updater(&server, "2.0.0", &target).update(None).await.is_err());
+        assert!(
+            updater(&server, "2.0.0", &target)
+                .update(None)
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(&target).expect("read"), b"old");
     }
 }

@@ -4,7 +4,7 @@
 //! of the tree's contents, followed by RequestPlan and an automatic Apply.
 //! Reports are logged.
 
-use super::{Hello, Instruction, Report, RevisionSource, Session, Transport, WireSecret, Welcome};
+use super::{Hello, Instruction, Report, RevisionSource, Session, Transport, Welcome, WireSecret};
 use crate::bundle::tree_digest;
 use async_trait::async_trait;
 use buckle_core::plan::RevisionId;
@@ -57,7 +57,9 @@ pub fn log_report(report: &Report) {
             tracing::warn!(revision = %plan.revision.short(), "the plan changed before it could be applied")
         }
         Report::ApplyEvent { event, .. } => tracing::info!(event = ?event, "apply"),
-        Report::ApplyResult { revision, outcome, .. } => {
+        Report::ApplyResult {
+            revision, outcome, ..
+        } => {
             if outcome.succeeded {
                 tracing::info!(
                     revision = %revision.short(),
@@ -202,7 +204,9 @@ impl Transport for LocalTransport {
                         }
                     }
                     Ok(_) => {}
-                    Err(err) => tracing::warn!(error = %err, "could not read the configuration directory"),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "could not read the configuration directory")
+                    }
                 }
                 // Wait for a change, then for the tree to settle.
                 tokio::select! {

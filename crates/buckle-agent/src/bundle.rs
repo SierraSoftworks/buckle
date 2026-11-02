@@ -33,7 +33,9 @@ pub fn verify_digest(bytes: &[u8], expected: &str) -> buckle_core::Result<()> {
                 "The revision bundle is corrupt: its digest is {actual} but the server announced {}.",
                 normalise_digest(expected)
             ),
-            &["The download was damaged in transit or the server's cache is inconsistent; the agent will fetch it again."],
+            &[
+                "The download was damaged in transit or the server's cache is inconsistent; the agent will fetch it again.",
+            ],
         ))
     }
 }
@@ -125,10 +127,12 @@ fn safe_relative(path: &Path) -> bool {
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-fn bad_bundle(message: impl Into<String>) -> buckle_core::Error {
+fn bad_bundle(message: String) -> buckle_core::Error {
     buckle_core::error::user(
         message,
-        &["The server sent a revision bundle Buckle will not unpack; check the server's revision store."],
+        &[
+            "The server sent a revision bundle Buckle will not unpack; check the server's revision store.",
+        ],
     )
 }
 
@@ -167,9 +171,13 @@ fn unpack_into(bytes: &[u8], staging: &Path) -> buckle_core::Result<()> {
     std::fs::create_dir_all(staging).to_human_error()?;
     let decoder = flate2::read::GzDecoder::new(bytes).take(MAX_BUNDLE_BYTES);
     let mut archive = tar::Archive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|e| buckle_core::error::wrap_user(e, "The revision bundle is not a valid tarball.", &["The server sent a damaged bundle; the agent will fetch it again."]))?;
+    let entries = archive.entries().map_err(|e| {
+        buckle_core::error::wrap_user(
+            e,
+            "The revision bundle is not a valid tarball.",
+            &["The server sent a damaged bundle; the agent will fetch it again."],
+        )
+    })?;
     for entry in entries {
         let mut entry = entry.map_err(|e| {
             buckle_core::error::wrap_user(
@@ -243,10 +251,17 @@ mod tests {
     #[test]
     fn packing_is_deterministic_and_digests_track_content() {
         let src = tree();
-        assert_eq!(pack_dir(src.path()).expect("pack"), pack_dir(src.path()).expect("pack"));
+        assert_eq!(
+            pack_dir(src.path()).expect("pack"),
+            pack_dir(src.path()).expect("pack")
+        );
         let before = tree_digest(src.path()).expect("digest");
         std::fs::write(src.path().join(".git/HEAD"), "other").expect("write");
-        assert_eq!(tree_digest(src.path()).expect("digest"), before, "hidden files do not count");
+        assert_eq!(
+            tree_digest(src.path()).expect("digest"),
+            before,
+            "hidden files do not count"
+        );
         std::fs::write(src.path().join("buckle.yaml"), "version: 2\n# edit\n").expect("write");
         assert_ne!(tree_digest(src.path()).expect("digest"), before);
     }
@@ -271,11 +286,7 @@ mod tests {
         builder
             .append_link(&mut header, "modules/evil", "/etc/passwd")
             .expect("append");
-        let bytes = builder
-            .into_inner()
-            .expect("tar")
-            .finish()
-            .expect("gzip");
+        let bytes = builder.into_inner().expect("tar").finish().expect("gzip");
         let out = tempfile::tempdir().expect("tempdir");
         let dest = out.path().join("r");
         assert!(extract_atomic(&bytes, &dest).is_err());
