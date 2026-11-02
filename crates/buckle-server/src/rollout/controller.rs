@@ -976,7 +976,12 @@ impl Controller {
             let target = self.live[ri].hosts[hi].runtime.revision.clone();
             let prev = self.live[ri].record.runtime.previous_stable.clone();
             match state {
-                HostPhase::Applying if result.revision == target => {
+                HostPhase::Applying
+                    if result.revision == target
+                        && (result.plan_digest.is_empty()
+                            || self.live[ri].hosts[hi].plan_digest.as_deref()
+                                == Some(result.plan_digest.as_str())) =>
+                {
                     self.live[ri].hosts[hi].result =
                         serde_json::to_value(ResultView::from(&result)).ok();
                     if result.succeeded {
@@ -1120,7 +1125,17 @@ impl Controller {
                         }
                     }
                 }
-                (HealthScope::Bake, HostPhase::Baking) => {
+                // A bake report belongs to this rollout's bake of the host:
+                // its revision and request (when the agent names them).
+                (HealthScope::Bake, HostPhase::Baking)
+                    if (report.revision.is_empty()
+                        || report.revision == self.live[ri].hosts[hi].runtime.revision)
+                        && (report.request_id.is_empty()
+                            || self.live[ri].hosts[hi]
+                                .runtime
+                                .bake_requests
+                                .contains(&report.request_id)) =>
+                {
                     self.live[ri].hosts[hi].health =
                         serde_json::to_value(HealthView::from(&report)).ok();
                     let h = &mut self.live[ri].hosts[hi];
@@ -2177,6 +2192,7 @@ impl Controller {
             h.runtime.bake_until = Some(until);
             h.runtime.failing_since.clear();
             h.runtime.bake_reports = 0;
+            h.runtime.bake_requests.clear();
         }
         self.set_host_state(ri, hi, HostPhase::Baking, "applied; baking");
         if bake > 0 {
@@ -2205,10 +2221,20 @@ impl Controller {
     fn send_bake_request(&mut self, ri: usize, hi: usize, until: DateTime<Utc>) {
         let span = self.host_span(ri, hi);
         let host = self.live[ri].hosts[hi].host.clone();
+        let request_id = new_id();
+        {
+            let requests = &mut self.live[ri].hosts[hi].runtime.bake_requests;
+            requests.push(request_id.clone());
+            // A handful is plenty (one per reconnect).
+            if requests.len() > 8 {
+                requests.remove(0);
+            }
+        }
+        self.touch_host(ri, hi);
         self.send(
             &host,
             server_message::Msg::Health(RunHealth {
-                request_id: new_id(),
+                request_id,
                 scope: HealthScope::Bake as i32,
                 modules: vec![],
                 until: Some(timestamp(until)),
@@ -2564,12 +2590,16 @@ impl Controller {
                 .iter()
                 .filter(|&&i| self.live[ri].hosts[i].state.in_flight())
                 .count();
+            let busy = self.busy_elsewhere(ri);
             for &hi in &hosts {
                 if inflight >= cap {
                     break;
                 }
                 let h = &self.live[ri].hosts[hi];
-                if h.state == HostPhase::Planned && self.eligible(&h.host) && self.approved(ri, hi)
+                if h.state == HostPhase::Planned
+                    && self.eligible(&h.host)
+                    && !busy.contains(&h.host)
+                    && self.approved(ri, hi)
                 {
                     self.start_baseline(ri, hi);
                     inflight += 1;
@@ -2618,9 +2648,11 @@ impl Controller {
     /// including while the rollout is paused by a failure.
     fn drive_released(&mut self, ri: usize) -> bool {
         let mut changed = false;
+        let busy = self.busy_elsewhere(ri);
         for hi in 0..self.live[ri].hosts.len() {
             let h = &self.live[ri].hosts[hi];
             if !h.runtime.released
+                || busy.contains(&h.host)
                 || h.state != HostPhase::Planned
                 || self.is_virtual(ri, hi)
                 || !self.may_apply(ri, hi)
@@ -2660,6 +2692,23 @@ impl Controller {
             self.set_host_state(ri, hi, HostPhase::Failed, why);
         }
         self.pause(ri, "gate", format!("{host}: {why}"), Some(host.to_owned()));
+    }
+
+    /// Hosts another live rollout (another rollout's phases, or an open
+    /// stragglers stage) is working on: they are not started here until it
+    /// is done with them.
+    fn busy_elsewhere(&self, ri: usize) -> HashSet<String> {
+        self.live
+            .iter()
+            .enumerate()
+            .filter(|(rj, _)| *rj != ri)
+            .flat_map(|(_, l)| {
+                l.hosts
+                    .iter()
+                    .filter(|h| h.state.in_flight() || h.state == HostPhase::RollingBack)
+                    .map(|h| h.host.clone())
+            })
+            .collect()
     }
 
     fn start_gate(&mut self, ri: usize, p: usize) {

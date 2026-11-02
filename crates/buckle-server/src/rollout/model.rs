@@ -293,6 +293,10 @@ pub struct HostRuntime {
     /// a bake window completes only once it has reported.
     #[serde(default)]
     pub bake_reports: u32,
+    /// The bake requests sent during this bake (reports answering others,
+    /// e.g. another rollout's, are not this bake's).
+    #[serde(default)]
+    pub bake_requests: Vec<String>,
 }
 
 /// One `rollout_hosts` row.

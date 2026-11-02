@@ -2056,3 +2056,91 @@ async fn a_check_failing_late_in_the_bake_is_followed_through_settle(#[case] rec
         );
     }
 }
+
+/// A host the previous rollout's stragglers stage is still applying is not
+/// started by the next rollout's phase until that apply is done.
+#[tokio::test(start_paused = true)]
+async fn a_phase_waits_for_a_host_busy_in_another_rollout() {
+    let mut h = Harness::new().await;
+    let policy = "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true' }\n";
+    h.revision("r1", policy).await;
+    h.revision("r2", policy).await;
+    h.enrol("a", "web").await;
+    h.enrol("late", "web").await;
+    h.connect("a", None);
+    let first = h.start("r1").await;
+    h.wait_state(&first, RolloutState::Completed).await;
+    h.script("late", |s| s.silent_apply = true);
+    h.connect("late", None);
+    h.wait(&first, "late applying in the stragglers stage", |_, hs| {
+        host(hs, "late").state == HostPhase::Applying
+    })
+    .await;
+    let second = h.start("r2").await;
+    h.idle(60).await;
+    assert!(
+        h.applies()
+            .iter()
+            .all(|x| !(x.1 == "late" && x.2.revision == "r2")),
+        "r2 does not apply to a host r1 is applying"
+    );
+    let (_, hosts) = h.snapshot(&second).await;
+    assert_eq!(host(&hosts, "late").state, HostPhase::Planned);
+    // r1's apply finishes; then r2 takes the host.
+    let apply = h.applies().into_iter().find(|x| x.1 == "late").unwrap().2;
+    h.script("late", |s| s.silent_apply = false);
+    h.handle.agent_message(
+        "late",
+        AMsg::Result(ApplyResult {
+            revision: apply.revision.clone(),
+            plan_digest: apply.plan_digest.clone(),
+            succeeded: true,
+            applied_revision: apply.revision,
+            ..Default::default()
+        }),
+    );
+    let (_, hosts) = h.wait_state(&second, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "late").state, HostPhase::Healthy);
+    assert_eq!(host(&hosts, "late").phase, "web");
+}
+
+/// A bake report naming another revision or a request this bake never sent
+/// (e.g. answering another rollout) does not count for the host's bake.
+#[tokio::test(start_paused = true)]
+async fn a_bake_report_for_another_revision_or_request_is_not_this_bake() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  settle: 30s\n  health: { bake: 2m }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "baking", |_, hs| {
+        let a = host(hs, "a");
+        a.state == HostPhase::Baking && a.runtime.bake_reports > 0
+    })
+    .await;
+    let failing = |revision: &str, request: &str| {
+        AMsg::Health(HealthReport {
+            scope: HealthScope::Bake as i32,
+            request_id: request.into(),
+            revision: revision.into(),
+            results: vec![pb::HealthResult {
+                module: "web".into(),
+                check: "http".into(),
+                required: true,
+                passed: false,
+                ..Default::default()
+            }],
+        })
+    };
+    h.handle.agent_message("a", failing("r0", ""));
+    h.handle
+        .agent_message("a", failing("r1", "someone-elses-request"));
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Healthy);
+    assert!(a.runtime.failing_since.is_empty() && a.runtime.flaps.is_empty());
+}
