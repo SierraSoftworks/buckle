@@ -280,6 +280,61 @@ impl HttpResponse {
     }
 }
 
+/// The error `System::remove` returns for a non-empty directory without
+/// `recursive`, identical for every implementation.
+pub fn not_empty(path: &Path) -> crate::Error {
+    crate::error::user(
+        format!("The directory {} is not empty.", path.display()),
+        &["Remove its contents first, or remove it recursively."],
+    )
+}
+
+/// The temp-file name [`RealSystem`]'s `write_atomic` uses next to `path`'s
+/// file name: `.<name>.buckle-tmp-` followed by the writer's pid.
+pub fn temp_prefix_for(file_name: &str) -> String {
+    format!(".{file_name}.buckle-tmp-")
+}
+
+/// Removes files in `dir` named `<prefix><pid>` left by a process that is no
+/// longer running (a crash between writing a temp file and renaming it).
+/// Best effort: errors are ignored.
+pub fn remove_temp_leftovers(dir: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name
+            .strip_prefix(prefix)
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != me && !process_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        match i32::try_from(pid) {
+            Ok(raw) => !matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None),
+                Err(nix::errno::Errno::ESRCH)
+            ),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Without a cheap liveness probe, only our own pid counts as alive.
+        pid == std::process::id()
+    }
+}
+
 /// The host, as tasks see it. Every method is fallible and async; paths are
 /// absolute on the host.
 #[async_trait]

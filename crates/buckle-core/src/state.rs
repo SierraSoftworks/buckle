@@ -170,7 +170,10 @@ pub trait StateStore: Send + Sync {
     fn save(&self, state: &State) -> crate::Result<()>;
 }
 
-/// A single CBOR file, written atomically (temp file + rename).
+/// A single CBOR file, written atomically: a `0600` temp file
+/// (`.<name>.buckle-tmp-<pid>`) in the same directory, fsynced, renamed over
+/// the state file, then the directory fsynced. Leftover temp files of a
+/// process that died mid-write are removed on load.
 #[derive(Debug, Clone)]
 pub struct FileStateStore {
     path: PathBuf,
@@ -184,11 +187,51 @@ impl FileStateStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    fn temp_prefix(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!(".{name}.buckle-tmp-")
+    }
+
+    fn temp_path(&self) -> PathBuf {
+        self.path
+            .with_file_name(format!("{}{}", self.temp_prefix(), std::process::id()))
+    }
+
+    /// Removes temp files a crashed earlier write left next to the state file.
+    fn remove_leftovers(&self) {
+        let Some(dir) = self.path.parent() else {
+            return;
+        };
+        crate::system::remove_temp_leftovers(dir, &self.temp_prefix());
+    }
+}
+
+/// fsyncs a directory so that a rename inside it is durable (no-op where
+/// directories cannot be opened, e.g. Windows).
+pub(crate) fn sync_dir(dir: Option<&Path>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = dir {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 impl StateStore for FileStateStore {
     fn load(&self) -> crate::Result<State> {
         use crate::error::HumanizableResult;
+        self.remove_leftovers();
         match std::fs::read(&self.path) {
             Ok(bytes) => ciborium::from_reader(bytes.as_slice()).map_err(|e| {
                 crate::error::wrap_system(e, format!("The Buckle state file at {} is corrupt.", self.path.display()), &[
@@ -205,7 +248,7 @@ impl StateStore for FileStateStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).to_human_error()?;
         }
-        let tmp = self.path.with_extension("tmp");
+        let tmp = self.temp_path();
         let mut bytes = Vec::new();
         ciborium::into_writer(state, &mut bytes).map_err(|e| {
             crate::error::wrap_system(
@@ -214,15 +257,26 @@ impl StateStore for FileStateStore {
                 &["This is a bug; please report it."],
             )
         })?;
-        std::fs::write(&tmp, &bytes).to_human_error()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .to_human_error()?;
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, &self.path)?;
+            sync_dir(self.path.parent())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, &self.path).to_human_error()?;
-        Ok(())
+        written.to_human_error()
     }
 }
 
@@ -281,9 +335,36 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded.resources.len(), 1);
         assert_eq!(loaded.applied_revision, Some(RevisionId::new("r2")));
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("nested"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["state.cbor"], "temp file is renamed away");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn leftover_temp_files_of_a_crashed_write_are_removed_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(dir.path().join("state.cbor"));
+        store.save(&State::default()).unwrap();
+        let leftover = dir.path().join(".state.cbor.buckle-tmp-999999");
+        std::fs::write(&leftover, b"half a state").unwrap();
+        let unrelated = dir.path().join(".other.buckle-tmp-1");
+        std::fs::write(&unrelated, b"x").unwrap();
+        store.load().unwrap();
+        assert!(!leftover.exists());
         assert!(
-            !dir.path().join("nested/state.tmp").exists(),
-            "temp file is renamed away"
+            unrelated.exists(),
+            "only this store's temp files are touched"
         );
     }
 

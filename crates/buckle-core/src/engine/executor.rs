@@ -84,6 +84,9 @@ struct Executor<'a> {
     facts: Mutex<Facts>,
     /// Modules of this run that have not started yet.
     scheduled: Mutex<HashSet<String>>,
+    /// State saves that failed during the run (reported, never fatal: the
+    /// host was changed either way).
+    save_errors: Mutex<Vec<String>>,
     /// Cross-module handlers waiting for their owner module to finish:
     /// owner → `(owner, handler)` pairs.
     pending_handlers: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -124,6 +127,7 @@ pub(super) async fn apply(
         facts: Mutex::new(facts),
         scheduled: Mutex::new(rich.order.iter().cloned().collect()),
         pending_handlers: Mutex::new(HashMap::new()),
+        save_errors: Mutex::new(Vec::new()),
     };
     let outcome = executor.run(&planner, rich, started, started_at).await?;
     Ok(outcome)
@@ -172,6 +176,18 @@ impl<'a> Executor<'a> {
     fn save_state(&self) -> crate::Result<()> {
         let snapshot = self.with_state(|s| s.clone());
         self.inputs.state.save(&snapshot)
+    }
+
+    /// Saves state now (after every step, so a crash loses at most the step
+    /// in flight); a failure is remembered for the outcome, not fatal.
+    fn checkpoint(&self) {
+        if let Err(e) = self.save_state() {
+            let message = format!("state could not be saved: {}", e.message());
+            let mut errors = self.save_errors.lock().unwrap_or_else(|p| p.into_inner());
+            if errors.last() != Some(&message) {
+                errors.push(message);
+            }
+        }
     }
 
     /// Applies a task (or handler) with the declaration's retry policy.
@@ -299,6 +315,7 @@ impl<'a> Executor<'a> {
                     self.changed_so_far.fetch_add(1, Ordering::Relaxed);
                 }
                 self.record_step(step, rs, Some(&applied), revision);
+                self.checkpoint();
                 self.emit(ApplyEvent::StepFinished {
                     module: module.to_owned(),
                     task_id: step.task.id.clone(),
@@ -528,6 +545,7 @@ impl<'a> Executor<'a> {
                 Planned::NoOp => {
                     span.record("buckle.changed", false);
                     self.record_step(step, rs, None, revision);
+                    self.checkpoint();
                     self.emit(ApplyEvent::StepFinished {
                         module: module.clone(),
                         task_id: step.task.id.clone(),
@@ -837,6 +855,7 @@ impl<'a> Executor<'a> {
                         s.forget(&removal.resource);
                         notes
                     });
+                    self.checkpoint();
                     if changed {
                         for note in notes {
                             let (m, h) =
@@ -1074,9 +1093,7 @@ impl<'a> Executor<'a> {
             results.push(run.outcome);
             let facts = self.facts();
             self.with_state(|s| s.facts = facts);
-            if let Err(e) = self.save_state() {
-                errors.push(format!("state could not be saved: {}", e.message()));
-            }
+            self.checkpoint();
         }
 
         // Module-scoped rollback of whatever failed, after in-flight modules drained.
@@ -1113,9 +1130,7 @@ impl<'a> Executor<'a> {
                     self.scrub(&err.message())
                 )),
             }
-            if let Err(e) = self.save_state() {
-                errors.push(format!("state could not be saved: {}", e.message()));
-            }
+            self.checkpoint();
         }
 
         // Handlers left for modules that never ran (the run halted, or they
@@ -1253,7 +1268,21 @@ impl<'a> Executor<'a> {
                 50,
             );
         });
-        self.save_state()?;
+        self.checkpoint();
+        // A failed save never turns what happened on the host into an error;
+        // it is reported alongside the outcome.
+        let save_errors =
+            std::mem::take(&mut *self.save_errors.lock().unwrap_or_else(|p| p.into_inner()));
+        let error = if save_errors.is_empty() {
+            error
+        } else {
+            let saves = save_errors.join("; ");
+            tracing::error!(error = %saves, "the state file could not be saved");
+            Some(match error {
+                Some(e) => format!("{e}; {saves}"),
+                None => saves,
+            })
+        };
 
         let deferred_names: BTreeSet<&String> = deferred.iter().collect();
         tracing::info!(

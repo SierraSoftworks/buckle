@@ -2606,6 +2606,100 @@ async fn state_persists_across_runs_so_removed_modules_become_orphans() {
     assert_eq!(state.applied_revision, Some(RevisionId::new("r2")));
 }
 
+/// A store that keeps every snapshot it was asked to save, optionally
+/// failing every save.
+#[derive(Default)]
+struct RecordingStore {
+    snapshots: Mutex<Vec<State>>,
+    fail: bool,
+}
+
+impl crate::state::StateStore for RecordingStore {
+    fn load(&self) -> crate::Result<State> {
+        Ok(self
+            .snapshots
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default())
+    }
+    fn save(&self, state: &State) -> crate::Result<()> {
+        if self.fail {
+            return Err(crate::error::system(
+                "the disk is full",
+                &["Free some space."],
+            ));
+        }
+        self.snapshots.lock().unwrap().push(state.clone());
+        Ok(())
+    }
+}
+
+fn three_step_inputs(sys: &FakeSystem, store: Arc<RecordingStore>) -> Inputs {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m
+tasks:
+  - test.file: { path: /sv/1 }
+  - test.file: { path: /sv/2 }
+  - test.file: { path: /sv/3 }
+",
+        )],
+    );
+    Inputs::new(
+        rev,
+        HostIdentity {
+            id: "h1".into(),
+            labels: Labels::new(),
+        },
+        Arc::new(sys.clone()),
+        Arc::new(SecretStore::new()),
+        store,
+    )
+    .with_frozen_facts(default_facts())
+}
+
+#[tokio::test]
+async fn state_is_saved_after_every_step() {
+    let store = Arc::new(RecordingStore::default());
+    let (outcome, _) = apply(&three_step_inputs(&FakeSystem::new(), store.clone())).await;
+    assert!(outcome.succeeded);
+    let counts: Vec<usize> = store
+        .snapshots
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.resources.len())
+        .collect();
+    assert!(counts.starts_with(&[1, 2, 3]), "{counts:?}");
+}
+
+#[tokio::test]
+async fn a_failed_state_save_is_reported_without_failing_the_apply() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(RecordingStore {
+        fail: true,
+        ..Default::default()
+    });
+    let (outcome, _) = apply(&three_step_inputs(&sys, store)).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(outcome.changes, 3);
+    let error = outcome.error.unwrap_or_default();
+    assert!(
+        error.contains("could not be saved") && error.contains("disk is full"),
+        "{error}"
+    );
+    assert_eq!(
+        error.matches("could not be saved").count(),
+        1,
+        "reported once: {error}"
+    );
+    assert!(sys.exists("/sv/3"));
+}
+
 #[tokio::test]
 async fn noop_steps_refresh_their_records_and_keep_their_origin() {
     let sys = FakeSystem::new();
