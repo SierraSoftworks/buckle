@@ -15,8 +15,8 @@ use yew_router::prelude::*;
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, DiffView, Empty, ErrorState, JsonTree, Kind, Loading, PageHead, Panel, Pill,
-    Refresh, RouteLink, TraceLink, use_toast,
+    Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind, Loading, PageHead,
+    Panel, Pill, Refresh, RouteLink, TraceLink, use_toast,
 };
 use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
 use crate::logic::format::{commit, relative, relative_opt, short, short_duration, timestamp};
@@ -356,7 +356,7 @@ fn runs(d: &HostDetail, now: DateTime<Utc>) -> Html {
                             <td class="mono" title={r.plan_digest.clone()}>{ short(&r.plan_digest) }</td>
                             <td>
                                 <Pill tone={outcome_tone(&r.outcome)} label={r.outcome.replace('_', " ")} />
-                                if let Some(e) = &r.error { <span class="cell-sub">{ e.clone() }</span> }
+                                if let Some(e) = &r.error { <ErrorBlock raw={e.clone()} tone={outcome_tone(&r.outcome)} compact=true /> }
                             </td>
                             <td>{ format!("{} · {} removals", r.changes, r.removals) }</td>
                             <td>{ short_duration(r.finished_at.signed_duration_since(r.started_at).num_seconds()) }</td>

@@ -1,0 +1,111 @@
+// Run reports and structured errors: what a host did, module by module and
+// step by step, and why something failed.
+@use 'tokens' as *;
+
+// A structured error: the message as the headline, then its causes and the
+// advice. The tone class on the block (`tone-danger`, `tone-warn`, …) sets
+// `--tone`, so a skip reason is not drawn as a failure.
+.error-block {
+  margin: 0.45rem 0;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--tone, var(--danger)) 30%, var(--line));
+  border-left: 3px solid var(--tone, var(--danger));
+  border-radius: var(--radius-sm);
+  background: var(--tone-soft, var(--danger-soft));
+  font-size: 0.84rem;
+  line-height: 1.45;
+
+  &__context {
+    margin: 0 0 0.2rem;
+    color: var(--fg-2);
+    font-size: 0.76rem;
+    overflow-wrap: anywhere;
+  }
+
+  &__head {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  &__icon {
+    display: inline-flex;
+    padding-top: 0.1rem;
+    color: var(--tone, var(--danger));
+  }
+
+  &__message {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    color: var(--fg);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+
+  &__kind {
+    flex-shrink: 0;
+    padding: 0 0.4rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    color: var(--fg-2);
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    line-height: 1.7;
+    text-transform: uppercase;
+    cursor: help;
+  }
+
+  &--system &__kind {
+    border-color: color-mix(in srgb, var(--warn) 50%, transparent);
+    color: var(--warn);
+  }
+
+  &__section {
+    margin: 0.45rem 0 0 1.5rem;
+  }
+
+  &__label {
+    margin: 0 0 0.1rem;
+    color: var(--fg-2);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  &__causes,
+  &__advice {
+    margin: 0;
+    padding-left: 1.2rem;
+
+    li {
+      margin: 0.1rem 0;
+      overflow-wrap: anywhere;
+    }
+  }
+
+  &__causes li::marker {
+    color: var(--fg-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__raw {
+    margin: 0;
+    color: var(--fg);
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  &--compact {
+    margin: 0.3rem 0 0;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.78rem;
+  }
+
+  &--compact &__raw {
+    font-size: 0.76rem;
+  }
+}

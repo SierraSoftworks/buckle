@@ -14,8 +14,8 @@ use yew::prelude::*;
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, Countdown, Empty, ErrorState, Kind, Loading, PageHead, Panel, Pill, Pipeline,
-    PlanGroupView, Refresh, RouteLink, TraceLink, use_toast,
+    Button, Confirm, Countdown, Empty, ErrorBlock, ErrorState, Kind, Loading, PageHead, Panel,
+    Pill, Pipeline, PlanGroupView, Refresh, RouteLink, TraceLink, use_toast,
 };
 use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
 use crate::logic::format::{count, first_line, relative, short, timestamp};
@@ -23,8 +23,8 @@ use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{GateKind, GateState, layout};
 use crate::logic::plan::{ApprovalScope, approval_scope};
 use crate::logic::tone::{
-    Tone, check_status_tone, host_state_label, host_state_tone, rollout_finished,
-    rollout_state_label, rollout_state_tone,
+    Tone, check_status_tone, host_error_headline, host_error_tone, host_state_label,
+    host_state_tone, rollout_finished, rollout_state_label, rollout_state_tone,
 };
 use crate::store::use_live;
 
@@ -680,7 +680,7 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td><RouteLink to={Route::Host { id: h.host.clone() }} classes="mono strong">{ h.host.clone() }</RouteLink></td>
                                 <td>{ phase.name.clone() }{ h.wave.map(|w| html! { <span class="muted small">{ format!(" · wave {w}") }</span> }).unwrap_or_default() }</td>
                                 <td>
-                                    <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} title={h.error.clone()} />
+                                    <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} title={host_error_headline(h)} />
                                     if h.needs_approval { <span class="badge badge--info">{ "needs approval" }</span> }
                                     if h.needs_attention {
                                         <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>
@@ -779,7 +779,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         .unwrap_or_default();
     html! {
         <div class="host-row">
-            if let Some(e) = &h.error { <p class={classes!("note", (h.state == HostRolloutState::Failed).then_some("note--danger"))}>{ e.clone() }</p> }
+            <ErrorBlock error={h.error_detail.clone()} raw={h.error.clone().map(AttrValue::from)} tone={host_error_tone(h)} />
             { actions.unwrap_or_default() }
             <div class="host-row__cols">
                 <div>

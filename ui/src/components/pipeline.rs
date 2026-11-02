@@ -18,7 +18,8 @@ use crate::app::Route;
 use crate::logic::format::{config_duration, relative, short};
 use crate::logic::pipeline::{Gate, GateKind, GateState, Stage, gate_check_tone, layout};
 use crate::logic::tone::{
-    LEGEND, block_look, host_state_class, host_state_label, phase_state_label, phase_state_tone,
+    LEGEND, Tone, block_look, host_error_headline, host_error_tone, host_state_class,
+    host_state_label, phase_state_label, phase_state_tone,
 };
 
 #[derive(Properties, PartialEq)]
@@ -222,8 +223,15 @@ fn block(entry: &RolloutHost, host: Option<&HostSummary>, now: DateTime<Utc>) ->
     if entry.needs_attention {
         detail.push(html! { <span class="block__error">{ "needs attention: its own rollback failed" }</span> });
     }
-    if let Some(error) = &entry.error {
-        detail.push(html! { <span class="block__error">{ error.clone() }</span> });
+    // The headline only: the full error, causes and advice are in the
+    // host's row and report.
+    if let Some(error) = host_error_headline(entry) {
+        let class = if host_error_tone(entry) == Tone::Danger {
+            "block__error"
+        } else {
+            "block__note"
+        };
+        detail.push(html! { <span class={class}>{ error }</span> });
     }
     detail.push(html! { <span class="muted">{ format!("updated {}", relative(entry.updated_at, now)) }</span> });
 
