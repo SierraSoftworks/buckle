@@ -115,7 +115,16 @@ pub fn endpoint(config: &AgentConfig) -> buckle_core::Result<Endpoint> {
                 ],
             ));
         }
-        "https" if tls.insecure_plaintext => true,
+        "https" if tls.insecure_plaintext => {
+            return Err(buckle_core::error::user(
+                format!(
+                    "The server URL '{server}' asks for TLS but `tls.insecure_plaintext` is set."
+                ),
+                &[
+                    "Remove `insecure_plaintext` to use TLS, or use an http:// URL if the connection really is protected another way (e.g. a tailnet).",
+                ],
+            ));
+        }
         "https" => false,
         other => {
             return Err(buckle_core::error::user(
@@ -124,10 +133,6 @@ pub fn endpoint(config: &AgentConfig) -> buckle_core::Result<Endpoint> {
             ));
         }
     };
-    let mut url = url;
-    if plaintext && url.scheme() == "https" {
-        let _ = url.set_scheme("http");
-    }
     let endpoint = Endpoint::from_shared(url.to_string())
         .map_err(|e| connection_error(e, "use the configured server URL"))?
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -405,7 +410,7 @@ mod tests {
     #[rstest]
     #[case("http://127.0.0.1:7700", true, true)]
     #[case("http://127.0.0.1:7700", false, false)]
-    #[case("https://127.0.0.1:7700", true, true)]
+    #[case::no_silent_downgrade("https://127.0.0.1:7700", true, false)]
     #[case("ftp://127.0.0.1:7700", true, false)]
     #[tokio::test]
     async fn plaintext_must_be_explicit(

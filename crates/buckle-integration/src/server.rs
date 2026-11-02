@@ -39,6 +39,14 @@ pub struct ServerPaths {
     pub secrets: PathBuf,
 }
 
+/// Why a start-up attempt failed.
+enum StartError {
+    /// The listen port was taken between allocation and bind; worth retrying.
+    PortTaken(String),
+    /// Anything else: the test should fail with the server's own error.
+    Fatal(String),
+}
+
 /// A running server.
 pub struct TestServer {
     /// The HTTP API.
@@ -63,9 +71,28 @@ fn quoted(path: &Path) -> String {
 
 impl TestServer {
     /// Starts a server over `paths` and waits for its API to answer.
+    ///
+    /// Ports come from binding `127.0.0.1:0` and releasing the socket, which
+    /// can race another test doing the same; a server that dies at start-up
+    /// because its port was taken is started again on fresh ports.
     pub async fn start(paths: &ServerPaths, settings: &ServerSettings) -> Self {
         crate::init();
         std::fs::create_dir_all(&paths.secrets).expect("create the secrets root");
+        let mut last_error = String::new();
+        for attempt in 1..=5 {
+            match Self::try_start(paths, settings).await {
+                Ok(server) => return server,
+                Err(StartError::PortTaken(e)) => {
+                    last_error = e;
+                    tracing::warn!(attempt, error = %last_error, "server start-up lost its port; retrying on fresh ports");
+                }
+                Err(StartError::Fatal(e)) => panic!("the server exited during start-up: {e}"),
+            }
+        }
+        panic!("the server could not bind its ports after 5 attempts: {last_error}");
+    }
+
+    async fn try_start(paths: &ServerPaths, settings: &ServerSettings) -> Result<Self, StartError> {
         let (grpc, http) = (free_port(), free_port());
         let yaml = format!(
             "listen: {{ grpc: \"{grpc}\", http: \"{http}\", tls: {{ mode: auto }} }}\n\
@@ -85,12 +112,11 @@ impl TestServer {
             .expect("the certificate loads")
             .expect("auto TLS has a fingerprint");
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(buckle_server::run(config, shutdown.clone()));
+        let mut task = tokio::spawn(buckle_server::run(config, shutdown.clone()));
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(0)
             .build()
             .expect("an HTTP client");
-        let mut up = false;
         for _ in 0..200 {
             if let Ok(r) = client
                 .get(format!("http://{http}/api/v1/fleet"))
@@ -98,20 +124,36 @@ impl TestServer {
                 .await
                 && r.status().is_success()
             {
-                up = true;
-                break;
+                return Ok(Self {
+                    http,
+                    grpc,
+                    fingerprint: format!("sha256:{fingerprint}"),
+                    shutdown,
+                    task,
+                });
             }
-            assert!(!task.is_finished(), "the server exited during start-up");
+            if task.is_finished() {
+                let outcome = match (&mut task).await {
+                    Ok(Ok(code)) => format!("run returned exit code {code}"),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(e) => format!("the server task panicked: {e}"),
+                };
+                let lower = outcome.to_ascii_lowercase();
+                return Err(
+                    if lower.contains("address") && lower.contains("use") || lower.contains("bind")
+                    {
+                        StartError::PortTaken(outcome)
+                    } else {
+                        StartError::Fatal(outcome)
+                    },
+                );
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(up, "the server's API did not come up");
-        Self {
-            http,
-            grpc,
-            fingerprint: format!("sha256:{fingerprint}"),
-            shutdown,
-            task,
-        }
+        shutdown.cancel();
+        Err(StartError::Fatal(
+            "the server's API did not come up within 5s".into(),
+        ))
     }
 
     /// Requests shutdown and waits for `run` to return its exit code.

@@ -140,14 +140,19 @@ pub enum Call {
 
 type HealthFn = Box<dyn Fn(&RevisionId, HealthScope) -> HealthReport + Send + Sync>;
 type OutcomeFn = Box<dyn Fn(&Plan) -> ApplyOutcome + Send + Sync>;
+type ApplyErrorFn = Box<dyn Fn(&Plan) -> Option<buckle_core::Error> + Send + Sync>;
 
 /// A scripted runner that records every call.
 pub struct FakeRunner {
     plans: Mutex<HashMap<RevisionId, VecDeque<Plan>>>,
     outcome: Mutex<OutcomeFn>,
+    apply_error: Mutex<Option<ApplyErrorFn>>,
     health: Mutex<HealthFn>,
     events_per_apply: Mutex<Vec<ApplyEvent>>,
     facts: Mutex<Facts>,
+    plan_facts: Mutex<Option<Facts>>,
+    applied_secrets: Mutex<Vec<(RevisionId, Vec<String>)>>,
+    drift_flags: Mutex<Vec<(&'static str, RevisionId, bool)>>,
     calls: Mutex<Vec<Call>>,
     changed: Notify,
 }
@@ -157,9 +162,13 @@ impl Default for FakeRunner {
         Self {
             plans: Mutex::new(HashMap::new()),
             outcome: Mutex::new(Box::new(succeeded)),
+            apply_error: Mutex::new(None),
             health: Mutex::new(Box::new(|_, scope| health(scope, true))),
             events_per_apply: Mutex::new(Vec::new()),
             facts: Mutex::new(Facts::new()),
+            plan_facts: Mutex::new(None),
+            applied_secrets: Mutex::new(Vec::new()),
+            drift_flags: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             changed: Notify::new(),
         }
@@ -188,6 +197,16 @@ impl FakeRunner {
         self
     }
 
+    /// Makes `apply` fail with the error `f` returns (when it returns one),
+    /// after recording the call.
+    pub fn with_apply_error(
+        &self,
+        f: impl Fn(&Plan) -> Option<buckle_core::Error> + Send + Sync + 'static,
+    ) -> &Self {
+        *lock(&self.apply_error) = Some(Box::new(f));
+        self
+    }
+
     /// Computes health reports with `f`.
     pub fn with_health(
         &self,
@@ -209,9 +228,26 @@ impl FakeRunner {
         self
     }
 
+    /// Returns these facts from `plan`, as the engine does when a provider's
+    /// TTL expired during planning (otherwise `plan` hands back the context's).
+    pub fn with_plan_facts(&self, facts: Facts) -> &Self {
+        *lock(&self.plan_facts) = Some(facts);
+        self
+    }
+
     /// Every call so far.
     pub fn calls(&self) -> Vec<Call> {
         lock(&self.calls).clone()
+    }
+
+    /// Whether each plan and apply ran in drift mode: (`plan`|`apply`, revision, drift).
+    pub fn drift_flags(&self) -> Vec<(&'static str, RevisionId, bool)> {
+        lock(&self.drift_flags).clone()
+    }
+
+    /// The names of the secrets each apply was given, in order.
+    pub fn applied_secrets(&self) -> Vec<(RevisionId, Vec<String>)> {
+        lock(&self.applied_secrets).clone()
     }
 
     /// The applies so far.
@@ -271,7 +307,11 @@ impl Runner for FakeRunner {
             waived_checks: ctx.waived_checks.clone(),
             force: ctx.force,
         });
-        Ok((self.plan_for(&revision.id), ctx.facts.clone()))
+        lock(&self.drift_flags).push(("plan", revision.id.clone(), ctx.drift));
+        let facts = lock(&self.plan_facts)
+            .clone()
+            .unwrap_or_else(|| ctx.facts.clone());
+        Ok((self.plan_for(&revision.id), facts))
     }
 
     async fn apply(
@@ -287,6 +327,17 @@ impl Runner for FakeRunner {
             waived_checks: ctx.waived_checks.clone(),
             force: ctx.force,
         });
+        lock(&self.drift_flags).push(("apply", revision.id.clone(), ctx.drift));
+        {
+            let mut names: Vec<String> = ctx.secrets.iter().map(|s| s.name().to_owned()).collect();
+            names.sort();
+            lock(&self.applied_secrets).push((revision.id.clone(), names));
+        }
+        if let Some(f) = lock(&self.apply_error).as_ref()
+            && let Some(err) = f(plan)
+        {
+            return Err(err);
+        }
         let scripted = lock(&self.events_per_apply).clone();
         for event in scripted {
             let _ = events.send(event).await;

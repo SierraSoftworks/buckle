@@ -14,6 +14,22 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// The platform a host's facts describe (`os.family`, then `os.id`), for dry
+    /// runs over facts fixtures: a Debian fixture must plan as Linux even when the
+    /// validator runs on macOS or Windows. `None` when the facts do not say.
+    pub fn from_facts(facts: &crate::facts::Facts) -> Option<Self> {
+        ["/os/family", "/os/id", "/os/kernel"]
+            .iter()
+            .filter_map(|p| facts.tree.pointer(p).and_then(|v| v.as_str()))
+            .find_map(|value| match value.to_ascii_lowercase().as_str() {
+                "darwin" | "macos" | "mac" => Some(Platform::MacOs),
+                "windows" | "windows_nt" | "win32" => Some(Platform::Windows),
+                "linux" | "debian" | "ubuntu" | "rhel" | "fedora" | "centos" | "suse" | "arch"
+                | "alpine" | "nixos" | "raspbian" | "gentoo" => Some(Platform::Linux),
+                _ => None,
+            })
+    }
+
     /// The platform of the running binary.
     pub const fn current() -> Self {
         if cfg!(target_os = "windows") {
@@ -93,5 +109,26 @@ mod tests {
     #[test]
     fn union_combines() {
         assert_eq!(Platforms::LINUX.union(Platforms::WINDOWS).iter().count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(serde_json::json!({"os": {"family": "debian", "id": "debian"}}), Some(Platform::Linux))]
+    #[case(serde_json::json!({"os": {"family": "Darwin"}}), Some(Platform::MacOs))]
+    #[case(serde_json::json!({"os": {"id": "windows"}}), Some(Platform::Windows))]
+    #[case(serde_json::json!({"os": {"family": "plan9"}}), None)]
+    #[case(serde_json::json!({}), None)]
+    fn platform_from_facts(#[case] tree: serde_json::Value, #[case] expected: Option<Platform>) {
+        let facts = crate::facts::Facts {
+            tree,
+            collected_at: Default::default(),
+            stale: Default::default(),
+        };
+        assert_eq!(Platform::from_facts(&facts), expected);
     }
 }

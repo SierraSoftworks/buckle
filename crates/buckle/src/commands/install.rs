@@ -88,24 +88,22 @@ pub async fn run(args: InstallArgs) -> buckle_core::Result<i32> {
                 drift: Default::default(),
                 vars: Default::default(),
                 telemetry: Default::default(),
+                local_secret_exec: Vec::new(),
             };
             config.validate()?;
             let options = buckle_agent::InstallOptions {
                 no_service: a.no_service,
                 exe: None,
             };
-            buckle_agent::install(&config, &a.config, &options).await?;
-            if a.no_service {
-                println!(
-                    "Wrote {}; start the agent with `buckle agent --config {}`.",
+            match buckle_agent::install(&config, &a.config, &options).await? {
+                buckle_agent::InstallOutcome::FilesOnly { start_command } => println!(
+                    "Wrote {}; start the agent with `{start_command}` (no service was installed).",
                     a.config.display(),
-                    a.config.display()
-                );
-            } else {
-                println!(
+                ),
+                buckle_agent::InstallOutcome::Service => println!(
                     "Installed and started the {} service.",
                     buckle_agent::install::SERVICE_NAME
-                );
+                ),
             }
             Ok(0)
         }

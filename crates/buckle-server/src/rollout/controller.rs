@@ -37,12 +37,23 @@ use tracing::Span;
 pub struct ControllerOptions {
     /// How long an in-flight host may stay disconnected before it fails.
     pub disconnect_timeout: Duration,
+    /// How long a host may stay applying without a result before it fails.
+    pub apply_timeout: Duration,
 }
+
+/// How often an Apply is re-sent to a host that reconnects without having
+/// run it before the host is failed instead.
+const MAX_APPLY_RESENDS: u32 = 3;
+
+/// The task selector of every RequestPlan (rollouts plan whole revisions),
+/// echoed in the Apply so the agent re-plans exactly what was approved.
+const PLAN_SELECT: &str = "";
 
 impl Default for ControllerOptions {
     fn default() -> Self {
         Self {
             disconnect_timeout: Duration::from_secs(600),
+            apply_timeout: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -66,6 +77,13 @@ pub struct Connected {
     pub host: String,
     pub applied_revision: Option<String>,
     pub last_plan_digest: Option<String>,
+    /// Revisions whose Apply is running on the agent, or ran with a result
+    /// the server has not acknowledged yet (it follows the Welcome).
+    pub unreported_apply_revisions: Vec<String>,
+    /// A new session (Hello). `false` when the controller re-evaluates an
+    /// already connected host (e.g. it was resumed): its Hello facts are
+    /// stale, so nothing is re-sent on their account.
+    pub new_session: bool,
 }
 
 /// Operator actions (design §10 "Paused offers four operator decisions").
@@ -516,6 +534,39 @@ impl Controller {
         self.connected(host) && !self.excluded.contains(host)
     }
 
+    /// Whether host `hi` may be sent an Apply (or a baseline check leading
+    /// to one) now: the rollout is running (not paused, rolling back or
+    /// finished), or the host is in the open stragglers stage, and the host
+    /// is connected and not excluded.
+    fn may_apply(&self, ri: usize, hi: usize) -> bool {
+        let record = &self.live[ri].record;
+        let open = if self.is_virtual(ri, hi) {
+            record.runtime.stragglers_open
+        } else {
+            record.is_running()
+        };
+        open && self.eligible(&self.live[ri].hosts[hi].host)
+    }
+
+    /// Returns a host whose baseline check or apply cannot go ahead (the
+    /// rollout stopped running) to planned, so it starts again from its
+    /// baseline when the rollout resumes.
+    fn defer_host(&mut self, ri: usize, hi: usize, why: &str) {
+        if let Some(pi) = self.live[ri].hosts[hi].runtime.phase_index
+            && let Some(p) = self.live[ri].record.runtime.phases.get_mut(pi)
+        {
+            p.started = p.started.saturating_sub(1);
+            self.live[ri].dirty = true;
+        }
+        {
+            let h = &mut self.live[ri].hosts[hi];
+            h.runtime.request_id = None;
+            h.runtime.applied = false;
+            h.runtime.apply_started_at = None;
+        }
+        self.set_host_state(ri, hi, HostPhase::Planned, why);
+    }
+
     // ------------------------------------------------------------ bookkeeping
 
     fn audit(
@@ -697,14 +748,42 @@ impl Controller {
             }
             match state {
                 HostPhase::PlanPending => self.request_plan(ri, hi),
-                HostPhase::Baseline => self.send_baseline(ri, hi),
+                HostPhase::Baseline if self.may_apply(ri, hi) => self.send_baseline(ri, hi),
+                HostPhase::Baseline => {
+                    self.defer_host(ri, hi, "reconnected while the rollout is not running")
+                }
                 HostPhase::Applying => {
-                    // An approved Apply keeps running on the agent after its
-                    // session drops and its result is delivered on
-                    // reconnect, so it is never re-sent; a host already on
-                    // the target revision has evidently finished.
+                    // The agent skips an Apply whose session ended before it
+                    // started, so the server re-sends it (same plan digest,
+                    // same approval token) unless the host already shows the
+                    // target revision (it finished: bake) or announces the
+                    // apply as running or its result as still to come.
                     if c.applied_revision.as_deref() == Some(target.as_str()) {
                         self.start_bake(ri, hi);
+                    } else if !c.new_session || c.unreported_apply_revisions.contains(&target) {
+                        tracing::debug!(host = %c.host, "the apply is running or its result is on its way");
+                    } else if let Some(run) = self.finished_run(ri, hi).await {
+                        // The result was stored but never reached the
+                        // controller (e.g. a server restart in between).
+                        let why = run
+                            .error
+                            .unwrap_or_else(|| format!("apply {}", run.outcome));
+                        self.fail_host(ri, hi, &why);
+                    } else if !self.may_apply(ri, hi) {
+                        // Never ran, and the rollout no longer starts work.
+                        self.defer_host(
+                            ri,
+                            hi,
+                            "the apply never ran and the rollout is not running",
+                        );
+                    } else if self.live[ri].hosts[hi].runtime.apply_resends >= MAX_APPLY_RESENDS {
+                        let why = format!(
+                            "the agent reconnected {} times without running the approved apply",
+                            MAX_APPLY_RESENDS
+                        );
+                        self.fail_host(ri, hi, &why);
+                    } else {
+                        self.resend_apply(ri, hi);
                     }
                 }
                 HostPhase::Baking => {
@@ -805,7 +884,14 @@ impl Controller {
                 h.runtime.plan_changes = Some(plan.changes);
                 h.runtime.plan_removals = Some(plan.removals);
                 h.runtime.destructive = plan.destructive;
-                h.runtime.error = None;
+                // A valid plan with modules that could not be planned: shown
+                // on the host; applying it fails those modules only.
+                h.runtime.error = (!plan.module_errors.is_empty()).then(|| {
+                    format!(
+                        "modules that could not be planned: {}",
+                        plan.module_errors.join("; ")
+                    )
+                });
             }
             self.touch_host(ri, hi);
             self.set_host_state(ri, hi, HostPhase::Planned, "plan received");
@@ -832,10 +918,18 @@ impl Controller {
                             h.runtime.failed_module = (!result.failed_module.is_empty())
                                 .then(|| result.failed_module.clone());
                             h.runtime.failed_checks = result.failed_checks.clone();
-                            h.runtime.error = Some(if result.error.is_empty() {
-                                "apply failed".into()
+                            let detail = if result.error.is_empty() {
+                                "apply failed".to_owned()
                             } else {
                                 result.error.clone()
+                            };
+                            // Blocked steps: failed for the rollout, but
+                            // nothing was rolled back; an operator must look.
+                            h.runtime.needs_attention = result.needs_attention;
+                            h.runtime.error = Some(if result.needs_attention {
+                                format!("needs attention: steps stayed blocked: {detail}")
+                            } else {
+                                detail
                             });
                         }
                         let why = self.live[ri].hosts[hi]
@@ -991,21 +1085,48 @@ impl Controller {
             {
                 continue;
             }
-            let why = format!(
-                "rolled itself back from {} to {}: {}",
-                short(&lr.from_revision),
-                short(&lr.to_revision),
-                lr.reason
-            );
+            let what = if lr.modules.is_empty() {
+                format!(
+                    "rolled itself back from {} to {}",
+                    short(&lr.from_revision),
+                    short(&lr.to_revision)
+                )
+            } else {
+                format!(
+                    "rolled module(s) {} back to {}",
+                    lr.modules.join(", "),
+                    short(&lr.to_revision)
+                )
+            };
+            // Design §10: a rollback that itself fails leaves the host in
+            // needs attention with both results recorded.
+            let why = if lr.succeeded {
+                format!("{what}: {}", lr.reason)
+            } else {
+                format!(
+                    "needs attention: {what}: {}; the rollback itself failed: {}",
+                    lr.reason,
+                    if lr.rollback_error.is_empty() {
+                        "no detail"
+                    } else {
+                        lr.rollback_error.as_str()
+                    }
+                )
+            };
             {
                 let h = &mut self.live[ri].hosts[hi];
                 h.runtime.error = Some(why.clone());
+                h.runtime.needs_attention = !lr.succeeded;
+                if !lr.modules.is_empty() {
+                    h.runtime.failed_module = lr.modules.first().cloned();
+                }
                 h.runtime.failed_checks = lr
                     .evidence
                     .iter()
                     .filter(|r| !r.passed)
                     .map(check_name)
                     .collect();
+                h.result = serde_json::to_value(RollbackView::from(&lr)).ok();
             }
             self.set_host_state(ri, hi, HostPhase::Failed, &why);
             let is_virtual = self.is_virtual(ri, hi);
@@ -1063,6 +1184,11 @@ impl Controller {
                 self.excluded.insert(host.to_owned());
             }
         }
+        if let Some(r) = &record
+            && self.connected(host)
+        {
+            self.push_host_update(r).await;
+        }
         if let Some(r) = record
             && r.status == HostStatus::Active
             && self.connected(host)
@@ -1071,9 +1197,48 @@ impl Controller {
                 host: host.to_owned(),
                 applied_revision: r.applied_revision.clone(),
                 last_plan_digest: r.last_plan_digest.clone(),
+                ..Default::default()
             })
             .await;
         }
+    }
+
+    /// Tells a connected agent what changed about its host record (status,
+    /// effective labels and, when active, the stable revision's secrets), as
+    /// Welcome would on the next session (design §08 "Registration").
+    async fn push_host_update(&self, record: &crate::store::HostRecord) {
+        let mut update = pb::HostUpdate {
+            status: crate::store::hosts_status_str(record.status).to_owned(),
+            labels: record.effective_labels().into_iter().collect(),
+            ..Default::default()
+        };
+        if let Some(stable) = self.stable.clone() {
+            update.stable_revision = stable.clone();
+            let id = stable.clone();
+            update.stable_tree_digest = self
+                .store
+                .call(move |db| Ok(db.revisions().get(&id)?.and_then(|r| r.tarball_digest)))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if record.status == HostStatus::Active
+                && let Ok(rev) = self.revisions.load(&stable).await
+            {
+                let h = record.id.clone();
+                let facts = self
+                    .store
+                    .call(move |db| Ok(db.hosts().latest_facts(&h)?.map(|(f, _)| f)))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(serde_json::Value::Null);
+                let ctx = crate::fleet::record_context(record, &facts, &rev.fleet);
+                update.secrets = Some(self.secrets.for_host(&rev, &ctx).await);
+            }
+        }
+        self.link
+            .send(&record.id, msg(server_message::Msg::HostUpdate(update)));
     }
 
     // ------------------------------------------------------------ commands
@@ -1336,6 +1501,12 @@ impl Controller {
                     return Err(CommandError::conflict(
                         format!("Host '{host}' is not connected."),
                         &["Wait for the agent to reconnect, then force it again."],
+                    ));
+                }
+                if !self.may_apply(ri, hi) {
+                    return Err(CommandError::conflict(
+                        format!("Rollout '{rollout}' is not running, so nothing is applied."),
+                        &["Resume the rollout first, then force the host."],
                     ));
                 }
                 self.command_audit(
@@ -1659,6 +1830,7 @@ impl Controller {
             h.runtime.failed_checks.clear();
             h.runtime.failed_module = None;
             h.runtime.error = None;
+            h.runtime.needs_attention = false;
             h.runtime.failing_since.clear();
             h.runtime.request_id = None;
             h.runtime.bake_until = None;
@@ -1773,17 +1945,16 @@ impl Controller {
         );
     }
 
-    fn send_apply(&mut self, ri: usize, hi: usize) {
-        let now = self.now();
+    /// The Apply for host `hi`: its approved plan digest and the approval
+    /// token over (rollout, phase, digest), identical every time it is built.
+    fn build_apply(&mut self, ri: usize, hi: usize) -> Apply {
         let span = self.host_span(ri, hi);
-        let live = &mut self.live[ri];
-        let h = &mut live.hosts[hi];
-        h.runtime.applied = true;
-        h.runtime.apply_started_at = Some(now);
+        let live = &self.live[ri];
+        let h = &live.hosts[hi];
         let digest = h.plan_digest.clone().unwrap_or_default();
         let phase = h.phase.clone();
         let rollout = live.record.id.clone();
-        let apply = Apply {
+        Apply {
             revision: h.runtime.revision.clone(),
             plan_digest: digest.clone(),
             approval_token: approval_token(&self.key, &rollout, &phase, &digest),
@@ -1792,7 +1963,56 @@ impl Controller {
             phase,
             force: h.runtime.force,
             traceparent: traceparent_of(&span).unwrap_or_default(),
-        };
+            select: PLAN_SELECT.to_owned(),
+        }
+    }
+
+    /// A finished, stored run of host `hi`'s approved plan since its Apply was
+    /// sent, when one exists (the agent acknowledged its result).
+    async fn finished_run(&self, ri: usize, hi: usize) -> Option<crate::store::RunRecord> {
+        let h = &self.live[ri].hosts[hi];
+        let (host, digest, revision) = (
+            h.host.clone(),
+            h.plan_digest.clone()?,
+            h.runtime.revision.clone(),
+        );
+        let since = h.runtime.apply_started_at?;
+        let runs = self
+            .store
+            .call(move |db| db.runs().for_host(&host, 20))
+            .await
+            .ok()?;
+        runs.into_iter()
+            .find(|r| r.plan_digest == digest && r.revision == revision && r.finished_at >= since)
+    }
+
+    /// Re-sends the Apply of a host that reconnected without having run it.
+    fn resend_apply(&mut self, ri: usize, hi: usize) {
+        let now = self.now();
+        let apply = self.build_apply(ri, hi);
+        let host = self.live[ri].hosts[hi].host.clone();
+        self.live[ri].hosts[hi].runtime.apply_started_at = Some(now);
+        self.live[ri].hosts[hi].runtime.apply_resends += 1;
+        self.touch_host(ri, hi);
+        tracing::info!(host = %host, digest = %short(&apply.plan_digest), "re-sending the apply after a reconnect");
+        self.send(&host, server_message::Msg::Apply(apply));
+    }
+
+    fn send_apply(&mut self, ri: usize, hi: usize) {
+        if !self.may_apply(ri, hi) {
+            self.defer_host(
+                ri,
+                hi,
+                "the rollout is not running; the apply waits for it to resume",
+            );
+            return;
+        }
+        let now = self.now();
+        let apply = self.build_apply(ri, hi);
+        let h = &mut self.live[ri].hosts[hi];
+        h.runtime.applied = true;
+        h.runtime.apply_started_at = Some(now);
+        h.runtime.apply_resends = 0;
         let host = h.host.clone();
         self.set_host_state(ri, hi, HostPhase::Applying, "apply sent");
         self.touch_host(ri, hi);
@@ -1906,6 +2126,8 @@ impl Controller {
             |l: &Live| chrono::Duration::from_std(l.record.policy.settle).unwrap_or_default();
         let timeout =
             chrono::Duration::from_std(self.options.disconnect_timeout).unwrap_or_default();
+        let apply_timeout =
+            chrono::Duration::from_std(self.options.apply_timeout).unwrap_or_default();
         let mut next: Option<DateTime<Utc>> = None;
         let mut consider = |t: DateTime<Utc>| {
             next = Some(next.map_or(t, |n| n.min(t)));
@@ -1923,6 +2145,11 @@ impl Controller {
                 if let Some(d) = h.runtime.disconnected_at {
                     consider(d + timeout);
                 }
+                if h.state == HostPhase::Applying
+                    && let Some(started) = h.runtime.apply_started_at
+                {
+                    consider(started + apply_timeout);
+                }
             }
         }
         next
@@ -1932,6 +2159,8 @@ impl Controller {
         let now = self.now();
         let timeout =
             chrono::Duration::from_std(self.options.disconnect_timeout).unwrap_or_default();
+        let apply_timeout =
+            chrono::Duration::from_std(self.options.apply_timeout).unwrap_or_default();
         for ri in 0..self.live.len() {
             if self.live[ri].record.is_terminal() && !self.live[ri].record.runtime.stragglers_open {
                 continue;
@@ -1964,6 +2193,18 @@ impl Controller {
                         self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
                         continue;
                     }
+                }
+                let h = &self.live[ri].hosts[hi];
+                if h.state == HostPhase::Applying
+                    && h.runtime
+                        .apply_started_at
+                        .is_some_and(|started| started + apply_timeout <= now)
+                {
+                    let mins = self.options.apply_timeout.as_secs() / 60;
+                    let why = format!("no apply result within {mins}m");
+                    self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                    self.fail_host(ri, hi, &why);
+                    continue;
                 }
                 let h = &self.live[ri].hosts[hi];
                 if let Some(d) = h.runtime.disconnected_at
@@ -2669,29 +2910,44 @@ impl Controller {
             }
         }
         let outbox = std::mem::take(&mut self.outbox);
+        let mut undeliverable: BTreeSet<String> = BTreeSet::new();
         for out in outbox {
             match out {
                 Out::Msg(host, m) => {
-                    self.link.send(&host, m);
+                    if !self.link.send(&host, m) {
+                        undeliverable.insert(host);
+                    }
                 }
                 Out::AssignAndPlan {
                     host,
                     revision,
                     stable,
-                } => self.assign_and_plan(&host, &revision, stable).await,
+                } => {
+                    if !self.assign_and_plan(&host, &revision, stable).await {
+                        undeliverable.insert(host);
+                    }
+                }
             }
+        }
+        // A message that could not be delivered means the session is gone:
+        // treat it as a disconnect so the disconnect timeout runs and the
+        // reconnect re-issues what was lost.
+        for host in undeliverable {
+            tracing::debug!(host = %host, "a message could not be delivered; treating the host as disconnected");
+            self.on_disconnected(&host);
         }
         // Forget finished rollouts (they stay in the store).
         self.live
             .retain(|l| !l.record.is_terminal() || l.record.runtime.stragglers_open);
     }
 
-    async fn assign_and_plan(&mut self, host: &str, revision: &str, stable: bool) {
+    /// Sends Assign and RequestPlan; `false` when the host has no session.
+    async fn assign_and_plan(&mut self, host: &str, revision: &str, stable: bool) -> bool {
         let rev = match self.revisions.load(revision).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(revision = %revision, error = %e, "the revision to assign could not be loaded");
-                return;
+                return true;
             }
         };
         let h = host.to_owned();
@@ -2706,11 +2962,11 @@ impl Controller {
             })
             .await;
         let Ok((Some(record), facts, tree_digest)) = found else {
-            return;
+            return true;
         };
         let ctx = crate::fleet::record_context(&record, &facts, &rev.fleet);
         let secrets = self.secrets.for_host(&rev, &ctx).await;
-        self.link.send(
+        let assigned = self.link.send(
             host,
             msg(server_message::Msg::Assign(Assign {
                 revision: revision.to_owned(),
@@ -2719,13 +2975,14 @@ impl Controller {
                 tree_digest: tree_digest.unwrap_or_default(),
             })),
         );
-        self.link.send(
+        let planned = self.link.send(
             host,
             msg(server_message::Msg::Plan(RequestPlan {
                 revision: revision.to_owned(),
-                select: String::new(),
+                select: PLAN_SELECT.to_owned(),
             })),
         );
+        assigned && planned
     }
 }
 
@@ -2769,6 +3026,53 @@ impl From<&ApplyResult> for ResultView {
     }
 }
 
+/// What is stored as the host row's `result` after a rollback the host ran
+/// on its own: the failure that triggered it and the rollback's own result.
+#[derive(serde::Serialize)]
+struct RollbackView {
+    kind: &'static str,
+    from_revision: String,
+    to_revision: String,
+    modules: Vec<String>,
+    reason: String,
+    evidence: Vec<serde_json::Value>,
+    succeeded: bool,
+    rollback_error: String,
+    rollback_outcome: Option<serde_json::Value>,
+}
+
+impl From<&LocalRollback> for RollbackView {
+    fn from(r: &LocalRollback) -> Self {
+        Self {
+            kind: if r.modules.is_empty() {
+                "local_rollback"
+            } else {
+                "module_rollback"
+            },
+            from_revision: r.from_revision.clone(),
+            to_revision: r.to_revision.clone(),
+            modules: r.modules.clone(),
+            reason: r.reason.clone(),
+            evidence: r.evidence.iter().map(health_result_json).collect(),
+            succeeded: r.succeeded,
+            rollback_error: r.rollback_error.clone(),
+            rollback_outcome: serde_json::from_slice(&r.rollback_outcome_json).ok(),
+        }
+    }
+}
+
+fn health_result_json(x: &pb::HealthResult) -> serde_json::Value {
+    serde_json::json!({
+        "module": x.module,
+        "check": x.check,
+        "kind": x.kind,
+        "required": x.required,
+        "passed": x.passed,
+        "unknown": x.unknown,
+        "reason": x.reason,
+    })
+}
+
 /// What is stored as the host row's `health`.
 #[derive(serde::Serialize)]
 struct HealthView {
@@ -2780,21 +3084,7 @@ impl From<&HealthReport> for HealthView {
     fn from(r: &HealthReport) -> Self {
         Self {
             scope: r.scope,
-            results: r
-                .results
-                .iter()
-                .map(|x| {
-                    serde_json::json!({
-                        "module": x.module,
-                        "check": x.check,
-                        "kind": x.kind,
-                        "required": x.required,
-                        "passed": x.passed,
-                        "unknown": x.unknown,
-                        "reason": x.reason,
-                    })
-                })
-                .collect(),
+            results: r.results.iter().map(health_result_json).collect(),
         }
     }
 }

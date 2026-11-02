@@ -1341,8 +1341,8 @@ fn fake_agent(e: &Env, host: &str, digest: &str) {
     });
     e.state.controller.connected(crate::rollout::Connected {
         host: host.to_owned(),
-        applied_revision: None,
-        last_plan_digest: None,
+        new_session: true,
+        ..Default::default()
     });
 }
 

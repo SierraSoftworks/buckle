@@ -629,3 +629,75 @@ async fn revisions_stream_in_chunks_with_total_and_digest() {
         .unwrap_err();
     assert_eq!(anonymous.code(), tonic::Code::Unauthenticated);
 }
+
+/// The next Ack on `stream`, skipping other messages.
+async fn next_ack(stream: &mut tonic::Streaming<ServerMessage>) -> Vec<u64> {
+    loop {
+        let m = tokio::time::timeout(std::time::Duration::from_secs(10), stream.message())
+            .await
+            .expect("an ack in time")
+            .unwrap()
+            .expect("the stream is open");
+        if let Some(server_message::Msg::Ack(a)) = m.msg {
+            return a.report_ids;
+        }
+    }
+}
+
+#[tokio::test]
+async fn durable_reports_are_acknowledged_and_stored_once() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    let result = AgentMessage {
+        msg: Some(agent_message::Msg::Result(buckle_proto::v1::ApplyResult {
+            revision: "r1".into(),
+            plan_digest: "d1".into(),
+            succeeded: true,
+            applied_revision: "r1".into(),
+            report_id: 42,
+            ..Default::default()
+        })),
+    };
+    tx.send(result.clone()).await.unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![42]);
+    // A re-send (after a reconnect) is acknowledged again but stored once.
+    tx.send(result).await.unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![42]);
+    let runs = s
+        .store
+        .call(|db| db.runs().for_host("pi-1", 10))
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+
+    let rollback = AgentMessage {
+        msg: Some(agent_message::Msg::Rollback(
+            buckle_proto::v1::LocalRollback {
+                from_revision: "r1".into(),
+                to_revision: "r0".into(),
+                reason: "cut off".into(),
+                succeeded: false,
+                rollback_error: "apt is locked".into(),
+                report_id: 43,
+                ..Default::default()
+            },
+        )),
+    };
+    tx.send(rollback.clone()).await.unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![43]);
+    tx.send(rollback).await.unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![43]);
+    let audits = s
+        .store
+        .call(|db| db.audit().for_subject("pi-1", 100))
+        .await
+        .unwrap();
+    let rollbacks: Vec<_> = audits
+        .iter()
+        .filter(|a| a.action == "host.local_rollback")
+        .collect();
+    assert_eq!(rollbacks.len(), 1, "one audit row per report");
+    assert!(rollbacks[0].message.contains("apt is locked"));
+    assert!(rollbacks[0].message.contains("needs attention"));
+}

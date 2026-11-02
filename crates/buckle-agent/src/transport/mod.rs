@@ -41,6 +41,9 @@ pub struct Hello {
     pub arch: String,
     /// Whether `token` is the bootstrap token (first contact).
     pub bootstrap: bool,
+    /// Revisions whose apply is running, or whose result is not yet
+    /// acknowledged (it follows the Welcome).
+    pub unreported_apply_revisions: Vec<RevisionId>,
 }
 
 impl std::fmt::Debug for Hello {
@@ -55,13 +58,18 @@ impl std::fmt::Debug for Hello {
             .field("platform", &self.platform)
             .field("arch", &self.arch)
             .field("bootstrap", &self.bootstrap)
+            .field(
+                "unreported_apply_revisions",
+                &self.unreported_apply_revisions,
+            )
             .finish()
     }
 }
 
 /// A secret value as delivered by the server, before it is sealed into a
-/// [`buckle_core::secrets::Secret`]. Its `Debug` never shows the value.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// [`buckle_core::secrets::Secret`]. Its `Debug` never shows the value, it
+/// is not serialisable, and its buffer is zeroed when it is dropped.
+#[derive(Clone, PartialEq, Eq)]
 pub struct WireSecret {
     /// The secret's name as referenced by modules.
     pub name: String,
@@ -69,6 +77,12 @@ pub struct WireSecret {
     pub value: Vec<u8>,
     /// The server's fingerprint of the value, for display.
     pub fingerprint: String,
+}
+
+impl Drop for WireSecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.value);
+    }
 }
 
 impl std::fmt::Debug for WireSecret {
@@ -80,8 +94,8 @@ impl std::fmt::Debug for WireSecret {
     }
 }
 
-/// The server's answer to [`Hello`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The server's answer to [`Hello`]. Its `Debug` hides the issued token.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Welcome {
     /// The server's version.
     pub server_version: String,
@@ -97,6 +111,41 @@ pub struct Welcome {
     pub status: String,
     /// Secrets for the stable revision, scoped to this host.
     pub secrets: Vec<WireSecret>,
+    /// Digest of the stable revision's tarball, to verify the cached tree.
+    pub stable_tree_digest: Option<String>,
+}
+
+impl std::fmt::Debug for Welcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Welcome")
+            .field("server_version", &self.server_version)
+            .field("session_id", &self.session_id)
+            .field("stable_revision", &self.stable_revision)
+            .field(
+                "issued_token",
+                &self.issued_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("labels", &self.labels)
+            .field("status", &self.status)
+            .field("secrets", &self.secrets)
+            .field("stable_tree_digest", &self.stable_tree_digest)
+            .finish()
+    }
+}
+
+/// What changed about the host, pushed while connected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostUpdate {
+    /// `pending`, `active` or `paused`.
+    pub status: String,
+    /// Effective labels after server overrides.
+    pub labels: IndexMap<String, String>,
+    /// The fleet's stable revision.
+    pub stable_revision: Option<RevisionId>,
+    /// Secrets for the stable revision, scoped to this host.
+    pub secrets: Vec<WireSecret>,
+    /// Digest of the stable revision's tarball.
+    pub stable_tree_digest: Option<String>,
 }
 
 /// What the control plane tells the agent to do.
@@ -135,6 +184,12 @@ pub enum Instruction {
         force: bool,
         /// W3C trace context of the span driving the apply.
         traceparent: Option<String>,
+        /// The selector the approved plan was made with.
+        select: Option<String>,
+        /// The rollout driving the apply, for tracing.
+        rollout_id: Option<String>,
+        /// The rollout phase, for tracing.
+        phase: Option<String>,
     },
     /// Apply this (older) revision now.
     Rollback {
@@ -142,6 +197,8 @@ pub enum Instruction {
         revision: RevisionId,
         /// Why, for logs and the run record.
         reason: String,
+        /// The rollout being rolled back, for tracing.
+        rollout_id: Option<String>,
         /// W3C trace context of the span driving the rollback.
         traceparent: Option<String>,
     },
@@ -164,6 +221,15 @@ pub enum Instruction {
     Upgrade {
         /// The release to install.
         version: String,
+        /// Wait until no other operation is queued.
+        when_idle: bool,
+    },
+    /// The host's record changed (approved, paused, resumed, relabelled).
+    HostUpdate(HostUpdate),
+    /// The server committed these durable reports; forget them.
+    Ack {
+        /// The acknowledged report ids.
+        report_ids: Vec<u64>,
     },
     /// The session is being closed by the other side.
     Rejected {
@@ -254,8 +320,10 @@ pub enum Report {
         /// The event.
         event: buckle_core::engine::ApplyEvent,
     },
-    /// The result of an apply.
+    /// The result of an apply (durable: kept until acknowledged).
     ApplyResult {
+        /// The durable report id.
+        report_id: u64,
         /// The revision that was applied.
         revision: RevisionId,
         /// The outcome.
@@ -281,13 +349,108 @@ pub enum Report {
         /// Whether the drift was corrected.
         corrected: bool,
     },
-    /// The agent rolled itself back while disconnected.
+    /// The agent rolled itself (or a module) back on its own (durable).
     LocalRollback(LocalRollbackRecord),
 }
 
-/// A local rollback, persisted until it is reported.
+impl Report {
+    /// The durable report id, for reports the server acknowledges.
+    pub fn report_id(&self) -> Option<u64> {
+        match self {
+            Report::ApplyResult { report_id, .. } => Some(*report_id),
+            Report::LocalRollback(record) => Some(record.report_id),
+            _ => None,
+        }
+    }
+}
+
+/// A report kept in agent.json until the server acknowledges it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DurableReport {
+    /// An ApplyResult.
+    ApplyResult {
+        /// The durable report id.
+        report_id: u64,
+        /// The revision that was applied.
+        revision: RevisionId,
+        /// The outcome (`buckle_core::engine::ApplyOutcome` as JSON).
+        outcome: serde_json::Value,
+        /// The revision applied on the host after the run.
+        applied_revision: Option<RevisionId>,
+    },
+    /// A local or module rollback.
+    LocalRollback(LocalRollbackRecord),
+}
+
+impl DurableReport {
+    /// The report id.
+    pub fn report_id(&self) -> u64 {
+        match self {
+            DurableReport::ApplyResult { report_id, .. } => *report_id,
+            DurableReport::LocalRollback(record) => record.report_id,
+        }
+    }
+
+    /// The revision an ApplyResult reports on.
+    pub fn apply_revision(&self) -> Option<&RevisionId> {
+        match self {
+            DurableReport::ApplyResult { revision, .. } => Some(revision),
+            DurableReport::LocalRollback(_) => None,
+        }
+    }
+
+    /// The durable form of a report, if it is one.
+    pub fn from_report(report: &Report) -> Option<Self> {
+        match report {
+            Report::ApplyResult {
+                report_id,
+                revision,
+                outcome,
+                applied_revision,
+            } => Some(DurableReport::ApplyResult {
+                report_id: *report_id,
+                revision: revision.clone(),
+                outcome: serde_json::to_value(outcome).unwrap_or_default(),
+                applied_revision: applied_revision.clone(),
+            }),
+            Report::LocalRollback(record) => Some(DurableReport::LocalRollback(record.clone())),
+            _ => None,
+        }
+    }
+
+    /// The report to (re-)send, or `None` when a stored outcome no longer parses.
+    pub fn to_report(&self) -> Option<Report> {
+        match self {
+            DurableReport::ApplyResult {
+                report_id,
+                revision,
+                outcome,
+                applied_revision,
+            } => match serde_json::from_value(outcome.clone()) {
+                Ok(outcome) => Some(Report::ApplyResult {
+                    report_id: *report_id,
+                    revision: revision.clone(),
+                    outcome,
+                    applied_revision: applied_revision.clone(),
+                }),
+                Err(err) => {
+                    tracing::warn!(report = report_id, error = %err, "dropping a stored apply result that no longer parses");
+                    None
+                }
+            },
+            DurableReport::LocalRollback(record) => Some(Report::LocalRollback(record.clone())),
+        }
+    }
+}
+
+/// A local (or module) rollback, persisted until the server acknowledges it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalRollbackRecord {
+    /// The durable report id (0 in records written by older agents; a fresh
+    /// id is assigned when they are loaded).
+    #[serde(default)]
+    pub report_id: u64,
     /// The revision that was rolled back.
     pub from: RevisionId,
     /// The stable revision applied in its place.
@@ -302,4 +465,10 @@ pub struct LocalRollbackRecord {
     pub at: chrono::DateTime<chrono::Utc>,
     /// Whether the rollback apply itself succeeded.
     pub succeeded: bool,
+    /// The rollback apply's own error, when it failed.
+    #[serde(default)]
+    pub rollback_error: Option<String>,
+    /// The rollback apply's outcome (`ApplyOutcome` as JSON), when it ran.
+    #[serde(default)]
+    pub rollback_outcome: Option<serde_json::Value>,
 }

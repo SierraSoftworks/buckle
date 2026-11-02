@@ -10,6 +10,8 @@ pub mod install;
 pub mod local;
 pub mod server;
 pub mod update;
+#[cfg(windows)]
+mod windows_service;
 
 /// Lightweight fleet configuration with phased, health-gated rollouts.
 #[derive(Parser, Debug)]

@@ -7,33 +7,10 @@ use std::collections::BTreeMap;
 
 /// Converts string labels into selector values: `true`/`false` become
 /// booleans and canonical numbers become numbers, as they would in YAML, so
-/// `host.labels.canary == true` works for a label set to `"true"`.
+/// `host.labels.canary == true` works for a label set to `"true"`. The same
+/// helper types the agent's labels, so both sides select alike.
 pub fn labels_to_core(labels: &BTreeMap<String, String>) -> Labels {
-    labels
-        .iter()
-        .map(|(k, v)| (k.clone(), label_value(v)))
-        .collect()
-}
-
-fn label_value(v: &str) -> serde_json::Value {
-    match v {
-        "true" => serde_json::Value::Bool(true),
-        "false" => serde_json::Value::Bool(false),
-        _ => match v.parse::<f64>() {
-            Ok(n) if n.is_finite() && format_number(n) == v => serde_json::Number::from_f64(n)
-                .map(serde_json::Value::Number)
-                .unwrap_or_else(|| serde_json::Value::String(v.to_owned())),
-            _ => serde_json::Value::String(v.to_owned()),
-        },
-    }
-}
-
-fn format_number(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{}", n as i64)
-    } else {
-        format!("{n}")
-    }
+    buckle_core::selectors::typed_labels(labels)
 }
 
 /// Builds the selector context for a host from its effective labels and
@@ -136,11 +113,11 @@ rollout:
 
     #[rstest]
     #[case("true", serde_json::json!(true))]
-    #[case("3", serde_json::json!(3.0))]
+    #[case("3", serde_json::json!(3))]
     #[case("007", serde_json::json!("007"))]
     #[case("home", serde_json::json!("home"))]
     fn labels_coerce_like_yaml(#[case] raw: &str, #[case] expected: serde_json::Value) {
-        assert_eq!(label_value(raw), expected);
+        assert_eq!(buckle_core::selectors::label_value(raw), expected);
     }
 
     #[test]

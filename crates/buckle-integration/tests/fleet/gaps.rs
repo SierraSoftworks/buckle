@@ -15,7 +15,6 @@ use std::time::Duration;
 /// Welcome, and the server sends Welcome once per session, so an agent stays
 /// `pending` (and on stale labels) until it reconnects.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "gap: approval and label changes are not pushed to a connected agent (grpc/service.rs sends Welcome only at session start)"]
 async fn an_approved_host_learns_its_status_and_labels_without_reconnecting() {
     let mut world = World::start_with(
         common::app(ONE_PHASE, 1),
@@ -59,7 +58,6 @@ async fn an_approved_host_learns_its_status_and_labels_without_reconnecting() {
 /// correction. The agent decides from the status in its last Welcome, which a
 /// pause does not refresh, so it keeps correcting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "gap: pausing a host does not reach its connected agent, which keeps correcting drift (session.rs drift() reads the Welcome status)"]
 async fn a_paused_host_stops_correcting_drift() {
     let mut world = World::start(common::app(ONE_PHASE, 1)).await;
     let v1 = world.source_revision();
@@ -206,7 +204,6 @@ async fn a_rotated_secret_is_a_fingerprint_change_on_the_line_that_uses_it() {
 /// the same hosts on both sides. It does not: the server puts the host in the
 /// `canary` group, the agent's engine does not select the module.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "design violation: the agent passes labels to the engine as strings while the server coerces them (buckle-agent session.rs labels_json vs buckle-server fleet.rs labels_to_core)"]
 async fn a_boolean_label_selects_the_same_modules_on_the_agent_as_on_the_server() {
     let fleet = common::app(ONE_PHASE, 1)
         .module(

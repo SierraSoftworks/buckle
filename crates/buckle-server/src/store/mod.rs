@@ -12,6 +12,7 @@ pub mod drift;
 mod health;
 mod hosts;
 pub mod kv;
+mod reports;
 mod revisions;
 pub mod rollouts;
 mod runs;
@@ -20,8 +21,10 @@ pub use approvals::{ApprovalRecord, Approvals};
 pub use audit::{Audit, AuditFilter, NewAudit};
 pub use drift::Drift;
 pub use health::{HealthEventRecord, HealthEvents};
+pub(crate) use hosts::status_str as hosts_status_str;
 pub use hosts::{HostRecord, Hosts, NewHost};
 pub use kv::Kv;
+pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
 pub use runs::{RunRecord, Runs};
@@ -185,7 +188,18 @@ CREATE TABLE apply_events (
     PRIMARY KEY (host, plan_digest, step)
 );
 "#,
-    // 2: what the latest drift pass found, per resource.
+    // 2: durable agent reports (ApplyResult, LocalRollback) seen per host, so
+    // a report the agent re-sends after a reconnect is stored once.
+    r#"
+CREATE TABLE agent_reports (
+    host TEXT NOT NULL,
+    report_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (host, report_id)
+);
+"#,
+    // 3: what the latest drift pass found, per resource.
     r#"
 CREATE TABLE host_drift (
     host_id TEXT NOT NULL,
@@ -271,6 +285,11 @@ impl<'c> Db<'c> {
     /// What drift passes found per host.
     pub fn drift(&self) -> Drift<'c> {
         Drift::new(self.conn)
+    }
+
+    /// Durable agent reports already stored.
+    pub fn reports(&self) -> AgentReports<'c> {
+        AgentReports::new(self.conn)
     }
 }
 

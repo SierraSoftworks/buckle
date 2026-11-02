@@ -4,12 +4,13 @@
 //! |---|---|
 //! | `token` | the per-host token issued at enrolment (0600) |
 //! | `install.key` | the key secret fingerprints are computed with (0600) |
-//! | `state.cbor` | the engine's resource state, applied and stable revision |
-//! | `agent.json` | session bookkeeping: last plan digest, labels, the local rollback watchdog, unreported local rollbacks (0600) |
+//! | `state.cbor` | the engine's resource state; written only by the engine (the agent reads it once, to migrate older state) |
+//! | `agent.json` | the agent's own bookkeeping: applied and stable revision, cached facts, last plan digest, labels, the local rollback watchdog, unacknowledged reports (0600) |
 //! | `revisions/<id>/` | extracted revision trees (the stable one is kept for local rollback) |
 //! | `secrets/<id>.cbor` | the secrets scoped to this host for a revision (0600) |
+//! | `tmp/` | scratch space planning may write to |
 
-use crate::transport::LocalRollbackRecord;
+use crate::transport::{DurableReport, LocalRollbackRecord};
 use crate::watchdog::WatchdogState;
 use buckle_core::error::HumanizableResult;
 use buckle_core::plan::RevisionId;
@@ -21,9 +22,28 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Session bookkeeping persisted in `agent.json`.
+/// The agent's own bookkeeping, persisted in `agent.json`.
+///
+/// `state.cbor` belongs to the engine, which loads it at the start of an
+/// apply and saves it as the run progresses; anything the agent records while
+/// an apply may be running (a Welcome naming a new stable revision, refreshed
+/// facts) lives here instead, so the engine is the only writer of
+/// `state.cbor`. Every write of this file happens under the session's data
+/// lock.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentState {
+    /// The revision this host has applied (last successful run).
+    #[serde(default)]
+    pub applied_revision: Option<RevisionId>,
+    /// The fleet's stable revision as last told by the server.
+    #[serde(default)]
+    pub stable_revision: Option<RevisionId>,
+    /// The tarball digest the server named for the stable revision.
+    #[serde(default)]
+    pub stable_tree_digest: Option<String>,
+    /// The facts collected so far, with their collection times.
+    #[serde(default)]
+    pub facts: buckle_core::facts::Facts,
     /// Digest of the last plan this agent produced.
     #[serde(default)]
     pub last_plan_digest: Option<String>,
@@ -36,9 +56,78 @@ pub struct AgentState {
     /// The armed local rollback watchdog, if any.
     #[serde(default)]
     pub watchdog: Option<WatchdogState>,
-    /// Local rollbacks not yet reported to a server.
+    /// Checks waived for the applied revision (`module/check`), from its Apply.
     #[serde(default)]
+    pub waived_checks: Vec<String>,
+    /// Modules of the applied revision that are back on the stable revision
+    /// after a module-scoped rollback. While set, drift is reported but not
+    /// corrected: after a failure the agent makes no further changes on its
+    /// own (design §04); the next Apply clears it.
+    #[serde(default)]
+    pub rolled_back_modules: Vec<String>,
+    /// The last durable report id handed out (0: none yet).
+    #[serde(default)]
+    pub last_report_id: u64,
+    /// Durable reports (apply results, local and module rollbacks) the
+    /// server has not acknowledged yet, oldest first. Re-sent after every
+    /// Welcome.
+    #[serde(default)]
+    pub unacked_reports: Vec<DurableReport>,
+    /// Local rollbacks recorded by older agents; moved into
+    /// `unacked_reports` on load.
+    #[serde(default, skip_serializing)]
     pub pending_rollbacks: Vec<LocalRollbackRecord>,
+}
+
+/// How many unacknowledged reports are kept; the oldest go first.
+pub const MAX_UNACKED_REPORTS: usize = 64;
+
+impl AgentState {
+    /// A fresh durable report id. Ids increase monotonically; the first one is
+    /// seeded from the clock so a wiped agent.json does not reuse ids the
+    /// server has already stored for this host.
+    pub fn next_report_id(&mut self) -> u64 {
+        if self.last_report_id == 0 {
+            // Milliseconds × 1000 leaves room for a thousand reports per
+            // millisecond of uptime before a re-seeded id could collide.
+            self.last_report_id =
+                (chrono::Utc::now().timestamp_millis().max(1) as u64).saturating_mul(1000);
+        }
+        self.last_report_id += 1;
+        self.last_report_id
+    }
+
+    /// Records a durable report until it is acknowledged, dropping the oldest
+    /// beyond [`MAX_UNACKED_REPORTS`].
+    pub fn keep_report(&mut self, report: DurableReport) {
+        self.unacked_reports.push(report);
+        if self.unacked_reports.len() > MAX_UNACKED_REPORTS {
+            let drop = self.unacked_reports.len() - MAX_UNACKED_REPORTS;
+            tracing::warn!(
+                dropped = drop,
+                "too many unacknowledged reports; forgetting the oldest"
+            );
+            self.unacked_reports.drain(..drop);
+        }
+    }
+
+    /// Forgets acknowledged reports; `true` when any was removed.
+    pub fn acknowledge(&mut self, ids: &[u64]) -> bool {
+        let before = self.unacked_reports.len();
+        self.unacked_reports
+            .retain(|r| !ids.contains(&r.report_id()));
+        before != self.unacked_reports.len()
+    }
+
+    /// Moves local rollbacks recorded by older agents into the durable queue.
+    pub fn migrate_legacy(&mut self) {
+        for mut record in std::mem::take(&mut self.pending_rollbacks) {
+            if record.report_id == 0 {
+                record.report_id = self.next_report_id();
+            }
+            self.keep_report(DurableReport::LocalRollback(record));
+        }
+    }
 }
 
 /// Writes `bytes` to `path` atomically with mode 0600.
@@ -126,6 +215,7 @@ impl Store {
             self.root.clone(),
             self.root.join("revisions"),
             self.root.join("secrets"),
+            self.scratch_dir(),
         ] {
             std::fs::create_dir_all(&dir).map_err(|e| {
                 buckle_core::error::wrap_user(
@@ -143,7 +233,16 @@ impl Store {
                     .to_human_error()?;
             }
         }
+        // Windows has no mode bits: restrict the whole state directory
+        // (tokens, install key, secrets) to Administrators and SYSTEM.
+        crate::install::restrict_windows_acl(&self.root, true)?;
         Ok(())
+    }
+
+    /// The directory planning may write to (the engine's plan guard refuses
+    /// any other write in plan mode).
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.root.join("tmp")
     }
 
     /// Where the per-host token lives.
@@ -198,17 +297,9 @@ impl Store {
         FileStateStore::new(self.root.join("state.cbor"))
     }
 
-    /// Loads the engine state.
+    /// Loads the engine state (read-only: only the engine writes it).
     pub fn load_state(&self) -> buckle_core::Result<State> {
         self.state_store().load()
-    }
-
-    /// Loads, modifies and saves the engine state.
-    pub fn update_state(&self, f: impl FnOnce(&mut State)) -> buckle_core::Result<()> {
-        let store = self.state_store();
-        let mut state = store.load()?;
-        f(&mut state);
-        store.save(&state)
     }
 
     /// The directory a revision's tree is extracted to.
@@ -224,19 +315,31 @@ impl Store {
             .unwrap_or(false)
     }
 
-    /// Deletes cached revision trees and secrets except those in `keep`.
+    /// Deletes cached revision trees and secrets except those in `keep`,
+    /// including secrets of revisions whose tree was never cached.
     pub fn prune_revisions(&self, keep: &[&RevisionId]) {
-        let Ok(entries) = std::fs::read_dir(self.root.join("revisions")) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || keep.iter().any(|k| k.0 == name) {
-                continue;
+        if let Ok(entries) = std::fs::read_dir(self.root.join("revisions")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || keep.iter().any(|k| k.0 == name) {
+                    continue;
+                }
+                tracing::debug!(revision = %name, "pruning cached revision");
+                let _ = std::fs::remove_dir_all(entry.path());
             }
-            tracing::debug!(revision = %name, "pruning cached revision");
-            let _ = std::fs::remove_dir_all(entry.path());
-            let _ = std::fs::remove_file(self.root.join("secrets").join(format!("{name}.cbor")));
+        }
+        if let Ok(entries) = std::fs::read_dir(self.root.join("secrets")) {
+            for entry in entries.flatten() {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                let Some(name) = file.strip_suffix(".cbor") else {
+                    continue;
+                };
+                if name.starts_with('.') || keep.iter().any(|k| k.0 == name) {
+                    continue;
+                }
+                tracing::debug!(revision = %name, "pruning cached secrets");
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 

@@ -2837,6 +2837,10 @@ async fn stale_plans_are_refused_with_both_digests() {
     let msg = err.message();
     assert!(msg.contains("stale"), "{msg}");
     assert!(msg.contains(old.digest.short()), "{msg}");
+    let stale = super::StalePlan::find(&err).expect("a typed stale-plan marker");
+    assert_eq!(stale.planned, old.digest);
+    assert_ne!(stale.fresh, old.digest);
+    assert!(super::StalePlan::find(&crate::error::user("other", &[])).is_none());
     assert!(!calls("stale1").iter().any(|c| c.starts_with("apply")));
 }
 
@@ -3749,6 +3753,36 @@ async fn a_valid_revision_validates_cleanly_and_with_facts() {
         .await
         .unwrap();
     assert!(with_facts.is_ok(), "{with_facts}");
+}
+
+#[rstest]
+#[case::debian(serde_json::json!({"os": {"family": "debian"}}), true)]
+#[case::ubuntu_id(serde_json::json!({"os": {"id": "ubuntu"}}), true)]
+#[case::darwin(serde_json::json!({"os": {"family": "darwin"}}), false)]
+#[case::windows(serde_json::json!({"os": {"family": "windows"}}), false)]
+#[tokio::test]
+async fn a_dry_run_checks_kinds_against_the_platform_the_facts_describe(
+    #[case] tree: serde_json::Value,
+    #[case] linux_ok: bool,
+) {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.linux: { path: /plat/linux-only, run: dryplat }\n",
+        )],
+    );
+    let host = HostIdentity {
+        id: "h".into(),
+        labels: Labels::new(),
+    };
+    let report = validate_with_facts(&rev, &host, &facts(tree))
+        .await
+        .unwrap();
+    assert_eq!(report.is_ok(), linux_ok, "{report}");
+    if !linux_ok {
+        assert!(report.to_string().contains("test.linux"), "{report}");
+    }
 }
 
 #[tokio::test]

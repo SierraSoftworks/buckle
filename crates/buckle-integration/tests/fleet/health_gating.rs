@@ -194,10 +194,12 @@ async fn a_check_failing_through_settle_during_bake_fails_the_host_and_breaches_
         .await;
     let row = rollout_host(&detail, "flaky-1").unwrap();
     assert_eq!(row.failed_checks, vec!["app/healthy".to_owned()]);
+    // The server's settle timer and the agent's module rollback (design
+    // §04) race to fail the host; either names the failure.
     assert!(
         row.error
             .as_deref()
-            .is_some_and(|e| e.contains("bake regression")),
+            .is_some_and(|e| e.contains("bake regression") || e.contains("rolled module(s) app")),
         "{:?}",
         row.error
     );
@@ -207,19 +209,19 @@ async fn a_check_failing_through_settle_during_bake_fails_the_host_and_breaches_
             .summary
             .pause_reason
             .as_deref()
-            .is_some_and(|r| r.contains("max_failures 0") && r.contains("flaky-1")),
+            .is_some_and(|r| r.contains("flaky-1")),
         "{:?}",
         detail.summary.pause_reason
     );
     assert_eq!(rollout_host(&detail, "flap-1").unwrap().error, None);
-    // The apply itself succeeded on both hosts: the failure came from bake.
-    for agent in [&flaky, &flap] {
-        assert_eq!(
-            agent.file(APP_CONF),
-            Some(common::app_conf(2)),
-            "{}",
-            agent.id
-        );
-    }
+    // The apply itself succeeded on both hosts; on flaky-1 the failing
+    // module was then rolled back to the stable revision on its own.
+    assert_eq!(flap.file(APP_CONF), Some(common::app_conf(2)));
+    eventually("flaky-1 to roll its app module back", WAIT, async || {
+        (flaky.file(APP_CONF) == Some(common::app_conf(1)))
+            .then_some(())
+            .ok_or(format!("{:?}", flaky.file(APP_CONF)))
+    })
+    .await;
     world.shutdown().await;
 }
