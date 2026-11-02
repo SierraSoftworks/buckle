@@ -245,15 +245,90 @@ fn health_error_report(scope: HealthScope, error: &buckle_core::Error) -> Health
     }
 }
 
-/// How often bake checks repeat: the shortest declared check interval, capped at 30 s.
-fn health_interval(revision: &Revision) -> Duration {
-    revision
-        .modules
+/// When each health check is due while checks repeat (bake, or any request
+/// with `until`): every check runs at its own declared interval (30 s when it
+/// declares none). The engine runs a module's checks together, so a module
+/// runs whenever one of its checks is due and only the due checks' results
+/// count and are reported.
+#[derive(Debug, Default)]
+struct CheckSchedule {
+    /// `module/check` → (interval, next due).
+    checks: HashMap<String, (Duration, Instant)>,
+}
+
+impl CheckSchedule {
+    const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
+
+    fn interval_of(revision: &Revision, module: &str, check: &str) -> Duration {
+        revision
+            .modules
+            .iter()
+            .find(|m| m.config.name == module)
+            .and_then(|m| m.config.health.iter().find(|h| h.display_name() == check))
+            .map(|h| h.interval)
+            .unwrap_or(Self::DEFAULT_INTERVAL)
+            .max(Duration::from_secs(1))
+    }
+
+    /// Keeps the results that were due at `now` (and checks seen for the
+    /// first time), and schedules their next run.
+    fn take_due(
+        &mut self,
+        revision: &Revision,
+        report: HealthReport,
+        now: Instant,
+    ) -> HealthReport {
+        let results = report
+            .results
+            .into_iter()
+            .filter(|r| {
+                let key = format!("{}/{}", r.module, r.check);
+                let interval = Self::interval_of(revision, &r.module, &r.check);
+                match self.checks.get_mut(&key) {
+                    Some((_, due)) if *due > now => false,
+                    Some((_, due)) => {
+                        *due = now + interval;
+                        true
+                    }
+                    None => {
+                        self.checks.insert(key, (interval, now + interval));
+                        true
+                    }
+                }
+            })
+            .collect();
+        HealthReport {
+            scope: report.scope,
+            results,
+        }
+    }
+
+    /// The modules with a check due at `now`.
+    fn due_modules(&self, now: Instant) -> Vec<String> {
+        let mut modules: Vec<String> = self
+            .checks
+            .iter()
+            .filter(|(_, (_, due))| *due <= now)
+            .filter_map(|(key, _)| key.split_once('/').map(|(m, _)| m.to_owned()))
+            .collect();
+        modules.sort();
+        modules.dedup();
+        modules
+    }
+
+    /// When the next check is due, if any check is known.
+    fn next_due(&self) -> Option<Instant> {
+        self.checks.values().map(|(_, due)| *due).min()
+    }
+}
+
+/// A filt-rs task selector matching every task of `modules`.
+fn module_selector(modules: &[String]) -> String {
+    modules
         .iter()
-        .flat_map(|m| m.config.health.iter().map(|h| h.interval))
-        .min()
-        .unwrap_or(Duration::from_secs(30))
-        .clamp(Duration::from_secs(1), Duration::from_secs(30))
+        .map(|m| format!("module.name == {}", serde_json::Value::String(m.clone())))
+        .collect::<Vec<_>>()
+        .join(" || ")
 }
 
 impl Agent {
@@ -1030,14 +1105,17 @@ impl Shared {
         }
     }
 
-    /// Applies `plan` and records the outcome. `report` sends ApplyEvents and
-    /// the ApplyResult to the current session.
+    /// Applies `plan`. `report` sends ApplyEvents and the (durable)
+    /// ApplyResult to the current session; `record` makes a success the
+    /// applied revision (a module-scoped rollback applies part of the stable
+    /// revision and records nothing).
     async fn run_apply(
         &self,
         rev: Arc<Revision>,
         ctx: &RunContext,
         plan: &Plan,
         report: bool,
+        record: bool,
     ) -> ApplyOutcome {
         let started = Instant::now();
         let (tx, rx) = mpsc::channel(256);
@@ -1064,11 +1142,15 @@ impl Shared {
         };
         let applied = {
             let mut data = self.data.lock().await;
-            if outcome.succeeded {
-                data.agent.applied_revision = Some(rev.id.clone());
+            if record {
+                if outcome.succeeded {
+                    data.agent.applied_revision = Some(rev.id.clone());
+                    data.agent.waived_checks = ctx.waived_checks.clone();
+                }
+                data.agent.rolled_back_modules = outcome.rolled_back_modules.clone();
+                data.agent.last_plan_digest = Some(plan.digest.to_string());
+                self.save_agent(&data);
             }
-            data.agent.last_plan_digest = Some(plan.digest.to_string());
-            self.save_agent(&data);
             data.agent.applied_revision.clone()
         };
         if report {
@@ -1130,7 +1212,7 @@ impl Shared {
                 .await;
             return;
         }
-        let outcome = self.run_apply(rev.clone(), &ctx, &plan, true).await;
+        let outcome = self.run_apply(rev.clone(), &ctx, &plan, true, true).await;
         tracing::info!(
             succeeded = outcome.succeeded,
             changes = outcome.changes,
@@ -1196,7 +1278,7 @@ impl Shared {
             Ok((rev, ctx, plan, facts)) => {
                 self.remember_facts(facts).await;
                 self.remember_plan(&plan).await;
-                self.run_apply(rev, &ctx, &plan, true).await;
+                self.run_apply(rev, &ctx, &plan, true, true).await;
                 // A server-driven rollback supersedes any local watchdog.
                 self.disarm_watchdog().await;
             }
@@ -1254,21 +1336,61 @@ impl Shared {
                     .to_std()
                     .unwrap_or(Duration::ZERO)
         });
-        let interval = health_interval(&rev);
         let cancel = self
             .session_cancel
             .lock()
             .map(|t| t.clone())
             .unwrap_or_default();
+        let settle = rev.fleet.rollout.settle;
+        let waived = self.data.lock().await.agent.waived_checks.clone();
+        let mut schedule = CheckSchedule::default();
+        // Required checks failing continuously during bake, since when.
+        let mut failing_since: HashMap<String, Instant> = HashMap::new();
+        let mut first = true;
         loop {
+            let now = Instant::now();
+            let targets = if first {
+                modules.clone()
+            } else {
+                Some(schedule.due_modules(now))
+            };
+            first = false;
             let report = match self
                 .runner
-                .health(rev.clone(), &ctx, scope, modules.as_deref())
+                .health(rev.clone(), &ctx, scope, targets.as_deref())
                 .await
             {
-                Ok(report) => report,
+                Ok(report) => schedule.take_due(&rev, report, now),
                 Err(err) => health_error_report(scope, &err),
             };
+            let report = self.scrub_report(&revision, report).await;
+            let mut rollback: Option<(Vec<String>, Vec<HealthResult>)> = None;
+            if scope == HealthScope::Bake {
+                for r in &report.results {
+                    let key = format!("{}/{}", r.module, r.check);
+                    if r.counts_as_failure(&waived) {
+                        failing_since.entry(key).or_insert(now);
+                    } else {
+                        failing_since.remove(&key);
+                    }
+                }
+                let settled: Vec<HealthResult> = report
+                    .failures(&waived)
+                    .filter(|r| {
+                        failing_since
+                            .get(&format!("{}/{}", r.module, r.check))
+                            .is_some_and(|since| now.duration_since(*since) >= settle)
+                    })
+                    .cloned()
+                    .collect();
+                if !settled.is_empty() {
+                    let mut failed: Vec<String> =
+                        settled.iter().map(|r| r.module.clone()).collect();
+                    failed.sort();
+                    failed.dedup();
+                    rollback = Some((failed, settled));
+                }
+            }
             self.sink
                 .send(Report::Health {
                     request_id: Some(request_id.clone()),
@@ -1276,23 +1398,152 @@ impl Shared {
                     report,
                 })
                 .await;
+            if let Some((failed, evidence)) = rollback {
+                // Design §04/§07: a required check failing past settle after
+                // its module applied rolls that module back to the stable
+                // revision; the agent then makes no further changes and the
+                // server decides (it pauses).
+                self.module_rollback(&revision, failed, evidence, settle)
+                    .await;
+                break;
+            }
             let Some(deadline) = deadline else { break };
-            if Instant::now() + interval >= deadline {
+            let Some(next) = schedule.next_due() else {
+                break;
+            };
+            if next > deadline {
                 break;
             }
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep_until(next) => {}
                 _ = cancel.cancelled() => break,
             }
         }
     }
 
+    /// Rolls `modules` of the applied revision back to the cached stable
+    /// revision (planned with a module selector, applied through the runner)
+    /// and reports it as a durable LocalRollback naming the modules.
+    async fn module_rollback(
+        &self,
+        applied: &RevisionId,
+        modules: Vec<String>,
+        evidence: Vec<HealthResult>,
+        settle: Duration,
+    ) {
+        let checks: Vec<String> = evidence
+            .iter()
+            .map(|r| format!("{}/{}", r.module, r.check))
+            .collect();
+        let reason = format!(
+            "required checks failing for longer than {} during bake: {}",
+            humantime_serde::re::humantime::format_duration(settle),
+            checks.join(", ")
+        );
+        let stable = self.data.lock().await.agent.stable_revision.clone();
+        let Some(stable) = stable.filter(|s| s != applied && self.store.has_revision(s)) else {
+            tracing::warn!(modules = ?modules, %reason, "a module failed its bake but no cached stable revision differs from the applied one; leaving it to the server");
+            return;
+        };
+        tracing::warn!(modules = ?modules, stable = %stable.short(), %reason, "rolling failed modules back to the stable revision");
+        let selector = module_selector(&modules);
+        let result = async {
+            let rev = self.ensure_revision(&stable, None).await?;
+            let mut ctx = self
+                .context(&stable, Some(selector.clone()), Vec::new(), true)
+                .await;
+            ctx.secrets = self.rollback_secrets(&stable, applied).await;
+            ctx.stable_revision = None;
+            let (plan, _) = self.runner.plan(rev.clone(), &ctx).await?;
+            Ok::<_, buckle_core::Error>(self.run_apply(rev, &ctx, &plan, false, false).await)
+        }
+        .await;
+        let (succeeded, rollback_error, rollback_outcome) = match result {
+            Ok(outcome) => (
+                outcome.succeeded,
+                (!outcome.succeeded).then(|| {
+                    outcome
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "a module failed".into())
+                }),
+                serde_json::to_value(&outcome).ok(),
+            ),
+            Err(err) => (
+                false,
+                Some(format!("the rollback could not run: {}", err.description())),
+                None,
+            ),
+        };
+        {
+            let mut data = self.data.lock().await;
+            for m in &modules {
+                if !data.agent.rolled_back_modules.contains(m) {
+                    data.agent.rolled_back_modules.push(m.clone());
+                }
+            }
+            self.save_agent(&data);
+        }
+        let report_id = self.next_report_id().await;
+        self.send_durable(Report::LocalRollback(LocalRollbackRecord {
+            report_id,
+            from: applied.clone(),
+            to: stable,
+            reason,
+            modules,
+            evidence,
+            at: chrono::Utc::now(),
+            succeeded,
+            rollback_error,
+            rollback_outcome,
+        }))
+        .await;
+    }
+
+    /// The secrets to render the stable revision with when rolling back: the
+    /// stable revision's own, topped up with the current ones (a secret the
+    /// stable revision needs may only have been delivered with a later one).
+    async fn rollback_secrets(
+        &self,
+        stable: &RevisionId,
+        current: &RevisionId,
+    ) -> Arc<SecretStore> {
+        let mut merged = (*self.secrets_for(current).await).clone();
+        for secret in self.secrets_for(stable).await.iter() {
+            merged.insert(secret.clone());
+        }
+        Arc::new(merged)
+    }
+
+    /// Health reasons may echo secret values (a URL with a token, command
+    /// output); scrub them before they go anywhere.
+    async fn scrub_report(&self, revision: &RevisionId, mut report: HealthReport) -> HealthReport {
+        let secrets = self.secrets_for(revision).await;
+        if secrets.is_empty() {
+            return report;
+        }
+        let redactor = buckle_core::secrets::redact::Redactor::new(&secrets);
+        for r in &mut report.results {
+            r.status = match std::mem::replace(&mut r.status, HealthStatus::Pass) {
+                HealthStatus::Fail { reason } => HealthStatus::Fail {
+                    reason: redactor.redact(&reason).into_inner(),
+                },
+                HealthStatus::Unknown { reason } => HealthStatus::Unknown {
+                    reason: redactor.redact(&reason).into_inner(),
+                },
+                HealthStatus::Pass => HealthStatus::Pass,
+            };
+        }
+        report
+    }
+
     async fn drift(&self) {
-        let (applied, paused) = {
+        let (applied, paused, rolled_back) = {
             let data = self.data.lock().await;
             (
                 data.agent.applied_revision.clone(),
                 data.agent.status.as_deref() == Some("paused"),
+                data.agent.rolled_back_modules.clone(),
             )
         };
         let Some(revision) = applied else { return };
@@ -1315,9 +1566,12 @@ impl Shared {
                         removals = plan.removals.len(),
                         "drift detected"
                     );
-                    if self.config.drift.correct && !paused {
+                    if self.config.drift.correct && !rolled_back.is_empty() {
+                        tracing::warn!(modules = ?rolled_back, "not correcting drift: modules were rolled back after a failure; waiting for the server");
+                    }
+                    if self.config.drift.correct && !paused && rolled_back.is_empty() {
                         corrected = self
-                            .run_apply(rev.clone(), &ctx, &plan, false)
+                            .run_apply(rev.clone(), &ctx, &plan, false, true)
                             .await
                             .succeeded;
                     }
@@ -1525,7 +1779,7 @@ impl Shared {
             let ctx = self.context(&to, None, Vec::new(), true).await;
             let (plan, facts) = self.runner.plan(rev.clone(), &ctx).await?;
             self.remember_facts(facts).await;
-            Ok::<_, buckle_core::Error>(self.run_apply(rev, &ctx, &plan, false).await)
+            Ok::<_, buckle_core::Error>(self.run_apply(rev, &ctx, &plan, false, true).await)
         }
         .await;
         let (succeeded, rollback_error, rollback_outcome) = match result {

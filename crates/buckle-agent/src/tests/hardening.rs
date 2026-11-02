@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::runner::{RunContext, Runner};
-use crate::testing::plan_with_changes;
+use crate::testing::{Call, plan_with_changes};
 use async_trait::async_trait;
 use buckle_core::engine::{ApplyEvent, ApplyOutcome, Revision};
 use buckle_core::facts::Facts;
@@ -272,4 +272,209 @@ fn local_rollbacks_from_older_agents_become_durable_reports() {
     let id = state.unacked_reports[0].report_id();
     assert!(id > 0);
     assert!(state.next_report_id() > id, "ids keep increasing");
+}
+
+/// A bundle with `buckle.yaml` and one module `m` declaring `health`.
+fn bundle_with_module(yaml: &str, module_yaml: &str) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("buckle.yaml"), yaml).expect("write");
+    std::fs::create_dir_all(dir.path().join("modules/m")).expect("mkdir");
+    std::fs::write(dir.path().join("modules/m/module.yaml"), module_yaml).expect("write");
+    crate::bundle::pack_dir(dir.path()).expect("pack")
+}
+
+fn rollback_msg(m: &pb::agent_message::Msg) -> Option<pb::LocalRollback> {
+    match m {
+        pb::agent_message::Msg::Rollback(r) => Some(r.clone()),
+        _ => None,
+    }
+}
+
+fn bake_request(id: &str, seconds: i64) -> pb::server_message::Msg {
+    let until = chrono::Utc::now() + chrono::Duration::seconds(seconds);
+    pb::server_message::Msg::Health(pb::RunHealth {
+        request_id: id.into(),
+        scope: pb::HealthScope::Bake as i32,
+        until: Some(crate::transport::convert::timestamp(until)),
+        ..Default::default()
+    })
+}
+
+/// Welcome naming `stable1` (cached), then roll out rev1.
+async fn rolled_out(fake: Arc<FakeRunner>) -> (Harness, ServerSessionAlias) {
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    fake.with_plans(&rev("stable1"), vec![plan_with_changes(&rev("stable1"), 1)]);
+    let mut h = Harness::start(Setup {
+        runner: fake,
+        ..Default::default()
+    })
+    .await;
+    h.fleet.add_revision("stable1", bundle(FLEET_YAML));
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(Some("stable1"), None)).await;
+    session.send(assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    assert!(session.expect(apply_result).await.succeeded);
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.has_revision(&rev("stable1"))).await;
+    (h, session)
+}
+
+type ServerSessionAlias = super::fake_server::ServerSession;
+
+#[tokio::test(start_paused = true)]
+async fn a_required_check_failing_past_settle_during_bake_rolls_its_module_back() {
+    let fake = FakeRunner::new();
+    let (h, mut session) = rolled_out(fake.clone()).await;
+    fake.with_health(|revision, scope| {
+        crate::testing::health(scope, !(revision.0 == "rev1" && scope == HealthScope::Bake))
+    });
+    let started = tokio::time::Instant::now();
+    session.send(bake_request("bake-1", 600)).await;
+    let rollback = session.expect(rollback_msg).await;
+    let elapsed = tokio::time::Instant::now() - started;
+    assert!(
+        elapsed >= Duration::from_secs(120) && elapsed < Duration::from_secs(160),
+        "after settle (2m), not before: {elapsed:?}"
+    );
+    assert_eq!(rollback.modules, vec!["m".to_string()]);
+    assert_eq!(rollback.from_revision, "rev1");
+    assert_eq!(rollback.to_revision, "stable1");
+    assert!(rollback.succeeded);
+    assert!(rollback.report_id > 0);
+    assert!(rollback.reason.contains("m/api"), "{}", rollback.reason);
+    assert!(rollback.evidence.iter().all(|e| !e.passed));
+    // The stable revision was planned for that module only and applied.
+    assert!(fake.calls().iter().any(|c| matches!(
+        c,
+        Call::Plan { revision, select: Some(s), .. }
+            if revision.0 == "stable1" && s == "module.name == \"m\""
+    )));
+    assert!(
+        fake.applies()
+            .iter()
+            .any(|c| matches!(c, Call::Apply { revision, .. } if revision.0 == "stable1"))
+    );
+    // The bake stopped; the host stays on rev1 with the module rolled back.
+    let bakes_before = bake_runs(&fake);
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(bake_runs(&fake), bakes_before);
+    let agent = Store::new(h.state_dir()).load_agent_state();
+    assert_eq!(agent.applied_revision, Some(rev("rev1")));
+    assert_eq!(agent.rolled_back_modules, vec!["m".to_string()]);
+    h.stop().await.expect("clean exit");
+}
+
+fn bake_runs(fake: &FakeRunner) -> usize {
+    fake.calls()
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                Call::Health {
+                    scope: HealthScope::Bake,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_check_that_recovers_inside_settle_is_a_flap_not_a_rollback() {
+    let fake = FakeRunner::new();
+    let (h, session) = rolled_out(fake.clone()).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    // Fails for the first three samples (60 s at 30 s intervals), then passes.
+    fake.with_health(move |_, scope| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::testing::health(scope, scope != HealthScope::Bake || n >= 3)
+    });
+    session.send(bake_request("bake-1", 300)).await;
+    tokio::time::sleep(Duration::from_secs(400)).await;
+    assert!(
+        !fake
+            .applies()
+            .iter()
+            .any(|c| matches!(c, Call::Apply { revision, .. } if revision.0 == "stable1")),
+        "no rollback"
+    );
+    assert!(bake_runs(&fake) >= 10, "the bake ran its whole window");
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn bake_checks_run_at_their_own_intervals_until_the_deadline() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    fake.with_health(|_, scope| HealthReport {
+        scope,
+        results: ["fast", "slow"]
+            .into_iter()
+            .map(|check| buckle_core::health::HealthResult {
+                module: "m".into(),
+                check: check.into(),
+                kind: "http".into(),
+                required: true,
+                status: buckle_core::health::HealthStatus::Pass,
+                at: chrono::Utc::now(),
+                duration_ms: 1,
+            })
+            .collect(),
+    });
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        ..Default::default()
+    })
+    .await;
+    let module = "name: m\nhealth:\n  - name: fast\n    http: { url: 'http://127.0.0.1/a' }\n    interval: 10s\n  - name: slow\n    http: { url: 'http://127.0.0.1/b' }\n    interval: 60s\n";
+    let digest = h
+        .fleet
+        .add_revision("rev1", bundle_with_module(FLEET_YAML, module));
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    session.send(assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    assert!(session.expect(apply_result).await.succeeded);
+
+    let started = tokio::time::Instant::now();
+    session.send(bake_request("bake-1", 125)).await;
+    let mut seen: Vec<(u64, String)> = Vec::new();
+    loop {
+        let report = session.expect(health_report).await;
+        let at = (tokio::time::Instant::now() - started).as_secs();
+        for r in report.results {
+            seen.push((at, r.check));
+        }
+        if at >= 120 {
+            break;
+        }
+    }
+    let times = |check: &str| -> Vec<u64> {
+        seen.iter()
+            .filter(|(_, c)| c == check)
+            .map(|(t, _)| *t)
+            .collect()
+    };
+    assert_eq!(times("slow"), vec![0, 60, 120]);
+    assert_eq!(
+        times("fast"),
+        (0..=12).map(|i| i * 10).collect::<Vec<u64>>(),
+        "every 10 s, up to the deadline"
+    );
+    h.stop().await.expect("clean exit");
 }

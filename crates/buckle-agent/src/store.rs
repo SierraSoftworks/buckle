@@ -52,6 +52,15 @@ pub struct AgentState {
     /// The armed local rollback watchdog, if any.
     #[serde(default)]
     pub watchdog: Option<WatchdogState>,
+    /// Checks waived for the applied revision (`module/check`), from its Apply.
+    #[serde(default)]
+    pub waived_checks: Vec<String>,
+    /// Modules of the applied revision that are back on the stable revision
+    /// after a module-scoped rollback. While set, drift is reported but not
+    /// corrected: after a failure the agent makes no further changes on its
+    /// own (design §04); the next Apply clears it.
+    #[serde(default)]
+    pub rolled_back_modules: Vec<String>,
     /// The last durable report id handed out (0: none yet).
     #[serde(default)]
     pub last_report_id: u64,

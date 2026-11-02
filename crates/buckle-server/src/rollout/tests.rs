@@ -36,6 +36,8 @@ struct Script {
     local_rollback_fails: bool,
     /// Never answer baseline checks (the test answers them).
     silent_baseline: bool,
+    /// The bake rollback is module-scoped (these modules).
+    rollback_modules: Vec<String>,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -229,6 +231,7 @@ impl Harness {
                         };
                         if scope == HealthScope::Bake && s.local_rollback_on_bake {
                             reply(AMsg::Rollback(LocalRollback {
+                                modules: s.rollback_modules.clone(),
                                 from_revision: String::new(),
                                 to_revision: "stable".into(),
                                 reason: "server unreachable and health failing".into(),
@@ -901,6 +904,36 @@ async fn a_local_rollback_fails_the_host_and_pauses() {
     assert_eq!(r.runtime.pause.unwrap().kind, "local_rollback");
     assert_eq!(host(&hosts, "a").state, HostPhase::Failed);
     assert!(!host(&hosts, "a").runtime.needs_attention);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_module_rollback_during_bake_fails_the_host_and_pauses() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 5m }\n  phases:\n    - { name: web, select: 'true', max_failures: 5 }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| {
+        s.local_rollback_on_bake = true;
+        s.rollback_modules = vec!["web".into()];
+    });
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    assert_eq!(r.runtime.pause.unwrap().kind, "local_rollback");
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Failed);
+    assert_eq!(a.runtime.failed_module.as_deref(), Some("web"));
+    assert!(
+        a.runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("module(s) web")
+    );
+    assert_eq!(a.result.as_ref().unwrap()["kind"], "module_rollback");
 }
 
 #[tokio::test(start_paused = true)]
