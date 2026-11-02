@@ -165,6 +165,10 @@ impl FleetPlan {
             .filter(|(_, v)| v.len() > 1)
             .map(|(p, _)| *p)
             .collect();
+        // A value every planned host holds somewhere (`active`, `running`)
+        // says nothing about the host: its path varies only because a list
+        // is ordered differently, so it is left as text.
+        let everywhere = common_values(hosts, &leaves);
 
         let mut out = FleetPlan::default();
         let mut used = BTreeSet::new();
@@ -173,10 +177,11 @@ impl FleetPlan {
                 out.unplanned.push(h.host.clone());
                 continue;
             };
-            let tok = Tokeniser::new(
-                l.iter()
-                    .filter(|(p, v)| varying.contains(p.as_str()) && v.len() >= MIN_FACT_LEN),
-            );
+            let tok = Tokeniser::new(l.iter().filter(|(p, v)| {
+                varying.contains(p.as_str())
+                    && v.len() >= MIN_FACT_LEN
+                    && !everywhere.contains(v.as_str())
+            }));
             out.add(&h.host, &tok.plan(plan));
             used.extend(tok.used.into_inner());
         }
@@ -399,6 +404,27 @@ fn flatten(path: &str, value: &serde_json::Value, out: &mut Vec<(String, String)
         }
         _ => {}
     }
+}
+
+/// The values every planned host holds at some path (none with fewer than
+/// two planned hosts, where nothing can be told apart).
+fn common_values<'a>(
+    hosts: &[FleetHost],
+    leaves: &'a [Vec<(String, String)>],
+) -> BTreeSet<&'a str> {
+    let mut planned = hosts
+        .iter()
+        .zip(leaves)
+        .filter(|(h, _)| h.plan.is_some())
+        .map(|(_, l)| {
+            l.iter()
+                .map(|(_, v)| v.as_str())
+                .collect::<BTreeSet<&str>>()
+        });
+    let (Some(first), Some(second)) = (planned.next(), planned.next()) else {
+        return BTreeSet::new();
+    };
+    planned.fold(&first & &second, |acc, set| &acc & &set)
 }
 
 fn samples(path: &str, hosts: &[FleetHost], leaves: &[Vec<(String, String)>]) -> FactSamples {
@@ -656,6 +682,37 @@ mod tests {
         let id = phase.fact("host.id").unwrap();
         assert_eq!(id.samples.len(), 1);
         assert_eq!(id.samples[0].host, "prophet");
+    }
+
+    #[test]
+    fn values_every_host_holds_stay_text_though_their_list_position_varies() {
+        // `active` sits at a different index of each host's unit list, so
+        // its path varies, but it says nothing about either host.
+        let with_units = |name: &str, ip: &str, units: serde_json::Value| {
+            let mut h = host(
+                name,
+                ip,
+                vec![change("run", "systemd-run --on-active=1min", "+x\n")],
+            );
+            h.context["facts"]["units"] = units;
+            h
+        };
+        let plan = FleetPlan::build(&[
+            with_units(
+                "seer",
+                "10.0.0.1",
+                json!([{"sub": "running"}, {"sub": "active"}]),
+            ),
+            with_units(
+                "prophet",
+                "10.0.0.2",
+                json!([{"sub": "active"}, {"sub": "running"}]),
+            ),
+        ]);
+        let step = &plan.modules[0].steps[0];
+        assert_eq!(step.key, "systemd-run --on-active=1min");
+        assert_eq!(step.variants.len(), 1, "{step:#?}");
+        assert!(plan.facts.iter().all(|f| !f.path.contains("units")));
     }
 
     #[test]

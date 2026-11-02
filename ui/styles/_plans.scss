@@ -46,17 +46,6 @@
   &__body {
     padding: 0 0.75rem 0.75rem;
   }
-
-  &__warnings {
-    list-style: none;
-    margin: 0.4rem 0;
-
-    li {
-      display: flex;
-      gap: 0.4rem;
-      color: var(--warn);
-    }
-  }
 }
 
 // A module (or removals, notes) as a collapsible block: its heading on one
@@ -99,8 +88,12 @@
     font-size: 0.85rem;
   }
 
-  &__count {
-    color: var(--fg-2);
+  // What the block changes and on how many hosts, against the right edge.
+  &__aside {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-left: auto;
   }
 
   &__body {
@@ -109,12 +102,51 @@
     border-left: 2px solid var(--line);
   }
 
+  &__icon {
+    display: inline-flex;
+    color: var(--warn);
+
+    .icon {
+      width: 14px;
+      height: 14px;
+    }
+  }
+
+  &--warnings > .plan-module__head {
+    border-bottom-color: color-mix(in srgb, var(--warn) 50%, var(--line));
+  }
+
+  &--warnings > .plan-module__body {
+    border-left-color: color-mix(in srgb, var(--warn) 40%, var(--line));
+  }
+
   &--removals > .plan-module__head {
     border-bottom-color: color-mix(in srgb, var(--danger) 50%, var(--line));
   }
 
   &--removals > .plan-module__body {
     border-left-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  }
+}
+
+// `+2 ~1 -1`: a block's changes by kind, in the change colours.
+.tally {
+  display: inline-flex;
+  gap: 0.45rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+
+  &__part--create {
+    color: var(--ok);
+  }
+
+  &__part--modify {
+    color: var(--warn);
+  }
+
+  &__part--remove,
+  &__part--blocked {
+    color: var(--danger);
   }
 }
 
@@ -146,6 +178,7 @@
 // Which hosts a fleet-wide plan line applies to.
 .scope {
   display: inline-flex;
+  flex: none;
   padding: 0 0.4rem;
   border-radius: 999px;
   font-size: 0.72rem;
@@ -167,6 +200,9 @@
 .fact {
   display: inline-flex;
   align-items: center;
+  max-width: 100%;
+  vertical-align: baseline;
+  line-height: 1.35;
   padding: 0 0.3rem;
   border: 1px dashed color-mix(in srgb, var(--info) 55%, transparent);
   border-radius: var(--radius-sm);
@@ -248,12 +284,27 @@
     text-align: center;
   }
 
+  // Long keys and summaries (a whole command line) wrap anywhere rather
+  // than push the line's badges off the edge.
+  &__resource,
+  &__summary,
+  &__text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
   &__resource {
     color: var(--fg);
   }
 
   &__summary {
     color: var(--fg-2);
+  }
+
+  // A warning's text: one inline run, taking the line's free space.
+  &__text {
+    flex: 1 1 20rem;
+    color: var(--warn);
   }
 
   // A step's diff or preview, indented under its line.

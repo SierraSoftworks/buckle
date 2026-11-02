@@ -8,13 +8,14 @@ use std::rc::Rc;
 use buckle_api::{FleetPlan, FleetStep, PlanGroup, Shared};
 use yew::prelude::*;
 
-use super::diff::{FactExemplars, secret_text};
+use super::diff::FactExemplars;
 use super::icons;
 use super::plan::{
-    DEFERRED_NOTE, HELD_NOTE, INDETERMINATE_NOTE, block, handler, module_head, note, rehome,
-    rehomed_block, removal, removals_block, step_class, step_detail, step_line,
+    DEFERRED_NOTE, HELD_NOTE, INDETERMINATE_NOTE, block, handler, module_head, note, notes_head,
+    rehome, rehomed_block, removal, removals_block, step_class, step_detail, step_line, warning,
+    warnings_block,
 };
-use crate::logic::fleet_plan::scope_label;
+use crate::logic::fleet_plan::{hosts_changed, scope_label, summarise};
 use crate::logic::format::count;
 
 #[derive(Properties, PartialEq)]
@@ -37,6 +38,23 @@ fn shared_scope<T>(all: &[String], s: &Shared<T>) -> Html {
     scope(all, &s.hosts)
 }
 
+/// How many of the hosts under review a block changes, for its heading.
+fn changed_of(all: &[String], changed: &[String]) -> Html {
+    let fleet_wide = all.iter().all(|h| changed.contains(h));
+    html! {
+        <span class={classes!("scope", if fleet_wide { "scope--all" } else { "scope--subset" })}
+            title={changed.join(", ")} data-testid="hosts-changed">
+            { hosts_changed(all.len(), changed.len()) }
+        </span>
+    }
+}
+
+/// The hosts any of `list` applies to.
+fn union<T>(list: &[Shared<T>]) -> Vec<String> {
+    let set: std::collections::BTreeSet<&String> = list.iter().flat_map(|s| &s.hosts).collect();
+    set.into_iter().cloned().collect()
+}
+
 /// A line's scope, unless it is the same as its module's.
 fn scope_within(all: &[String], module: &[String], hosts: &[String]) -> Html {
     if module.iter().all(|h| hosts.contains(h)) {
@@ -56,35 +74,49 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
             ..Default::default()
         }))
     });
-    let warnings = (!p.warnings.is_empty()).then(|| html! {
-        <ul class="plan__warnings">
-            { for p.warnings.iter().map(|w| html! { <li>{ icons::alert() }{ secret_text(&w.value) }{ shared_scope(all, w) }</li> }) }
-        </ul>
+    // A warning names its hosts only where they differ from the block's.
+    let warnings = (!p.warnings.is_empty()).then(|| {
+        let warned = union(&p.warnings);
+        warnings_block(
+            p.warnings.len(),
+            scope(all, &warned),
+            html! { { for p.warnings.iter().map(|w| warning(&w.value, scope_within(all, &warned, &w.hosts))) } },
+        )
     });
-    let modules = p.modules.iter().map(|m| {
+    // Modules that change nothing anywhere are left out; the rest are
+    // headed by what they change on how many hosts, a line within naming
+    // its own hosts only where it changes fewer than its module does.
+    let modules = p.modules.iter().filter_map(|m| {
+        let summary = summarise(m);
+        if !summary.has_changes() {
+            return None;
+        }
         let changed: Vec<&FleetStep> = m.steps.iter().filter(|s| !s.variants.is_empty()).collect();
-        let unchanged = m.steps.len() - changed.len();
-        block(
+        let within = summary.changed.clone();
+        Some(block(
             "",
-            !changed.is_empty(),
-            module_head(&m.module, &m.needs, changed.len(), unchanged, scope(all, &m.hosts)),
+            module_head(&m.module, &m.needs, summary.tally, changed_of(all, &summary.changed)),
             html! {
                 <ul class="steps">
                     { for changed.into_iter().map(|s| html! {
-                        <FleetStepView step={s.clone()} all={all.clone()} module={m.hosts.clone()} />
+                        <FleetStepView step={s.clone()} all={all.clone()} module={within.clone()} />
                     }) }
-                    { for m.handlers.iter().map(|h| handler(&m.module, &h.value, scope_within(all, &m.hosts, &h.hosts))) }
+                    { for m.handlers.iter().map(|h| handler(&m.module, &h.value, scope_within(all, &within, &h.hosts))) }
                 </ul>
             },
-        )
+        ))
     });
     let removals = (!p.removals.is_empty()).then(|| {
         removals_block(
+            p.removals.len(),
+            changed_of(all, &union(&p.removals)),
             html! { { for p.removals.iter().map(|r| removal(&r.value, shared_scope(all, r))) } },
         )
     });
     let rehomed = (!p.rehomed.is_empty()).then(|| {
         rehomed_block(
+            p.rehomed.len(),
+            changed_of(all, &union(&p.rehomed)),
             html! { { for p.rehomed.iter().map(|r| rehome(&r.value, shared_scope(all, r))) } },
         )
     });
@@ -99,11 +131,7 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
         }
         block(
             "",
-            true,
-            html! { <>
-                <h4 class="plan-module__name">{ title.to_string() }</h4>
-                if !aside.is_empty() { <span class="muted">{ aside.to_string() }</span> }
-            </> },
+            notes_head(title, aside, list.len()),
             html! { <>
                 <ul class="steps">{ for list.iter().map(|n| note(&n.value, glyph, class, shared_scope(all, n))) }</ul>
                 { footer }
@@ -114,9 +142,7 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
         <ContextProvider<FactExemplars> context={(*exemplars).clone()}>
             <div class="fleet-plan" data-testid="fleet-plan">
                 <p class="fleet-plan__intro muted small">
-                    { format!("Every change across {}. ", count(all.len(), "host", "hosts")) }
-                    <span class="scope scope--all">{ "all hosts" }</span>
-                    { " marks a module every host plans; a change that applies to fewer of its hosts names its own." }
+                    { format!("The modules that change something on {}, each with what it changes on how many; open one for its diffs. ", count(all.len(), "host", "hosts")) }
                     if !p.facts.is_empty() {
                         { " " }<span class="fact fact--legend">{ icons::host() }<span class="fact__path">{ "fact" }</span></span>
                         { " stands for a value that differs per host; hover it for examples." }
@@ -144,7 +170,7 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
 struct FleetStepProps {
     step: FleetStep,
     all: Vec<String>,
-    /// The hosts its module is planned on.
+    /// The hosts its module changes.
     module: Vec<String>,
 }
 

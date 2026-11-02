@@ -200,10 +200,6 @@ pub fn rollout_page(props: &Props) -> Html {
     let s = &d.summary;
     let admin = auth.is_admin();
     let finished = rollout_finished(s.state);
-    let head_actions = html! { <>
-        <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
-        if admin { { controls(s, &open) } }
-    </> };
 
     let subtitle = html! {
         <div class="rollout-meta">
@@ -230,17 +226,15 @@ pub fn rollout_page(props: &Props) -> Html {
         .or(wanting.first())
         .copied();
 
+    let head_actions = html! { <>
+        <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
+        if admin { { controls(s, focused.filter(|p| !scope_of(p, &plan_groups).digests.is_empty()).map(|p| p.name.as_str()), &open) } }
+    </> };
+
     let approval = match focused {
-        Some(phase) if !finished => approval_pane(
-            phase,
-            &wanting,
-            &d,
-            &plan_groups,
-            admin,
-            s.state == RolloutState::AwaitingApproval,
-            &open,
-            &focus_phase,
-        ),
+        Some(phase) if !finished => {
+            approval_pane(phase, &wanting, &d, &plan_groups, admin, &focus_phase)
+        }
         _ => all_plans(&plan_groups, d.fleet.as_ref()),
     };
 
@@ -416,17 +410,27 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
     }
 }
 
-/// The rollout-wide decisions for its state: pause or resume, roll back,
-/// abort. Nothing once it has finished.
-pub(crate) fn controls(s: &RolloutSummary, open: &Callback<Ask>) -> Html {
+/// The rollout-wide decisions for its state: approve the phase waiting for
+/// it (`approve`, once it has plans to bind), reject a rollout held at a
+/// gate, pause or resume, roll back, abort. Nothing once it has finished.
+pub(crate) fn controls(s: &RolloutSummary, approve: Option<&str>, open: &Callback<Ask>) -> Html {
     if rollout_finished(s.state) {
         return html! {};
     }
-    let act = |a: &'static str| {
+    let ask = |a: Ask| {
         let o = open.clone();
-        Callback::from(move |_: MouseEvent| o.emit(Ask::Action(a)))
+        Callback::from(move |_: MouseEvent| o.emit(a.clone()))
     };
+    let act = |a: &'static str| ask(Ask::Action(a));
     html! { <>
+        if let Some(phase) = approve {
+            <Button kind={Kind::Primary} onclick={ask(Ask::Approve(phase.to_string()))}>
+                { format!("Approve {phase}…") }
+            </Button>
+        }
+        if s.state == RolloutState::AwaitingApproval {
+            <Button kind={Kind::Danger} onclick={ask(Ask::Reject)}>{ "Reject…" }</Button>
+        }
         if s.state == RolloutState::Paused {
             <Button kind={Kind::Primary} onclick={act("resume")}>{ "Resume" }</Button>
         } else if s.state != RolloutState::RollingBack {
@@ -478,7 +482,7 @@ fn approval_hosts(phase: &RolloutPhase) -> Vec<&RolloutHost> {
         .collect()
 }
 
-fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalScope {
+pub(crate) fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalScope {
     approval_scope(&approval_hosts(phase), plans)
 }
 
@@ -489,9 +493,6 @@ fn approval_pane(
     d: &RolloutDetail,
     plans: &[PlanGroup],
     admin: bool,
-    // The rollout is held at a gate: rejecting it is possible (only then).
-    rejectable: bool,
-    open: &Callback<Ask>,
     focus: &UseStateHandle<Option<String>>,
 ) -> Html {
     let scope = scope_of(phase, plans);
@@ -529,14 +530,6 @@ fn approval_pane(
             </div>
         }
     });
-    let approve = {
-        let (open, name) = (open.clone(), phase.name.clone());
-        Callback::from(move |_: MouseEvent| open.emit(Ask::Approve(name.clone())))
-    };
-    let reject = {
-        let open = open.clone();
-        Callback::from(move |_: MouseEvent| open.emit(Ask::Reject))
-    };
     let policy = if phase.approval == "if_destructive" {
         "approval: if_destructive, and a plan here is destructive"
     } else {
@@ -571,14 +564,8 @@ fn approval_pane(
             }
             <div class="approval__actions">
                 if admin {
-                    <Button kind={Kind::Primary} onclick={approve} disabled={scope.digests.is_empty()}>
-                        { "Review and approve…" }
-                    </Button>
-                    if rejectable {
-                        <Button kind={Kind::Danger} onclick={reject}>{ "Reject…" }</Button>
-                    }
-                    <span class="muted small">{ format!("Binds {} for {}. A host whose plan changes after approval asks again.",
-                        count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</span>
+                    <span class="muted small">{ format!("Approving {} binds {} for {}. A host whose plan changes after approval asks again.",
+                        phase.name, count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</span>
                 } else {
                     <p class="muted">{ "Approving needs an administrator (admin_acl)." }</p>
                 }

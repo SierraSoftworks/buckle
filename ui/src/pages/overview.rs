@@ -5,13 +5,13 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{Fleet, PhaseState, RolloutDetail, RolloutState, RolloutSummary};
+use buckle_api::{Fleet, PhaseState, PlanGroup, RolloutDetail, RolloutState, RolloutSummary};
 use yew::prelude::*;
 
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Empty, ErrorState, Kind, Loading, PageHead, Panel, Pill, Pipeline, Refresh, RouteLink,
+    Empty, ErrorState, Loading, PageHead, Panel, Pill, Pipeline, Refresh, RouteLink,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{Bucket, attention, rollup};
@@ -21,7 +21,7 @@ use crate::logic::pipeline::{fleet_map, layout};
 use crate::logic::tone::{
     Tone, revision_status_tone, rollout_finished, rollout_state_label, rollout_state_tone,
 };
-use crate::pages::rollout::{Ask, controls, use_rollout_actions, wanting_approval};
+use crate::pages::rollout::{Ask, controls, scope_of, use_rollout_actions, wanting_approval};
 
 #[function_component(Overview)]
 pub fn overview() -> Html {
@@ -84,7 +84,7 @@ pub fn overview() -> Html {
                         <RouteLink to={Route::rollout(id)} classes="btn btn--small">{ "Open rollout" }</RouteLink>
                     }).unwrap_or_default()}>
                     { match (&rollout_live, &rollout.error) {
-                        (Some(d), _) => latest(d, auth.is_admin(), &actions.open, now),
+                        (Some(d), _) => latest(d, &plan_groups, auth.is_admin(), &actions.open, now),
                         (None, Some(e)) if waiting => html! { <ErrorState error={e.clone()} retry={rollout.reload.clone()} /> },
                         (None, _) if waiting => html! { <Loading /> },
                         (None, _) => html! { <Empty title="No rollouts yet"
@@ -133,6 +133,7 @@ pub fn overview() -> Html {
 /// live, its decisions for an administrator.
 fn latest(
     d: &RolloutDetail,
+    plans: &[PlanGroup],
     admin: bool,
     open: &Callback<Ask>,
     now: chrono::DateTime<chrono::Utc>,
@@ -141,10 +142,14 @@ fn latest(
     let live = !rollout_finished(s.state);
     let pipeline = layout(d);
     let wanting = wanting_approval(&pipeline);
-    let phase = wanting
+    // The phase the rollout page's approval pane would show, once it has
+    // plans to bind.
+    let approve = wanting
         .iter()
         .find(|p| p.state == PhaseState::AwaitingApproval)
-        .or(wanting.first());
+        .or(wanting.first())
+        .filter(|p| !scope_of(p, plans).digests.is_empty())
+        .map(|p| p.name.clone());
     html! { <>
         { rollout_head(s, now) }
         if let Some(reason) = &s.pause_reason {
@@ -154,19 +159,7 @@ fn latest(
         }
         if admin && live {
             <div class="overview__controls" data-testid="rollout-controls">
-                if let Some(phase) = phase {
-                    <Button kind={Kind::Primary} onclick={{
-                        let (open, name) = (open.clone(), phase.name.clone());
-                        Callback::from(move |_: MouseEvent| open.emit(Ask::Approve(name.clone())))
-                    }}>{ format!("Approve {}…", phase.name) }</Button>
-                }
-                if s.state == RolloutState::AwaitingApproval {
-                    <Button kind={Kind::Danger} onclick={{
-                        let open = open.clone();
-                        Callback::from(move |_: MouseEvent| open.emit(Ask::Reject))
-                    }}>{ "Reject…" }</Button>
-                }
-                { controls(s, open) }
+                { controls(s, approve.as_deref(), open) }
             </div>
         }
     </> }

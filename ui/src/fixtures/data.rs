@@ -974,7 +974,17 @@ fn removal(
 }
 
 fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
-    let mut modules = vec![common_module()];
+    // Already in place everywhere: a module the plan review leaves out.
+    let tailscale = ModuleView {
+        module: "tailscale".into(),
+        needs: vec![],
+        steps: vec![
+            step("tailscale", "apt.package", "tailscale", None),
+            step("tailscale", "systemd.unit", "tailscaled", None),
+        ],
+        handlers: vec![],
+    };
+    let mut modules = vec![common_module(), tailscale];
     if nomad {
         modules.push(ModuleView {
             module: "nomad".into(),
@@ -1094,7 +1104,12 @@ fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
             "caddy: host.labels.role == \"edge\"".into(),
         ],
         warnings: if grey {
-            vec!["Removing apt.package[grey-agent] can remove packages that depend on it.".into()]
+            vec![
+                "Removing apt.package[grey-agent] can remove packages that depend on it.".into(),
+                format!(
+                    "removal: grey/command.run[/usr/local/bin/grey-agent deregister --node {host} && systemd-run --unit=grey-agent-cleanup --on-active=1min --timer-property=AccuracySec=1s /usr/bin/true] — released: left in place (policy leave)"
+                ),
+            ]
         } else {
             vec![]
         },

@@ -98,7 +98,7 @@ describe("approving a phase", () => {
     assert.ok((await pane.locator(".step--destructive").count()) >= 4);
     assert.match(await pane.textContent(), /1 host has no plan yet \(az-1\)/);
 
-    await pane.getByRole("button", { name: "Review and approve…" }).click();
+    await page.getByRole("button", { name: "Approve cloud…" }).click();
     const dialog = page.getByRole("dialog", { name: "Approve cloud of rollout #42" });
     await dialog.waitFor();
     const summary = await dialog.getByTestId("approval-summary").textContent();
@@ -126,17 +126,41 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42");
     const fleet = page.locator("#approval").getByTestId("fleet-plan");
     await fleet.waitFor();
-    // A module every host plans says so, its changes showing host values as
-    // placeholders; the retired module's cleanup names the hosts it runs on.
+    const module = (resource) => fleet.locator(`details.plan-module:has(li[data-resource="${resource}"])`);
+    // Modules start closed, headed by what they change on how many hosts;
+    // modules that change nothing are left out.
+    const blocks = fleet.locator("details.plan-module");
+    assert.ok((await blocks.count()) > 0);
+    assert.equal(await fleet.locator("details.plan-module[open]").count(), 0, "every module starts collapsed");
+    assert.equal(await fleet.locator(".plan-module__name", { hasText: /^tailscale$/ }).count(), 0, "a module that changes nothing is left out");
+    const nomad = module("file.template[/etc/nomad.d/client.hcl]");
+    const nomadHead = nomad.locator("> summary");
+    assert.match(await nomadHead.getByTestId("tally").textContent(), /~\d+/);
+    assert.match(await nomadHead.getByTestId("hosts-changed").textContent(), /all \d+ hosts changed/);
+    assert.match(
+      await module("file.absent[/etc/grey/agent.token]").locator("> summary").getByTestId("hosts-changed").textContent(),
+      /4 changed · \d+ unchanged/,
+    );
+
+    // Warnings are one block too, each a single wrapping line of text.
+    const warnings = fleet.locator("details.plan-module--warnings");
+    assert.match(await warnings.locator("> summary").textContent(), /2 warnings/);
+    await warnings.locator("> summary").click();
+    const long = warnings.locator(".step__text", { hasText: "released: left in place" });
+    await long.waitFor();
+    assert.equal(await long.locator(".fact").count(), 1, "the host's name reads as a placeholder");
+    const box = await long.boundingBox();
+    const pane = await fleet.boundingBox();
+    assert.ok(box.x + box.width <= pane.x + pane.width + 1, "a long warning wraps inside the plan");
+
+    // Opening a module shows its diffs, host values as placeholders.
+    await nomadHead.click();
     const client = fleet.locator('li[data-resource="file.template[/etc/nomad.d/client.hcl]"]');
-    const head = (resource) =>
-      fleet.locator(`details.plan-module:has(li[data-resource="${resource}"]) > summary`).textContent();
-    assert.match(await head("file.template[/etc/nomad.d/client.hcl]"), /all \d+ hosts/);
+    await client.waitFor();
     assert.equal(await client.locator(".scope").count(), 0, "a change on all of its module's hosts adds no scope of its own");
     const text = await client.textContent();
     assert.match(text, /«fact:host\.id»/);
     assert.match(text, /«fact:host\.facts\.tailscale\.ip»/);
-    assert.match(await head("file.absent[/etc/grey/agent.token]"), /4 of \d+ hosts/);
     assert.ok((await fleet.locator(".mark--modify").count()) > 0);
     assert.ok((await fleet.locator(".mark--remove").count()) > 0);
 
@@ -152,7 +176,7 @@ describe("approving a phase", () => {
 
   test("dialogs keep the keyboard and close on Escape", async () => {
     const { page, close } = await open("/rollouts/42");
-    await page.getByRole("button", { name: "Review and approve…" }).click();
+    await page.getByRole("button", { name: "Approve cloud…" }).click();
     const dialog = page.getByRole("dialog");
     await dialog.waitFor();
     // Focus starts inside the dialog and Tab cannot leave it.
@@ -195,7 +219,7 @@ describe("approving a phase", () => {
 
   test("a running rollout offers no reject, only abort", async () => {
     const { page, close } = await open("/rollouts/42");
-    await page.getByRole("button", { name: "Review and approve…" }).waitFor();
+    await page.getByRole("button", { name: "Approve cloud…" }).waitFor();
     assert.equal(await page.getByRole("button", { name: "Reject…" }).count(), 0);
     await page.getByRole("button", { name: "Abort…" }).waitFor();
     await close();
