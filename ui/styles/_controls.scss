@@ -324,6 +324,15 @@ textarea.input {
   }
 }
 
+.tabs--small {
+  margin-bottom: 0.5rem;
+
+  .tabs__tab {
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+  }
+}
+
 .toolbar {
   display: flex;
   flex-wrap: wrap;

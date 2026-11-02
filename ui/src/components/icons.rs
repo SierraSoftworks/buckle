@@ -162,6 +162,50 @@ pub fn plus() -> Html {
     </> })
 }
 
+/// A change that creates something: a circled plus.
+pub fn create() -> Html {
+    icon(html! { <>
+        <circle cx="12" cy="12" r="9" />
+        <line x1="12" y1="8" x2="12" y2="16" />
+        <line x1="8" y1="12" x2="16" y2="12" />
+    </> })
+}
+
+/// A change that modifies something in place: a circled pencil stroke.
+pub fn modify() -> Html {
+    icon(html! { <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M9 15l1-3 4.5-4.5 2 2L12 14z" />
+    </> })
+}
+
+/// A change that removes something: a circled minus.
+pub fn remove() -> Html {
+    icon(html! { <>
+        <circle cx="12" cy="12" r="9" />
+        <line x1="8" y1="12" x2="16" y2="12" />
+    </> })
+}
+
+/// A step that cannot run: a circled cross.
+pub fn blocked() -> Html {
+    icon(html! { <>
+        <circle cx="12" cy="12" r="9" />
+        <line x1="9" y1="9" x2="15" y2="15" />
+        <line x1="15" y1="9" x2="9" y2="15" />
+    </> })
+}
+
+/// A host-specific value (a fact placeholder).
+pub fn host() -> Html {
+    icon(html! { <>
+        <rect x="3" y="4" width="18" height="7" rx="1.5" />
+        <rect x="3" y="13" width="18" height="7" rx="1.5" />
+        <line x1="7" y1="7.5" x2="7.01" y2="7.5" />
+        <line x1="7" y1="16.5" x2="7.01" y2="16.5" />
+    </> })
+}
+
 pub fn copy() -> Html {
     icon(html! { <>
         <rect x="9" y="9" width="12" height="12" rx="2" />

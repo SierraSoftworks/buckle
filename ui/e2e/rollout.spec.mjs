@@ -84,6 +84,7 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42");
     const pane = page.locator("#approval");
     await pane.getByRole("heading", { name: "Approve phase: cloud" }).waitFor();
+    await pane.getByRole("tab", { name: "By distinct plan" }).click();
     // Two distinct plans for twelve hosts, the destructive one flagged, the
     // secret rotation shown only as tokens.
     assert.equal(await pane.locator("details.plan").count(), 2);
@@ -114,6 +115,34 @@ describe("approving a phase", () => {
       assert.doesNotMatch(await gate.getAttribute("class"), /gate--closed/);
     });
     assert.equal(await page.locator('.stage[data-stage="cloud"] a.block--needs-approval').count(), 0);
+    await close();
+  });
+
+  test("shows the union across hosts with fact placeholders", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const fleet = page.locator("#approval").getByTestId("fleet-plan");
+    await fleet.waitFor();
+    // A module every host plans says so, its changes showing host values as
+    // placeholders; the retired module's cleanup names the hosts it runs on.
+    const client = fleet.locator('li[data-resource="file.template[/etc/nomad.d/client.hcl]"]');
+    const head = (resource) =>
+      fleet.locator(`details.plan-module:has(li[data-resource="${resource}"]) > summary`).textContent();
+    assert.match(await head("file.template[/etc/nomad.d/client.hcl]"), /all \d+ hosts/);
+    assert.equal(await client.locator(".scope").count(), 0, "a change on all of its module's hosts adds no scope of its own");
+    const text = await client.textContent();
+    assert.match(text, /«fact:host\.id»/);
+    assert.match(text, /«fact:host\.facts\.tailscale\.ip»/);
+    assert.match(await head("file.absent[/etc/grey/agent.token]"), /4 of \d+ hosts/);
+    assert.ok((await fleet.locator(".mark--modify").count()) > 0);
+    assert.ok((await fleet.locator(".mark--remove").count()) > 0);
+
+    // Hovering a placeholder shows what it stands for on some hosts.
+    await client.locator('.fact[data-fact="host.id"]').first().hover();
+    const tip = page.getByRole("tooltip");
+    await tip.waitFor();
+    assert.match(await tip.textContent(), /host\.id/);
+    assert.match(await tip.textContent(), /oci-1/);
+
     await close();
   });
 
