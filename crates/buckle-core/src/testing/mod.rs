@@ -361,7 +361,24 @@ impl System for FakeSystem {
     }
 
     async fn read(&self, path: &Path) -> Result<Option<Vec<u8>>> {
-        Ok(self.file(path))
+        // Like the real filesystem, reading follows symlinks.
+        let mut current = path.to_path_buf();
+        for _ in 0..40 {
+            match self.node(&current) {
+                Some(Node::File { bytes, .. }) => return Ok(Some(bytes)),
+                Some(Node::Symlink { target }) => {
+                    current = match current.parent() {
+                        Some(parent) if target.is_relative() => parent.join(target),
+                        _ => target,
+                    };
+                }
+                Some(Node::Dir { .. }) | None => return Ok(None),
+            }
+        }
+        Err(crate::error::user(
+            format!("{} is a symlink loop.", path.display()),
+            &["Fix the symlinks."],
+        ))
     }
 
     async fn stat(&self, path: &Path) -> Result<Option<FileMeta>> {
@@ -370,16 +387,9 @@ impl System for FakeSystem {
     }
 
     async fn write_atomic(&self, path: &Path, bytes: &[u8], perms: &FilePerms) -> Result<()> {
-        let existing = self.node(path);
-        let merged = match existing {
-            Some(Node::File { perms: old, .. }) => FilePerms {
-                mode: perms.mode.or(old.mode),
-                owner: perms.owner.clone().or(old.owner),
-                group: perms.group.clone().or(old.group),
-            },
-            _ => perms.clone(),
-        };
-        self.put_file(path, bytes.to_vec(), merged);
+        // Like the real write (a new file renamed into place), the result has
+        // exactly `perms`; nothing carries over from the file it replaces.
+        self.put_file(path, bytes.to_vec(), perms.clone());
         Ok(())
     }
 
@@ -436,10 +446,7 @@ impl System for FakeSystem {
                 .cloned()
                 .collect();
             if !children.is_empty() && !recursive {
-                return Err(crate::error::user(
-                    format!("{} is not empty", path.display()),
-                    &["Remove it recursively."],
-                ));
+                return Err(crate::system::not_empty(path));
             }
             for c in children {
                 inner.fs.remove(&c);
@@ -574,6 +581,10 @@ impl System for FakeSystem {
 
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         self.inner.lock().unwrap().now
+    }
+
+    fn temp_dir(&self) -> PathBuf {
+        PathBuf::from("/tmp")
     }
 }
 
@@ -723,6 +734,19 @@ mod tests {
         );
         assert!(sys.remove(Path::new("/etc"), true).await.unwrap());
         assert!(!sys.exists("/etc/a.conf"));
+    }
+
+    #[tokio::test]
+    async fn write_atomic_sets_perms_rather_than_merging_them() {
+        let sys = FakeSystem::new().with_file("/etc/a", "x", FilePerms::mode(0o600));
+        sys.write_atomic(Path::new("/etc/a"), b"y", &FilePerms::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            sys.stat(Path::new("/etc/a")).await.unwrap().unwrap().mode,
+            Some(0o644),
+            "like a new file renamed into place"
+        );
     }
 
     #[tokio::test]

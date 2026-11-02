@@ -14,14 +14,17 @@ use serde::{Deserialize, Serialize};
 /// the expression is true and fails when it is false. Use it for conditions
 /// such as `host.facts.hardware.disk.root.free_percent > 10`; facts cannot be
 /// indexed, so providers expose flat keys for exactly this. A fact that is
-/// missing (its provider failed or returned `null`) makes comparisons false,
-/// so the check fails; guard with `host.facts.x != null && ...` if absence
-/// should pass.
+/// missing (its provider returned `null`, or failed without ever producing a
+/// value) makes comparisons false, so the check fails; guard with
+/// `host.facts.x != null && ...` if absence should pass. A provider that fails
+/// after an earlier success keeps its last good value.
 ///
 /// The check reads the facts already in the context, it does not collect
-/// them. The engine refreshes facts before the rollout and drift scopes so
-/// that values such as free disk space are current when these checks run; a
-/// `manual` run uses whatever the agent last collected. An expression that
+/// them. After an apply, a module's checks see the facts refreshed by the
+/// providers it declares under `facts.provides` (re-run before its checks)
+/// and by modules applied before it. Outside an apply (`buckle health` and
+/// the baseline, rollout and drift scopes) the engine collects facts by
+/// provider TTL first, so a value can be up to one TTL old. An expression that
 /// does not parse is unknown, not failed.
 pub struct FilterCheck;
 
@@ -41,6 +44,13 @@ impl HealthCheck for FilterCheck {
 
     #[tracing::instrument(name = "health.filter", skip_all, fields(expr = %spec.expr))]
     async fn check(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
+        // Reasons can quote command output or response bodies: scrub known secrets.
+        super::redacted(cx, self.probe(cx, spec).await)
+    }
+}
+
+impl FilterCheck {
+    async fn probe(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
         let filter = match Filter::new(spec.expr.as_str()) {
             Ok(f) => f,
             Err(e) => {

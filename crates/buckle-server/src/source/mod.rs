@@ -82,6 +82,19 @@ impl RevisionBuilder {
             .await
     }
 
+    /// Announces an already stored revision again, as if it were new (the
+    /// branch moved back to it). Returns its record, if it is stored.
+    pub async fn reannounce(&self, id: &str) -> Result<Option<RevisionRecord>> {
+        let id = id.to_owned();
+        let record = self.store.call(move |db| db.revisions().get(&id)).await?;
+        if let Some(record) = &record
+            && let Some(f) = &self.on_added
+        {
+            f(record);
+        }
+        Ok(record)
+    }
+
     /// Builds a revision from `tree` (which is moved under the revision
     /// cache) and stores it. Returns the stored record.
     pub async fn build(
@@ -219,6 +232,10 @@ fn io_error(e: std::io::Error) -> buckle_core::Error {
 /// Verifies a GitHub-style `X-Hub-Signature-256: sha256=<hex>` header over
 /// `body` in constant time.
 pub fn verify_webhook_signature(secret: &str, body: &[u8], header: &str) -> bool {
+    // An empty key would make every signature computable by anyone.
+    if secret.is_empty() {
+        return false;
+    }
     let Some(hex_sig) = header.trim().strip_prefix("sha256=") else {
         return false;
     };

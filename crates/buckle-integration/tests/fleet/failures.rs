@@ -58,7 +58,18 @@ fn deploy_runs(system: &FakeSystem) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_modules_roll_back_locally_the_budget_pauses_and_operator_decisions_resolve_it() {
-    let mut world = World::start(common::app(common::ONE_PHASE, 1)).await;
+    // Skip the baseline check so every host's Apply leaves in the same wave:
+    // with `max_failures: 0` the first failure pauses the phase and nothing
+    // else starts, so a host still answering its baseline on a slow runner
+    // would otherwise stay Planned and the three-failure expectation would race.
+    let fleet = common::app_module(
+        Fleet::with_phases(
+            "  health: { baseline: skip, bake: 1s }\n",
+            common::ONE_PHASE,
+        ),
+        1,
+    );
+    let mut world = World::start(fleet).await;
     let v1 = world.source_revision();
     let ok = world.spawn(common::host("ok-1").system(deploys(common::healthy_system("ok-1"))));
     let task = world

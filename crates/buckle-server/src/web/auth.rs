@@ -8,6 +8,11 @@
 //! `admin_acl` whether it carries administrative rights (absent: nobody),
 //! both evaluated over [`AclRequest`]. Mutating requests also need the
 //! double-submit CSRF token.
+//!
+//! ACLs see the path the router dispatches on: percent-decoded, with any
+//! path that could be read two ways (an encoded `/` or `\`, a `.` or `..`
+//! segment) refused outright, so an encoded path cannot slip past a path
+//! rule. Signing out revokes the session server-side.
 
 use super::{ApiError, AppState};
 use actix_web::cookie::{Cookie, SameSite};
@@ -105,18 +110,70 @@ impl Filterable for AclRequest<'_> {
     }
 }
 
-/// The client address, honouring `web.trust_proxy` for `X-Forwarded-For`.
-pub fn client_ip(trust_proxy: bool, req: &HttpRequest) -> Option<String> {
-    if trust_proxy
-        && let Some(v) = req
+/// The client address, honouring `web.trust_proxy` for `X-Forwarded-For`:
+/// the entry `web.trusted_proxy_hops` (default 1) places from the right,
+/// which is the address the outermost trusted proxy saw. Entries to its
+/// left are the client's own claims and never used.
+pub fn client_ip(web: &crate::config::WebConfig, req: &HttpRequest) -> Option<String> {
+    if web.trust_proxy {
+        let hops = web.trusted_proxy_hops.unwrap_or(1).max(1) as usize;
+        let chain: Vec<&str> = req
             .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-        && let Some(first) = v.split(',').next().map(str::trim).filter(|s| !s.is_empty())
-    {
-        return Some(first.to_owned());
+            .get_all("x-forwarded-for")
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !chain.is_empty() {
+            // Fewer entries than hops: every entry was written by a trusted
+            // proxy, so the leftmost is the client.
+            let index = chain.len().saturating_sub(hops);
+            return Some(chain[index].to_owned());
+        }
     }
     req.peer_addr().map(|a| a.ip().to_string())
+}
+
+/// The request path as the router dispatches on it, percent-decoded, or
+/// `None` when it is ambiguous and must be refused: an encoded `/` or `\`,
+/// a literal backslash, a `.` or `..` segment (encoded or not), or bytes
+/// that do not decode to UTF-8.
+pub fn normalised_path(raw: &str) -> Option<String> {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            let decoded = match (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(h), Some(l)) => h * 16 + l,
+                _ => return None,
+            };
+            if matches!(decoded, b'/' | b'\\') {
+                return None;
+            }
+            out.push(decoded);
+            i += 3;
+        } else {
+            if b == b'\\' {
+                return None;
+            }
+            out.push(b);
+            i += 1;
+        }
+    }
+    let path = String::from_utf8(out).ok()?;
+    if path.split('/').any(|seg| seg == "." || seg == "..") {
+        return None;
+    }
+    Some(path)
 }
 
 fn is_mutating(method: &actix_web::http::Method) -> bool {
@@ -150,6 +207,9 @@ pub async fn resolve(state: &AppState, req: &HttpRequest) -> Result<Principal, A
             let Some(cookie) = req.cookie(SESSION_COOKIE) else {
                 return Err(ApiError::unauthorized());
             };
+            if state.revoked.contains(cookie.value()) {
+                return Err(ApiError::unauthorized());
+            }
             match oidc.validate(cookie.value(), None).await {
                 Ok(c) => (Some(c), true),
                 Err(e) if e.is(buckle_core::error::Kind::System) => {
@@ -191,12 +251,14 @@ pub fn evaluate(
     req: &HttpRequest,
     claims: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> (bool, bool) {
-    let path = req.path().to_owned();
+    // The middleware refuses ambiguous paths before this runs; the raw
+    // path is only a fallback for callers outside it.
+    let path = normalised_path(req.path()).unwrap_or_else(|| req.path().to_owned());
     let method = req.method().as_str().to_owned();
     let acl = AclRequest {
         method: &method,
         path: &path,
-        client_ip: client_ip(web.trust_proxy, req),
+        client_ip: client_ip(web, req),
         headers: req.headers(),
         claims,
     };
@@ -218,7 +280,16 @@ pub async fn middleware(
     req: ServiceRequest,
     next: actix_web::middleware::Next<BoxBody>,
 ) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
-    let path = req.path().to_owned();
+    let Some(path) = normalised_path(req.path()) else {
+        let (http, _) = req.into_parts();
+        return Ok(ServiceResponse::new(
+            http,
+            ApiError::bad_request(
+                "The request path contains an encoded separator or a dot segment.",
+            )
+            .response(),
+        ));
+    };
     if !path.starts_with("/api/v1/") || exempt(&path) {
         return next.call(req).await;
     }
@@ -307,6 +378,55 @@ impl PendingAuths {
         let p = self.inner.lock().ok()?.remove(state)?;
         (p.expires > Instant::now()).then_some(p)
     }
+}
+
+/// Sessions signed out before their id token expired, by SHA-256 of the
+/// token, until that expiry.
+#[derive(Default)]
+pub struct RevokedSessions {
+    inner: Mutex<HashMap<String, Instant>>,
+}
+
+impl RevokedSessions {
+    /// The longest a revocation is kept when the token's expiry cannot be read.
+    const FALLBACK: Duration = Duration::from_secs(24 * 3600);
+
+    /// Revokes the session holding `token` until the token expires.
+    pub fn revoke(&self, token: &str) {
+        let remaining = unverified_expiry(token)
+            .map(|exp| (exp - chrono::Utc::now().timestamp()).max(0) as u64)
+            .map(Duration::from_secs)
+            .unwrap_or(Self::FALLBACK)
+            .min(Self::FALLBACK);
+        let now = Instant::now();
+        let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        m.retain(|_, until| *until > now);
+        m.insert(super::oidc::sha256_b64(token), now + remaining);
+    }
+
+    /// Whether the session holding `token` was signed out.
+    pub fn contains(&self, token: &str) -> bool {
+        let key = super::oidc::sha256_b64(token);
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .is_some_and(|until| *until > Instant::now())
+    }
+}
+
+/// The `exp` claim of a JWT, without verifying it (only used to bound how
+/// long a revocation is remembered).
+fn unverified_expiry(token: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_i64()
 }
 
 /// A fixed-window limiter per client address for the sign-in endpoints.
@@ -405,6 +525,90 @@ mod tests {
     #[case(None, "/")]
     fn return_to_must_be_local(#[case] raw: Option<&str>, #[case] expected: &str) {
         assert_eq!(safe_return_to(raw), expected);
+    }
+
+    #[rstest]
+    #[case("/api/v1/fleet", Some("/api/v1/fleet"))]
+    #[case("/api/v1/fl%65et", Some("/api/v1/fleet"))]
+    #[case("/api/v1/hosts/a%20b", Some("/api/v1/hosts/a b"))]
+    #[case("/api/v1/hosts%2Fx", None)]
+    #[case("/api/v1/hosts%2fx", None)]
+    #[case("/api/v1/hosts%5Cx", None)]
+    #[case("/api/v1\\hosts", None)]
+    #[case("/api/v1/auth/../fleet", None)]
+    #[case("/api/v1/auth/%2e%2e/fleet", None)]
+    #[case("/api/v1/./fleet", None)]
+    #[case("/api/v1/bad%zz", None)]
+    #[case("/api/v1/bad%", None)]
+    #[case("/api/v1/%ff", None)]
+    #[case("/assets/app.js", Some("/assets/app.js"))]
+    fn paths_are_decoded_once_and_ambiguous_ones_refused(
+        #[case] raw: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(normalised_path(raw).as_deref(), expected);
+    }
+
+    fn forwarded(hops: Option<u32>, headers: &[&str]) -> Option<String> {
+        let mut req =
+            actix_web::test::TestRequest::get().peer_addr("10.9.9.9:1234".parse().unwrap());
+        for h in headers {
+            req = req.append_header(("x-forwarded-for", *h));
+        }
+        let web = crate::config::WebConfig {
+            trust_proxy: true,
+            trusted_proxy_hops: hops,
+            ..Default::default()
+        };
+        client_ip(&web, &req.to_http_request())
+    }
+
+    #[rstest]
+    #[case(None, &["6.6.6.6, 1.2.3.4"], Some("1.2.3.4"))]
+    #[case(None, &["6.6.6.6", "1.2.3.4"], Some("1.2.3.4"))]
+    #[case(Some(2), &["6.6.6.6, 1.2.3.4, 10.0.0.2"], Some("1.2.3.4"))]
+    #[case(Some(3), &["1.2.3.4, 10.0.0.2"], Some("1.2.3.4"))]
+    #[case(None, &[], Some("10.9.9.9"))]
+    fn the_client_is_the_rightmost_untrusted_hop(
+        #[case] hops: Option<u32>,
+        #[case] headers: &[&str],
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(forwarded(hops, headers).as_deref(), expected);
+    }
+
+    #[test]
+    fn without_trust_proxy_the_header_is_ignored() {
+        let req = actix_web::test::TestRequest::get()
+            .peer_addr("10.9.9.9:1234".parse().unwrap())
+            .insert_header(("x-forwarded-for", "6.6.6.6"))
+            .to_http_request();
+        assert_eq!(
+            client_ip(&Default::default(), &req).as_deref(),
+            Some("10.9.9.9")
+        );
+    }
+
+    #[test]
+    fn revoked_sessions_are_remembered_until_the_token_expires() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let exp = chrono::Utc::now().timestamp() + 600;
+        let token = format!(
+            "h.{}.s",
+            b64.encode(serde_json::json!({ "exp": exp }).to_string())
+        );
+        let revoked = RevokedSessions::default();
+        assert!(!revoked.contains(&token));
+        revoked.revoke(&token);
+        assert!(revoked.contains(&token));
+        assert!(!revoked.contains("another"));
+        let expired = format!(
+            "h.{}.s",
+            b64.encode(serde_json::json!({ "exp": 1 }).to_string())
+        );
+        revoked.revoke(&expired);
+        assert!(!revoked.contains(&expired), "nothing to remember");
     }
 
     #[test]

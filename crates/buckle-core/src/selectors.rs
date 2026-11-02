@@ -17,37 +17,31 @@ use std::sync::Arc;
 /// scalar JSON values (strings, numbers, booleans).
 pub type Labels = IndexMap<String, serde_json::Value>;
 
-/// A label value typed like a YAML scalar, the way both the server and the
-/// agent evaluate labels: `true`/`false` are booleans, canonical integers
-/// and decimals (`42`, `-3`, `1.5`) are numbers, anything else (`1.0`,
-/// `007`, `yes`, `worker`) stays a string. Labels arrive as strings (from
-/// agent.yaml, Hello, Welcome and the API), so `host.labels.canary == true`
-/// must see the same value on every side.
+/// A label value given as text (`--labels`, agent.yaml): `true`/`false`
+/// become booleans, `3` and `1.5` numbers, a quoted `"3"` or `'x'` the string
+/// inside the quotes, anything else the text itself.
 pub fn label_value(raw: &str) -> serde_json::Value {
-    match raw {
-        "true" => return serde_json::Value::Bool(true),
-        "false" => return serde_json::Value::Bool(false),
-        _ => {}
+    let raw = raw.trim();
+    match serde_yaml::from_str::<serde_yaml::Value>(raw) {
+        Ok(serde_yaml::Value::Bool(b)) => serde_json::Value::Bool(b),
+        Ok(serde_yaml::Value::Number(n)) => n
+            .as_i64()
+            .map(serde_json::Value::from)
+            .or_else(|| n.as_u64().map(serde_json::Value::from))
+            .or_else(|| {
+                n.as_f64()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(serde_json::Value::Number)
+            })
+            .unwrap_or_else(|| serde_json::Value::String(raw.to_owned())),
+        Ok(serde_yaml::Value::String(s)) => serde_json::Value::String(s),
+        _ => serde_json::Value::String(raw.to_owned()),
     }
-    if let Ok(i) = raw.parse::<i64>()
-        && i.to_string() == raw
-    {
-        return serde_json::Value::from(i);
-    }
-    if let Ok(f) = raw.parse::<f64>()
-        && f.is_finite()
-        && f.fract() != 0.0
-        && format!("{f}") == raw
-        && let Some(n) = serde_json::Number::from_f64(f)
-    {
-        return serde_json::Value::Number(n);
-    }
-    serde_json::Value::String(raw.to_owned())
 }
 
-/// String labels as typed [`Labels`] (see [`label_value`]).
-pub fn typed_labels<'a>(labels: impl IntoIterator<Item = (&'a String, &'a String)>) -> Labels {
-    labels
+/// Labels from text values, typed with [`label_value`].
+pub fn typed_labels<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)>) -> Labels {
+    pairs
         .into_iter()
         .map(|(k, v)| (k.clone(), label_value(v)))
         .collect()
@@ -153,10 +147,22 @@ impl HostContext {
         c
     }
 
-    /// Evaluates a selector against this host. Evaluation itself cannot fail;
-    /// parse errors were reported when the filter was built.
+    /// Evaluates a selector against this host, treating an evaluation error as
+    /// "no match". Use [`HostContext::try_matches`] where an error must not be
+    /// mistaken for a definite `false` (module selection, which drives removal).
     pub fn matches(&self, filter: &crate::Filter) -> bool {
-        filter.matches(self).unwrap_or(false)
+        self.try_matches(filter).unwrap_or(false)
+    }
+
+    /// Evaluates a selector against this host, reporting evaluation errors.
+    /// The error text names the filter, never the values it compared.
+    pub fn try_matches(&self, filter: &crate::Filter) -> Result<bool, String> {
+        filter.matches(self).map_err(|e| {
+            format!(
+                "the selector `{}` could not be evaluated: {e}",
+                filter.raw()
+            )
+        })
     }
 
     /// The template context (`host`, `vars`, `module`, `task`) as JSON. Secrets
@@ -339,29 +345,23 @@ fn lookup_path_ci<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a ser
 }
 
 #[cfg(test)]
-mod label_tests {
-    use super::label_value;
-    use rstest::rstest;
-
-    #[rstest]
-    #[case("true", serde_json::json!(true))]
-    #[case("false", serde_json::json!(false))]
-    #[case("42", serde_json::json!(42))]
-    #[case("-3", serde_json::json!(-3))]
-    #[case("1.5", serde_json::json!(1.5))]
-    #[case("1.0", serde_json::json!("1.0"))]
-    #[case("007", serde_json::json!("007"))]
-    #[case("yes", serde_json::json!("yes"))]
-    #[case("worker", serde_json::json!("worker"))]
-    #[case("True", serde_json::json!("True"))]
-    fn labels_are_typed_like_yaml_scalars(#[case] raw: &str, #[case] expected: serde_json::Value) {
-        assert_eq!(label_value(raw), expected);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case("true", serde_json::json!(true))]
+    #[case("False", serde_json::json!(false))]
+    #[case("3", serde_json::json!(3))]
+    #[case("1.5", serde_json::json!(1.5))]
+    #[case("\"3\"", serde_json::json!("3"))]
+    #[case("'true'", serde_json::json!("true"))]
+    #[case("worker", serde_json::json!("worker"))]
+    #[case("yes", serde_json::json!("yes"))]
+    #[case("", serde_json::json!(""))]
+    #[case("[a]", serde_json::json!("[a]"))]
+    fn label_values_parse_as_typed_scalars(#[case] raw: &str, #[case] expected: serde_json::Value) {
+        assert_eq!(label_value(raw), expected);
+    }
     use crate::Filter;
     use crate::secrets::{InstallKey, Secret, SecretStore};
     use rstest::rstest;

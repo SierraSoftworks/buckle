@@ -15,6 +15,33 @@ pub mod http;
 pub mod systemd;
 pub mod tcp;
 
+/// Runs a check's reason through the secret scrubber, so a failing command's
+/// output or an HTTP body that echoes a secret never reaches the UI or logs.
+pub(crate) fn redacted(
+    cx: &buckle_core::task::Cx,
+    status: buckle_core::health::HealthStatus,
+) -> buckle_core::health::HealthStatus {
+    use buckle_core::health::HealthStatus;
+    let scrub = |reason: String| {
+        if cx.secrets.is_empty() {
+            reason
+        } else {
+            buckle_core::secrets::redact::Redactor::new(&cx.secrets)
+                .redact(&reason)
+                .into_inner()
+        }
+    };
+    match status {
+        HealthStatus::Fail { reason } => HealthStatus::Fail {
+            reason: scrub(reason),
+        },
+        HealthStatus::Unknown { reason } => HealthStatus::Unknown {
+            reason: scrub(reason),
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tasks::sys_exec::testkit::cx;

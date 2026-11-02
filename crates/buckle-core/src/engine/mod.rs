@@ -26,7 +26,9 @@ pub mod validate;
 #[cfg(test)]
 mod tests;
 
-pub use validate::{ValidationIssue, ValidationReport, validate, validate_with_facts};
+pub use validate::{
+    HostSummary, ValidationIssue, ValidationReport, validate, validate_host, validate_with_facts,
+};
 
 use crate::facts::Facts;
 use crate::health::{HealthReport, HealthScope};
@@ -49,6 +51,10 @@ pub struct Revision {
     pub modules: Vec<LoadedModule>,
     /// Raw contents of every `vars` overlay file referenced by the fleet config.
     pub var_files: indexmap::IndexMap<PathBuf, serde_yaml::Value>,
+    /// Directories under `modules/` that have no `module.yaml`. Their module
+    /// is indeterminate: resources recorded under that name are never treated
+    /// as orphans, because the directory may be a module mid-edit.
+    pub unloaded: Vec<String>,
 }
 
 impl Revision {
@@ -101,6 +107,22 @@ pub struct Inputs {
     /// When set, `facts` is used as-is and no provider runs: for tests and
     /// `--facts` fixtures.
     pub facts_frozen: bool,
+    /// Whether apply runs the plan's removals. When false the plan still lists
+    /// them (and its digest is unchanged) but apply leaves the resources and
+    /// their records alone: the agent's unattended drift correction passes
+    /// false so that only an operator-approved apply removes anything.
+    pub removals: bool,
+    /// Drift mode: plan only the modules this host has applied at
+    /// `revision` (per [`crate::state::State::module_at`]) and never treat a
+    /// resource recorded at another revision as an orphan. Modules that moved
+    /// on to a newer revision, failed, or never ran are reported in
+    /// [`Plan::held`] and left alone. Set it on the inputs of both the plan
+    /// and the apply (the apply re-plans and compares digests).
+    pub drift: bool,
+    /// Directories planning may write to besides the system's temp dir (the
+    /// agent passes `<state_dir>/tmp`). Any other mutation while planning is
+    /// refused (see [`crate::system::PlanGuard`]).
+    pub scratch_dirs: Vec<PathBuf>,
 }
 
 impl Inputs {
@@ -129,7 +151,29 @@ impl Inputs {
             stable_revision: None,
             agent_vars: Vars::new(),
             facts_frozen: false,
+            removals: true,
+            drift: false,
+            scratch_dirs: Vec::new(),
         }
+    }
+
+    /// A directory planning may write to (e.g. `<state_dir>/tmp`).
+    pub fn with_scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch_dirs.push(dir.into());
+        self
+    }
+
+    /// Drift mode; see [`Inputs::drift`].
+    pub fn with_drift(mut self, drift: bool) -> Self {
+        self.drift = drift;
+        self
+    }
+
+    /// Whether apply runs the plan's removals (default true). Plans list
+    /// removals either way.
+    pub fn with_removals(mut self, removals: bool) -> Self {
+        self.removals = removals;
+        self
     }
 
     /// Labels managed on the server, overlaid on the agent's own.
@@ -263,6 +307,15 @@ pub enum ModuleStatus {
     RolledBack,
     NotStarted,
     Deferred,
+    /// The module's selection could not be decided on this host (see
+    /// [`crate::plan::Indeterminate`]); it was not applied.
+    Indeterminate,
+    /// The module applied what it could but some steps stayed blocked; the
+    /// run needs attention (it does not count as a success).
+    Blocked,
+    /// The module was deferred, and its `when` turned out false against the
+    /// refreshed facts: not applied, its resources removed as orphans.
+    Skipped,
 }
 
 /// Progress events emitted during apply, for the agent to stream to the server.
@@ -323,6 +376,20 @@ impl Engine {
         let span = tracing::info_span!("engine.plan", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id);
         let (rich, facts) =
             tracing::Instrument::instrument(planner::plan(inputs, &inputs.revision), span).await?;
+        Ok((rich.plan, facts))
+    }
+
+    /// [`Engine::plan`] in drift mode (see [`Inputs::drift`]) whatever
+    /// `inputs.drift` says. To correct the drift, apply the plan with inputs
+    /// that have [`Inputs::with_drift`]`(true)` (and, unattended,
+    /// [`Inputs::with_removals`]`(false)`).
+    pub async fn drift(inputs: &Inputs) -> crate::Result<(Plan, Facts)> {
+        let span = tracing::info_span!("engine.drift", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id);
+        let (rich, facts) = tracing::Instrument::instrument(
+            planner::plan_mode(inputs, &inputs.revision, true),
+            span,
+        )
+        .await?;
         Ok((rich.plan, facts))
     }
 

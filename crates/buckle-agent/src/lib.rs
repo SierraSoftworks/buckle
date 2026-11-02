@@ -50,6 +50,23 @@ pub async fn run_with_version(
     agent_version: &str,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> buckle_core::Result<i32> {
+    run_with_system(
+        config,
+        agent_version,
+        Arc::new(buckle_core::system::RealSystem::new()),
+        shutdown,
+    )
+    .await
+}
+
+/// [`run_with_version`] over a caller-supplied [`buckle_core::system::System`],
+/// which is how the binary attaches its HTTP client to the real host system.
+pub async fn run_with_system(
+    config: AgentConfig,
+    agent_version: &str,
+    system: Arc<dyn buckle_core::system::System>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> buckle_core::Result<i32> {
     config.validate()?;
     let transport: Arc<dyn transport::Transport> = match &config.source {
         Some(source) => {
@@ -63,10 +80,7 @@ pub async fn run_with_version(
         None => Arc::new(transport::grpc::GrpcTransport::new(&config)?),
     };
     let state = Arc::new(store::Store::new(&config.state_dir).state_store());
-    let runner = Arc::new(runner::EngineRunner::new(
-        Arc::new(buckle_core::system::RealSystem::new()),
-        state,
-    ));
+    let runner = Arc::new(runner::EngineRunner::new(system, state));
     let updater = Arc::new(update::GitHubUpdater::new(agent_version));
     let options = AgentOptions {
         agent_version: agent_version.to_owned(),

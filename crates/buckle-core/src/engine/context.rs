@@ -3,11 +3,13 @@
 //! agent-local overrides), rendered lazily with cycle detection.
 
 use super::Revision;
+use crate::facts::Facts;
 use crate::model::ModuleConfig;
 use crate::selectors::{HostContext, Labels, Vars};
 use crate::template::Templater;
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 
 /// The agent's labels with the server's overlaid; the server wins on conflicts.
 pub fn merged_labels(agent: &Labels, server: &Labels) -> Labels {
@@ -19,16 +21,117 @@ pub fn merged_labels(agent: &Labels, server: &Labels) -> Labels {
 }
 
 /// Evaluates the fleet's group selectors against `ctx` (labels and facts; no
-/// groups yet). Groups keep their declaration order.
-pub fn evaluate_groups(revision: &Revision, ctx: &HostContext) -> Vec<String> {
-    revision
-        .fleet
-        .fleet
-        .groups
-        .iter()
-        .filter(|(_, selector)| ctx.matches(selector))
-        .map(|(name, _)| name.clone())
+/// groups yet), keeping declaration order. Also returns the groups whose
+/// membership is uncertain: their selector could not be evaluated, or reads
+/// facts that are unavailable in `facts`.
+pub fn evaluate_groups_checked(
+    revision: &Revision,
+    ctx: &HostContext,
+    facts: &Facts,
+) -> (Vec<String>, Vec<String>) {
+    let mut member = Vec::new();
+    let mut uncertain = Vec::new();
+    for (name, selector) in &revision.fleet.fleet.groups {
+        match ctx.try_matches(selector) {
+            Ok(true) => member.push(name.clone()),
+            Ok(false) => {}
+            Err(_) => {
+                uncertain.push(name.clone());
+                continue;
+            }
+        }
+        if selector_uncertainty(selector.raw(), facts, &[]).is_some() {
+            uncertain.push(name.clone());
+        }
+    }
+    (member, uncertain)
+}
+
+static FACT_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bhost\.facts\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)")
+        .expect("static regex compiles")
+});
+static GROUPS_REF: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\bhost\.groups\b").expect("static regex compiles"));
+static VARS_REF: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\bvars\.").expect("static regex compiles"));
+
+/// The fact paths (below `host.facts.`) a selector or template mentions.
+pub fn fact_references(text: &str) -> Vec<String> {
+    FACT_REF
+        .captures_iter(text)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_owned()))
         .collect()
+}
+
+/// Whether the fact path `path` (below `host.facts.`) lies under one of the
+/// provider mount points `providers`, compared case-insensitively.
+pub fn provided_by(path: &str, providers: &[String]) -> bool {
+    let path = path.to_ascii_lowercase();
+    providers.iter().any(|p| {
+        let p = p.to_ascii_lowercase();
+        path == p || path.starts_with(&format!("{p}.")) || p.starts_with(&format!("{path}."))
+    })
+}
+
+/// Every fact path a module's text mentions: its vars, task and handler
+/// specs and `when`s, and the fleet's vars overlays (which feed its vars).
+pub fn module_fact_references(revision: &Revision, module: &ModuleConfig) -> Vec<String> {
+    fn strings<'a>(value: &'a serde_yaml::Value, out: &mut Vec<&'a str>) {
+        match value {
+            serde_yaml::Value::String(s) => out.push(s),
+            serde_yaml::Value::Sequence(items) => items.iter().for_each(|v| strings(v, out)),
+            serde_yaml::Value::Mapping(map) => map.values().for_each(|v| strings(v, out)),
+            serde_yaml::Value::Tagged(t) => strings(&t.value, out),
+            _ => {}
+        }
+    }
+    let mut texts: Vec<&str> = Vec::new();
+    module.vars.values().for_each(|v| strings(v, &mut texts));
+    for decl in module.tasks.iter().chain(module.handlers.values()) {
+        strings(&decl.spec, &mut texts);
+        if let Some(w) = &decl.when {
+            texts.push(w.raw());
+        }
+    }
+    for overlay in &revision.fleet.vars {
+        overlay.values.values().for_each(|v| strings(v, &mut texts));
+        if let Some(file) = &overlay.file
+            && let Some(content) = revision.var_files.get(file)
+        {
+            strings(content, &mut texts);
+        }
+    }
+    texts.into_iter().flat_map(fact_references).collect()
+}
+
+/// Whether a selector mentions `vars.*`.
+pub fn reads_vars(text: &str) -> bool {
+    VARS_REF.is_match(text)
+}
+
+/// Why a selector's result cannot be trusted on this host, if it cannot: it
+/// reads facts of a provider that failed without an earlier value, or reads
+/// `host.groups` while some group's membership is uncertain.
+pub fn selector_uncertainty(
+    raw: &str,
+    facts: &Facts,
+    uncertain_groups: &[String],
+) -> Option<String> {
+    for path in fact_references(raw) {
+        if facts.is_unavailable_path(&path) {
+            return Some(format!(
+                "it reads host.facts.{path}, but that fact provider failed and has no earlier value"
+            ));
+        }
+    }
+    if GROUPS_REF.is_match(raw) && !uncertain_groups.is_empty() {
+        return Some(format!(
+            "it reads host.groups, and the membership of {} is uncertain because a fact provider failed",
+            uncertain_groups.join(", ")
+        ));
+    }
+    None
 }
 
 /// Converts a YAML value into JSON. Non-string mapping keys are stringified.
@@ -69,36 +172,6 @@ fn yaml_key(key: &serde_yaml::Value) -> String {
         other => serde_yaml::to_string(other)
             .map(|s| s.trim().to_owned())
             .unwrap_or_default(),
-    }
-}
-
-/// Renders every string scalar in `value` that contains template syntax with
-/// [`Templater::render_plain`] and returns the result as JSON. A reference to a
-/// secret is an error: task spec fields are plain strings that end up in plans.
-pub fn render_value(
-    value: &serde_yaml::Value,
-    templater: &Templater,
-    ctx: &HostContext,
-) -> crate::Result<serde_json::Value> {
-    match value {
-        serde_yaml::Value::String(s) if Templater::needs_render(s) => {
-            Ok(serde_json::Value::String(templater.render_plain(s, ctx)?))
-        }
-        serde_yaml::Value::Sequence(items) => Ok(serde_json::Value::Array(
-            items
-                .iter()
-                .map(|v| render_value(v, templater, ctx))
-                .collect::<crate::Result<Vec<_>>>()?,
-        )),
-        serde_yaml::Value::Mapping(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                out.insert(yaml_key(k), render_value(v, templater, ctx)?);
-            }
-            Ok(serde_json::Value::Object(out))
-        }
-        serde_yaml::Value::Tagged(tagged) => render_value(&tagged.value, templater, ctx),
-        other => Ok(yaml_to_json(other)),
     }
 }
 

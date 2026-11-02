@@ -161,6 +161,25 @@ impl<'c> Revisions<'c> {
         Ok(())
     }
 
+    /// Where a blob with this digest can be read from within one of
+    /// `revisions`: `(revision, path)`.
+    pub fn find_blob_in(
+        &self,
+        digest: &str,
+        revisions: &[String],
+    ) -> Result<Option<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT revision, path FROM revision_blobs WHERE digest = ?1")
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![digest], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()
+            .map_err(db_error)?;
+        Ok(rows.into_iter().find(|(rev, _)| revisions.contains(rev)))
+    }
+
     /// Where a blob with this digest can be read from: `(revision, path)`.
     pub fn find_blob(&self, digest: &str) -> Result<Option<(String, String)>> {
         self.conn

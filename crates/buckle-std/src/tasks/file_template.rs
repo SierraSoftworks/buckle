@@ -1,13 +1,13 @@
 //! `file.template`: render a Jinja template from the module and write it to the host.
 
-use super::hostkit::{self, describe_perms, diffable_text, digest_change, effective_perms};
+use super::hostkit::{self, describe_perms, diffable_text, digest_change};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::secrets::sinks::FileSink;
 use buckle_core::secrets::{Redacted, Rendered};
 use buckle_core::state::ResourceRecord;
-use buckle_core::system::{Command, FileKind, FileMeta, FilePerms};
-use buckle_core::task::{Applied, Cx, Mode, Task};
+use buckle_core::system::{FileKind, FileMeta, FilePerms};
+use buckle_core::task::{Applied, Cx, Task};
 use buckle_core::{Digest, Platforms, Result, error};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -36,12 +36,17 @@ use tracing::instrument;
 /// the plan reports `content changed (digest a → b)` rather than a diff.
 ///
 /// `validate` is a command (argv) run against the rendered content before it
-/// replaces the destination; `{path}` is replaced with a temporary file next
-/// to `dest`. A non-zero exit fails the task and leaves `dest` untouched.
-/// When the file contains secrets, the validator's output is not echoed.
+/// replaces the destination (and while planning); `{path}` is replaced with a
+/// private temporary file under `<state_dir>/tmp`, deleted afterwards. A
+/// non-zero exit fails the task and leaves `dest` untouched. When the file
+/// contains secrets, the validator's output is not echoed. Without
+/// `validate`, `/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are
+/// checked with `visudo -cf {path}` and `sshd -t -f {path}` (when those tools
+/// are installed); `validate: []` turns that off.
 ///
 /// Removal deletes `dest` only if its content still matches what Buckle wrote.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Template path, relative to the module's `files/` directory.
     pub src: String,
@@ -50,6 +55,7 @@ pub struct Spec {
     #[serde(flatten)]
     pub perms: FilePerms,
     /// A command that checks the rendered file; `{path}` stands for the file to check.
+    /// Default: automatic for sudoers and sshd_config; `[]` disables.
     #[serde(default)]
     pub validate: Option<Vec<String>>,
     /// Keep a timestamped `.bak` copy of the destination before replacing its content.
@@ -110,13 +116,36 @@ impl FileTemplate {
             if !perms.is_empty() {
                 summary.push_str(&format!(" (and {})", perms.join(", ")));
             }
-            // The old content is only shown when the new render is secret-free: a
-            // sensitive file that drifted would otherwise be read back into a plan.
-            match (&rendered, diffable_text(&current)) {
-                (Rendered::Plain(_), Some(old)) => Planned::change(Diff::unified(
+            // The file is known to hold secrets when the new render does, or
+            // when the shadow recorded last time does. Such a file is never read
+            // back into a plan: the old side is the previous redacted shadow (a
+            // rotated secret shows as a fingerprint change on exactly its line),
+            // provided the file is still what Buckle wrote; otherwise only the
+            // digest change is shown.
+            let previous = cx.previous.as_deref();
+            let sensitive = rendered.is_sensitive() || hostkit::ever_sensitive(cx);
+            let unchanged_since_written = previous
+                .and_then(|r| r.content_digest.as_ref())
+                .is_some_and(|d| *d == current_digest);
+            let context = if sensitive {
+                0
+            } else {
+                hostkit::diff_context(cx, &spec.dest)
+            };
+            match (
+                sensitive,
+                previous.and_then(|r| r.shadow.as_ref()),
+                diffable_text(&current),
+            ) {
+                (true, Some(shadow), _) if unchanged_since_written => Planned::change(
+                    hostkit::redacted_unified(cx, summary, shadow.get(), redacted.get(), context),
+                ),
+                (false, _, Some(old)) => Planned::change(hostkit::redacted_unified(
+                    cx,
                     summary,
-                    &Redacted::plain(old.to_owned()),
-                    &redacted,
+                    old,
+                    redacted.get(),
+                    context,
                 )),
                 _ => {
                     let preview = hostkit::truncate_redacted(redacted.clone())
@@ -137,72 +166,6 @@ impl FileTemplate {
             redacted,
             existing: Some((meta, current)),
         })
-    }
-
-    /// Runs the `validate` command against the real render in a temporary file next to `dest`.
-    async fn validate(&self, cx: &Cx, spec: &Spec, rendered: &Rendered) -> Result<()> {
-        let Some(argv) = &spec.validate else {
-            return Ok(());
-        };
-        if !argv.iter().any(|a| a.contains("{path}")) {
-            return Err(error::user(
-                "The `validate` command does not contain the `{path}` placeholder.",
-                &[
-                    "Add `{path}` where the command takes the file to check, e.g. [\"nginx\", \"-t\", \"-c\", \"{path}\"].",
-                ],
-            ));
-        }
-        let parent = spec.dest.parent().unwrap_or(std::path::Path::new("/"));
-        if cx.mode == Mode::Plan && cx.system.stat(parent).await?.is_none() {
-            // Validating would mean creating the directory; apply will validate.
-            return Ok(());
-        }
-        let tmp = hostkit::sibling_temp(&spec.dest, "buckle-validate");
-        let perms = FilePerms {
-            mode: Some(spec.perms.mode.unwrap_or(0o600)),
-            owner: None,
-            group: None,
-        };
-        FileSink
-            .write_rendered(&*cx.system, &tmp, rendered, &perms)
-            .await?;
-        let substituted: Vec<String> = argv
-            .iter()
-            .map(|a| a.replace("{path}", &tmp.to_string_lossy()))
-            .collect();
-        let outcome = match Command::from_argv(&substituted) {
-            Some(command) => cx.system.run(command).await,
-            None => Err(error::user(
-                "The `validate` command is empty.",
-                &["Give the program and its arguments as a list."],
-            )),
-        };
-        // Always clean up, whatever the validator said.
-        let _ = cx.system.remove(&tmp, false).await;
-        let out = outcome?;
-        if out.success() {
-            return Ok(());
-        }
-        let detail = if rendered.is_sensitive() {
-            "Its output is withheld because the file contains secrets.".to_owned()
-        } else {
-            format!("stderr: {}", hostkit::output_tail(&out.stderr))
-        };
-        Err(error::user(
-            format!(
-                "The rendered content for {} failed validation: `{}` {}. {detail}",
-                spec.dest.display(),
-                substituted.join(" "),
-                match out.code {
-                    Some(c) => format!("exited with status {c}"),
-                    None => "did not exit cleanly".to_owned(),
-                },
-            ),
-            &[
-                "Fix the template or the variables it uses; the destination file was not changed.",
-                "Run the validator by hand against the rendered file to see the full message.",
-            ],
-        ))
     }
 }
 
@@ -229,8 +192,17 @@ impl Task for FileTemplate {
     #[instrument(name = "task.file.template.plan", skip_all, fields(src = %spec.src, dest = %spec.dest.display()))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         let inspection = self.inspect(cx, spec).await?;
-        if inspection.planned.is_change() && content_changes(&inspection) {
-            self.validate(cx, spec, &inspection.rendered).await?;
+        if inspection.planned.is_change()
+            && content_changes(&inspection)
+            && let hostkit::validate::Checked::ToolMissing(reason) = hostkit::validate::check(
+                cx,
+                &spec.dest,
+                spec.validate.as_deref(),
+                hostkit::validate::Content::Rendered(&inspection.rendered),
+            )
+            .await?
+        {
+            return Ok(Planned::blocked(reason));
         }
         Ok(inspection.planned)
     }
@@ -243,32 +215,54 @@ impl Task for FileTemplate {
         let shadow = (inspection.redacted.get().len() <= hostkit::SHADOW_LIMIT)
             .then(|| inspection.redacted.clone());
         if !inspection.planned.is_change() {
-            return Ok(hostkit::written(
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("{} already up to date", dest.display()),
                 dest,
+                false,
                 digest,
                 shadow,
                 false,
             ));
         }
-        if content_changes(&inspection) {
-            self.validate(cx, spec, &inspection.rendered).await?;
+        let wrote_content = content_changes(&inspection);
+        if wrote_content {
+            hostkit::validate::check(
+                cx,
+                &spec.dest,
+                spec.validate.as_deref(),
+                hostkit::validate::Content::Rendered(&inspection.rendered),
+            )
+            .await?;
             let existing_meta = inspection.existing.as_ref().map(|(m, _)| m);
             if spec.backup
                 && let Some((meta, current)) = &inspection.existing
             {
                 hostkit::backup_file(cx, dest, meta, current).await?;
             }
-            let perms = effective_perms(&spec.perms, existing_meta);
+            // A new file with secrets in it is not world-readable unless asked.
+            let perms = hostkit::effective_perms_sensitive(
+                &spec.perms,
+                existing_meta,
+                inspection.rendered.is_sensitive(),
+            );
             FileSink
                 .write_rendered(&*cx.system, dest, &inspection.rendered, &perms)
                 .await?;
         } else {
             cx.system.set_perms(dest, &spec.perms).await?;
         }
-        Ok(hostkit::written(
-            format!("wrote {}", dest.display()),
+        // A permission change on a file Buckle never wrote adopts it rather than
+        // claiming it, so that removal does not delete a file Buckle did not create.
+        Ok(hostkit::ownership::file_written(
+            cx,
+            if wrote_content {
+                format!("wrote {}", dest.display())
+            } else {
+                format!("updated permissions of {}", dest.display())
+            },
             dest,
+            wrote_content,
             digest,
             shadow,
             true,
@@ -464,8 +458,8 @@ mod tests {
         for (path, content) in seen.iter() {
             assert_ne!(path, "{path}", "the placeholder was substituted");
             assert!(
-                path.replace('\\', "/").starts_with("/etc/app/"),
-                "the temp file is next to dest: {path}"
+                path.replace('\\', "/").starts_with("/var/lib/buckle/tmp/"),
+                "the temp file is in Buckle's scratch directory, not next to dest: {path}"
             );
             assert_eq!(content, "name = nomad\n", "it saw the real render");
             assert!(!sys.exists(path), "the temp file is removed");
@@ -506,7 +500,7 @@ mod tests {
         assert!(
             sys.paths()
                 .iter()
-                .all(|p| !p.to_string_lossy().contains("buckle-validate"))
+                .all(|p| !p.to_string_lossy().contains("validate-"))
         );
     }
 
@@ -575,5 +569,162 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_mode_only_change_adopts_a_preexisting_file_and_removal_leaves_it() {
+        let sys =
+            FakeSystem::new().with_file("/etc/app.conf", "name = nomad\n", FilePerms::mode(0o644));
+        let c = vars_cx(&sys, source());
+        let s600 =
+            spec::<Spec>(json!({"src": "app.conf.j2", "dest": "/etc/app.conf", "mode": "0600"}));
+        let applied = apply(&FileTemplate, &c, &s600).await;
+        assert!(
+            !applied
+                .artefacts
+                .iter()
+                .any(|a| matches!(a, buckle_core::task::Artefact::File { .. })),
+            "Buckle did not write the file, so it does not own it: {:?}",
+            applied.artefacts
+        );
+        let rec = record("file.template", "/etc/app.conf", &applied);
+        let out = FileTemplate.remove(&c, &rec).await.unwrap();
+        assert!(
+            !out.changed && out.summary.contains("existed before"),
+            "{}",
+            out.summary
+        );
+        assert!(sys.exists("/etc/app.conf"));
+
+        // A file Buckle wrote stays its own after a later mode-only change.
+        let sys = FakeSystem::new();
+        let c = vars_cx(&sys, source());
+        let wrote = apply(&FileTemplate, &c, &s600).await;
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .source(source())
+            .host((*c.host).clone())
+            .previous(record("file.template", "/etc/app.conf", &wrote))
+            .build();
+        let spec_0640 =
+            spec::<Spec>(json!({"src": "app.conf.j2", "dest": "/etc/app.conf", "mode": "0640"}));
+        let again = apply(&FileTemplate, &c, &spec_0640).await;
+        assert!(
+            again
+                .artefacts
+                .iter()
+                .any(|a| matches!(a, buckle_core::task::Artefact::File { .. }))
+        );
+        assert!(
+            FileTemplate
+                .remove(&c, &record("file.template", "/etc/app.conf", &again))
+                .await
+                .unwrap()
+                .changed
+        );
+    }
+
+    fn cx_with_previous(
+        sys: &FakeSystem,
+        value: &str,
+        previous: buckle_core::state::ResourceRecord,
+    ) -> Cx {
+        buckle_core::testing::CxBuilder::new(sys.clone())
+            .source(source_with_name())
+            .secrets(secrets("token", value))
+            .previous(previous)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn a_rotated_secret_shows_both_fingerprints_on_its_line_and_neither_value() {
+        const OLD: &str = "old-secret-value-1";
+        const NEW: &str = "new-secret-value-2";
+        let sys = FakeSystem::new();
+        let s: Spec = spec(json!({"src": "secret.conf.j2", "dest": "/etc/app.conf"}));
+        let first = apply(
+            &FileTemplate,
+            &cx_secrets(&sys, source_with_name(), secrets("token", OLD)),
+            &s,
+        )
+        .await;
+        let old_token = first
+            .shadow
+            .as_ref()
+            .unwrap()
+            .get()
+            .trim()
+            .trim_start_matches("token = ")
+            .to_owned();
+        let rotated = cx_with_previous(&sys, NEW, record("file.template", "/etc/app.conf", &first));
+        let planned = FileTemplate.plan(&rotated, &s).await.unwrap();
+        let Diff::Update {
+            unified: Some(u), ..
+        } = diff(&planned)
+        else {
+            panic!("{planned:?}")
+        };
+        let text = u.get();
+        let minus: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .collect();
+        let plus: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .collect();
+        assert_eq!(
+            minus,
+            vec![format!("-token = {old_token}").as_str()],
+            "{text}"
+        );
+        assert_eq!(plus.len(), 1, "{text}");
+        assert!(
+            plus[0].contains("\u{ab}secret:token@") && plus[0] != minus[0].replacen('-', "+", 1)
+        );
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(!json.contains(OLD) && !json.contains(NEW), "{json}");
+
+        // A sensitive file new on disk is created 0600 when no mode was given.
+        let meta = buckle_core::system::System::stat(&sys, std::path::Path::new("/etc/app.conf"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.mode, Some(0o600));
+    }
+
+    #[tokio::test]
+    async fn once_a_file_held_secrets_its_disk_content_is_never_diffed() {
+        // The template no longer uses the secret, but the file on disk still holds it.
+        const VALUE: &str = "still-on-disk-secret";
+        let sys = FakeSystem::new();
+        let s: Spec = spec(json!({"src": "secret.conf.j2", "dest": "/etc/app.conf"}));
+        let first = apply(
+            &FileTemplate,
+            &cx_secrets(&sys, source_with_name(), secrets("token", VALUE)),
+            &s,
+        )
+        .await;
+        let plain = buckle_core::testing::CxBuilder::new(sys.clone())
+            .source(MemorySource::new().with("secret.conf.j2", "token = none\n"))
+            .previous(record("file.template", "/etc/app.conf", &first))
+            .build();
+        let planned = FileTemplate.plan(&plain, &s).await.unwrap();
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(!json.contains(VALUE), "{json}");
+        assert!(
+            json.contains("secret:token@"),
+            "the old side is the redacted shadow: {json}"
+        );
+
+        // Drifted since Buckle wrote it: only a digest summary.
+        put(
+            &sys,
+            "/etc/app.conf",
+            &format!("token = {VALUE}\nextra = 1\n"),
+        )
+        .await;
+        let planned = FileTemplate.plan(&plain, &s).await.unwrap();
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(!json.contains(VALUE) && json.contains("digest"), "{json}");
     }
 }

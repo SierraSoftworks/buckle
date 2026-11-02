@@ -1,6 +1,7 @@
 //! The `Fleet` service.
 
 use super::auth::{self, Whois};
+use super::guard::SessionGuard;
 use super::tls::ServerIdentity;
 use crate::clock::Clock;
 use crate::config::{AgentAuth, AgentsConfig, Registration};
@@ -9,14 +10,14 @@ use crate::rollout::{Connected, ControllerHandle, HostLink, Sessions};
 use crate::secrets::ServerSecrets;
 use crate::source::cache::RevisionCache;
 use crate::store::{HealthEventRecord, NewAudit, NewHost, RunRecord, Store};
-use buckle_api::{Connection as LinkState, HealthSummary, HostStatus, LiveEvent};
+use buckle_api::{Connection as LinkState, HealthSummary, HostStatus, LiveEvent, RevisionStatus};
 use buckle_proto::v1::fleet_server::{Fleet, FleetServer};
 use buckle_proto::v1::{
     Ack, AgentMessage, Chunk, FetchBlobRequest, FetchRevisionRequest, FetchSecretsRequest, Hello,
     Rejected, SecretBundle, ServerMessage, Welcome, agent_message, server_message,
 };
 use futures::{Stream, StreamExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,6 +43,8 @@ pub struct FleetService {
     pub events: EventBus,
     pub clock: Arc<dyn Clock>,
     pub server_version: String,
+    /// Live-session cancellation, enrolment throttling and the Hello timeout.
+    pub guard: Arc<SessionGuard>,
 }
 
 impl std::fmt::Debug for FleetService {
@@ -175,13 +178,33 @@ impl FleetService {
                             false,
                         ));
                     }
+                    // Whois says who the peer is, not that it belongs to the
+                    // fleet: nodes shared in from other tailnets reach us too.
+                    let trust = &self.agents.tailscale;
+                    let admitted = trust.admits(&identity.tags, identity.user.as_deref());
+                    if trust.is_configured() && !admitted {
+                        return Err((
+                            format!(
+                                "The tailnet node '{}' is not trusted as an agent; give it one of agents.tailscale.allowed_tags or have one of agents.tailscale.allowed_users own it.",
+                                identity.node
+                            ),
+                            false,
+                        ));
+                    }
                     let id = identity.node.clone();
-                    let status = self.initial_status();
+                    let status = if admitted {
+                        self.initial_status()
+                    } else {
+                        HostStatus::Pending
+                    };
                     let now = self.now();
                     let created = self
                         .store
                         .call(move |db| match db.hosts().get(&id)? {
-                            Some(h) => Ok((h.status, false)),
+                            // Enrolled with a token: the token is its identity,
+                            // not whichever tailnet node carries its name.
+                            Some(h) if h.token_hash.is_some() => Ok(None),
+                            Some(h) => Ok(Some((h.status, false))),
                             None => {
                                 db.hosts().create(&NewHost {
                                     id: id.clone(),
@@ -190,11 +213,17 @@ impl FleetService {
                                     auth_method: "tailscale".into(),
                                     at: now,
                                 })?;
-                                Ok((status, true))
+                                Ok(Some((status, true)))
                             }
                         })
                         .await
                         .map_err(|e| (e.description().to_string(), true))?;
+                    let Some(created) = created else {
+                        tracing::debug!(host = %identity.node, "a token-enrolled host on the tailnet; authenticating by token");
+                        return self
+                            .authenticate_by_token(Some(peer), hello, metadata_token)
+                            .await;
+                    };
                     if created.1 {
                         self.audit(
                             "controller",
@@ -219,6 +248,17 @@ impl FleetService {
                 }
             }
         }
+        self.authenticate_by_token(peer, hello, metadata_token)
+            .await
+    }
+
+    /// Token authentication and bootstrap enrolment.
+    async fn authenticate_by_token(
+        &self,
+        peer: Option<SocketAddr>,
+        hello: &Hello,
+        metadata_token: Option<String>,
+    ) -> Result<Authenticated, (String, bool)> {
         if !self.uses(AgentAuth::Token) {
             return Err((
                 "This server accepts agents over the tailnet only.".into(),
@@ -259,6 +299,14 @@ impl FleetService {
         let Some(bootstrap) = &self.agents.bootstrap_token else {
             return Err(("The token is not recognised.".into(), false));
         };
+        // Anything that is not a per-host token is a bootstrap attempt;
+        // throttle them per address so the bootstrap token cannot be guessed.
+        if !self.guard.allow_enrolment(peer.map(|p| p.ip())) {
+            return Err((
+                "Too many enrolment attempts from this address; try again in a minute.".into(),
+                true,
+            ));
+        }
         if !auth::constant_time_eq(&token, bootstrap) {
             return Err(("The token is not recognised.".into(), false));
         }
@@ -276,11 +324,11 @@ impl FleetService {
         let outcome = self
             .store
             .transaction(move |db| match db.hosts().get(&id)? {
-                Some(h) if h.token_hash.is_some() => Ok(Err(h.id)),
-                Some(h) => {
-                    db.hosts().set_token_hash(&h.id, &issued_hash)?;
-                    Ok(Ok(h.status))
-                }
+                // Never hand a token for an identity that already exists:
+                // an enrolled host presents its per-host token, and a host
+                // registered over the tailnet never gets one this way. A
+                // forgotten host has no row and enrols afresh.
+                Some(h) => Ok(Err(h.id)),
                 None => {
                     db.hosts().create(&NewHost {
                         id: id.clone(),
@@ -297,7 +345,7 @@ impl FleetService {
         match outcome {
             Err(id) => Err((
                 format!(
-                    "'{id}' is already enrolled; present its per-host token instead of the bootstrap token."
+                    "'{id}' is already registered; present its per-host token, or forget the host in the UI to enrol it again."
                 ),
                 false,
             )),
@@ -328,7 +376,26 @@ impl FleetService {
             && whois.covers(&peer)
             && let Ok(Some(identity)) = whois.whois(&peer).await
         {
-            return Ok(identity.node);
+            let trust = &self.agents.tailscale;
+            if trust.is_configured() && !trust.admits(&identity.tags, identity.user.as_deref()) {
+                return Err(Status::permission_denied(
+                    "this tailnet node is not trusted as an agent",
+                ));
+            }
+            let node = identity.node.clone();
+            let token_enrolled = self
+                .store
+                .call(move |db| {
+                    Ok(db
+                        .hosts()
+                        .get(&node)?
+                        .is_some_and(|h| h.token_hash.is_some()))
+                })
+                .await
+                .map_err(internal)?;
+            if !token_enrolled {
+                return Ok(identity.node);
+            }
         }
         let token = request
             .metadata()
@@ -343,6 +410,42 @@ impl FleetService {
             .map_err(internal)?
             .map(|h| h.id)
             .ok_or_else(|| Status::unauthenticated("the token is not recognised"))
+    }
+
+    /// The revisions `host` may fetch content and secrets for: only an
+    /// active host, and only the stable revision and the revisions its
+    /// rollouts assign it (design §06: content and secrets are scoped to what
+    /// the host is meant to run).
+    async fn entitled(&self, host: &str) -> Result<BTreeSet<String>, Status> {
+        let h = host.to_owned();
+        let (record, mut revisions, stable) = self
+            .store
+            .call(move |db| {
+                Ok((
+                    db.hosts().get(&h)?,
+                    db.rollouts().revisions_for_host(&h)?,
+                    db.kv().get(crate::store::kv::keys::STABLE_REVISION)?,
+                ))
+            })
+            .await
+            .map_err(internal)?;
+        let record =
+            record.ok_or_else(|| Status::permission_denied("the host is not registered"))?;
+        if record.status != HostStatus::Active {
+            return Err(Status::permission_denied("the host is not active"));
+        }
+        revisions.extend(stable);
+        Ok(revisions)
+    }
+
+    /// Checks that `host` may fetch `revision` and that it is valid.
+    async fn entitled_to(&self, host: &str, revision: &str) -> Result<(), Status> {
+        if !self.entitled(host).await?.contains(revision) {
+            return Err(Status::permission_denied(
+                "the revision is not assigned to this host",
+            ));
+        }
+        Ok(())
     }
 
     async fn welcome(&self, host: &str, authed: &Authenticated, session_id: u64) -> Welcome {
@@ -723,7 +826,17 @@ impl Fleet for FleetService {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let mut inbound = request.into_inner();
-        let hello = match inbound.message().await? {
+        let first = match tokio::time::timeout(self.guard.hello_timeout, inbound.message()).await {
+            Ok(m) => m?,
+            Err(_) => {
+                tracing::debug!(peer = ?peer, "a session sent no Hello in time");
+                return Ok(Response::new(rejected(
+                    "The session must start with Hello.",
+                    true,
+                )));
+            }
+        };
+        let hello = match first {
             Some(AgentMessage {
                 msg: Some(agent_message::Msg::Hello(h)),
             }) => h,
@@ -734,13 +847,8 @@ impl Fleet for FleetService {
                 )));
             }
         };
-        let authed = match self.authenticate(peer, &hello, metadata_token).await {
-            Ok(a) => a,
-            Err((reason, retry)) => {
-                tracing::warn!(peer = ?peer, host = %hello.host_id, reason = %reason, "agent rejected");
-                return Ok(Response::new(rejected(reason, retry)));
-            }
-        };
+        // Before anything is written: a refused old agent must be able to
+        // enrol once it has been upgraded.
         if let Some(min) = &self.agents.minimum_agent_version
             && !auth::version_at_least(&hello.agent_version, min)
         {
@@ -752,6 +860,13 @@ impl Fleet for FleetService {
                 false,
             )));
         }
+        let authed = match self.authenticate(peer, &hello, metadata_token).await {
+            Ok(a) => a,
+            Err((reason, retry)) => {
+                tracing::warn!(peer = ?peer, host = %hello.host_id, reason = %reason, "agent rejected");
+                return Ok(Response::new(rejected(reason, retry)));
+            }
+        };
         let host = authed.host.clone();
         let now = self.now();
         {
@@ -774,6 +889,7 @@ impl Fleet for FleetService {
                 .map_err(internal)?;
         }
         let (session_id, rx) = self.sessions.attach(&host);
+        let closed = self.guard.sessions.register(&host, session_id);
         let welcome = self.welcome(&host, &authed, session_id).await;
         tracing::info!(buckle.host = %host, session = session_id, status = %welcome.status, version = %hello.agent_version, "agent connected");
         self.controller.connected(Connected {
@@ -789,9 +905,17 @@ impl Fleet for FleetService {
 
         let svc = self.clone();
         let reader_host = host.clone();
+        let reader_closed = closed.clone();
         tokio::spawn(async move {
             loop {
-                match inbound.message().await {
+                let next = tokio::select! {
+                    _ = reader_closed.cancelled() => {
+                        tracing::info!(buckle.host = %reader_host, session = session_id, "session closed by the server");
+                        break;
+                    }
+                    m = inbound.message() => m,
+                };
+                match next {
                     Ok(Some(AgentMessage { msg: Some(m) })) => svc.route(&reader_host, m).await,
                     Ok(Some(_)) => {}
                     Ok(None) => break,
@@ -801,6 +925,7 @@ impl Fleet for FleetService {
                     }
                 }
             }
+            svc.guard.sessions.release(&reader_host, session_id);
             if svc.sessions.detach(&reader_host, session_id) {
                 let now = svc.now();
                 let h = reader_host.clone();
@@ -818,7 +943,8 @@ impl Fleet for FleetService {
             msg: Some(server_message::Msg::Welcome(welcome)),
         };
         let stream = futures::stream::once(async move { Ok(first) })
-            .chain(UnboundedReceiverStream::new(rx).map(Ok));
+            .chain(UnboundedReceiverStream::new(rx).map(Ok))
+            .take_until(closed.cancelled_owned());
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -826,8 +952,9 @@ impl Fleet for FleetService {
         &self,
         request: Request<FetchRevisionRequest>,
     ) -> Result<Response<Self::FetchRevisionStream>, Status> {
-        self.caller(&request).await?;
+        let host = self.caller(&request).await?;
         let id = request.into_inner().revision;
+        self.entitled_to(&host, &id).await?;
         let id2 = id.clone();
         let record = self
             .store
@@ -849,12 +976,13 @@ impl Fleet for FleetService {
         &self,
         request: Request<FetchBlobRequest>,
     ) -> Result<Response<Self::FetchBlobStream>, Status> {
-        self.caller(&request).await?;
+        let host = self.caller(&request).await?;
         let digest = request.into_inner().digest;
+        let allowed: Vec<String> = self.entitled(&host).await?.into_iter().collect();
         let d2 = digest.clone();
         let (revision, path) = self
             .store
-            .call(move |db| db.revisions().find_blob(&d2))
+            .call(move |db| db.revisions().find_blob_in(&d2, &allowed))
             .await
             .map_err(internal)?
             .ok_or_else(|| Status::not_found("no such blob"))?;
@@ -868,19 +996,27 @@ impl Fleet for FleetService {
     ) -> Result<Response<SecretBundle>, Status> {
         let host = self.caller(&request).await?;
         let req = request.into_inner();
-        let h = host.clone();
-        let (record, facts) = self
+        self.entitled_to(&host, &req.revision).await?;
+        let (h, r) = (host.clone(), req.revision.clone());
+        let (record, facts, revision_record) = self
             .store
             .call(move |db| {
                 let rec = db.hosts().get(&h)?;
                 let facts = db.hosts().latest_facts(&h)?.map(|(f, _)| f);
-                Ok((rec, facts.unwrap_or(serde_json::Value::Null)))
+                Ok((
+                    rec,
+                    facts.unwrap_or(serde_json::Value::Null),
+                    db.revisions().get(&r)?,
+                ))
             })
             .await
             .map_err(internal)?;
         let record = record.ok_or_else(|| Status::unauthenticated("unknown host"))?;
         if record.status != HostStatus::Active {
             return Err(Status::permission_denied("the host is not active"));
+        }
+        if revision_record.map(|r| r.status) != Some(RevisionStatus::Valid) {
+            return Err(Status::failed_precondition("the revision is not valid"));
         }
         let revision = self
             .revisions

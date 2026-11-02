@@ -16,6 +16,7 @@ pub mod config;
 pub mod events;
 pub mod fleet;
 pub mod grpc;
+pub mod metrics;
 pub mod rollout;
 pub mod secrets;
 pub mod source;
@@ -126,12 +127,26 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         ));
     }
 
+    tasks.push(tokio::spawn(metrics::run(
+        store.clone(),
+        sessions.clone(),
+        cancel.clone(),
+    )));
+
     let identity = grpc::tls::load(&config.listen.tls, &config.data_dir)?;
     match &identity {
         Some(id) => {
             tracing::info!(fingerprint = %format_args!("sha256:{}", id.fingerprint), "gRPC TLS certificate fingerprint (agents pin this with --ca-fingerprint)")
         }
         None => tracing::warn!("the gRPC listener is plaintext (listen.tls.mode: none)"),
+    }
+    if config.agents.auth.contains(&config::AgentAuth::Tailscale)
+        && config.agents.registration == config::Registration::Auto
+        && !config.agents.tailscale.is_configured()
+    {
+        tracing::warn!(
+            "agents.tailscale lists no allowed_tags or allowed_users: new tailnet nodes register as pending and wait for an admin"
+        );
     }
     let whois: Option<Arc<dyn grpc::Whois>> = config
         .agents
@@ -142,6 +157,7 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
                 config.agents.tailscale_socket.clone(),
             )) as Arc<dyn grpc::Whois>
         });
+    let guard = Arc::new(grpc::SessionGuard::default());
     let fleet = grpc::FleetService {
         store: store.clone(),
         sessions: sessions.clone(),
@@ -153,6 +169,7 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         events: events.clone(),
         clock,
         server_version: VERSION.to_owned(),
+        guard: guard.clone(),
     };
     let grpc_listener = tokio::net::TcpListener::bind(&config.listen.grpc)
         .await
@@ -174,7 +191,12 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         )
     })?;
     tracing::info!(address = %config.listen.http, "serving the API and UI");
-    let state = web::AppState::new(
+    if config.web.oidc.is_some() && config.web.user_acl.is_none() {
+        tracing::warn!(
+            "web.oidc is configured without web.user_acl: anyone the identity provider signs in may read the fleet"
+        );
+    }
+    let mut state = web::AppState::new(
         store,
         revisions,
         controller,
@@ -184,6 +206,7 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         trigger,
         VERSION.to_owned(),
     );
+    state.agent_sessions = guard.sessions.clone();
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
 
     let mut failed = false;

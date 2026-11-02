@@ -5,8 +5,10 @@
 //! [`crate::testing::FakeSystem`], which is why the task library's unit tests
 //! are hermetic and fast.
 
+mod guard;
 mod real;
 
+pub use guard::PlanGuard;
 pub use real::{HttpClient, RealSystem};
 
 use crate::Platform;
@@ -232,8 +234,9 @@ pub struct GroupInfo {
     pub members: Vec<String>,
 }
 
-/// An HTTP request issued by a task or health check.
-#[derive(Debug, Clone, Default)]
+/// An HTTP request issued by a task or health check. Its `Debug` shows
+/// header names but never their values (they carry tokens).
+#[derive(Clone, Default)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
@@ -242,6 +245,26 @@ pub struct HttpRequest {
     pub timeout: Option<Duration>,
     /// Accept any TLS certificate (for local self-signed endpoints in health checks).
     pub insecure: bool,
+}
+
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field(
+                "header_names",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("body_bytes", &self.body.as_ref().map(Vec::len))
+            .field("timeout", &self.timeout)
+            .field("insecure", &self.insecure)
+            .finish()
+    }
 }
 
 impl HttpRequest {
@@ -277,6 +300,61 @@ impl HttpResponse {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+}
+
+/// The error `System::remove` returns for a non-empty directory without
+/// `recursive`, identical for every implementation.
+pub fn not_empty(path: &Path) -> crate::Error {
+    crate::error::user(
+        format!("The directory {} is not empty.", path.display()),
+        &["Remove its contents first, or remove it recursively."],
+    )
+}
+
+/// The temp-file name [`RealSystem`]'s `write_atomic` uses next to `path`'s
+/// file name: `.<name>.buckle-tmp-` followed by the writer's pid.
+pub fn temp_prefix_for(file_name: &str) -> String {
+    format!(".{file_name}.buckle-tmp-")
+}
+
+/// Removes files in `dir` named `<prefix><pid>` left by a process that is no
+/// longer running (a crash between writing a temp file and renaming it).
+/// Best effort: errors are ignored.
+pub fn remove_temp_leftovers(dir: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name
+            .strip_prefix(prefix)
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != me && !process_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        match i32::try_from(pid) {
+            Ok(raw) => !matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None),
+                Err(nix::errno::Errno::ESRCH)
+            ),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Without a cheap liveness probe, only our own pid counts as alive.
+        pid == std::process::id()
     }
 }
 
@@ -342,6 +420,12 @@ pub trait System: Send + Sync {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
     }
+
+    /// A directory for scratch files (validator inputs, downloads being
+    /// checked). Planning may write here; nowhere else.
+    fn temp_dir(&self) -> PathBuf {
+        std::env::temp_dir()
+    }
 }
 
 #[cfg(test)]
@@ -374,6 +458,15 @@ mod tests {
             yaml.contains("'0640'") || yaml.contains("\"0640\""),
             "{yaml}"
         );
+    }
+
+    #[test]
+    fn http_request_debug_shows_header_names_but_never_values() {
+        let req =
+            HttpRequest::get("https://api.example/x").header("Authorization", "Bearer s3cret");
+        let dbg = format!("{req:?}");
+        assert!(dbg.contains("Authorization"), "{dbg}");
+        assert!(!dbg.contains("s3cret"), "{dbg}");
     }
 
     #[test]

@@ -113,15 +113,28 @@ impl std::fmt::Display for ValidationReport {
 }
 
 static SECRET_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)").expect("static regex compiles")
+    // `secrets` must start a word (not `mysecrets.x`, not `host.secrets.x`);
+    // the regex crate has no look-behind, so the boundary is matched as a
+    // non-capturing prefix.
+    regex::Regex::new(
+        r#"(?:^|[^A-Za-z0-9_.])secrets\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*(?:"([^"]+)"|'([^']+)')\s*\])"#,
+    )
+    .expect("static regex compiles")
 });
 
-/// The secret names referenced by a piece of text (`secrets.NAME`, with or
-/// without `.present` / `.fingerprint`).
+/// The secret names referenced by a piece of text: `secrets.NAME` (with or
+/// without `.present` / `.fingerprint`) and the subscript forms
+/// `secrets["NAME"]` / `secrets['NAME']`. `secrets` must begin a word, so
+/// `mysecrets.x` and `host.secrets.x` are not references.
 pub fn secret_references(text: &str) -> BTreeSet<String> {
     SECRET_REF
         .captures_iter(text)
-        .filter_map(|c| c.get(1).map(|m| m.as_str().to_owned()))
+        .filter_map(|c| {
+            c.get(1)
+                .or_else(|| c.get(2))
+                .or_else(|| c.get(3))
+                .map(|m| m.as_str().to_owned())
+        })
         .collect()
 }
 
@@ -220,6 +233,14 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
         }
     }
 
+    for name in &revision.unloaded {
+        report.warning(
+            Some(name),
+            format!("modules/{name}"),
+            "the directory has no module.yaml: nothing is planned for it, and resources Buckle recorded for a module of this name are kept rather than removed",
+        );
+    }
+
     // Module names and graph.
     let mut seen: HashMap<&str, usize> = HashMap::new();
     for m in &revision.modules {
@@ -300,6 +321,9 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             }
         }
         let check_decl = |report: &mut ValidationReport, decl: &TaskDecl, location: &str| {
+            if let Some(problem) = after_unsupported(decl) {
+                report.error(Some(name), location, problem);
+            }
             if crate::task::registry().get(decl.kind.as_str()).is_none() {
                 report.error(
                     Some(name),
@@ -333,11 +357,11 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             }
         };
         for (i, decl) in m.config.tasks.iter().enumerate() {
-            check_decl(
-                &mut report,
-                decl,
-                &format!("{file} tasks[{i}] ({})", decl.kind),
-            );
+            let location = format!("{file} tasks[{i}] ({})", decl.kind);
+            check_decl(&mut report, decl, &location);
+            if let Some(problem) = command_run_without_id(decl) {
+                report.error(Some(name), &location, problem);
+            }
         }
         for (hname, decl) in &m.config.handlers {
             check_decl(
@@ -384,6 +408,24 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
     Ok(report)
 }
 
+/// What a dry planning pass decided for one host (`buckle validate --facts`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSummary {
+    pub host: String,
+    /// Fleet groups the host is a member of.
+    pub groups: Vec<String>,
+    /// Modules selected, in dependency order.
+    pub selected: Vec<String>,
+    pub skipped: Vec<String>,
+    /// Modules whose `when` reads facts a selected module provides: decided
+    /// on the host after that module applies.
+    #[serde(default)]
+    pub conditional: Vec<String>,
+    /// Modules whose selection cannot be decided from these facts.
+    #[serde(default)]
+    pub indeterminate: Vec<crate::plan::Indeterminate>,
+}
+
 /// Static validation plus a dry planning pass for one host described by
 /// `host` and `facts`: groups, vars, module selection, spec rendering, spec
 /// parsing and resource keys (duplicates are errors). No task `plan` runs and
@@ -393,15 +435,74 @@ pub async fn validate_with_facts(
     host: &HostIdentity,
     facts: &Facts,
 ) -> crate::Result<ValidationReport> {
+    Ok(validate_host(revision, host, facts).await?.0)
+}
+
+/// [`validate_with_facts`], also returning what was decided for the host
+/// (`None` when static validation already failed). Module-scoped problems are
+/// reported per module; an indeterminate module is a warning.
+pub async fn validate_host(
+    revision: &Revision,
+    host: &HostIdentity,
+    facts: &Facts,
+) -> crate::Result<(ValidationReport, Option<HostSummary>)> {
     let mut report = validate(revision)?;
     if !report.is_ok() {
-        return Ok(report);
+        return Ok((report, None));
     }
+    let location = format!("host {}", host.id);
     match super::planner::dry_run(revision, host, facts).await {
-        Ok(()) => {}
-        Err(err) => report.error(None, format!("host {}", host.id), err.message()),
+        Ok(dry) => {
+            for (module, message, is_error) in &dry.problems {
+                if *is_error {
+                    report.error(
+                        Some(module),
+                        &location,
+                        format!("module '{module}': {message}"),
+                    );
+                } else {
+                    report.warning(
+                        Some(module),
+                        &location,
+                        format!("module '{module}': {message}"),
+                    );
+                }
+            }
+            for i in &dry.summary.indeterminate {
+                report.warning(
+                    Some(&i.module),
+                    &location,
+                    format!("module '{}' is indeterminate: {}", i.module, i.reason),
+                );
+            }
+            Ok((report, Some(dry.summary)))
+        }
+        Err(err) => {
+            report.error(None, location, err.message());
+            Ok((report, None))
+        }
     }
-    Ok(report)
+}
+
+/// `after:` is parsed but not implemented: tasks of a module run strictly in
+/// order. Rather than silently ignoring it, it is rejected.
+pub fn after_unsupported(decl: &TaskDecl) -> Option<String> {
+    decl.after.as_ref().map(|_| {
+        "sets `after:`, which this Buckle does not support: the tasks of a module run one at a time in the order they are written; remove `after:` and order the tasks instead".to_owned()
+    })
+}
+
+/// `command.run` is keyed by its rendered command line, so editing the
+/// command (or a var inside it) turns the old resource into an orphan and runs
+/// its `remove:`. A task with `remove:` must therefore carry an explicit `id`.
+pub fn command_run_without_id(decl: &TaskDecl) -> Option<String> {
+    let has_remove = decl
+        .spec
+        .as_mapping()
+        .is_some_and(|m| m.contains_key(serde_yaml::Value::String("remove".into())));
+    (decl.kind == "command.run" && has_remove && decl.id.is_none()).then(|| {
+        "sets `remove:` but no `id`: a command.run is identified by its rendered command, so editing the command (or a var inside it) would run the old `remove:`; give the task a stable `id`".to_owned()
+    })
 }
 
 /// Looks up the kind for `decl`, as a validation-friendly error.

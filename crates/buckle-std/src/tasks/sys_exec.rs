@@ -1,12 +1,14 @@
 //! Helpers shared by the apt, systemd, sysctl and ufw task kinds: running
-//! commands through [`System`], and a tiny ownership ledger.
+//! commands through [`System`], and reading the legacy ownership ledger.
 //!
-//! The ledger exists because [`buckle_core::task::Task::apply`] cannot see the
-//! resource's previous [`buckle_core::state::ResourceRecord`]. A task that
-//! must remember "Buckle installed this package" across a later re-apply (for
-//! example a version bump, when the package is already installed) records the
-//! fact in the ledger as well as in its artefacts, so that the artefacts of the
-//! new record stay complete.
+//! Ownership ("Buckle installed this package", "Buckle enabled this unit") is
+//! per resource: a task reads what its own previous apply recorded from
+//! [`Cx::previous`] and records it again (see `hostkit::ownership`). Earlier
+//! versions also kept a host-global ledger under `<state_dir>/ledger/`, keyed
+//! only by package or unit name, which let one module claim (and later
+//! remove) what another module installed. The ledger is no longer written;
+//! [`legacy_ledger`] reads it for the one-time migration of `ufw.default` and
+//! `ufw.state` records, whose "value before Buckle" lived only there.
 
 use buckle_core::Result;
 use buckle_core::system::{Command, Output};
@@ -30,7 +32,7 @@ pub(crate) async fn run_checked(cx: &Cx, command: Command) -> Result<Output> {
     if out.success() {
         return Ok(out);
     }
-    let detail = first_lines(&out.stderr_str(), &out.stdout_str(), 6);
+    let detail = super::hostkit::scrub(cx, &first_lines(&out.stderr_str(), &out.stdout_str(), 6));
     let how = if out.timed_out {
         "timed out".to_owned()
     } else {
@@ -95,61 +97,16 @@ pub(crate) fn squash_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A persistent key → value map under `<state_dir>/ledger/<namespace>.json`.
-pub(crate) struct Ledger {
-    path: PathBuf,
-    entries: BTreeMap<String, String>,
-}
-
-impl Ledger {
-    pub(crate) async fn open(cx: &Cx, namespace: &str) -> Result<Self> {
-        let path = state_dir(cx)
-            .join("ledger")
-            .join(format!("{namespace}.json"));
-        let entries = match cx.system.read(&path).await? {
-            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            None => BTreeMap::new(),
-        };
-        Ok(Self { path, entries })
-    }
-
-    pub(crate) fn get(&self, key: &str) -> Option<&str> {
-        self.entries.get(key).map(String::as_str)
-    }
-
-    pub(crate) fn contains(&self, key: &str) -> bool {
-        self.entries.contains_key(key)
-    }
-
-    pub(crate) fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.entries.insert(key.into(), value.into());
-    }
-
-    pub(crate) fn remove(&mut self, key: &str) -> Option<String> {
-        self.entries.remove(key)
-    }
-
-    /// Persists the ledger, deleting the file when it is empty.
-    pub(crate) async fn save(&self, cx: &Cx) -> Result<()> {
-        if self.entries.is_empty() {
-            cx.system.remove(&self.path, false).await?;
-            return Ok(());
-        }
-        let bytes = serde_json::to_vec_pretty(&self.entries).map_err(|e| {
-            buckle_core::error::wrap_system(
-                e,
-                "The ownership ledger could not be serialised.",
-                &["This is a bug in Buckle; please report it."],
-            )
-        })?;
-        cx.system
-            .write_atomic(
-                &self.path,
-                &bytes,
-                &buckle_core::system::FilePerms::mode(0o600),
-            )
-            .await
-    }
+/// Reads the legacy ledger `<state_dir>/ledger/<namespace>.json` (never
+/// written any more). Empty when it is missing or unreadable.
+pub(crate) async fn legacy_ledger(cx: &Cx, namespace: &str) -> Result<BTreeMap<String, String>> {
+    let path = state_dir(cx)
+        .join("ledger")
+        .join(format!("{namespace}.json"));
+    Ok(match cx.system.read(&path).await? {
+        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        None => BTreeMap::new(),
+    })
 }
 
 /// Whether `path` is the same as what we last wrote, judged by digest. `None`
@@ -181,6 +138,14 @@ pub(crate) mod testkit {
     /// A context over a clone of `sys`, so the test can keep inspecting `sys`.
     pub fn cx(sys: &FakeSystem) -> Cx {
         CxBuilder::new(sys.clone()).module("web").build()
+    }
+
+    /// A context whose resource was applied before with `previous`.
+    pub fn cx_after(sys: &FakeSystem, previous: ResourceRecord) -> Cx {
+        CxBuilder::new(sys.clone())
+            .module("web")
+            .previous(previous)
+            .build()
     }
 
     /// The record the engine would persist for an apply result.

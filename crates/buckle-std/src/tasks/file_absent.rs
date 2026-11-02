@@ -21,10 +21,16 @@ use tracing::instrument;
 /// ```
 ///
 /// A symlink is removed as a link and its target is left alone. A non-empty
-/// directory is reported as blocked unless `recursive: true`. Because Buckle
+/// directory is reported as blocked unless `recursive: true`. A recursive
+/// delete is refused for `/`, for any top-level directory (`/etc`, `/var`,
+/// `/home`, ...), for well-known system directories such as `/usr/lib` or
+/// `/var/lib`, for a path containing `..`, and for a path that is empty or
+/// has surrounding whitespace (the usual sign of a template that rendered
+/// nothing). Because Buckle
 /// deleted something that was not its own, there is nothing to undo when the
 /// task is later removed from the configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path to delete.
     pub path: PathBuf,
@@ -36,8 +42,80 @@ pub struct Spec {
 pub struct FileAbsent;
 buckle_core::register_task!(FileAbsent);
 
+/// System directories (beyond `/` and every top-level directory) that a
+/// recursive delete must never target.
+const PROTECTED: &[&str] = &[
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/libexec",
+    "/usr/local",
+    "/usr/share",
+    "/usr/include",
+    "/var/lib",
+    "/var/log",
+    "/var/cache",
+    "/var/spool",
+    "/var/backups",
+    "/etc/ssh",
+    "/etc/systemd",
+    "/etc/default",
+    "/etc/apt",
+    "/etc/sudoers.d",
+    "/etc/ssl",
+    "/etc/pam.d",
+    "/etc/security",
+    "/etc/network",
+    "/etc/netplan",
+    "/boot/efi",
+    "/lib/modules",
+];
+
+/// Refuses recursive deletes of paths whose removal would wreck the host.
+fn check_recursive_target(path: &std::path::Path) -> Result<()> {
+    use std::path::Component;
+    let text = path.to_string_lossy();
+    let refuse = |why: &str| {
+        Err(buckle_core::error::user(
+            format!("file.absent refuses to delete '{text}' recursively: {why}."),
+            &[
+                "Check the `path` (and the variables it is rendered from).",
+                "Delete a more specific path, such as the application's own subdirectory.",
+            ],
+        ))
+    };
+    if text.trim().is_empty() {
+        return refuse("the path is empty");
+    }
+    if text.trim() != text {
+        return refuse("the path has leading or trailing whitespace");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return refuse("the path contains `.` or `..`");
+    }
+    let normal: Vec<_> = path
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .collect();
+    if normal.len() <= 1 {
+        return refuse("it is the root or a top-level directory");
+    }
+    let trimmed = text.trim_end_matches('/');
+    if PROTECTED.contains(&trimmed) {
+        return refuse("it is a system directory");
+    }
+    Ok(())
+}
+
 impl FileAbsent {
     async fn inspect(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
+        if spec.recursive {
+            check_recursive_target(&spec.path)?;
+        }
         hostkit::require_absolute(&spec.path, "path")?;
         let Some(meta) = cx.system.stat(&spec.path).await? else {
             return Ok(Planned::NoOp);
@@ -123,28 +201,28 @@ mod tests {
 
     #[rstest]
     #[case::missing(FakeSystem::new(), false, Class::NoOp)]
-    #[case::file(FakeSystem::new().with_file("/x", "1", FilePerms::default()), false, Class::Change)]
-    #[case::empty_dir(FakeSystem::new().with_dir("/x", FilePerms::default()), false, Class::Change)]
-    #[case::full_dir_needs_recursive(FakeSystem::new().with_file("/x/a", "1", FilePerms::default()), false, Class::Blocked)]
-    #[case::full_dir_recursive(FakeSystem::new().with_file("/x/a", "1", FilePerms::default()), true, Class::Change)]
+    #[case::file(FakeSystem::new().with_file("/srv/x", "1", FilePerms::default()), false, Class::Change)]
+    #[case::empty_dir(FakeSystem::new().with_dir("/srv/x", FilePerms::default()), false, Class::Change)]
+    #[case::full_dir_needs_recursive(FakeSystem::new().with_file("/srv/x/a", "1", FilePerms::default()), false, Class::Blocked)]
+    #[case::full_dir_recursive(FakeSystem::new().with_file("/srv/x/a", "1", FilePerms::default()), true, Class::Change)]
     #[tokio::test]
     async fn plan_outcomes(
         #[case] sys: FakeSystem,
         #[case] recursive: bool,
         #[case] expected: Class,
     ) {
-        let s: Spec = spec(json!({"path": "/x", "recursive": recursive}));
+        let s: Spec = spec(json!({"path": "/srv/x", "recursive": recursive}));
         assert_eq!(plan_class(&FileAbsent, &cx(&sys), &s).await, expected);
     }
 
     #[tokio::test]
     async fn apply_deletes_and_second_plan_is_a_noop() {
-        let sys = FakeSystem::new().with_file("/x/a", "1", FilePerms::default());
-        let s: Spec = spec(json!({"path": "/x", "recursive": true}));
+        let sys = FakeSystem::new().with_file("/srv/x/a", "1", FilePerms::default());
+        let s: Spec = spec(json!({"path": "/srv/x", "recursive": true}));
         let c = cx(&sys);
         let applied = apply(&FileAbsent, &c, &s).await;
         assert!(applied.changed && applied.artefacts.is_empty());
-        assert!(!sys.exists("/x"));
+        assert!(!sys.exists("/srv/x"));
         assert_eq!(plan_class(&FileAbsent, &c, &s).await, Class::NoOp);
     }
 
@@ -161,26 +239,63 @@ mod tests {
 
     #[tokio::test]
     async fn removal_does_nothing() {
-        let sys = FakeSystem::new().with_file("/x", "1", FilePerms::default());
-        let s: Spec = spec(json!({"path": "/x"}));
+        let sys = FakeSystem::new().with_file("/srv/x", "1", FilePerms::default());
+        let s: Spec = spec(json!({"path": "/srv/x"}));
         let c = cx(&sys);
-        let rec = record("file.absent", "/x", &apply(&FileAbsent, &c, &s).await);
+        let rec = record("file.absent", "/srv/x", &apply(&FileAbsent, &c, &s).await);
         let out = FileAbsent.remove(&c, &rec).await.unwrap();
         assert!(!out.changed);
     }
 
     #[tokio::test]
     async fn apply_of_a_blocked_plan_is_a_user_error() {
-        let sys = FakeSystem::new().with_file("/x/a", "1", FilePerms::default());
-        let s: Spec = spec(json!({"path": "/x"}));
+        let sys = FakeSystem::new().with_file("/srv/x/a", "1", FilePerms::default());
+        let s: Spec = spec(json!({"path": "/srv/x"}));
         assert!(
             FileAbsent
                 .apply(&cx(&sys), &s, &Planned::NoOp)
                 .await
                 .is_err()
         );
-        assert!(sys.exists("/x/a"));
+        assert!(sys.exists("/srv/x/a"));
     }
 
     use std::path::Path;
+
+    #[rstest]
+    #[case::root("/")]
+    #[case::root_slashes("//")]
+    #[case::etc("/etc")]
+    #[case::etc_slash("/etc/")]
+    #[case::home("/home")]
+    #[case::var_lib("/var/lib")]
+    #[case::usr_lib("/usr/lib/")]
+    #[case::empty("")]
+    #[case::whitespace("   ")]
+    #[case::trailing_space("/srv/app ")]
+    #[case::dotdot("/srv/app/../..")]
+    #[tokio::test]
+    async fn recursive_deletes_of_dangerous_paths_are_refused(#[case] path: &str) {
+        let sys = FakeSystem::new()
+            .with_dir("/etc", FilePerms::mode(0o755))
+            .with_file("/etc/passwd", "root", FilePerms::mode(0o644));
+        let spec: Spec = spec(json!({"path": path, "recursive": true}));
+        let err = FileAbsent.plan(&cx(&sys), &spec).await.unwrap_err();
+        assert!(err.is(buckle_core::error::Kind::User), "{path}");
+        assert!(
+            FileAbsent
+                .apply(&cx(&sys), &spec, &Planned::NoOp)
+                .await
+                .is_err()
+        );
+        assert!(sys.exists("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn recursive_deletes_of_application_paths_still_work() {
+        let sys = FakeSystem::new().with_file("/srv/app/cache/x", "x", FilePerms::default());
+        let spec: Spec = spec(json!({"path": "/srv/app/cache", "recursive": true}));
+        apply(&FileAbsent, &cx(&sys), &spec).await;
+        assert!(!sys.exists("/srv/app/cache"));
+    }
 }

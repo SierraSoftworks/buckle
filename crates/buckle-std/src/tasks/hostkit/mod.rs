@@ -4,8 +4,10 @@
 //! make their behaviour uniform: the same permission comparison, the same
 //! previews, the same "changed outside Buckle, left in place" removal rule.
 
+pub(crate) mod ownership;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub(crate) mod validate;
 
 use buckle_core::error;
 use buckle_core::plan::Planned;
@@ -227,6 +229,20 @@ pub fn effective_perms(want: &FilePerms, existing: Option<&FileMeta>) -> FilePer
     }
 }
 
+/// [`effective_perms`] for content that may hold secrets: a new file whose
+/// mode is not given is created 0600 rather than with the default umask.
+pub fn effective_perms_sensitive(
+    want: &FilePerms,
+    existing: Option<&FileMeta>,
+    sensitive: bool,
+) -> FilePerms {
+    let mut perms = effective_perms(want, existing);
+    if sensitive && existing.is_none() && perms.mode.is_none() {
+        perms.mode = Some(0o600);
+    }
+    perms
+}
+
 /// The permissions an existing file already has, for rewriting it unchanged.
 pub fn perms_of(meta: &FileMeta) -> FilePerms {
     FilePerms {
@@ -289,11 +305,28 @@ pub async fn run_checked(cx: &Cx, command: Command, what: &str) -> Result<Output
     if out.success() {
         return Ok(out);
     }
-    Err(command_failed(what, &line, &out, sensitive))
+    Err(command_failed(cx, what, &line, &out, sensitive))
 }
 
-/// The error for a command that did not succeed.
-pub fn command_failed(what: &str, line: &str, out: &Output, sensitive: bool) -> buckle_core::Error {
+/// Scrubs every known secret value (and its common encodings) from `text`.
+pub fn scrub(cx: &Cx, text: &str) -> String {
+    if cx.secrets.is_empty() {
+        return text.to_owned();
+    }
+    buckle_core::secrets::redact::Redactor::new(&cx.secrets)
+        .redact(text)
+        .into_inner()
+}
+
+/// The error for a command that did not succeed. Its output is scrubbed of
+/// known secrets, and withheld entirely when `sensitive`.
+pub fn command_failed(
+    cx: &Cx,
+    what: &str,
+    line: &str,
+    out: &Output,
+    sensitive: bool,
+) -> buckle_core::Error {
     let status = if out.timed_out {
         "timed out".to_owned()
     } else {
@@ -305,8 +338,8 @@ pub fn command_failed(what: &str, line: &str, out: &Output, sensitive: bool) -> 
     let detail = if sensitive {
         "Its output is withheld because the command's environment carried secrets.".to_owned()
     } else {
-        let stderr = output_tail(&out.stderr);
-        let stdout = output_tail(&out.stdout);
+        let stderr = scrub(cx, &output_tail(&out.stderr));
+        let stdout = scrub(cx, &output_tail(&out.stdout));
         match (stderr.is_empty(), stdout.is_empty()) {
             (false, _) => format!("stderr: {stderr}"),
             (true, false) => format!("stdout: {stdout}"),
@@ -329,6 +362,12 @@ pub async fn remove_recorded_file(cx: &Cx, record: &ResourceRecord) -> Result<Ap
         Artefact::File { path } => Some(path.clone()),
         _ => None,
     }) else {
+        if ownership::any_adopted(&record.artefacts) {
+            return Ok(Applied::skipped(format!(
+                "{} existed before Buckle managed it (only its permissions were set), left in place",
+                record.key.key
+            )));
+        }
         return Ok(Applied::skipped("nothing recorded to remove"));
     };
     let Some(bytes) = cx.system.read(&path).await? else {
@@ -351,6 +390,33 @@ pub async fn remove_recorded_file(cx: &Cx, record: &ResourceRecord) -> Result<Ap
             path.display()
         ))),
     }
+}
+
+/// Serialises read-modify-write edits of one file across tasks and modules.
+///
+/// `Task::LOCKS` is static, so the executor cannot lock on a path; editors
+/// (`file.line`, `file.block`, `ssh.authorized_key`) instead hold this
+/// in-process lock, keyed by the path, from reading the file to writing it
+/// back. Two modules editing `/etc/ssh/sshd_config` therefore never lose each
+/// other's line, while edits of different files still run in parallel.
+pub async fn lock_path(path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex, Weak};
+    type Table = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: LazyLock<Table> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    let lock = {
+        let mut table = LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+        table.retain(|_, w| w.strong_count() > 0);
+        match table.get(path).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                table.insert(path.to_path_buf(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
 }
 
 /// Splits text into lines without their terminators.
@@ -384,15 +450,6 @@ pub fn file_artefact(path: &Path) -> Artefact {
     Artefact::File {
         path: path.to_path_buf(),
     }
-}
-
-/// A path next to `dest` with a name that directory-globbing consumers ignore.
-pub fn sibling_temp(dest: &Path, suffix: &str) -> PathBuf {
-    let name = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    dest.with_file_name(format!(".{name}.{suffix}"))
 }
 
 /// A timestamped backup path for `path`.
@@ -501,17 +558,91 @@ pub async fn save_text(
         .await
 }
 
-/// A diff between two texts of a host file: unified when small, else a summary.
-pub fn text_diff(summary: impl Into<String>, old: &str, new: &str) -> buckle_core::plan::Diff {
+/// The token prefix a redacted render uses for a secret (`«secret:NAME@fp»`).
+pub const SECRET_TOKEN: &str = "\u{ab}secret:";
+
+/// Files whose content commonly holds credentials or whose other lines are
+/// nobody's business in a plan: `/etc/environment`, `/etc/fstab`, sudoers,
+/// anything under `/etc/ssh` or `/etc/netplan`, `~/.ssh/*`, `/etc/shadow`.
+/// Their diffs carry no context lines and their replaced lines are never
+/// stored in state.
+pub fn is_sensitive_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    path == Path::new("/etc/environment")
+        || path == Path::new("/etc/fstab")
+        || path == Path::new("/etc/shadow")
+        || path == Path::new("/etc/gshadow")
+        || path == Path::new("/etc/sudoers")
+        || path.starts_with("/etc/sudoers.d")
+        || path.starts_with("/etc/ssh")
+        || path.starts_with("/etc/netplan")
+        || text.contains("/.ssh/")
+}
+
+/// Whether this resource's previous record shows that the file held secrets
+/// (its redacted shadow carries a secret token).
+pub fn ever_sensitive(cx: &Cx) -> bool {
+    cx.previous
+        .as_deref()
+        .and_then(|r| r.shadow.as_ref())
+        .is_some_and(|s| s.get().contains(SECRET_TOKEN))
+}
+
+/// Context lines for diffs of `path`: none for sensitive files, else three.
+pub fn diff_context(cx: &Cx, path: &Path) -> usize {
+    if is_sensitive_path(path) || ever_sensitive(cx) {
+        0
+    } else {
+        3
+    }
+}
+
+/// A unified diff (`current` → `planned`) with `context` lines, scrubbed of
+/// every known secret value.
+pub fn redacted_unified(
+    cx: &Cx,
+    summary: impl Into<String>,
+    old: &str,
+    new: &str,
+    context: usize,
+) -> buckle_core::plan::Diff {
+    let text = similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(context)
+        .header("current", "planned")
+        .to_string();
+    buckle_core::plan::Diff::Update {
+        summary: summary.into(),
+        unified: Some(buckle_core::secrets::redact::Redactor::new(&cx.secrets).redact(&text)),
+    }
+}
+
+/// A diff between the current text of host file `path` and its new text:
+/// unified when small (no context lines for sensitive files, scrubbed of
+/// known secrets), a summary when large, and without the old side at all
+/// when the file is known to have held secrets.
+pub fn text_diff(
+    cx: &Cx,
+    path: &Path,
+    summary: impl Into<String>,
+    old: &str,
+    new: &str,
+) -> buckle_core::plan::Diff {
+    let summary = summary.into();
+    if ever_sensitive(cx) {
+        return buckle_core::plan::Diff::Update {
+            summary: format!(
+                "{summary}: content changed ({}); the current content is not shown because the file has held secrets",
+                digest_change(&Digest::of(old.as_bytes()), &Digest::of(new.as_bytes()))
+            ),
+            unified: None,
+        };
+    }
     if old.len() <= SHADOW_LIMIT && new.len() <= SHADOW_LIMIT {
-        buckle_core::plan::Diff::unified(
-            summary,
-            &Redacted::plain(old.to_owned()),
-            &Redacted::plain(new.to_owned()),
-        )
+        redacted_unified(cx, summary, old, new, diff_context(cx, path))
     } else {
         buckle_core::plan::Diff::Update {
-            summary: summary.into(),
+            summary,
             unified: None,
         }
     }
@@ -552,6 +683,32 @@ pub fn insertion_index(
 
 /// How long a download may take before it is abandoned.
 pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Resolves request headers whose values may reference secrets
+/// (`Authorization: "Bearer {{ secrets.token }}"`) into the pairs to send.
+///
+/// buckle-core has no HTTP sink yet, so a sensitive value is opened here with
+/// the transport sink's witness: an HTTP request header is a transport of the
+/// secret to the server that needs it. This is the only place in buckle-std
+/// that does so; the resolved pairs go straight into the request and are
+/// never logged (requests are not formatted anywhere in this crate).
+pub fn resolve_headers(
+    cx: &Cx,
+    headers: &std::collections::BTreeMap<String, buckle_core::secrets::SecretField>,
+) -> Result<Vec<(String, String)>> {
+    use buckle_core::secrets::Rendered;
+    use buckle_core::secrets::sinks::{Sink, TransportSink};
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = match value.resolve(&cx.templater, &cx.host)? {
+                Rendered::Plain(text) => text,
+                Rendered::Sensitive(secret) => secret.expose(TransportSink.witness()).clone(),
+            };
+            Ok((name.clone(), value))
+        })
+        .collect()
+}
 
 /// GETs `url` and returns the body, turning transport and status failures into
 /// user errors that name the URL.
@@ -648,8 +805,14 @@ pub fn find_version(text: &str) -> Option<String> {
 }
 
 /// `Planned::change` of [`text_diff`].
-pub fn text_diff_planned(summary: impl Into<String>, old: &str, new: &str) -> Planned {
-    Planned::change(text_diff(summary, old, new))
+pub fn text_diff_planned(
+    cx: &Cx,
+    path: &Path,
+    summary: impl Into<String>,
+    old: &str,
+    new: &str,
+) -> Planned {
+    Planned::change(text_diff(cx, path, summary, old, new))
 }
 
 #[cfg(test)]
@@ -741,6 +904,144 @@ mod registry_tests {
         }
     }
 
+    /// Minimal specs for the kinds whose samples live in `sys_exec`'s tests.
+    fn system_samples() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "apt.repository",
+                json!({"name": "x", "uri": "https://x.example", "suites": ["s"]}),
+            ),
+            ("apt.package", json!({"name": "nginx"})),
+            ("apt.update", json!({})),
+            ("systemd.unit", json!({"name": "nomad", "enabled": true})),
+            (
+                "systemd.dropin",
+                json!({"unit": "nomad.service", "content": "[Service]\n"}),
+            ),
+            ("systemd.daemon_reload", json!({})),
+            ("systemd.restart", json!({"name": "nomad"})),
+            ("systemd.reload", json!({"name": "nomad"})),
+            (
+                "sysctl.param",
+                json!({"name": "vm.swappiness", "value": 10}),
+            ),
+            (
+                "ufw.default",
+                json!({"direction": "incoming", "policy": "deny"}),
+            ),
+            ("ufw.rule", json!({"rule": "allow", "to_port": 22})),
+            ("ufw.state", json!({"enabled": true})),
+        ]
+    }
+
+    #[test]
+    fn every_kind_rejects_an_unknown_field_naming_it() {
+        let all: Vec<_> = samples().into_iter().chain(system_samples()).collect();
+        let mut covered: Vec<&str> = all.iter().map(|(k, _)| *k).collect();
+        covered.sort_unstable();
+        let mut registered: Vec<&str> = registry()
+            .keys()
+            .copied()
+            .filter(|k| !k.starts_with("test."))
+            .collect();
+        registered.sort_unstable();
+        assert_eq!(covered, registered, "every registered kind has a sample");
+        for (kind, mut raw) in all {
+            let task = lookup(kind).unwrap();
+            task.parse(raw.clone())
+                .unwrap_or_else(|e| panic!("{kind}: the sample parses: {}", e.description()));
+            raw.as_object_mut()
+                .unwrap()
+                .insert("bogus_field".into(), json!("x"));
+            let err = match task.parse(raw) {
+                Ok(_) => panic!("{kind} accepted an unknown field"),
+                Err(e) => e,
+            };
+            let text = format!("{} {err:?}", err.description());
+            assert!(text.contains(kind), "{kind}: {text}");
+            assert!(text.contains("bogus_field"), "{kind}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_typo_in_a_flattened_permission_field_is_rejected() {
+        for kind in [
+            "file.copy",
+            "file.template",
+            "file.directory",
+            "file.download",
+            "archive.extract",
+            "github.release",
+        ] {
+            let (_, mut raw) = samples().into_iter().find(|(k, _)| *k == kind).unwrap();
+            raw.as_object_mut()
+                .unwrap()
+                .insert("onwer".into(), json!("root"));
+            assert!(
+                lookup(kind).unwrap().parse(raw).is_err(),
+                "{kind} accepted `onwer`"
+            );
+        }
+    }
+
+    /// Planning on a host without the tool a kind shells out to is Blocked
+    /// with advice, never a plan error (a minimal container image).
+    #[rstest::rstest]
+    #[case("apt.package", json!({"name": "nginx"}))]
+    #[case("apt.package", json!({"name": "nginx", "state": "absent"}))]
+    #[case("apt.update", json!({}))]
+    #[case("apt.repository", json!({"name": "x", "uri": "https://x.example", "suites": ["s"]}))]
+    #[case("systemd.unit", json!({"name": "nomad", "enabled": true}))]
+    #[case("systemd.dropin", json!({"unit": "nomad.service", "content": "[Service]\n"}))]
+    #[case("systemd.daemon_reload", json!({}))]
+    #[case("systemd.restart", json!({"name": "nomad"}))]
+    #[case("systemd.reload", json!({"name": "nomad"}))]
+    #[case("docker.image", json!({"name": "i:1"}))]
+    #[case("hostname.set", json!({"name": "web-1"}))]
+    #[case("swap.file", json!({"path": "/swapfile", "size_mb": 10}))]
+    #[case("user.account", json!({"name": "u"}))]
+    #[case("user.group", json!({"name": "g"}))]
+    #[tokio::test]
+    async fn a_missing_tool_at_plan_time_is_blocked_not_an_error(
+        #[case] kind: &str,
+        #[case] raw: serde_json::Value,
+    ) {
+        let sys = buckle_core::testing::FakeSystem::new().with_hostname("old");
+        let cx = super::testkit::cx(&sys);
+        let task = lookup(kind).unwrap();
+        let spec = task.parse(raw).unwrap();
+        match task.plan(&cx, &spec).await {
+            Ok(buckle_core::plan::Planned::Blocked { reason }) => {
+                assert!(!reason.is_empty(), "{kind}")
+            }
+            other => panic!("{kind}: expected Blocked, got {other:?}"),
+        }
+        assert!(
+            sys.commands_run().is_empty(),
+            "{kind} ran a command it does not have"
+        );
+    }
+
+    /// Kinds that need no tool to plan still plan without one.
+    #[rstest::rstest]
+    #[case("sysctl.param", json!({"name": "vm.swappiness", "value": 10}))]
+    #[case("cron.job", json!({"name": "j", "schedule": "@daily", "command": "x"}))]
+    #[case("ufw.rule", json!({"rule": "allow", "to_port": 22}))]
+    #[case("command.run", json!({"run": ["x"], "unless": ["missing-probe"]}))]
+    #[tokio::test]
+    async fn kinds_that_need_no_tool_to_plan_do_not_fail_without_one(
+        #[case] kind: &str,
+        #[case] raw: serde_json::Value,
+    ) {
+        let sys = buckle_core::testing::FakeSystem::new();
+        let cx = super::testkit::cx(&sys);
+        let task = lookup(kind).unwrap();
+        let spec = task.parse(raw).unwrap();
+        task.plan(&cx, &spec)
+            .await
+            .unwrap_or_else(|e| panic!("{kind}: {}", e.description()));
+    }
+
     #[test]
     fn locks_platforms_and_cautions_match_the_catalogue() {
         let get = |k| lookup(k).unwrap();
@@ -771,6 +1072,8 @@ mod registry_tests {
         for (kind, pointer) in [
             ("command.run", "/properties/env/additionalProperties"),
             ("user.account", "/properties/password"),
+            ("file.download", "/properties/headers/additionalProperties"),
+            ("apt.repository", "/$defs/Auth/properties/password"),
         ] {
             let schema = serde_json::to_string(&lookup(kind).unwrap().schema()).unwrap();
             assert!(schema.contains("x-buckle-secret"), "{kind}: {pointer}");

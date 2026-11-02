@@ -31,6 +31,7 @@ use tracing::instrument;
 /// runs `docker image rm` for an image Buckle pulled; an image still used by a
 /// container is left in place. It holds the `docker` lock.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
     #[serde(default)]
@@ -144,10 +145,10 @@ impl Task for DockerImage {
             }
             Ensure::Present => {
                 if before.is_some() && spec.pull == Pull::Missing {
-                    return Ok(Applied::unchanged(format!(
-                        "image {} is already present",
-                        spec.name
-                    )));
+                    return Ok(hostkit::ownership::carry_forward(
+                        cx,
+                        Applied::unchanged(format!("image {} is already present", spec.name)),
+                    ));
                 }
                 hostkit::run_checked(
                     cx,
@@ -167,7 +168,8 @@ impl Task for DockerImage {
                         description: format!("{ARTEFACT_PREFIX}{}", spec.name),
                     });
                 }
-                Ok(applied)
+                // An image Buckle pulled first stays Buckle's when a later pull updates it.
+                Ok(hostkit::ownership::carry_forward(cx, applied))
             }
         }
     }
@@ -209,6 +211,7 @@ impl Task for DockerImage {
             )))
         } else {
             Err(hostkit::command_failed(
+                cx,
                 "Removing the image",
                 &format!("docker image rm {name}"),
                 &out,

@@ -145,20 +145,100 @@ impl RealSystem {
     }
 }
 
+fn kernel_hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        nix::unistd::gethostname()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// Whether `path` is a file this process could execute: on Unix a regular
+/// file with an execute bit; elsewhere any file (PATHEXT decides).
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Creates (or truncates) `path` with mode 0600, writes `bytes` and fsyncs.
+async fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+/// The mode a new file gets when the caller does not ask for one: 0666 less
+/// the process umask (read from /proc on Linux, without changing it), as if
+/// the file had been created directly.
+fn default_file_mode() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let umask = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Umask:"))
+                    .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+            })
+            .unwrap_or(0o022);
+        Some(0o666 & !umask)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 #[async_trait]
 impl System for RealSystem {
     fn platform(&self) -> Platform {
         Platform::current()
     }
 
+    /// The kernel's hostname (`gethostname`), then `$HOSTNAME`, then
+    /// `/etc/hostname`. A shell exports `HOSTNAME` but a service manager does
+    /// not, and `/etc/hostname` can disagree with the running kernel, so the
+    /// kernel wins. On Windows the computer name (`COMPUTERNAME`) comes first.
     fn hostname(&self) -> String {
-        std::env::var("HOSTNAME")
-            .ok()
-            .filter(|h| !h.is_empty())
+        kernel_hostname()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|h| !h.trim().is_empty())
             .or_else(|| {
                 std::fs::read_to_string("/etc/hostname")
                     .ok()
                     .map(|s| s.trim().to_owned())
+                    .filter(|h| !h.is_empty())
             })
             .unwrap_or_else(|| "localhost".to_owned())
     }
@@ -203,14 +283,27 @@ impl System for RealSystem {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let tmp = parent.join(format!(".{file_name}.buckle-tmp-{}", std::process::id()));
-        tokio::fs::write(&tmp, bytes).await.to_human_error()?;
-        if let Err(e) = Self::apply_perms(&tmp, perms).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e);
+        let prefix = super::temp_prefix_for(&file_name);
+        super::remove_temp_leftovers(parent, &prefix);
+        let tmp = parent.join(format!("{prefix}{}", std::process::id()));
+        // The temp file starts private (0600) and only gets its final mode
+        // and owner once the content is written, so a secret is never
+        // readable through a wider mode, even briefly.
+        let written = async {
+            write_private(&tmp, bytes).await.to_human_error()?;
+            let mut final_perms = perms.clone();
+            if final_perms.mode.is_none() {
+                final_perms.mode = default_file_mode();
+            }
+            Self::apply_perms(&tmp, &final_perms).await?;
+            tokio::fs::rename(&tmp, path).await.to_human_error()?;
+            crate::state::sync_dir(Some(parent)).to_human_error()
         }
-        tokio::fs::rename(&tmp, path).await.to_human_error()?;
-        Ok(())
+        .await;
+        if written.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        written
     }
 
     async fn set_perms(&self, path: &Path, perms: &FilePerms) -> crate::Result<()> {
@@ -234,6 +327,9 @@ impl System for RealSystem {
         match result {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                Err(super::not_empty(path))
+            }
             Err(e) => Err(e).to_human_error(),
         }
     }
@@ -294,6 +390,10 @@ impl System for RealSystem {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
+        // Its own process group, so a timeout can kill everything it started
+        // (a shell's children included), not just the direct child.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn().map_err(|e| {
             crate::error::wrap_user(
                 e,
@@ -307,11 +407,21 @@ impl System for RealSystem {
             let _ = pipe.write_all(stdin).await;
             drop(pipe);
         }
+        let pid = child.id();
         let wait = child.wait_with_output();
         let (result, timed_out) = match command.timeout {
             Some(t) => match tokio::time::timeout(t, wait).await {
                 Ok(r) => (r, false),
                 Err(_) => {
+                    #[cfg(unix)]
+                    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+                        let _ = nix::sys::signal::killpg(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    let _ = pid;
                     return Ok(Output {
                         code: None,
                         stdout: Vec::new(),
@@ -334,7 +444,7 @@ impl System for RealSystem {
     async fn which(&self, program: &str) -> crate::Result<Option<PathBuf>> {
         if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
             let p = PathBuf::from(program);
-            return Ok(if p.exists() { Some(p) } else { None });
+            return Ok(is_executable(&p).then_some(p));
         }
         // On Windows an executable is found by name plus one of the PATHEXT
         // extensions (`sh` resolves to `sh.exe`); elsewhere the bare name is the file.
@@ -356,7 +466,7 @@ impl System for RealSystem {
         for dir in std::env::split_paths(&path) {
             for ext in &extensions {
                 let candidate = dir.join(format!("{program}{ext}"));
-                if candidate.is_file() {
+                if is_executable(&candidate) {
                     return Ok(Some(candidate));
                 }
             }
@@ -489,6 +599,92 @@ mod tests {
         assert!(!sys.remove(&path, false).await.unwrap());
     }
 
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_atomic_sets_perms_rather_than_merging_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = RealSystem::new();
+        let path = dir.path().join("conf");
+        sys.write_atomic(&path, b"one", &FilePerms::mode(0o640))
+            .await
+            .unwrap();
+        assert_eq!(mode_of(&path), 0o640);
+        sys.write_atomic(&path, b"two", &FilePerms::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(mode_of(&path)),
+            default_file_mode(),
+            "no mode means a new file's default, not the replaced file's mode"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(names.len(), 1, "no temp file is left behind");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_atomic_leaves_nothing_behind_when_perms_fail_and_clears_crash_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = RealSystem::new();
+        let path = dir.path().join("secret.conf");
+        let leftover = dir.path().join(".secret.conf.buckle-tmp-999999");
+        std::fs::write(&leftover, b"half").unwrap();
+        let mut perms = FilePerms::mode(0o600);
+        perms.owner = Some("no-such-user-buckle".into());
+        assert!(sys.write_atomic(&path, b"s3cret", &perms).await.is_err());
+        assert!(!path.exists());
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_non_empty_directory_is_the_same_user_error_as_the_fake() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = RealSystem::new();
+        let sub = dir.path().join("d");
+        sys.write_atomic(&sub.join("f"), b"x", &FilePerms::default())
+            .await
+            .unwrap();
+        let real = sys.remove(&sub, false).await.unwrap_err();
+        let fake_sys =
+            crate::testing::FakeSystem::new().with_file(sub.join("f"), "x", FilePerms::default());
+        let fake = fake_sys.remove(&sub, false).await.unwrap_err();
+        assert!(real.is(crate::error::Kind::User));
+        assert_eq!(real.message(), fake.message());
+        assert!(sys.remove(&sub, true).await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_follows_symlinks_like_the_fake() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = RealSystem::new();
+        let target = dir.path().join("target");
+        sys.write_atomic(&target, b"through", &FilePerms::default())
+            .await
+            .unwrap();
+        let link = dir.path().join("link");
+        sys.symlink(Path::new("target"), &link).await.unwrap();
+        let fake =
+            crate::testing::FakeSystem::new().with_file(&target, "through", FilePerms::default());
+        fake.symlink(Path::new("target"), &link).await.unwrap();
+        assert_eq!(
+            sys.read(&link).await.unwrap(),
+            fake.read(&link).await.unwrap()
+        );
+        assert_eq!(fake.read(&link).await.unwrap().unwrap(), b"through");
+    }
+
     #[tokio::test]
     async fn run_captures_output_and_exit_code() {
         let sys = RealSystem::new();
@@ -518,6 +714,64 @@ mod tests {
             .await
             .unwrap();
         assert!(out.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let sys = RealSystem::new();
+        let out = sys
+            .run(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("sleep 30 & echo $! > {}; wait", pidfile.display()))
+                    .timeout(Duration::from_millis(300)),
+            )
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut alive = true;
+        for _ in 0..100 {
+            // Reaped by init once killed; ESRCH means gone.
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+                || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|s| s.contains(") Z "))
+                    .unwrap_or(true)
+            {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive, "the shell's background child was killed too");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn which_requires_the_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let sys = RealSystem::new();
+        assert_eq!(sys.which(tool.to_str().unwrap()).await.unwrap(), None);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(sys.which(tool.to_str().unwrap()).await.unwrap(), Some(tool));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostname_prefers_the_kernel() {
+        let kernel = nix::unistd::gethostname().unwrap().into_string().unwrap();
+        assert_eq!(RealSystem::new().hostname(), kernel.trim());
     }
 
     #[tokio::test]

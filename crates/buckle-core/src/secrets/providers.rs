@@ -16,7 +16,10 @@ pub trait SecretProvider: Send + Sync {
     async fn resolve(&self, name: &str, reference: &SecretRef) -> crate::Result<Option<String>>;
 }
 
-/// Reads secrets from the resolving process's environment.
+/// Reads secrets from the resolving process's environment, any variable.
+/// Right for a local run, where the environment is the operator's own; a
+/// process whose environment also holds its own credentials (the server)
+/// uses [`ScopedEnvProvider`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EnvProvider;
 
@@ -38,13 +41,145 @@ impl SecretProvider for EnvProvider {
     }
 }
 
+/// Reads secrets from the environment, confined by name.
+///
+/// Patterns are exact variable names or a prefix ending in `*`
+/// (`BUCKLE_*`). A variable matching `deny` is never read; when `allow` is
+/// set, only variables matching it are. Deny wins.
+///
+/// ```
+/// use buckle_core::secrets::providers::ScopedEnvProvider;
+///
+/// let p = ScopedEnvProvider {
+///     allow: None,
+///     deny: vec!["BUCKLE_*".into(), "OIDC_CLIENT_SECRET".into()],
+/// };
+/// assert!(p.permits("NOMAD_TOKEN"));
+/// assert!(!p.permits("BUCKLE_BOOTSTRAP_TOKEN"));
+/// assert!(!p.permits("OIDC_CLIENT_SECRET"));
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct ScopedEnvProvider {
+    /// When set, the only variables that may be read.
+    pub allow: Option<Vec<String>>,
+    /// Variables that may never be read.
+    pub deny: Vec<String>,
+}
+
+fn env_pattern_matches(pattern: &str, var: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => var.starts_with(prefix),
+        None => pattern == var,
+    }
+}
+
+impl ScopedEnvProvider {
+    /// Whether `var` may be read.
+    pub fn permits(&self, var: &str) -> bool {
+        if self.deny.iter().any(|p| env_pattern_matches(p, var)) {
+            return false;
+        }
+        match &self.allow {
+            Some(allow) => allow.iter().any(|p| env_pattern_matches(p, var)),
+            None => true,
+        }
+    }
+}
+
+#[async_trait]
+impl SecretProvider for ScopedEnvProvider {
+    fn kind(&self) -> &'static str {
+        "env"
+    }
+
+    fn handles(&self, reference: &SecretRef) -> bool {
+        matches!(reference, SecretRef::Env { .. })
+    }
+
+    async fn resolve(&self, name: &str, reference: &SecretRef) -> crate::Result<Option<String>> {
+        let SecretRef::Env { env: var } = reference else {
+            return Ok(None);
+        };
+        if !self.permits(var) {
+            return Err(crate::error::user(
+                format!(
+                    "The secret '{name}' reads the environment variable `{var}`, which this server does not hand out."
+                ),
+                &[
+                    "The server's own credentials (BUCKLE_*, the variables server.yaml interpolates, and those listed under secrets.providers.env.deny) are never available as fleet secrets.",
+                    "Deliver the value under another variable name, or through the file provider.",
+                ],
+            ));
+        }
+        Ok(std::env::var(var).ok())
+    }
+}
+
 /// Reads secrets from files (one value per file, a single trailing newline trimmed).
 /// Typically fed by a Nomad `template` stanza rendering Nomad Variables.
 #[derive(Debug, Clone, Default)]
 pub struct FileProvider {
-    /// When set, relative paths resolve against this root and absolute paths
-    /// outside it are refused.
+    /// When set, relative paths resolve against this root, and a path that
+    /// leaves it is refused: absolute paths elsewhere, `..` components, and
+    /// symbolic links that resolve outside the (canonicalised) root.
     pub root: Option<std::path::PathBuf>,
+}
+
+fn outside_root(name: &str) -> crate::Error {
+    crate::error::user(
+        format!("The secret '{name}' points outside the configured secrets root."),
+        &[
+            "Keep secret files under the `secrets.providers.file.root` directory, without `..` or links that leave it.",
+        ],
+    )
+}
+
+fn unreadable(e: std::io::Error, name: &str) -> crate::Error {
+    crate::error::wrap_user(
+        e,
+        format!("The secret file for '{name}' could not be read."),
+        &["Check the file's permissions and that the path in buckle.yaml is correct."],
+    )
+}
+
+/// Resolves `path` under `root`, following links, and refuses anything that
+/// ends up outside it. `Ok(None)` when the file (or the root) does not exist.
+async fn confine(
+    name: &str,
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> crate::Result<Option<std::path::PathBuf>> {
+    use std::path::Component;
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(outside_root(name));
+    }
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let real_root = tokio::fs::canonicalize(root).await;
+    let lexically_inside = joined.starts_with(root)
+        || real_root
+            .as_ref()
+            .is_ok_and(|real_root| joined.starts_with(real_root));
+    if !lexically_inside {
+        return Err(outside_root(name));
+    }
+    let real_root = match real_root {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e, name)),
+    };
+    let real = match tokio::fs::canonicalize(&joined).await {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e, name)),
+    };
+    if !real.starts_with(&real_root) {
+        return Err(outside_root(name));
+    }
+    Ok(Some(real))
 }
 
 #[async_trait]
@@ -62,20 +197,10 @@ impl SecretProvider for FileProvider {
             return Ok(None);
         };
         let path = match &self.root {
-            Some(root) => {
-                let joined = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    root.join(path)
-                };
-                if !joined.starts_with(root) {
-                    return Err(crate::error::user(
-                        format!("The secret '{name}' points outside the configured secrets root."),
-                        &["Keep secret files under the `secrets.providers.file.root` directory."],
-                    ));
-                }
-                joined
-            }
+            Some(root) => match confine(name, root, path).await? {
+                Some(p) => p,
+                None => return Ok(None),
+            },
             None => path.clone(),
         };
         match tokio::fs::read_to_string(&path).await {
@@ -89,11 +214,7 @@ impl SecretProvider for FileProvider {
                 Ok(Some(content))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(crate::error::wrap_user(
-                e,
-                format!("The secret file for '{name}' could not be read."),
-                &["Check the file's permissions and that the path in buckle.yaml is correct."],
-            )),
+            Err(e) => Err(unreadable(e, name)),
         }
     }
 }
@@ -329,6 +450,117 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is(crate::error::Kind::User));
+    }
+
+    #[rstest]
+    #[case::parent_relative("../outside")]
+    #[case::parent_inside("sub/../../outside")]
+    #[case::link_out("link")]
+    #[case::absolute_elsewhere("ABS")]
+    #[tokio::test]
+    async fn file_provider_refuses_every_way_out_of_its_root(#[case] reference: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("secrets");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(dir.path().join("outside"), "server-only").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("outside"), root.join("link")).unwrap();
+        #[cfg(not(unix))]
+        if reference == "link" {
+            return;
+        }
+        let file: std::path::PathBuf = if reference == "ABS" {
+            dir.path().join("outside")
+        } else {
+            reference.into()
+        };
+        let err = FileProvider { root: Some(root) }
+            .resolve("x", &SecretRef::File { file })
+            .await
+            .unwrap_err();
+        assert!(err.is(crate::error::Kind::User));
+        assert!(err.message().contains("outside"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn file_provider_reads_inside_its_root_and_through_links_that_stay_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("secrets");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/tok"), "inside\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("sub/tok"), root.join("alias")).unwrap();
+        let provider = FileProvider {
+            root: Some(root.clone()),
+        };
+        for file in ["sub/tok", "alias"] {
+            #[cfg(not(unix))]
+            if file == "alias" {
+                continue;
+            }
+            let got = provider
+                .resolve("x", &SecretRef::File { file: file.into() })
+                .await
+                .unwrap();
+            assert_eq!(got.as_deref(), Some("inside"), "{file}");
+        }
+        let absolute = provider
+            .resolve(
+                "x",
+                &SecretRef::File {
+                    file: root.join("sub/tok"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(absolute.as_deref(), Some("inside"));
+        let missing = provider
+            .resolve(
+                "x",
+                &SecretRef::File {
+                    file: "nope".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_env_provider_refuses_denied_and_unlisted_variables() {
+        // SAFETY: the variables are unique to this test.
+        unsafe {
+            std::env::set_var("BUCKLE_TEST_SCOPED_OWN", "server");
+            std::env::set_var("BUCKLE_TEST_SCOPED_FLEET", "fleet");
+        }
+        let env = |v: &str| SecretRef::Env { env: v.into() };
+        let deny = ScopedEnvProvider {
+            allow: None,
+            deny: vec!["BUCKLE_TEST_SCOPED_OWN".into()],
+        };
+        assert!(
+            deny.resolve("x", &env("BUCKLE_TEST_SCOPED_OWN"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            deny.resolve("x", &env("BUCKLE_TEST_SCOPED_FLEET"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("fleet")
+        );
+        let allow = ScopedEnvProvider {
+            allow: Some(vec!["FLEET_*".into()]),
+            deny: vec![],
+        };
+        let err = allow
+            .resolve("x", &env("BUCKLE_TEST_SCOPED_FLEET"))
+            .await
+            .unwrap_err();
+        assert!(err.is(crate::error::Kind::User));
+        assert!(err.message().contains("BUCKLE_TEST_SCOPED_FLEET"));
+        assert!(!err.message().contains("fleet\""), "never the value");
     }
 
     #[tokio::test]

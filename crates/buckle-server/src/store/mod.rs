@@ -330,12 +330,19 @@ impl Store {
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().map_err(|_| {
-                buckle_core::error::system(
-                    "The database connection lock was poisoned by an earlier panic.",
-                    &["Restart the server; report the panic that preceded this."],
-                )
-            })?;
+            // A panic inside an earlier closure poisons the lock; the
+            // connection itself is still sound, so recover rather than
+            // refuse every later call, and roll back whatever transaction
+            // the panic left open.
+            let guard = conn.lock().unwrap_or_else(|poisoned| {
+                tracing::error!("an earlier database call panicked; recovering the connection");
+                conn.clear_poison();
+                poisoned.into_inner()
+            });
+            if !guard.is_autocommit() {
+                tracing::warn!("rolling back a transaction an earlier call left open");
+                let _ = guard.execute_batch("ROLLBACK");
+            }
             f(&Db::new(&guard))
         })
         .await
@@ -351,10 +358,15 @@ impl Store {
         self.call(move |db| {
             db.conn.execute_batch("BEGIN IMMEDIATE").map_err(db_error)?;
             match f(db) {
-                Ok(v) => {
-                    db.conn.execute_batch("COMMIT").map_err(db_error)?;
-                    Ok(v)
-                }
+                Ok(v) => match db.conn.execute_batch("COMMIT") {
+                    Ok(()) => Ok(v),
+                    Err(e) => {
+                        // A failed COMMIT can leave the transaction open;
+                        // never let the next caller write into it.
+                        let _ = db.conn.execute_batch("ROLLBACK");
+                        Err(db_error(e))
+                    }
+                },
                 Err(e) => {
                     let _ = db.conn.execute_batch("ROLLBACK");
                     Err(e)
@@ -508,6 +520,66 @@ mod tests {
             .unwrap();
         assert_eq!(count, MIGRATIONS.len() as i64);
         assert_eq!(value.as_deref(), Some("v"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_rolls_back_and_leaves_no_transaction_open() {
+        let store = Store::in_memory().await.unwrap();
+        store
+            .call(|db| {
+                db.conn()
+                    .execute_batch(
+                        "CREATE TABLE p (id INTEGER PRIMARY KEY); \
+                         CREATE TABLE c (pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);",
+                    )
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+        let result = store
+            .transaction(|db| {
+                db.kv().set("a", "1")?;
+                db.conn()
+                    .execute("INSERT INTO c (pid) VALUES (99)", [])
+                    .map_err(db_error)?;
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err(), "the deferred foreign key fails the COMMIT");
+        let (open, value) = store
+            .call(|db| Ok((!db.conn().is_autocommit(), db.kv().get("a")?)))
+            .await
+            .unwrap();
+        assert!(!open, "no transaction is left open");
+        assert_eq!(value, None, "nothing from the failed transaction is kept");
+        store.call(|db| db.kv().set("b", "2")).await.unwrap();
+        assert_eq!(
+            store.call(|db| db.kv().get("b")).await.unwrap().as_deref(),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panic_inside_a_call_does_not_brick_the_store() {
+        let store = Store::in_memory().await.unwrap();
+        let panicked: Result<()> = store
+            .call(|db| {
+                db.conn().execute_batch("BEGIN").map_err(db_error)?;
+                db.kv().set("half", "written")?;
+                panic!("a bug in a repository");
+            })
+            .await;
+        assert!(panicked.is_err());
+        store.call(|db| db.kv().set("k", "v")).await.unwrap();
+        let (k, half) = store
+            .call(|db| Ok((db.kv().get("k")?, db.kv().get("half")?)))
+            .await
+            .unwrap();
+        assert_eq!(k.as_deref(), Some("v"));
+        assert_eq!(
+            half, None,
+            "the panicking call's transaction was rolled back"
+        );
     }
 
     #[tokio::test]

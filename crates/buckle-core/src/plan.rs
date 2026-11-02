@@ -139,9 +139,20 @@ impl Diff {
         old: &Redacted<String>,
         new: &Redacted<String>,
     ) -> Diff {
+        Self::unified_with_context(summary, old, new, 3)
+    }
+
+    /// [`Diff::unified`] with `context` lines around each change; zero shows
+    /// only the changed lines (for files whose other lines are sensitive).
+    pub fn unified_with_context(
+        summary: impl Into<String>,
+        old: &Redacted<String>,
+        new: &Redacted<String>,
+        context: usize,
+    ) -> Diff {
         let text = similar::TextDiff::from_lines(old.get().as_str(), new.get().as_str())
             .unified_diff()
-            .context_radius(3)
+            .context_radius(context)
             .header("current", "planned")
             .to_string();
         Diff::Update {
@@ -213,6 +224,38 @@ pub struct Removal {
     pub introduced_in: Option<RevisionId>,
 }
 
+/// A module a drift plan leaves alone because the host does not have it
+/// applied at the plan's revision: it moved on to a newer revision, its last
+/// run failed, or it never ran. Its resources are never orphans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    pub module: String,
+    pub reason: String,
+}
+
+/// How an orphaned record relates to a desired resource that took it over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RehomeKind {
+    /// The same kind and key now lives in another module: the record is
+    /// re-keyed to the new module and kept (with its origin and shadow).
+    Moved,
+    /// A desired resource of another kind (or key) manages the same artefact
+    /// (file path, package, user, unit…): the old record is forgotten without
+    /// running its cleanup, which would delete what the new resource manages.
+    Superseded,
+}
+
+/// A resource in state that left the desired set but is not removed, because
+/// a desired resource took it over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rehome {
+    pub from: ResourceKey,
+    pub to: ResourceKey,
+    pub kind: RehomeKind,
+    pub summary: String,
+}
+
 /// A module that could not be planned yet because it depends on facts a
 /// sibling module provides after applying.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +263,23 @@ pub struct Deferred {
     pub module: String,
     pub waiting_on: Vec<String>,
     pub reason: String,
+}
+
+/// A module whose selection or plan could not be determined on this host: its
+/// `when` could not be evaluated or reads facts a provider failed to collect,
+/// its vars or fields could not be rendered, its directory has no
+/// `module.yaml`, or it needs such a module. An indeterminate module is never
+/// applied and its recorded resources are never treated as orphans, so an
+/// uncertain selection cannot remove anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Indeterminate {
+    pub module: String,
+    pub reason: String,
+    /// The module is selected but could not be planned: a plan error for that
+    /// module (design §03). Applying the plan reports the module as failed;
+    /// other modules still run.
+    #[serde(default)]
+    pub plan_error: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +299,15 @@ pub struct Plan {
     /// Warnings worth showing the operator (always-run commands, cautionary removals, …).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Modules whose selection or plan is uncertain; see [`Indeterminate`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indeterminate: Vec<Indeterminate>,
+    /// Records taken over by a desired resource instead of being removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rehomed: Vec<Rehome>,
+    /// Drift plans only: modules not applied at this revision, left alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<Held>,
 }
 
 impl Plan {
@@ -260,22 +329,75 @@ impl Plan {
             deferred,
             skipped: Vec::new(),
             warnings: Vec::new(),
+            indeterminate: Vec::new(),
+            rehomed: Vec::new(),
+            held: Vec::new(),
         };
         plan.digest = plan.compute_digest();
         plan
     }
 
+    /// Sets the indeterminate modules and recomputes the digest (they change
+    /// what an apply does).
+    pub fn with_indeterminate(mut self, indeterminate: Vec<Indeterminate>) -> Self {
+        self.indeterminate = indeterminate;
+        self.digest = self.compute_digest();
+        self
+    }
+
+    /// Sets the held modules and recomputes the digest.
+    pub fn with_held(mut self, held: Vec<Held>) -> Self {
+        self.held = held;
+        self.digest = self.compute_digest();
+        self
+    }
+
+    /// Sets the re-homed records and recomputes the digest.
+    pub fn with_rehomed(mut self, rehomed: Vec<Rehome>) -> Self {
+        self.rehomed = rehomed;
+        self.digest = self.compute_digest();
+        self
+    }
+
     pub fn compute_digest(&self) -> Digest {
+        /// A removal without its origin: hosts that applied the same resource
+        /// in different revisions still share the plan.
+        #[derive(Serialize)]
+        struct RemovalContent<'a> {
+            resource: &'a ResourceKey,
+            policy: RemovalPolicy,
+            summary: &'a str,
+            caution: bool,
+        }
+        let removals: Vec<RemovalContent<'_>> = self
+            .removals
+            .iter()
+            .map(|r| RemovalContent {
+                resource: &r.resource,
+                policy: r.policy,
+                summary: &r.summary,
+                caution: r.caution,
+            })
+            .collect();
         #[derive(Serialize)]
         struct Content<'a> {
             modules: &'a [ModulePlan],
-            removals: &'a [Removal],
+            removals: &'a [RemovalContent<'a>],
             deferred: &'a [Deferred],
+            #[serde(skip_serializing_if = "<[Indeterminate]>::is_empty")]
+            indeterminate: &'a [Indeterminate],
+            #[serde(skip_serializing_if = "<[Rehome]>::is_empty")]
+            rehomed: &'a [Rehome],
+            #[serde(skip_serializing_if = "<[Held]>::is_empty")]
+            held: &'a [Held],
         }
         Digest::of_json(&Content {
             modules: &self.modules,
-            removals: &self.removals,
+            removals: &removals,
             deferred: &self.deferred,
+            indeterminate: &self.indeterminate,
+            rehomed: &self.rehomed,
+            held: &self.held,
         })
     }
 
@@ -363,6 +485,32 @@ mod tests {
     }
 
     #[test]
+    fn removal_origins_do_not_split_the_digest() {
+        let removal = |origin: &str| Removal {
+            resource: ResourceKey::new("m", "file.copy", "/gone"),
+            policy: RemovalPolicy::Cleanup,
+            summary: "delete /gone".into(),
+            caution: false,
+            introduced_in: Some(RevisionId::new(origin)),
+        };
+        let a = Plan::new(
+            RevisionId::new("r"),
+            "a",
+            vec![],
+            vec![removal("r1")],
+            vec![],
+        );
+        let b = Plan::new(
+            RevisionId::new("r"),
+            "b",
+            vec![],
+            vec![removal("r7")],
+            vec![],
+        );
+        assert_eq!(a.digest, b.digest);
+    }
+
+    #[test]
     fn counts_changes_and_detects_destructive_plans() {
         let plan = Plan::new(
             RevisionId::new("r"),
@@ -430,6 +578,31 @@ mod tests {
         };
         assert!(u.get().contains("-b"));
         assert!(u.get().contains("+c"));
+    }
+
+    #[test]
+    fn unified_diffs_can_omit_context() {
+        let old = Redacted::plain("a\nb\nc\nd\n".to_string());
+        let new = Redacted::plain("a\nb\nX\nd\n".to_string());
+        let Diff::Update {
+            unified: Some(u), ..
+        } = Diff::unified_with_context("1 line", &old, &new, 0)
+        else {
+            panic!()
+        };
+        assert!(
+            u.get().contains("-c") && u.get().contains("+X"),
+            "{}",
+            u.get()
+        );
+        assert!(!u.get().contains(" b"), "no context lines: {}", u.get());
+        let Diff::Update {
+            unified: Some(u), ..
+        } = Diff::unified("1 line", &old, &new)
+        else {
+            panic!()
+        };
+        assert!(u.get().contains(" b"));
     }
 
     #[test]

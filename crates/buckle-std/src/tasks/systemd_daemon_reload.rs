@@ -40,7 +40,10 @@ impl Task for SystemdDaemonReload {
     }
 
     #[tracing::instrument(name = "task.systemd.daemon_reload.plan", skip_all)]
-    async fn plan(&self, _cx: &Cx, _spec: &Spec) -> Result<Planned> {
+    async fn plan(&self, cx: &Cx, _spec: &Spec) -> Result<Planned> {
+        if let Some(blocked) = super::systemd_common::unavailable(cx).await? {
+            return Ok(blocked);
+        }
         Ok(Planned::change(Diff::Opaque {
             summary: "daemon-reload".into(),
         }))
@@ -63,7 +66,12 @@ mod tests {
 
     #[tokio::test]
     async fn always_plans_a_change_and_reloads_on_apply() {
-        let sys = FakeSystem::new().on_command_ok("systemctl", &["daemon-reload"], "");
+        let sys = FakeSystem::new()
+            .with_dir(
+                "/run/systemd/system",
+                buckle_core::system::FilePerms::mode(0o755),
+            )
+            .on_command_ok("systemctl", &["daemon-reload"], "");
         let cx = cx(&sys);
         let planned = SystemdDaemonReload.plan(&cx, &Spec {}).await.unwrap();
         match &planned {
@@ -90,12 +98,17 @@ mod tests {
 
     #[tokio::test]
     async fn failures_and_removal() {
-        let sys = FakeSystem::new().on_command_fail(
-            "systemctl",
-            &["daemon-reload"],
-            1,
-            "Failed to connect to bus",
-        );
+        let sys = FakeSystem::new()
+            .with_dir(
+                "/run/systemd/system",
+                buckle_core::system::FilePerms::mode(0o755),
+            )
+            .on_command_fail(
+                "systemctl",
+                &["daemon-reload"],
+                1,
+                "Failed to connect to bus",
+            );
         let cx = cx(&sys);
         let err = SystemdDaemonReload
             .apply(&cx, &Spec {}, &Planned::NoOp)

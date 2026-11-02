@@ -134,7 +134,7 @@ async fn csrf(state: Data, req: HttpRequest) -> ApiResult {
 }
 
 fn peer_ip(state: &AppState, req: &HttpRequest) -> Option<std::net::IpAddr> {
-    auth::client_ip(state.web.trust_proxy, req).and_then(|s| s.parse().ok())
+    auth::client_ip(&state.web, req).and_then(|s| s.parse().ok())
 }
 
 #[derive(Deserialize)]
@@ -345,6 +345,13 @@ async fn refresh(state: Data, req: HttpRequest) -> ApiResult {
 async fn logout(state: Data, req: HttpRequest) -> ApiResult {
     if !auth::csrf_ok(&req) {
         return Err(ApiError::csrf());
+    }
+    // The id token stays valid until it expires; revoke it here so a copy
+    // (another tab's event stream, a stolen cookie) stops working too.
+    if let Some(session) = req.cookie(auth::SESSION_COOKIE)
+        && !session.value().is_empty()
+    {
+        state.revoked.revoke(session.value());
     }
     Ok(HttpResponse::NoContent()
         .cookie(auth::clear_cookie(&state, auth::SESSION_COOKIE, "/"))
@@ -633,6 +640,11 @@ async fn host_forget(state: Data, admin: Administrative, path: web::Path<String>
         None,
     )
     .await;
+    // A forgotten host keeps no session: its agent reconnects and, being
+    // unknown, registers afresh.
+    if state.agent_sessions.close(&id) {
+        tracing::info!(buckle.host = %id, "closed the session of a forgotten host");
+    }
     state.controller.host_changed(&id);
     Ok(HttpResponse::NoContent().finish())
 }
@@ -946,13 +958,47 @@ fn sse_frame(event: &LiveEvent) -> web::Bytes {
     web::Bytes::from(format!("event: {kind}\ndata: {json}\n\n"))
 }
 
-async fn events(state: Data, _: Authenticated) -> HttpResponse {
+/// One open event stream: what it reads from and the request it re-checks.
+struct EventStream {
+    rx: tokio::sync::broadcast::Receiver<LiveEvent>,
+    state: Data,
+    req: HttpRequest,
+    next_check: tokio::time::Instant,
+    ended: bool,
+}
+
+async fn events(state: Data, req: HttpRequest, _: Authenticated) -> HttpResponse {
     let rx = state.events.subscribe();
     let first = futures::stream::once(async {
         Ok::<_, actix_web::Error>(web::Bytes::from_static(b": connected\n\n"))
     });
-    let rest = futures::stream::unfold(rx, |mut rx| async move {
-        let frame = match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+    let recheck = state.sse_recheck;
+    let keepalive = Duration::from_secs(15);
+    let stream = EventStream {
+        rx,
+        next_check: tokio::time::Instant::now() + recheck,
+        state: state.clone(),
+        req,
+        ended: false,
+    };
+    // The session is re-checked every `sse_recheck` (expiry, sign-out and
+    // the ACLs as they are now); a stream that no longer passes says so and
+    // ends, and the browser's reconnect then meets the usual 401/403.
+    let rest = futures::stream::unfold(stream, move |mut s| async move {
+        if s.ended {
+            return None;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= s.next_check {
+            if auth::resolve(&s.state, &s.req).await.is_err() {
+                s.ended = true;
+                let bye = web::Bytes::from_static(b"event: session_ended\ndata: {}\n\n");
+                return Some((Ok::<_, actix_web::Error>(bye), s));
+            }
+            s.next_check = tokio::time::Instant::now() + recheck;
+        }
+        let wait = keepalive.min(s.next_check.saturating_duration_since(now));
+        let frame = match tokio::time::timeout(wait, s.rx.recv()).await {
             Ok(Ok(ev)) => sse_frame(&ev),
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                 web::Bytes::from_static(b"event: lagged\ndata: {}\n\n")
@@ -960,7 +1006,7 @@ async fn events(state: Data, _: Authenticated) -> HttpResponse {
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
             Err(_) => web::Bytes::from_static(b": keepalive\n\n"),
         };
-        Some((Ok::<_, actix_web::Error>(frame), rx))
+        Some((Ok::<_, actix_web::Error>(frame), s))
     });
     use futures::StreamExt as _;
     HttpResponse::Ok()
@@ -982,6 +1028,9 @@ struct AuditQuery {
     before: Option<u64>,
     #[serde(default)]
     limit: Option<u32>,
+    /// `false` leaves out controller progress transitions.
+    #[serde(default)]
+    progress: Option<bool>,
 }
 
 async fn audit(state: Data, _: Authenticated, q: web::Query<AuditQuery>) -> ApiResult {
@@ -994,21 +1043,22 @@ async fn audit(state: Data, _: Authenticated, q: web::Query<AuditQuery>) -> ApiR
         None => None,
     };
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let (items, total) = state
+    let page = state
         .store
         .call(move |db| {
-            db.audit().list(&AuditFilter {
+            db.audit().page(&AuditFilter {
                 filter,
                 before: q.before,
                 limit,
+                hide_progress: q.progress == Some(false),
             })
         })
         .await?;
-    let next = (items.len() as u64) < total;
-    let next = next
-        .then(|| items.last().map(|e| e.id.to_string()))
-        .flatten();
-    Ok(HttpResponse::Ok().json(Page { items, next, total }))
+    Ok(HttpResponse::Ok().json(Page {
+        items: page.items,
+        next: page.next.map(|n| n.to_string()),
+        total: page.total,
+    }))
 }
 
 async fn webhook(state: Data, req: HttpRequest, body: web::Bytes) -> ApiResult {

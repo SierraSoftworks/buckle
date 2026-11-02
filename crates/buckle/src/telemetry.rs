@@ -1,8 +1,8 @@
-//! tracing-batteries session for the binary. OTLP export is configured from the
-//! standard `OTEL_EXPORTER_OTLP_*` environment variables (or `--otel-endpoint`);
-//! `buckle agent` also reads `telemetry.otlp_endpoint` and
-//! `telemetry.otlp_headers` from its agent.yaml (the environment and the flag
-//! win over the file).
+//! tracing-batteries session for the binary. OTLP export (traces and
+//! metrics) goes to `--otel-endpoint` / the standard `OTEL_EXPORTER_OTLP_*`
+//! environment variables or, when those are not set, to
+//! `telemetry.otlp_endpoint` and `telemetry.otlp_headers` from server.yaml
+//! (`buckle server`) or agent.yaml (`buckle agent`).
 
 use tracing_batteries::{OpenTelemetry, Session};
 
@@ -39,11 +39,21 @@ fn otlp_target(
 }
 
 pub fn session(cli: &crate::commands::Cli) -> Session {
-    let file = agent_telemetry(cli);
-    let (endpoint, headers) = otlp_target(cli.otel_endpoint.as_deref(), file.as_ref());
-    let mut otel = OpenTelemetry::new(endpoint);
-    // Headers from OTEL_EXPORTER_OTLP_HEADERS keep precedence (with_header
-    // never replaces a header already set).
+    let (endpoint, headers) = match &cli.command {
+        crate::commands::Command::Server(args) => {
+            let file = buckle_server::config::TelemetryConfig::peek(&args.config).unwrap_or_default();
+            (
+                cli.otel_endpoint
+                    .clone()
+                    .or(file.otlp_endpoint)
+                    .unwrap_or_default(),
+                file.otlp_headers.into_iter().collect(),
+            )
+        }
+        _ => otlp_target(cli.otel_endpoint.as_deref(), agent_telemetry(cli).as_ref()),
+    };
+    // Headers from OTEL_EXPORTER_OTLP_HEADERS win; with_header keeps them.
+    let mut otel = OpenTelemetry::new(endpoint).with_metrics();
     for (key, value) in headers {
         otel = otel.with_header(key, value);
     }
