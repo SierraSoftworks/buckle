@@ -396,7 +396,7 @@ async fn fetch(cx: &Cx, src: &str) -> Result<Vec<u8>> {
 fn creates_path(spec: &Spec) -> Option<PathBuf> {
     spec.creates.as_ref().map(|c| {
         let p = Path::new(c);
-        if p.is_absolute() {
+        if p.is_absolute() || p.has_root() {
             p.to_path_buf()
         } else {
             spec.dest.join(p)
