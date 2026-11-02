@@ -84,6 +84,7 @@ async fn the_agent_transport_enrols_is_assigned_and_fetches_a_verified_revision(
             platform: "linux".into(),
             arch: "aarch64".into(),
             bootstrap: true,
+            unreported_apply_revisions: vec![],
         })
         .await
         .expect("the session opens over pinned TLS");

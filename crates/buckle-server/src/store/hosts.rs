@@ -387,6 +387,9 @@ impl<'c> Hosts<'c> {
         self.conn
             .execute("DELETE FROM host_facts WHERE host_id = ?1", params![id])
             .map_err(db_error)?;
+        self.conn
+            .execute("DELETE FROM agent_reports WHERE host = ?1", params![id])
+            .map_err(db_error)?;
         let n = self
             .conn
             .execute("DELETE FROM hosts WHERE host_id = ?1", params![id])

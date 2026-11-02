@@ -110,14 +110,44 @@ pub fn launchd_plist(exe: &Path, config: &Path) -> String {
     )
 }
 
-/// The `sc.exe` invocations that create, configure and start the Windows service.
-pub fn windows_service_commands(exe: &Path, config: &Path) -> Vec<Vec<String>> {
-    let bin_path = format!(
-        "\"{}\" agent --config \"{}\"",
+/// What `install` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// The service is installed (or reconfigured) and started.
+    Service,
+    /// Only the files were written: `--no-service`, or no supported service
+    /// manager (e.g. Linux without systemd). Run this to start the agent.
+    FilesOnly {
+        /// The command that runs the agent.
+        start_command: String,
+    },
+}
+
+/// The `binPath=` of the Windows service: the agent in service mode.
+fn windows_bin_path(exe: &Path, config: &Path) -> String {
+    format!(
+        "\"{}\" agent --config \"{}\" --windows-service",
         exe.to_string_lossy(),
         config.to_string_lossy()
-    );
-    vec![
+    )
+}
+
+/// The `sc.exe` invocations that create (or, when the service already
+/// exists, reconfigure and restart) and start the Windows service.
+pub fn windows_service_commands(exe: &Path, config: &Path, exists: bool) -> Vec<Vec<String>> {
+    let bin_path = windows_bin_path(exe, config);
+    let define = if exists {
+        vec![
+            "config".into(),
+            SERVICE_NAME.into(),
+            "binPath=".into(),
+            bin_path,
+            "start=".into(),
+            "auto".into(),
+            "DisplayName=".into(),
+            "Buckle agent".into(),
+        ]
+    } else {
         vec![
             "create".into(),
             SERVICE_NAME.into(),
@@ -127,7 +157,10 @@ pub fn windows_service_commands(exe: &Path, config: &Path) -> Vec<Vec<String>> {
             "auto".into(),
             "DisplayName=".into(),
             "Buckle agent".into(),
-        ],
+        ]
+    };
+    vec![
+        define,
         vec![
             "failure".into(),
             SERVICE_NAME.into(),
@@ -138,6 +171,67 @@ pub fn windows_service_commands(exe: &Path, config: &Path) -> Vec<Vec<String>> {
         ],
         vec!["start".into(), SERVICE_NAME.into()],
     ]
+}
+
+/// The `icacls` arguments that restrict `path` to Administrators and SYSTEM
+/// (by SID, so they work on localised Windows): inheritance removed, full
+/// control granted to those two only, inherited by children of a directory.
+pub fn icacls_restrict_args(path: &Path, directory: bool) -> Vec<String> {
+    let inherit = if directory { "(OI)(CI)" } else { "" };
+    vec![
+        path.to_string_lossy().into_owned(),
+        "/inheritance:r".into(),
+        "/grant:r".into(),
+        format!("*S-1-5-32-544:{inherit}F"),
+        "/grant:r".into(),
+        format!("*S-1-5-18:{inherit}F"),
+    ]
+}
+
+/// On Windows, restricts `path` to Administrators and SYSTEM with `icacls`
+/// (the counterpart of mode 0600/0700 elsewhere). A no-op on other platforms.
+pub fn restrict_windows_acl(path: &Path, directory: bool) -> buckle_core::Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let status = std::process::Command::new("icacls")
+        .args(icacls_restrict_args(path, directory))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map_err(|e| {
+            buckle_core::error::wrap_user(
+                e,
+                format!("Could not run icacls to protect {}.", path.display()),
+                &["Run Buckle as an administrator."],
+            )
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(buckle_core::error::user(
+            format!(
+                "icacls could not restrict {} to Administrators and SYSTEM ({status}).",
+                path.display()
+            ),
+            &["Run Buckle as an administrator."],
+        ))
+    }
+}
+
+/// Whether `program` is on PATH.
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+/// The command that runs the agent in the foreground.
+pub fn start_command(exe: &Path, config: &Path) -> String {
+    format!(
+        "{} agent --config {}",
+        systemd_quote(&exe.to_string_lossy()),
+        systemd_quote(&config.to_string_lossy())
+    )
 }
 
 /// Serialises the agent configuration as written to agent.yaml.
@@ -181,7 +275,21 @@ async fn run(program: &str, args: &[String]) -> buckle_core::Result<()> {
     }
 }
 
-async fn install_service(exe: &Path, config_path: &Path) -> buckle_core::Result<()> {
+async fn install_service(exe: &Path, config_path: &Path) -> buckle_core::Result<InstallOutcome> {
+    install_service_with(exe, config_path, on_path("systemctl")).await
+}
+
+async fn install_service_with(
+    exe: &Path,
+    config_path: &Path,
+    systemd: bool,
+) -> buckle_core::Result<InstallOutcome> {
+    if cfg!(target_os = "linux") && !systemd {
+        tracing::warn!("systemd is not available; wrote the configuration only");
+        return Ok(InstallOutcome::FilesOnly {
+            start_command: start_command(exe, config_path),
+        });
+    }
     if cfg!(target_os = "linux") {
         write_atomic(
             Path::new(SYSTEMD_UNIT_PATH),
@@ -195,7 +303,8 @@ async fn install_service(exe: &Path, config_path: &Path) -> buckle_core::Result<
         )
         .await?;
         // A reinstall picks up a new binary or configuration.
-        run("systemctl", &["restart".into(), SERVICE_NAME.into()]).await
+        run("systemctl", &["restart".into(), SERVICE_NAME.into()]).await?;
+        Ok(InstallOutcome::Service)
     } else if cfg!(target_os = "macos") {
         write_atomic(
             Path::new(LAUNCHD_PLIST_PATH),
@@ -215,12 +324,26 @@ async fn install_service(exe: &Path, config_path: &Path) -> buckle_core::Result<
                 LAUNCHD_PLIST_PATH.into(),
             ],
         )
-        .await
+        .await?;
+        Ok(InstallOutcome::Service)
     } else if cfg!(windows) {
-        for args in windows_service_commands(exe, config_path) {
+        // `sc query` succeeds when the service exists: reconfigure it
+        // instead of failing on `sc create`, and restart it so it runs the
+        // new binary and configuration.
+        let exists = tokio::process::Command::new("sc.exe")
+            .args(["query", SERVICE_NAME])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|s| s.success());
+        if exists {
+            let _ = run("sc.exe", &["stop".into(), SERVICE_NAME.into()]).await;
+        }
+        for args in windows_service_commands(exe, config_path, exists) {
             run("sc.exe", &args).await?;
         }
-        Ok(())
+        Ok(InstallOutcome::Service)
     } else {
         Err(buckle_core::error::user(
             "Buckle does not know how to install a service on this platform.",
@@ -237,14 +360,12 @@ pub async fn install(
     config: &AgentConfig,
     config_path: &Path,
     options: &InstallOptions,
-) -> buckle_core::Result<()> {
+) -> buckle_core::Result<InstallOutcome> {
     config.validate()?;
     write_config(config, config_path)?;
+    restrict_windows_acl(config_path, false)?;
     tracing::info!(path = %config_path.display(), "wrote the agent configuration");
     Store::new(&config.state_dir).ensure()?;
-    if options.no_service {
-        return Ok(());
-    }
     let exe = match &options.exe {
         Some(exe) => exe.clone(),
         None => std::env::current_exe().map_err(|e| {
@@ -255,6 +376,11 @@ pub async fn install(
             )
         })?,
     };
+    if options.no_service {
+        return Ok(InstallOutcome::FilesOnly {
+            start_command: start_command(&exe, config_path),
+        });
+    }
     install_service(&exe, config_path).await
 }
 
@@ -298,16 +424,66 @@ mod tests {
         assert!(plist.contains(LAUNCHD_LABEL));
     }
 
-    #[test]
-    fn the_windows_service_restarts_on_failure() {
+    #[rstest::rstest]
+    #[case::new_service(false, "create")]
+    #[case::existing_service(true, "config")]
+    fn the_windows_service_is_created_or_reconfigured_and_restarts_on_failure(
+        #[case] exists: bool,
+        #[case] verb: &str,
+    ) {
         let cmds = windows_service_commands(
             Path::new(r"C:\Program Files\buckle\buckle.exe"),
             Path::new(r"C:\ProgramData\buckle\agent.yaml"),
+            exists,
         );
-        assert_eq!(cmds[0][0], "create");
+        assert_eq!(cmds[0][0], verb);
         assert!(cmds[0][3].starts_with("\"C:\\Program Files\\buckle\\buckle.exe\" agent --config"));
+        assert!(
+            cmds[0][3].ends_with("--windows-service"),
+            "the SCM starts the agent in service mode"
+        );
         assert!(cmds[1].iter().any(|a| a.starts_with("restart/5000")));
         assert_eq!(cmds[2], vec!["start", SERVICE_NAME]);
+    }
+
+    #[rstest::rstest]
+    #[case::directory(true, "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F")]
+    #[case::file(false, "*S-1-5-32-544:F", "*S-1-5-18:F")]
+    fn icacls_grants_only_administrators_and_system(
+        #[case] directory: bool,
+        #[case] admins: &str,
+        #[case] system: &str,
+    ) {
+        let args = icacls_restrict_args(Path::new(r"C:\ProgramData\buckle"), directory);
+        assert_eq!(
+            args,
+            vec![
+                r"C:\ProgramData\buckle".to_string(),
+                "/inheritance:r".into(),
+                "/grant:r".into(),
+                admins.into(),
+                "/grant:r".into(),
+                system.into(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn without_systemd_install_writes_the_files_and_says_how_to_start() {
+        let outcome = install_service_with(
+            Path::new("/usr/local/bin/buckle"),
+            Path::new("/etc/buckle/agent.yaml"),
+            false,
+        )
+        .await
+        .expect("no failure without systemd");
+        assert_eq!(
+            outcome,
+            InstallOutcome::FilesOnly {
+                start_command: "/usr/local/bin/buckle agent --config /etc/buckle/agent.yaml".into()
+            }
+        );
     }
 
     fn config(token: Option<&str>, state_dir: &Path) -> AgentConfig {

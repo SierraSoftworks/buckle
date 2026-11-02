@@ -262,8 +262,12 @@ impl RunningAgent {
             inner: GrpcTransport::new(&config).expect("the transport builds"),
             reports: reports.clone(),
         });
-        let state = Arc::new(Store::new(state_dir).state_store());
-        let runner = Arc::new(EngineRunner::new(Arc::new(spec.system.clone()), state));
+        let store = Store::new(state_dir);
+        let state = Arc::new(store.state_store());
+        let runner = Arc::new(
+            EngineRunner::new(Arc::new(spec.system.clone()), state)
+                .with_scratch_dir(store.scratch_dir()),
+        );
         let options = AgentOptions {
             agent_version: "2.0.0".into(),
             heartbeat: Duration::from_secs(1),
@@ -271,8 +275,10 @@ impl RunningAgent {
             backoff_min: Duration::from_millis(100),
             backoff_max: Duration::from_millis(300),
             backoff_jitter: false,
+            rejected_backoff_max: Duration::from_secs(1),
             event_spacing: Duration::from_millis(10),
             shutdown_grace: Duration::from_secs(5),
+            welcome_timeout: Duration::from_secs(10),
         };
         let agent = Agent::new(config, transport, runner, Arc::new(NoUpdates), options)
             .expect("the agent starts");

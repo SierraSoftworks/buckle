@@ -5,10 +5,97 @@
 //! * Revision and digest fields are hex strings.
 //! * Structured documents the UI also needs (plans, outcomes, facts) travel as
 //!   JSON bytes of the `buckle-core` types, so the schema lives in one place.
-//! * Trace context is carried in gRPC metadata (`traceparent`), not in messages.
+//! * Trace context: the session call carries `traceparent` in gRPC metadata;
+//!   because one session outlives many operations, the server-driven
+//!   operations (Apply, Rollback, RunHealth) also carry their own
+//!   `traceparent` field, which the agent uses as the parent of its span.
+//! * Messages carrying secret values or tokens (SecretValue, SecretBundle,
+//!   Welcome, Assign, Hello, HostUpdate) have Debug impls that show names and
+//!   fingerprints only, never values or tokens.
 
 pub mod v1 {
     tonic::include_proto!("buckle.v1");
+
+    use std::fmt;
+
+    fn redacted(token: &str) -> &'static str {
+        if token.is_empty() { "" } else { "<redacted>" }
+    }
+
+    impl fmt::Debug for SecretValue {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("SecretValue")
+                .field("name", &self.name)
+                .field("fingerprint", &self.fingerprint)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl fmt::Debug for SecretBundle {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("SecretBundle")
+                .field("secrets", &self.secrets)
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for Welcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Welcome")
+                .field("server_version", &self.server_version)
+                .field("session_id", &self.session_id)
+                .field("stable_revision", &self.stable_revision)
+                .field("issued_token", &redacted(&self.issued_token))
+                .field("labels", &self.labels)
+                .field("status", &self.status)
+                .field("secrets", &self.secrets)
+                .field("stable_tree_digest", &self.stable_tree_digest)
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for Assign {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Assign")
+                .field("revision", &self.revision)
+                .field("stable", &self.stable)
+                .field("secrets", &self.secrets)
+                .field("tree_digest", &self.tree_digest)
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for Hello {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Hello")
+                .field("host_id", &self.host_id)
+                .field("agent_version", &self.agent_version)
+                .field("labels", &self.labels)
+                .field("applied_revision", &self.applied_revision)
+                .field("last_plan_digest", &self.last_plan_digest)
+                .field("token", &redacted(&self.token))
+                .field("platform", &self.platform)
+                .field("arch", &self.arch)
+                .field("bootstrap", &self.bootstrap)
+                .field(
+                    "unreported_apply_revisions",
+                    &self.unreported_apply_revisions,
+                )
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for HostUpdate {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("HostUpdate")
+                .field("status", &self.status)
+                .field("labels", &self.labels)
+                .field("stable_revision", &self.stable_revision)
+                .field("secrets", &self.secrets)
+                .field("stable_tree_digest", &self.stable_tree_digest)
+                .finish()
+        }
+    }
 
     impl From<buckle_health::HealthScope> for HealthScope {
         fn from(scope: buckle_health::HealthScope) -> Self {
@@ -76,6 +163,64 @@ mod tests {
         let bytes = hello.encode_to_vec();
         let decoded = AgentMessage::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded, hello);
+    }
+
+    #[test]
+    fn debug_never_shows_secret_values_or_tokens() {
+        let bundle = || {
+            Some(SecretBundle {
+                secrets: vec![SecretValue {
+                    name: "db".into(),
+                    value: b"hunter2".to_vec(),
+                    fingerprint: "0a1b2c3d".into(),
+                }],
+            })
+        };
+        let shown = [
+            format!("{:?}", bundle()),
+            format!(
+                "{:?}",
+                ServerMessage {
+                    msg: Some(server_message::Msg::Welcome(Welcome {
+                        issued_token: "tok-en-value".into(),
+                        secrets: bundle(),
+                        ..Default::default()
+                    })),
+                }
+            ),
+            format!(
+                "{:?}",
+                Assign {
+                    secrets: bundle(),
+                    ..Default::default()
+                }
+            ),
+            format!(
+                "{:?}",
+                AgentMessage {
+                    msg: Some(agent_message::Msg::Hello(Hello {
+                        token: "tok-en-value".into(),
+                        ..Default::default()
+                    })),
+                }
+            ),
+            format!(
+                "{:?}",
+                HostUpdate {
+                    secrets: bundle(),
+                    ..Default::default()
+                }
+            ),
+        ];
+        for text in shown {
+            assert!(!text.contains("hunter2"), "{text}");
+            assert!(
+                !text.contains("104, 117, 110"),
+                "bytes of the value: {text}"
+            );
+            assert!(!text.contains("tok-en-value"), "{text}");
+        }
+        assert!(format!("{:?}", bundle()).contains("0a1b2c3d"));
     }
 
     #[test]

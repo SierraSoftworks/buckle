@@ -117,8 +117,15 @@ pub fn choose_release<'a>(releases: &'a [Release], wanted: Option<&str>) -> Opti
 #[async_trait]
 impl Updater for GitHubUpdater {
     async fn update(&self, version: Option<&str>) -> buckle_core::Result<UpdateOutcome> {
+        // A span guard held across awaits would attach whatever else runs on
+        // this thread to the update span; instrument the future instead.
         let span = tracing::info_span!("agent.update", version = version.unwrap_or("latest"));
-        let _guard = span.enter();
+        tracing::Instrument::instrument(self.update_in_span(version), span).await
+    }
+}
+
+impl GitHubUpdater {
+    async fn update_in_span(&self, version: Option<&str>) -> buckle_core::Result<UpdateOutcome> {
         let releases = self.source.get_releases().await?;
         let release = choose_release(&releases, version).ok_or_else(|| {
             buckle_core::error::user(
@@ -182,14 +189,22 @@ impl Updater for GitHubUpdater {
             std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
                 .to_human_error()?;
         }
+        // Windows cannot replace a running executable, but it can rename it:
+        // move it aside first, and put it back if the swap fails so the
+        // service still has a binary to start.
         #[cfg(windows)]
-        {
+        let aside = {
             let aside = target.with_extension("old.exe");
             let _ = std::fs::remove_file(&aside);
             std::fs::rename(&target, &aside).to_human_error()?;
-        }
+            aside
+        };
         if let Err(err) = std::fs::rename(&staging, &target) {
             let _ = std::fs::remove_file(&staging);
+            #[cfg(windows)]
+            if let Err(restore) = std::fs::rename(&aside, &target) {
+                tracing::error!(error = %restore, "could not restore the previous binary after a failed update");
+            }
             return Err(err).to_human_error();
         }
         tracing::info!(version = %release.version, path = %target.display(), "installed a new Buckle binary");

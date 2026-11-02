@@ -31,6 +31,9 @@ tracing-batteries.workspace = true
 buckle-api.workspace = true
 tokio-util.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
 [dev-dependencies]
 chrono.workspace = true
 rstest.workspace = true

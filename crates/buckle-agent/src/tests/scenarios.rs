@@ -174,7 +174,7 @@ async fn assign_plan_apply_reports_the_plan_coalesced_events_and_the_result() {
         serde_json::from_slice(&result.outcome_json).expect("outcome json");
     assert!(outcome.succeeded);
 
-    let state = Store::new(h.state_dir()).load_state().expect("state");
+    let state = Store::new(h.state_dir()).load_agent_state();
     assert_eq!(state.applied_revision, Some(rev("rev1")));
 
     // The next Hello carries the applied revision and the last plan digest.
@@ -466,12 +466,26 @@ async fn local_rollback_triggers_when_cut_off_with_failing_health() {
     assert!(rollback.reason.contains("m/api"), "{}", rollback.reason);
     assert!(!rollback.evidence.is_empty());
     assert!(rollback.evidence.iter().all(|e| !e.passed && e.required));
-    assert!(
-        Store::new(h.state_dir())
+    assert!(rollback.succeeded);
+    assert!(rollback.report_id > 0);
+    // Kept until the server acknowledges it.
+    let store = Store::new(h.state_dir());
+    let kept = |store: &Store| {
+        store
             .load_agent_state()
-            .pending_rollbacks
-            .is_empty()
-    );
+            .unacked_reports
+            .iter()
+            .any(|r| r.report_id() == rollback.report_id)
+    };
+    assert!(kept(&store));
+    session
+        .send(pb::server_message::Msg::Ack(pb::Ack {
+            report_ids: vec![rollback.report_id],
+        }))
+        .await;
+    while kept(&store) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     h.stop().await.expect("clean exit");
 }
 
@@ -485,12 +499,18 @@ async fn local_rollback_does_not_trigger_when_health_is_fine() {
         state.watchdog, None,
         "the window passed and the watchdog disarmed"
     );
-    assert!(state.pending_rollbacks.is_empty());
+    assert!(
+        state
+            .unacked_reports
+            .iter()
+            .all(|r| matches!(r, crate::transport::DurableReport::ApplyResult { .. })),
+        "no local rollback was recorded"
+    );
     h.stop().await.expect("clean exit");
 }
 
 #[tokio::test(start_paused = true)]
-async fn local_rollback_does_not_trigger_when_the_server_was_already_gone() {
+async fn an_approved_apply_whose_session_ended_before_it_started_is_skipped() {
     let runner = FakeRunner::new();
     let plan = plan_with_changes(&rev("rev1"), 1);
     runner.with_plans(&rev("rev1"), vec![plan.clone()]);
@@ -537,23 +557,45 @@ async fn local_rollback_does_not_trigger_when_the_server_was_already_gone() {
     h.fleet.set_unreachable(true);
     session.close();
 
-    tokio::time::timeout(
-        Duration::from_secs(3600),
-        runner.wait_for(|calls| {
-            calls
-                .iter()
-                .any(|c| matches!(c, Call::Apply { revision, .. } if revision.0 == "rev1"))
-        }),
-    )
-    .await
-    .expect("the approved apply ran");
+    // The apply belonged to the dead session: it never runs (the server
+    // re-sends it after the reconnect), so nothing arms the watchdog and
+    // nothing rolls back.
     tokio::time::sleep(Duration::from_secs(1200)).await;
+    assert!(
+        !runner
+            .applies()
+            .iter()
+            .any(|c| matches!(c, Call::Apply { revision, .. } if revision.0 == "rev1")),
+        "the orphaned apply was skipped"
+    );
     assert_eq!(
         stable_applies(&runner),
         1,
         "only the initial rollout of the stable revision"
     );
     assert_eq!(Store::new(h.state_dir()).load_agent_state().watchdog, None);
+
+    // The next Hello still shows the stable revision and no apply in flight.
+    h.fleet.set_unreachable(false);
+    let mut next = h.sessions.accept().await;
+    assert_eq!(next.hello.applied_revision, "stable1");
+    assert!(
+        !next
+            .hello
+            .unreported_apply_revisions
+            .contains(&"rev1".to_string())
+    );
+    // The re-sent apply runs on the new session.
+    next.send(welcome(Some("stable1"), None)).await;
+    next.send(pb::server_message::Msg::Apply(apply(
+        "rev1",
+        plan.digest.as_str(),
+    )))
+    .await;
+    let result = next
+        .expect(|m| apply_result(m).filter(|r| r.revision == "rev1"))
+        .await;
+    assert!(result.succeeded);
     h.stop().await.expect("clean exit");
 }
 
@@ -574,12 +616,19 @@ async fn a_restart_mid_window_resumes_the_watchdog() {
                 )
                 .expect("extract");
             }
-            store
-                .update_state(|s| {
-                    s.applied_revision = Some(rev("rev1"));
-                    s.stable_revision = Some(rev("stable1"));
-                })
-                .expect("state");
+            // Bookkeeping as an older agent kept it, in the engine's state:
+            // adopted on start.
+            {
+                use buckle_core::state::StateStore;
+                store
+                    .state_store()
+                    .save(&buckle_core::state::State {
+                        applied_revision: Some(rev("rev1")),
+                        stable_revision: Some(rev("stable1")),
+                        ..Default::default()
+                    })
+                    .expect("state");
+            }
             store
                 .save_agent_state(&crate::store::AgentState {
                     watchdog: Some(crate::watchdog::WatchdogState {
@@ -615,12 +664,16 @@ async fn a_restart_mid_window_resumes_the_watchdog() {
         elapsed >= Duration::from_secs(179) && elapsed < Duration::from_secs(300),
         "{elapsed:?}"
     );
-    let pending = Store::new(h.state_dir())
-        .load_agent_state()
-        .pending_rollbacks;
+    let pending = Store::new(h.state_dir()).load_agent_state().unacked_reports;
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].to, rev("stable1"));
-    assert!(pending[0].succeeded);
+    match &pending[0] {
+        crate::transport::DurableReport::LocalRollback(record) => {
+            assert_eq!(record.to, rev("stable1"));
+            assert!(record.succeeded);
+            assert!(record.report_id > 0);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
     h.join_after_shutdown().await;
 }
 
@@ -665,29 +718,19 @@ async fn reconnect_backoff_grows_and_resets_after_a_session() {
     h.stop().await.expect("clean exit");
 }
 
-#[rstest]
-#[case::final_rejection(false)]
-#[case::retryable(true)]
 #[tokio::test(start_paused = true)]
-async fn rejection_stops_the_agent_unless_retry_is_allowed(#[case] retry: bool) {
+async fn a_retryable_rejection_reconnects() {
     let mut h = Harness::start(Setup::default()).await;
     let session = h.sessions.accept().await;
     session
         .send(pb::server_message::Msg::Rejected(pb::Rejected {
-            reason: "unknown host".into(),
-            retry,
+            reason: "server busy".into(),
+            retry: true,
         }))
         .await;
-    if retry {
-        let again = h.sessions.accept().await;
-        assert_eq!(again.hello.host_id, "test-host");
-        h.stop().await.expect("clean exit");
-    } else {
-        let err = h.join().await.expect_err("the agent gives up");
-        assert!(err.description().contains("unknown host"));
-        tokio::time::sleep(Duration::from_secs(600)).await;
-        assert_eq!(h.fleet.attempts().len(), 1, "no further attempts");
-    }
+    let again = h.sessions.accept().await;
+    assert_eq!(again.hello.host_id, "test-host");
+    h.stop().await.expect("clean exit");
 }
 
 #[tokio::test(start_paused = true)]

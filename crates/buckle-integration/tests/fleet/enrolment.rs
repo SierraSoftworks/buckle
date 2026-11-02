@@ -106,26 +106,24 @@ async fn a_pending_host_waits_for_approval_then_converges_and_is_welcomed_with_i
     .await;
 
     // A second machine claiming the enrolled id with the bootstrap token is
-    // refused, and so is a wrong bootstrap token; neither agent retries.
-    world.spawn(common::host("new-1").state_dir("impostor"));
-    world.spawn(AgentSpec::new("intruder").bootstrap_token("not-the-token"));
-    for name in ["impostor", "intruder"] {
-        eventually(&format!("the {name} agent to give up"), WAIT, async || {
-            world
-                .agent_exited(name)
-                .then_some(())
-                .ok_or("still running".to_owned())
-        })
-        .await;
-        let err = world
+    // refused, and so is a wrong bootstrap token. Neither exits (a service
+    // manager would only restart it every few seconds): both keep retrying
+    // with a slow backoff and are never welcomed.
+    let impostor = world.spawn(common::host("new-1").state_dir("impostor"));
+    let intruder = world.spawn(AgentSpec::new("intruder").bootstrap_token("not-the-token"));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for (name, agent) in [("impostor", &impostor), ("intruder", &intruder)] {
+        assert!(!world.agent_exited(name), "{name} keeps running");
+        assert_eq!(agent.token(), None, "{name} was never issued a token");
+        assert_eq!(
+            agent.agent_state().status,
+            None,
+            "{name} was never welcomed"
+        );
+        world
             .stop_agent(name)
             .await
-            .expect_err("a rejected agent exits with an error");
-        assert!(
-            err.description().contains("rejected"),
-            "{name}: {}",
-            err.description()
-        );
+            .expect("a refused agent stops cleanly on shutdown");
     }
     let (status, _) = world
         .api()

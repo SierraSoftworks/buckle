@@ -6,6 +6,7 @@
 //! localhost TCP port.
 
 mod fake_server;
+mod hardening;
 mod scenarios;
 
 use crate::config::AgentConfig;
@@ -50,7 +51,13 @@ pub struct Setup {
     pub tcp: bool,
     /// Prepares the state directory before the agent starts.
     pub prepare: Option<Prepare>,
+    /// Builds a runner to use instead of `runner`, given the state
+    /// directory (`runner` is then only reachable if the wrapper delegates).
+    pub custom_runner: Option<RunnerFactory>,
 }
+
+/// Builds a runner for a state directory.
+pub type RunnerFactory = Box<dyn FnOnce(&Path) -> Arc<dyn crate::runner::Runner>>;
 
 impl Default for Setup {
     fn default() -> Self {
@@ -59,6 +66,7 @@ impl Default for Setup {
             runner: FakeRunner::new(),
             tcp: false,
             prepare: None,
+            custom_runner: None,
         }
     }
 }
@@ -97,14 +105,11 @@ impl Harness {
             backoff_jitter: false,
             ..Default::default()
         };
-        let agent = Agent::new(
-            config,
-            transport,
-            setup.runner.clone(),
-            updater.clone(),
-            options,
-        )
-        .expect("agent");
+        let runner: Arc<dyn crate::runner::Runner> = match setup.custom_runner {
+            Some(build) => build(&state_dir),
+            None => setup.runner.clone(),
+        };
+        let agent = Agent::new(config, transport, runner, updater.clone(), options).expect("agent");
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn(agent.run(shutdown.clone()));
         Self {

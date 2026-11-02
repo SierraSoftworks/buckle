@@ -278,6 +278,12 @@ pub struct HostRuntime {
     /// The phase index the host belongs to (stragglers use `usize::MAX` → None).
     #[serde(default)]
     pub phase_index: Option<usize>,
+    /// A rollback the host ran on its own failed; both results are recorded.
+    #[serde(default)]
+    pub needs_attention: bool,
+    /// How often the Apply was re-sent after reconnects without being run.
+    #[serde(default)]
+    pub apply_resends: u32,
 }
 
 /// One `rollout_hosts` row.

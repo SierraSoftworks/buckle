@@ -231,6 +231,44 @@ impl Inputs {
     }
 }
 
+/// The cause [`Engine::apply`] attaches to its stale-plan error: the host now
+/// plans differently from the plan it was handed (design §04 "a changed
+/// system between plan and apply … surfaces as a stale plan error"). Callers
+/// find it with [`StalePlan::find`] instead of matching the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalePlan {
+    /// The digest of the plan handed to apply.
+    pub planned: crate::Digest,
+    /// The digest the host plans as now.
+    pub fresh: crate::Digest,
+}
+
+impl std::fmt::Display for StalePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "planned {} but the host now plans {}",
+            self.planned, self.fresh
+        )
+    }
+}
+
+impl std::error::Error for StalePlan {}
+
+impl StalePlan {
+    /// The stale-plan marker in `err`'s cause chain, if it is one.
+    pub fn find(err: &crate::Error) -> Option<&StalePlan> {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+        while let Some(e) = cause {
+            if let Some(stale) = e.downcast_ref::<StalePlan>() {
+                return Some(stale);
+            }
+            cause = e.source();
+        }
+        None
+    }
+}
+
 /// Result of an apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyOutcome {

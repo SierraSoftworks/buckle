@@ -28,7 +28,7 @@ pub mod testing;
 mod tests;
 
 pub use config::AgentConfig;
-pub use install::InstallOptions;
+pub use install::{InstallOptions, InstallOutcome};
 pub use runner::{RunContext, Runner};
 pub use session::{Agent, AgentOptions};
 
@@ -69,11 +69,21 @@ pub async fn run_with_system(
 ) -> buckle_core::Result<i32> {
     config.validate()?;
     let transport: Arc<dyn transport::Transport> = match &config.source {
-        Some(source) => Arc::new(transport::local::LocalTransport::new(source.clone())),
+        Some(source) => {
+            let store = store::Store::new(&config.state_dir);
+            store.ensure()?;
+            Arc::new(
+                transport::local::LocalTransport::new(source.clone())
+                    .with_secrets(store.install_key()?, config.local_secret_exec.clone()),
+            )
+        }
         None => Arc::new(transport::grpc::GrpcTransport::new(&config)?),
     };
-    let state = Arc::new(store::Store::new(&config.state_dir).state_store());
-    let runner = Arc::new(runner::EngineRunner::new(system, state));
+    let store = store::Store::new(&config.state_dir);
+    store.ensure()?;
+    let state = Arc::new(store.state_store());
+    let runner =
+        Arc::new(runner::EngineRunner::new(system, state).with_scratch_dir(store.scratch_dir()));
     let updater = Arc::new(update::GitHubUpdater::new(agent_version));
     let options = AgentOptions {
         agent_version: agent_version.to_owned(),
@@ -90,6 +100,6 @@ pub async fn install(
     config: &AgentConfig,
     config_path: &Path,
     options: &InstallOptions,
-) -> buckle_core::Result<()> {
+) -> buckle_core::Result<InstallOutcome> {
     install::install(config, config_path, options).await
 }

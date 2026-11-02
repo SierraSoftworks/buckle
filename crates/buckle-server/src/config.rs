@@ -296,6 +296,13 @@ pub struct AgentsConfig {
         with = "humantime_serde"
     )]
     pub disconnect_timeout: Duration,
+    /// How long a host may stay applying (from the Apply being sent or
+    /// re-sent) without an ApplyResult before the rollout counts it as failed.
+    #[serde(
+        default = "AgentsConfig::default_apply_timeout",
+        with = "humantime_serde"
+    )]
+    pub apply_timeout: Duration,
 }
 
 impl std::fmt::Debug for AgentsConfig {
@@ -312,6 +319,7 @@ impl std::fmt::Debug for AgentsConfig {
             .field("tailscale_socket", &self.tailscale_socket)
             .field("tailscale", &self.tailscale)
             .field("disconnect_timeout", &self.disconnect_timeout)
+            .field("apply_timeout", &self.apply_timeout)
             .finish()
     }
 }
@@ -319,6 +327,10 @@ impl std::fmt::Debug for AgentsConfig {
 impl AgentsConfig {
     fn default_disconnect_timeout() -> Duration {
         Duration::from_secs(600)
+    }
+
+    fn default_apply_timeout() -> Duration {
+        Duration::from_secs(30 * 60)
     }
 
     fn default_auth() -> Vec<AgentAuth> {
@@ -340,6 +352,7 @@ impl Default for AgentsConfig {
             tailscale_socket: Self::default_tailscale_socket(),
             tailscale: TailscaleConfig::default(),
             disconnect_timeout: Self::default_disconnect_timeout(),
+            apply_timeout: Self::default_apply_timeout(),
         }
     }
 }
@@ -701,6 +714,7 @@ secrets:
             );
         }
         assert_eq!(cfg.agents.disconnect_timeout, Duration::from_secs(600));
+        assert_eq!(cfg.agents.apply_timeout, Duration::from_secs(1800));
         assert_eq!(
             redact_url("https://user:pw@github.com/x.git"),
             "https://user:***@github.com/x.git"

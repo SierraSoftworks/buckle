@@ -57,8 +57,7 @@ async fn a_cut_off_agent_with_failing_health_reapplies_the_stable_revision_and_r
     // Past local_rollback.after with checks failing past settle and no
     // session, the agent applies the cached stable revision on its own.
     let record = eventually("the agent to roll itself back", WAIT, async || {
-        edge.agent_state()
-            .pending_rollbacks
+        local_rollbacks(&edge.agent_state())
             .first()
             .cloned()
             .ok_or("no local rollback yet".to_owned())
@@ -106,12 +105,25 @@ async fn a_cut_off_agent_with_failing_health_reapplies_the_stable_revision_and_r
         audit.items
     );
     eventually("the report to leave the agent's queue", WAIT, async || {
-        edge.agent_state()
-            .pending_rollbacks
+        local_rollbacks(&edge.agent_state())
             .is_empty()
             .then_some(())
             .ok_or("still pending".to_owned())
     })
     .await;
     world.shutdown().await;
+}
+
+/// Local rollbacks the agent holds until the server acknowledges them.
+fn local_rollbacks(
+    state: &buckle_agent::store::AgentState,
+) -> Vec<buckle_agent::transport::LocalRollbackRecord> {
+    state
+        .unacked_reports
+        .iter()
+        .filter_map(|r| match r {
+            buckle_agent::transport::DurableReport::LocalRollback(record) => Some(record.clone()),
+            _ => None,
+        })
+        .collect()
 }

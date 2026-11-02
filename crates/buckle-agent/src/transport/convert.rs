@@ -1,7 +1,7 @@
 //! Conversions between the transport-neutral agent types and the protobuf
 //! messages in [`buckle_proto::v1`].
 
-use super::{Hello, Instruction, LocalRollbackRecord, Report, Welcome, WireSecret};
+use super::{Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, Welcome, WireSecret};
 use buckle_core::health::{HealthReport, HealthResult, HealthStatus};
 use buckle_core::plan::RevisionId;
 use buckle_proto::v1 as pb;
@@ -50,6 +50,11 @@ pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
         platform: hello.platform.clone(),
         arch: hello.arch.clone(),
         bootstrap: hello.bootstrap,
+        unreported_apply_revisions: hello
+            .unreported_apply_revisions
+            .iter()
+            .map(|r| r.0.clone())
+            .collect(),
     }
 }
 
@@ -59,10 +64,12 @@ pub fn secrets_from_proto(bundle: Option<pb::SecretBundle>) -> Vec<WireSecret> {
         .map(|b| {
             b.secrets
                 .into_iter()
-                .map(|s| WireSecret {
-                    name: s.name,
-                    value: s.value,
-                    fingerprint: s.fingerprint,
+                .map(|mut s| WireSecret {
+                    name: std::mem::take(&mut s.name),
+                    // Moved, not copied: the wire buffer becomes the
+                    // WireSecret's, which zeroes it on drop.
+                    value: std::mem::take(&mut s.value),
+                    fingerprint: std::mem::take(&mut s.fingerprint),
                 })
                 .collect()
         })
@@ -81,6 +88,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             labels: w.labels.into_iter().collect(),
             status: w.status,
             secrets: secrets_from_proto(w.secrets),
+            stable_tree_digest: non_empty(w.stable_tree_digest),
         }),
         Msg::Assign(a) => Instruction::Assign {
             revision: RevisionId(a.revision),
@@ -100,10 +108,14 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             waived_checks: a.waived_checks,
             force: a.force,
             traceparent: non_empty(a.traceparent),
+            select: non_empty(a.select),
+            rollout_id: non_empty(a.rollout_id),
+            phase: non_empty(a.phase),
         },
         Msg::Rollback(r) => Instruction::Rollback {
             revision: RevisionId(r.revision),
             reason: r.reason,
+            rollout_id: non_empty(r.rollout_id),
             traceparent: non_empty(r.traceparent),
         },
         Msg::Health(h) => {
@@ -121,7 +133,20 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             }
         }
         Msg::Ping(_) => Instruction::Ping,
-        Msg::Upgrade(u) => Instruction::Upgrade { version: u.version },
+        Msg::Upgrade(u) => Instruction::Upgrade {
+            version: u.version,
+            when_idle: u.when_idle,
+        },
+        Msg::HostUpdate(u) => Instruction::HostUpdate(HostUpdate {
+            status: u.status,
+            labels: u.labels.into_iter().collect(),
+            stable_revision: non_empty(u.stable_revision).map(RevisionId),
+            secrets: secrets_from_proto(u.secrets),
+            stable_tree_digest: non_empty(u.stable_tree_digest),
+        }),
+        Msg::Ack(a) => Instruction::Ack {
+            report_ids: a.report_ids,
+        },
         Msg::Rejected(r) => Instruction::Rejected {
             reason: r.reason,
             retry: r.retry,
@@ -190,8 +215,33 @@ pub fn health_report_to_proto(
     }
 }
 
+/// Whether an unsuccessful outcome is the engine's "needs attention": no
+/// module failed or rolled back, but some stayed blocked.
+pub fn needs_attention(outcome: &buckle_core::engine::ApplyOutcome) -> bool {
+    use buckle_core::engine::ModuleStatus;
+    !outcome.succeeded
+        && outcome.failed_module.is_none()
+        && outcome.rolled_back_modules.is_empty()
+        && outcome
+            .module_results
+            .iter()
+            .any(|m| m.status == ModuleStatus::Blocked)
+        && !outcome.module_results.iter().any(|m| {
+            matches!(
+                m.status,
+                ModuleStatus::Failed | ModuleStatus::Unhealthy | ModuleStatus::RolledBack
+            )
+        })
+}
+
 fn plan_result(plan: &buckle_core::plan::Plan, error: String) -> pb::PlanResult {
     pb::PlanResult {
+        module_errors: plan
+            .indeterminate
+            .iter()
+            .filter(|i| i.plan_error)
+            .map(|i| format!("{}: {}", i.module, i.reason))
+            .collect(),
         revision: plan.revision.0.clone(),
         digest: plan.digest.to_string(),
         plan_json: json_bytes(plan),
@@ -211,6 +261,14 @@ fn local_rollback_to_proto(record: &LocalRollbackRecord) -> pb::LocalRollback {
         at: Some(timestamp(record.at)),
         modules: record.modules.clone(),
         evidence: record.evidence.iter().map(health_result_to_proto).collect(),
+        succeeded: record.succeeded,
+        report_id: record.report_id,
+        rollback_error: record.rollback_error.clone().unwrap_or_default(),
+        rollback_outcome_json: record
+            .rollback_outcome
+            .as_ref()
+            .map(json_bytes)
+            .unwrap_or_default(),
     }
 }
 
@@ -262,10 +320,13 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             event_json: json_bytes(event),
         }),
         Report::ApplyResult {
+            report_id,
             revision,
             outcome,
             applied_revision,
         } => Msg::Result(pb::ApplyResult {
+            report_id: *report_id,
+            needs_attention: needs_attention(outcome),
             revision: revision.0.clone(),
             plan_digest: outcome.plan_digest.to_string(),
             succeeded: outcome.succeeded,
@@ -395,6 +456,65 @@ mod tests {
     }
 
     #[test]
+    fn blocked_modules_without_failures_need_attention() {
+        use buckle_core::engine::{ModuleOutcome, ModuleStatus};
+        let plan = crate::testing::plan_with_changes(&RevisionId::new("r"), 1);
+        let mut outcome = crate::testing::succeeded(&plan);
+        assert!(!needs_attention(&outcome));
+        outcome.succeeded = false;
+        outcome.module_results = vec![ModuleOutcome {
+            module: "m".into(),
+            status: ModuleStatus::Blocked,
+            changes: 0,
+            duration_ms: 1,
+            error: Some("waiting on a lock".into()),
+        }];
+        let report = Report::ApplyResult {
+            report_id: 1,
+            revision: RevisionId::new("r"),
+            outcome: outcome.clone(),
+            applied_revision: None,
+        };
+        match report_to_proto(&report).msg {
+            Some(pb::agent_message::Msg::Result(r)) => {
+                assert!(r.needs_attention);
+                assert!(!r.succeeded);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        outcome.failed_module = Some("m".into());
+        outcome.module_results[0].status = ModuleStatus::Failed;
+        assert!(!needs_attention(&outcome), "a failure is a failure");
+    }
+
+    #[test]
+    fn module_plan_errors_travel_with_the_plan() {
+        let mut plan = crate::testing::plan_with_changes(&RevisionId::new("r"), 1);
+        plan.indeterminate = vec![
+            buckle_core::plan::Indeterminate {
+                module: "nomad".into(),
+                reason: "var 'dc' is undefined".into(),
+                plan_error: true,
+            },
+            buckle_core::plan::Indeterminate {
+                module: "docker".into(),
+                reason: "facts missing".into(),
+                plan_error: false,
+            },
+        ];
+        match report_to_proto(&Report::Plan(plan)).msg {
+            Some(pb::agent_message::Msg::Plan(p)) => {
+                assert_eq!(p.error, "", "the plan itself is valid");
+                assert_eq!(
+                    p.module_errors,
+                    vec!["nomad: var 'dc' is undefined".to_string()]
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn wire_secrets_never_debug_their_value() {
         let s = WireSecret {
             name: "db".into(),
@@ -404,5 +524,28 @@ mod tests {
         let shown = format!("{s:?}");
         assert!(shown.contains("db"));
         assert!(!shown.contains("hunter2"));
+    }
+
+    #[test]
+    fn welcome_debug_hides_the_issued_token_and_secret_values() {
+        let message = pb::ServerMessage {
+            msg: Some(pb::server_message::Msg::Welcome(pb::Welcome {
+                issued_token: "per-host-token-value".into(),
+                secrets: Some(pb::SecretBundle {
+                    secrets: vec![pb::SecretValue {
+                        name: "db".into(),
+                        value: b"hunter2".to_vec(),
+                        fingerprint: "0a1b2c3d".into(),
+                    }],
+                }),
+                ..Default::default()
+            })),
+        };
+        let instruction = instruction_from_proto(message).expect("welcome");
+        let shown = format!("{instruction:?}");
+        assert!(!shown.contains("per-host-token-value"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("0a1b2c3d"), "{shown}");
     }
 }
