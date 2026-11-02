@@ -117,6 +117,7 @@ enum Op {
     Rollback {
         revision: RevisionId,
         reason: String,
+        rollout_id: Option<String>,
         traceparent: Option<String>,
     },
     Health {
@@ -132,6 +133,7 @@ enum Op {
     },
     Upgrade {
         version: String,
+        when_idle: bool,
     },
     WatchdogCheck,
 }
@@ -199,6 +201,9 @@ struct Shared {
     watchdog_queued: AtomicBool,
     /// The revision an Apply is running for, for Hello.
     applying: Mutex<Option<RevisionId>>,
+    /// The span of the current (or last) session, which agent-initiated
+    /// passes follow from.
+    session_span: Mutex<Option<tracing::Span>>,
     /// Shutting down (or restarting after an upgrade): queued operations are
     /// dropped; the running one finishes.
     stopping: AtomicBool,
@@ -397,6 +402,7 @@ impl Agent {
                 applying: Mutex::new(None),
                 use_bootstrap: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
+                session_span: Mutex::new(None),
             }),
         })
     }
@@ -415,7 +421,12 @@ impl Agent {
             tx,
             len: Arc::new(AtomicUsize::new(0)),
         };
-        let worker = tokio::spawn(Shared::worker(shared.clone(), rx, queue.len.clone()));
+        let worker = tokio::spawn(Shared::worker(
+            shared.clone(),
+            rx,
+            queue.len.clone(),
+            queue.tx.downgrade(),
+        ));
         let ticker_cancel = CancellationToken::new();
         let ticker = tokio::spawn(Shared::watchdog_ticker(
             shared.clone(),
@@ -455,6 +466,9 @@ impl Agent {
                 None => break Ok(0),
                 Some(Ok(session)) => {
                     let span = tracing::info_span!("agent.session", buckle.host = %shared.host_id);
+                    if let Ok(mut guard) = shared.session_span.lock() {
+                        *guard = Some(span.clone());
+                    }
                     match shared
                         .clone()
                         .drive(session, &queue, &shutdown)
@@ -825,6 +839,13 @@ impl Shared {
         self.save_agent(&data);
     }
 
+    /// Links an agent-initiated root span to the current (or last) session.
+    fn follow_session(&self, span: &tracing::Span) {
+        if let Some(session) = self.session_span.lock().ok().and_then(|g| g.clone()) {
+            span.follows_from(&session);
+        }
+    }
+
     fn set_applying(&self, revision: Option<RevisionId>) {
         if let Ok(mut guard) = self.applying.lock() {
             *guard = revision;
@@ -860,9 +881,26 @@ impl Shared {
         self: Arc<Self>,
         mut rx: mpsc::UnboundedReceiver<Queued>,
         len: Arc<AtomicUsize>,
+        requeue: mpsc::WeakUnboundedSender<Queued>,
     ) {
         while let Some(queued) = rx.recv().await {
             len.fetch_sub(1, Ordering::SeqCst);
+            // An upgrade sent `when_idle` waits until nothing else is queued
+            // (design §08: "install … when idle").
+            if let Op::Upgrade {
+                when_idle: true, ..
+            } = &queued.op
+                && len.load(Ordering::SeqCst) > 0
+                && !self.stopping.load(Ordering::SeqCst)
+                && let Some(tx) = requeue.upgrade()
+            {
+                tracing::debug!("deferring the upgrade until the agent is idle");
+                len.fetch_add(1, Ordering::SeqCst);
+                if tx.send(queued).is_err() {
+                    len.fetch_sub(1, Ordering::SeqCst);
+                }
+                continue;
+            }
             if self.stopping.load(Ordering::SeqCst) || self.stop.is_cancelled() {
                 tracing::info!(op = ?queued.op, "not starting an operation: the agent is stopping");
                 continue;
@@ -902,7 +940,12 @@ impl Shared {
                     .await
             }
             Op::Plan { revision, select } => {
-                let span = tracing::info_span!("agent.plan", revision = %revision.short());
+                let span = tracing::info_span!(
+                    "agent.plan",
+                    buckle.host = %self.host_id,
+                    buckle.revision = %revision.0,
+                    buckle.plan.digest = tracing::field::Empty
+                );
                 self.plan(revision, select).instrument(span).await
             }
             Op::Apply {
@@ -934,9 +977,16 @@ impl Shared {
             Op::Rollback {
                 revision,
                 reason,
+                rollout_id,
                 traceparent,
             } => {
-                let span = tracing::info_span!("agent.apply", revision = %revision.short(), rollback = true);
+                let span = tracing::info_span!(
+                    "agent.apply",
+                    buckle.host = %self.host_id,
+                    buckle.revision = %revision.0,
+                    buckle.rollout = rollout_id.as_deref().unwrap_or(""),
+                    rollback = true
+                );
                 set_parent_from_traceparent(&span, traceparent.as_deref());
                 self.rollback(revision, reason).instrument(span).await
             }
@@ -947,21 +997,41 @@ impl Shared {
                 until,
                 traceparent,
             } => {
-                let span =
-                    tracing::info_span!("agent.health", scope = ?scope, request = %request_id);
+                let span = tracing::info_span!(
+                    "agent.health",
+                    buckle.host = %self.host_id,
+                    buckle.revision = tracing::field::Empty,
+                    scope = ?scope,
+                    request = %request_id
+                );
                 set_parent_from_traceparent(&span, traceparent.as_deref());
                 self.health(request_id, scope, modules, until)
                     .instrument(span)
                     .await
             }
             Op::Drift => {
-                let span = tracing::info_span!("agent.drift");
+                // Agent-initiated work starts a fresh trace per pass that
+                // follows from the session (design §13), so it exports
+                // promptly rather than with a session that lives for days.
+                let span = tracing::info_span!(
+                    parent: None,
+                    "agent.drift",
+                    buckle.host = %self.host_id,
+                    buckle.revision = tracing::field::Empty,
+                    buckle.plan.digest = tracing::field::Empty
+                );
+                self.follow_session(&span);
                 self.drift().instrument(span).await
             }
             Op::Facts { force_report } => self.facts(force_report).await,
-            Op::Upgrade { version } => self.upgrade(version).await,
+            Op::Upgrade { version, .. } => self.upgrade(version).await,
             Op::WatchdogCheck => {
-                let span = tracing::info_span!("agent.watchdog");
+                let span = tracing::info_span!(
+                    parent: None,
+                    "agent.watchdog",
+                    buckle.host = %self.host_id
+                );
+                self.follow_session(&span);
                 self.watchdog_check().instrument(span).await
             }
         }
@@ -1294,6 +1364,7 @@ impl Shared {
                 }
                 self.remember_facts(facts).await;
                 self.remember_plan(&plan).await;
+                tracing::Span::current().record("buckle.plan.digest", plan.digest.as_str());
                 tracing::info!(digest = %plan.digest.short(), changes = plan.changes(), "planned");
                 self.sink.send(Report::Plan(plan)).await;
             }
@@ -1554,6 +1625,9 @@ impl Shared {
         until: Option<chrono::DateTime<chrono::Utc>>,
     ) {
         let applied = self.data.lock().await.agent.applied_revision.clone();
+        if let Some(r) = &applied {
+            tracing::Span::current().record("buckle.revision", r.0.as_str());
+        }
         let Some(revision) = applied else {
             self.sink
                 .send(Report::Health {
@@ -1821,6 +1895,7 @@ impl Shared {
             )
         };
         let Some(revision) = applied else { return };
+        tracing::Span::current().record("buckle.revision", revision.0.as_str());
         let rev = match self.ensure_revision(&revision, None).await {
             Ok(rev) => rev,
             Err(err) => {
@@ -2150,10 +2225,12 @@ fn op_for(instruction: Instruction) -> Option<Op> {
         Instruction::Rollback {
             revision,
             reason,
+            rollout_id,
             traceparent,
         } => Op::Rollback {
             revision,
             reason,
+            rollout_id,
             traceparent,
         },
         Instruction::RunHealth {
@@ -2169,7 +2246,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             until,
             traceparent,
         },
-        Instruction::Upgrade { version } => Op::Upgrade { version },
+        Instruction::Upgrade { version, when_idle } => Op::Upgrade { version, when_idle },
         Instruction::Welcome(_)
         | Instruction::Ping
         | Instruction::Ack { .. }

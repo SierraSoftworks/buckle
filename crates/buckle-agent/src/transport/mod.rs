@@ -197,6 +197,8 @@ pub enum Instruction {
         revision: RevisionId,
         /// Why, for logs and the run record.
         reason: String,
+        /// The rollout being rolled back, for tracing.
+        rollout_id: Option<String>,
         /// W3C trace context of the span driving the rollback.
         traceparent: Option<String>,
     },
@@ -219,6 +221,8 @@ pub enum Instruction {
     Upgrade {
         /// The release to install.
         version: String,
+        /// Wait until no other operation is queued.
+        when_idle: bool,
     },
     /// The host's record changed (approved, paused, resumed, relabelled).
     HostUpdate(HostUpdate),

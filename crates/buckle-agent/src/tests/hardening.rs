@@ -1116,3 +1116,45 @@ async fn a_local_rollback_renders_the_stable_revision_with_both_revisions_secret
     assert_eq!(stable.1, vec!["new".to_string(), "old".to_string()]);
     h.stop().await.expect("clean exit");
 }
+
+#[rstest::rstest]
+#[case::when_idle(true)]
+#[case::right_away(false)]
+#[tokio::test(start_paused = true)]
+async fn an_upgrade_when_idle_waits_for_queued_operations(#[case] when_idle: bool) {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    let (mut h, runner) = gated(fake.clone()).await;
+    let session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    let later = h.fleet.add_revision("rev2", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    runner.started.notified().await;
+    session
+        .send(pb::server_message::Msg::Upgrade(pb::Upgrade {
+            version: "2.1.0".into(),
+            when_idle,
+        }))
+        .await;
+    session.send(assign("rev2", &later)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    runner.release.notify_one();
+    assert_eq!(h.join().await.expect("exits after upgrading"), 0);
+    assert_eq!(
+        *h.updater.requested.lock().expect("lock"),
+        vec![Some("2.1.0".to_string())]
+    );
+    assert_eq!(
+        Store::new(h.state_dir()).has_revision(&rev("rev2")),
+        when_idle,
+        "the queued assignment runs first only when the upgrade waits for idle"
+    );
+}

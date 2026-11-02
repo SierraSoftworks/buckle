@@ -115,6 +115,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
         Msg::Rollback(r) => Instruction::Rollback {
             revision: RevisionId(r.revision),
             reason: r.reason,
+            rollout_id: non_empty(r.rollout_id),
             traceparent: non_empty(r.traceparent),
         },
         Msg::Health(h) => {
@@ -132,7 +133,10 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             }
         }
         Msg::Ping(_) => Instruction::Ping,
-        Msg::Upgrade(u) => Instruction::Upgrade { version: u.version },
+        Msg::Upgrade(u) => Instruction::Upgrade {
+            version: u.version,
+            when_idle: u.when_idle,
+        },
         Msg::HostUpdate(u) => Instruction::HostUpdate(HostUpdate {
             status: u.status,
             labels: u.labels.into_iter().collect(),
