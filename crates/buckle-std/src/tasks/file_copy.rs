@@ -501,7 +501,9 @@ mod tests {
         let ran = sys.commands_run();
         let checked = ran.iter().find(|c| c.program == "visudo").unwrap();
         assert!(
-            checked.args[1].starts_with("/srv/buckle-state/tmp/"),
+            checked.args[1]
+                .replace('\\', "/")
+                .starts_with("/srv/buckle-state/tmp/"),
             "{:?}",
             checked.args
         );

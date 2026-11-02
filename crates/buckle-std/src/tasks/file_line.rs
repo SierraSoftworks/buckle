@@ -889,7 +889,7 @@ mod tests {
             sys.paths()
                 .iter()
                 .all(|p| !p.starts_with("/var/lib/buckle/stash/file.line/")
-                    || p.as_os_str() == "/var/lib/buckle/stash/file.line")
+                    || p == std::path::Path::new("/var/lib/buckle/stash/file.line"))
         );
     }
 

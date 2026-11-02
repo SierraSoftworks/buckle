@@ -136,7 +136,8 @@ fn proc_path(name: &str) -> std::path::PathBuf {
     } else {
         name.replace('.', "/")
     };
-    std::path::Path::new("/proc/sys").join(rel)
+    // Linux-only, so the path is always `/`-separated (also under Windows tests).
+    std::path::PathBuf::from(format!("/proc/sys/{rel}"))
 }
 
 /// The live value, read from `/proc/sys` so that planning needs no `sysctl`
