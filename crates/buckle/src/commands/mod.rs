@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod install;
 pub mod local;
 pub mod server;
+pub mod update;
 
 /// Lightweight fleet configuration with phased, health-gated rollouts.
 #[derive(Parser, Debug)]
@@ -80,7 +81,7 @@ pub async fn run(cli: Cli) -> buckle_core::Result<i32> {
         Command::Server(args) => server::run(args).await,
         Command::Install(args) => install::run(args).await,
         Command::Catalog(args) => catalog::run(args),
-        Command::Update(_) => Err(not_yet("buckle update")),
+        Command::Update(args) => update::run(args).await,
         Command::Migrate(_) => Err(not_yet("buckle migrate")),
     }
 }

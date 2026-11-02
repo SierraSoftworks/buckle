@@ -219,9 +219,8 @@ message Apply {
   string phase = 6;
   // Operator forced an apply despite a failing baseline.
   bool force = 7;
-  // W3C trace context of the rollout span that issued this apply, so the
-  // agent's apply span joins the rollout trace (a bidirectional stream has no
-  // per-message gRPC metadata).
+  // W3C trace context of the rollout span driving this apply; the agent's
+  // `agent.apply` span uses it as its parent. Empty when not traced.
   string traceparent = 8;
 }
 
@@ -229,7 +228,7 @@ message Rollback {
   string revision = 1;
   string reason = 2;
   string rollout_id = 3;
-  // W3C trace context of the rollout span that issued this rollback.
+  // W3C trace context of the span driving this rollback, when traced.
   string traceparent = 4;
 }
 
@@ -240,7 +239,7 @@ message RunHealth {
   repeated string modules = 3;
   // For bake: repeat until this instant.
   google.protobuf.Timestamp until = 4;
-  // W3C trace context of the rollout span that asked for these checks.
+  // W3C trace context of the span requesting the checks, when traced.
   string traceparent = 5;
 }
 

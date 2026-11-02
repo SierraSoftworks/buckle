@@ -49,7 +49,9 @@ impl DirSource {
     }
 
     fn resolve(&self, path: &Path) -> crate::Result<PathBuf> {
+        // `has_root` catches `/abs` on Windows too, where `is_absolute` wants a drive letter.
         if path.is_absolute()
+            || path.has_root()
             || path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))

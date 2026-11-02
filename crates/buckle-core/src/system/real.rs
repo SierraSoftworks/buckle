@@ -332,15 +332,33 @@ impl System for RealSystem {
     }
 
     async fn which(&self, program: &str) -> crate::Result<Option<PathBuf>> {
-        if program.contains(std::path::MAIN_SEPARATOR) {
+        if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
             let p = PathBuf::from(program);
             return Ok(if p.exists() { Some(p) } else { None });
         }
+        // On Windows an executable is found by name plus one of the PATHEXT
+        // extensions (`sh` resolves to `sh.exe`); elsewhere the bare name is the file.
+        let extensions: Vec<String> = if cfg!(windows) {
+            let mut exts = vec![String::new()];
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_owned());
+            exts.extend(
+                pathext
+                    .split(';')
+                    .filter(|e| !e.is_empty())
+                    .map(|e| e.to_ascii_lowercase()),
+            );
+            exts
+        } else {
+            vec![String::new()]
+        };
         let path = std::env::var_os("PATH").unwrap_or_default();
         for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(program);
-            if candidate.is_file() {
-                return Ok(Some(candidate));
+            for ext in &extensions {
+                let candidate = dir.join(format!("{program}{ext}"));
+                if candidate.is_file() {
+                    return Ok(Some(candidate));
+                }
             }
         }
         Ok(None)
@@ -516,6 +534,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(sys.which("sh").await.unwrap().is_some());
+        let present = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(
+            sys.which(present).await.unwrap().is_some(),
+            "{present} should be on the PATH"
+        );
     }
 }
