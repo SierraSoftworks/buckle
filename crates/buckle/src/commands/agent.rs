@@ -46,7 +46,8 @@ pub async fn run(args: AgentArgs) -> buckle_core::Result<i32> {
     }
     let system = std::sync::Arc::new(
         buckle_core::system::RealSystem::new()
-            .with_http(std::sync::Arc::new(crate::http::ReqwestClient::new())),
+            .with_http(std::sync::Arc::new(crate::http::ReqwestClient::new()))
+            .with_state_dir(config.state_dir.clone()),
     );
     buckle_agent::run_with_system(
         config,

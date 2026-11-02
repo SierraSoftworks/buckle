@@ -509,3 +509,222 @@ pub fn command_run_without_id(decl: &TaskDecl) -> Option<String> {
 pub(super) fn kind_of(decl: &TaskDecl) -> crate::Result<&'static dyn crate::task::DynTask> {
     crate::task::lookup(&decl.kind)
 }
+
+/// The selector context for `host` on `revision`: labels, `facts` (the
+/// facts tree, `Null` when none are known) and the fleet's groups evaluated
+/// in declaration order, so a group may refer to earlier ones. The server
+/// builds this from a host record and the agent from its own state, so both
+/// sides select the same modules for the same inputs.
+pub fn host_context(
+    revision: &Revision,
+    host: HostIdentity,
+    facts: &serde_json::Value,
+) -> crate::selectors::HostContext {
+    let mut ctx = crate::selectors::HostContext::new(host).with_facts(facts.clone());
+    let mut groups = Vec::new();
+    for (name, filter) in &revision.fleet.fleet.groups {
+        if ctx.matches(filter) {
+            groups.push(name.clone());
+            ctx.groups = groups.clone();
+        }
+    }
+    ctx.groups = groups;
+    ctx
+}
+
+/// Whether a selector reads a fact that `facts` does not describe: there
+/// are no facts at all, or the top-level fact the selector names has no
+/// entry (a provider that has not reported yet). A provider that reported
+/// `null` counts as known.
+///
+/// A `when` that reads unknown facts cannot be evaluated faithfully, so
+/// [`secret_names_for_host`] treats its module as possibly selected rather
+/// than definitely not: the server sees a host's facts only once the agent
+/// has reported them, and withholding a secret on that account would make
+/// the host's first plan fail.
+pub fn reads_unknown_facts(raw: &str, facts: &serde_json::Value) -> bool {
+    let refs = super::context::fact_references(raw);
+    if refs.is_empty() {
+        return false;
+    }
+    let Some(known) = facts.as_object() else {
+        return true;
+    };
+    refs.iter().any(|path| {
+        let top = path.split('.').next().unwrap_or(path);
+        !known.contains_key(top)
+    })
+}
+
+/// The declared secrets that the modules and vars overlays selected for the
+/// host in `ctx` reference (design §06: a host receives exactly these). A
+/// module or overlay whose `when` reads facts the context does not have
+/// ([`reads_unknown_facts`]) is included, as it may well be selected once
+/// they are known.
+pub fn secret_names_for_host(
+    revision: &Revision,
+    ctx: &crate::selectors::HostContext,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for module in &revision.modules {
+        let cfg = &module.config;
+        let selected = match &cfg.when {
+            None => true,
+            Some(when) => {
+                ctx.in_module(&cfg.name, &cfg.tags).matches(when)
+                    || reads_unknown_facts(when.raw(), &ctx.facts)
+            }
+        };
+        if !selected {
+            continue;
+        }
+        if let Ok(yaml) = serde_yaml::to_string(cfg) {
+            names.extend(secret_references(&yaml));
+        }
+        for (_, template) in &module.templates {
+            names.extend(secret_references(template));
+        }
+    }
+    for overlay in &revision.fleet.vars {
+        if let Some(when) = &overlay.when
+            && !ctx.matches(when)
+            && !reads_unknown_facts(when.raw(), &ctx.facts)
+        {
+            continue;
+        }
+        if let Ok(yaml) = serde_yaml::to_string(&overlay.values) {
+            names.extend(secret_references(&yaml));
+        }
+        if let Some(file) = &overlay.file
+            && let Some(value) = revision.var_files.get(file)
+            && let Ok(yaml) = serde_yaml::to_string(value)
+        {
+            names.extend(secret_references(&yaml));
+        }
+    }
+    names.retain(|n| revision.fleet.secrets.contains_key(n));
+    names
+}
+
+#[cfg(test)]
+mod secret_scope_tests {
+    use super::*;
+    use crate::plan::RevisionId;
+
+    fn write(root: &std::path::Path, rel: &str, content: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+
+    fn revision() -> (tempfile::TempDir, Revision) {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "buckle.yaml",
+            "version: 2\nfleet:\n  groups:\n    home: 'host.labels.site == \"home\"'\nvars:\n  - when: 'host.groups contains \"home\"'\n    values: { token: '{{ secrets.HOME_TOKEN }}' }\nsecrets:\n  ADMIN: { env: FLEET_ADMIN }\n  TS: { env: FLEET_TS }\n  CLOUD: { env: FLEET_CLOUD }\n  HOME_TOKEN: { env: FLEET_HOME }\n  BACKUP: { env: FLEET_BACKUP }\n",
+        );
+        write(
+            repo.path(),
+            "modules/users/module.yaml",
+            "name: users\nwhen: 'host.facts.os.family == \"debian\"'\ntasks:\n  - user.account: { name: a, password: '{{ secrets.ADMIN }}' }\n",
+        );
+        write(
+            repo.path(),
+            "modules/tailscale/module.yaml",
+            "name: tailscale\nwhen: 'host.facts.os.family == \"debian\"'\ntasks:\n  - command.run: { run: [tailscale, up], env: { TS_AUTHKEY: '{{ secrets.TS }}' } }\n",
+        );
+        write(
+            repo.path(),
+            "modules/cloud/module.yaml",
+            "name: cloud\nwhen: 'host.facts.cloud.provider == \"oci\"'\ntasks:\n  - file.template: { src: c.j2, dest: /etc/c }\n",
+        );
+        write(
+            repo.path(),
+            "modules/cloud/files/c.j2",
+            "{{ secrets.CLOUD }}\n",
+        );
+        write(
+            repo.path(),
+            "modules/backup/module.yaml",
+            "name: backup\nwhen: 'host.labels.backup == true'\ntasks:\n  - command.run: { run: [rustic], env: { KEY: '{{ secrets.BACKUP }}' } }\n",
+        );
+        let rev = super::super::loader::load_dir(repo.path(), RevisionId::new("r")).unwrap();
+        (repo, rev)
+    }
+
+    fn host(site: &str) -> HostIdentity {
+        HostIdentity {
+            id: "pi-1".into(),
+            labels: [("site".to_string(), serde_json::Value::String(site.into()))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn names(rev: &Revision, facts: serde_json::Value) -> Vec<String> {
+        let ctx = host_context(rev, host("home"), &facts);
+        secret_names_for_host(rev, &ctx).into_iter().collect()
+    }
+
+    #[test]
+    fn unknown_facts_keep_fact_gated_modules_in_scope() {
+        let (_repo, rev) = revision();
+        // Nothing reported yet: every fact-gated module may be selected;
+        // the label-gated one is decided.
+        assert_eq!(
+            names(&rev, serde_json::Value::Null),
+            vec!["ADMIN", "CLOUD", "HOME_TOKEN", "TS"]
+        );
+        // The os provider reported but cloud has not.
+        assert_eq!(
+            names(&rev, serde_json::json!({ "os": { "family": "ubuntu" } })),
+            vec!["CLOUD", "HOME_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn known_facts_decide_the_scope_exactly() {
+        let (_repo, rev) = revision();
+        assert_eq!(
+            names(
+                &rev,
+                serde_json::json!({ "os": { "family": "debian" }, "cloud": null })
+            ),
+            vec!["ADMIN", "HOME_TOKEN", "TS"]
+        );
+        let ctx = host_context(
+            &rev,
+            host("oci"),
+            &serde_json::json!({ "os": { "family": "debian" }, "cloud": { "provider": "oci" } }),
+        );
+        assert_eq!(
+            secret_names_for_host(&rev, &ctx)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["ADMIN", "CLOUD", "TS"]
+        );
+    }
+
+    #[test]
+    fn unknown_facts_are_detected_per_top_level_fact() {
+        let facts = serde_json::json!({ "os": { "family": "debian" }, "cloud": null });
+        assert!(!reads_unknown_facts(
+            "host.facts.os.family == \"debian\"",
+            &facts
+        ));
+        assert!(!reads_unknown_facts(
+            "host.facts.cloud.provider == \"oci\"",
+            &facts
+        ));
+        assert!(reads_unknown_facts("host.facts.tailscale.online", &facts));
+        assert!(reads_unknown_facts(
+            "host.facts.os.id == \"x\"",
+            &serde_json::Value::Null
+        ));
+        assert!(!reads_unknown_facts(
+            "host.labels.role == \"x\"",
+            &serde_json::Value::Null
+        ));
+    }
+}

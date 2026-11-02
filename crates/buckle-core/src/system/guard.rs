@@ -149,6 +149,10 @@ impl System for PlanGuard {
     fn temp_dir(&self) -> PathBuf {
         self.inner.temp_dir()
     }
+
+    fn state_dir(&self) -> PathBuf {
+        self.inner.state_dir()
+    }
 }
 
 #[cfg(test)]

@@ -1357,6 +1357,7 @@ impl Shared {
     async fn plan(&self, revision: RevisionId, select: Option<String>) {
         let result = async {
             let rev = self.ensure_revision(&revision, None).await?;
+            self.ensure_secrets(&revision, &rev).await;
             let ctx = self
                 .context(&revision, select.clone(), Vec::new(), false)
                 .await;
@@ -1482,6 +1483,7 @@ impl Shared {
         };
         let prepared = async {
             let rev = self.ensure_revision(&revision, None).await?;
+            self.ensure_secrets(&revision, &rev).await;
             let ctx = self
                 .context(&revision, select.clone(), waived_checks.clone(), force)
                 .await;
@@ -1980,6 +1982,55 @@ impl Shared {
         match self.runner.facts(&previous).await {
             Ok(facts) => self.remember_facts_and_report(facts, force_report).await,
             Err(err) => tracing::warn!(error = %err.description(), "could not collect facts"),
+        }
+    }
+
+    /// Before planning or applying `revision`, fetches the secrets that the
+    /// modules selected for this host reference but the host does not hold.
+    ///
+    /// The server scopes a Welcome's or Assign's bundle with the facts it has
+    /// for the host; on a first session, or when facts are stale there, a
+    /// module gated on `host.facts.*` may be left out of the bundle while the
+    /// agent, which has the real facts, selects it. The agent knows exactly
+    /// which secrets its selection needs, so it asks for the gap (one call,
+    /// only when something is missing) rather than failing the plan with an
+    /// undefined secret. Failures are logged and the run goes ahead: the
+    /// template error then names the missing secret.
+    async fn ensure_secrets(&self, revision: &RevisionId, rev: &Revision) {
+        if rev.fleet.secrets.is_empty() || !self.connected.load(Ordering::SeqCst) {
+            return;
+        }
+        let ctx = {
+            let data = self.data.lock().await;
+            let host = buckle_core::selectors::HostIdentity {
+                id: self.host_id.clone(),
+                labels: buckle_core::engine::merged_labels(
+                    &labels_json(&self.config.labels),
+                    &labels_json(&data.agent.labels),
+                ),
+            };
+            buckle_core::engine::host_context(rev, host, &data.agent.facts.tree)
+        };
+        let held = self.secrets_for(revision).await;
+        let missing: Vec<String> = buckle_core::engine::secret_names_for_host(rev, &ctx)
+            .into_iter()
+            .filter(|name| !held.contains(name))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        tracing::info!(revision = %revision.short(), count = missing.len(), "fetching secrets the selected modules need but this host does not hold");
+        match self.transport.fetch_secrets(revision, &missing).await {
+            Ok(wire) if !wire.is_empty() => {
+                let mut data = self.data.lock().await;
+                self.cache_secrets(&mut data, revision, &wire);
+            }
+            Ok(_) => {
+                tracing::warn!(revision = %revision.short(), ?missing, "the server did not supply the missing secrets; they are not scoped to this host there")
+            }
+            Err(err) => {
+                tracing::warn!(error = %err.description(), "could not fetch the missing secrets")
+            }
         }
     }
 
