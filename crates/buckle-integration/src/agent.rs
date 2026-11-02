@@ -271,6 +271,7 @@ impl RunningAgent {
             backoff_min: Duration::from_millis(100),
             backoff_max: Duration::from_millis(300),
             backoff_jitter: false,
+            rejected_backoff_max: Duration::from_secs(1),
             event_spacing: Duration::from_millis(10),
             shutdown_grace: Duration::from_secs(5),
         };

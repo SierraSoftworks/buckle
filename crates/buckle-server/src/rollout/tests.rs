@@ -1393,3 +1393,50 @@ async fn an_applying_host_that_never_reports_fails_after_the_apply_timeout() {
     );
     assert!(r.runtime.pause.unwrap().at - sent >= chrono::Duration::minutes(30));
 }
+
+#[tokio::test(start_paused = true)]
+async fn approving_pausing_and_relabelling_reach_a_connected_agent() {
+    let mut h = Harness::new().await;
+    h.revision("r1", "  phases:\n    - { name: web, select: 'true' }\n")
+        .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    h.store
+        .call(|db| {
+            db.hosts().set_status("a", HostStatus::Paused)?;
+            let mut labels = BTreeMap::new();
+            labels.insert("tier".to_string(), "db".to_string());
+            db.hosts().set_labels("a", &labels)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    h.handle.host_changed("a");
+    h.idle(1).await;
+    let updates: Vec<pb::HostUpdate> = h
+        .sent(|host, m| host == "a" && matches!(m, SMsg::HostUpdate(_)))
+        .into_iter()
+        .filter_map(|(_, _, m)| match m {
+            SMsg::HostUpdate(u) => Some(u),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].status, "paused");
+    assert_eq!(
+        updates[0].labels.get("tier").map(String::as_str),
+        Some("db")
+    );
+
+    h.store
+        .call(|db| db.hosts().set_status("a", HostStatus::Active).map(|_| ()))
+        .await
+        .unwrap();
+    h.handle.host_changed("a");
+    h.idle(1).await;
+    let last = h
+        .sent(|host, m| host == "a" && matches!(m, SMsg::HostUpdate(_)))
+        .pop()
+        .unwrap();
+    assert!(matches!(last.2, SMsg::HostUpdate(u) if u.status == "active"));
+}

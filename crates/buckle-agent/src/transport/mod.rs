@@ -106,6 +106,19 @@ pub struct Welcome {
     pub secrets: Vec<WireSecret>,
 }
 
+/// What changed about the host, pushed while connected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostUpdate {
+    /// `pending`, `active` or `paused`.
+    pub status: String,
+    /// Effective labels after server overrides.
+    pub labels: IndexMap<String, String>,
+    /// The fleet's stable revision.
+    pub stable_revision: Option<RevisionId>,
+    /// Secrets for the stable revision, scoped to this host.
+    pub secrets: Vec<WireSecret>,
+}
+
 /// What the control plane tells the agent to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instruction {
@@ -172,6 +185,8 @@ pub enum Instruction {
         /// The release to install.
         version: String,
     },
+    /// The host's record changed (approved, paused, resumed, relabelled).
+    HostUpdate(HostUpdate),
     /// The server committed these durable reports; forget them.
     Ack {
         /// The acknowledged report ids.

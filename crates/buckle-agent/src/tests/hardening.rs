@@ -553,3 +553,75 @@ async fn a_refused_host_token_falls_back_to_the_bootstrap_token() {
     assert!(!third.hello.bootstrap);
     h.stop().await.expect("clean exit");
 }
+
+fn host_update(status: &str, labels: &[(&str, &str)]) -> pb::server_message::Msg {
+    pb::server_message::Msg::HostUpdate(pb::HostUpdate {
+        status: status.into(),
+        labels: labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_host_update_reaches_a_connected_agent() {
+    let mut h = Harness::start(Setup::default()).await;
+    let session = h.sessions.accept().await;
+    session
+        .send(pb::server_message::Msg::Welcome(pb::Welcome {
+            status: "pending".into(),
+            ..Default::default()
+        }))
+        .await;
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.load_agent_state().status.as_deref() == Some("pending")).await;
+    session
+        .send(host_update(
+            "active",
+            &[("role", "web"), ("canary", "true")],
+        ))
+        .await;
+    wait_until(|| store.load_agent_state().status.as_deref() == Some("active")).await;
+    let state = store.load_agent_state();
+    assert_eq!(state.labels.get("role").map(String::as_str), Some("web"));
+    assert_eq!(h.fleet.attempts().len(), 1, "no reconnect was needed");
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_host_paused_while_connected_stops_correcting_drift() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 2);
+    let drift = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone(), drift.clone()]);
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        yaml: "drift: { interval: 10m, correct: true }\n".into(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    assert!(session.expect(apply_result).await.succeeded);
+    session.send(host_update("paused", &[])).await;
+    let reported = session
+        .expect(|m| match m {
+            pb::agent_message::Msg::Drift(d) => Some(d.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(reported.changes, 1, "drift is still reported");
+    assert!(!reported.corrected, "but a paused host does not correct it");
+    assert_eq!(fake.applies().len(), 1);
+    h.stop().await.expect("clean exit");
+}

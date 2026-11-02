@@ -199,11 +199,10 @@ pub struct Agent {
     shared: Arc<Shared>,
 }
 
+/// Labels typed the way the server types them (`"true"` is a boolean), so
+/// module `when` selectors agree on both sides.
 fn labels_json(labels: &indexmap::IndexMap<String, String>) -> buckle_core::selectors::Labels {
-    labels
-        .iter()
-        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-        .collect()
+    buckle_core::selectors::typed_labels(labels)
 }
 
 /// `agent.yaml` vars as JSON values; a value JSON cannot represent is dropped with a warning.
@@ -628,6 +627,7 @@ impl Shared {
                     }
                     Some(Instruction::Ping) => {}
                     Some(Instruction::Ack { report_ids }) => self.on_ack(&report_ids).await,
+                    Some(Instruction::HostUpdate(update)) => self.on_host_update(update, queue).await,
                     Some(other) => {
                         if let Some(op) = op_for(other) {
                             // Plans, health answers, applies and rollbacks
@@ -695,26 +695,14 @@ impl Shared {
         }
         let pending = {
             let mut data = self.data.lock().await;
-            data.agent.labels = welcome.labels.clone();
-            data.agent.status = Some(welcome.status.clone()).filter(|s| !s.is_empty());
-            if let Some(stable) = &welcome.stable_revision {
-                data.agent.stable_revision = Some(stable.clone());
-                if !welcome.secrets.is_empty() {
-                    self.cache_secrets(&mut data, stable, &welcome.secrets);
-                }
-                if !self.store.has_revision(stable) {
-                    queue.push(
-                        Op::Assign {
-                            revision: stable.clone(),
-                            stable: true,
-                            secrets: Vec::new(),
-                            tree_digest: None,
-                            desired: false,
-                        },
-                        None,
-                    );
-                }
-            }
+            self.adopt_host(
+                &mut data,
+                &welcome.status,
+                &welcome.labels,
+                welcome.stable_revision.as_ref(),
+                &welcome.secrets,
+                queue,
+            );
             if let Ok(mut guard) = self.watchdog.lock()
                 && let Some(w) = guard.take()
             {
@@ -740,6 +728,54 @@ impl Shared {
             self.sink.send(report).await;
         }
         queue.push(Op::Facts { force_report: true }, None);
+    }
+
+    /// Takes on what the server says about this host (from Welcome or a
+    /// HostUpdate): status, effective labels, the stable revision and its
+    /// secrets (fetching the stable tree if it is not cached).
+    fn adopt_host(
+        &self,
+        data: &mut Data,
+        status: &str,
+        labels: &indexmap::IndexMap<String, String>,
+        stable: Option<&RevisionId>,
+        secrets: &[WireSecret],
+        queue: &Queue,
+    ) {
+        data.agent.labels = labels.clone();
+        data.agent.status = Some(status.to_owned()).filter(|s| !s.is_empty());
+        if let Some(stable) = stable {
+            data.agent.stable_revision = Some(stable.clone());
+            if !secrets.is_empty() {
+                self.cache_secrets(data, stable, secrets);
+            }
+            if !self.store.has_revision(stable) {
+                queue.push(
+                    Op::Assign {
+                        revision: stable.clone(),
+                        stable: true,
+                        secrets: Vec::new(),
+                        tree_digest: None,
+                        desired: false,
+                    },
+                    None,
+                );
+            }
+        }
+    }
+
+    async fn on_host_update(&self, update: crate::transport::HostUpdate, queue: &Queue) {
+        tracing::info!(status = %update.status, "the server updated this host's record");
+        let mut data = self.data.lock().await;
+        self.adopt_host(
+            &mut data,
+            &update.status,
+            &update.labels,
+            update.stable_revision.as_ref(),
+            &update.secrets,
+            queue,
+        );
+        self.save_agent(&data);
     }
 
     fn set_applying(&self, revision: Option<RevisionId>) {
@@ -1919,6 +1955,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
         Instruction::Welcome(_)
         | Instruction::Ping
         | Instruction::Ack { .. }
+        | Instruction::HostUpdate(_)
         | Instruction::Rejected { .. } => return None,
     })
 }

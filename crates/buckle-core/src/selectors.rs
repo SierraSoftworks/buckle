@@ -17,6 +17,42 @@ use std::sync::Arc;
 /// scalar JSON values (strings, numbers, booleans).
 pub type Labels = IndexMap<String, serde_json::Value>;
 
+/// A label value typed like a YAML scalar, the way both the server and the
+/// agent evaluate labels: `true`/`false` are booleans, canonical integers
+/// and decimals (`42`, `-3`, `1.5`) are numbers, anything else (`1.0`,
+/// `007`, `yes`, `worker`) stays a string. Labels arrive as strings (from
+/// agent.yaml, Hello, Welcome and the API), so `host.labels.canary == true`
+/// must see the same value on every side.
+pub fn label_value(raw: &str) -> serde_json::Value {
+    match raw {
+        "true" => return serde_json::Value::Bool(true),
+        "false" => return serde_json::Value::Bool(false),
+        _ => {}
+    }
+    if let Ok(i) = raw.parse::<i64>()
+        && i.to_string() == raw
+    {
+        return serde_json::Value::from(i);
+    }
+    if let Ok(f) = raw.parse::<f64>()
+        && f.is_finite()
+        && f.fract() != 0.0
+        && format!("{f}") == raw
+        && let Some(n) = serde_json::Number::from_f64(f)
+    {
+        return serde_json::Value::Number(n);
+    }
+    serde_json::Value::String(raw.to_owned())
+}
+
+/// String labels as typed [`Labels`] (see [`label_value`]).
+pub fn typed_labels<'a>(labels: impl IntoIterator<Item = (&'a String, &'a String)>) -> Labels {
+    labels
+        .into_iter()
+        .map(|(k, v)| (k.clone(), label_value(v)))
+        .collect()
+}
+
 /// Variables after overlay resolution.
 pub type Vars = IndexMap<String, serde_json::Value>;
 
@@ -300,6 +336,27 @@ fn lookup_path_ci<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a ser
         };
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::label_value;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case("true", serde_json::json!(true))]
+    #[case("false", serde_json::json!(false))]
+    #[case("42", serde_json::json!(42))]
+    #[case("-3", serde_json::json!(-3))]
+    #[case("1.5", serde_json::json!(1.5))]
+    #[case("1.0", serde_json::json!("1.0"))]
+    #[case("007", serde_json::json!("007"))]
+    #[case("yes", serde_json::json!("yes"))]
+    #[case("worker", serde_json::json!("worker"))]
+    #[case("True", serde_json::json!("True"))]
+    fn labels_are_typed_like_yaml_scalars(#[case] raw: &str, #[case] expected: serde_json::Value) {
+        assert_eq!(label_value(raw), expected);
+    }
 }
 
 #[cfg(test)]

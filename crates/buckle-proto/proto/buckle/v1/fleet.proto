@@ -193,7 +193,22 @@ message ServerMessage {
     Upgrade upgrade = 8;
     Rejected rejected = 9;
     Ack ack = 10;
+    HostUpdate host_update = 11;
   }
+}
+
+// The host's record changed while it is connected (approved, paused,
+// resumed, labels edited): the parts of Welcome that describe the host,
+// pushed without a reconnect.
+message HostUpdate {
+  // pending, active or paused.
+  string status = 1;
+  // Effective labels after server overrides.
+  map<string, string> labels = 2;
+  // The fleet's stable revision and the secrets scoped to the host for it
+  // (sent when the host is active), as in Welcome.
+  string stable_revision = 3;
+  SecretBundle secrets = 4;
 }
 
 // The server stored these durable reports (ApplyResult, LocalRollback) in a

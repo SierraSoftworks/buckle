@@ -19,6 +19,7 @@ mod runs;
 pub use approvals::{ApprovalRecord, Approvals};
 pub use audit::{Audit, AuditFilter, NewAudit};
 pub use health::{HealthEventRecord, HealthEvents};
+pub(crate) use hosts::status_str as hosts_status_str;
 pub use hosts::{HostRecord, Hosts, NewHost};
 pub use kv::Kv;
 pub use reports::AgentReports;

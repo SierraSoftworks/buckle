@@ -1165,6 +1165,11 @@ impl Controller {
                 self.excluded.insert(host.to_owned());
             }
         }
+        if let Some(r) = &record
+            && self.connected(host)
+        {
+            self.push_host_update(r).await;
+        }
         if let Some(r) = record
             && r.status == HostStatus::Active
             && self.connected(host)
@@ -1177,6 +1182,36 @@ impl Controller {
             })
             .await;
         }
+    }
+
+    /// Tells a connected agent what changed about its host record (status,
+    /// effective labels and, when active, the stable revision's secrets), as
+    /// Welcome would on the next session (design §08 "Registration").
+    async fn push_host_update(&self, record: &crate::store::HostRecord) {
+        let mut update = pb::HostUpdate {
+            status: crate::store::hosts_status_str(record.status).to_owned(),
+            labels: record.effective_labels().into_iter().collect(),
+            ..Default::default()
+        };
+        if let Some(stable) = self.stable.clone() {
+            update.stable_revision = stable.clone();
+            if record.status == HostStatus::Active
+                && let Ok(rev) = self.revisions.load(&stable).await
+            {
+                let h = record.id.clone();
+                let facts = self
+                    .store
+                    .call(move |db| Ok(db.hosts().latest_facts(&h)?.map(|(f, _)| f)))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(serde_json::Value::Null);
+                let ctx = crate::fleet::record_context(record, &facts, &rev.fleet);
+                update.secrets = Some(self.secrets.for_host(&rev, &ctx).await);
+            }
+        }
+        self.link
+            .send(&record.id, msg(server_message::Msg::HostUpdate(update)));
     }
 
     // ------------------------------------------------------------ commands

@@ -1,7 +1,7 @@
 //! Conversions between the transport-neutral agent types and the protobuf
 //! messages in [`buckle_proto::v1`].
 
-use super::{Hello, Instruction, LocalRollbackRecord, Report, Welcome, WireSecret};
+use super::{Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, Welcome, WireSecret};
 use buckle_core::health::{HealthReport, HealthResult, HealthStatus};
 use buckle_core::plan::RevisionId;
 use buckle_proto::v1 as pb;
@@ -127,6 +127,12 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
         }
         Msg::Ping(_) => Instruction::Ping,
         Msg::Upgrade(u) => Instruction::Upgrade { version: u.version },
+        Msg::HostUpdate(u) => Instruction::HostUpdate(HostUpdate {
+            status: u.status,
+            labels: u.labels.into_iter().collect(),
+            stable_revision: non_empty(u.stable_revision).map(RevisionId),
+            secrets: secrets_from_proto(u.secrets),
+        }),
         Msg::Ack(a) => Instruction::Ack {
             report_ids: a.report_ids,
         },
