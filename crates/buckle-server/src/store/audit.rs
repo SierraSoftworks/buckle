@@ -23,20 +23,8 @@ pub struct NewAudit {
 pub const SCAN_LIMIT: usize = 5000;
 
 /// Controller transitions that only show a host moving through a rollout's
-/// ordinary steps (`progress` in filters); outcomes such as healthy, failed,
-/// held, skipped or rolled back are not progress.
-pub const PROGRESS_ACTIONS: &[&str] = &[
-    "rollout.host.plan_pending",
-    "rollout.host.planned",
-    "rollout.host.baseline",
-    "rollout.host.applying",
-    "rollout.host.baking",
-    "rollout.host.rolling_back",
-];
-
-fn is_progress(actor: &str, action: &str) -> bool {
-    actor == "controller" && PROGRESS_ACTIONS.contains(&action)
-}
+/// ordinary steps (`progress` in filters). Shared with the UI.
+pub use buckle_api::PROGRESS_ACTIONS;
 
 fn progress_sql() -> String {
     let actions = PROGRESS_ACTIONS
@@ -92,7 +80,7 @@ impl Filterable for AuditView<'_> {
             "subject" => e.subject.as_deref().into(),
             "message" => e.message.as_str().into(),
             "trace_id" => e.trace_id.as_deref().into(),
-            "progress" => FilterValue::Bool(is_progress(&e.actor, &e.action)),
+            "progress" => FilterValue::Bool(e.is_progress()),
             other => match (other.strip_prefix("detail."), &e.detail) {
                 (Some(path), Some(detail)) => buckle_core::selectors::lookup_path(detail, path)
                     .map(buckle_core::selectors::json_to_filter_value)

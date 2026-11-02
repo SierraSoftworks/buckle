@@ -1631,6 +1631,27 @@ pub fn audit(now: DateTime<Utc>) -> Vec<AuditEntry> {
             "alice paused lab-4.",
             None,
         ),
+        // Progress transitions, hidden on the audit page until asked for.
+        e(
+            19,
+            2,
+            "controller",
+            "rollout.host.baking",
+            "ok",
+            Some("42"),
+            "pi-3 is baking for 5m.",
+            Some(json!({"host": "pi-3", "phase": "home"})),
+        ),
+        e(
+            20,
+            1,
+            "controller",
+            "rollout.host.applying",
+            "ok",
+            Some("42"),
+            "pi-4 is applying plan 5b1c9e02.",
+            Some(json!({"host": "pi-4", "phase": "home"})),
+        ),
     ];
     v.reverse();
     v

@@ -679,7 +679,11 @@ pub fn catalog() -> Result<Catalog, ApiError> {
     Ok(data::catalog())
 }
 
-pub fn audit(filter: &str, before: Option<u64>) -> Result<Page<AuditEntry>, ApiError> {
+pub fn audit(
+    filter: &str,
+    before: Option<u64>,
+    progress: bool,
+) -> Result<Page<AuditEntry>, ApiError> {
     if let crate::logic::filter::Check::Invalid { message, .. } =
         crate::logic::filter::check(filter)
     {
@@ -691,6 +695,7 @@ pub fn audit(filter: &str, before: Option<u64>) -> Result<Page<AuditEntry>, ApiE
         let matched: Vec<AuditEntry> = crate::logic::filter::filter_entries(&s.audit, filter)
             .into_iter()
             .filter(|e| before.is_none_or(|b| e.id < b))
+            .filter(|e| progress || !e.is_progress())
             .cloned()
             .collect();
         let total = matched.len() as u64;

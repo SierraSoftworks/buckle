@@ -99,6 +99,19 @@ describe("every page renders in demo mode", () => {
     await close();
   });
 
+  test("audit hides rollout progress until asked, and keeps the choice in the URL", async () => {
+    const { page, close } = await open("/audit");
+    await page.getByTestId("audit-table").waitFor();
+    const actions = () => page.locator("tbody tr td:nth-child(3)").allTextContents();
+    assert.ok(!(await actions()).includes("rollout.host.applying"), "progress is hidden by default");
+    await page.getByTestId("audit-progress").check();
+    await eventually(async () => assert.ok((await actions()).includes("rollout.host.applying")));
+    assert.equal(new URL(page.url()).searchParams.get("progress"), "true");
+    await page.getByTestId("audit-progress").uncheck();
+    await eventually(async () => assert.ok(!(await actions()).includes("rollout.host.applying")));
+    await close();
+  });
+
   test("reference renders kinds from their schemas with secret fields marked", async () => {
     const { page, close } = await open("/reference");
     assert.equal(await heading(page), "Reference");

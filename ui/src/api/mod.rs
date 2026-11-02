@@ -417,12 +417,21 @@ pub async fn catalog() -> Result<Catalog, ApiError> {
 }
 
 /// A page of the audit log, newest first, optionally filtered with a filt-rs
-/// expression and continued from before an entry id.
-pub async fn audit(filter: &str, before: Option<u64>) -> Result<Page<AuditEntry>, ApiError> {
-    demo!(demo_store::audit(filter, before));
+/// expression and continued from before an entry id. Without `progress`
+/// the controller's progress transitions (`buckle_api::PROGRESS_ACTIONS`)
+/// are left out (`progress=false`).
+pub async fn audit(
+    filter: &str,
+    before: Option<u64>,
+    progress: bool,
+) -> Result<Page<AuditEntry>, ApiError> {
+    demo!(demo_store::audit(filter, before, progress));
     let mut path = format!("/audit?limit=100&filter={}", enc(filter.trim()));
     if let Some(before) = before {
         path.push_str(&format!("&before={before}"));
+    }
+    if !progress {
+        path.push_str("&progress=false");
     }
     get(&path).await
 }

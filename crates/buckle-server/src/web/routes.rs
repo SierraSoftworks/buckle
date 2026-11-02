@@ -1206,7 +1206,8 @@ struct AuditQuery {
     before: Option<u64>,
     #[serde(default)]
     limit: Option<u32>,
-    /// `false` leaves out controller progress transitions.
+    /// `false` leaves out controller progress transitions
+    /// (`buckle_api::PROGRESS_ACTIONS`); absent or `true` keeps them.
     #[serde(default)]
     progress: Option<bool>,
 }
