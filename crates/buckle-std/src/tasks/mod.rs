@@ -14,3 +14,5 @@ pub mod file_line;
 pub mod file_symlink;
 pub mod file_template;
 pub mod github_release;
+pub mod user_account;
+pub mod user_group;
