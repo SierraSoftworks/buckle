@@ -9,6 +9,7 @@ pub mod fleet;
 pub mod plan;
 pub mod revision;
 pub mod rollout;
+pub mod run;
 
 pub use audit::*;
 pub use auth::*;
@@ -17,6 +18,7 @@ pub use fleet::*;
 pub use plan::*;
 pub use revision::*;
 pub use rollout::*;
+pub use run::*;
 
 use serde::{Deserialize, Serialize};
 

@@ -78,6 +78,13 @@ pub struct RolloutHost {
     /// `error` (and the stored result), and an operator must look.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_attention: bool,
+    /// `error` as a structured error (message, causes, advice), when the agent
+    /// reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<crate::run::ErrorView>,
+    /// The host's run for this rollout, for `GET /rollouts/{id}/hosts/{host}/report`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +228,10 @@ pub enum LiveEvent {
     },
     RevisionAdded {
         revision: RevisionSummary,
+    },
+    /// A step or module of a host's run changed state (SSE event `run_progress`).
+    RunProgress {
+        progress: crate::run::RunProgress,
     },
     Audit {
         entry: AuditEntryRef,

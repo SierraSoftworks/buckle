@@ -330,6 +330,8 @@ mod tests {
             bake_until: None,
             needs_approval: false,
             needs_attention: false,
+            error_detail: None,
+            run_id: None,
         }
     }
 

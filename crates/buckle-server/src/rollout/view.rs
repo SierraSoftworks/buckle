@@ -78,6 +78,8 @@ pub fn host(
         bake_until: h.runtime.bake_until,
         needs_approval: waiting && needs_approval(phase, h, approvals),
         needs_attention: h.runtime.needs_attention,
+        error_detail: None,
+        run_id: None,
     }
 }
 
