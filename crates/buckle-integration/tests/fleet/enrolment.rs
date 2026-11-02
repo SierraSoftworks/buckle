@@ -142,3 +142,37 @@ async fn a_pending_host_waits_for_approval_then_converges_and_is_welcomed_with_i
     );
     world.shutdown().await;
 }
+
+/// Design §08 "Registration": a forgotten host registers afresh when its
+/// agent comes back (the agent falls back to the bootstrap token). The
+/// controller must stop excluding it then, not only after a server restart,
+/// so the next rollout applies to it in its own phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forgotten_host_that_registers_again_takes_part_in_the_next_rollout() {
+    let mut world = World::start(common::app(common::ONE_PHASE, 1)).await;
+    let v1 = world.source_revision();
+    let agent = world.spawn(common::host("again-1"));
+    world.spawn(common::host("other-1"));
+    world.converge(&v1, &["again-1", "other-1"]).await;
+    let (status, _) = world
+        .api()
+        .request(reqwest::Method::DELETE, "/api/v1/hosts/again-1", None)
+        .await
+        .expect("the API answers");
+    assert!(status.is_success(), "{status}");
+    world
+        .wait_host("again-1", "registered again and online", |h| {
+            h.status == HostStatus::Active && h.connection == Connection::Online
+        })
+        .await;
+    let v2 = world.publish(&common::app(common::ONE_PHASE, 2)).await.id;
+    let done = world.converge(&v2, &["again-1", "other-1"]).await;
+    assert_eq!(
+        rollout_host(&done, "again-1").map(|h| h.phase.as_str()),
+        Some("fleet"),
+        "{}",
+        buckle_integration::describe(&done)
+    );
+    assert_eq!(agent.file(APP_CONF), Some(common::app_conf(2)));
+    world.shutdown().await;
+}

@@ -44,6 +44,8 @@ struct Script {
     silent_gate: bool,
     /// Never answer bake checks.
     silent_bake: bool,
+    /// Planning fails with this error.
+    plan_error: Option<String>,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -215,6 +217,11 @@ impl Harness {
                 let s = script.lock().unwrap().clone();
                 let reply = |msg: AMsg| handle.agent_message(&name, msg);
                 match m {
+                    SMsg::Plan(p) if s.plan_error.is_some() => reply(AMsg::Plan(PlanResult {
+                        revision: p.revision,
+                        error: s.plan_error.clone().unwrap_or_default(),
+                        ..Default::default()
+                    })),
                     SMsg::Plan(p) => reply(AMsg::Plan(PlanResult {
                         revision: p.revision,
                         digest: s.digest.clone(),
@@ -2143,4 +2150,102 @@ async fn a_bake_report_for_another_revision_or_request_is_not_this_bake() {
     let a = host(&hosts, "a");
     assert_eq!(a.state, HostPhase::Healthy);
     assert!(a.runtime.failing_since.is_empty() && a.runtime.flaps.is_empty());
+}
+
+/// A plan that fails for a host of a later phase is shown on the host at
+/// once but charged to its phase's budget only when that phase starts: the
+/// canary is not paused for it.
+#[tokio::test(start_paused = true)]
+async fn a_plan_error_in_a_later_phase_is_charged_when_that_phase_starts() {
+    let mut h = Harness::new().await;
+    h.revision("r1", TWO_PHASES).await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.enrol("w2", "web").await;
+    h.script("w1", |s| s.plan_error = Some("template error".into()));
+    for x in ["c1", "w1", "w2"] {
+        h.connect(x, None);
+    }
+    let id = h.start("r1").await;
+    let (r, hosts) = h
+        .wait(&id, "w1 failed planning", |_, hs| {
+            host(hs, "w1").state == HostPhase::Failed
+        })
+        .await;
+    assert_ne!(r.state, RolloutState::Paused, "the canary is not paused");
+    assert!(
+        host(&hosts, "w1")
+            .runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("template error")
+    );
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "canary".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    assert_eq!(host(&hosts, "c1").state, HostPhase::Healthy);
+    let pause = r.runtime.pause.unwrap();
+    assert_eq!(pause.kind, "failure_budget");
+    assert!(pause.reason.contains("'web'"), "{}", pause.reason);
+    assert!(
+        h.applies().iter().all(|a| a.1 == "c1"),
+        "nothing starts in a phase over its budget"
+    );
+    h.script("w1", |s| s.plan_error = None);
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: "w1".into(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+}
+
+/// Forgetting a host mid-rollout skips it (it is neither waited for nor a
+/// failure), and when it registers again it is no longer excluded.
+#[tokio::test(start_paused = true)]
+async fn a_host_forgotten_mid_rollout_is_skipped_and_can_register_again() {
+    let mut h = Harness::new().await;
+    let policy = "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', parallel: 2, max_failures: 0 }\n";
+    h.revision("r1", policy).await;
+    h.revision("r2", policy).await;
+    h.enrol("a", "web").await;
+    h.enrol("b", "web").await;
+    h.script("a", |s| s.silent_apply = true);
+    h.connect("a", None);
+    h.connect("b", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "a applying", |_, hs| {
+        host(hs, "a").state == HostPhase::Applying
+    })
+    .await;
+    h.store
+        .call(|db| db.hosts().delete("a").map(|_| ()))
+        .await
+        .unwrap();
+    h.disconnect("a");
+    h.handle.host_changed("a");
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Skipped);
+    assert!(a.runtime.error.as_deref().unwrap().contains("forgotten"));
+
+    // It registers afresh (the gRPC layer tells the controller).
+    h.enrol("a", "web").await;
+    h.handle.host_changed("a");
+    h.connect("a", Some("r1"));
+    let second = h.start("r2").await;
+    let (_, hosts) = h.wait_state(&second, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Healthy);
+    assert_eq!(host(&hosts, "a").phase, "web");
 }

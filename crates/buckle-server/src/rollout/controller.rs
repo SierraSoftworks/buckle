@@ -942,7 +942,14 @@ impl Controller {
             if !plan.error.is_empty() && !stale {
                 let error = format!("planning failed: {}", plan.error);
                 self.live[ri].hosts[hi].runtime.error = Some(error.clone());
-                self.fail_host(ri, hi, &error);
+                if self.later_phase(ri, hi) {
+                    // Shown now, charged to its phase's budget once that
+                    // phase starts (drive_phases), so an earlier phase is
+                    // not paused for it.
+                    self.set_host_state(ri, hi, HostPhase::Failed, &error);
+                } else {
+                    self.fail_host(ri, hi, &error);
+                }
                 continue;
             }
             let plan_json: Option<serde_json::Value> = serde_json::from_slice(&plan.plan_json).ok();
@@ -1265,6 +1272,9 @@ impl Controller {
                 self.excluded.insert(host.to_owned());
             }
         }
+        if record.is_none() {
+            self.forget_host(host);
+        }
         if let Some(r) = &record
             && self.connected(host)
         {
@@ -1281,6 +1291,39 @@ impl Controller {
                 ..Default::default()
             })
             .await;
+        }
+    }
+
+    /// A forgotten host leaves every live rollout it has not finished:
+    /// skipped (it no longer exists, so it is neither waited for nor counted
+    /// as a failure) and dropped from pending gates.
+    fn forget_host(&mut self, host: &str) {
+        for ri in 0..self.live.len() {
+            let mut gated = false;
+            for p in &mut self.live[ri].record.runtime.phases {
+                if let Some(g) = p.gate.as_mut() {
+                    gated |= g.pending.remove(host).is_some();
+                }
+            }
+            self.live[ri].dirty |= gated;
+            let Some(hi) = self.live[ri].find(host) else {
+                continue;
+            };
+            let state = self.live[ri].hosts[hi].state;
+            if matches!(
+                state,
+                HostPhase::Healthy | HostPhase::Skipped | HostPhase::RolledBack
+            ) {
+                continue;
+            }
+            {
+                let h = &mut self.live[ri].hosts[hi];
+                h.runtime.error = Some("the host was forgotten".into());
+                h.runtime.disconnected_at = None;
+                h.runtime.request_id = None;
+            }
+            self.set_host_state(ri, hi, HostPhase::Skipped, "the host was forgotten");
+            self.unpause_if_cleared(ri, "controller");
         }
     }
 
@@ -2261,6 +2304,15 @@ impl Controller {
         );
     }
 
+    /// Host `hi` belongs to a phase after the one being worked on.
+    fn later_phase(&self, ri: usize, hi: usize) -> bool {
+        !self.is_virtual(ri, hi)
+            && self.live[ri].hosts[hi]
+                .runtime
+                .phase_index
+                .is_some_and(|p| p > self.live[ri].record.runtime.current_phase)
+    }
+
     fn is_virtual(&self, ri: usize, hi: usize) -> bool {
         self.live[ri].hosts[hi]
             .runtime
@@ -2655,6 +2707,7 @@ impl Controller {
                 || busy.contains(&h.host)
                 || h.state != HostPhase::Planned
                 || self.is_virtual(ri, hi)
+                || self.later_phase(ri, hi)
                 || !self.may_apply(ri, hi)
                 || !self.approved(ri, hi)
             {
