@@ -170,7 +170,7 @@ pub struct SourceConfig {
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitSource {
     pub url: String,
@@ -184,6 +184,32 @@ pub struct GitSource {
     pub webhook_secret: Option<String>,
 }
 
+impl std::fmt::Debug for GitSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitSource")
+            .field("url", &redact_url(&self.url))
+            .field("branch", &self.branch)
+            .field("poll", &self.poll)
+            .field("credentials", &self.credentials)
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_ref().map(|_| "***"),
+            )
+            .finish()
+    }
+}
+
+/// A URL with any embedded password replaced, for logs.
+pub fn redact_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) if u.password().is_some() => {
+            let _ = u.set_password(Some("***"));
+            u.to_string()
+        }
+        _ => url.to_owned(),
+    }
+}
+
 impl GitSource {
     fn default_branch() -> String {
         "main".into()
@@ -193,7 +219,7 @@ impl GitSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitCredentials {
     #[serde(default)]
@@ -204,7 +230,17 @@ pub struct GitCredentials {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Debug for GitCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitCredentials")
+            .field("token", &self.token.as_ref().map(|_| "***"))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentsConfig {
     #[serde(default = "AgentsConfig::default_auth")]
@@ -220,9 +256,37 @@ pub struct AgentsConfig {
     /// Path to the tailscaled LocalAPI socket for whois.
     #[serde(default = "AgentsConfig::default_tailscale_socket")]
     pub tailscale_socket: PathBuf,
+    /// How long a host may stay disconnected in the middle of its wave
+    /// before the rollout counts it as failed.
+    #[serde(
+        default = "AgentsConfig::default_disconnect_timeout",
+        with = "humantime_serde"
+    )]
+    pub disconnect_timeout: Duration,
+}
+
+impl std::fmt::Debug for AgentsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentsConfig")
+            .field("auth", &self.auth)
+            .field(
+                "bootstrap_token",
+                &self.bootstrap_token.as_ref().map(|_| "***"),
+            )
+            .field("registration", &self.registration)
+            .field("minimum_agent_version", &self.minimum_agent_version)
+            .field("desired_version", &self.desired_version)
+            .field("tailscale_socket", &self.tailscale_socket)
+            .field("disconnect_timeout", &self.disconnect_timeout)
+            .finish()
+    }
 }
 
 impl AgentsConfig {
+    fn default_disconnect_timeout() -> Duration {
+        Duration::from_secs(600)
+    }
+
     fn default_auth() -> Vec<AgentAuth> {
         vec![AgentAuth::Tailscale, AgentAuth::Token]
     }
@@ -240,6 +304,7 @@ impl Default for AgentsConfig {
             minimum_agent_version: None,
             desired_version: None,
             tailscale_socket: Self::default_tailscale_socket(),
+            disconnect_timeout: Self::default_disconnect_timeout(),
         }
     }
 }
@@ -276,7 +341,7 @@ pub struct WebConfig {
     pub oidc: Option<OidcConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// Issuer; discovery at `{endpoint}/.well-known/openid-configuration`.
@@ -285,6 +350,17 @@ pub struct OidcConfig {
     pub client_secret: String,
     #[serde(default = "OidcConfig::default_scopes")]
     pub scopes: Vec<String>,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("endpoint", &self.endpoint)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field("scopes", &self.scopes)
+            .finish()
+    }
 }
 
 impl OidcConfig {
@@ -329,13 +405,27 @@ pub struct ExecProviderConfig {
     pub allow: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// `telemetry`: where traces and metrics go.
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// Extra OTLP headers (often an API key); values are redacted in logs.
     #[serde(default)]
     pub otlp_headers: IndexMap<String, String>,
+}
+
+impl std::fmt::Debug for TelemetryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryConfig")
+            .field("otlp_endpoint", &self.otlp_endpoint)
+            .field(
+                "otlp_headers",
+                &self.otlp_headers.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +526,23 @@ secrets:
             _ => None,
         };
         assert_eq!(interpolate_str(input, &lookup).unwrap(), expected);
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let cfg = with_env(EXAMPLE).unwrap();
+        let dbg = format!("{cfg:?}");
+        for secret in ["ghp_x", "boot", "shh"] {
+            assert!(
+                !dbg.contains(&format!("\"{secret}\"")),
+                "{secret} leaked: {dbg}"
+            );
+        }
+        assert_eq!(cfg.agents.disconnect_timeout, Duration::from_secs(600));
+        assert_eq!(
+            redact_url("https://user:pw@github.com/x.git"),
+            "https://user:***@github.com/x.git"
+        );
     }
 
     #[test]

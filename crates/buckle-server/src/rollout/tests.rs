@@ -28,7 +28,6 @@ struct Script {
     bake_fail: bool,
     gate_fail: bool,
     silent_apply: bool,
-    stale_once: bool,
     /// On the next Apply, answer as the agent does: a PlanResult whose error
     /// starts with "stale plan" carrying this fresh digest.
     stale_plan_result: Option<String>,
@@ -257,16 +256,6 @@ impl Harness {
                                     "stale plan: the approved plan was {} but the host now plans {fresh}",
                                     a.plan_digest
                                 ),
-                                ..Default::default()
-                            }));
-                            continue;
-                        }
-                        if s.stale_once {
-                            script.lock().unwrap().stale_once = false;
-                            reply(AMsg::Result(ApplyResult {
-                                revision: a.revision,
-                                plan_digest: a.plan_digest,
-                                stale_plan: true,
                                 ..Default::default()
                             }));
                             continue;
@@ -1004,22 +993,6 @@ async fn a_plan_that_changes_after_approval_needs_reapproval() {
     h.wait_state(&id, RolloutState::Completed).await;
     let b_apply = h.applies().into_iter().find(|a| a.1 == "b").unwrap();
     assert_eq!(b_apply.2.plan_digest, "plan-b");
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_stale_plan_is_replanned_not_failed() {
-    let mut h = Harness::new().await;
-    h.revision(
-        "r1",
-        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true' }\n",
-    )
-    .await;
-    h.enrol("a", "web").await;
-    h.script("a", |s| s.stale_once = true);
-    h.connect("a", None);
-    let id = h.start("r1").await;
-    h.wait_state(&id, RolloutState::Completed).await;
-    assert_eq!(h.sent(|_, m| matches!(m, SMsg::Plan(_))).len(), 2);
 }
 
 #[tokio::test(start_paused = true)]

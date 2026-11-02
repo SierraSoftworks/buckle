@@ -107,9 +107,6 @@ message ApplyResult {
   bytes outcome_json = 12;
   // Checks that failed (module/check), for the operator's continue decision.
   repeated string failed_checks = 13;
-  // The agent refused to apply because its fresh plan digest differed from
-  // the approved one; the server re-requests a plan instead of counting a failure.
-  bool stale_plan = 14;
 }
 
 enum HealthScope {
@@ -204,8 +201,6 @@ message RequestPlan {
   string revision = 1;
   // Optional task selector (filt-rs) to restrict the plan.
   string select = 2;
-  // W3C trace context of the rollout span that asked for this plan.
-  string traceparent = 3;
 }
 
 message Apply {

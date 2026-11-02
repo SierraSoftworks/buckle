@@ -49,6 +49,7 @@ regex.workspace = true
 minijinja.workspace = true
 tracing-batteries.workspace = true
 secrecy.workspace = true
+tokio-rustls.workspace = true
 
 [build-dependencies]
 

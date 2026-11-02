@@ -150,6 +150,50 @@ impl<'c> Audit<'c> {
     }
 }
 
+impl Audit<'_> {
+    /// Entries about one subject (e.g. a rollout id), newest first.
+    pub fn for_subject(&self, subject: &str, limit: u32) -> Result<Vec<AuditEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, at, actor, action, outcome, subject, message, detail, trace_id FROM audit_log WHERE subject = ?1 ORDER BY id DESC LIMIT ?2")
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![subject, limit], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        rows.into_iter()
+            .map(
+                |(id, at, actor, action, outcome, subject, message, detail, trace_id)| {
+                    Ok(AuditEntry {
+                        id: id as u64,
+                        at: parse_ts(&at)?,
+                        actor,
+                        action,
+                        outcome,
+                        subject,
+                        message,
+                        detail: detail.as_deref().map(from_json).transpose()?,
+                        trace_id,
+                    })
+                },
+            )
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::Store;
@@ -196,49 +240,5 @@ mod tests {
         assert_eq!(total, expected);
         assert_eq!(items.len() as u64, expected);
         assert!(items.windows(2).all(|w| w[0].id > w[1].id), "newest first");
-    }
-}
-
-impl Audit<'_> {
-    /// Entries about one subject (e.g. a rollout id), newest first.
-    pub fn for_subject(&self, subject: &str, limit: u32) -> Result<Vec<AuditEntry>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, at, actor, action, outcome, subject, message, detail, trace_id FROM audit_log WHERE subject = ?1 ORDER BY id DESC LIMIT ?2")
-            .map_err(db_error)?;
-        let rows = stmt
-            .query_map(params![subject, limit], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, Option<String>>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                ))
-            })
-            .map_err(db_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(db_error)?;
-        rows.into_iter()
-            .map(
-                |(id, at, actor, action, outcome, subject, message, detail, trace_id)| {
-                    Ok(AuditEntry {
-                        id: id as u64,
-                        at: parse_ts(&at)?,
-                        actor,
-                        action,
-                        outcome,
-                        subject,
-                        message,
-                        detail: detail.as_deref().map(from_json).transpose()?,
-                        trace_id,
-                    })
-                },
-            )
-            .collect()
     }
 }

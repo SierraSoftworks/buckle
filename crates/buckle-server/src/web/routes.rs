@@ -947,19 +947,15 @@ async fn events(state: Data, _: Authenticated) -> HttpResponse {
         Ok::<_, actix_web::Error>(web::Bytes::from_static(b": connected\n\n"))
     });
     let rest = futures::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
-                Ok(Ok(ev)) => return Some((Ok::<_, actix_web::Error>(sse_frame(&ev)), rx)),
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-                    return Some((
-                        Ok(web::Bytes::from_static(b"event: lagged\ndata: {}\n\n")),
-                        rx,
-                    ));
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
-                Err(_) => return Some((Ok(web::Bytes::from_static(b": keepalive\n\n")), rx)),
+        let frame = match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+            Ok(Ok(ev)) => sse_frame(&ev),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                web::Bytes::from_static(b"event: lagged\ndata: {}\n\n")
             }
-        }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+            Err(_) => web::Bytes::from_static(b": keepalive\n\n"),
+        };
+        Some((Ok::<_, actix_web::Error>(frame), rx))
     });
     use futures::StreamExt as _;
     HttpResponse::Ok()

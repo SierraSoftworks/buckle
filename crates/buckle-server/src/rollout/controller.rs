@@ -331,7 +331,6 @@ enum Out {
         host: String,
         revision: String,
         stable: bool,
-        traceparent: String,
     },
 }
 
@@ -825,16 +824,7 @@ impl Controller {
                 HostPhase::Applying if result.revision == target => {
                     self.live[ri].hosts[hi].result =
                         serde_json::to_value(ResultView::from(&result)).ok();
-                    if result.stale_plan {
-                        self.live[ri].hosts[hi].plan_digest = None;
-                        self.set_host_state(
-                            ri,
-                            hi,
-                            HostPhase::PlanPending,
-                            "stale plan; re-planning",
-                        );
-                        self.request_plan(ri, hi);
-                    } else if result.succeeded {
+                    if result.succeeded {
                         self.start_bake(ri, hi);
                     } else {
                         {
@@ -1656,12 +1646,10 @@ impl Controller {
         }
         let revision = self.live[ri].hosts[hi].runtime.revision.clone();
         let stable = self.stable.as_deref() == Some(revision.as_str());
-        let tp = traceparent_of(&self.live[ri].span).unwrap_or_default();
         self.outbox.push(Out::AssignAndPlan {
             host,
             revision,
             stable,
-            traceparent: tp,
         });
     }
 
@@ -2690,11 +2678,7 @@ impl Controller {
                     host,
                     revision,
                     stable,
-                    traceparent,
-                } => {
-                    self.assign_and_plan(&host, &revision, stable, traceparent)
-                        .await
-                }
+                } => self.assign_and_plan(&host, &revision, stable).await,
             }
         }
         // Forget finished rollouts (they stay in the store).
@@ -2702,13 +2686,7 @@ impl Controller {
             .retain(|l| !l.record.is_terminal() || l.record.runtime.stragglers_open);
     }
 
-    async fn assign_and_plan(
-        &mut self,
-        host: &str,
-        revision: &str,
-        stable: bool,
-        traceparent: String,
-    ) {
+    async fn assign_and_plan(&mut self, host: &str, revision: &str, stable: bool) {
         let rev = match self.revisions.load(revision).await {
             Ok(r) => r,
             Err(e) => {
@@ -2746,7 +2724,6 @@ impl Controller {
             msg(server_message::Msg::Plan(RequestPlan {
                 revision: revision.to_owned(),
                 select: String::new(),
-                traceparent,
             })),
         );
     }
@@ -2770,7 +2747,6 @@ struct ResultView {
     not_started_modules: Vec<String>,
     error: String,
     failed_checks: Vec<String>,
-    stale_plan: bool,
     outcome: Option<serde_json::Value>,
 }
 
@@ -2788,7 +2764,6 @@ impl From<&ApplyResult> for ResultView {
             not_started_modules: r.not_started_modules.clone(),
             error: r.error.clone(),
             failed_checks: r.failed_checks.clone(),
-            stale_plan: r.stale_plan,
             outcome: serde_json::from_slice(&r.outcome_json).ok(),
         }
     }
