@@ -98,6 +98,196 @@ impl SecretProvider for FileProvider {
     }
 }
 
+/// Runs a program and uses its stdout as the value: `{ exec: [op, read, "op://vault/item"] }`.
+///
+/// **Development only.** Design §06: production secrets arrive through the
+/// `file` and `env` providers (Nomad renders them); `exec` exists so that a
+/// developer can point a local run at a password manager CLI. It is off unless
+/// the server or agent configuration lists the program in an allowlist, and an
+/// empty allowlist (the default) refuses everything.
+///
+/// * The program (`exec[0]`) must equal an allowlist entry exactly. A bare
+///   name such as `op` is looked up on `PATH`; an absolute path pins one
+///   binary. `op` does not permit `/tmp/op`.
+/// * The value is stdout with one trailing newline (`\n` or `\r\n`) trimmed.
+/// * A non-zero exit is a user error that includes stderr but never stdout,
+///   because stdout may be (part of) the secret.
+/// * The child runs with stdin closed and is killed after the timeout
+///   (30 seconds by default).
+///
+/// ```
+/// use buckle_core::model::SecretRef;
+/// use buckle_core::secrets::providers::{ExecProvider, SecretProvider};
+///
+/// let provider = ExecProvider::new(vec!["op".into()]);
+/// assert!(provider.allows("op"));
+/// assert!(!provider.allows("/tmp/op"));
+/// assert!(provider.handles(&SecretRef::Exec { exec: vec!["op".into()] }));
+/// ```
+#[derive(Debug, Clone)]
+pub struct ExecProvider {
+    allow: Vec<String>,
+    timeout: std::time::Duration,
+}
+
+impl Default for ExecProvider {
+    /// An exec provider with an empty allowlist: every program is refused.
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl ExecProvider {
+    /// The default time a secret program may run before it is killed.
+    pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A provider permitted to run exactly the programs in `allow`.
+    pub fn new(allow: Vec<String>) -> Self {
+        Self {
+            allow,
+            timeout: Self::DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// Overrides how long a program may run.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Whether `program` (an `exec[0]`) is on the allowlist.
+    pub fn allows(&self, program: &str) -> bool {
+        self.allow.iter().any(|a| a == program)
+    }
+
+    /// The configured allowlist.
+    pub fn allowlist(&self) -> &[String] {
+        &self.allow
+    }
+}
+
+/// Most of a program's stderr that is quoted in an error.
+const STDERR_LIMIT: usize = 4096;
+
+fn quote_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        return "(no output on stderr)".to_owned();
+    }
+    if text.len() <= STDERR_LIMIT {
+        return text.to_owned();
+    }
+    let mut cut = STDERR_LIMIT;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}… (truncated)", &text[..cut])
+}
+
+#[async_trait]
+impl SecretProvider for ExecProvider {
+    fn kind(&self) -> &'static str {
+        "exec"
+    }
+
+    fn handles(&self, reference: &SecretRef) -> bool {
+        matches!(reference, SecretRef::Exec { .. })
+    }
+
+    async fn resolve(&self, name: &str, reference: &SecretRef) -> crate::Result<Option<String>> {
+        let SecretRef::Exec { exec } = reference else {
+            return Ok(None);
+        };
+        let Some((program, args)) = exec.split_first() else {
+            return Err(crate::error::user(
+                format!("The secret '{name}' has an empty `exec` command."),
+                &[
+                    "Give the program and its arguments, e.g. `{ exec: [op, read, \"op://vault/item/field\"] }`.",
+                ],
+            ));
+        };
+        if !self.allows(program) {
+            return Err(crate::error::user(
+                format!(
+                    "The secret '{name}' runs '{program}', which is not on the exec provider's allowlist."
+                ),
+                &[
+                    "Add the program to `secrets.providers.exec.allow` in the server or agent configuration (development only).",
+                    "In production, deliver secrets with the file or env providers instead.",
+                ],
+            ));
+        }
+
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = command.spawn().map_err(|e| {
+            crate::error::wrap_user(
+                e,
+                format!("The program '{program}' for the secret '{name}' could not be started."),
+                &["Check that the program is installed and on the PATH of the resolving process."],
+            )
+        })?;
+        let output = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                return Err(crate::error::wrap_system(
+                    e,
+                    format!("Waiting for '{program}' to produce the secret '{name}' failed."),
+                    &[
+                        "Read the internal error message for details and report the issue if it persists.",
+                    ],
+                ));
+            }
+            Err(_) => {
+                return Err(crate::error::user(
+                    format!(
+                        "The program '{program}' for the secret '{name}' did not finish within {}s.",
+                        self.timeout.as_secs()
+                    ),
+                    &[
+                        "Check whether the program is waiting for interactive input (for example a password manager that needs unlocking).",
+                    ],
+                ));
+            }
+        };
+        if !output.status.success() {
+            let status = match output.status.code() {
+                Some(code) => format!("exit code {code}"),
+                None => "a signal".to_owned(),
+            };
+            // Never include stdout: it may hold the secret, or part of it.
+            return Err(crate::error::user(
+                format!(
+                    "The program '{program}' for the secret '{name}' failed with {status}: {}",
+                    quote_stderr(&output.stderr)
+                ),
+                &[
+                    "Run the command by hand to check that it prints the secret, e.g. that the password manager is signed in.",
+                ],
+            ));
+        }
+        let mut value = String::from_utf8(output.stdout).map_err(|_| {
+            crate::error::user(
+                format!("The program '{program}' printed a value for the secret '{name}' that is not valid UTF-8."),
+                &["Secrets must be text; encode binary values (for example as base64) before printing them."],
+            )
+        })?;
+        if value.ends_with('\n') {
+            value.pop();
+            if value.ends_with('\r') {
+                value.pop();
+            }
+        }
+        Ok(Some(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +361,100 @@ mod tests {
             .unwrap();
         assert_eq!(got.as_deref(), Some("shh"));
         assert!(!EnvProvider.handles(&SecretRef::File { file: "/x".into() }));
+    }
+
+    fn exec(argv: &[&str]) -> SecretRef {
+        SecretRef::Exec {
+            exec: argv.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case("printf 'tok3n\\n'", "tok3n")]
+    #[case("printf 'tok3n\\r\\n'", "tok3n")]
+    #[case("printf 'tok3n'", "tok3n")]
+    #[case("printf 'a\\nb\\n\\n'", "a\nb\n")]
+    #[tokio::test]
+    async fn exec_provider_runs_allowlisted_programs(#[case] script: &str, #[case] expected: &str) {
+        let got = ExecProvider::new(vec!["sh".into()])
+            .resolve("x", &exec(&["sh", "-c", script]))
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn exec_provider_refuses_programs_off_the_allowlist() {
+        let provider = ExecProvider::new(vec!["op".into()]);
+        for argv in [&["sh", "-c", "echo hi"][..], &["/tmp/op", "read"][..]] {
+            let err = provider.resolve("db", &exec(argv)).await.unwrap_err();
+            assert!(err.is(crate::error::Kind::User));
+            assert!(err.message().contains(argv[0]), "{}", err.message());
+            assert!(err.message().contains("'db'"));
+        }
+        let err = ExecProvider::default()
+            .resolve("db", &exec(&["sh"]))
+            .await
+            .unwrap_err();
+        assert!(err.is(crate::error::Kind::User));
+    }
+
+    #[tokio::test]
+    async fn exec_provider_rejects_an_empty_command() {
+        let err = ExecProvider::new(vec!["sh".into()])
+            .resolve("db", &exec(&[]))
+            .await
+            .unwrap_err();
+        assert!(err.is(crate::error::Kind::User));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_provider_failure_quotes_stderr_but_never_stdout() {
+        let err = ExecProvider::new(vec!["sh".into()])
+            .resolve(
+                "db",
+                &exec(&[
+                    "sh",
+                    "-c",
+                    "echo partial-SECRET-stdout; echo 'vault is locked' >&2; exit 3",
+                ]),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is(crate::error::Kind::User));
+        let shown = format!("{} {} {err:?}", err.message(), err.description());
+        assert!(shown.contains("vault is locked"), "{shown}");
+        assert!(shown.contains("exit code 3"), "{shown}");
+        assert!(!shown.contains("partial-SECRET-stdout"), "{shown}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_provider_reports_missing_programs_and_timeouts() {
+        let missing = ExecProvider::new(vec!["buckle-no-such-program".into()])
+            .resolve("db", &exec(&["buckle-no-such-program"]))
+            .await
+            .unwrap_err();
+        assert!(missing.is(crate::error::Kind::User));
+        assert!(missing.message().contains("buckle-no-such-program"));
+
+        let slow = ExecProvider::new(vec!["sleep".into()])
+            .with_timeout(std::time::Duration::from_millis(100))
+            .resolve("db", &exec(&["sleep", "5"]))
+            .await
+            .unwrap_err();
+        assert!(slow.is(crate::error::Kind::User));
+        assert!(slow.message().contains("did not finish"));
+    }
+
+    #[test]
+    fn stderr_quotes_are_bounded() {
+        let long = "é".repeat(STDERR_LIMIT);
+        let quoted = quote_stderr(long.as_bytes());
+        assert!(quoted.len() < STDERR_LIMIT + 32);
+        assert!(quoted.ends_with("(truncated)"));
+        assert_eq!(quote_stderr(b"  \n"), "(no output on stderr)");
     }
 }

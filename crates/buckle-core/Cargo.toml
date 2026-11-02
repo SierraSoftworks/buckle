@@ -14,7 +14,9 @@ default = []
 testing = []
 
 [dependencies]
+aho-corasick.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
 ciborium.workspace = true
 filt-rs.workspace = true
@@ -26,6 +28,7 @@ humantime-serde.workspace = true
 indexmap.workspace = true
 inventory.workspace = true
 minijinja.workspace = true
+percent-encoding.workspace = true
 rand.workspace = true
 regex.workspace = true
 schemars.workspace = true
