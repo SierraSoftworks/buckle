@@ -31,6 +31,11 @@ fn json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
 }
 
 /// The protobuf Hello.
+/// Optional behaviours this agent understands, announced in Hello:
+/// `force_plan` (an operator's force apply skips the digest check) and
+/// `approval_digest` (an approval binds the plan's intent).
+pub const CAPABILITIES: &[&str] = &["force_plan", "approval_digest"];
+
 pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
     pb::Hello {
         host_id: hello.host_id.clone(),
@@ -55,6 +60,7 @@ pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
             .iter()
             .map(|r| r.0.clone())
             .collect(),
+        capabilities: CAPABILITIES.iter().map(|c| (*c).to_owned()).collect(),
     }
 }
 
@@ -102,9 +108,13 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
         },
         // The server always binds a digest: an empty one never matches a plan
         // and is refused as stale, rather than meaning "apply anything".
+        // Only an operator's explicit force apply binds nothing.
         Msg::Apply(a) => Instruction::Apply {
             revision: RevisionId(a.revision),
-            plan_digest: Some(a.plan_digest),
+            plan_digest: (!a.force_plan).then_some(a.plan_digest),
+            approval_digest: (!a.force_plan)
+                .then(|| non_empty(a.approval_digest))
+                .flatten(),
             waived_checks: a.waived_checks,
             force: a.force,
             traceparent: non_empty(a.traceparent),
@@ -318,6 +328,7 @@ fn plan_result(plan: &buckle_core::plan::Plan, error: String) -> pb::PlanResult 
         destructive: plan.is_destructive(),
         deferred_modules: plan.deferred.iter().map(|d| d.module.clone()).collect(),
         error,
+        approval_digest: plan.intent_digest().to_string(),
     }
 }
 

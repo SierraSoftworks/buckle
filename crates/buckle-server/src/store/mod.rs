@@ -265,6 +265,11 @@ FROM health_events e
 LEFT JOIN hosts h ON h.host_id = e.host
 WHERE e.id IN (SELECT MAX(id) FROM health_events GROUP BY host, module, check_name);
 "#,
+    // 6: approvals also bind the plans' intent digests (resources and
+    // actions without rendered text), so content-only re-plans stay approved.
+    r#"
+ALTER TABLE approvals ADD COLUMN approval_digests TEXT NOT NULL DEFAULT '[]';
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.

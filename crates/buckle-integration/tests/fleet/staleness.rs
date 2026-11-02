@@ -1,7 +1,8 @@
-//! Scenario 9: an approval binds plan digests (design §08 "Assignment is not
-//! apply", §11 "Approval binds digests"). When the host changes between its
-//! plan and the approved Apply, the agent's fresh plan has another digest; it
-//! refuses to apply, and the host needs approval again.
+//! Scenario 9: an approval binds what the plan does (design §08 "Assignment is
+//! not apply", §11 "Approval binds digests"). When the host changes between
+//! its plan and the approved Apply so that the fresh plan acts differently,
+//! the agent refuses to apply and the host needs approval again; when only
+//! the content changed, the approved actions run from the fresh plan.
 
 use crate::common::{self, APP_CONF, CANARY_THEN_REST};
 use buckle_agent::transport::Report;
@@ -27,8 +28,9 @@ async fn a_host_that_changed_after_approval_refuses_the_stale_plan_and_needs_app
         .and_then(|h| h.plan_digest.clone())
         .unwrap();
 
-    // Someone edits the file after the operator reviewed the plan.
-    canary.write_file(APP_CONF, "edited after review\n");
+    // Someone deletes the file after the operator reviewed its update: the
+    // fresh plan creates it instead.
+    canary.remove_file(APP_CONF).await;
     let approved = world.approve(&id, "canary").await;
     assert_eq!(approved, vec![reviewed.clone()]);
 
@@ -48,7 +50,7 @@ async fn a_host_that_changed_after_approval_refuses_the_stale_plan_and_needs_app
         .unwrap();
     assert_eq!(
         canary.file(APP_CONF),
-        Some("edited after review\n".to_owned()),
+        None,
         "the stale plan was not applied"
     );
     let refused = canary.reports().iter().any(|r| {
@@ -78,5 +80,40 @@ async fn a_host_that_changed_after_approval_refuses_the_stale_plan_and_needs_app
         })
         .await;
     assert_eq!(canary.file(APP_CONF), Some(common::app_conf(2)));
+    world.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_content_only_change_after_approval_applies_under_the_same_approval() {
+    let mut world = World::start(common::app(CANARY_THEN_REST, 1)).await;
+    let v1 = world.source_revision();
+    let canary = world.spawn(common::host("canary-1").label("canary", "true"));
+    world.converge(&v1, &["canary-1"]).await;
+
+    let v2 = world.publish(&common::app(CANARY_THEN_REST, 2)).await.id;
+    let id = world.rollout_for(&v2).await.summary.id;
+    world
+        .wait_rollout(&id, "the canary planned", |d| {
+            rollout_host(d, "canary-1").is_some_and(|h| h.needs_approval)
+        })
+        .await;
+
+    // Someone edits the file after review: the update now has another diff,
+    // but it is still the update that was approved.
+    canary.write_file(APP_CONF, "edited after review\n");
+    world.approve(&id, "canary").await;
+    let detail = world
+        .wait_rollout(&id, "completed", |d| {
+            d.summary.state == RolloutState::Completed
+        })
+        .await;
+    assert_eq!(canary.file(APP_CONF), Some(common::app_conf(2)));
+    assert!(
+        detail
+            .events
+            .iter()
+            .any(|e| e.kind == "rollout.host.plan_content_changed"),
+        "the content change is recorded"
+    );
     world.shutdown().await;
 }

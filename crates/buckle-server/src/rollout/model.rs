@@ -314,6 +314,15 @@ pub struct HostRuntime {
     /// the stragglers stage on promotion.
     #[serde(default)]
     pub held_at_baseline: bool,
+    /// The intent digest of the host's current plan
+    /// (`PlanResult.approval_digest`), from agents that report one. An
+    /// approval binding it covers re-plans that differ only in content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_digest: Option<String>,
+    /// An operator force-applied the host: the Apply binds no digest and the
+    /// agent runs whatever it plans. Cleared by the result or a re-plan.
+    #[serde(default)]
+    pub force_plan: bool,
 }
 
 /// One `rollout_hosts` row.

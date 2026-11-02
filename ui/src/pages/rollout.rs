@@ -411,6 +411,20 @@ pub fn rollout_page(props: &Props) -> Html {
     }
 }
 
+/// Whether an operator can force apply a host in this state: it is not
+/// planning, applying or baking right now.
+fn can_force_apply(s: HostRolloutState) -> bool {
+    matches!(
+        s,
+        HostRolloutState::Held
+            | HostRolloutState::Planned
+            | HostRolloutState::Failed
+            | HostRolloutState::Healthy
+            | HostRolloutState::Skipped
+            | HostRolloutState::Pending
+    )
+}
+
 fn finished_state(s: HostRolloutState) -> bool {
     matches!(
         s,
@@ -631,7 +645,7 @@ fn dialog(
                 "force" => (
                     "Force apply",
                     true,
-                    "Applies although the host's baseline checks are failing. Use this when the host was already broken and the change is the fix.",
+                    "Applies whatever the host plans right now, without approval, a digest check or a passing baseline. Use it to re-run a plan, to run one on a host that failed it, or when the plan keeps changing between attempts. Your note is recorded in the audit log.",
                 ),
                 _ => (
                     "Skip",
@@ -855,7 +869,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
             if h.state == HostRolloutState::Failed && !h.failed_checks.is_empty() {
                 <Button small=true onclick={ask(Ask::Continue(h.host.clone(), h.failed_checks.clone()))}>{ "Continue with checks waived…" }</Button>
             }
-            if h.state == HostRolloutState::Held {
+            if can_force_apply(h.state) {
                 <Button small=true kind={Kind::Danger} onclick={ask(Ask::Host("force", h.host.clone()))}>{ "Force apply…" }</Button>
             }
             if !finished_state(h.state) {

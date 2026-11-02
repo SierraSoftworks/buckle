@@ -224,6 +224,72 @@ async fn a_stale_plan_is_refused(#[case] force: bool) {
     h.stop().await.expect("clean exit");
 }
 
+/// The approved plan with its rendered text changed but the same actions.
+fn content_changed(plan: &Plan) -> Plan {
+    let mut fresh = plan.clone();
+    for step in &mut fresh.modules[0].steps {
+        step.planned = buckle_core::plan::Planned::change(buckle_core::plan::Diff::Opaque {
+            summary: "write with other content".into(),
+        });
+    }
+    fresh.digest = fresh.compute_digest();
+    fresh
+}
+
+#[rstest]
+#[case::force_plan(true, false)]
+#[case::same_intent_other_content(false, true)]
+#[tokio::test(start_paused = true)]
+async fn an_apply_runs_the_fresh_plan_when_forced_or_its_intent_is_approved(
+    #[case] force_plan: bool,
+    #[case] same_intent: bool,
+) {
+    let runner = FakeRunner::new();
+    let approved = plan_with_changes(&rev("rev1"), 1);
+    let fresh = if same_intent {
+        content_changed(&approved)
+    } else {
+        plan_with_changes(&rev("rev1"), 2)
+    };
+    assert_ne!(approved.digest, fresh.digest);
+    runner.with_plans(&rev("rev1"), vec![approved.clone(), fresh.clone()]);
+    let mut h = Harness::start(Setup {
+        runner: runner.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    session.send(request_plan("rev1")).await;
+    let planned = session.expect(plan_result).await;
+    assert_eq!(
+        planned.approval_digest,
+        approved.intent_digest().to_string()
+    );
+
+    session
+        .send(pb::server_message::Msg::Apply(pb::Apply {
+            force_plan,
+            approval_digest: if same_intent {
+                planned.approval_digest.clone()
+            } else {
+                String::new()
+            },
+            ..apply("rev1", approved.digest.as_str())
+        }))
+        .await;
+    // The plan that runs is reported before its result.
+    let reported = session.expect(plan_result).await;
+    assert!(reported.error.is_empty(), "{}", reported.error);
+    assert_eq!(reported.digest, fresh.digest.to_string());
+    let result = session.expect(apply_result).await;
+    assert_eq!(result.plan_digest, fresh.digest.to_string());
+    assert_eq!(runner.applies().len(), 1);
+    h.stop().await.expect("clean exit");
+}
+
 #[tokio::test(start_paused = true)]
 async fn waived_checks_and_force_reach_the_runner() {
     let runner = FakeRunner::new();

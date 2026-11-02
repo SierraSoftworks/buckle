@@ -186,6 +186,7 @@ fn assignment(revision: RevisionId, secrets: Vec<WireSecret>) -> [Instruction; 3
         Instruction::Apply {
             revision,
             plan_digest: None,
+            approval_digest: None,
             waived_checks: Vec::new(),
             force: false,
             traceparent: None,
