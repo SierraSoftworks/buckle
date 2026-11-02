@@ -18,6 +18,15 @@ fn default_config_path() -> &'static str {
 
 pub async fn run(args: AgentArgs) -> buckle_core::Result<i32> {
     let config = buckle_agent::AgentConfig::load(&args.config)?;
-    buckle_agent::run_with_version(config, crate::telemetry::version(), super::shutdown_token())
-        .await
+    let system = std::sync::Arc::new(
+        buckle_core::system::RealSystem::new()
+            .with_http(std::sync::Arc::new(crate::http::ReqwestClient::new())),
+    );
+    buckle_agent::run_with_system(
+        config,
+        crate::telemetry::version(),
+        system,
+        super::shutdown_token(),
+    )
+    .await
 }

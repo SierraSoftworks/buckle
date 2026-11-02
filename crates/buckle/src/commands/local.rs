@@ -188,7 +188,7 @@ fn load_revision(config: &Path) -> buckle_core::Result<Arc<Revision>> {
 
 fn real_system() -> buckle_core::Result<Arc<dyn System>> {
     Ok(Arc::new(
-        RealSystem::new().with_http(Arc::new(crate::http::ReqwestClient::new()?)),
+        RealSystem::new().with_http(Arc::new(crate::http::ReqwestClient::new())),
     ))
 }
 
