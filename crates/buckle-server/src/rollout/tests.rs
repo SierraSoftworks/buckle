@@ -1798,6 +1798,121 @@ async fn a_host_that_stays_away_after_a_restart_misses_its_phase() {
     assert_eq!(host(&hosts, "b").phase, STRAGGLERS, "b missed its phase");
 }
 
+/// A dropped session leaves the link before its disconnect reaches the
+/// controller. A pass over the rollout in between must not take the host for
+/// offline: it keeps its phase, and the disconnect starts its grace.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_session_not_yet_reported_does_not_miss_its_phase() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.enrol("b", "web").await;
+    h.connect("a", None);
+    h.connect("b", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "plans in", |r, hs| {
+        r.state == RolloutState::AwaitingApproval && hs.iter().all(|x| x.plan_digest.is_some())
+    })
+    .await;
+
+    // b's session is gone from the link; its disconnect is still on its way.
+    let session = h.session_ids.remove("b").expect("b has a session");
+    h.sessions.detach("b", session);
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "web".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "a healthy", |_, hs| {
+        host(hs, "a").state == HostPhase::Healthy
+    })
+    .await;
+    let (r, hosts) = h.snapshot(&id).await;
+    assert!(r.is_running(), "{:?}", r.state);
+    assert_eq!(
+        (host(&hosts, "b").phase.as_str(), host(&hosts, "b").state),
+        ("web", HostPhase::Planned)
+    );
+
+    h.handle.disconnected("b");
+    h.idle(30).await;
+    assert!(
+        h.snapshot(&id).await.0.is_running(),
+        "b is inside its grace"
+    );
+    h.connect("b", None);
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(
+        (host(&hosts, "b").phase.as_str(), host(&hosts, "b").state),
+        ("web", HostPhase::Healthy),
+        "b finished in its own phase"
+    );
+}
+
+/// A phase that requires approval does not complete because every one of
+/// its hosts missed it (offline when the rollout started): nothing would
+/// have been approved and the next phase would start on its own. It waits
+/// until its host comes back and is approved, or an operator skips it.
+#[rstest::rstest]
+#[case::reconnect_and_approve("approve")]
+#[case::skip("skip")]
+#[tokio::test(start_paused = true)]
+async fn a_required_phase_whose_hosts_are_all_offline_waits(#[case] decision: &str) {
+    let mut h = Harness::new().await;
+    h.revision("r1", TWO_PHASES).await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.connect("w1", None);
+    let id = h.start("r1").await;
+    h.idle(120).await;
+    let (r, hosts) = h.snapshot(&id).await;
+    assert!(r.is_running(), "{:?}", r.state);
+    assert_eq!(r.runtime.current_phase, 0, "the canary phase holds");
+    assert_eq!(host(&hosts, "c1").phase, "canary");
+    assert!(h.applies().is_empty(), "nothing applied unapproved");
+    assert_eq!(
+        h.store
+            .call(|db| db.kv().get("stable_revision"))
+            .await
+            .unwrap(),
+        None,
+        "nothing was promoted"
+    );
+
+    match decision {
+        "approve" => {
+            h.connect("c1", None);
+            h.wait_state(&id, RolloutState::AwaitingApproval).await;
+            h.command(Command::Approve {
+                rollout: id.clone(),
+                phase: "canary".into(),
+                digests: vec!["plan-a".into()],
+                note: String::new(),
+            })
+            .await
+            .unwrap();
+        }
+        _ => {
+            h.command(Command::Skip {
+                rollout: id.clone(),
+                host: "c1".into(),
+                note: String::new(),
+            })
+            .await
+            .unwrap();
+        }
+    }
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "w1").state, HostPhase::Healthy);
+}
+
 /// Retrying one of two failed hosts lets that host proceed, but the phase
 /// stays over its budget (max_failures 0) while the other failure stands: no
 /// completion, no promotion, until that one is resolved too.

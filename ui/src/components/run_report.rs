@@ -5,7 +5,7 @@
 //! rest is a click away, or all of it with "expand all". The same view shows
 //! a run in progress, so a live update only changes states.
 
-use buckle_api::{HealthResultDto, ModuleReport, RemovalReport, RunReport, StepReport, StepState};
+use buckle_api::{ModuleReport, RemovalReport, RunReport, StepReport, StepState};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
@@ -17,6 +17,7 @@ use super::ui::{Pill, TraceLink};
 use crate::app::Route;
 use crate::hooks::use_now;
 use crate::logic::format::{commit, count, millis, relative, rollout_label, short, timestamp};
+use crate::logic::health::{Bucket, CheckState, current_state, timeline};
 use crate::logic::run::{
     current_step, elapsed_ms, error_tone, expanded_by_default, module_has_problem, module_label,
     module_slug, module_tone, resource_module, run_finished, run_label, run_tone, step_glyph,
@@ -122,6 +123,7 @@ pub fn run_report(props: &RunReportProps) -> Html {
         <div class="run" data-run={r.id.clone()} data-state={run_label(r.state).replace(' ', "-")}>
             { summary(r, now, props.in_rollout) }
             <ErrorBlock error={r.error.clone()} context={AttrValue::from("The run")} />
+            { health_section(r, now) }
             if !r.modules.is_empty() {
                 <div class="run__toolbar">
                     <div class="chips" role="group" aria-label="Filter modules">
@@ -293,10 +295,6 @@ fn module_row(
                             { for m.handlers.iter().map(|s| step_row(s, now, live, false)) }
                         </ol>
                     }
-                    if !m.health.is_empty() {
-                        <h5 class="run-module__sub">{ "Health" }</h5>
-                        { health(&m.health, now) }
-                    }
                 </div>
             }
         </li>
@@ -361,19 +359,73 @@ fn removal_row(x: &RemovalReport, now: DateTime<Utc>, live: bool) -> Html {
     step_row(&step, now, live, x.caution)
 }
 
-fn health(results: &[HealthResultDto], now: DateTime<Utc>) -> Html {
+/// How many slices a module's health bar has.
+const HEALTH_BUCKETS: usize = 30;
+
+/// Each module's health through the run (bake, pre-phase and drift
+/// readings): its current state and a bar of equal time slices, each as bad
+/// as its worst check, with the checks' readings on hover or focus.
+fn health_section(r: &RunReport, now: DateTime<Utc>) -> Html {
+    let modules: Vec<&ModuleReport> = r.modules.iter().filter(|m| !m.health.is_empty()).collect();
+    if modules.is_empty() {
+        return html! {};
+    }
     html! {
-        <ul class="run-health">
-            { for results.iter().map(|r| html! {
-                <li class="run-health__item">
-                    <Pill tone={check_status_tone(&r.status)} label={r.status.clone()} />
-                    <span class="mono">{ format!("{}/{}", r.module, r.check) }</span>
-                    <span class="badge">{ r.scope.clone() }</span>
-                    if !r.required { <span class="muted small">{ "informational" }</span> }
-                    <span class="run-health__reason">{ r.reason.clone().unwrap_or_default() }</span>
-                    <span class="muted small" title={timestamp(r.at)}>{ relative(r.at, now) }</span>
-                </li>
-            }) }
-        </ul>
+        <section class="run-health" aria-label="Health by module">
+            <h4 class="run__section-title">{ "Health" }<span class="muted">{ " · worst reading per slice of the run, hover for each check" }</span></h4>
+            <ul class="run-health__modules">
+                { for modules.into_iter().map(|m| {
+                    let current = current_state(&m.health);
+                    let buckets = timeline(&m.health, r.started_at, HEALTH_BUCKETS);
+                    let (from, until) = (buckets.first().map(|b| b.from), buckets.last().map(|b| b.until));
+                    html! {
+                        <li class="run-health__module" data-module={m.name.clone()}
+                            data-state={current.map(CheckState::slug)}>
+                            <span class="run-health__name mono">{ m.name.clone() }</span>
+                            if let Some(c) = current { <Pill tone={c.tone()} label={c.label()} /> }
+                            <div class="hbar" role="list" aria-label={format!("Health of {} over time", m.name)}>
+                                { for buckets.iter().map(health_bucket) }
+                            </div>
+                            <span class="run-health__span muted small">
+                                if let (Some(from), Some(until)) = (from, until) {
+                                    <span title={timestamp(from)}>{ relative(from, now) }</span>
+                                    { " → " }
+                                    <span title={timestamp(until)}>{ relative(until, now) }</span>
+                                }
+                            </span>
+                        </li>
+                    }
+                }) }
+            </ul>
+        </section>
+    }
+}
+
+fn health_bucket(b: &Bucket<'_>) -> Html {
+    let Some(state) = b.state else {
+        return html! { <span class="hbar__bucket hbar__bucket--empty" role="listitem" aria-label="no readings yet" /> };
+    };
+    let span = format!("{} to {}", timestamp(b.from), timestamp(b.until));
+    html! {
+        <span class={classes!("hbar__bucket", state.tone().class())} role="listitem" tabindex="0"
+            data-state={state.slug()} aria-label={format!("{}: {span}", state.label())}>
+            <span class="hbar__pop" role="tooltip">
+                <span class="hbar__when small muted">{ span }</span>
+                <ul class="hbar__checks">
+                    { for b.checks.iter().map(|c| html! {
+                        <li class="hbar__check" data-check={c.reading.check.clone()} data-state={c.state.slug()}>
+                            <Pill tone={check_status_tone(&c.reading.status)} label={c.reading.status.clone()} />
+                            <span class="mono">{ c.reading.check.clone() }</span>
+                            <span class="badge">{ c.reading.scope.clone() }</span>
+                            if !c.reading.required { <span class="muted small">{ "informational" }</span> }
+                            if let Some(reason) = &c.reading.reason { <span class="hbar__reason">{ reason.clone() }</span> }
+                            if c.carried {
+                                <span class="muted small">{ format!("last read {}", timestamp(c.reading.at)) }</span>
+                            }
+                        </li>
+                    }) }
+                </ul>
+            </span>
+        </span>
     }
 }

@@ -142,6 +142,25 @@ describe("a host's latest run", () => {
     await page.locator("#run-report").getByText("No runs yet").waitFor();
     await close();
   });
+
+  test("shows each module's health over the run, worst per slice, with the checks on hover", async () => {
+    const { page, close } = await open("/hosts/pi-1");
+    const nomad = page.locator('#run-report .run-health__module[data-module="nomad"]');
+    await nomad.waitFor();
+    assert.equal(await nomad.getAttribute("data-state"), "pass", "it reads healthy now");
+    // The api blipped once during bake: one slice shows it, the rest pass.
+    const failing = nomad.locator('.hbar__bucket[data-state="fail"]');
+    assert.equal(await failing.count(), 1);
+    assert.ok((await nomad.locator('.hbar__bucket[data-state="pass"]').count()) > 1);
+    const pop = failing.locator(".hbar__pop");
+    assert.equal(await pop.isVisible(), false);
+    await failing.hover();
+    await pop.waitFor({ state: "visible" });
+    assert.equal(await pop.locator('.hbar__check[data-check="api"]').getAttribute("data-state"), "fail");
+    assert.match(await pop.textContent(), /answered 500/);
+    assert.equal(await pop.locator('.hbar__check[data-check="unit"]').getAttribute("data-state"), "pass");
+    await close();
+  });
 });
 
 describe("a host's run in a rollout", () => {

@@ -17,7 +17,7 @@ use crate::source::cache::RevisionCache;
 use crate::store::{ApprovalRecord, NewAudit, Store, kv::keys};
 use buckle_api::{HostStatus, LiveEvent, PhaseState, RevisionStatus, RolloutState};
 use buckle_core::engine::Revision;
-use buckle_core::model::{BaselinePolicy, FailurePolicy, SupersedePolicy};
+use buckle_core::model::{ApprovalPolicy, BaselinePolicy, FailurePolicy, SupersedePolicy};
 use buckle_proto::v1::{
     self as pb, Apply, ApplyResult, Assign, HealthReport, HealthScope, LocalRollback, PlanResult,
     RequestPlan, RunHealth, ServerMessage, agent_message, server_message,
@@ -466,6 +466,10 @@ struct Controller {
     stable: Option<String>,
     stable_dirty: bool,
     excluded: HashSet<String>,
+    /// Hosts this controller has seen connect and not yet seen disconnect.
+    /// A dropped session leaves the link before its disconnect reaches the
+    /// controller; until then the host is not taken for offline.
+    online: HashSet<String>,
     /// Each host's status and effective labels as last seen, so a host
     /// update that changes neither (e.g. notes) is not acted on.
     host_seen: HashMap<String, (HostStatus, BTreeMap<String, String>)>,
@@ -691,6 +695,7 @@ impl Controller {
             stable,
             stable_dirty: false,
             excluded,
+            online: HashSet::new(),
             host_seen,
             flush_retry: None,
             flush_failures: 0,
@@ -738,12 +743,17 @@ impl Controller {
     }
 
     /// Whether a host still to plan or apply counts as missing its phase:
-    /// excluded, or disconnected and not inside a reconnect grace (after a
-    /// restart every host is disconnected until its agent comes back; the
-    /// disconnect clock started by [`Controller::load`] bounds the wait).
+    /// excluded, or known to be disconnected and not inside a reconnect
+    /// grace (after a restart every host is disconnected until its agent
+    /// comes back; the disconnect clock started by [`Controller::load`]
+    /// bounds the wait). A host whose session has left the link but whose
+    /// disconnect has not reached the controller yet is not offline: the
+    /// disconnect starts its grace when it arrives.
     fn offline_for_phase(&self, h: &RolloutHostRecord) -> bool {
         self.excluded.contains(&h.host)
-            || (!self.connected(&h.host) && h.runtime.disconnected_at.is_none())
+            || (!self.connected(&h.host)
+                && !self.online.contains(&h.host)
+                && h.runtime.disconnected_at.is_none())
     }
 
     /// Whether host `hi` may be sent an Apply (or a baseline check leading
@@ -1004,6 +1014,7 @@ impl Controller {
 
     async fn on_connected(&mut self, c: Connected) {
         let now = self.now();
+        self.online.insert(c.host.clone());
         for ri in 0..self.live.len() {
             let Some(hi) = self.live[ri].find(&c.host) else {
                 continue;
@@ -1115,6 +1126,7 @@ impl Controller {
 
     fn on_disconnected(&mut self, host: &str) {
         let now = self.now();
+        self.online.remove(host);
         for ri in 0..self.live.len() {
             let gate_pending = self.live[ri].record.runtime.phases.iter().any(|p| {
                 p.gate
@@ -3066,7 +3078,7 @@ impl Controller {
                     || (matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
                         && self.offline_for_phase(h))
             });
-            if !done {
+            if !done || self.unapproved(ri, p, &hosts) {
                 return changed;
             }
             for &hi in &upto {
@@ -3085,6 +3097,23 @@ impl Controller {
             self.start_gate(ri, p);
             changed = true;
         }
+    }
+
+    /// Whether phase `p` requires approval and none of its hosts has gone
+    /// past it (started, finished or been skipped): all are still to plan or
+    /// waiting to start. Such a phase never completes by its hosts missing
+    /// it, or the phases after it would start without anything in it having
+    /// been approved and applied; it waits for its hosts to come back, or
+    /// for an operator to skip them or abort.
+    fn unapproved(&self, ri: usize, p: usize, hosts: &[usize]) -> bool {
+        self.live[ri].record.runtime.phases[p].approval == ApprovalPolicy::Required
+            && !hosts.is_empty()
+            && hosts.iter().all(|&i| {
+                matches!(
+                    self.live[ri].hosts[i].state,
+                    HostPhase::PlanPending | HostPhase::Planned
+                )
+            })
     }
 
     /// Starts hosts an operator retried or continued, in whichever phase
