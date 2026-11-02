@@ -89,6 +89,9 @@ pub(super) struct RichStep {
     pub spec: ErasedSpec,
     pub cx: Cx,
     pub retry: RetryPolicy,
+    /// Blocked by the engine because the kind does not support this platform
+    /// (never planned again), as opposed to blocked by the task itself.
+    pub platform_blocked: bool,
 }
 
 pub(super) struct RichHandler {
@@ -457,8 +460,9 @@ impl<'a> Planner<'a> {
                 buckle.task.key = %pt.key.key,
                 buckle.changed = tracing::field::Empty,
             );
+            let platform_blocked = !pt.task.platforms().contains(platform);
             let planned = async {
-                if !pt.task.platforms().contains(platform) {
+                if platform_blocked {
                     return Ok::<_, crate::Error>(Planned::blocked(format!(
                         "the {} task kind does not support {platform}",
                         pt.decl.kind
@@ -494,6 +498,7 @@ impl<'a> Planner<'a> {
                 spec: pt.spec,
                 cx: pt.cx,
                 retry: pt.decl.retry.clone(),
+                platform_blocked,
             });
         }
         let (handler_runs, handlers) = self
@@ -518,7 +523,7 @@ impl<'a> Planner<'a> {
     /// ordered `systemd.daemon_reload` → `systemd.restart` → `systemd.reload` →
     /// everything else in notification order; a restart of a unit subsumes a
     /// reload of the same unit.
-    async fn plan_handlers(
+    pub async fn plan_handlers(
         &self,
         module: &str,
         module_ctx: &Arc<HostContext>,
@@ -847,7 +852,13 @@ pub(super) async fn plan_with(
         deferred,
     );
     plan.skipped = selection.skipped;
-    plan.warnings = warnings(&plan);
+    let platform_blocked: BTreeSet<ResourceKey> = planned
+        .iter()
+        .flat_map(|m| m.plan.steps.iter().zip(m.steps.iter()))
+        .filter(|(_, rs)| rs.platform_blocked)
+        .map(|(s, _)| s.resource.clone())
+        .collect();
+    plan.warnings = warnings(&plan, &platform_blocked);
     Ok(RichPlan {
         plan,
         modules: planned,
@@ -859,7 +870,7 @@ pub(super) async fn plan_with(
 }
 
 /// Operator-facing warnings: removals, always-run steps, blocked steps.
-pub(super) fn warnings(plan: &Plan) -> Vec<String> {
+pub(super) fn warnings(plan: &Plan, platform_blocked: &BTreeSet<ResourceKey>) -> Vec<String> {
     let mut out = Vec::new();
     for r in &plan.removals {
         let caution = if r.caution {
@@ -877,7 +888,14 @@ pub(super) fn warnings(plan: &Plan) -> Vec<String> {
             ));
         }
         if let Planned::Blocked { reason } = &step.planned {
-            out.push(format!("{} is blocked: {reason}", step.resource));
+            if platform_blocked.contains(&step.resource) {
+                out.push(format!("{} is blocked: {reason}", step.resource));
+            } else {
+                out.push(format!(
+                    "{} is blocked: {reason} (planned again at apply time once earlier steps have run)",
+                    step.resource
+                ));
+            }
         }
     }
     out

@@ -1,2 +1,3 @@
 [build]
+incremental = false
 target-dir = "/home/user/buckle/target"

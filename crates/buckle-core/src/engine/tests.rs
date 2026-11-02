@@ -91,10 +91,18 @@ struct FileSpec {
     wait_for: Option<String>,
     #[serde(default)]
     sleep_ms: u64,
+    /// A path that must exist before this task can be planned (a "tool").
+    #[serde(default)]
+    requires: Option<String>,
 }
 
 async fn plan_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Planned> {
     record(&spec.run, format!("plan {}/{}", cx.module, spec.path));
+    if let Some(required) = &spec.requires
+        && !cx.system.stat(Path::new(required)).await?.is_some()
+    {
+        return Ok(Planned::blocked(format!("{required} is not installed")));
+    }
     let existing = cx.system.read(Path::new(&spec.path)).await?;
     Ok(match existing {
         Some(bytes) if bytes == spec.content.as_bytes() => Planned::NoOp,
@@ -1330,6 +1338,107 @@ async fn unsupported_platforms_block_steps_and_are_warned_about() {
         !calls("plat1")
             .iter()
             .any(|c| c.contains("linux-only") && c.starts_with("apply"))
+    );
+}
+
+#[tokio::test]
+async fn task_blocked_steps_are_planned_again_once_earlier_steps_changed_something() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            r#"
+name: m
+tasks:
+  - test.file: { path: /tool/bin, content: bin, run: blk1 }
+  - test.file: { path: /tool/conf, content: conf, run: blk1, requires: /tool/bin }
+    notify: [restart]
+  - test.linux: { path: /tool/mac, run: blk1 }
+handlers:
+  restart: { systemd.restart: { name: tool, run: blk1 } }
+"#,
+        )],
+    );
+    let sys = FakeSystem::new().with_platform(Platform::MacOs);
+    let inputs = inputs(rev, &sys);
+    let plan = plan(&inputs).await;
+    assert!(
+        matches!(&step(&plan, "m", "/tool/conf").planned, Planned::Blocked { reason } if reason.contains("/tool/bin"))
+    );
+    assert!(matches!(
+        step(&plan, "m", "/tool/mac").planned,
+        Planned::Blocked { .. }
+    ));
+    assert!(
+        plan.modules[0].handlers.is_empty(),
+        "nothing changed at plan time notifies the handler"
+    );
+    let conf_warning = plan
+        .warnings
+        .iter()
+        .find(|w| w.contains("/tool/conf"))
+        .unwrap();
+    assert!(conf_warning.contains("planned again"), "{conf_warning}");
+    let mac_warning = plan
+        .warnings
+        .iter()
+        .find(|w| w.contains("/tool/mac"))
+        .unwrap();
+    assert!(!mac_warning.contains("planned again"), "{mac_warning}");
+
+    let (outcome, events) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(
+        outcome.changes, 2,
+        "the blocked step was planned again and applied"
+    );
+    assert_eq!(sys.file_string("/tool/conf").as_deref(), Some("conf"));
+    assert!(
+        !sys.exists("/tool/mac"),
+        "platform-blocked steps are never planned again"
+    );
+    assert!(
+        calls("blk1").contains(&"handler m:systemd.restart tool".to_string()),
+        "{:?}",
+        calls("blk1")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::HandlerRun { handler, .. } if handler == "restart"))
+    );
+    let state = inputs.state.load().unwrap();
+    assert!(
+        state
+            .get(&ResourceKey::new("m", "test.file", "/tool/conf"))
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn blocked_steps_stay_blocked_when_nothing_changed_before_them() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m
+tasks:
+  - test.file: { path: /tool2/conf, run: blk2, requires: /tool2/bin }
+",
+        )],
+    );
+    let sys = FakeSystem::new();
+    let (outcome, _) = apply(&inputs(rev, &sys)).await;
+    assert!(outcome.succeeded);
+    assert_eq!(outcome.changes, 0);
+    assert!(!sys.exists("/tool2/conf"));
+    assert_eq!(
+        calls("blk2")
+            .iter()
+            .filter(|c| c.starts_with("plan"))
+            .count(),
+        2,
+        "plan, then the apply's stale check; no re-plan"
     );
 }
 

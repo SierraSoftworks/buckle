@@ -107,6 +107,9 @@ impl EngineRunner {
             select,
             waived_checks: ctx.waived_checks.clone(),
             parallelism: self.parallelism,
+            stable_revision: None,
+            agent_vars: Default::default(),
+            facts_frozen: false,
         })
     }
 }
@@ -123,6 +126,7 @@ impl Runner for EngineRunner {
             module: String::new(),
             secrets: Arc::new(SecretStore::new()),
             waived_checks: Arc::new(Vec::new()),
+            previous: None,
         };
         let mut facts = previous.clone();
         if facts.tree.is_null() {

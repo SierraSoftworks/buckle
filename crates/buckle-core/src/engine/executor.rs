@@ -9,13 +9,15 @@
 //! the run halts; removals run last, only when nothing halted.
 
 use super::checks;
-use super::planner::{Planner, RichModulePlan, RichPlan, collect_facts, plan_with};
+use super::planner::{
+    Contexts, Planner, RichHandler, RichModulePlan, RichPlan, RichStep, collect_facts, plan_with,
+};
 use super::{ApplyEvent, ApplyOutcome, Inputs, ModuleOutcome, ModuleStatus};
 use crate::Digest;
 use crate::facts::Facts;
 use crate::health::{HealthReport, HealthResult, HealthScope};
 use crate::model::{RemovalPolicy, RetryPolicy};
-use crate::plan::{Plan, Planned, RevisionId};
+use crate::plan::{HandlerRun, Plan, Planned, RevisionId, Step};
 use crate::secrets::redact::Redactor;
 use crate::state::{ResourceRecord, RunOutcome, RunRecord, State};
 use crate::task::{Applied, Cx, DynTask, ErasedSpec, Mode};
@@ -24,6 +26,7 @@ use futures::stream::FuturesUnordered;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 use tracing::Instrument;
@@ -72,6 +75,8 @@ struct Executor<'a> {
     locks: LockTable,
     state: Arc<Mutex<State>>,
     redactor: Redactor,
+    /// Steps that changed something so far in this run; gates re-planning of blocked steps.
+    changed_so_far: AtomicUsize,
 }
 
 /// `Engine::apply`.
@@ -105,6 +110,7 @@ pub(super) async fn apply(
         locks: LockTable::default(),
         state: Arc::new(Mutex::new(state)),
         redactor: Redactor::new(&inputs.secrets),
+        changed_so_far: AtomicUsize::new(0),
     };
     let outcome = executor
         .run(&planner, rich, &mut facts, started, started_at)
@@ -165,12 +171,180 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Refreshes (or creates) the record of a resource after a step, keeping
+    /// whatever the task did not report from the existing record.
+    fn record_step(
+        &self,
+        step: &Step,
+        rs: &RichStep,
+        applied: Option<&Applied>,
+        revision: &RevisionId,
+    ) {
+        let now = self.inputs.system.now();
+        self.with_state(|state| {
+            let existing = state.get(&step.resource).cloned();
+            state.record(ResourceRecord {
+                key: step.resource.clone(),
+                spec_digest: Digest::of_json(&rs.spec.json),
+                shadow: applied
+                    .and_then(|a| a.shadow.clone())
+                    .or_else(|| existing.as_ref().and_then(|e| e.shadow.clone())),
+                content_digest: applied
+                    .and_then(|a| a.content_digest.clone())
+                    .or_else(|| existing.as_ref().and_then(|e| e.content_digest.clone())),
+                artefacts: match applied {
+                    Some(a) => a.artefacts.clone(),
+                    None => existing
+                        .as_ref()
+                        .map(|e| e.artefacts.clone())
+                        .unwrap_or_default(),
+                },
+                removal: step.removal,
+                revision: revision.clone(),
+                applied_at: now,
+                introduced_in: existing
+                    .map(|e| e.introduced_in)
+                    .unwrap_or_else(|| revision.clone()),
+            });
+        });
+    }
+
+    /// Applies one changing step under its locks, with retries, and records the
+    /// resource. `Err` carries the scrubbed error message.
+    async fn apply_step(
+        &self,
+        module: &str,
+        step: &Step,
+        rs: &RichStep,
+        planned: &Planned,
+        revision: &RevisionId,
+        span: &tracing::Span,
+    ) -> Result<Applied, String> {
+        self.emit(ApplyEvent::StepStarted {
+            module: module.to_owned(),
+            task_id: step.task.id.clone(),
+            kind: step.task.kind.clone(),
+        })
+        .await;
+        let mut cx = rs.cx.clone();
+        cx.mode = Mode::Apply;
+        cx.previous = self
+            .with_state(|s| s.get(&step.resource).cloned())
+            .map(Arc::new);
+        let result = async {
+            let _guards = self.locks.acquire(&step.locks).await;
+            self.apply_with_retry(
+                rs.task,
+                &cx,
+                &rs.spec,
+                planned,
+                &rs.retry,
+                &format!("{}", step.resource),
+            )
+            .await
+        }
+        .instrument(span.clone())
+        .await;
+        match result {
+            Ok(applied) => {
+                span.record("buckle.changed", applied.changed);
+                if applied.changed {
+                    self.changed_so_far.fetch_add(1, Ordering::Relaxed);
+                }
+                self.record_step(step, rs, Some(&applied), revision);
+                self.emit(ApplyEvent::StepFinished {
+                    module: module.to_owned(),
+                    task_id: step.task.id.clone(),
+                    kind: step.task.kind.clone(),
+                    changed: applied.changed,
+                    summary: self.scrub(&applied.summary),
+                })
+                .await;
+                Ok(applied)
+            }
+            Err(err) => {
+                let message = self.scrub(&err.message());
+                tracing::error!(parent: span, error = %message, "task failed");
+                self.emit(ApplyEvent::StepFailed {
+                    module: module.to_owned(),
+                    task_id: step.task.id.clone(),
+                    kind: step.task.kind.clone(),
+                    error: message.clone(),
+                })
+                .await;
+                Err(message)
+            }
+        }
+    }
+
+    /// Runs one handler (when its plan is a change) and emits the event.
+    async fn run_handler(
+        &self,
+        module: &str,
+        run: &HandlerRun,
+        rh: &RichHandler,
+    ) -> Result<(), String> {
+        let span = tracing::info_span!(
+            "handler.run",
+            buckle.module = %run.module,
+            buckle.handler = %run.handler,
+            buckle.task.kind = %run.kind,
+        );
+        if rh.planned.is_change() {
+            let mut cx = rh.cx.clone();
+            cx.mode = Mode::Apply;
+            let locks: Vec<String> = rh.task.locks().iter().map(|l| l.to_string()).collect();
+            let result = async {
+                let _guards = self.locks.acquire(&locks).await;
+                self.apply_with_retry(
+                    rh.task,
+                    &cx,
+                    &rh.spec,
+                    &rh.planned,
+                    &rh.retry,
+                    &format!("handler {}:{}", run.module, run.handler),
+                )
+                .await
+            }
+            .instrument(span.clone())
+            .await;
+            if let Err(err) = result {
+                let message = self.scrub(&err.message());
+                tracing::error!(parent: &span, error = %message, "handler failed");
+                self.emit(ApplyEvent::StepFailed {
+                    module: module.to_owned(),
+                    task_id: format!("{}:{}", run.module, run.handler),
+                    kind: run.kind.clone(),
+                    error: message.clone(),
+                })
+                .await;
+                return Err(format!(
+                    "handler {}:{} failed: {message}",
+                    run.module, run.handler
+                ));
+            }
+        }
+        self.emit(ApplyEvent::HandlerRun {
+            module: run.module.clone(),
+            handler: run.handler.clone(),
+        })
+        .await;
+        Ok(())
+    }
+
     /// Runs one module: steps in order, then handlers, then (optionally) the
     /// module's health checks with settle.
+    ///
+    /// A step that was `Blocked` at plan time by its own kind (not by the
+    /// platform) is planned again once anything earlier in the run changed,
+    /// because an earlier step may have installed the tool it was missing. If
+    /// it now plans a change, the change is applied and the handlers it
+    /// notifies run alongside the planned ones.
     async fn run_module(
         &self,
         planner: &Planner<'_>,
         rich: Arc<RichModulePlan>,
+        contexts: &Contexts,
         revision: &RevisionId,
         run_health: bool,
     ) -> ModuleRun {
@@ -182,6 +356,7 @@ impl<'a> Executor<'a> {
         .await;
         let mut changes = 0usize;
         let mut health = Vec::new();
+        let mut late_changes: Vec<Step> = Vec::new();
 
         let finish = |status: ModuleStatus,
                       error: Option<String>,
@@ -200,22 +375,52 @@ impl<'a> Executor<'a> {
 
         for (index, step) in rich.plan.steps.iter().enumerate() {
             let rs = &rich.steps[index];
-            let task_id = step.task.id.clone();
-            let kind = step.task.kind.clone();
             let span = tracing::info_span!(
                 "task.apply",
                 buckle.module = %module,
-                buckle.task.kind = %kind,
+                buckle.task.kind = %step.task.kind,
                 buckle.task.key = %step.resource.key,
                 buckle.changed = tracing::field::Empty,
             );
-            match &step.planned {
+            let replanned: Option<Planned> = match &step.planned {
+                Planned::Blocked { .. }
+                    if !rs.platform_blocked && self.changed_so_far.load(Ordering::Relaxed) > 0 =>
+                {
+                    let mut cx = rs.cx.clone();
+                    cx.previous = self
+                        .with_state(|s| s.get(&step.resource).cloned())
+                        .map(Arc::new);
+                    let replan = rs
+                        .task
+                        .plan(&cx, &rs.spec)
+                        .instrument(tracing::info_span!(
+                            "task.plan",
+                            buckle.module = %module,
+                            buckle.task.kind = %step.task.kind,
+                            buckle.task.key = %step.resource.key,
+                        ))
+                        .await;
+                    match replan {
+                        Ok(planned) => {
+                            tracing::info!(parent: &span, change = planned.is_change(), "planned the blocked step again after earlier changes");
+                            Some(planned)
+                        }
+                        Err(err) => {
+                            tracing::warn!(parent: &span, error = %self.scrub(&err.message()), "planning the blocked step again failed; leaving it blocked");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let planned = replanned.as_ref().unwrap_or(&step.planned);
+            match planned {
                 Planned::Blocked { reason } => {
                     span.record("buckle.changed", false);
                     self.emit(ApplyEvent::StepFinished {
                         module: module.clone(),
-                        task_id,
-                        kind,
+                        task_id: step.task.id.clone(),
+                        kind: step.task.kind.clone(),
                         changed: false,
                         summary: format!("blocked: {reason}"),
                     })
@@ -223,185 +428,102 @@ impl<'a> Executor<'a> {
                 }
                 Planned::NoOp => {
                     span.record("buckle.changed", false);
-                    let now = self.inputs.system.now();
-                    self.with_state(|state| {
-                        let existing = state.get(&step.resource).cloned();
-                        state.record(ResourceRecord {
-                            key: step.resource.clone(),
-                            spec_digest: Digest::of_json(&rs.spec.json),
-                            shadow: existing.as_ref().and_then(|e| e.shadow.clone()),
-                            content_digest: existing
-                                .as_ref()
-                                .and_then(|e| e.content_digest.clone()),
-                            artefacts: existing
-                                .as_ref()
-                                .map(|e| e.artefacts.clone())
-                                .unwrap_or_default(),
-                            removal: step.removal,
-                            revision: revision.clone(),
-                            applied_at: now,
-                            introduced_in: existing
-                                .map(|e| e.introduced_in)
-                                .unwrap_or_else(|| revision.clone()),
-                        });
-                    });
+                    self.record_step(step, rs, None, revision);
                     self.emit(ApplyEvent::StepFinished {
                         module: module.clone(),
-                        task_id,
-                        kind,
+                        task_id: step.task.id.clone(),
+                        kind: step.task.kind.clone(),
                         changed: false,
                         summary: "no change".to_owned(),
                     })
                     .await;
                 }
                 Planned::Change { .. } => {
-                    self.emit(ApplyEvent::StepStarted {
-                        module: module.clone(),
-                        task_id: task_id.clone(),
-                        kind: kind.clone(),
-                    })
-                    .await;
-                    let mut cx = rs.cx.clone();
-                    cx.mode = Mode::Apply;
-                    cx.previous = self
-                        .with_state(|s| s.get(&step.resource).cloned())
-                        .map(Arc::new);
-                    let result = async {
-                        let _guards = self.locks.acquire(&step.locks).await;
-                        self.apply_with_retry(
-                            rs.task,
-                            &cx,
-                            &rs.spec,
-                            &step.planned,
-                            &rs.retry,
-                            &format!("{}", step.resource),
-                        )
+                    match self
+                        .apply_step(&module, step, rs, planned, revision, &span)
                         .await
-                    }
-                    .instrument(span.clone())
-                    .await;
-                    match result {
+                    {
                         Ok(applied) => {
-                            span.record("buckle.changed", applied.changed);
                             if applied.changed {
                                 changes += 1;
+                                if replanned.is_some() && !step.notifies.is_empty() {
+                                    late_changes.push(Step {
+                                        planned: planned.clone(),
+                                        ..step.clone()
+                                    });
+                                }
                             }
-                            let now = self.inputs.system.now();
-                            self.with_state(|state| {
-                                let existing = state.get(&step.resource).cloned();
-                                state.record(ResourceRecord {
-                                    key: step.resource.clone(),
-                                    spec_digest: Digest::of_json(&rs.spec.json),
-                                    shadow: applied.shadow.clone().or_else(|| {
-                                        existing.as_ref().and_then(|e| e.shadow.clone())
-                                    }),
-                                    content_digest: applied.content_digest.clone().or_else(|| {
-                                        existing.as_ref().and_then(|e| e.content_digest.clone())
-                                    }),
-                                    artefacts: applied.artefacts.clone(),
-                                    removal: step.removal,
-                                    revision: revision.clone(),
-                                    applied_at: now,
-                                    introduced_in: existing
-                                        .map(|e| e.introduced_in)
-                                        .unwrap_or_else(|| revision.clone()),
-                                });
-                            });
-                            self.emit(ApplyEvent::StepFinished {
-                                module: module.clone(),
-                                task_id,
-                                kind,
-                                changed: applied.changed,
-                                summary: self.scrub(&applied.summary),
-                            })
-                            .await;
                         }
-                        Err(err) => {
-                            let message = self.scrub(&err.message());
-                            tracing::error!(parent: &span, error = %message, "task failed");
-                            self.emit(ApplyEvent::StepFailed {
-                                module: module.clone(),
-                                task_id,
-                                kind,
-                                error: message.clone(),
-                            })
-                            .await;
-                            let run = finish(
-                                ModuleStatus::Failed,
-                                Some(format!("{} failed: {message}", step.resource)),
-                                changes,
-                                health,
-                            );
+                        Err(message) => {
                             self.emit(ApplyEvent::ModuleFinished {
                                 module: module.clone(),
                                 status: ModuleStatus::Failed,
                             })
                             .await;
-                            return run;
+                            return finish(
+                                ModuleStatus::Failed,
+                                Some(format!("{} failed: {message}", step.resource)),
+                                changes,
+                                health,
+                            );
                         }
                     }
                 }
             }
         }
 
-        for (index, run) in rich.plan.handlers.iter().enumerate() {
-            let rh = &rich.handlers[index];
-            let span = tracing::info_span!(
-                "handler.run",
-                buckle.module = %run.module,
-                buckle.handler = %run.handler,
-                buckle.task.kind = %run.kind,
-            );
-            if rh.planned.is_change() {
-                let mut cx = rh.cx.clone();
-                cx.mode = Mode::Apply;
-                let locks: Vec<String> = rh.task.locks().iter().map(|l| l.to_string()).collect();
-                let result = async {
-                    let _guards = self.locks.acquire(&locks).await;
-                    self.apply_with_retry(
-                        rh.task,
-                        &cx,
-                        &rh.spec,
-                        &rh.planned,
-                        &rh.retry,
-                        &format!("handler {}:{}", run.module, run.handler),
-                    )
-                    .await
+        // Handlers: the planned ones, then those notified only by steps that
+        // were blocked at plan time and changed once planned again.
+        let mut extra: Vec<(HandlerRun, RichHandler)> = Vec::new();
+        if !late_changes.is_empty() {
+            match planner
+                .plan_handlers(&module, &rich.ctx, &late_changes, contexts)
+                .await
+            {
+                Ok((runs, handlers)) => {
+                    extra = runs
+                        .into_iter()
+                        .zip(handlers)
+                        .filter(|(r, _)| {
+                            !rich
+                                .plan
+                                .handlers
+                                .iter()
+                                .any(|h| h.module == r.module && h.handler == r.handler)
+                        })
+                        .collect();
                 }
-                .instrument(span.clone())
-                .await;
-                if let Err(err) = result {
+                Err(err) => {
                     let message = self.scrub(&err.message());
-                    tracing::error!(parent: &span, error = %message, "handler failed");
-                    self.emit(ApplyEvent::StepFailed {
-                        module: module.clone(),
-                        task_id: format!("{}:{}", run.module, run.handler),
-                        kind: run.kind.clone(),
-                        error: message.clone(),
-                    })
-                    .await;
-                    let out = finish(
-                        ModuleStatus::Failed,
-                        Some(format!(
-                            "handler {}:{} failed: {message}",
-                            run.module, run.handler
-                        )),
-                        changes,
-                        health,
-                    );
                     self.emit(ApplyEvent::ModuleFinished {
                         module: module.clone(),
                         status: ModuleStatus::Failed,
                     })
                     .await;
-                    return out;
+                    return finish(
+                        ModuleStatus::Failed,
+                        Some(format!("planning handlers failed: {message}")),
+                        changes,
+                        health,
+                    );
                 }
             }
-            self.emit(ApplyEvent::HandlerRun {
-                module: run.module.clone(),
-                handler: run.handler.clone(),
-            })
-            .await;
+        }
+        let handlers = rich
+            .plan
+            .handlers
+            .iter()
+            .zip(rich.handlers.iter())
+            .chain(extra.iter().map(|(r, h)| (r, h)));
+        for (run, rh) in handlers {
+            if let Err(message) = self.run_handler(&module, run, rh).await {
+                self.emit(ApplyEvent::ModuleFinished {
+                    module: module.clone(),
+                    status: ModuleStatus::Failed,
+                })
+                .await;
+                return finish(ModuleStatus::Failed, Some(message), changes, health);
+            }
         }
 
         let mut status = if changes > 0 {
@@ -470,8 +592,9 @@ impl<'a> Executor<'a> {
         let planner = Planner::from_inputs(self.inputs, stable)?;
         let state = self.with_state(|s| s.clone());
         let rich = planner.plan_one(module, facts, &state, false).await?;
+        let contexts = planner.contexts(facts);
         let mut run = self
-            .run_module(&planner, Arc::new(rich), &stable.id, true)
+            .run_module(&planner, Arc::new(rich), &contexts, &stable.id, true)
             .instrument(tracing::info_span!("module.rollback", buckle.module = %module, buckle.revision = %stable.id))
             .await;
         if !run.failed {
@@ -561,10 +684,14 @@ impl<'a> Executor<'a> {
                     };
                     started_modules.insert(name.clone());
                     let rev = revision.clone();
+                    let contexts = Arc::new(planner.contexts(facts));
                     let span = tracing::info_span!("module.apply", buckle.module = %name);
                     running.push(Box::pin(
-                        async move { self.run_module(planner, module_plan, &rev, true).await }
-                            .instrument(span),
+                        async move {
+                            self.run_module(planner, module_plan, &contexts, &rev, true)
+                                .await
+                        }
+                        .instrument(span),
                     ));
                 }
             }
