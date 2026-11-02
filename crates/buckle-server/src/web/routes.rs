@@ -496,6 +496,8 @@ fn resources(row: Option<crate::store::RolloutHostRecord>) -> Vec<ResourceSummar
 
 fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
     RunSummary {
+        id: String::new(),
+        state: None,
         trace_url: state.trace_url(r.trace_id.as_deref()),
         revision: r.revision,
         plan_digest: r.plan_digest,
@@ -549,6 +551,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         drift,
         recent_runs: runs.into_iter().map(|r| run_dto(&state, r)).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
+        latest_run: None,
     }))
 }
 

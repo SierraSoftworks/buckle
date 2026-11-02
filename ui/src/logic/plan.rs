@@ -238,6 +238,8 @@ mod tests {
             bake_until: None,
             needs_approval: true,
             needs_attention: false,
+            error_detail: None,
+            run_id: None,
         };
         let hosts = [
             host("oci-2", Some("5b1c9e02")),

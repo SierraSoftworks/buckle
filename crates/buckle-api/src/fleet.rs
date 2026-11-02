@@ -69,6 +69,10 @@ pub struct HostDetail {
     /// one entry per drifted resource. Empty when the host has not drifted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drift: Vec<DriftItem>,
+    /// The newest run on this host, module by module and step by step (live
+    /// while it is applying). `GET /hosts/{id}/runs/{run}` serves older ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run: Option<crate::run::RunReport>,
 }
 
 /// One resource whose live state no longer matches what Buckle applied, as
@@ -100,6 +104,14 @@ pub struct ResourceSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSummary {
+    /// Stable identifier, the key for `GET /hosts/{id}/runs/{run}`. Empty from
+    /// servers that predate run reports.
+    #[serde(default)]
+    pub id: String,
+    /// The run's state; absent from servers that predate run reports (use
+    /// `outcome`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<crate::run::RunState>,
     pub revision: String,
     pub plan_digest: String,
     pub started_at: DateTime<Utc>,

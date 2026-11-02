@@ -378,6 +378,8 @@ fn entry(
         bake_until: None,
         needs_approval: false,
         needs_attention: false,
+        error_detail: None,
+        run_id: None,
     }
 }
 
@@ -1879,6 +1881,8 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
                error: Option<&str>| {
         let trace = fake_trace(hours as u64 + 1_000);
         RunSummary {
+            id: String::new(),
+            state: None,
             revision: rev.into(),
             plan_digest: digest.into(),
             started_at: now - Duration::hours(hours),
@@ -1961,6 +1965,7 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         recent_runs,
         health_results,
         drift,
+        latest_run: None,
     }
 }
 
