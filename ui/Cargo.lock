@@ -42,10 +42,10 @@ dependencies = [
  "buckle-api",
  "chrono",
  "console_error_panic_hook",
+ "filt-rs",
  "futures",
  "gloo-net 0.6.0",
  "gloo-timers",
- "gloo-utils",
  "js-sys",
  "log",
  "serde",
@@ -123,6 +123,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
+name = "filt-rs"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1f92a904c1eadc902213cf932d9db85eb154eebcb3667b3027d5829b3ae55d"
+dependencies = [
+ "chrono",
+ "human-errors",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -151,7 +161,6 @@ checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
 dependencies = [
  "futures-channel",
  "futures-core",
- "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -173,17 +182,6 @@ name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
-
-[[package]]
-name = "futures-executor"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
-dependencies = [
- "futures-core",
- "futures-task",
- "futures-util",
-]
 
 [[package]]
 name = "futures-io"
@@ -355,7 +353,6 @@ checksum = "c06f627b1a58ca3d42b45d6104bf1e1a03799df472df00988b6ba21accc10580"
 dependencies = [
  "futures-channel",
  "futures-core",
- "futures-sink",
  "gloo-utils",
  "http 1.5.0",
  "js-sys",
@@ -481,6 +478,12 @@ dependencies = [
  "bytes",
  "itoa",
 ]
+
+[[package]]
+name = "human-errors"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef44dcc0e508d433319e72dcd65819757dde3f756b17f91e875a43d0b65bb7cb"
 
 [[package]]
 name = "iana-time-zone"

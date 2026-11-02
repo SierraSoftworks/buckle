@@ -1,0 +1,537 @@
+//! How a Server-Sent Event changes what a page shows.
+//!
+//! A page fetches its data once and then lets the event stream keep it
+//! current: every event after the fetch is applied to the fetched value by one
+//! of the `apply_*` functions here. Events replace whole objects (a host, a
+//! rollout summary, one host's rollout entry), so applying one twice, or
+//! applying one the fetch already reflected, changes nothing.
+
+use std::collections::VecDeque;
+use std::rc::Rc;
+
+use buckle_api::{
+    Connection, Fleet, FleetCounts, HealthSummary, HostDetail, HostStatus, HostSummary, LiveEvent,
+    RevisionSummary, RolloutDetail, RolloutSummary,
+};
+
+use super::tone::rollout_finished;
+
+/// Recomputes the fleet's counts from its hosts.
+pub fn recount(hosts: &[HostSummary]) -> FleetCounts {
+    let mut c = FleetCounts {
+        total: hosts.len() as u32,
+        ..FleetCounts::default()
+    };
+    for h in hosts {
+        c.online += u32::from(h.connection == Connection::Online);
+        c.healthy += u32::from(h.health == HealthSummary::Healthy);
+        c.failing += u32::from(h.health == HealthSummary::Failing);
+        c.drifted += u32::from(h.drifted);
+        c.pending += u32::from(h.status == HostStatus::Pending);
+        c.paused += u32::from(h.status == HostStatus::Paused);
+    }
+    c
+}
+
+/// Replaces (or adds) a host in a list.
+pub fn apply_hosts(hosts: &mut Vec<HostSummary>, event: &LiveEvent) -> bool {
+    let LiveEvent::HostChanged { host } = event else {
+        return false;
+    };
+    match hosts.iter_mut().find(|h| h.id == host.id) {
+        Some(existing) => *existing = host.clone(),
+        None => hosts.push(host.clone()),
+    }
+    true
+}
+
+pub fn apply_fleet(fleet: &mut Fleet, event: &LiveEvent) {
+    match event {
+        LiveEvent::HostChanged { .. } => {
+            if apply_hosts(&mut fleet.hosts, event) {
+                fleet.counts = recount(&fleet.hosts);
+            }
+        }
+        LiveEvent::RolloutChanged { rollout } => {
+            if !rollout_finished(rollout.state) {
+                fleet.active_rollout = Some(rollout.id.clone());
+            } else if fleet.active_rollout.as_deref() == Some(rollout.id.as_str()) {
+                fleet.active_rollout = None;
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn apply_host_detail(detail: &mut HostDetail, event: &LiveEvent) {
+    if let LiveEvent::HostChanged { host } = event
+        && host.id == detail.summary.id
+    {
+        detail.summary = host.clone();
+    }
+}
+
+/// Applies a rollout or rollout-host change to a rollout's detail. A host
+/// whose entry now names another phase moves there, so it is still drawn in
+/// exactly one stage.
+pub fn apply_rollout(detail: &mut RolloutDetail, event: &LiveEvent) {
+    match event {
+        LiveEvent::RolloutChanged { rollout } if rollout.id == detail.summary.id => {
+            detail.summary = rollout.clone();
+        }
+        LiveEvent::RolloutHostChanged { rollout_id, host } if *rollout_id == detail.summary.id => {
+            let target = detail.phases.iter().position(|p| p.name == host.phase);
+            let current = detail.phases.iter().enumerate().find_map(|(i, p)| {
+                p.hosts
+                    .iter()
+                    .position(|h| h.host == host.host)
+                    .map(|j| (i, j))
+            });
+            match (current, target) {
+                (Some((i, j)), Some(t)) if i != t => {
+                    detail.phases[i].hosts.remove(j);
+                    detail.phases[t].hosts.push(host.clone());
+                }
+                (Some((i, j)), _) => detail.phases[i].hosts[j] = host.clone(),
+                (None, Some(t)) => detail.phases[t].hosts.push(host.clone()),
+                (None, None) => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keeps a list of rollouts current, newest first.
+pub fn apply_rollouts(list: &mut Vec<RolloutSummary>, event: &LiveEvent) {
+    if let LiveEvent::RolloutChanged { rollout } = event {
+        match list.iter_mut().find(|r| r.id == rollout.id) {
+            Some(existing) => *existing = rollout.clone(),
+            None => list.insert(0, rollout.clone()),
+        }
+    }
+}
+
+/// Keeps a list of revisions current, newest first.
+pub fn apply_revisions(list: &mut Vec<RevisionSummary>, event: &LiveEvent) {
+    match event {
+        LiveEvent::RevisionAdded { revision } => {
+            match list.iter_mut().find(|r| r.id == revision.id) {
+                Some(existing) => *existing = revision.clone(),
+                None => list.insert(0, revision.clone()),
+            }
+        }
+        LiveEvent::RolloutChanged { rollout } => {
+            if let Some(r) = list.iter_mut().find(|r| r.id == rollout.revision) {
+                r.rollout_id = Some(rollout.id.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What the event stream named an event (`event: host_changed`), decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Frame {
+    Event(Box<LiveEvent>),
+    /// The server dropped events for this client: everything must be refetched.
+    Lagged,
+}
+
+/// Decodes one SSE frame. The payload's own `type` tag decides the variant;
+/// the event name only distinguishes the out-of-band `lagged` signal.
+pub fn decode(name: &str, data: &str) -> Result<Frame, String> {
+    if name == "lagged" {
+        return Ok(Frame::Lagged);
+    }
+    serde_json::from_str::<LiveEvent>(data)
+        .map(|e| Frame::Event(Box::new(e)))
+        .map_err(|e| format!("unreadable {name} event: {e}"))
+}
+
+/// The event names the server sends, each of which must be subscribed to by
+/// name (an `EventSource` only delivers unnamed events to `message`).
+pub const EVENT_NAMES: &[&str] = &[
+    "host_changed",
+    "rollout_changed",
+    "rollout_host_changed",
+    "revision_added",
+    "audit",
+    "lagged",
+    "message",
+];
+
+/// A bounded, sequence-numbered log of the events received, so that a page
+/// can ask for everything after the moment it fetched.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EventLog {
+    /// The sequence number of the newest event (0 before the first).
+    pub seq: u64,
+    entries: VecDeque<(u64, Rc<LiveEvent>)>,
+}
+
+impl EventLog {
+    pub const CAPACITY: usize = 256;
+
+    pub fn push(&mut self, event: LiveEvent) {
+        self.seq += 1;
+        self.entries.push_back((self.seq, Rc::new(event)));
+        while self.entries.len() > Self::CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    /// The events after `seq`, oldest first, or `None` when some of them have
+    /// already been dropped and the caller must fetch afresh.
+    pub fn since(&self, seq: u64) -> Option<Vec<Rc<LiveEvent>>> {
+        if seq >= self.seq {
+            return Some(Vec::new());
+        }
+        let oldest = self
+            .entries
+            .front()
+            .map(|(s, _)| *s)
+            .unwrap_or(self.seq + 1);
+        if seq + 1 < oldest {
+            return None;
+        }
+        Some(
+            self.entries
+                .iter()
+                .filter(|(s, _)| *s > seq)
+                .map(|(_, e)| e.clone())
+                .collect(),
+        )
+    }
+}
+
+/// Exponential reconnect delays with a cap, so a server that is down is not
+/// hammered and one that comes back is found again quickly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backoff {
+    pub base_ms: u32,
+    pub cap_ms: u32,
+    attempt: u32,
+}
+
+impl Backoff {
+    pub fn new(base_ms: u32, cap_ms: u32) -> Self {
+        Self {
+            base_ms,
+            cap_ms,
+            attempt: 0,
+        }
+    }
+
+    /// The next delay. `jitter` in `0.0..1.0` spreads reconnecting clients up
+    /// to a fifth either side of the nominal delay.
+    pub fn next_delay(&mut self, jitter: f64) -> u32 {
+        let nominal = (self.base_ms as u64)
+            .saturating_mul(1u64 << self.attempt.min(16))
+            .min(self.cap_ms as u64) as f64;
+        self.attempt = self.attempt.saturating_add(1);
+        let spread = nominal * 0.2 * (jitter.clamp(0.0, 1.0) * 2.0 - 1.0);
+        (nominal + spread).round().max(0.0) as u32
+    }
+
+    pub fn attempts(&self) -> u32 {
+        self.attempt
+    }
+
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buckle_api::{
+        HostRolloutState, PhaseState, RevisionStatus, RolloutHost, RolloutPhase, RolloutState,
+    };
+    use chrono::Utc;
+    use std::collections::BTreeMap;
+
+    fn host(id: &str, health: HealthSummary) -> HostSummary {
+        HostSummary {
+            id: id.into(),
+            status: HostStatus::Active,
+            connection: Connection::Online,
+            agent_labels: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            effective_labels: BTreeMap::new(),
+            groups: vec![],
+            platform: None,
+            arch: None,
+            agent_version: None,
+            applied_revision: None,
+            health,
+            health_at: None,
+            drifted: false,
+            first_seen: Utc::now(),
+            last_seen: None,
+            notes: String::new(),
+        }
+    }
+
+    fn summary(id: &str, state: RolloutState) -> RolloutSummary {
+        RolloutSummary {
+            id: id.into(),
+            revision: "rev".into(),
+            revision_message: "m".into(),
+            state,
+            started_at: Utc::now(),
+            finished_at: None,
+            triggered_by: "controller".into(),
+            hosts_total: 2,
+            hosts_done: 0,
+            hosts_failed: 0,
+            current_phase: None,
+            pause_reason: None,
+            trace_id: None,
+            trace_url: None,
+        }
+    }
+
+    fn entry(host: &str, phase: &str, state: HostRolloutState) -> RolloutHost {
+        RolloutHost {
+            host: host.into(),
+            phase: phase.into(),
+            wave: None,
+            state,
+            plan_digest: None,
+            plan_changes: None,
+            plan_removals: None,
+            failed_module: None,
+            failed_checks: vec![],
+            waived_checks: vec![],
+            error: None,
+            updated_at: Utc::now(),
+            bake_until: None,
+            needs_approval: false,
+        }
+    }
+
+    fn phase(name: &str, hosts: Vec<RolloutHost>) -> RolloutPhase {
+        RolloutPhase {
+            name: name.into(),
+            state: PhaseState::Running,
+            parallel: "1".into(),
+            approval: "auto".into(),
+            bake_seconds: 0,
+            max_failures: "0".into(),
+            virtual_stage: false,
+            hosts,
+            approved_by: None,
+            approved_at: None,
+            bake_until: None,
+        }
+    }
+
+    #[test]
+    fn a_host_change_replaces_the_host_and_recounts_the_fleet() {
+        let mut fleet = Fleet {
+            hosts: vec![
+                host("pi-1", HealthSummary::Healthy),
+                host("pi-2", HealthSummary::Healthy),
+            ],
+            stable_revision: None,
+            active_rollout: None,
+            counts: FleetCounts::default(),
+            server_version: None,
+        };
+        let event = LiveEvent::HostChanged {
+            host: host("pi-2", HealthSummary::Failing),
+        };
+        apply_fleet(&mut fleet, &event);
+        apply_fleet(&mut fleet, &event); // twice is the same as once
+        assert_eq!(fleet.hosts.len(), 2);
+        assert_eq!((fleet.counts.healthy, fleet.counts.failing), (1, 1));
+
+        apply_fleet(
+            &mut fleet,
+            &LiveEvent::HostChanged {
+                host: host("pi-3", HealthSummary::Unknown),
+            },
+        );
+        assert_eq!(fleet.counts.total, 3);
+    }
+
+    #[test]
+    fn the_active_rollout_follows_rollout_transitions() {
+        let mut fleet = Fleet {
+            hosts: vec![],
+            stable_revision: None,
+            active_rollout: None,
+            counts: FleetCounts::default(),
+            server_version: None,
+        };
+        apply_fleet(
+            &mut fleet,
+            &LiveEvent::RolloutChanged {
+                rollout: summary("42", RolloutState::Rolling),
+            },
+        );
+        assert_eq!(fleet.active_rollout.as_deref(), Some("42"));
+        // Another rollout finishing does not clear this one.
+        apply_fleet(
+            &mut fleet,
+            &LiveEvent::RolloutChanged {
+                rollout: summary("41", RolloutState::Completed),
+            },
+        );
+        assert_eq!(fleet.active_rollout.as_deref(), Some("42"));
+        apply_fleet(
+            &mut fleet,
+            &LiveEvent::RolloutChanged {
+                rollout: summary("42", RolloutState::Completed),
+            },
+        );
+        assert_eq!(fleet.active_rollout, None);
+    }
+
+    #[test]
+    fn a_rollout_host_change_updates_in_place_or_moves_stage() {
+        let mut detail = RolloutDetail {
+            summary: summary("42", RolloutState::Rolling),
+            phases: vec![
+                phase(
+                    "cloud",
+                    vec![entry("az-1", "cloud", HostRolloutState::PlanPending)],
+                ),
+                phase("stragglers", vec![]),
+            ],
+            plans: vec![],
+            events: vec![],
+        };
+        apply_rollout(
+            &mut detail,
+            &LiveEvent::RolloutHostChanged {
+                rollout_id: "42".into(),
+                host: entry("az-1", "cloud", HostRolloutState::Planned),
+            },
+        );
+        assert_eq!(detail.phases[0].hosts[0].state, HostRolloutState::Planned);
+
+        apply_rollout(
+            &mut detail,
+            &LiveEvent::RolloutHostChanged {
+                rollout_id: "42".into(),
+                host: entry("az-1", "stragglers", HostRolloutState::Pending),
+            },
+        );
+        assert!(detail.phases[0].hosts.is_empty());
+        assert_eq!(detail.phases[1].hosts.len(), 1);
+
+        // Another rollout's hosts are not this rollout's business.
+        apply_rollout(
+            &mut detail,
+            &LiveEvent::RolloutHostChanged {
+                rollout_id: "41".into(),
+                host: entry("pi-9", "cloud", HostRolloutState::Failed),
+            },
+        );
+        assert!(detail.phases[0].hosts.is_empty());
+
+        let mut paused = summary("42", RolloutState::Paused);
+        paused.pause_reason = Some("pi-5 failed nomad/api".into());
+        apply_rollout(&mut detail, &LiveEvent::RolloutChanged { rollout: paused });
+        assert_eq!(detail.summary.state, RolloutState::Paused);
+    }
+
+    #[test]
+    fn lists_gain_new_items_at_the_top() {
+        let mut rollouts = vec![summary("41", RolloutState::Completed)];
+        apply_rollouts(
+            &mut rollouts,
+            &LiveEvent::RolloutChanged {
+                rollout: summary("42", RolloutState::Planning),
+            },
+        );
+        apply_rollouts(
+            &mut rollouts,
+            &LiveEvent::RolloutChanged {
+                rollout: summary("42", RolloutState::Rolling),
+            },
+        );
+        assert_eq!(rollouts.len(), 2);
+        assert_eq!(
+            (rollouts[0].id.as_str(), rollouts[0].state),
+            ("42", RolloutState::Rolling)
+        );
+
+        let revision = |id: &str| RevisionSummary {
+            id: id.into(),
+            commit: id.into(),
+            author: "a".into(),
+            message: "m".into(),
+            created_at: Utc::now(),
+            status: RevisionStatus::Valid,
+            validation_errors: vec![],
+            is_stable: false,
+            rollout_id: None,
+            module_count: 1,
+        };
+        let mut revisions = vec![revision("rev")];
+        apply_revisions(
+            &mut revisions,
+            &LiveEvent::RevisionAdded {
+                revision: revision("new"),
+            },
+        );
+        apply_revisions(
+            &mut revisions,
+            &LiveEvent::RolloutChanged {
+                rollout: summary("43", RolloutState::Planning),
+            },
+        );
+        assert_eq!(revisions[0].id, "new");
+        assert_eq!(revisions[1].rollout_id.as_deref(), Some("43"));
+    }
+
+    #[test]
+    fn frames_decode_by_their_payload_tag() {
+        let data = serde_json::to_string(&LiveEvent::HostChanged {
+            host: host("pi-1", HealthSummary::Healthy),
+        })
+        .unwrap();
+        match decode("host_changed", &data) {
+            Ok(Frame::Event(e)) => assert!(matches!(*e, LiveEvent::HostChanged { .. })),
+            other => panic!("expected a host change, got {other:?}"),
+        }
+        assert_eq!(decode("lagged", "{}"), Ok(Frame::Lagged));
+        assert!(decode("host_changed", "{not json").is_err());
+    }
+
+    #[test]
+    fn the_log_says_when_a_page_has_missed_events() {
+        let mut log = EventLog::default();
+        let ev = || LiveEvent::HostChanged {
+            host: host("pi-1", HealthSummary::Healthy),
+        };
+        assert_eq!(log.since(0).map(|v| v.len()), Some(0));
+        log.push(ev());
+        log.push(ev());
+        assert_eq!(log.since(0).map(|v| v.len()), Some(2));
+        assert_eq!(log.since(1).map(|v| v.len()), Some(1));
+        assert_eq!(log.since(2).map(|v| v.len()), Some(0));
+        for _ in 0..EventLog::CAPACITY {
+            log.push(ev());
+        }
+        assert_eq!(log.since(1), None, "events 2 and 3 were dropped");
+        assert_eq!(log.since(log.seq - 1).map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn reconnects_back_off_exponentially_up_to_the_cap() {
+        let mut b = Backoff::new(1_000, 30_000);
+        let delays: Vec<u32> = (0..7).map(|_| b.next_delay(0.5)).collect();
+        assert_eq!(
+            delays,
+            vec![1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]
+        );
+        assert_eq!(b.attempts(), 7);
+        b.reset();
+        assert_eq!(b.next_delay(0.0), 800);
+        assert_eq!(b.next_delay(1.0), 2_400);
+    }
+}

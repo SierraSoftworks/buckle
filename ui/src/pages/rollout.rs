@@ -1,0 +1,771 @@
+//! Rollout detail (design §10–§12): the pipeline, the approval pane with
+//! deduplicated plans and their diffs, each host's apply timeline and health
+//! during bake, and the operator decisions, offered to admins only.
+
+use std::collections::BTreeMap;
+
+use buckle_api::{
+    ApproveRequest, ContinueRequest, HealthResultDto, HostRolloutState, PlanGroup, RolloutDetail,
+    RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
+};
+use chrono::{DateTime, Utc};
+use yew::prelude::*;
+
+use crate::api::{self, ApiError};
+use crate::app::{Route, use_auth};
+use crate::components::{
+    Button, Confirm, Countdown, Empty, ErrorState, Kind, Loading, PageHead, Panel, Pill, Pipeline,
+    PlanGroupView, Refresh, RouteLink, TraceLink, use_toast,
+};
+use crate::hooks::{use_fetch, use_live_value, use_now};
+use crate::logic::format::{count, first_line, relative, short, timestamp};
+use crate::logic::live::{apply_fleet, apply_rollout};
+use crate::logic::pipeline::{GateKind, GateState, layout};
+use crate::logic::plan::{ApprovalScope, approval_scope};
+use crate::logic::tone::{
+    Tone, check_status_tone, host_state_label, host_state_tone, rollout_finished,
+    rollout_state_label, rollout_state_tone,
+};
+
+#[derive(Properties, PartialEq)]
+pub struct Props {
+    pub id: String,
+}
+
+/// The decision an open dialog is asking about.
+#[derive(Clone, PartialEq)]
+enum Ask {
+    Approve(String),
+    /// Confirmed: the phase and exactly the digests the dialog showed.
+    Bind(String, Vec<String>),
+    Reject,
+    Action(&'static str),
+    Host(&'static str, String),
+    Continue(String, Vec<String>),
+}
+
+#[function_component(RolloutPage)]
+pub fn rollout_page(props: &Props) -> Html {
+    let now = use_now(5);
+    let auth = use_auth();
+    let toast = use_toast();
+    let detail = use_fetch(
+        props.id.clone(),
+        |id| async move { api::rollout(&id).await },
+    );
+    let live = use_live_value(&detail, apply_rollout);
+    let plans = use_fetch(props.id.clone(), |id| async move {
+        api::rollout_plans(&id).await
+    });
+    let fleet = use_fetch((), |_| api::fleet());
+    let fleet = use_live_value(&fleet, apply_fleet);
+    let ask = use_state(|| None::<Ask>);
+    let busy = use_state(|| false);
+    let error = use_state(|| None::<String>);
+    let focus_phase = use_state(|| None::<String>);
+
+    let Some(d) = live else {
+        return html! {
+            <div class="page">
+                <PageHead title={format!("Rollout #{}", props.id)} />
+                { match &detail.error {
+                    Some(e) => html! { <ErrorState error={e.clone()} retry={detail.reload.clone()} /> },
+                    None => html! { <Loading label="Loading the rollout…" /> },
+                } }
+            </div>
+        };
+    };
+
+    // The plans endpoint is the authority for diffs; the detail's copy stands
+    // in until it has answered.
+    let plan_groups: Vec<PlanGroup> = plans.value().cloned().unwrap_or_else(|| d.plans.clone());
+    let hosts: BTreeMap<String, _> = fleet
+        .map(|f| f.hosts.into_iter().map(|h| (h.id.clone(), h)).collect())
+        .unwrap_or_default();
+
+    let open = {
+        let (ask, error) = (ask.clone(), error.clone());
+        Callback::from(move |a: Ask| {
+            error.set(None);
+            ask.set(Some(a));
+        })
+    };
+    let close = {
+        let ask = ask.clone();
+        Callback::from(move |_| ask.set(None))
+    };
+
+    // Runs an action, puts its answer on the page, and says how it went.
+    let run = {
+        let (busy, error, ask, set, toast) = (
+            busy.clone(),
+            error.clone(),
+            ask.clone(),
+            detail.set.clone(),
+            toast.clone(),
+        );
+        let id = props.id.clone();
+        Callback::from(move |(what, note): (Ask, String)| {
+            let (busy, error, ask, set, toast, id) = (
+                busy.clone(),
+                error.clone(),
+                ask.clone(),
+                set.clone(),
+                toast.clone(),
+                id.clone(),
+            );
+            busy.set(true);
+            wasm_bindgen_futures::spawn_local(async move {
+                let (result, done): (Result<RolloutDetail, ApiError>, String) = match &what {
+                    Ask::Approve(_) => return,
+                    Ask::Bind(phase, digests) => (
+                        api::approve(
+                            &id,
+                            &ApproveRequest {
+                                phase: phase.clone(),
+                                plan_digests: digests.clone(),
+                                note,
+                            },
+                        )
+                        .await,
+                        format!(
+                            "Approved {phase}: {} bound.",
+                            count(digests.len(), "plan", "plans")
+                        ),
+                    ),
+                    Ask::Reject => (
+                        api::rollout_action(&id, "abort", &note).await,
+                        format!("Rollout #{id} rejected and aborted."),
+                    ),
+                    Ask::Action(action) => (
+                        api::rollout_action(&id, action, &note).await,
+                        format!("Rollout #{id}: {action} sent."),
+                    ),
+                    Ask::Host(action, host) => (
+                        api::rollout_host_action(&id, host, action, &note).await,
+                        format!("{host}: {action} sent."),
+                    ),
+                    Ask::Continue(host, checks) => (
+                        api::continue_host(
+                            &id,
+                            host,
+                            &ContinueRequest {
+                                waive_checks: checks.clone(),
+                                note,
+                            },
+                        )
+                        .await,
+                        format!("{host}: continuing with {} waived.", checks.join(", ")),
+                    ),
+                };
+                busy.set(false);
+                match result {
+                    Ok(detail) => {
+                        set.emit(detail);
+                        ask.set(None);
+                        toast.ok(done);
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if e.is_forbidden() {
+                            toast.error(format!("Not permitted: {message}"));
+                        }
+                        error.set(Some(message));
+                    }
+                }
+            });
+        })
+    };
+
+    let s = &d.summary;
+    let admin = auth.is_admin();
+    let finished = rollout_finished(s.state);
+    let actions = if admin && !finished {
+        let o = open.clone();
+        let act = move |a: &'static str| {
+            let o = o.clone();
+            Callback::from(move |_: MouseEvent| o.emit(Ask::Action(a)))
+        };
+        html! { <>
+            if s.state == RolloutState::Paused {
+                <Button kind={Kind::Primary} onclick={act("resume")}>{ "Resume" }</Button>
+            } else if s.state != RolloutState::RollingBack {
+                <Button onclick={act("pause")}>{ "Pause" }</Button>
+            }
+            if matches!(s.state, RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking) {
+                <Button kind={Kind::Danger} onclick={act("rollback")}>{ "Roll back…" }</Button>
+            }
+            <Button kind={Kind::Danger} onclick={act("abort")}>{ "Abort…" }</Button>
+        </> }
+    } else {
+        html! {}
+    };
+    let actions = html! { <>
+        <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
+        { actions }
+    </> };
+
+    let subtitle = html! {
+        <div class="rollout-meta">
+            <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
+            <span class="mono" title={s.revision.clone()}>{ short(&s.revision) }</span>
+            <span>{ format!("“{}”", first_line(&s.revision_message)) }</span>
+            <span class="muted">{ format!("{} · started {}", s.triggered_by, relative(s.started_at, now)) }</span>
+            if let Some(f) = s.finished_at { <span class="muted">{ format!("finished {}", relative(f, now)) }</span> }
+            <TraceLink id={s.trace_id.clone()} url={s.trace_url.clone()} />
+        </div>
+    };
+
+    let pipeline = layout(&d);
+    // Phases an approval is wanted for: reached and waiting, or gated and
+    // not yet approved, or holding hosts whose plan changed since.
+    let wanting: Vec<&RolloutPhase> = pipeline
+        .stages
+        .iter()
+        .filter(|st| {
+            st.gate.kind == GateKind::Approval
+                && (st.gate.state == GateState::AwaitingApproval
+                    || (st.gate.state == GateState::Waiting && st.phase.approved_by.is_none())
+                    || st
+                        .hosts()
+                        .any(|h| h.needs_approval && !finished_state(h.state)))
+                && st.counts.total > 0
+        })
+        .map(|st| st.phase)
+        .collect();
+    let focused = focus_phase
+        .as_ref()
+        .and_then(|n| wanting.iter().find(|p| &p.name == n))
+        .or_else(|| {
+            wanting
+                .iter()
+                .find(|p| p.state == buckle_api::PhaseState::AwaitingApproval)
+        })
+        .or(wanting.first())
+        .copied();
+
+    let approval = match focused {
+        Some(phase) if !finished => approval_pane(
+            phase,
+            &wanting,
+            &d,
+            &plan_groups,
+            admin,
+            &open,
+            &focus_phase,
+        ),
+        _ => all_plans(&plan_groups),
+    };
+
+    let dialog = ask
+        .as_ref()
+        .map(|a| dialog(a, &d, &plan_groups, *busy, (*error).clone(), &run, &close));
+
+    html! {
+        <div class="page page--wide">
+            <PageHead title={format!("Rollout #{}", s.id)} {subtitle} {actions} />
+            if let Some(reason) = &s.pause_reason {
+                <div class={classes!("banner", if s.state == RolloutState::Paused { "banner--warn" } else { "banner--info" })} role="status">
+                    <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
+                    if admin && s.state == RolloutState::Paused {
+                        <span class="muted">{ " Retry, continue or skip the failed host below, or resume, roll back or abort the rollout." }</span>
+                    }
+                </div>
+            }
+            <Panel title="Pipeline" subtitle={format!("{} hosts in {} stages · {}/{} done", s.hosts_total, d.phases.len(), s.hosts_done, s.hosts_total)}>
+                <Pipeline detail={d.clone()} hosts={hosts.clone()} {now} />
+            </Panel>
+            { approval }
+            <Panel title="Hosts" subtitle="Each host's apply timeline and health during bake">
+                <HostTable detail={d.clone()} admin={admin && !finished} on_ask={open.clone()} {now} />
+            </Panel>
+            <Panel title="Timeline" subtitle="Rollout and phase transitions">
+                { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), now) }
+            </Panel>
+            { dialog.unwrap_or_default() }
+        </div>
+    }
+}
+
+fn finished_state(s: HostRolloutState) -> bool {
+    matches!(
+        s,
+        HostRolloutState::Healthy | HostRolloutState::Skipped | HostRolloutState::RolledBack
+    )
+}
+
+/// The hosts of a phase an approval concerns: before the first approval,
+/// every host not yet finished; after it, those whose plan changed since and
+/// those still without a plan.
+fn approval_hosts(phase: &RolloutPhase) -> Vec<&RolloutHost> {
+    let approved = phase.approved_by.is_some();
+    phase
+        .hosts
+        .iter()
+        .filter(|h| !finished_state(h.state))
+        .filter(|h| !approved || h.needs_approval || h.plan_digest.is_none())
+        .collect()
+}
+
+fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalScope {
+    approval_scope(&approval_hosts(phase), plans)
+}
+
+fn approval_pane(
+    phase: &RolloutPhase,
+    wanting: &[&RolloutPhase],
+    d: &RolloutDetail,
+    plans: &[PlanGroup],
+    admin: bool,
+    open: &Callback<Ask>,
+    focus: &UseStateHandle<Option<String>>,
+) -> Html {
+    let scope = scope_of(phase, plans);
+    let index = d
+        .phases
+        .iter()
+        .position(|p| p.name == phase.name)
+        .unwrap_or(0);
+    let earlier_running: Vec<&str> = d.phases[..index]
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.state,
+                buckle_api::PhaseState::Done | buckle_api::PhaseState::Skipped
+            )
+        })
+        .map(|p| p.name.as_str())
+        .collect();
+    let focus_names: Vec<String> = phase.hosts.iter().map(|h| h.host.clone()).collect();
+    let tabs = (wanting.len() > 1).then(|| {
+        html! {
+            <div class="tabs" role="tablist" aria-label="Phases needing approval">
+                { for wanting.iter().map(|p| {
+                    let name = p.name.clone();
+                    let focus = focus.clone();
+                    let selected = p.name == phase.name;
+                    html! {
+                        <button type="button" role="tab" aria-selected={selected.to_string()}
+                            class={classes!("tabs__tab", selected.then_some("tabs__tab--active"))}
+                            onclick={Callback::from(move |_| focus.set(Some(name.clone())))}>
+                            { p.name.clone() }
+                        </button>
+                    }
+                }) }
+            </div>
+        }
+    });
+    let approve = {
+        let (open, name) = (open.clone(), phase.name.clone());
+        Callback::from(move |_: MouseEvent| open.emit(Ask::Approve(name.clone())))
+    };
+    let reject = {
+        let open = open.clone();
+        Callback::from(move |_: MouseEvent| open.emit(Ask::Reject))
+    };
+    let policy = if phase.approval == "if_destructive" {
+        "approval: if_destructive, and a plan here is destructive"
+    } else {
+        "approval: required"
+    };
+    html! {
+        <Panel title={format!("Approve phase: {}", phase.name)} id="approval"
+            subtitle={format!("Plans · {} · {} distinct · {policy}", count(scope.hosts.len() + scope.without_plan.len(), "host", "hosts"), scope.digests.len())}
+            class="panel--approval">
+            { tabs.unwrap_or_default() }
+            if !earlier_running.is_empty() {
+                <p class="note">{ format!("{} still running; an approval given now is held until {} is reached.", earlier_running.join(", "), phase.name) }</p>
+            }
+            if scope.groups.is_empty() {
+                <Empty title="No plans yet" message="Plans arrive as the hosts answer; this phase can be approved once they have." />
+            }
+            <div class="plans">
+                { for scope.groups.iter().enumerate().map(|(n, i)| html! {
+                    <PlanGroupView group={plans[*i].clone()} focus={focus_names.clone()} open={n == 0 || plans[*i].destructive} />
+                }) }
+            </div>
+            if !scope.without_plan.is_empty() {
+                <p class="note note--warn">
+                    { format!("{} no plan yet ({}): not covered by this approval. A host that misses its wave moves to the stragglers stage.",
+                        count(scope.without_plan.len(), "host has", "hosts have"), scope.without_plan.join(", ")) }
+                </p>
+            }
+            <div class="approval__actions">
+                if admin {
+                    <Button kind={Kind::Primary} onclick={approve} disabled={scope.digests.is_empty()}>
+                        { "Review and approve…" }
+                    </Button>
+                    <Button kind={Kind::Danger} onclick={reject}>{ "Reject…" }</Button>
+                    <span class="muted small">{ format!("Binds {} for {}. A host whose plan changes after approval asks again.",
+                        count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</span>
+                } else {
+                    <p class="muted">{ "Approving needs an administrator (admin_acl)." }</p>
+                }
+            </div>
+        </Panel>
+    }
+}
+
+fn all_plans(plans: &[PlanGroup]) -> Html {
+    if plans.is_empty() {
+        return html! {};
+    }
+    html! {
+        <Panel title="Plans" subtitle={format!("{} across the rollout", count(plans.len(), "distinct plan", "distinct plans"))}>
+            <div class="plans">
+                { for plans.iter().map(|g| html! { <PlanGroupView group={g.clone()} /> }) }
+            </div>
+        </Panel>
+    }
+}
+
+fn dialog(
+    ask: &Ask,
+    d: &RolloutDetail,
+    plans: &[PlanGroup],
+    busy: bool,
+    error: Option<String>,
+    run: &Callback<(Ask, String)>,
+    close: &Callback<()>,
+) -> Html {
+    let confirm = {
+        let (run, ask) = (run.clone(), ask.clone());
+        Callback::from(move |note: String| run.emit((ask.clone(), note)))
+    };
+    let id = &d.summary.id;
+    match ask {
+        Ask::Bind(..) => html! {},
+        Ask::Approve(phase_name) => {
+            let Some(phase) = d.phases.iter().find(|p| &p.name == phase_name) else {
+                return html! {};
+            };
+            let scope = scope_of(phase, plans);
+            // What is sent is what this dialog shows: if the plans change
+            // while it is open, it redraws with the new digests.
+            let confirm = {
+                let (run, bind) = (
+                    run.clone(),
+                    Ask::Bind(phase_name.clone(), scope.digests.clone()),
+                );
+                Callback::from(move |note: String| run.emit((bind.clone(), note)))
+            };
+            let hosts = scope.hosts.len();
+            let ack = (scope.destructive > 0).then(|| {
+                AttrValue::from(format!(
+                    "I have reviewed the {} destructive {}, including {}.",
+                    scope.destructive,
+                    if scope.destructive == 1 {
+                        "step"
+                    } else {
+                        "steps"
+                    },
+                    count(scope.removals, "removal", "removals"),
+                ))
+            });
+            html! {
+                <Confirm title={format!("Approve {phase_name} of rollout #{id}")}
+                    confirm_label={format!("Approve {}", count(hosts, "host", "hosts"))}
+                    acknowledge={ack} note=true note_placeholder="Why this is safe to go ahead"
+                    {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                    <p>{ format!("This approves {} on {} in {phase_name}.", count(scope.digests.len(), "distinct plan", "distinct plans"), count(hosts, "host", "hosts")) }</p>
+                    <ul class="confirm__facts" data-testid="approval-summary">
+                        <li><strong>{ hosts }</strong>{ " hosts: " }<span class="mono">{ scope.hosts.join(", ") }</span></li>
+                        <li><strong>{ scope.changes }</strong>{ " changes across the distinct plans" }</li>
+                        <li class={classes!((scope.destructive > 0).then_some("text-danger"))}>
+                            <strong>{ scope.destructive }</strong>{ " destructive steps (" }{ count(scope.removals, "removal", "removals") }{ ")" }
+                        </li>
+                        <li>{ "Binds digests " }{ for scope.digests.iter().map(|g| html! { <code class="mono">{ format!("{} ", short(g)) }</code> }) }</li>
+                    </ul>
+                    if !scope.without_plan.is_empty() {
+                        <p class="muted">{ format!("Not covered (no plan yet): {}.", scope.without_plan.join(", ")) }</p>
+                    }
+                    <p class="muted small">{ "The approval binds these digests: an agent refuses to apply any other plan, and a host whose plan changes asks again." }</p>
+                </Confirm>
+            }
+        }
+        Ask::Reject => html! {
+            <Confirm title={format!("Reject rollout #{id}")} confirm_label="Reject and abort" danger=true note=true
+                type_to_confirm={AttrValue::from(format!("#{id}"))} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                <p>{ "Rejecting aborts the rollout where it stands. Hosts already updated keep the new revision until a later rollout or a rollback changes them." }</p>
+            </Confirm>
+        },
+        Ask::Action(action) => {
+            let (title, label, danger, body, typed) = match *action {
+                "pause" => ("Pause", "Pause rollout", false, "Nothing new starts while paused; hosts mid-apply finish their apply.".to_string(), None),
+                "resume" => ("Resume", "Resume rollout", false, "The rollout carries on from where it paused.".to_string(), None),
+                "rollback" => ("Roll back", "Roll back", true, format!(
+                    "Applies the previous stable revision to every host this rollout updated ({}), newest phase first. Rolling back is applying, including removal of what this revision added; an irreversible task rolls back only as far as its kind can.",
+                    count(updated(d), "host", "hosts")), Some(format!("#{id}"))),
+                _ => ("Abort", "Abort rollout", true, "Stops the rollout where it is, with its state recorded. Hosts already updated keep the new revision.".to_string(), Some(format!("#{id}"))),
+            };
+            html! {
+                <Confirm title={format!("{title} rollout #{id}")} confirm_label={label} {danger} note=true
+                    type_to_confirm={typed.map(AttrValue::from)} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                    <p>{ body }</p>
+                </Confirm>
+            }
+        }
+        Ask::Host(action, host) => {
+            let (label, danger, body) = match *action {
+                "retry" => (
+                    "Retry",
+                    false,
+                    "Re-plans and re-applies the host as it stands; the same checks apply.",
+                ),
+                "force" => (
+                    "Force apply",
+                    true,
+                    "Applies although the host's baseline checks are failing. Use this when the host was already broken and the change is the fix.",
+                ),
+                _ => (
+                    "Skip",
+                    true,
+                    "Excludes the host from this rollout; it converges later as a straggler or with the next rollout.",
+                ),
+            };
+            html! {
+                <Confirm title={format!("{label} {host}")} confirm_label={format!("{label} {host}")} {danger} note=true
+                    note_placeholder={if *action == "skip" { "Reason (recorded with the skip)" } else { "" }}
+                    {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                    <p>{ body }</p>
+                </Confirm>
+            }
+        }
+        Ask::Continue(host, checks) => html! {
+            <Confirm title={format!("Continue {host} with checks waived")} confirm_label={format!("Waive {} and continue", count(checks.len(), "check", "checks"))}
+                danger=true note=true acknowledge={AttrValue::from("I understand these checks still run and report, but no longer count for this host in this rollout.")}
+                {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                <p>{ "Retries the host with these failing checks waived, so the run proceeds past the module and finishes the rest:" }</p>
+                <ul class="confirm__facts">{ for checks.iter().map(|c| html! { <li class="mono">{ c.clone() }</li> }) }</ul>
+            </Confirm>
+        },
+    }
+}
+
+fn updated(d: &RolloutDetail) -> usize {
+    d.phases
+        .iter()
+        .flat_map(|p| &p.hosts)
+        .filter(|h| {
+            matches!(
+                h.state,
+                HostRolloutState::Healthy
+                    | HostRolloutState::Baking
+                    | HostRolloutState::Applying
+                    | HostRolloutState::Failed
+            )
+        })
+        .count()
+}
+
+fn timeline(events: Vec<&RolloutEvent>, now: DateTime<Utc>) -> Html {
+    if events.is_empty() {
+        return html! { <p class="muted">{ "No events yet." }</p> };
+    }
+    html! {
+        <ol class="timeline">
+            { for events.into_iter().rev().map(|e| html! {
+                <li class={classes!("timeline__item", tone_of_event(&e.kind).class())}>
+                    <time class="timeline__at" datetime={e.at.to_rfc3339()} title={timestamp(e.at)}>{ relative(e.at, now) }</time>
+                    <span class="timeline__kind mono">{ e.kind.clone() }</span>
+                    <span class="timeline__message">{ e.message.clone() }</span>
+                    if let Some(a) = &e.actor { <span class="timeline__actor muted">{ a.clone() }</span> }
+                </li>
+            }) }
+        </ol>
+    }
+}
+
+fn tone_of_event(kind: &str) -> Tone {
+    if kind.contains("fail") || kind.contains("abort") {
+        Tone::Danger
+    } else if kind.contains("rollback") {
+        Tone::Mute
+    } else if kind.contains("held")
+        || kind.contains("paused")
+        || kind.contains("check_failing")
+        || kind.contains("lost")
+        || kind.contains("skip")
+    {
+        Tone::Warn
+    } else if kind.contains("healthy")
+        || kind.contains("done")
+        || kind.contains("approved")
+        || kind.contains("complete")
+    {
+        Tone::Ok
+    } else {
+        Tone::Neutral
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct HostTableProps {
+    detail: RolloutDetail,
+    admin: bool,
+    on_ask: Callback<Ask>,
+    now: DateTime<Utc>,
+}
+
+#[function_component(HostTable)]
+fn host_table(props: &HostTableProps) -> Html {
+    let expanded = use_state(|| None::<String>);
+    let p = layout(&props.detail);
+    let rows = p
+        .stages
+        .iter()
+        .flat_map(|st| st.hosts().map(move |h| (st.phase, h)));
+    html! {
+        <div class="table-wrap">
+            <table class="table table--hosts">
+                <thead><tr>
+                    <th scope="col">{ "Host" }</th>
+                    <th scope="col">{ "Stage" }</th>
+                    <th scope="col">{ "State" }</th>
+                    <th scope="col">{ "Plan" }</th>
+                    <th scope="col">{ "Checks" }</th>
+                    <th scope="col">{ "Updated" }</th>
+                    <th scope="col"><span class="visually-hidden">{ "Details" }</span></th>
+                </tr></thead>
+                <tbody>
+                    { for rows.map(|(phase, h)| {
+                        let open = expanded.as_deref() == Some(h.host.as_str());
+                        let toggle = {
+                            let (expanded, name) = (expanded.clone(), h.host.clone());
+                            Callback::from(move |_: MouseEvent| expanded.set(if open { None } else { Some(name.clone()) }))
+                        };
+                        html! { <>
+                            <tr key={h.host.clone()} class={classes!(open.then_some("is-open"))}>
+                                <td><RouteLink to={Route::Host { id: h.host.clone() }} classes="mono strong">{ h.host.clone() }</RouteLink></td>
+                                <td>{ phase.name.clone() }{ h.wave.map(|w| html! { <span class="muted small">{ format!(" · wave {w}") }</span> }).unwrap_or_default() }</td>
+                                <td>
+                                    <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} title={h.error.clone()} />
+                                    if h.needs_approval { <span class="badge badge--info">{ "needs approval" }</span> }
+                                    if let Some(until) = h.bake_until.filter(|u| *u > props.now) {
+                                        <span class="small muted">{ " " }<Countdown {until} /></span>
+                                    }
+                                </td>
+                                <td>{ h.plan_digest.as_deref().map(|d| html! {
+                                    <span class="mono" title={d.to_string()}>{ short(d) }</span>
+                                }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
+                                    { h.plan_changes.map(|c| html! { <span class="cell-sub">{ format!("{c} changes{}", h.plan_removals.filter(|r| *r > 0).map(|r| format!(" · {r} removals")).unwrap_or_default()) }</span> }).unwrap_or_default() }
+                                </td>
+                                <td>
+                                    { for h.failed_checks.iter().map(|c| html! { <span class="badge badge--danger mono">{ c.clone() }</span> }) }
+                                    { for h.waived_checks.iter().map(|c| html! { <span class="badge mono" title="waived for this rollout">{ format!("waived {c}") }</span> }) }
+                                </td>
+                                <td title={timestamp(h.updated_at)}>{ relative(h.updated_at, props.now) }</td>
+                                <td>
+                                    <button type="button" class="btn btn--subtle btn--small" onclick={toggle}
+                                        aria-expanded={open.to_string()} aria-label={format!("Details for {}", h.host)}>
+                                        { if open { "Hide" } else { "Details" } }
+                                    </button>
+                                </td>
+                            </tr>
+                            if open {
+                                <tr class="table__detail" key={format!("{}-detail", h.host)}>
+                                    <td colspan="7">
+                                        <HostDetailRow detail={props.detail.clone()} host={h.clone()} admin={props.admin} on_ask={props.on_ask.clone()} now={props.now} />
+                                    </td>
+                                </tr>
+                            }
+                        </> }
+                    }) }
+                </tbody>
+            </table>
+        </div>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct HostDetailRowProps {
+    detail: RolloutDetail,
+    host: RolloutHost,
+    admin: bool,
+    on_ask: Callback<Ask>,
+    now: DateTime<Utc>,
+}
+
+#[function_component(HostDetailRow)]
+fn host_detail_row(props: &HostDetailRowProps) -> Html {
+    let h = &props.host;
+    let rollout_id = props.detail.summary.id.clone();
+    let started = props.detail.summary.started_at;
+    let health = use_fetch(
+        h.host.clone(),
+        |id| async move { api::host_health(&id).await },
+    );
+    let events: Vec<&RolloutEvent> = props
+        .detail
+        .events
+        .iter()
+        .filter(|e| e.host.as_deref() == Some(h.host.as_str()))
+        .collect();
+    let ask = |a: Ask| {
+        let on_ask = props.on_ask.clone();
+        Callback::from(move |_: MouseEvent| on_ask.emit(a.clone()))
+    };
+    let actions = props.admin.then(|| html! {
+        <div class="row-actions">
+            if matches!(h.state, HostRolloutState::Failed | HostRolloutState::RolledBack) {
+                <Button small=true onclick={ask(Ask::Host("retry", h.host.clone()))}>{ "Retry" }</Button>
+            }
+            if h.state == HostRolloutState::Failed && !h.failed_checks.is_empty() {
+                <Button small=true onclick={ask(Ask::Continue(h.host.clone(), h.failed_checks.clone()))}>{ "Continue with checks waived…" }</Button>
+            }
+            if h.state == HostRolloutState::Held {
+                <Button small=true kind={Kind::Danger} onclick={ask(Ask::Host("force", h.host.clone()))}>{ "Force apply…" }</Button>
+            }
+            if !finished_state(h.state) {
+                <Button small=true kind={Kind::Danger} onclick={ask(Ask::Host("skip", h.host.clone()))}>{ "Skip…" }</Button>
+            }
+        </div>
+    });
+    let bake: Vec<HealthResultDto> = health
+        .value()
+        .map(|list| {
+            list.iter()
+                .filter(|r| match &r.rollout_id {
+                    Some(id) => *id == rollout_id,
+                    None => r.scope != "drift" && r.at >= started,
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    html! {
+        <div class="host-row">
+            if let Some(e) = &h.error { <p class={classes!("note", (h.state == HostRolloutState::Failed).then_some("note--danger"))}>{ e.clone() }</p> }
+            { actions.unwrap_or_default() }
+            <div class="host-row__cols">
+                <div>
+                    <h4 class="subhead">{ "Apply timeline" }</h4>
+                    { timeline(events, props.now) }
+                </div>
+                <div>
+                    <h4 class="subhead">{ "Health in this rollout" }</h4>
+                    { match (&health.error, health.value()) {
+                        (Some(e), None) => html! { <ErrorState error={e.clone()} retry={health.reload.clone()} /> },
+                        (_, None) => html! { <Loading /> },
+                        (_, Some(_)) if bake.is_empty() => html! { <p class="muted">{ "No checks have run for this rollout yet." }</p> },
+                        (_, Some(_)) => html! {
+                            <ul class="checks">
+                                { for bake.iter().rev().map(|r| html! {
+                                    <li class="checks__item">
+                                        <Pill tone={check_status_tone(&r.status)} label={r.status.clone()} />
+                                        <span class="mono">{ format!("{}/{}", r.module, r.check) }</span>
+                                        <span class="badge">{ r.scope.clone() }</span>
+                                        if !r.required { <span class="muted small">{ "informational" }</span> }
+                                        if h.waived_checks.contains(&format!("{}/{}", r.module, r.check)) { <span class="badge">{ "waived" }</span> }
+                                        <span class="checks__reason">{ r.reason.clone().unwrap_or_default() }</span>
+                                        <span class="muted small" title={timestamp(r.at)}>{ relative(r.at, props.now) }</span>
+                                    </li>
+                                }) }
+                            </ul>
+                        },
+                    } }
+                </div>
+            </div>
+        </div>
+    }
+}

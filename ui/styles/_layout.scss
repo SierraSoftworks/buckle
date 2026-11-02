@@ -1,0 +1,185 @@
+// The shell: 48 px app bar, 220 px sidebar (a drawer on a narrow screen),
+// and the page column.
+@use 'tokens' as *;
+
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-bar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  height: var(--bar-h);
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+
+  &__menu {
+    display: none;
+  }
+
+  &__brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: 650;
+    font-size: 1rem;
+    text-decoration: none;
+    color: var(--fg);
+
+    .logo {
+      color: var(--brand);
+    }
+  }
+
+  &__spacer {
+    flex: 1;
+  }
+}
+
+.app-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  align-items: start;
+}
+
+.sidebar {
+  position: sticky;
+  top: var(--bar-h);
+  height: calc(100vh - var(--bar-h));
+  overflow-y: auto;
+  border-right: 1px solid var(--line);
+  padding: 0.9rem 0.7rem;
+  background: var(--bg);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+
+  &__item {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.45rem 0.6rem;
+    border-radius: var(--radius-sm);
+    color: var(--fg-2);
+    font-weight: 500;
+    text-decoration: none;
+    transition: background var(--transition), color var(--transition);
+
+    &:hover {
+      background: var(--surface-2);
+      color: var(--fg);
+    }
+
+    &--active {
+      background: var(--surface-2);
+      color: var(--fg);
+
+      .nav__icon {
+        color: var(--brand);
+      }
+    }
+  }
+
+  &__icon {
+    display: inline-flex;
+    color: var(--fg-3);
+  }
+}
+
+.app-main {
+  min-width: 0;
+  outline: none;
+}
+
+.page {
+  max-width: 1200px;
+  padding: 1.5rem 2rem 4rem;
+
+  &--wide {
+    max-width: none;
+  }
+}
+
+.splash {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+}
+
+.scrim {
+  display: none;
+}
+
+.grid {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+
+  &--overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  &--host {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    margin: 0 0 1rem;
+  }
+
+  &__wide {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: $narrow) {
+  .app-bar__menu {
+    display: inline-flex;
+  }
+
+  .app-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sidebar {
+    position: fixed;
+    left: 0;
+    top: var(--bar-h);
+    z-index: 25;
+    width: var(--sidebar-w);
+    transform: translateX(-100%);
+    transition: transform 160ms ease;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+
+    &--open {
+      transform: none;
+    }
+  }
+
+  .scrim {
+    display: block;
+    position: fixed;
+    inset: var(--bar-h) 0 0 0;
+    z-index: 20;
+    background: var(--scrim);
+  }
+
+  .page {
+    padding: 1rem 1rem 3rem;
+  }
+
+  .grid--overview,
+  .grid--host {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

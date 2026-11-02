@@ -1,6 +1,8 @@
 /target
 **/target
 /ui/dist
+/ui/dist-e2e
+/ui/node_modules
 /ui/target
 *.swp
 .DS_Store
