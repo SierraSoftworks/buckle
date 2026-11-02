@@ -15,12 +15,13 @@ use yew::prelude::*;
 
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
+use crate::components::ui::Copyable;
 use crate::components::{
     Button, Confirm, Countdown, Empty, ErrorBlock, ErrorState, Kind, Loading, PageHead, Panel,
     Pill, Pipeline, PlanGroupView, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
-use crate::logic::format::{count, first_line, relative, short, timestamp};
+use crate::logic::format::{count, first_line, relative, rollout_label, short, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{GateKind, GateState, layout};
 use crate::logic::plan::{ApprovalScope, approval_scope};
@@ -30,6 +31,7 @@ use crate::logic::tone::{
     host_state_tone, rollout_finished, rollout_state_label, rollout_state_tone,
 };
 use crate::store::use_live;
+use yew_router::prelude::use_navigator;
 
 #[derive(Properties, PartialEq)]
 pub struct Props {
@@ -61,6 +63,22 @@ pub fn rollout_page(props: &Props) -> Html {
         props.id.clone(),
         |id| async move { api::rollout(&id).await },
     );
+    // A rollout opened by name (`/rollouts/word.word.word`) settles on its
+    // id, which its live updates and links use.
+    {
+        let navigator = use_navigator();
+        let canonical = detail
+            .data
+            .as_ref()
+            .map(|d| d.1.summary.id.clone())
+            .filter(|id| *id != props.id);
+        use_effect_with(canonical, move |id| {
+            if let (Some(id), Some(n)) = (id, navigator) {
+                n.replace(&Route::Rollout { id: id.clone() });
+            }
+            || ()
+        });
+    }
     // Host entries, the summary and timeline entries arrive on the stream
     // and are applied as they come. Phase states and approvals do not: when
     // the rollout itself changes, its detail is fetched again once the burst
@@ -148,7 +166,7 @@ pub fn rollout_page(props: &Props) -> Html {
     let Some(d) = live else {
         return html! {
             <div class="page">
-                <PageHead title={format!("Rollout #{}", props.id)} />
+                <PageHead title={format!("Rollout {}", rollout_label(&props.id))} />
                 { match &detail.error {
                     Some(e) => html! { <ErrorState error={e.clone()} retry={detail.reload.clone()} /> },
                     None => html! { <Loading label="Loading the rollout…" /> },
@@ -195,6 +213,7 @@ pub fn rollout_page(props: &Props) -> Html {
                 toast.clone(),
                 id.clone(),
             );
+            let label = rollout_label(&id);
             busy.set(true);
             wasm_bindgen_futures::spawn_local(async move {
                 let (result, done): (Result<RolloutDetail, ApiError>, String) = match &what {
@@ -216,11 +235,11 @@ pub fn rollout_page(props: &Props) -> Html {
                     ),
                     Ask::Reject => (
                         api::reject(&id, &note).await,
-                        format!("Rollout #{id} rejected."),
+                        format!("Rollout {label} rejected."),
                     ),
                     Ask::Action(action) => (
                         api::rollout_action(&id, action, &note).await,
-                        format!("Rollout #{id}: {action} sent."),
+                        format!("Rollout {label}: {action} sent."),
                     ),
                     Ask::Host(action, host) => (
                         api::rollout_host_action(&id, host, action, &note).await,
@@ -294,6 +313,7 @@ pub fn rollout_page(props: &Props) -> Html {
             <span class="muted">{ format!("{} · started {}", s.triggered_by, relative(s.started_at, now)) }</span>
             if let Some(f) = s.finished_at { <span class="muted">{ format!("finished {}", relative(f, now)) }</span> }
             <TraceLink id={s.trace_id.clone()} url={s.trace_url.clone()} />
+            if s.name.is_some() { <Copyable text={s.id.clone()} label={format!("{}…", short(&s.id))} /> }
         </div>
     };
 
@@ -345,7 +365,7 @@ pub fn rollout_page(props: &Props) -> Html {
 
     html! {
         <div class="page page--wide">
-            <PageHead title={format!("Rollout #{}", s.id)} {subtitle} {actions} />
+            <PageHead title={format!("Rollout {}", rollout_label(&s.id))} {subtitle} {actions} />
             if let Some(reason) = &s.pause_reason {
                 <div class={classes!("banner", if s.state == RolloutState::Paused { "banner--warn" } else { "banner--info" })} role="status">
                     <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
@@ -526,7 +546,7 @@ fn dialog(
         let (run, ask) = (run.clone(), ask.clone());
         Callback::from(move |note: String| run.emit((ask.clone(), note)))
     };
-    let id = &d.summary.id;
+    let label = rollout_label(&d.summary.id);
     match ask {
         Ask::Bind(..) => html! {},
         Ask::Approve(phase_name) => {
@@ -557,7 +577,7 @@ fn dialog(
                 ))
             });
             html! {
-                <Confirm title={format!("Approve {phase_name} of rollout #{id}")}
+                <Confirm title={format!("Approve {phase_name} of rollout {label}")}
                     confirm_label={format!("Approve {}", count(hosts, "host", "hosts"))}
                     acknowledge={ack} note=true note_placeholder="Why this is safe to go ahead"
                     {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
@@ -578,9 +598,9 @@ fn dialog(
             }
         }
         Ask::Reject => html! {
-            <Confirm title={format!("Reject rollout #{id}")} confirm_label="Reject rollout" danger=true note_required=true
+            <Confirm title={format!("Reject rollout {label}")} confirm_label="Reject rollout" danger=true note_required=true
                 note_placeholder="What is wrong with these plans"
-                type_to_confirm={AttrValue::from(format!("#{id}"))} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                type_to_confirm={AttrValue::from(label.clone())} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
                 <p>{ "Rejecting ends the rollout here: nothing in the waiting phase is applied, and the rollout is recorded as aborted with your reason. Hosts updated in earlier phases keep the new revision until a later rollout or a rollback changes them." }</p>
             </Confirm>
         },
@@ -590,11 +610,11 @@ fn dialog(
                 "resume" => ("Resume", "Resume rollout", false, "The rollout carries on from where it paused.".to_string(), None),
                 "rollback" => ("Roll back", "Roll back", true, format!(
                     "Applies the previous stable revision to every host this rollout updated ({}), newest phase first. Rolling back is applying, including removal of what this revision added; an irreversible task rolls back only as far as its kind can.",
-                    count(updated(d), "host", "hosts")), Some(format!("#{id}"))),
-                _ => ("Abort", "Abort rollout", true, "Stops the rollout where it is, with its state recorded. Hosts already updated keep the new revision.".to_string(), Some(format!("#{id}"))),
+                    count(updated(d), "host", "hosts")), Some(label.clone())),
+                _ => ("Abort", "Abort rollout", true, "Stops the rollout where it is, with its state recorded. Hosts already updated keep the new revision.".to_string(), Some(label.clone())),
             };
             html! {
-                <Confirm title={format!("{title} rollout #{id}")} confirm_label={label} {danger} note=true
+                <Confirm title={format!("{title} rollout {label}")} confirm_label={label} {danger} note=true
                     type_to_confirm={typed.map(AttrValue::from)} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
                     <p>{ body }</p>
                 </Confirm>

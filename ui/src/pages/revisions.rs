@@ -14,7 +14,7 @@ use crate::components::{
     use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
-use crate::logic::format::{commit, first_line, relative, timestamp};
+use crate::logic::format::{commit, first_line, relative, rollout_label, timestamp};
 use crate::logic::live::{apply_revisions, apply_rollouts};
 use crate::logic::tone::{Tone, rollout_finished, rollout_state_label, rollout_state_tone};
 
@@ -71,8 +71,8 @@ pub fn revisions() -> Html {
                 match api::start_rollout(&rev.id, &note).await {
                     Ok(r) => {
                         toast.ok(format!(
-                            "Rollout #{} of {} started.",
-                            r.id,
+                            "Rollout {} of {} started.",
+                            rollout_label(&r.id),
                             commit(&rev.commit)
                         ));
                         ask.set(None);
@@ -118,7 +118,7 @@ pub fn revisions() -> Html {
                                     <Pill tone={if rejected { Tone::Danger } else { Tone::Ok }} label={if rejected { "rejected" } else { "valid" }} />
                                     { match rollout {
                                         Some(o) => html! { <RouteLink to={Route::Rollout { id: o.id.clone() }}>
-                                            <Pill tone={rollout_state_tone(o.state)} label={format!("rollout #{} {}", o.id, rollout_state_label(o.state))} />
+                                            <Pill tone={rollout_state_tone(o.state)} label={format!("rollout {} {}", rollout_label(&o.id), rollout_state_label(o.state))} />
                                         </RouteLink> },
                                         None => html! {},
                                     } }
@@ -156,7 +156,7 @@ pub fn revisions() -> Html {
 
     let dialog = ask.as_ref().map(|a| {
         let cancel = { let ask = ask.clone(); Callback::from(move |_| ask.set(None)) };
-        let queued = active.map(|r| format!("Rollout #{} is still running; depending on rollout.supersede the new one waits for it or replaces it.", r.id));
+        let queued = active.map(|r| format!("Rollout {} is still running; depending on rollout.supersede the new one waits for it or replaces it.", rollout_label(&r.id)));
         match a {
             Ask::Start(r) => html! {
                 <Confirm title={format!("Start a rollout of {}", commit(&r.commit))} confirm_label="Start rollout" note=true

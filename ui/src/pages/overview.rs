@@ -14,7 +14,7 @@ use crate::components::{
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{Bucket, attention, rollup};
-use crate::logic::format::{age, commit, count, first_line, relative};
+use crate::logic::format::{age, commit, count, first_line, relative, rollout_label};
 use crate::logic::live::{apply_fleet, apply_revisions, apply_rollout, apply_rollouts};
 use crate::logic::tone::{Tone, revision_status_tone, rollout_state_label, rollout_state_tone};
 
@@ -136,7 +136,7 @@ fn rollout_head(s: &RolloutSummary, now: chrono::DateTime<chrono::Utc>) -> Html 
     html! {
         <div class="rollout-head">
             <RouteLink to={Route::Rollout { id: s.id.clone() }} classes="rollout-head__title">
-                { format!("Rollout #{}", s.id) }
+                { format!("Rollout {}", rollout_label(&s.id)) }
             </RouteLink>
             <span class="mono">{ commit(&s.revision) }</span>
             <span class="rollout-head__message">{ format!("“{}”", first_line(&s.revision_message)) }</span>
@@ -186,7 +186,7 @@ fn recent(
                             (buckle_api::RevisionStatus::Rejected, _) => html! { <Pill tone={revision_status_tone(r.status)} label="rejected" /> },
                             (_, Some(o)) => html! {
                                 <RouteLink to={Route::Rollout { id: o.id.clone() }} classes="revlist__rollout">
-                                    <Pill tone={rollout_state_tone(o.state)} label={format!("#{} {}", o.id, rollout_state_label(o.state))} />
+                                    <Pill tone={rollout_state_tone(o.state)} label={format!("{} {}", rollout_label(&o.id), rollout_state_label(o.state))} />
                                 </RouteLink>
                             },
                             _ => html! { <span class="muted">{ "not rolled out" }</span> },

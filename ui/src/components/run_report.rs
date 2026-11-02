@@ -16,7 +16,7 @@ use super::link::RouteLink;
 use super::ui::{Pill, TraceLink};
 use crate::app::Route;
 use crate::hooks::use_now;
-use crate::logic::format::{commit, count, millis, relative, short, timestamp};
+use crate::logic::format::{commit, count, millis, relative, rollout_label, short, timestamp};
 use crate::logic::run::{
     current_step, elapsed_ms, error_tone, expanded_by_default, module_has_problem, module_label,
     module_slug, module_tone, resource_module, run_finished, run_label, run_tone, step_glyph,
@@ -204,7 +204,7 @@ fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
                 <span class="mono" title={r.revision.clone()}>{ format!("revision {}", commit(&r.revision)) }</span>
                 <span class="mono" title={r.plan_digest.clone()}>{ format!("plan {}", short(&r.plan_digest)) }</span>
                 if let (Some(id), false) = (&r.rollout_id, in_rollout) {
-                    <RouteLink to={Route::Rollout { id: id.clone() }}>{ format!("rollout #{id}") }</RouteLink>
+                    <RouteLink to={Route::Rollout { id: id.clone() }}>{ format!("rollout {}", rollout_label(id)) }</RouteLink>
                 }
                 if r.trace_id.is_some() { <TraceLink id={r.trace_id.clone()} url={r.trace_url.clone()} /> }
             </span>

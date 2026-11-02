@@ -23,7 +23,9 @@ use crate::components::{
     Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
-use crate::logic::format::{commit, relative, relative_opt, short, short_duration, timestamp};
+use crate::logic::format::{
+    commit, relative, relative_opt, rollout_label, short, short_duration, timestamp,
+};
 use crate::logic::labels::{Change, Row, changes, collect, effective, rows};
 use crate::logic::live::{apply_fleet, apply_host_detail};
 use crate::logic::run::{follow_run_list, newest_run, run_label};
@@ -318,7 +320,7 @@ fn health_panel(results: &[HealthResultDto], now: DateTime<Utc>) -> Html {
                         <h3 class="subhead">
                             { scope_label(&scope) }
                             if let Some(id) = rollout {
-                                { " · " }<RouteLink to={Route::Rollout { id: id.clone() }}>{ format!("rollout #{id}") }</RouteLink>
+                                { " · " }<RouteLink to={Route::Rollout { id: id.clone() }}>{ format!("rollout {}", rollout_label(&id)) }</RouteLink>
                             }
                         </h3>
                         <ul class="checks">
