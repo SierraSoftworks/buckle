@@ -10,6 +10,7 @@ use yew::prelude::*;
 
 use super::diff::{DiffView, secret_text};
 use super::icons;
+use crate::logic::fleet_plan::Tally;
 use crate::logic::format::{count, short};
 use crate::logic::plan::review;
 
@@ -112,11 +113,11 @@ pub fn mark(m: Mark) -> Html {
     }
 }
 
-/// A collapsible block of a plan (a module, removals, notes): its heading
-/// on one line, its lines indented under it.
-pub fn block(class: &'static str, open: bool, head: Html, body: Html) -> Html {
+/// A collapsible block of a plan (a module, removals, notes), closed to its
+/// heading line until opened, its lines indented under it.
+pub fn block(class: &'static str, head: Html, body: Html) -> Html {
     html! {
-        <details class={classes!("plan-module", class)} open={open}>
+        <details class={classes!("plan-module", class)}>
             <summary class="plan-module__head">
                 <span class="plan-module__chevron">{ icons::chevron() }</span>
                 { head }
@@ -140,11 +141,7 @@ fn notes(
     }
     block(
         "",
-        true,
-        html! { <>
-            <h4 class="plan-module__name">{ title.to_string() }</h4>
-            if !aside.is_empty() { <span class="muted">{ aside.to_string() }</span> }
-        </> },
+        notes_head(title, aside, list.len()),
         html! { <>
             <ul class="steps">
                 { for list.iter().map(|n| note(n, glyph, class, html! {})) }
@@ -152,6 +149,15 @@ fn notes(
             { footer }
         </> },
     )
+}
+
+/// The heading of a section of module notes.
+pub fn notes_head(title: &str, aside: &str, modules: usize) -> Html {
+    html! { <>
+        <h4 class="plan-module__name">{ title.to_string() }</h4>
+        if !aside.is_empty() { <span class="muted">{ aside.to_string() }</span> }
+        <span class="plan-module__aside muted">{ count(modules, "module", "modules") }</span>
+    </> }
 }
 
 /// One deferred, held or indeterminate module.
@@ -171,35 +177,54 @@ pub fn note(n: &ModuleNote, glyph: &str, class: &str, scope: Html) -> Html {
 }
 
 fn body(plan: &PlanView) -> Html {
-    let warnings = (!plan.warnings.is_empty()).then(|| html! {
-        <ul class="plan__warnings">
-            { for plan.warnings.iter().map(|w| html! { <li>{ icons::alert() }{ secret_text(w) }</li> }) }
-        </ul>
+    let warnings = (!plan.warnings.is_empty()).then(|| {
+        warnings_block(
+            plan.warnings.len(),
+            html! {},
+            html! { { for plan.warnings.iter().map(|w| warning(w, html! {})) } },
+        )
     });
-    let modules = plan.modules.iter().map(|m| {
+    // A module with nothing to apply is left out; the rest open to their
+    // diffs from a heading that counts them.
+    let modules = plan.modules.iter().filter_map(|m| {
         let changed: Vec<&StepView> = m
             .steps
             .iter()
             .filter(|s| s.outcome != StepOutcome::NoOp)
             .collect();
-        let unchanged = m.steps.len() - changed.len();
-        block(
+        if changed.is_empty() && m.handlers.is_empty() {
+            return None;
+        }
+        Some(block(
             "",
-            !changed.is_empty(),
-            module_head(&m.module, &m.needs, changed.len(), unchanged, html! {}),
+            module_head(
+                &m.module,
+                &m.needs,
+                Tally::of_steps(changed.iter().copied()),
+                html! {},
+            ),
             html! {
                 <ul class="steps">
                     { for changed.into_iter().map(|s| step(s, html! {})) }
                     { for m.handlers.iter().map(|h| handler(&m.module, h, html! {})) }
                 </ul>
             },
-        )
+        ))
     });
     let removals = (!plan.removals.is_empty()).then(|| {
-        removals_block(html! { { for plan.removals.iter().map(|r| removal(r, html! {})) } })
+        removals_block(
+            plan.removals.len(),
+            html! {},
+            html! { { for plan.removals.iter().map(|r| removal(r, html! {})) } },
+        )
     });
-    let rehomed = (!plan.rehomed.is_empty())
-        .then(|| rehomed_block(html! { { for plan.rehomed.iter().map(|r| rehome(r, html! {})) } }));
+    let rehomed = (!plan.rehomed.is_empty()).then(|| {
+        rehomed_block(
+            plan.rehomed.len(),
+            html! {},
+            html! { { for plan.rehomed.iter().map(|r| rehome(r, html! {})) } },
+        )
+    });
     html! { <>
         { warnings.unwrap_or_default() }
         { for modules }
@@ -219,42 +244,80 @@ pub const DEFERRED_NOTE: &str = "If a deferred module's plan turns out destructi
 pub const INDETERMINATE_NOTE: &str = "not applied; their resources are never removed";
 pub const HELD_NOTE: &str = "not applied at this revision; left alone";
 
-/// A module's heading: its name, what it needs, and what it changes.
-pub fn module_head(
-    module: &str,
-    needs: &[String],
-    changed: usize,
-    unchanged: usize,
-    scope: Html,
-) -> Html {
+/// A module's heading: its name and what it needs, then (right-aligned)
+/// what it changes and, in a fleet-wide plan, on how many hosts.
+pub fn module_head(module: &str, needs: &[String], changes: Tally, hosts: Html) -> Html {
     html! { <>
         <h4 class="plan-module__name mono">{ module.to_string() }</h4>
-        if changed > 0 { <span class="plan-module__count">{ count(changed, "change", "changes") }</span> }
-        if unchanged > 0 { <span class="muted">{ format!("{unchanged} unchanged") }</span> }
         if !needs.is_empty() { <span class="muted">{ format!("needs: {}", needs.join(", ")) }</span> }
-        { scope }
+        <span class="plan-module__aside">{ tally(changes) }{ hosts }</span>
     </> }
 }
 
-pub fn removals_block(items: Html) -> Html {
+/// `+2 ~1 -1`: what a block creates, modifies and removes (and is blocked
+/// on), each in its change colour; kinds it has none of are left out.
+pub fn tally(t: Tally) -> Html {
+    let part = |n: usize, class: &'static str, sign: &'static str, what: &'static str| {
+        (n > 0).then(|| html! {
+            <span class={classes!("tally__part", format!("tally__part--{class}"))} title={format!("{n} {what}")}>
+                { format!("{sign}{n}") }
+            </span>
+        })
+    };
+    html! {
+        <span class="tally" data-testid="tally">
+            { part(t.create, "create", "+", "to create").unwrap_or_default() }
+            { part(t.modify, "modify", "~", "to modify").unwrap_or_default() }
+            { part(t.remove, "remove", "-", "to remove").unwrap_or_default() }
+            { part(t.blocked, "blocked", "!", "blocked").unwrap_or_default() }
+        </span>
+    }
+}
+
+/// The plan's warnings, as a block like a module's: counted in its heading,
+/// listed one per line when opened.
+pub fn warnings_block(n: usize, hosts: Html, items: Html) -> Html {
     block(
-        "plan-module--removals",
-        true,
+        "plan-module--warnings",
         html! { <>
-            <h4 class="plan-module__name">{ "Removals" }</h4>
-            <span class="muted">{ "resources the revision no longer declares" }</span>
+            <span class="plan-module__icon">{ icons::alert() }</span>
+            <h4 class="plan-module__name">{ "Warnings" }</h4>
+            <span class="plan-module__aside"><span class="muted">{ count(n, "warning", "warnings") }</span>{ hosts }</span>
         </> },
         html! { <ul class="steps">{ items }</ul> },
     )
 }
 
-pub fn rehomed_block(items: Html) -> Html {
+/// One warning: its text flowing (and wrapping) as one run, placeholders
+/// inline, then the hosts it applies to.
+pub fn warning(text: &str, scope: Html) -> Html {
+    html! {
+        <li class="step step--warning">
+            <span class="step__text">{ secret_text(text) }</span>
+            { scope }
+        </li>
+    }
+}
+
+pub fn removals_block(n: usize, hosts: Html, items: Html) -> Html {
+    block(
+        "plan-module--removals",
+        html! { <>
+            <h4 class="plan-module__name">{ "Removals" }</h4>
+            <span class="muted">{ "resources the revision no longer declares" }</span>
+            <span class="plan-module__aside">{ tally(Tally { remove: n, ..Tally::default() }) }{ hosts }</span>
+        </> },
+        html! { <ul class="steps">{ items }</ul> },
+    )
+}
+
+pub fn rehomed_block(n: usize, hosts: Html, items: Html) -> Html {
     block(
         "",
-        true,
         html! { <>
             <h4 class="plan-module__name">{ "Taken over" }</h4>
             <span class="muted">{ "records a declared resource now manages, kept instead of removed" }</span>
+            <span class="plan-module__aside"><span class="muted">{ count(n, "record", "records") }</span>{ hosts }</span>
         </> },
         html! { <ul class="steps">{ items }</ul> },
     )

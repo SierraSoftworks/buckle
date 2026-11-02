@@ -160,7 +160,7 @@ describe("empty and not-permitted states", () => {
   test("a read-only user sees no admin actions", async () => {
     const { page, close } = await open("/rollouts/42", { flags: "role=viewer" });
     await page.getByText("Approving needs an administrator").waitFor();
-    for (const name of ["Review and approve…", "Pause", "Abort…"]) {
+    for (const name of ["Approve cloud…", "Pause", "Abort…"]) {
       assert.equal(await page.getByRole("button", { name }).count(), 0, name);
     }
     await page.goto(page.url().replace("/rollouts/42", "/hosts/pi-1"));

@@ -284,31 +284,6 @@ pub fn rollout_page(props: &Props) -> Html {
     let s = &d.summary;
     let admin = auth.is_admin();
     let finished = rollout_finished(s.state);
-    let actions = if admin && !finished {
-        let o = open.clone();
-        let act = move |a: &'static str| {
-            let o = o.clone();
-            Callback::from(move |_: MouseEvent| o.emit(Ask::Action(a)))
-        };
-        html! { <>
-            if s.state == RolloutState::Paused {
-                <Button kind={Kind::Primary} onclick={act("resume")}>{ "Resume" }</Button>
-            } else if s.state != RolloutState::RollingBack {
-                <Button onclick={act("pause")}>{ "Pause" }</Button>
-            }
-            if matches!(s.state, RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking) {
-                <Button kind={Kind::Danger} onclick={act("rollback")}>{ "Roll back…" }</Button>
-            }
-            <Button kind={Kind::Danger} onclick={act("abort")}>{ "Abort…" }</Button>
-        </> }
-    } else {
-        html! {}
-    };
-    let actions = html! { <>
-        <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
-        { actions }
-    </> };
-
     let subtitle = html! {
         <div class="rollout-meta">
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
@@ -349,17 +324,60 @@ pub fn rollout_page(props: &Props) -> Html {
         .or(wanting.first())
         .copied();
 
+    let actions = if admin && !finished {
+        let o = open.clone();
+        let act = move |a: &'static str| {
+            let o = o.clone();
+            Callback::from(move |_: MouseEvent| {
+                o.emit(if a == "reject" {
+                    Ask::Reject
+                } else {
+                    Ask::Action(a)
+                })
+            })
+        };
+        // Approving the phase the approval pane shows sits with the
+        // rollout's other controls, as does rejecting a rollout held at a gate.
+        let approve = focused.map(|phase| {
+            let ready = !scope_of(phase, &plan_groups).digests.is_empty();
+            let (o, name) = (open.clone(), phase.name.clone());
+            html! {
+                <Button kind={Kind::Primary} disabled={!ready}
+                    onclick={Callback::from(move |_: MouseEvent| o.emit(Ask::Approve(name.clone())))}>
+                    { format!("Approve {}…", phase.name) }
+                </Button>
+            }
+        });
+        let reject = (focused.is_some() && s.state == RolloutState::AwaitingApproval).then(|| {
+            html! {
+                <Button kind={Kind::Danger} onclick={act("reject")}>{ "Reject…" }</Button>
+            }
+        });
+        html! { <>
+            { approve.unwrap_or_default() }
+            { reject.unwrap_or_default() }
+            if s.state == RolloutState::Paused {
+                <Button kind={Kind::Primary} onclick={act("resume")}>{ "Resume" }</Button>
+            } else if s.state != RolloutState::RollingBack {
+                <Button onclick={act("pause")}>{ "Pause" }</Button>
+            }
+            if matches!(s.state, RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking) {
+                <Button kind={Kind::Danger} onclick={act("rollback")}>{ "Roll back…" }</Button>
+            }
+            <Button kind={Kind::Danger} onclick={act("abort")}>{ "Abort…" }</Button>
+        </> }
+    } else {
+        html! {}
+    };
+    let actions = html! { <>
+        <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
+        { actions }
+    </> };
+
     let approval = match focused {
-        Some(phase) if !finished => approval_pane(
-            phase,
-            &wanting,
-            &d,
-            &plan_groups,
-            admin,
-            s.state == RolloutState::AwaitingApproval,
-            &open,
-            &focus_phase,
-        ),
+        Some(phase) if !finished => {
+            approval_pane(phase, &wanting, &d, &plan_groups, admin, &focus_phase)
+        }
         _ => all_plans(&plan_groups, d.fleet.as_ref()),
     };
 
@@ -424,9 +442,6 @@ fn approval_pane(
     d: &RolloutDetail,
     plans: &[PlanGroup],
     admin: bool,
-    // The rollout is held at a gate: rejecting it is possible (only then).
-    rejectable: bool,
-    open: &Callback<Ask>,
     focus: &UseStateHandle<Option<String>>,
 ) -> Html {
     let scope = scope_of(phase, plans);
@@ -464,14 +479,6 @@ fn approval_pane(
             </div>
         }
     });
-    let approve = {
-        let (open, name) = (open.clone(), phase.name.clone());
-        Callback::from(move |_: MouseEvent| open.emit(Ask::Approve(name.clone())))
-    };
-    let reject = {
-        let open = open.clone();
-        Callback::from(move |_: MouseEvent| open.emit(Ask::Reject))
-    };
     let policy = if phase.approval == "if_destructive" {
         "approval: if_destructive, and a plan here is destructive"
     } else {
@@ -506,14 +513,8 @@ fn approval_pane(
             }
             <div class="approval__actions">
                 if admin {
-                    <Button kind={Kind::Primary} onclick={approve} disabled={scope.digests.is_empty()}>
-                        { "Review and approve…" }
-                    </Button>
-                    if rejectable {
-                        <Button kind={Kind::Danger} onclick={reject}>{ "Reject…" }</Button>
-                    }
-                    <span class="muted small">{ format!("Binds {} for {}. A host whose plan changes after approval asks again.",
-                        count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</span>
+                    <span class="muted small">{ format!("Approving {} binds {} for {}. A host whose plan changes after approval asks again.",
+                        phase.name, count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</span>
                 } else {
                     <p class="muted">{ "Approving needs an administrator (admin_acl)." }</p>
                 }
