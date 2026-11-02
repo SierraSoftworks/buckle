@@ -1,5 +1,5 @@
 //! Host detail (design §12): the facts tree, what Buckle owns on the host,
-//! health per rollout and scope with reasons, drift diffs, the latest run
+//! each health check's current reading and its worst in recent rollouts, drift diffs, the latest run
 //! module by module and step by step (live while it applies, with any older
 //! run a pick away), and, for admins, the controls: server labels with a live preview of the
 //! groups and phase they produce, registration approval, pause and resume,
@@ -8,8 +8,7 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    Connection, HealthResultDto, HostDetail, HostPatch, HostPreview, HostStatus, RunReport,
-    RunSummary,
+    Connection, HostCheck, HostDetail, HostPatch, HostPreview, HostStatus, RunReport, RunSummary,
 };
 use chrono::{DateTime, Utc};
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
@@ -26,6 +25,7 @@ use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now,
 use crate::logic::format::{
     commit, relative, relative_opt, rollout_label, short, short_duration, timestamp,
 };
+use crate::logic::health::CheckState;
 use crate::logic::labels::{Change, Row, changes, collect, effective, rows};
 use crate::logic::live::{apply_fleet, apply_host_detail};
 use crate::logic::run::{follow_run_list, newest_run, run_label};
@@ -242,7 +242,7 @@ pub fn host_page(props: &Props) -> Html {
                 <NotesEditor id={h.id.clone()} notes={h.notes.clone()} admin={admin} on_saved={detail.reload.clone()} />
                 <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
             </div>
-            { health_panel(&d.health_results, now) }
+            { health_panel(&d.health_checks, now) }
             if !d.drift.is_empty() || h.drifted {
                 <Panel title="Drift" subtitle="What the latest drift check found different from the applied revision">
                     if d.drift.is_empty() {
@@ -292,49 +292,28 @@ pub fn host_page(props: &Props) -> Html {
     }
 }
 
-fn health_panel(results: &[HealthResultDto], now: DateTime<Utc>) -> Html {
-    let mut by_scope: BTreeMap<(u8, String, Option<String>), Vec<&HealthResultDto>> =
-        BTreeMap::new();
-    for r in results {
-        let order = match r.scope.as_str() {
-            "drift" => 0,
-            "baseline" => 1,
-            "bake" => 2,
-            "rollout" => 3,
-            _ => 4,
-        };
-        by_scope
-            .entry((order, r.scope.clone(), r.rollout_id.clone()))
-            .or_default()
-            .push(r);
+/// Each check as it reads now, module by module, with how it fared in the
+/// host's recent rollouts: one mark per rollout, oldest to newest, coloured
+/// by its worst reading.
+fn health_panel(checks: &[HostCheck], now: DateTime<Utc>) -> Html {
+    let mut by_module: BTreeMap<&str, Vec<&HostCheck>> = BTreeMap::new();
+    for c in checks {
+        by_module.entry(c.module.as_str()).or_default().push(c);
     }
     html! {
-        <Panel title="Health" subtitle="Results per rollout and scope, with reasons">
-            if results.is_empty() {
+        <Panel title="Health" subtitle="Each check as it reads now, and its worst reading in each recent rollout">
+            if checks.is_empty() {
                 <Empty title="No health results" message="Checks run with each drift check and during rollouts." />
             }
-            { for by_scope.into_iter().map(|((_, scope, rollout), mut list)| {
-                list.sort_by_key(|r| std::cmp::Reverse(r.at));
+            { for by_module.into_iter().map(|(module, list)| {
+                let worst = list.iter().map(|c| CheckState::of(&c.status, c.required)).max();
                 html! {
-                    <section class="health-scope">
+                    <section class="health-module" data-module={module.to_string()}>
                         <h3 class="subhead">
-                            { scope_label(&scope) }
-                            if let Some(id) = rollout {
-                                { " · " }<RouteLink to={Route::Rollout { id: id.clone() }}>{ format!("rollout {}", rollout_label(&id)) }</RouteLink>
-                            }
+                            <span class="mono">{ module.to_string() }</span>
+                            if let Some(w) = worst { { " " }<Pill tone={w.tone()} label={w.label()} /> }
                         </h3>
-                        <ul class="checks">
-                            { for list.into_iter().map(|r| html! {
-                                <li class="checks__item">
-                                    <Pill tone={check_status_tone(&r.status)} label={r.status.clone()} />
-                                    <span class="mono">{ format!("{}/{}", r.module, r.check) }</span>
-                                    <span class="badge">{ r.kind.clone() }</span>
-                                    if !r.required { <span class="muted small">{ "informational" }</span> }
-                                    <span class="checks__reason">{ r.reason.clone().unwrap_or_default() }</span>
-                                    <span class="muted small" title={timestamp(r.at)}>{ relative(r.at, now) }</span>
-                                </li>
-                            }) }
-                        </ul>
+                        <ul class="checks">{ for list.into_iter().map(|c| check_row(c, now)) }</ul>
                     </section>
                 }
             }) }
@@ -342,9 +321,42 @@ fn health_panel(results: &[HealthResultDto], now: DateTime<Utc>) -> Html {
     }
 }
 
+fn check_row(c: &HostCheck, now: DateTime<Utc>) -> Html {
+    let state = CheckState::of(&c.status, c.required);
+    html! {
+        <li class="checks__item" data-check={format!("{}/{}", c.module, c.check)} data-state={state.slug()}>
+            <Pill tone={check_status_tone(&c.status)} label={c.status.clone()} />
+            <span class="mono">{ c.check.clone() }</span>
+            <span class="badge">{ c.kind.clone() }</span>
+            if !c.required { <span class="muted small">{ "informational" }</span> }
+            <span class="checks__reason">{ c.reason.clone().unwrap_or_default() }</span>
+            <ol class="check-history" aria-label={format!("{} in recent rollouts, oldest first", c.check)}>
+                { for c.history.iter().rev().map(|e| {
+                    let worst = CheckState::of(&e.worst, c.required);
+                    let label = match &e.rollout_id {
+                        Some(id) => format!("rollout {}", rollout_label(id)),
+                        None => format!("revision {}", commit(&e.revision)),
+                    };
+                    let title = format!(
+                        "{label}: worst {}, last {} · {} {} from {} to {}",
+                        e.worst, e.status, e.readings,
+                        if e.readings == 1 { "reading" } else { "readings" },
+                        timestamp(e.first_at), timestamp(e.last_at),
+                    );
+                    html! {
+                        <li class={classes!("check-history__epoch", worst.tone().class())}
+                            data-state={worst.slug()} title={title.clone()} aria-label={title} />
+                    }
+                }) }
+            </ol>
+            <span class="muted small" title={format!("{} · {}", scope_label(&c.scope), timestamp(c.at))}>{ relative(c.at, now) }</span>
+        </li>
+    }
+}
+
 fn scope_label(scope: &str) -> &str {
     match scope {
-        "drift" => "Latest drift check",
+        "drift" => "Drift check",
         "baseline" => "Baseline, before apply",
         "bake" => "Bake, after apply",
         "rollout" => "Pre-phase re-check",

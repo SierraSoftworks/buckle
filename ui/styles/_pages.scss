@@ -256,8 +256,22 @@
   }
 }
 
-.health-scope + .health-scope {
+.health-module + .health-module {
   margin-top: 0.5rem;
+}
+
+// One mark per recent rollout, oldest first, coloured by its worst reading.
+.check-history {
+  display: inline-flex;
+  gap: 2px;
+  list-style: none;
+
+  &__epoch {
+    width: 0.5rem;
+    height: 0.9rem;
+    border-radius: 2px;
+    background: var(--tone, var(--fg-3));
+  }
 }
 
 .host-row {

@@ -49,12 +49,16 @@ describe("every page renders in demo mode", () => {
     await close();
   });
 
-  test("a host shows facts, owned resources, health per scope, drift and runs", async () => {
+  test("a host shows facts, owned resources, current health with its history, drift and runs", async () => {
     const { page, close } = await open("/hosts/hz-3");
     assert.equal(await heading(page), "hz-3");
     for (const panel of ["Summary", "Labels", "Notes", "Health", "Drift", "Owned resources", "Recent runs", "Facts"]) {
       await page.getByRole("heading", { name: panel, exact: true }).waitFor();
     }
+    // Each check reads once, with a mark per recent rollout.
+    const api = page.locator('.checks__item[data-check="nomad/api"]');
+    assert.equal(await api.count(), 1);
+    assert.equal(await api.locator(".check-history__epoch").count(), 3);
     // Secrets are only ever tokens.
     const drift = await page.locator(".drift").last().textContent();
     assert.match(drift, /«secret:nomad_server@3f9a»/);
