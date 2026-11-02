@@ -11,5 +11,6 @@ pub mod labels;
 pub mod live;
 pub mod pipeline;
 pub mod plan;
+pub mod run;
 pub mod schema;
 pub mod tone;

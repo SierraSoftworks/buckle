@@ -16,7 +16,7 @@ use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
     Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind, Loading, PageHead,
-    Panel, Pill, Refresh, RouteLink, TraceLink, use_toast,
+    Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
 };
 use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
 use crate::logic::format::{commit, relative, relative_opt, short, short_duration, timestamp};
@@ -229,6 +229,12 @@ pub fn host_page(props: &Props) -> Html {
                     }) }
                 </Panel>
             }
+            <Panel title="Latest run" subtitle="Every module of the host's newest run in plan order, with its steps">
+                { match &d.latest_run {
+                    Some(report) => html! { <RunReportView report={report.clone()} /> },
+                    None => html! { <Empty title="No runs yet" message="A report appears here once the host applies a revision." /> },
+                } }
+            </Panel>
             <Panel title="Owned resources" subtitle="What Buckle manages on this host, and what removal would do">
                 { resources(&d, now) }
             </Panel>

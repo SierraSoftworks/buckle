@@ -15,6 +15,18 @@ pub fn short_duration(secs: i64) -> String {
     }
 }
 
+/// How long a step took, to the precision that matters at its size:
+/// `230ms`, `1.4s`, `45s`, `2m 05s`, `1h 02m`.
+pub fn millis(ms: u64) -> String {
+    match ms {
+        0..=999 => format!("{ms}ms"),
+        1_000..=9_999 => format!("{}.{}s", ms / 1_000, (ms % 1_000) / 100),
+        10_000..=59_999 => format!("{}s", ms / 1_000),
+        60_000..=3_599_999 => format!("{}m {:02}s", ms / 60_000, (ms % 60_000) / 1_000),
+        _ => format!("{}h {:02}m", ms / 3_600_000, (ms % 3_600_000) / 60_000),
+    }
+}
+
 /// A countdown: `4:05`, `1:02:30`, never negative.
 pub fn countdown(secs: i64) -> String {
     let secs = secs.max(0);
@@ -116,6 +128,15 @@ mod tests {
         assert_eq!(short_duration(3_600), "1h");
         assert_eq!(short_duration(86_400), "1d");
         assert_eq!(short_duration(-90), "1m");
+    }
+
+    #[test]
+    fn step_durations_keep_the_precision_that_matters() {
+        assert_eq!(millis(230), "230ms");
+        assert_eq!(millis(1_480), "1.4s");
+        assert_eq!(millis(45_000), "45s");
+        assert_eq!(millis(125_000), "2m 05s");
+        assert_eq!(millis(3_720_000), "1h 02m");
     }
 
     #[test]

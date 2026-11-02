@@ -108,6 +108,11 @@ pub fn check() -> Html {
     icon(html! { <polyline points="5 12 10 17 19 7" /> })
 }
 
+/// Points right; turned a quarter down by the stylesheet when its section is open.
+pub fn chevron() -> Html {
+    icon(html! { <polyline points="9 6 15 12 9 18" /> })
+}
+
 pub fn clock() -> Html {
     icon(html! { <>
         <circle cx="12" cy="12" r="9" />
