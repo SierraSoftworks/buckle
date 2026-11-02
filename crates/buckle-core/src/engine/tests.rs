@@ -3755,6 +3755,36 @@ async fn a_valid_revision_validates_cleanly_and_with_facts() {
     assert!(with_facts.is_ok(), "{with_facts}");
 }
 
+#[rstest]
+#[case::debian(serde_json::json!({"os": {"family": "debian"}}), true)]
+#[case::ubuntu_id(serde_json::json!({"os": {"id": "ubuntu"}}), true)]
+#[case::darwin(serde_json::json!({"os": {"family": "darwin"}}), false)]
+#[case::windows(serde_json::json!({"os": {"family": "windows"}}), false)]
+#[tokio::test]
+async fn a_dry_run_checks_kinds_against_the_platform_the_facts_describe(
+    #[case] tree: serde_json::Value,
+    #[case] linux_ok: bool,
+) {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.linux: { path: /plat/linux-only, run: dryplat }\n",
+        )],
+    );
+    let host = HostIdentity {
+        id: "h".into(),
+        labels: Labels::new(),
+    };
+    let report = validate_with_facts(&rev, &host, &facts(tree))
+        .await
+        .unwrap();
+    assert_eq!(report.is_ok(), linux_ok, "{report}");
+    if !linux_ok {
+        assert!(report.to_string().contains("test.linux"), "{report}");
+    }
+}
+
 #[tokio::test]
 async fn validation_with_facts_catches_duplicate_keys_and_bad_var_references() {
     let rev = revision(

@@ -10,6 +10,8 @@ use crate::error::HumanizableResult;
 #[derive(Debug, Default, Clone)]
 pub struct RealSystem {
     http: Option<std::sync::Arc<dyn HttpClient>>,
+    /// Reported instead of the running binary's platform (dry runs over facts).
+    platform: Option<Platform>,
 }
 
 /// HTTP is injected so that the core crate does not depend on an HTTP client;
@@ -26,6 +28,13 @@ impl RealSystem {
 
     pub fn with_http(mut self, http: std::sync::Arc<dyn HttpClient>) -> Self {
         self.http = Some(http);
+        self
+    }
+
+    /// Reports `platform` from [`System::platform`] instead of the binary's own,
+    /// so a dry run over another host's facts checks kinds against that host.
+    pub fn with_platform(mut self, platform: Platform) -> Self {
+        self.platform = Some(platform);
         self
     }
 
@@ -223,7 +232,7 @@ fn default_file_mode() -> Option<u32> {
 #[async_trait]
 impl System for RealSystem {
     fn platform(&self) -> Platform {
-        Platform::current()
+        self.platform.unwrap_or_else(Platform::current)
     }
 
     /// The kernel's hostname (`gethostname`), then `$HOSTNAME`, then
