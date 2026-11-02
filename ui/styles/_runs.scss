@@ -456,6 +456,31 @@
   }
 }
 
+// A module's health results in this run.
+.run-health {
+  list-style: none;
+
+  &__item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.25rem 0.6rem;
+    padding: 0.3rem 0.4rem;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.82rem;
+
+    &:last-child {
+      border-bottom: none;
+    }
+  }
+
+  &__reason {
+    flex: 1;
+    min-width: 12rem;
+    color: var(--fg-2);
+  }
+}
+
 .run-removals {
   margin-top: 0.25rem;
 

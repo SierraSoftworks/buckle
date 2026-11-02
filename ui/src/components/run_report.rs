@@ -356,14 +356,14 @@ fn removal_row(x: &RemovalReport) -> Html {
 
 fn health(results: &[HealthResultDto], now: DateTime<Utc>) -> Html {
     html! {
-        <ul class="checks">
+        <ul class="run-health">
             { for results.iter().map(|r| html! {
-                <li class="checks__item">
+                <li class="run-health__item">
                     <Pill tone={check_status_tone(&r.status)} label={r.status.clone()} />
                     <span class="mono">{ format!("{}/{}", r.module, r.check) }</span>
                     <span class="badge">{ r.scope.clone() }</span>
                     if !r.required { <span class="muted small">{ "informational" }</span> }
-                    <span class="checks__reason">{ r.reason.clone().unwrap_or_default() }</span>
+                    <span class="run-health__reason">{ r.reason.clone().unwrap_or_default() }</span>
                     <span class="muted small" title={timestamp(r.at)}>{ relative(r.at, now) }</span>
                 </li>
             }) }
