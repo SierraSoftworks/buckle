@@ -25,8 +25,17 @@ pub struct InstallAgentArgs {
     #[arg(long)]
     pub token: Option<String>,
     /// Pin the server certificate by fingerprint (sha256:…).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "ca_file")]
     pub ca_fingerprint: Option<String>,
+    /// Trust this CA bundle (PEM) instead of the system roots.
+    #[arg(long, value_name = "FILE")]
+    pub ca_file: Option<PathBuf>,
+    /// Allow a plaintext connection (only sensible over a tailnet).
+    #[arg(long)]
+    pub insecure_plaintext: bool,
+    /// Where the agent keeps its state.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
     /// Seed labels, repeatable: --label role=worker.
     #[arg(long = "label", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
@@ -63,22 +72,41 @@ pub async fn run(args: InstallArgs) -> buckle_core::Result<i32> {
                 source: a.source,
                 host_id: a.host_id,
                 labels: a.labels.into_iter().collect(),
-                state_dir: if cfg!(windows) {
-                    r"C:\ProgramData\buckle".into()
-                } else {
-                    "/var/lib/buckle".into()
-                },
+                state_dir: a.state_dir.unwrap_or_else(|| {
+                    if cfg!(windows) {
+                        r"C:\ProgramData\buckle".into()
+                    } else {
+                        "/var/lib/buckle".into()
+                    }
+                }),
                 bootstrap_token: a.token,
                 tls: buckle_agent::config::TlsConfig {
                     ca_fingerprint: a.ca_fingerprint,
-                    ..Default::default()
+                    ca_file: a.ca_file,
+                    insecure_plaintext: a.insecure_plaintext,
                 },
                 drift: Default::default(),
                 vars: Default::default(),
                 telemetry: Default::default(),
             };
             config.validate()?;
-            buckle_agent::install(&config, &a.config).await?;
+            let options = buckle_agent::InstallOptions {
+                no_service: a.no_service,
+                exe: None,
+            };
+            buckle_agent::install(&config, &a.config, &options).await?;
+            if a.no_service {
+                println!(
+                    "Wrote {}; start the agent with `buckle agent --config {}`.",
+                    a.config.display(),
+                    a.config.display()
+                );
+            } else {
+                println!(
+                    "Installed and started the {} service.",
+                    buckle_agent::install::SERVICE_NAME
+                );
+            }
             Ok(0)
         }
     }

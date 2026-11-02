@@ -8,32 +8,49 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+## The scripted `FakeRunner` and helpers for exercising the agent in tests.
+testing = []
+
 [dependencies]
 buckle-core.workspace = true
 buckle-proto.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+ciborium.workspace = true
+flate2.workspace = true
 futures.workspace = true
+hex.workspace = true
 human-errors.workspace = true
-indexmap.workspace = true
 humantime-serde.workspace = true
+indexmap.workspace = true
 notify.workspace = true
+prost-types.workspace = true
 rand.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
-hex.workspace = true
+tar.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+tracing-batteries.workspace = true
+update-rs.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 buckle-core = { workspace = true, features = ["testing"] }
+hyper-util.workspace = true
 pretty_assertions.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tower.workspace = true
+wiremock.workspace = true
