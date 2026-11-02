@@ -7,9 +7,10 @@ tags: [base]
 vars:
   swap_profile: small       # module default; the Pis override it to none, pi-4 and az-1 differ again
 tasks:
-  # Task fields are plain strings once templated, so a number cannot come from
-  # a variable. Two mutually exclusive variants share one id, hence one resource
-  # (and one swap file on the host) whichever is selected.
+  # A templated field takes the schema's type, so `size_mb: "{{ vars.n }}"` would
+  # work too; two mutually exclusive variants are used instead to show `when` on
+  # tasks. They share one id, hence one resource (and one swap file on the host)
+  # whichever is selected.
   - swap.file: { path: /swapfile, size_mb: 1024, swappiness: 10 }
     id: swapfile
     when: 'vars.swap_profile == "small"'

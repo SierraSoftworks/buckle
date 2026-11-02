@@ -198,7 +198,11 @@ fn facts_summary(facts: &serde_json::Value) -> Option<String> {
             _ => {}
         }
     }
-    if let Some(arch) = facts.get("arch").and_then(|v| v.as_str()) {
+    if let Some(arch) = facts
+        .pointer("/hardware/arch")
+        .or_else(|| facts.get("arch"))
+        .and_then(|v| v.as_str())
+    {
         parts.push(format!("arch={arch}"));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -433,7 +437,7 @@ mod tests {
             &plan,
             "working-tree",
             Some(
-                &serde_json::json!({"os": {"family": "debian", "codename": "bookworm"}, "arch": "aarch64"}),
+                &serde_json::json!({"os": {"family": "debian", "codename": "bookworm"}, "hardware": {"arch": "aarch64"}}),
             ),
         );
         assert!(

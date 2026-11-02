@@ -95,9 +95,10 @@ run_inner() {
   echo "== buckle validate"
   "$bin" validate --config "$example" "${facts[@]}"
 
-  # Plain containers have no systemd to ask about units.
-  local select='!(task.kind like "systemd.*")'
-  [ "$offline" = 1 ] && select="$select && !(task.tags contains \"network\")"
+  # Plain containers have no systemd as PID 1; systemd tasks plan as Blocked
+  # there, which is exactly what this check exercises, so they are kept.
+  local select='true'
+  [ "$offline" = 1 ] && select='!(task.tags contains "network")'
   local state status=0
   state=$(mktemp -d)
   echo "== buckle plan (as a Nomad worker; select: $select)"
