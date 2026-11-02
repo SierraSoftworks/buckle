@@ -387,10 +387,7 @@ impl Artefact {
             }
             Artefact::Rule { subsystem, id } => format!("rule:{subsystem}:{id}"),
             Artefact::Adopted { path } => format!("path:{}", path.to_string_lossy()),
-            Artefact::Other { .. } => match self.adopted_path() {
-                Some(path) => format!("path:{}", path.to_string_lossy()),
-                None => return None,
-            },
+            Artefact::Other { .. } => format!("path:{}", self.adopted_path()?.to_string_lossy()),
         })
     }
 }
