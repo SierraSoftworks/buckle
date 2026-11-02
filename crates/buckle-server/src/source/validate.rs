@@ -1,5 +1,5 @@
 //! Validation of a loaded revision beyond what loading itself checks:
-//! module graph, secret references and template syntax.
+//! module graph, rollout phase names, secret references and template syntax.
 
 use crate::secrets::ServerSecrets;
 use buckle_core::engine::Revision;
@@ -36,6 +36,21 @@ pub fn validate(revision: &Revision) -> Vec<String> {
             "The module graph has a cycle: {}.",
             cycle.join(" → ")
         ));
+    }
+    let mut phases = BTreeSet::new();
+    for phase in &revision.fleet.rollout.phases {
+        let name = phase.name.trim();
+        if name.is_empty() {
+            errors.push("A rollout phase has no name.".to_owned());
+        } else if name.eq_ignore_ascii_case(crate::rollout::model::STRAGGLERS) {
+            errors.push(format!(
+                "The rollout phase name '{name}' is reserved for the stage that converges hosts which missed their phase."
+            ));
+        } else if !phases.insert(name.to_ascii_lowercase()) {
+            errors.push(format!(
+                "The rollout phase '{name}' is defined more than once; phase names must be unique."
+            ));
+        }
     }
     let declared: BTreeSet<&str> = revision.fleet.secrets.keys().map(String::as_str).collect();
     for m in &revision.modules {
@@ -132,6 +147,9 @@ mod tests {
     #[case(&[("buckle.yaml", "version: 2\n"), ("modules/a/module.yaml", "name: a\nneeds: [zzz]\n")], "does not exist")]
     #[case(&[("buckle.yaml", "version: 2\n"), ("modules/a/module.yaml", "name: a\n"), ("modules/a/files/x.j2", "{{ secrets.nope }}")], "does not declare")]
     #[case(&[("buckle.yaml", "version: 2\n"), ("modules/a/module.yaml", "name: a\n"), ("modules/a/files/x.j2", "{% if %}")], "does not parse")]
+    #[case(&[("buckle.yaml", "version: 2\nrollout:\n  phases:\n    - { name: canary, select: 'true' }\n    - { name: Canary, select: 'true' }\n")], "more than once")]
+    #[case(&[("buckle.yaml", "version: 2\nrollout:\n  phases:\n    - { name: stragglers, select: 'true' }\n")], "reserved")]
+    #[case(&[("buckle.yaml", "version: 2\n"), ("modules/a/module.yaml", "name: a\n"), ("modules/a/files/x.j2", "{{ secrets[\"nope\"] }}")], "does not declare")]
     fn invalid_revisions_are_reported(#[case] files: &[(&str, &str)], #[case] needle: &str) {
         let errors = validate(&load(files));
         assert!(errors.iter().any(|e| e.contains(needle)), "{errors:?}");

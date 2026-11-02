@@ -2250,3 +2250,22 @@ fn secret_reference_scanning_finds_names() {
     );
     assert_eq!(refs.into_iter().collect::<Vec<_>>(), vec!["a", "b", "c"]);
 }
+
+#[rstest]
+#[case(r#"{{ secrets["db-pass"] }}"#, &["db-pass"])]
+#[case("{{ secrets['tok'] }}", &["tok"])]
+#[case("{{secrets.a}}", &["a"])]
+#[case("secrets.a", &["a"])]
+#[case("x = mysecrets.a", &[])]
+#[case("host.secrets.a and not_secrets.b", &[])]
+#[case("(secrets.a.present) && !secrets . b . present", &["a", "b"])]
+fn secret_reference_scanning_respects_word_boundaries(
+    #[case] text: &str,
+    #[case] expected: &[&str],
+) {
+    let refs = validate::secret_references(text);
+    assert_eq!(
+        refs.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
+}

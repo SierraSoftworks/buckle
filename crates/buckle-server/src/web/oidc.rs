@@ -2,8 +2,9 @@
 //! variant), hardened along the lines of rustak's implementation:
 //!
 //! * discovery is cached for an hour and the key set for a day; a token
-//!   naming an unknown `kid` refetches the key set once (rotation), and the
-//!   issuer is taken from the discovery document;
+//!   naming an unknown `kid` refetches the key set (rotation), at most once
+//!   a minute so forged `kid`s cannot hammer the provider; the discovery
+//!   document's issuer must be the configured endpoint;
 //! * only asymmetric algorithms are accepted, `kid` is required, `exp`,
 //!   `aud` and `iss` are required, a multi-audience token must name us as
 //!   `azp`, and the nonce of the flow that asked is checked;
@@ -22,6 +23,8 @@ use std::time::{Duration, Instant};
 
 const DISCOVERY_TTL: Duration = Duration::from_secs(3600);
 const JWKS_TTL: Duration = Duration::from_secs(24 * 3600);
+/// The least time between two key-set refetches forced by an unknown `kid`.
+const JWKS_REFETCH_INTERVAL: Duration = Duration::from_secs(60);
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -137,6 +140,8 @@ pub struct OidcClient {
     http: reqwest::Client,
     discovery: Mutex<Option<Cached<Discovery>>>,
     jwks: Mutex<Option<Cached<jsonwebtoken::jwk::JwkSet>>>,
+    /// When an unknown `kid` last forced a key-set refetch.
+    forced_refetch: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for OidcClient {
@@ -159,6 +164,7 @@ impl OidcClient {
                 .unwrap_or_default(),
             discovery: Mutex::new(None),
             jwks: Mutex::new(None),
+            forced_refetch: Mutex::new(None),
         }
     }
 
@@ -211,6 +217,18 @@ impl OidcClient {
             self.config.endpoint.trim_end_matches('/')
         );
         let d: Discovery = self.get_json(&url, "discovery document").await?;
+        // OpenID Connect Discovery §4.3: the issuer must be the URL the
+        // document was fetched for, or a provider (or anything between us
+        // and it) could make us accept another issuer's tokens.
+        if d.issuer.trim_end_matches('/') != self.config.endpoint.trim_end_matches('/') {
+            return Err(buckle_core::error::system(
+                format!(
+                    "The identity provider's discovery document names the issuer '{}', not the configured '{}'.",
+                    d.issuer, self.config.endpoint
+                ),
+                &["Set web.oidc.endpoint to the provider's exact issuer URL."],
+            ));
+        }
         if let Ok(mut g) = self.discovery.lock() {
             *g = Some(Cached {
                 value: d.clone(),
@@ -239,6 +257,21 @@ impl OidcClient {
             });
         }
         Ok(keys)
+    }
+
+    /// Whether an unknown `kid` may force a key-set refetch now (at most
+    /// once per [`JWKS_REFETCH_INTERVAL`]); records the refetch when it may.
+    fn may_refetch_keys(&self) -> bool {
+        let mut last = self
+            .forced_refetch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < JWKS_REFETCH_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     /// The URL to send the browser to.
@@ -354,6 +387,7 @@ impl OidcClient {
         let mut keys = self.jwks(&d, false).await?;
         if let Some(kid) = jsonwebtoken::decode_header(token).ok().and_then(|h| h.kid)
             && keys.find(&kid).is_none()
+            && self.may_refetch_keys()
         {
             keys = self.jwks(&d, true).await?;
         }

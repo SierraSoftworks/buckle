@@ -122,6 +122,21 @@ fn h_record(raw: RawHost) -> Result<RolloutHostRecord> {
     })
 }
 
+/// Parses rollout rows, skipping (and logging by id) any that cannot be
+/// read, so one corrupt row cannot stop the controller from starting.
+fn readable_rollouts(rows: Vec<RawRollout>) -> Vec<RolloutRecord> {
+    rows.into_iter()
+        .filter_map(|raw| {
+            let id = raw.0.clone();
+            r_record(raw)
+                .map_err(|e| {
+                    tracing::error!(rollout = %id, error = %e, "skipping a rollout row that cannot be read");
+                })
+                .ok()
+        })
+        .collect()
+}
+
 impl<'c> Rollouts<'c> {
     pub(super) fn new(conn: &'c Connection) -> Self {
         Self { conn }
@@ -174,7 +189,7 @@ impl<'c> Rollouts<'c> {
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        rows.into_iter().map(r_record).collect()
+        Ok(readable_rollouts(rows))
     }
 
     /// Total number of rollouts.
@@ -199,8 +214,7 @@ impl<'c> Rollouts<'c> {
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        let records: Vec<RolloutRecord> = rows.into_iter().map(r_record).collect::<Result<_>>()?;
-        Ok(records
+        Ok(readable_rollouts(rows)
             .into_iter()
             .filter(|r| !r.is_terminal() || r.runtime.stragglers_open)
             .collect())
@@ -257,7 +271,17 @@ impl<'c> Rollouts<'c> {
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        rows.into_iter().map(h_record).collect()
+        Ok(rows
+            .into_iter()
+            .filter_map(|raw| {
+                let (rollout, host) = (raw.0.clone(), raw.1.clone());
+                h_record(raw)
+                    .map_err(|e| {
+                        tracing::error!(rollout = %rollout, host = %host, error = %e, "skipping a rollout host row that cannot be read");
+                    })
+                    .ok()
+            })
+            .collect())
     }
 
     /// Removes a host row (a forgotten host).
@@ -273,6 +297,51 @@ impl<'c> Rollouts<'c> {
 }
 
 impl Rollouts<'_> {
+    /// The revisions rollouts currently ask `host` to fetch: the target of
+    /// every rollout that is not rolled back or aborted and has a row for the
+    /// host (the rollout's revision, the host row's own target, which is the
+    /// stable revision in the stragglers stage, and the previous stable
+    /// revision a rollback sends it to). Rows that cannot be read are skipped.
+    pub fn revisions_for_host(&self, host: &str) -> Result<std::collections::BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.id, r.revision, r.state, r.policy, r.started_at, r.finished_at, r.triggered_by, r.detail, h.detail \
+                 FROM rollout_hosts h JOIN rollouts r ON r.id = h.rollout \
+                 WHERE h.host = ?1 AND r.state NOT IN ('rolled_back', 'aborted')",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![host], |r| Ok((r_row(r)?, r.get::<_, String>(8)?)))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let mut out = std::collections::BTreeSet::new();
+        for (raw, host_detail) in rows {
+            let id = raw.0.clone();
+            let record = match r_record(raw) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(rollout = %id, error = %e, "skipping a rollout row that cannot be read");
+                    continue;
+                }
+            };
+            if record.is_terminal() && !record.runtime.stragglers_open {
+                continue;
+            }
+            out.insert(record.revision.clone());
+            if let Some(prev) = &record.runtime.previous_stable {
+                out.insert(prev.clone());
+            }
+            if let Ok(rt) = from_json::<crate::rollout::model::HostRuntime>(&host_detail)
+                && !rt.revision.is_empty()
+            {
+                out.insert(rt.revision);
+            }
+        }
+        Ok(out)
+    }
+
     /// The most recent healthy row for a host (what it last converged to).
     pub fn latest_healthy_for_host(&self, host: &str) -> Result<Option<RolloutHostRecord>> {
         self.conn
@@ -285,5 +354,108 @@ impl Rollouts<'_> {
             .map_err(db_error)?
             .map(h_record)
             .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Store;
+    use super::*;
+    use crate::rollout::model::{HostRuntime, RolloutRuntime};
+
+    pub(crate) fn rollout(id: &str, revision: &str, state: RolloutState) -> RolloutRecord {
+        RolloutRecord {
+            id: id.into(),
+            revision: revision.into(),
+            state,
+            policy: Default::default(),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            triggered_by: "controller".into(),
+            runtime: RolloutRuntime {
+                previous_stable: Some("old".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    pub(crate) fn host_row(rollout: &str, host: &str, revision: &str) -> RolloutHostRecord {
+        RolloutHostRecord {
+            rollout: rollout.into(),
+            host: host.into(),
+            phase: "all".into(),
+            wave: None,
+            state: HostPhase::PlanPending,
+            plan_digest: None,
+            plan: None,
+            result: None,
+            health: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            runtime: HostRuntime {
+                revision: revision.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_rows_are_skipped_rather_than_failing_the_load() {
+        let store = Store::in_memory().await.unwrap();
+        let (live, listed, hosts) = store
+            .call(|db| {
+                db.rollouts()
+                    .save(&rollout("good", "a", RolloutState::Rolling))?;
+                db.rollouts().save_host(&host_row("good", "pi-1", "a"))?;
+                db.rollouts().save_host(&host_row("good", "pi-2", "a"))?;
+                db.rollouts()
+                    .save(&rollout("bad", "b", RolloutState::Rolling))?;
+                db.conn()
+                    .execute_batch(
+                        "UPDATE rollouts SET state = 'exploded' WHERE id = 'bad'; \
+                         UPDATE rollout_hosts SET detail = '{not json' WHERE host = 'pi-2';",
+                    )
+                    .map_err(crate::store::db_error)?;
+                Ok((
+                    db.rollouts().live()?,
+                    db.rollouts().list(10, 0)?,
+                    db.rollouts().hosts("good")?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            live.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            hosts.iter().map(|h| h.host.as_str()).collect::<Vec<_>>(),
+            vec!["pi-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_is_entitled_to_the_revisions_its_live_rollouts_name() {
+        let store = Store::in_memory().await.unwrap();
+        let revisions = store
+            .call(|db| {
+                db.rollouts()
+                    .save(&rollout("r1", "new", RolloutState::Rolling))?;
+                db.rollouts().save_host(&host_row("r1", "pi-1", "new"))?;
+                db.rollouts()
+                    .save(&rollout("r2", "dead", RolloutState::Aborted))?;
+                db.rollouts().save_host(&host_row("r2", "pi-1", "dead"))?;
+                db.rollouts()
+                    .save(&rollout("r3", "other", RolloutState::Rolling))?;
+                db.rollouts().save_host(&host_row("r3", "pi-2", "other"))?;
+                db.rollouts().revisions_for_host("pi-1")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            revisions.into_iter().collect::<Vec<_>>(),
+            vec!["new".to_string(), "old".to_string()]
+        );
     }
 }
