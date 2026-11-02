@@ -67,6 +67,8 @@ impl std::fmt::Debug for LoadedModule {
     }
 }
 
+/// One module of a revision: its parsed `module.yaml`, a reader for its
+/// `files/` directory and the templates found there.
 pub struct LoadedModule {
     pub config: crate::model::ModuleConfig,
     pub source: Arc<dyn Source>,
@@ -130,6 +132,7 @@ impl Inputs {
         }
     }
 
+    /// Labels managed on the server, overlaid on the agent's own.
     pub fn with_server_labels(mut self, labels: Labels) -> Self {
         self.server_labels = labels;
         self
@@ -148,26 +151,31 @@ impl Inputs {
         self
     }
 
+    /// Restricts the run to tasks matching a selector over the task scope.
     pub fn with_select(mut self, select: Option<crate::Filter>) -> Self {
         self.select = select;
         self
     }
 
+    /// Health checks (`module/check`) that may fail without failing the run.
     pub fn with_waived_checks(mut self, waived: Vec<String>) -> Self {
         self.waived_checks = waived;
         self
     }
 
+    /// How many modules may apply at once (at least one).
     pub fn with_parallelism(mut self, parallelism: usize) -> Self {
         self.parallelism = parallelism.max(1);
         self
     }
 
+    /// The known-good revision a failing module is re-applied from.
     pub fn with_stable_revision(mut self, stable: Option<Arc<Revision>>) -> Self {
         self.stable_revision = stable;
         self
     }
 
+    /// Agent-local var overrides, the last layer of the vars precedence.
     pub fn with_agent_vars(mut self, vars: Vars) -> Self {
         self.agent_vars = vars;
         self
