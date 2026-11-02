@@ -1,0 +1,451 @@
+//! Helpers shared by the file, archive, command, user and system task kinds.
+//!
+//! Nothing here is registered as a task. The helpers keep the kinds small and
+//! make their behaviour uniform: the same permission comparison, the same
+//! previews, the same "changed outside Buckle, left in place" removal rule.
+
+#[cfg(test)]
+pub(crate) mod testkit;
+
+use buckle_core::error;
+use buckle_core::plan::Planned;
+use buckle_core::secrets::Redacted;
+use buckle_core::state::ResourceRecord;
+use buckle_core::system::{Command, FileKind, FileMeta, FilePerms, Output};
+use buckle_core::task::{Applied, Artefact, Cx};
+use buckle_core::{Digest, Platform, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// Previews of text content shown in plans stop after this many bytes.
+pub const PREVIEW_LIMIT: usize = 64 * 1024;
+
+/// Redacted shadows kept in state are dropped beyond this size.
+pub const SHADOW_LIMIT: usize = 256 * 1024;
+
+/// `present` or `absent`, for kinds that can remove what they manage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Ensure {
+    #[default]
+    Present,
+    Absent,
+}
+
+/// A command given either as an argv list (run directly) or as a string (run
+/// through `sh -c`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum StringOrArgv {
+    /// A shell snippet, run with `sh -c`.
+    Shell(String),
+    /// A program and its arguments, run without a shell.
+    Argv(Vec<String>),
+}
+
+impl StringOrArgv {
+    /// Builds the process to run. An empty argv is a user error.
+    pub fn to_command(&self, platform: Platform) -> Result<Command> {
+        match self {
+            StringOrArgv::Shell(script) if script.trim().is_empty() => Err(error::user(
+                "A command was given as an empty string.",
+                &["Provide the command to run, for example `run: [\"systemctl\", \"daemon-reload\"]`."],
+            )),
+            StringOrArgv::Shell(script) => Ok(if platform == Platform::Windows {
+                Command::new("cmd").arg("/C").arg(script.clone())
+            } else {
+                Command::new("sh").arg("-c").arg(script.clone())
+            }),
+            StringOrArgv::Argv(argv) => Command::from_argv(argv).ok_or_else(|| {
+                error::user(
+                    "A command was given as an empty list.",
+                    &["Provide the program as the first element, for example `[\"systemctl\", \"daemon-reload\"]`."],
+                )
+            }),
+        }
+    }
+
+    /// The command as the operator would type it, for summaries.
+    pub fn display(&self) -> String {
+        match self {
+            StringOrArgv::Shell(s) => s.trim().to_owned(),
+            StringOrArgv::Argv(a) => a
+                .iter()
+                .map(|p| {
+                    if p.is_empty() || p.contains(char::is_whitespace) {
+                        format!("{p:?}")
+                    } else {
+                        p.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+}
+
+/// A user error for a path that must be absolute.
+pub fn require_absolute(path: &Path, field: &str) -> Result<()> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(error::user(
+            format!("The `{field}` path '{}' is not absolute.", path.display()),
+            &["Use an absolute path such as /etc/example.conf."],
+        ))
+    }
+}
+
+/// Reads a file from the module's `files/` directory, failing with advice when it is missing.
+pub async fn read_module_file(cx: &Cx, rel: &str) -> Result<Vec<u8>> {
+    cx.source.read(Path::new(rel)).await?.ok_or_else(|| {
+        error::user(
+            format!("The module file '{rel}' does not exist."),
+            &["Create the file under the module's files/ directory, or fix the `src` path."],
+        )
+    })
+}
+
+/// Reads a module file that must be UTF-8 text.
+pub async fn read_module_text(cx: &Cx, rel: &str) -> Result<String> {
+    let bytes = read_module_file(cx, rel).await?;
+    String::from_utf8(bytes).map_err(|_| {
+        error::user(
+            format!("The module file '{rel}' is not valid UTF-8 text."),
+            &["Use file.copy for binary files; templates must be text."],
+        )
+    })
+}
+
+/// A redacted preview of content that did not pass through a secret-aware render
+/// (module files and host files). Binary content previews as `binary`.
+pub fn text_preview(bytes: &[u8]) -> Redacted<String> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Redacted::plain(truncate_preview(text.to_owned(), bytes.len())),
+        Err(_) => Redacted::plain("binary".to_owned()),
+    }
+}
+
+/// Truncates an already-redacted render to the preview limit.
+pub fn truncate_redacted(text: Redacted<String>) -> Redacted<String> {
+    text.map(|t| {
+        let total = t.len();
+        truncate_preview(t, total)
+    })
+}
+
+fn truncate_preview(mut text: String, total: usize) -> String {
+    if text.len() <= PREVIEW_LIMIT {
+        return text;
+    }
+    let mut cut = PREVIEW_LIMIT;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str(&format!("\n... (truncated, {total} bytes in total)\n"));
+    text
+}
+
+/// The text of `bytes` when it is a UTF-8 document small enough to diff.
+pub fn diffable_text(bytes: &[u8]) -> Option<&str> {
+    if bytes.len() > SHADOW_LIMIT {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()
+}
+
+/// A shadow for state when `bytes` is small UTF-8 text from a non-secret source.
+pub fn shadow_of(bytes: &[u8]) -> Option<Redacted<String>> {
+    diffable_text(bytes).map(|t| Redacted::plain(t.to_owned()))
+}
+
+/// `digest 9a1f6c2e → 02c7b4aa`, for content that must not be displayed.
+pub fn digest_change(old: &Digest, new: &Digest) -> String {
+    format!("digest {} → {}", old.short(), new.short())
+}
+
+/// Describes the fields of `perms` that are set: `0644 root:root`.
+pub fn describe_perms(perms: &FilePerms) -> String {
+    let mut parts = Vec::new();
+    if let Some(mode) = perms.mode {
+        parts.push(format!("{mode:04o}"));
+    }
+    match (&perms.owner, &perms.group) {
+        (Some(o), Some(g)) => parts.push(format!("{o}:{g}")),
+        (Some(o), None) => parts.push(o.clone()),
+        (None, Some(g)) => parts.push(format!(":{g}")),
+        (None, None) => {}
+    }
+    parts.join(" ")
+}
+
+/// The differences between a path's current permissions and the wanted ones, as
+/// `mode 0644 → 0600` style fragments. Fields that are not set in `want` are ignored.
+pub fn perm_changes(meta: &FileMeta, want: &FilePerms) -> Vec<String> {
+    let mut changes = Vec::new();
+    if let Some(mode) = want.mode {
+        let current = meta.mode.map(|m| m & 0o7777);
+        if current != Some(mode) {
+            changes.push(match current {
+                Some(c) => format!("mode {c:04o} → {mode:04o}"),
+                None => format!("mode → {mode:04o}"),
+            });
+        }
+    }
+    if let Some(owner) = &want.owner
+        && meta.owner.as_deref() != Some(owner.as_str())
+    {
+        changes.push(format!(
+            "owner {} → {owner}",
+            meta.owner.as_deref().unwrap_or("?")
+        ));
+    }
+    if let Some(group) = &want.group
+        && meta.group.as_deref() != Some(group.as_str())
+    {
+        changes.push(format!(
+            "group {} → {group}",
+            meta.group.as_deref().unwrap_or("?")
+        ));
+    }
+    changes
+}
+
+/// The permissions to write with: the wanted ones, falling back to the existing
+/// file's so that editing a file in place does not reset its mode and ownership.
+pub fn effective_perms(want: &FilePerms, existing: Option<&FileMeta>) -> FilePerms {
+    let Some(meta) = existing else {
+        return want.clone();
+    };
+    FilePerms {
+        mode: want.mode.or(meta.mode.map(|m| m & 0o7777)),
+        owner: want.owner.clone().or_else(|| meta.owner.clone()),
+        group: want.group.clone().or_else(|| meta.group.clone()),
+    }
+}
+
+/// The permissions an existing file already has, for rewriting it unchanged.
+pub fn perms_of(meta: &FileMeta) -> FilePerms {
+    FilePerms {
+        mode: meta.mode.map(|m| m & 0o7777),
+        owner: meta.owner.clone(),
+        group: meta.group.clone(),
+    }
+}
+
+/// Whether anything is set in `perms`.
+pub fn has_perms(perms: &FilePerms) -> bool {
+    perms.mode.is_some() || perms.owner.is_some() || perms.group.is_some()
+}
+
+/// The `Planned::Blocked` for a missing tool, or `None` when it is installed.
+pub async fn missing_tool(cx: &Cx, tool: &str, hint: &str) -> Result<Option<Planned>> {
+    if cx.system.which(tool).await?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(Planned::blocked(format!(
+        "`{tool}` is not installed on this host; {hint}"
+    ))))
+}
+
+/// The user error raised in apply when a required tool is missing.
+pub async fn require_tool(cx: &Cx, tool: &str, hint: &str) -> Result<()> {
+    if cx.system.which(tool).await?.is_some() {
+        return Ok(());
+    }
+    Err(error::user(
+        format!("`{tool}` is not installed on this host; {hint}"),
+        &[
+            "Install the tool (for example with an apt.package task that runs earlier in the module).",
+        ],
+    ))
+}
+
+const OUTPUT_TAIL: usize = 2048;
+
+/// The last part of a process's output, trimmed, for error messages.
+pub fn output_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.len() <= OUTPUT_TAIL {
+        return text.to_owned();
+    }
+    let mut start = text.len() - OUTPUT_TAIL;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...{}", &text[start..])
+}
+
+/// Runs a command and turns a non-zero exit into a user error carrying stderr
+/// (withheld when the command's environment carried secrets).
+pub async fn run_checked(cx: &Cx, command: Command, what: &str) -> Result<Output> {
+    let sensitive = command.sensitive_env;
+    let line = command.display_line();
+    let out = cx.system.run(command).await?;
+    if out.success() {
+        return Ok(out);
+    }
+    Err(command_failed(what, &line, &out, sensitive))
+}
+
+/// The error for a command that did not succeed.
+pub fn command_failed(what: &str, line: &str, out: &Output, sensitive: bool) -> buckle_core::Error {
+    let status = if out.timed_out {
+        "timed out".to_owned()
+    } else {
+        match out.code {
+            Some(code) => format!("exited with status {code}"),
+            None => "was terminated by a signal".to_owned(),
+        }
+    };
+    let detail = if sensitive {
+        "Its output is withheld because the command's environment carried secrets.".to_owned()
+    } else {
+        let stderr = output_tail(&out.stderr);
+        let stdout = output_tail(&out.stdout);
+        match (stderr.is_empty(), stdout.is_empty()) {
+            (false, _) => format!("stderr: {stderr}"),
+            (true, false) => format!("stdout: {stdout}"),
+            (true, true) => "It printed nothing.".to_owned(),
+        }
+    };
+    error::user(
+        format!("{what} failed: `{line}` {status}. {detail}"),
+        &[
+            "Run the command by hand on the host to see the failure in context.",
+            "Check the arguments in the task and that any tools it needs are installed.",
+        ],
+    )
+}
+
+/// Removes the single file a task recorded, but only when its content still has
+/// the digest recorded at apply time. Anything else is drift and is left alone.
+pub async fn remove_recorded_file(cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
+    let Some(path) = record.artefacts.iter().find_map(|a| match a {
+        Artefact::File { path } => Some(path.clone()),
+        _ => None,
+    }) else {
+        return Ok(Applied::skipped("nothing recorded to remove"));
+    };
+    let Some(bytes) = cx.system.read(&path).await? else {
+        return Ok(Applied::unchanged(format!(
+            "{} was already absent",
+            path.display()
+        )));
+    };
+    match &record.content_digest {
+        Some(expected) if *expected == Digest::of(&bytes) => {
+            cx.system.remove(&path, false).await?;
+            Ok(Applied::changed(format!("deleted {}", path.display())))
+        }
+        Some(_) => Ok(Applied::skipped(format!(
+            "{} changed outside Buckle, left in place",
+            path.display()
+        ))),
+        None => Ok(Applied::skipped(format!(
+            "{} has no recorded digest to verify against, left in place",
+            path.display()
+        ))),
+    }
+}
+
+/// Splits text into lines without their terminators.
+pub fn split_lines(text: &str) -> Vec<String> {
+    text.lines().map(str::to_owned).collect()
+}
+
+/// Joins lines with a terminator after every line, including the last.
+pub fn join_lines(lines: &[String]) -> String {
+    let mut out = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Compiles a user-supplied regular expression with a helpful error.
+pub fn compile_regex(pattern: &str, field: &str) -> Result<regex::Regex> {
+    regex::Regex::new(pattern).map_err(|e| {
+        error::wrap_user(
+            e,
+            format!("The `{field}` pattern '{pattern}' is not a valid regular expression."),
+            &["Check the pattern's syntax; Buckle uses the Rust `regex` dialect."],
+        )
+    })
+}
+
+/// A path as the `Artefact::File` for it.
+pub fn file_artefact(path: &Path) -> Artefact {
+    Artefact::File {
+        path: path.to_path_buf(),
+    }
+}
+
+/// Whether `meta` describes a regular file.
+pub fn is_file(meta: &FileMeta) -> bool {
+    meta.kind == FileKind::File
+}
+
+/// A path next to `dest` with a name that directory-globbing consumers ignore.
+pub fn sibling_temp(dest: &Path, suffix: &str) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!(".{name}.{suffix}"))
+}
+
+/// A timestamped backup path for `path`.
+pub fn backup_path(cx: &Cx, path: &Path) -> PathBuf {
+    let stamp = cx.system.now().format("%Y%m%dT%H%M%SZ");
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.{stamp}.bak"))
+}
+
+/// Copies an existing file aside before it is changed.
+pub async fn backup_file(cx: &Cx, path: &Path, meta: &FileMeta, bytes: &[u8]) -> Result<PathBuf> {
+    let target = backup_path(cx, path);
+    cx.system
+        .write_atomic(&target, bytes, &perms_of(meta))
+        .await?;
+    Ok(target)
+}
+
+/// Truncates a command for use in span fields.
+pub fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut cut = max;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &text[..cut])
+}
+
+/// The `Applied` for a file whose content Buckle wrote: the file artefact, the
+/// digest of the real content and, when available, the redacted shadow.
+pub fn written(
+    summary: impl Into<String>,
+    path: &Path,
+    digest: Digest,
+    shadow: Option<Redacted<String>>,
+    changed: bool,
+) -> Applied {
+    let mut applied = if changed {
+        Applied::changed(summary)
+    } else {
+        Applied::unchanged(summary)
+    };
+    applied.artefacts.push(file_artefact(path));
+    applied.content_digest = Some(digest);
+    applied.shadow = shadow;
+    applied
+}
