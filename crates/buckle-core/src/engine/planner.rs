@@ -8,8 +8,8 @@ use super::{Inputs, LoadedModule, Revision};
 use crate::facts::Facts;
 use crate::model::{ModuleConfig, RemovalPolicy, RetryPolicy, TaskDecl};
 use crate::plan::{
-    Deferred, HandlerRun, Indeterminate, ModulePlan, Plan, Planned, Rehome, RehomeKind, Removal,
-    ResourceKey, Step, TaskRef,
+    Deferred, HandlerRun, Held, Indeterminate, ModulePlan, Plan, Planned, Rehome, RehomeKind,
+    Removal, ResourceKey, Step, TaskRef,
 };
 use crate::secrets::SecretStore;
 use crate::selectors::{HostContext, HostIdentity, Vars};
@@ -203,6 +203,8 @@ pub(super) struct Planner<'a> {
     pub waived: Arc<Vec<String>>,
     pub agent_vars: &'a Vars,
     pub templater: Arc<Templater>,
+    /// Drift mode (see [`Inputs::drift`]).
+    pub drift: bool,
     /// JSON schemas by task kind, for secret-field aware spec rendering.
     schemas: Mutex<HashMap<&'static str, Arc<serde_json::Value>>>,
 }
@@ -227,12 +229,13 @@ impl<'a> Planner<'a> {
             waived,
             agent_vars,
             templater: Arc::new(build_templater(revision)?),
+            drift: false,
             schemas: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn from_inputs(inputs: &'a Inputs, revision: &'a Revision) -> crate::Result<Self> {
-        Self::new(
+        let mut planner = Self::new(
             revision,
             HostIdentity {
                 id: inputs.host.id.clone(),
@@ -243,7 +246,9 @@ impl<'a> Planner<'a> {
             inputs.select.as_ref(),
             Arc::new(inputs.waived_checks.clone()),
             &inputs.agent_vars,
-        )
+        )?;
+        planner.drift = inputs.drift;
+        Ok(planner)
     }
 
     fn schema_of(&self, task: &'static dyn DynTask) -> Arc<serde_json::Value> {
@@ -1030,7 +1035,17 @@ pub(super) async fn collect_facts(inputs: &Inputs, planner: &Planner<'_>) -> Fac
 
 /// Plans the whole revision for the host described by `inputs`.
 pub(super) async fn plan(inputs: &Inputs, revision: &Revision) -> crate::Result<(RichPlan, Facts)> {
-    let planner = Planner::from_inputs(inputs, revision)?;
+    plan_mode(inputs, revision, inputs.drift).await
+}
+
+/// [`plan`], in drift mode or not.
+pub(super) async fn plan_mode(
+    inputs: &Inputs,
+    revision: &Revision,
+    drift: bool,
+) -> crate::Result<(RichPlan, Facts)> {
+    let mut planner = Planner::from_inputs(inputs, revision)?;
+    planner.drift = drift;
     let facts = collect_facts(inputs, &planner).await;
     let state = inputs.state.load()?;
     let rich = plan_with(&planner, &facts, &state).await?;
@@ -1044,7 +1059,34 @@ pub(super) async fn plan_with(
     state: &State,
 ) -> crate::Result<RichPlan> {
     let contexts = planner.contexts(facts);
-    let selection = planner.select(&contexts)?;
+    let mut selection = planner.select(&contexts)?;
+
+    // Drift re-plans only what this host has applied at this revision.
+    let mut held: Vec<Held> = Vec::new();
+    if planner.drift {
+        let revision = &planner.revision.id;
+        selection.order.retain(|m| {
+            let name = &m.config.name;
+            if state.module_at(name, revision) {
+                return true;
+            }
+            let reason = match (
+                state.failed_modules.get(name),
+                state.module_revisions.get(name),
+            ) {
+                (Some(failed), _) => {
+                    format!("its last run failed (revision {failed}); drift does not re-apply it")
+                }
+                (None, Some(other)) => format!("it is applied at revision {other}, not {revision}"),
+                (None, None) => format!("it has not been applied at revision {revision}"),
+            };
+            held.push(Held {
+                module: name.clone(),
+                reason,
+            });
+            false
+        });
+    }
 
     let mut prepared = Vec::with_capacity(selection.order.len());
     for module in &selection.order {
@@ -1073,6 +1115,7 @@ pub(super) async fn plan_with(
         .indeterminate
         .iter()
         .map(|i| i.module.clone())
+        .chain(held.iter().map(|h| h.module.clone()))
         .collect();
     let rehomed = planner.rehomes(state, &mut prepared, &undecided);
     let rehomed_from: BTreeSet<ResourceKey> = rehomed.iter().map(|r| r.from.clone()).collect();
@@ -1109,8 +1152,19 @@ pub(super) async fn plan_with(
     let exclude: BTreeSet<String> = deferred
         .iter()
         .map(|d| d.module.clone())
-        .chain(selection.indeterminate.iter().map(|i| i.module.clone()))
+        .chain(undecided.iter().cloned())
         .collect();
+    // Drift never removes what a revision other than its own recorded.
+    let mut rehomed_from = rehomed_from;
+    if planner.drift {
+        rehomed_from.extend(
+            state
+                .resources
+                .values()
+                .filter(|r| r.revision != planner.revision.id)
+                .map(|r| r.key.clone()),
+        );
+    }
     let (removals, rich_removals): (Vec<Removal>, Vec<RichRemoval>) = planner
         .removals(state, &desired, &exclude, &rehomed_from)
         .into_iter()
@@ -1134,7 +1188,8 @@ pub(super) async fn plan_with(
         .collect();
     let mut plan = plan
         .with_indeterminate(selection.indeterminate)
-        .with_rehomed(rehomed);
+        .with_rehomed(rehomed)
+        .with_held(held);
     plan.warnings = warnings(&plan, &platform_blocked);
     plan.warnings.extend(task_warnings);
     Ok(RichPlan {
@@ -1174,6 +1229,9 @@ pub(super) fn warnings(plan: &Plan, platform_blocked: &BTreeSet<ResourceKey>) ->
     }
     for r in &plan.rehomed {
         out.push(format!("not removed: {} — {}", r.from, r.summary));
+    }
+    for h in &plan.held {
+        out.push(format!("module '{}' is held: {}", h.module, h.reason));
     }
     for step in plan.steps() {
         if step.always_runs {

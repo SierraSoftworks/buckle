@@ -84,6 +84,15 @@ pub struct State {
     /// Cached facts with collection times.
     #[serde(default)]
     pub facts: crate::facts::Facts,
+    /// The revision each module last applied successfully (or was rolled back
+    /// to). A failed run leaves `applied_revision` behind while the modules
+    /// that succeeded move on; drift uses this to tell them apart.
+    #[serde(default)]
+    pub module_revisions: BTreeMap<String, RevisionId>,
+    /// Modules whose most recent run failed, with the revision they failed
+    /// on; cleared when the module next applies successfully.
+    #[serde(default)]
+    pub failed_modules: BTreeMap<String, RevisionId>,
 }
 
 impl State {
@@ -107,6 +116,20 @@ impl State {
         self.resources
             .values()
             .filter(move |r| !desired.contains(&r.key))
+    }
+
+    /// Whether `module` is applied at `revision` on this host: its recorded
+    /// module revision is `revision` (or, for state written before module
+    /// revisions were recorded, the host's applied revision is) and its last
+    /// run did not fail.
+    pub fn module_at(&self, module: &str, revision: &RevisionId) -> bool {
+        if self.failed_modules.contains_key(module) {
+            return false;
+        }
+        match self.module_revisions.get(module) {
+            Some(r) => r == revision,
+            None => self.applied_revision.as_ref() == Some(revision),
+        }
     }
 
     /// Appends a run, keeping the most recent `keep`.

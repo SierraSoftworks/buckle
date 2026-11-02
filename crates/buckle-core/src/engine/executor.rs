@@ -675,6 +675,9 @@ impl<'a> Executor<'a> {
             });
             if i.plan_error {
                 plan_errors.push(i.module.clone());
+                self.with_state(|s| {
+                    s.failed_modules.insert(i.module.clone(), revision.clone());
+                });
             }
         }
 
@@ -740,6 +743,14 @@ impl<'a> Executor<'a> {
             done.insert(name.clone());
             total_changes += run.outcome.changes;
             health.extend(run.health);
+            self.with_state(|s| {
+                if run.failed {
+                    s.failed_modules.insert(name.clone(), revision.clone());
+                } else {
+                    s.failed_modules.remove(&name);
+                    s.module_revisions.insert(name.clone(), revision.clone());
+                }
+            });
             if run.failed {
                 failed.push(name.clone());
                 halted = true;
@@ -766,6 +777,11 @@ impl<'a> Executor<'a> {
                     health.extend(run.health);
                     if run.outcome.status == ModuleStatus::RolledBack {
                         rolled_back.push(name.clone());
+                        if let Some(stable) = &self.inputs.stable_revision {
+                            self.with_state(|s| {
+                                s.module_revisions.insert(name.clone(), stable.id.clone());
+                            });
+                        }
                     } else {
                         errors.push(format!(
                             "rolling back '{name}' failed: {}",
@@ -898,6 +914,11 @@ impl<'a> Executor<'a> {
             s.facts = facts.clone();
             if succeeded {
                 s.applied_revision = Some(revision.clone());
+                // Forget modules that are neither selected nor own anything.
+                let owners: BTreeSet<String> =
+                    s.resources.values().map(|r| r.key.module.clone()).collect();
+                s.module_revisions
+                    .retain(|m, _| order.contains(m) || owners.contains(m));
             }
             s.push_run(
                 RunRecord {

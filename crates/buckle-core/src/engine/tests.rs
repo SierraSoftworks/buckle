@@ -2406,6 +2406,108 @@ async fn without_a_stable_revision_a_failing_module_stays_failed() {
 }
 
 // ---------------------------------------------------------------------------
+// Drift after a failed run
+// ---------------------------------------------------------------------------
+
+fn drift_modules(rev: &str) -> Vec<LoadedModule> {
+    let content = if rev == "r1" { "one" } else { "two" };
+    let fail = if rev == "r1" { 0 } else { 99 };
+    let mut modules = vec![
+        module(&format!(
+            "name: a\ntasks: [ {{ test.file: {{ path: /dr/a, content: {content}, run: dr1 }} }} ]\n"
+        )),
+        module(&format!(
+            "name: b\ntasks: [ {{ test.file: {{ path: /dr/b, content: {content}, run: dr1, fail_times: {fail} }} }} ]\n"
+        )),
+        module(
+            "name: c\nneeds: [b]\ntasks: [ { test.file: { path: /dr/c, content: c, run: dr1 } } ]\n",
+        ),
+    ];
+    if rev == "r2" {
+        modules.push(module(
+            "name: aa\ntasks: [ { test.file: { path: /dr/aa, content: new, run: dr1 } } ]\n",
+        ));
+    }
+    modules
+}
+
+#[tokio::test]
+async fn drift_after_a_failed_run_neither_undoes_succeeded_modules_nor_retries_the_failed_one() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision("r1", FLEET, drift_modules("r1"));
+    let (outcome, _) =
+        apply(&inputs_with_store(r1.clone(), &sys, store.clone()).with_parallelism(1)).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+
+    let r2 = revision("r2", FLEET, drift_modules("r2"));
+    let (outcome, _) = apply(&inputs_with_store(r2, &sys, store.clone()).with_parallelism(1)).await;
+    assert!(!outcome.succeeded);
+    assert_eq!(status_of(&outcome, "a"), ModuleStatus::Applied);
+    assert_eq!(status_of(&outcome, "aa"), ModuleStatus::Applied);
+    assert_eq!(status_of(&outcome, "b"), ModuleStatus::Failed);
+    let state = store.load().unwrap();
+    assert_eq!(state.applied_revision, Some(RevisionId::new("r1")));
+    assert_eq!(state.module_revisions["a"], RevisionId::new("r2"));
+    assert_eq!(state.module_revisions["b"], RevisionId::new("r1"));
+    assert_eq!(state.failed_modules["b"], RevisionId::new("r2"));
+
+    // Without drift mode, re-planning the applied revision would undo `a`
+    // and remove what the newer revision added: the bug drift mode avoids.
+    let naive = plan(&inputs_with_store(r1.clone(), &sys, store.clone())).await;
+    assert!(!naive.removals.is_empty());
+
+    // The agent drifts against its applied revision.
+    let inputs = inputs_with_store(r1, &sys, store.clone())
+        .with_drift(true)
+        .with_removals(false)
+        .with_parallelism(1);
+    let (plan, _) = Engine::drift(&inputs).await.unwrap();
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    let held: Vec<&str> = plan.held.iter().map(|h| h.module.as_str()).collect();
+    assert_eq!(held, vec!["a", "b"]);
+    assert!(plan.held[1].reason.contains("failed"), "{:#?}", plan.held);
+    assert_eq!(module_names(&plan), vec!["c"]);
+    assert!(plan.is_empty(), "{plan:#?}");
+    let before = calls("dr1")
+        .iter()
+        .filter(|c| c.starts_with("apply:start"))
+        .count();
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(
+        calls("dr1")
+            .iter()
+            .filter(|c| c.starts_with("apply:start"))
+            .count(),
+        before,
+        "the failed module is not re-applied and nothing else changes"
+    );
+    assert_eq!(sys.file_string("/dr/a").as_deref(), Some("two"));
+    assert!(sys.exists("/dr/aa"));
+    assert_eq!(store.load().unwrap().resources.len(), 4);
+}
+
+#[tokio::test]
+async fn drift_corrects_modules_applied_at_its_revision() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision("r1", FLEET, drift_modules("r1"));
+    let (outcome, _) = apply(&inputs_with_store(r1.clone(), &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+    sys.write_atomic(Path::new("/dr/a"), b"hand edit", &FilePerms::mode(0o644))
+        .await
+        .unwrap();
+    let inputs = inputs_with_store(r1, &sys, store).with_drift(true);
+    let (plan, _) = Engine::drift(&inputs).await.unwrap();
+    assert!(plan.held.is_empty());
+    assert_eq!(plan.changes(), 1);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert_eq!(sys.file_string("/dr/a").as_deref(), Some("one"));
+}
+
+// ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 

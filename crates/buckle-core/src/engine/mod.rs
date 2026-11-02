@@ -110,6 +110,13 @@ pub struct Inputs {
     /// their records alone: the agent's unattended drift correction passes
     /// false so that only an operator-approved apply removes anything.
     pub removals: bool,
+    /// Drift mode: plan only the modules this host has applied at
+    /// `revision` (per [`crate::state::State::module_at`]) and never treat a
+    /// resource recorded at another revision as an orphan. Modules that moved
+    /// on to a newer revision, failed, or never ran are reported in
+    /// [`Plan::held`] and left alone. Set it on the inputs of both the plan
+    /// and the apply (the apply re-plans and compares digests).
+    pub drift: bool,
 }
 
 impl Inputs {
@@ -139,7 +146,14 @@ impl Inputs {
             agent_vars: Vars::new(),
             facts_frozen: false,
             removals: true,
+            drift: false,
         }
+    }
+
+    /// Drift mode; see [`Inputs::drift`].
+    pub fn with_drift(mut self, drift: bool) -> Self {
+        self.drift = drift;
+        self
     }
 
     /// Whether apply runs the plan's removals (default true). Plans list
@@ -305,6 +319,20 @@ impl Engine {
         let span = tracing::info_span!("engine.plan", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id);
         let (rich, facts) =
             tracing::Instrument::instrument(planner::plan(inputs, &inputs.revision), span).await?;
+        Ok((rich.plan, facts))
+    }
+
+    /// [`Engine::plan`] in drift mode (see [`Inputs::drift`]) whatever
+    /// `inputs.drift` says. To correct the drift, apply the plan with inputs
+    /// that have [`Inputs::with_drift`]`(true)` (and, unattended,
+    /// [`Inputs::with_removals`]`(false)`).
+    pub async fn drift(inputs: &Inputs) -> crate::Result<(Plan, Facts)> {
+        let span = tracing::info_span!("engine.drift", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id);
+        let (rich, facts) = tracing::Instrument::instrument(
+            planner::plan_mode(inputs, &inputs.revision, true),
+            span,
+        )
+        .await?;
         Ok((rich.plan, facts))
     }
 

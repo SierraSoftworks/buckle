@@ -213,6 +213,15 @@ pub struct Removal {
     pub introduced_in: Option<RevisionId>,
 }
 
+/// A module a drift plan leaves alone because the host does not have it
+/// applied at the plan's revision: it moved on to a newer revision, its last
+/// run failed, or it never ran. Its resources are never orphans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    pub module: String,
+    pub reason: String,
+}
+
 /// How an orphaned record relates to a desired resource that took it over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,6 +294,9 @@ pub struct Plan {
     /// Records taken over by a desired resource instead of being removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rehomed: Vec<Rehome>,
+    /// Drift plans only: modules not applied at this revision, left alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<Held>,
 }
 
 impl Plan {
@@ -308,6 +320,7 @@ impl Plan {
             warnings: Vec::new(),
             indeterminate: Vec::new(),
             rehomed: Vec::new(),
+            held: Vec::new(),
         };
         plan.digest = plan.compute_digest();
         plan
@@ -317,6 +330,13 @@ impl Plan {
     /// what an apply does).
     pub fn with_indeterminate(mut self, indeterminate: Vec<Indeterminate>) -> Self {
         self.indeterminate = indeterminate;
+        self.digest = self.compute_digest();
+        self
+    }
+
+    /// Sets the held modules and recomputes the digest.
+    pub fn with_held(mut self, held: Vec<Held>) -> Self {
+        self.held = held;
         self.digest = self.compute_digest();
         self
     }
@@ -338,6 +358,8 @@ impl Plan {
             indeterminate: &'a [Indeterminate],
             #[serde(skip_serializing_if = "<[Rehome]>::is_empty")]
             rehomed: &'a [Rehome],
+            #[serde(skip_serializing_if = "<[Held]>::is_empty")]
+            held: &'a [Held],
         }
         Digest::of_json(&Content {
             modules: &self.modules,
@@ -345,6 +367,7 @@ impl Plan {
             deferred: &self.deferred,
             indeterminate: &self.indeterminate,
             rehomed: &self.rehomed,
+            held: &self.held,
         })
     }
 
