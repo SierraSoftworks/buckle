@@ -510,11 +510,7 @@ fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
         started_at: r.started_at,
         // A run in progress has no duration yet: the UI reads
         // finished_at <= started_at as such.
-        finished_at: if running {
-            r.started_at
-        } else {
-            r.finished_at
-        },
+        finished_at: if running { r.started_at } else { r.finished_at },
         outcome: r.outcome,
         changes: r.changes,
         removals: r.removals,

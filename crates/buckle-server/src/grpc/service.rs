@@ -867,8 +867,16 @@ fn open_run(
     digest: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> buckle_core::Result<RunRecord> {
-    if let Some(open) = db.runs().open_for_host(host)? {
+    if let Some(mut open) = db.runs().open_for_host(host)? {
         if open.plan_digest == digest {
+            // A run of a rollout always names it; look again in case the
+            // rollout's row was not there at the first event.
+            if open.rollout.is_none()
+                && let Some(rollout) = db.rollouts().applying_with_plan(host, digest)?
+            {
+                db.runs().set_rollout(&open.id, &rollout)?;
+                open.rollout = Some(rollout);
+            }
             return Ok(open);
         }
         db.runs().abandon(&open.id, now)?;
@@ -900,7 +908,15 @@ fn finish_run(db: &crate::store::Db<'_>, mut result: RunRecord) -> buckle_core::
         Some(open) => {
             result.id = open.id;
             result.started_at = open.started_at;
-            result.rollout = open.rollout;
+            result.rollout = match open.rollout {
+                Some(rollout) => Some(rollout),
+                None => db
+                    .rollouts()
+                    .applying_with_plan(&result.host, &result.plan_digest)?,
+            };
+            if let Some(rollout) = &result.rollout {
+                db.runs().set_rollout(&result.id, rollout)?;
+            }
             db.runs().finish(&result)?;
         }
         None => {

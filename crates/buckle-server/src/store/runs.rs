@@ -191,6 +191,17 @@ impl<'c> Runs<'c> {
         Ok(())
     }
 
+    /// Attaches a run to the rollout it belongs to.
+    pub fn set_rollout(&self, run_id: &str, rollout: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET rollout = ?2 WHERE run_id = ?1",
+                params![run_id, rollout],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
     /// The host's run that has not finished, if any (the newest one).
     pub fn open_for_host(&self, host: &str) -> Result<Option<RunRecord>> {
         Ok(self
