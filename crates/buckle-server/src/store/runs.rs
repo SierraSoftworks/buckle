@@ -359,7 +359,9 @@ impl<'c> Runs<'c> {
     }
 
     /// Stores the latest event for one key (a step, module, handler,
-    /// removal or check) of a run.
+    /// removal or check) of a run. A step stored as `failed` or `blocked`
+    /// keeps that event: a module rollback runs the same step again, and the
+    /// live report must still show what failed.
     #[allow(clippy::too_many_arguments)]
     pub fn record_event(
         &self,
@@ -373,7 +375,7 @@ impl<'c> Runs<'c> {
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO run_events (run_id, key, seq, module, step_id, state, event, at) VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1), ?3, ?4, ?5, ?6, ?7) ON CONFLICT(run_id, key) DO UPDATE SET seq = excluded.seq, module = excluded.module, step_id = excluded.step_id, state = excluded.state, event = excluded.event, at = excluded.at",
+                "INSERT INTO run_events (run_id, key, seq, module, step_id, state, event, at) VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1), ?3, ?4, ?5, ?6, ?7) ON CONFLICT(run_id, key) DO UPDATE SET seq = excluded.seq, module = excluded.module, step_id = excluded.step_id, state = excluded.state, event = excluded.event, at = excluded.at WHERE run_events.state IS NULL OR run_events.state NOT IN ('failed', 'blocked')",
                 params![run_id, key, module, step_id, state, event, ts(at)],
             )
             .map_err(db_error)?;
@@ -537,6 +539,30 @@ mod tests {
         assert_eq!(
             events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
             vec!["a", "c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_blocked_step_is_never_replaced_by_a_later_event_of_it() {
+        let store = Store::in_memory().await.unwrap();
+        let t = Utc::now();
+        let events = store
+            .call(move |db| {
+                let runs = db.runs();
+                for (key, first) in [("step:m/x", "failed"), ("step:m/y", "blocked")] {
+                    runs.record_event("r", key, Some("m"), None, Some("running"), "started", t)?;
+                    runs.record_event("r", key, Some("m"), None, Some(first), first, t)?;
+                    // The rollback runs it again.
+                    runs.record_event("r", key, Some("m"), None, Some("running"), "again", t)?;
+                    runs.record_event("r", key, Some("m"), None, Some("changed"), "again", t)?;
+                }
+                runs.events("r")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
+            vec!["failed", "blocked"]
         );
     }
 }

@@ -615,9 +615,26 @@ impl FleetService {
                     Some(ev) => crate::views::event_key(ev),
                     None => format!("raw:{}/{}", e.module, e.step_id),
                 };
-                let module = (!e.module.is_empty()).then(|| e.module.clone());
-                let step_id = (!e.step_id.is_empty()).then(|| e.step_id.clone());
-                let state = (!e.step_state.is_empty()).then(|| e.step_state.clone());
+                // From the wire fields, else the event itself (older agents).
+                let step = parsed.as_ref().and_then(|ev| ev.step());
+                let module = (!e.module.is_empty())
+                    .then(|| e.module.clone())
+                    .or_else(|| step.map(|(m, _)| m.to_owned()));
+                let step_id = (!e.step_id.is_empty())
+                    .then(|| e.step_id.clone())
+                    .or_else(|| {
+                        step.map(|(_, id)| id.to_owned())
+                            .filter(|id| !id.is_empty())
+                    });
+                let state = (!e.step_state.is_empty())
+                    .then(|| e.step_state.clone())
+                    .or_else(|| {
+                        parsed
+                            .as_ref()
+                            .and_then(|ev| ev.step_state())
+                            .and_then(|st| serde_json::to_value(st).ok())
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                    });
                 tracing::debug!(buckle.host = %host, key = %key, event = %event, "apply event");
                 let (digest, revision) = (e.plan_digest.clone(), e.revision.clone());
                 let run = self
