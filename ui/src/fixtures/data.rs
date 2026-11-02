@@ -401,7 +401,21 @@ fn phase(
         approved_by: None,
         approved_at: None,
         bake_until: None,
+        health_checks: gate_checks(name),
     }
+}
+
+/// The demo's health gate per stage: the required checks of the modules
+/// the stage's hosts apply.
+fn gate_checks(phase: &str) -> Vec<String> {
+    let mut checks = vec!["tailscale/up", "docker/daemon", "nomad/api", "nomad/unit"];
+    match phase {
+        "home" => checks.push("backup/marker"),
+        "everything-else" => checks = vec!["tailscale/up", "docker/daemon"],
+        "stragglers" => checks = vec![],
+        _ => {}
+    }
+    checks.into_iter().map(Into::into).collect()
 }
 
 /// The active rollout: canary done, home in flight with a host in every

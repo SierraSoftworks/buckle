@@ -48,6 +48,18 @@ describe("the rollout pipeline", () => {
     await close();
   });
 
+  test("each stage shows its health gate, red where a host fails a check", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const home = page.locator('[data-stage="home"] .gate-checks');
+    await home.getByText("backup/marker").waitFor();
+    const api = home.locator(".pill", { hasText: "nomad/api" });
+    assert.match(await api.getAttribute("class"), /tone-danger/, "pi-5 failed nomad/api");
+    const gate = page.getByTestId("health-gate");
+    await gate.getByText("nomad/unit").waitFor();
+    assert.equal(await gate.locator(".pill").count(), 4, "the cloud stage's four required checks");
+    await close();
+  });
+
   test("the gate in front of an unapproved stage is closed", async () => {
     const { page, close } = await open("/rollouts/42");
     const gate = page.locator('.pipeline__step:has(.stage[data-stage="cloud"]) .gate');

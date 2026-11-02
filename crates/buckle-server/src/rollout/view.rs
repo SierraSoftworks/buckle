@@ -159,6 +159,7 @@ pub fn detail(
                 approved_by: approval.map(|a| a.approver.clone()),
                 approved_at: approval.map(|a| a.at),
                 bake_until: p.bake_until,
+                health_checks: Vec::new(),
             }
         })
         .collect();

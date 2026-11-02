@@ -391,3 +391,24 @@
     }
   }
 }
+
+// A phase's health gate: one chip per required check.
+.gate-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0.2rem 0 0;
+  padding: 0;
+  list-style: none;
+
+  .pill {
+    font-size: 0.72rem;
+  }
+}
+
+.approval__gate {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0.75rem 0;
+}

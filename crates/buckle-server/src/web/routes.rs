@@ -842,7 +842,87 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
             .filter(|h| h.plan_digest.as_deref() == Some(g.digest.as_str()))
             .find_map(|h| crate::views::stored_plan_view(h.plan.as_ref()));
     }
+    fill_health_checks(state, &r.revision, &hosts, &mut detail).await?;
     Ok(detail)
+}
+
+/// Fills each phase's health gate: the required checks of the modules its
+/// hosts apply, each host judged against the revision it is moving to (the
+/// rollout's, or the stable one in the stragglers stage).
+async fn fill_health_checks(
+    state: &AppState,
+    rollout_revision: &str,
+    hosts: &[crate::store::RolloutHostRecord],
+    detail: &mut buckle_api::RolloutDetail,
+) -> Result<(), ApiError> {
+    let revision_of = |h: &crate::store::RolloutHostRecord| {
+        if h.runtime.revision.is_empty() {
+            rollout_revision.to_owned()
+        } else {
+            h.runtime.revision.clone()
+        }
+    };
+    let mut revisions = HashMap::new();
+    for id in hosts.iter().map(revision_of) {
+        if !revisions.contains_key(&id)
+            && let Ok(rev) = state.revisions.load(&id).await
+        {
+            revisions.insert(id, rev);
+        }
+    }
+    let plans: HashMap<&str, Option<buckle_api::PlanView>> = hosts
+        .iter()
+        .map(|h| {
+            (
+                h.host.as_str(),
+                crate::views::stored_plan_view(h.plan.as_ref()),
+            )
+        })
+        .collect();
+    // Hosts without a plan are judged by their labels and facts.
+    let unplanned: Vec<String> = plans
+        .iter()
+        .filter(|(_, p)| p.is_none())
+        .map(|(h, _)| (*h).to_owned())
+        .collect();
+    let contexts = state
+        .store
+        .call(move |db| {
+            let mut out = HashMap::new();
+            for id in unplanned {
+                if let Some(h) = db.hosts().get(&id)? {
+                    let facts = db.hosts().latest_facts(&id)?.map(|(f, _)| f);
+                    out.insert(id, (h, facts.unwrap_or(serde_json::Value::Null)));
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+    for phase in &mut detail.phases {
+        let mut checks: Vec<String> = Vec::new();
+        for entry in &phase.hosts {
+            let Some(record) = hosts.iter().find(|h| h.host == entry.host) else {
+                continue;
+            };
+            let Some(revision) = revisions.get(&revision_of(record)) else {
+                continue;
+            };
+            let selected = crate::views::selected_modules(
+                revision,
+                plans.get(record.host.as_str()).and_then(Option::as_ref),
+                contexts.get(&record.host).map(|(h, f)| (h, f)),
+            );
+            for check in
+                crate::views::required_checks(revision, selected.iter().map(String::as_str))
+            {
+                if !checks.contains(&check) {
+                    checks.push(check);
+                }
+            }
+        }
+        phase.health_checks = checks;
+    }
+    Ok(())
 }
 
 async fn rollouts(state: Data, _: Authenticated, q: web::Query<PageQuery>) -> ApiResult {

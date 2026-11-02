@@ -418,6 +418,13 @@ fn approval_pane(
                     <PlanGroupView group={plans[*i].clone()} focus={focus_names.clone()} open={n == 0 || plans[*i].destructive} />
                 }) }
             </div>
+            if !phase.health_checks.is_empty() {
+                <div class="approval__gate" data-testid="health-gate">
+                    <h4 class="subhead">{ "Health gate" }</h4>
+                    { crate::components::pipeline::health_gate(phase) }
+                    <p class="muted small">{ "Checked on each host before it applies, through its bake, and on every updated host again before the next phase starts." }</p>
+                </div>
+            }
             if !scope.without_plan.is_empty() {
                 <p class="note note--warn">
                     { format!("{} no plan yet ({}): not covered by this approval. A host that misses its wave moves to the stragglers stage.",

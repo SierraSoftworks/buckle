@@ -324,6 +324,7 @@ mod tests {
             approved_by: None,
             approved_at: None,
             bake_until: None,
+            health_checks: vec![],
         }
     }
 

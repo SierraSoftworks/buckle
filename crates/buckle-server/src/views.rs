@@ -201,6 +201,57 @@ pub fn stored_plan_view(plan: Option<&serde_json::Value>) -> Option<PlanView> {
     }
 }
 
+/// The modules a host applies of `revision`: those of its plan (deferred
+/// ones included) when it has one, else those whose `when` matches its
+/// labels and facts (an approximation of the engine's selection, which can
+/// also hold a module back as indeterminate).
+pub fn selected_modules(
+    revision: &Revision,
+    plan: Option<&PlanView>,
+    host: Option<(&HostRecord, &serde_json::Value)>,
+) -> Vec<String> {
+    if let Some(plan) = plan {
+        return plan
+            .modules
+            .iter()
+            .map(|m| m.module.clone())
+            .chain(plan.deferred.iter().map(|d| d.module.clone()))
+            .collect();
+    }
+    let ctx = host.map(|(h, facts)| crate::fleet::record_context(h, facts, &revision.fleet));
+    revision
+        .modules
+        .iter()
+        .filter(|m| match (&m.config.when, &ctx) {
+            (None, _) => true,
+            (Some(when), Some(ctx)) => ctx.matches(when),
+            (Some(_), None) => false,
+        })
+        .map(|m| m.config.name.clone())
+        .collect()
+}
+
+/// The required checks (`module/check`) of the `selected` modules, in the
+/// revision's module and declaration order.
+pub fn required_checks<'a>(
+    revision: &Revision,
+    selected: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let selected: std::collections::BTreeSet<&str> = selected.into_iter().collect();
+    revision
+        .modules
+        .iter()
+        .filter(|m| selected.contains(m.config.name.as_str()))
+        .flat_map(|m| {
+            m.config
+                .health
+                .iter()
+                .filter(|h| h.required)
+                .map(|h| format!("{}/{}", m.config.name, h.display_name()))
+        })
+        .collect()
+}
+
 /// Loads and summarises one host.
 pub async fn load_summary(
     store: &Store,

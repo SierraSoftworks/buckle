@@ -91,6 +91,11 @@ pub struct RolloutPhase {
     pub approved_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bake_until: Option<DateTime<Utc>>,
+    /// The health gate: the required checks (`module/check`) of the modules
+    /// selected for this phase's hosts, which baseline, bake and the
+    /// pre-phase re-check hold the phase to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

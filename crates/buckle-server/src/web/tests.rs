@@ -1538,3 +1538,137 @@ async fn plans_are_served_typed_and_deduplicated_by_digest() {
             .any(|s| s.destructive && s.key == "/etc/nomad.d/old.hcl")
     );
 }
+
+// ------------------------------------------------------------ health gates
+
+#[actix_web::test]
+async fn each_phase_names_the_required_checks_of_the_modules_its_hosts_apply() {
+    use crate::rollout::model::{HostPhase, HostRuntime, PhaseRuntime};
+    use buckle_core::model::{ApprovalPolicy, Parallelism};
+    let e = env(WebConfig::default()).await;
+    let dir = e.state.revisions.dir("r1");
+    for (name, yaml) in [
+        (
+            "common",
+            "name: common\nhealth:\n  - name: unit\n    systemd: { unit: common }\n",
+        ),
+        (
+            "web",
+            "name: web\nwhen: 'host.labels.tier == \"web\"'\nhealth:\n  - name: api\n    http: { url: 'http://127.0.0.1/health' }\n  - name: metrics\n    required: false\n    tcp: { port: 9100 }\n",
+        ),
+        (
+            "canary",
+            "name: canary\nwhen: 'host.labels.tier == \"canary\"'\nhealth:\n  - name: probe\n    http: { url: 'http://127.0.0.1/probe' }\n",
+        ),
+    ] {
+        std::fs::create_dir_all(dir.join("modules").join(name)).unwrap();
+        std::fs::write(dir.join("modules").join(name).join("module.yaml"), yaml).unwrap();
+    }
+    std::fs::write(dir.join("buckle.yaml"), "version: 2\n").unwrap();
+    for (id, tier) in [("pi-1", "canary"), ("pi-2", "web")] {
+        add_host(&e.store, id, HostStatus::Active).await;
+        let (id, tier) = (id.to_owned(), tier.to_owned());
+        e.store
+            .call(move |db| {
+                db.hosts()
+                    .set_labels(&id, &[("tier".to_string(), tier)].into_iter().collect())
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+    }
+    // pi-1 has planned: its plan applies `common` only, whatever its labels say.
+    let plan = buckle_core::plan::Plan::new(
+        buckle_core::plan::RevisionId::new("r1"),
+        "pi-1",
+        vec![buckle_core::plan::ModulePlan {
+            module: "common".into(),
+            needs: vec![],
+            steps: vec![],
+            handlers: vec![],
+            provides_facts: vec![],
+        }],
+        vec![],
+        vec![],
+    );
+    let phase = |name: &str| PhaseRuntime {
+        name: name.into(),
+        state: buckle_api::PhaseState::Done,
+        parallel: Parallelism::Count(1),
+        approval: ApprovalPolicy::Auto,
+        bake_seconds: 0,
+        max_failures: Parallelism::Count(0),
+        virtual_stage: false,
+        accepted_failures: 0,
+        started: 0,
+        gate: None,
+        bake_until: None,
+    };
+    let mut rollout = finished_rollout("7", None);
+    rollout.runtime.phases = vec![phase("canary"), phase("rest")];
+    let host = |name: &str, phase: &str, index: usize, plan: Option<serde_json::Value>| {
+        crate::store::RolloutHostRecord {
+            rollout: "7".into(),
+            host: name.into(),
+            phase: phase.into(),
+            wave: Some(1),
+            state: HostPhase::Healthy,
+            plan_digest: Some(format!("d-{name}")),
+            plan,
+            result: None,
+            health: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            runtime: HostRuntime {
+                revision: "r1".into(),
+                phase_index: Some(index),
+                ..Default::default()
+            },
+        }
+    };
+    let rows = [
+        host(
+            "pi-1",
+            "canary",
+            0,
+            Some(serde_json::to_value(&plan).unwrap()),
+        ),
+        host("pi-2", "rest", 1, None),
+    ];
+    e.store
+        .call(move |db| {
+            db.rollouts().save(&rollout)?;
+            for r in &rows {
+                db.rollouts().save_host(r)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let detail: buckle_api::RolloutDetail = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/rollouts/7")
+                .to_request(),
+        )
+        .await,
+    )
+    .await;
+    let checks = |name: &str| {
+        detail
+            .phases
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap()
+            .health_checks
+            .clone()
+    };
+    assert_eq!(checks("canary"), vec!["common/unit"], "from pi-1's plan");
+    assert_eq!(
+        checks("rest"),
+        vec!["common/unit", "web/api"],
+        "from pi-2's labels; informational checks do not gate"
+    );
+}
