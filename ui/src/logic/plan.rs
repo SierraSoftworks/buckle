@@ -418,6 +418,7 @@ mod tests {
             updated_at: Utc::now(),
             bake_until: None,
             needs_approval: true,
+            needs_attention: false,
         };
         let hosts = [
             host("oci-2", Some("5b1c9e02")),

@@ -268,6 +268,7 @@ mod tests {
             updated_at: Utc::now() - Duration::seconds(age_secs),
             bake_until: None,
             needs_approval: false,
+            needs_attention: false,
         }
     }
 

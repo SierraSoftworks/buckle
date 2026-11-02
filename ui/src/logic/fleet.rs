@@ -378,6 +378,7 @@ mod tests {
             updated_at: now,
             bake_until: None,
             needs_approval: stale,
+            needs_attention: false,
         };
         let rollout = RolloutDetail {
             summary: RolloutSummary {
