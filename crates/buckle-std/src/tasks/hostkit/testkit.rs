@@ -202,12 +202,20 @@ pub fn with_account_tools(sys: FakeSystem) -> FakeSystem {
         let host = host.clone();
         move |cmd: &buckle_core::system::Command| {
             let name = cmd.args.last().cloned().unwrap_or_default();
-            let gid = flag_value(cmd, "-g").and_then(|g| g.parse().ok()).unwrap_or(1000);
+            let gid = flag_value(cmd, "-g")
+                .and_then(|g| g.parse().ok())
+                .unwrap_or(1000);
             let _ = host.clone().with_user(UserInfo {
-                uid: flag_value(cmd, "-u").and_then(|u| u.parse().ok()).unwrap_or(1000),
+                uid: flag_value(cmd, "-u")
+                    .and_then(|u| u.parse().ok())
+                    .unwrap_or(1000),
                 gid,
-                home: flag_value(cmd, "-d").map(Into::into).unwrap_or_else(|| format!("/home/{name}").into()),
-                shell: flag_value(cmd, "-s").unwrap_or_else(|| "/bin/sh".into()).into(),
+                home: flag_value(cmd, "-d")
+                    .map(Into::into)
+                    .unwrap_or_else(|| format!("/home/{name}").into()),
+                shell: flag_value(cmd, "-s")
+                    .unwrap_or_else(|| "/bin/sh".into())
+                    .into(),
                 gecos: flag_value(cmd, "-c").unwrap_or_default(),
                 name,
             });
@@ -235,7 +243,11 @@ pub fn with_account_tools(sys: FakeSystem) -> FakeSystem {
             }
             if let Some(groups) = flag_value(cmd, "-G") {
                 for g in groups.split(',') {
-                    let mut group = futures_lite_group(&host, g).unwrap_or(GroupInfo { name: g.into(), gid: 2000, members: vec![] });
+                    let mut group = futures_lite_group(&host, g).unwrap_or(GroupInfo {
+                        name: g.into(),
+                        gid: 2000,
+                        members: vec![],
+                    });
                     if !group.members.contains(&name) {
                         group.members.push(name.clone());
                     }
@@ -250,7 +262,9 @@ pub fn with_account_tools(sys: FakeSystem) -> FakeSystem {
         move |cmd: &buckle_core::system::Command| {
             let name = cmd.args.last().cloned().unwrap_or_default();
             let _ = host.clone().with_group(GroupInfo {
-                gid: flag_value(cmd, "-g").and_then(|g| g.parse().ok()).unwrap_or(2000),
+                gid: flag_value(cmd, "-g")
+                    .and_then(|g| g.parse().ok())
+                    .unwrap_or(2000),
                 members: vec![],
                 name,
             });
@@ -261,7 +275,10 @@ pub fn with_account_tools(sys: FakeSystem) -> FakeSystem {
         let host = host.clone();
         move |cmd: &buckle_core::system::Command| {
             let name = cmd.args.last().cloned().unwrap_or_default();
-            if let (Some(mut group), Some(gid)) = (futures_lite_group(&host, &name), flag_value(cmd, "-g").and_then(|g| g.parse().ok())) {
+            if let (Some(mut group), Some(gid)) = (
+                futures_lite_group(&host, &name),
+                flag_value(cmd, "-g").and_then(|g| g.parse().ok()),
+            ) {
                 group.gid = gid;
                 let _ = host.clone().with_group(group);
             }

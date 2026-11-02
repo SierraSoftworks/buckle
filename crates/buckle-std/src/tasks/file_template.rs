@@ -163,14 +163,9 @@ impl FileTemplate {
             owner: None,
             group: None,
         };
-        match rendered {
-            Rendered::Plain(text) => {
-                cx.system
-                    .write_atomic(&tmp, text.as_bytes(), &perms)
-                    .await?
-            }
-            Rendered::Sensitive(text) => FileSink.write(&*cx.system, &tmp, text, &perms).await?,
-        }
+        FileSink
+            .write_rendered(&*cx.system, &tmp, rendered, &perms)
+            .await?;
         let substituted: Vec<String> = argv
             .iter()
             .map(|a| a.replace("{path}", &tmp.to_string_lossy()))
@@ -265,16 +260,9 @@ impl Task for FileTemplate {
                 hostkit::backup_file(cx, dest, meta, current).await?;
             }
             let perms = effective_perms(&spec.perms, existing_meta);
-            match &inspection.rendered {
-                Rendered::Plain(text) => {
-                    cx.system
-                        .write_atomic(dest, text.as_bytes(), &perms)
-                        .await?
-                }
-                Rendered::Sensitive(text) => {
-                    FileSink.write(&*cx.system, dest, text, &perms).await?
-                }
-            }
+            FileSink
+                .write_rendered(&*cx.system, dest, &inspection.rendered, &perms)
+                .await?;
         } else {
             cx.system.set_perms(dest, &spec.perms).await?;
         }

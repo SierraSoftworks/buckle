@@ -3,12 +3,10 @@
 use super::hostkit::{self, StringOrArgv};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
-use buckle_core::secrets::Rendered;
-use buckle_core::secrets::sinks::ProcessEnvSink;
+use buckle_core::secrets::{Rendered, SecretField};
 use buckle_core::state::ResourceRecord;
 use buckle_core::system::{Command, Output};
 use buckle_core::task::{Applied, Artefact, Cx, Task};
-use buckle_core::template::Templater;
 use buckle_core::{Platforms, Result, error};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -73,9 +71,10 @@ pub struct Spec {
     #[serde(default)]
     #[schemars(with = "Option<String>")]
     pub changed_when: Option<ChangedWhen>,
-    /// Environment variables; values may be templates and may reference secrets.
+    /// Environment variables; values may be templates and may reference secrets
+    /// (they are rendered for real and handed over through the environment sink).
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, SecretField>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
     /// How long the command may run, e.g. `30s` or `5m`.
@@ -189,19 +188,8 @@ impl CommandRun {
         let mut command = argv.to_command(cx.platform())?;
         command.cwd = spec.cwd.clone();
         command.timeout = spec.timeout;
-        for (name, value) in &spec.env {
-            if !Templater::needs_render(value) {
-                command.env.insert(name.clone(), value.clone());
-                continue;
-            }
-            match cx.templater.render_sensitive(value, &cx.host)? {
-                Rendered::Plain(text) => {
-                    command.env.insert(name.clone(), text);
-                }
-                Rendered::Sensitive(secret) => {
-                    ProcessEnvSink.inject_sensitive(&mut command, name.clone(), &secret);
-                }
-            }
+        for (name, field) in &spec.env {
+            field.inject_env(&mut command, name.clone(), &cx.templater, &cx.host)?;
         }
         Ok(command)
     }
@@ -343,8 +331,11 @@ impl Task for CommandRun {
                 env: spec
                     .env
                     .iter()
-                    .filter(|(_, v)| !Templater::needs_render(v))
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .filter(|(_, field)| !field.references_secrets())
+                    .filter_map(|(k, field)| match field.resolve(&cx.templater, &cx.host) {
+                        Ok(Rendered::Plain(text)) => Some((k.clone(), text)),
+                        _ => None,
+                    })
                     .collect(),
             };
             let json = serde_json::to_string(&cleanup).map_err(|e| {
