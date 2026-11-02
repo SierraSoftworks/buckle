@@ -278,6 +278,56 @@ file_kind!(
     always = true
 );
 
+/// A `command.run` stand-in keyed (like the real one) by its command line,
+/// with an optional `remove:` command.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+struct CmdSpec {
+    run: Vec<String>,
+    #[serde(default)]
+    remove: Option<Vec<String>>,
+    #[serde(default)]
+    log: String,
+}
+
+struct TestCommand;
+
+#[async_trait]
+impl Task for TestCommand {
+    type Spec = CmdSpec;
+    const KIND: &'static str = "command.run";
+
+    fn key(spec: &CmdSpec) -> String {
+        spec.run.join(" ")
+    }
+
+    async fn plan(&self, _cx: &Cx, spec: &CmdSpec) -> crate::Result<Planned> {
+        Ok(Planned::change(Diff::Opaque {
+            summary: format!("run `{}`", spec.run.join(" ")),
+        }))
+    }
+
+    async fn apply(&self, _cx: &Cx, spec: &CmdSpec, _planned: &Planned) -> crate::Result<Applied> {
+        record(&spec.log, format!("run {}", spec.run.join(" ")));
+        Ok(
+            Applied::changed(format!("ran {}", spec.run.join(" "))).with_artefact(
+                Artefact::Other {
+                    description: format!(
+                        "remove={}",
+                        spec.remove.clone().unwrap_or_default().join(" ")
+                    ),
+                },
+            ),
+        )
+    }
+
+    async fn remove(&self, _cx: &Cx, record: &ResourceRecord) -> crate::Result<Applied> {
+        self::record("removals", format!("undo {}", record.key));
+        Ok(Applied::changed("undone"))
+    }
+}
+
+crate::register_task!(TestCommand);
+
 /// A systemd-shaped handler kind: `name` is the unit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 struct UnitSpec {
@@ -1939,6 +1989,133 @@ async fn removal_policy_is_task_then_module_then_kind(
     let (outcome, _) = apply_plan(&inputs, &plan).await;
     assert!(outcome.succeeded);
     assert_eq!(sys.exists("/pol/x"), expected == RemovalPolicy::Leave);
+}
+
+// ---------------------------------------------------------------------------
+// Moved and re-keyed tasks are taken over, not removed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_task_moved_between_modules_keeps_its_resource_and_record() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![
+            module("name: a\ntasks: [ { test.file: { path: /mv/x, content: same, run: mv1 } } ]\n"),
+            module("name: b\n"),
+        ],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+
+    let r2 = revision(
+        "r2",
+        FLEET,
+        vec![
+            module("name: a\n"),
+            module("name: b\ntasks: [ { test.file: { path: /mv/x, content: same, run: mv1 } } ]\n"),
+        ],
+    );
+    let inputs = inputs_with_store(r2, &sys, store.clone());
+    let plan = plan(&inputs).await;
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert_eq!(plan.rehomed.len(), 1);
+    assert_eq!(plan.rehomed[0].kind, crate::plan::RehomeKind::Moved);
+    assert_eq!(plan.rehomed[0].to.to_string(), "b/test.file[/mv/x]");
+    assert_eq!(step(&plan, "b", "/mv/x").planned, Planned::NoOp);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert_eq!(sys.file_string("/mv/x").as_deref(), Some("same"));
+    let state = store.load().unwrap();
+    let keys: Vec<&String> = state.resources.keys().collect();
+    assert_eq!(keys, vec!["b/test.file[/mv/x]"]);
+    assert_eq!(
+        state.resources["b/test.file[/mv/x]"].introduced_in,
+        RevisionId::new("r1"),
+        "the moved record keeps its origin"
+    );
+    assert!(!calls("removals").iter().any(|c| c.contains("/mv/x")));
+}
+
+#[tokio::test]
+async fn a_task_changing_kind_for_the_same_path_is_not_deleted() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /mv/y, content: one, run: mv2 } } ]\n",
+        )],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+
+    // As file.copy → file.template of the same destination.
+    let r2 = revision(
+        "r2",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.locked: { path: /mv/y, content: two, run: mv2 } } ]\n",
+        )],
+    );
+    let inputs = inputs_with_store(r2, &sys, store.clone());
+    let plan = plan(&inputs).await;
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert_eq!(plan.rehomed[0].kind, crate::plan::RehomeKind::Superseded);
+    assert!(
+        plan.rehomed[0].summary.contains("path /mv/y"),
+        "{}",
+        plan.rehomed[0].summary
+    );
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(sys.file_string("/mv/y").as_deref(), Some("two"));
+    let state = store.load().unwrap();
+    let keys: Vec<&String> = state.resources.keys().collect();
+    assert_eq!(keys, vec!["m/test.locked[/mv/y]"]);
+    assert!(!calls("removals").iter().any(|c| c.contains("/mv/y")));
+}
+
+#[rstest]
+#[case::without_id(None, true)]
+#[case::with_id(Some("install-tool"), false)]
+#[tokio::test]
+async fn bumping_a_var_inside_a_command_only_undoes_it_when_the_task_has_no_id(
+    #[case] id: Option<&str>,
+    #[case] orphaned: bool,
+) {
+    let id_line = id.map(|i| format!("    id: {i}\n")).unwrap_or_default();
+    let yaml = |version: &str| {
+        format!(
+            "name: m\nvars: {{ v: '{version}' }}\ntasks:\n  - command.run: {{ run: [install, 'tool-{{{{ vars.v }}}}'], remove: [uninstall, tool], log: cmd-{} }}\n{id_line}",
+            id.unwrap_or("none")
+        )
+    };
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision("r1", FLEET, vec![module(&yaml("1.0"))]);
+    let report = validate(&r1).unwrap();
+    assert_eq!(
+        report.errors.iter().any(|e| e.message.contains("`id`")),
+        orphaned,
+        "{report}"
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+
+    let r2 = revision("r2", FLEET, vec![module(&yaml("1.1"))]);
+    let plan = plan(&inputs_with_store(r2, &sys, store)).await;
+    assert_eq!(!plan.removals.is_empty(), orphaned, "{:#?}", plan.removals);
+    assert_eq!(
+        plan.warnings.iter().any(|w| w.contains("`id`")),
+        orphaned,
+        "{:?}",
+        plan.warnings
+    );
+    assert_eq!(plan.changes(), 1);
 }
 
 #[tokio::test]

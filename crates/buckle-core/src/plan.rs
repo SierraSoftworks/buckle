@@ -213,6 +213,29 @@ pub struct Removal {
     pub introduced_in: Option<RevisionId>,
 }
 
+/// How an orphaned record relates to a desired resource that took it over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RehomeKind {
+    /// The same kind and key now lives in another module: the record is
+    /// re-keyed to the new module and kept (with its origin and shadow).
+    Moved,
+    /// A desired resource of another kind (or key) manages the same artefact
+    /// (file path, package, user, unit…): the old record is forgotten without
+    /// running its cleanup, which would delete what the new resource manages.
+    Superseded,
+}
+
+/// A resource in state that left the desired set but is not removed, because
+/// a desired resource took it over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rehome {
+    pub from: ResourceKey,
+    pub to: ResourceKey,
+    pub kind: RehomeKind,
+    pub summary: String,
+}
+
 /// A module that could not be planned yet because it depends on facts a
 /// sibling module provides after applying.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +282,9 @@ pub struct Plan {
     /// Modules whose selection or plan is uncertain; see [`Indeterminate`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub indeterminate: Vec<Indeterminate>,
+    /// Records taken over by a desired resource instead of being removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rehomed: Vec<Rehome>,
 }
 
 impl Plan {
@@ -281,6 +307,7 @@ impl Plan {
             skipped: Vec::new(),
             warnings: Vec::new(),
             indeterminate: Vec::new(),
+            rehomed: Vec::new(),
         };
         plan.digest = plan.compute_digest();
         plan
@@ -294,6 +321,13 @@ impl Plan {
         self
     }
 
+    /// Sets the re-homed records and recomputes the digest.
+    pub fn with_rehomed(mut self, rehomed: Vec<Rehome>) -> Self {
+        self.rehomed = rehomed;
+        self.digest = self.compute_digest();
+        self
+    }
+
     pub fn compute_digest(&self) -> Digest {
         #[derive(Serialize)]
         struct Content<'a> {
@@ -302,12 +336,15 @@ impl Plan {
             deferred: &'a [Deferred],
             #[serde(skip_serializing_if = "<[Indeterminate]>::is_empty")]
             indeterminate: &'a [Indeterminate],
+            #[serde(skip_serializing_if = "<[Rehome]>::is_empty")]
+            rehomed: &'a [Rehome],
         }
         Digest::of_json(&Content {
             modules: &self.modules,
             removals: &self.removals,
             deferred: &self.deferred,
             indeterminate: &self.indeterminate,
+            rehomed: &self.rehomed,
         })
     }
 

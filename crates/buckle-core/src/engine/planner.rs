@@ -8,8 +8,8 @@ use super::{Inputs, LoadedModule, Revision};
 use crate::facts::Facts;
 use crate::model::{ModuleConfig, RemovalPolicy, RetryPolicy, TaskDecl};
 use crate::plan::{
-    Deferred, HandlerRun, Indeterminate, ModulePlan, Plan, Planned, Removal, ResourceKey, Step,
-    TaskRef,
+    Deferred, HandlerRun, Indeterminate, ModulePlan, Plan, Planned, Rehome, RehomeKind, Removal,
+    ResourceKey, Step, TaskRef,
 };
 use crate::secrets::SecretStore;
 use crate::selectors::{HostContext, HostIdentity, Vars};
@@ -519,6 +519,9 @@ impl<'a> Planner<'a> {
                     &["Run `buckle catalog` to list the task kinds this Buckle knows about."],
                 )
             })?;
+            if let Some(problem) = super::validate::command_run_without_id(decl) {
+                warnings.push(format!("{label} {problem}"));
+            }
             let provisional = decl.id.clone().unwrap_or_default();
             let render_ctx = ctx.in_task(&decl.kind, &provisional, &decl.tags);
             let json = self.render_spec(task, &decl.spec, &render_ctx).map_err(|e| {
@@ -828,14 +831,101 @@ impl<'a> Planner<'a> {
         self.plan_module(prepared, &contexts).await
     }
 
+    /// Records that left the desired set but were taken over by a desired
+    /// resource, so must not be removed: the same kind and key in another
+    /// module (a moved task: the record is re-keyed and kept), or a desired
+    /// resource that owns one of the record's artefacts (a re-keyed task, e.g.
+    /// `file.copy` → `file.template` of the same path: the old record is
+    /// forgotten without cleanup). A moved task plans against its old record.
+    pub fn rehomes(
+        &self,
+        state: &State,
+        prepared: &mut [PreparedModule],
+        exclude_modules: &BTreeSet<String>,
+    ) -> Vec<Rehome> {
+        let desired: Vec<ResourceKey> = prepared
+            .iter()
+            .flat_map(|p| p.desired_keys().cloned())
+            .collect();
+        let desired_set: BTreeSet<&ResourceKey> = desired.iter().collect();
+        let mut by_kind_key: HashMap<(&str, &str), &ResourceKey> = HashMap::new();
+        let mut by_identity: HashMap<String, &ResourceKey> = HashMap::new();
+        let mut taken: BTreeSet<&ResourceKey> = BTreeSet::new();
+        for key in &desired {
+            by_kind_key
+                .entry((key.kind.as_str(), key.key.as_str()))
+                .or_insert(key);
+            let mut ids: Vec<String> = crate::task::key_identity(&key.key).into_iter().collect();
+            if let Some(record) = state.get(key) {
+                taken.insert(key);
+                ids.extend(record.identities());
+            }
+            for id in ids {
+                by_identity.entry(id).or_insert(key);
+            }
+        }
+        let mut out = Vec::new();
+        let mut moved: Vec<(ResourceKey, ResourceRecord)> = Vec::new();
+        for record in state.resources.values() {
+            if exclude_modules.contains(&record.key.module) || desired_set.contains(&record.key) {
+                continue;
+            }
+            if let Some(to) = by_kind_key
+                .get(&(record.key.kind.as_str(), record.key.key.as_str()))
+                .copied()
+                && taken.insert(to)
+            {
+                out.push(Rehome {
+                    from: record.key.clone(),
+                    to: to.clone(),
+                    kind: RehomeKind::Moved,
+                    summary: format!(
+                        "moved to module '{}': the record (introduced in {}) is kept, nothing is removed",
+                        to.module, record.introduced_in
+                    ),
+                });
+                let mut rekeyed = record.clone();
+                rekeyed.key = to.clone();
+                moved.push((to.clone(), rekeyed));
+                continue;
+            }
+            if let Some((id, to)) = record
+                .identities()
+                .into_iter()
+                .find_map(|id| by_identity.get(&id).map(|to| (id, *to)))
+            {
+                out.push(Rehome {
+                    from: record.key.clone(),
+                    to: to.clone(),
+                    kind: RehomeKind::Superseded,
+                    summary: format!(
+                        "superseded by {to}, which manages the same {}: forgotten without cleanup",
+                        id.replacen(':', " ", 1)
+                    ),
+                });
+            }
+        }
+        for (to, record) in moved {
+            let record = Arc::new(record);
+            for task in prepared.iter_mut().flat_map(|p| p.tasks.iter_mut()) {
+                if task.key == to {
+                    task.cx.previous = Some(record.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Orphans: resources in state that no selected module wants any more,
-    /// skipping modules whose plan is deferred (their keys are unknown yet).
-    /// Ordered for execution: dependents before their dependencies.
+    /// skipping modules whose plan is deferred (their keys are unknown yet) or
+    /// indeterminate, and records `skip` names (re-homed ones). Ordered for
+    /// execution: dependents before their dependencies.
     pub fn removals(
         &self,
         state: &State,
         desired: &[ResourceKey],
         exclude_modules: &BTreeSet<String>,
+        skip: &BTreeSet<ResourceKey>,
     ) -> Vec<(Removal, RichRemoval)> {
         let mut graph = Graph::new();
         for m in &self.revision.modules {
@@ -852,7 +942,11 @@ impl<'a> Planner<'a> {
         let mut orphans: Vec<&ResourceRecord> = state
             .resources
             .values()
-            .filter(|r| !exclude_modules.contains(&r.key.module) && !desired.contains(&r.key))
+            .filter(|r| {
+                !exclude_modules.contains(&r.key.module)
+                    && !desired.contains(&r.key)
+                    && !skip.contains(&r.key)
+            })
             .collect();
         orphans.sort_by(|a, b| {
             rank(&a.key.module)
@@ -975,6 +1069,14 @@ pub(super) async fn plan_with(
         .map(|p| (p.name.clone(), p.provides.clone()))
         .collect();
 
+    let undecided: BTreeSet<String> = selection
+        .indeterminate
+        .iter()
+        .map(|i| i.module.clone())
+        .collect();
+    let rehomed = planner.rehomes(state, &mut prepared, &undecided);
+    let rehomed_from: BTreeSet<ResourceKey> = rehomed.iter().map(|r| r.from.clone()).collect();
+
     let mut planned: Vec<RichModulePlan> = Vec::new();
     let mut deferred: Vec<Deferred> = Vec::new();
     for module in prepared {
@@ -1010,7 +1112,7 @@ pub(super) async fn plan_with(
         .chain(selection.indeterminate.iter().map(|i| i.module.clone()))
         .collect();
     let (removals, rich_removals): (Vec<Removal>, Vec<RichRemoval>) = planner
-        .removals(state, &desired, &exclude)
+        .removals(state, &desired, &exclude, &rehomed_from)
         .into_iter()
         .unzip();
 
@@ -1030,7 +1132,9 @@ pub(super) async fn plan_with(
         .filter(|(_, rs)| rs.platform_blocked)
         .map(|(s, _)| s.resource.clone())
         .collect();
-    let mut plan = plan.with_indeterminate(selection.indeterminate);
+    let mut plan = plan
+        .with_indeterminate(selection.indeterminate)
+        .with_rehomed(rehomed);
     plan.warnings = warnings(&plan, &platform_blocked);
     plan.warnings.extend(task_warnings);
     Ok(RichPlan {
@@ -1067,6 +1171,9 @@ pub(super) fn warnings(plan: &Plan, platform_blocked: &BTreeSet<ResourceKey>) ->
             ""
         };
         out.push(format!("removal: {} — {}{caution}", r.resource, r.summary));
+    }
+    for r in &plan.rehomed {
+        out.push(format!("not removed: {} — {}", r.from, r.summary));
     }
     for step in plan.steps() {
         if step.always_runs {

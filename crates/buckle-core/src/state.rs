@@ -30,6 +30,17 @@ pub struct ResourceRecord {
     pub introduced_in: RevisionId,
 }
 
+impl ResourceRecord {
+    /// Everything this resource is known to own (see [`Artefact::identity`]
+    /// and [`crate::task::key_identity`]).
+    pub fn identities(&self) -> std::collections::BTreeSet<String> {
+        crate::task::key_identity(&self.key.key)
+            .into_iter()
+            .chain(self.artefacts.iter().filter_map(Artefact::identity))
+            .collect()
+    }
+}
+
 /// Outcome of a run for the local history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {

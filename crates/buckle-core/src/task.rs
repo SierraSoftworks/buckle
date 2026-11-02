@@ -318,6 +318,39 @@ pub enum Artefact {
     },
 }
 
+impl Artefact {
+    /// A namespaced identity for overlap checks between resources
+    /// (`path:/etc/x`, `package:apt:nomad`, `user:sierra`…), or `None` for
+    /// [`Artefact::Other`].
+    pub fn identity(&self) -> Option<String> {
+        Some(match self {
+            Artefact::File { path } | Artefact::Directory { path } | Artefact::Symlink { path } => {
+                format!("path:{}", path.to_string_lossy())
+            }
+            Artefact::Package { manager, name } => format!("package:{manager}:{name}"),
+            Artefact::Repository { manager, name } => format!("repository:{manager}:{name}"),
+            Artefact::Unit { name, .. } => format!("unit:{name}"),
+            Artefact::User { name } => format!("user:{name}"),
+            Artefact::Group { name } => format!("group:{name}"),
+            Artefact::Line { path, marker } => {
+                format!("line:{}:{marker}", path.to_string_lossy())
+            }
+            Artefact::Rule { subsystem, id } => format!("rule:{subsystem}:{id}"),
+            Artefact::Other { .. } => return None,
+        })
+    }
+}
+
+/// The identity a resource key implies on its own: an absolute path names a
+/// filesystem path whatever the kind (`file.copy`, `file.template`, …).
+pub fn key_identity(key: &str) -> Option<String> {
+    let windows_abs = key.len() > 2
+        && key.as_bytes()[0].is_ascii_alphabetic()
+        && key.as_bytes()[1] == b':'
+        && matches!(key.as_bytes()[2], b'/' | b'\\');
+    (key.starts_with('/') || windows_abs).then(|| format!("path:{key}"))
+}
+
 /// Type-erased spec: a boxed `Task::Spec` plus the raw JSON it came from.
 pub struct ErasedSpec {
     inner: Box<dyn Any + Send + Sync>,

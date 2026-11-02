@@ -341,11 +341,11 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             }
         };
         for (i, decl) in m.config.tasks.iter().enumerate() {
-            check_decl(
-                &mut report,
-                decl,
-                &format!("{file} tasks[{i}] ({})", decl.kind),
-            );
+            let location = format!("{file} tasks[{i}] ({})", decl.kind);
+            check_decl(&mut report, decl, &location);
+            if let Some(problem) = command_run_without_id(decl) {
+                report.error(Some(name), &location, problem);
+            }
         }
         for (hname, decl) in &m.config.handlers {
             check_decl(
@@ -410,6 +410,19 @@ pub async fn validate_with_facts(
         Err(err) => report.error(None, format!("host {}", host.id), err.message()),
     }
     Ok(report)
+}
+
+/// `command.run` is keyed by its rendered command line, so editing the
+/// command (or a var inside it) turns the old resource into an orphan and runs
+/// its `remove:`. A task with `remove:` must therefore carry an explicit `id`.
+pub fn command_run_without_id(decl: &TaskDecl) -> Option<String> {
+    let has_remove = decl
+        .spec
+        .as_mapping()
+        .is_some_and(|m| m.contains_key(serde_yaml::Value::String("remove".into())));
+    (decl.kind == "command.run" && has_remove && decl.id.is_none()).then(|| {
+        "sets `remove:` but no `id`: a command.run is identified by its rendered command, so editing the command (or a var inside it) would run the old `remove:`; give the task a stable `id`".to_owned()
+    })
 }
 
 /// Looks up the kind for `decl`, as a validation-friendly error.

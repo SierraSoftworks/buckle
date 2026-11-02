@@ -615,6 +615,20 @@ impl<'a> Executor<'a> {
         let plan_digest = rich.plan.digest.clone();
         let parallelism = self.inputs.parallelism.max(1);
 
+        // Records a desired resource took over: re-key moved ones, forget
+        // superseded ones (without cleanup) so that nothing removes them.
+        for r in &rich.plan.rehomed {
+            self.with_state(|s| {
+                if let Some(mut record) = s.forget(&r.from)
+                    && r.kind == crate::plan::RehomeKind::Moved
+                    && s.get(&r.to).is_none()
+                {
+                    record.key = r.to.clone();
+                    s.record(record);
+                }
+            });
+        }
+
         let mut module_plans: HashMap<String, Arc<RichModulePlan>> = rich
             .modules
             .into_iter()
