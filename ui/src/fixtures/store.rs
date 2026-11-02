@@ -192,6 +192,9 @@ pub fn host(id: &str) -> Result<HostDetail, ApiError> {
 }
 
 pub fn host_runs(id: &str) -> Result<Vec<RunSummary>, ApiError> {
+    if flag("runs").as_deref() == Some("fail") {
+        return Err(ApiError::Server("The runs could not be read.".into()));
+    }
     host(id).map(|d| d.recent_runs)
 }
 

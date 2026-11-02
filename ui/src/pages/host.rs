@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    Connection, HealthResultDto, HostDetail, HostPatch, HostPreview, HostStatus, LiveEvent,
-    RunReport, RunSummary,
+    Connection, HealthResultDto, HostDetail, HostPatch, HostPreview, HostStatus, RunReport,
+    RunSummary,
 };
 use chrono::{DateTime, Utc};
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
@@ -26,7 +26,7 @@ use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now,
 use crate::logic::format::{commit, relative, relative_opt, short, short_duration, timestamp};
 use crate::logic::labels::{Change, Row, changes, collect, effective, rows};
 use crate::logic::live::{apply_fleet, apply_host_detail};
-use crate::logic::run::{apply_run_list, newest_run, run_label};
+use crate::logic::run::{follow_run_list, newest_run, run_label};
 use crate::logic::tone::{
     Tone, check_status_tone, health_label, health_tone, host_status_label, host_status_tone,
     outcome_tone,
@@ -460,25 +460,38 @@ fn runs_panel(props: &RunsProps) -> Html {
     );
     let store = use_live();
     let mut runs: Vec<RunSummary> = list.value().cloned().unwrap_or_default();
-    let mut unknown = false;
-    if let Some(events) = list.data.as_ref().and_then(|d| store.log.since(d.0)) {
-        for event in events {
-            if let LiveEvent::RunProgress { progress } = &*event {
-                unknown |= !apply_run_list(&mut runs, &props.host, progress);
-            }
-        }
-    }
+    let unlisted = follow_run_list(
+        &mut runs,
+        &props.host,
+        list.data.as_ref().map(|d| d.0),
+        &store.log,
+    );
+    // Fetched again once per update about a run it lacks: a fetch that
+    // fails is tried again on the next such update, not in a loop.
+    let tried = use_mut_ref(|| 0u64);
     {
-        let reload = list.reload.clone();
-        let at = unknown.then(|| list.data.as_ref().map(|d| d.0)).flatten();
-        use_effect_with(at, move |at| {
-            if at.is_some() {
+        let (reload, tried) = (list.reload.clone(), tried.clone());
+        use_effect_with((unlisted, list.loading), move |(unlisted, loading)| {
+            if let Some(seq) = *unlisted
+                && !*loading
+                && seq > *tried.borrow()
+            {
+                *tried.borrow_mut() = seq;
                 reload.emit(());
             }
             || ()
         });
     }
     runs.retain(|r| !r.id.is_empty());
+    let list_error = list.error.as_ref().map(|e| {
+        let reload = list.reload.clone();
+        html! {
+            <span class="run-picker__error" role="alert" title={e.to_string()}>
+                { if runs.is_empty() { "The host's runs could not be listed." } else { "The list of runs may be out of date." } }
+                <Button small=true kind={Kind::Subtle} onclick={Callback::from(move |_| reload.emit(()))}>{ "Try again" }</Button>
+            </span>
+        }
+    });
 
     // The select shows the run shown, also after "Show the newest" or a
     // recent-runs row changed it (an option's `selected` attribute does not
@@ -539,7 +552,7 @@ fn runs_panel(props: &RunsProps) -> Html {
     html! {
         <Panel title={if older { "Run report" } else { "Latest run" }} id="run-report" class="run-panel"
             subtitle={if older { "An older run of this host, module by module" } else { "The host's newest run, module by module and step by step" }}
-            actions={html! { <>{ back.unwrap_or_default() }{ picker.unwrap_or_default() }</> }}>
+            actions={html! { <>{ back.unwrap_or_default() }{ list_error.unwrap_or_default() }{ picker.unwrap_or_default() }</> }}>
             { body }
         </Panel>
     }

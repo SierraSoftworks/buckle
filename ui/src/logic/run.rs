@@ -505,6 +505,31 @@ pub fn follow(held: Option<&mut RunReport>, p: &RunProgress, watch: &Watch) -> A
     }
 }
 
+/// Keeps a host's list of runs current from the updates after `base` (the
+/// sequence number the list was fetched at; `None` when it never loaded, so
+/// every update still in the log counts), and returns the sequence number
+/// of the newest update about a run the list does not hold. A caller fetches
+/// the list again for it, and, should that fail, again on the next such
+/// update, whose number is higher.
+pub fn follow_run_list(
+    list: &mut [RunSummary],
+    host: &str,
+    base: Option<u64>,
+    log: &EventLog,
+) -> Option<u64> {
+    let from = base.unwrap_or_else(|| log.oldest());
+    let events = log.since(from)?;
+    let mut newest = None;
+    for (i, event) in events.iter().enumerate() {
+        if let LiveEvent::RunProgress { progress } = &**event
+            && !apply_run_list(list, host, progress)
+        {
+            newest = Some(from + 1 + i as u64);
+        }
+    }
+    newest
+}
+
 /// What an update the report cannot take is about, so that the same
 /// question is not asked again before the last answer is in: the run, when
 /// it is not the run held (or none is); the module, when the report does
@@ -1295,6 +1320,61 @@ pub(crate) mod tests {
         let mut p = progress(None, None);
         p.run_id = "run-2".into();
         assert_eq!(follow(Some(&mut r), &p, &pinned), Applied::Ignored);
+    }
+
+    #[test]
+    fn a_run_list_names_the_newest_update_about_a_run_it_lacks() {
+        let summary = |id: &str| RunSummary {
+            id: id.into(),
+            state: Some(RunState::Running),
+            revision: "r".into(),
+            plan_digest: "d".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            outcome: "running".into(),
+            changes: 0,
+            removals: 0,
+            error: None,
+            trace_id: None,
+            trace_url: None,
+        };
+        let on = |host: &str, run: &str, state: RunState| LiveEvent::RunProgress {
+            progress: RunProgress {
+                host: host.into(),
+                run_id: run.into(),
+                run_state: state,
+                ..progress(None, None)
+            },
+        };
+        let mut log = EventLog::default();
+        log.push(on("pi-1", "run-1", RunState::Succeeded)); // 1
+        let fetched_at = log.seq;
+        log.push(on("pi-1", "run-1", RunState::Succeeded)); // 2
+        log.push(on("pi-1", "run-2", RunState::Running)); // 3: a new run
+        log.push(on("pi-2", "run-9", RunState::Running)); // 4: another host
+        let mut list = vec![summary("run-1")];
+        assert_eq!(
+            follow_run_list(&mut list, "pi-1", Some(fetched_at), &log),
+            Some(3)
+        );
+        assert_eq!(list[0].state, Some(RunState::Succeeded));
+        // The fetch for it failed (the list is as it was): the next update
+        // about the new run is a later one, so it is tried again then.
+        log.push(on("pi-1", "run-2", RunState::Running)); // 5
+        let mut list = vec![summary("run-1")];
+        assert_eq!(
+            follow_run_list(&mut list, "pi-1", Some(fetched_at), &log),
+            Some(5)
+        );
+        // A list that never loaded counts every update still held.
+        assert_eq!(follow_run_list(&mut [], "pi-1", None, &log), Some(5));
+        assert_eq!(follow_run_list(&mut [], "pi-3", None, &log), None);
+        // A list fetched after the new run is known has nothing to fetch for.
+        let mut list = vec![summary("run-2"), summary("run-1")];
+        assert_eq!(
+            follow_run_list(&mut list, "pi-1", Some(fetched_at), &log),
+            None
+        );
     }
 
     #[test]

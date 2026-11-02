@@ -126,6 +126,17 @@ describe("a host's latest run", () => {
     await close();
   });
 
+  test("a run list that cannot be read says so, and the report still shows", async () => {
+    const { page, close } = await open("/hosts/pi-5", { flags: "runs=fail" });
+    const report = page.locator("#run-report");
+    await report.locator(".run").waitFor();
+    const error = report.getByRole("alert").filter({ hasText: "The host's runs could not be listed." });
+    await error.waitFor();
+    await error.getByRole("button", { name: "Try again" }).waitFor();
+    assert.equal(await page.getByLabel("Run to show").count(), 0);
+    await close();
+  });
+
   test("a host without runs says so", async () => {
     const { page, close } = await open("/hosts/rpi-new");
     await page.locator("#run-report").getByText("No runs yet").waitFor();
