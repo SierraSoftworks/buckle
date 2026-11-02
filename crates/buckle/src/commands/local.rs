@@ -40,7 +40,9 @@ pub struct LocalArgs {
     #[arg(long)]
     pub host_id: Option<String>,
 
-    /// Labels for this host, as comma-separated key=value pairs.
+    /// Labels for this host, as comma-separated key=value pairs. Values are
+    /// typed like YAML scalars: `canary=true` is a boolean, `rack=3` a number,
+    /// `rack="3"` a string.
     #[arg(long, value_parser = parse_labels, default_value = "")]
     pub labels: BTreeMap<String, String>,
 
@@ -121,6 +123,10 @@ pub struct ValidateArgs {
     /// Facts files to validate selectors and templates against.
     #[arg(long = "facts", value_name = "FILE")]
     pub facts: Vec<PathBuf>,
+    /// Labels applied to every --facts host, as comma-separated key=value
+    /// pairs (typed like `plan --labels`).
+    #[arg(long, value_parser = parse_labels, default_value = "")]
+    pub labels: BTreeMap<String, String>,
 }
 
 impl std::ops::Deref for PlanArgs {
@@ -133,21 +139,11 @@ impl std::ops::Deref for PlanArgs {
 /// The revision label for a local directory.
 const WORKING_TREE: &str = "working-tree";
 
-/// A label value: `true`, `42` and `1.5` become typed JSON; everything else is a string.
+/// A label value: `true`, `42` and `1.5` become typed JSON, a quoted value
+/// stays the string inside the quotes, everything else is a string (the same
+/// rule as [`buckle_core::selectors::label_value`]).
 fn label_value(raw: &str) -> serde_json::Value {
-    match serde_yaml::from_str::<serde_yaml::Value>(raw) {
-        Ok(serde_yaml::Value::Bool(b)) => serde_json::Value::Bool(b),
-        Ok(serde_yaml::Value::Number(n)) => n
-            .as_i64()
-            .map(serde_json::Value::from)
-            .or_else(|| {
-                n.as_f64()
-                    .and_then(serde_json::Number::from_f64)
-                    .map(serde_json::Value::Number)
-            })
-            .unwrap_or_else(|| serde_json::Value::String(raw.to_owned())),
-        _ => serde_json::Value::String(raw.to_owned()),
-    }
+    buckle_core::selectors::label_value(raw)
 }
 
 fn load_facts_file(path: &Path) -> buckle_core::Result<Facts> {
@@ -177,6 +173,7 @@ fn load_facts_file(path: &Path) -> buckle_core::Result<Facts> {
     Ok(Facts {
         tree,
         collected_at: Default::default(),
+        stale: Default::default(),
     })
 }
 
@@ -425,6 +422,12 @@ pub(crate) async fn validate_to(
     let revision =
         buckle_core::engine::loader::load_dir(&args.config, RevisionId::new(WORKING_TREE))?;
     let mut report = buckle_core::engine::validate(&revision)?;
+    let labels: Labels = args
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), label_value(v)))
+        .collect();
+    let mut summaries = Vec::new();
     if report.is_ok() {
         for path in &args.facts {
             let facts = load_facts_file(path)?;
@@ -433,10 +436,13 @@ pub(crate) async fn validate_to(
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "validate".into()),
-                labels: Labels::new(),
+                labels: labels.clone(),
             };
-            let mut with_facts =
-                buckle_core::engine::validate_with_facts(&revision, &host, &facts).await?;
+            let (mut with_facts, summary) =
+                buckle_core::engine::validate_host(&revision, &host, &facts).await?;
+            if let Some(summary) = summary {
+                summaries.push((path.clone(), summary));
+            }
             for issue in with_facts
                 .errors
                 .iter_mut()
@@ -448,6 +454,33 @@ pub(crate) async fn validate_to(
         }
     }
     let _ = write!(out, "{report}");
+    for (path, s) in &summaries {
+        let list = |v: &[String]| {
+            if v.is_empty() {
+                "none".to_owned()
+            } else {
+                v.join(", ")
+            }
+        };
+        let _ = writeln!(
+            out,
+            "host {} ({}): groups {}; selected {}",
+            s.host,
+            path.display(),
+            list(&s.groups),
+            list(&s.selected)
+        );
+        if !s.conditional.is_empty() {
+            let _ = writeln!(
+                out,
+                "  decided on the host after a provider applies: {}",
+                s.conditional.join(", ")
+            );
+        }
+        for i in &s.indeterminate {
+            let _ = writeln!(out, "  indeterminate: {} ({})", i.module, i.reason);
+        }
+    }
     let _ = writeln!(
         out,
         "{} modules in {}: {} error{}, {} warning{}",
@@ -654,6 +687,7 @@ mod tests {
             ValidateArgs {
                 config: dir.path().to_path_buf(),
                 facts: vec![],
+                labels: BTreeMap::new(),
             },
             &mut out,
         )
@@ -677,6 +711,7 @@ mod tests {
                     fixtures().join("facts/debian-arm64.json"),
                     fixtures().join("facts/ubuntu-amd64.json"),
                 ],
+                labels: BTreeMap::new(),
             },
             &mut out,
         )
@@ -685,6 +720,47 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert_eq!(code, 0, "{text}");
         assert!(text.contains("0 errors"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn validate_applies_labels_to_every_fixture_and_reports_groups_and_indeterminate_modules()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("buckle.yaml"),
+            "version: 2\nfleet:\n  groups:\n    canary: 'host.labels.canary == true'\n    rack3: 'host.labels.rack == 3'\n    named: 'host.labels.name == \"3\"'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/canaried")).unwrap();
+        std::fs::write(
+            dir.path().join("modules/canaried/module.yaml"),
+            "name: canaried\nwhen: 'host.groups contains \"canary\"'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/half/files")).unwrap();
+        let mut out = Vec::new();
+        let code = validate_to(
+            ValidateArgs {
+                config: dir.path().to_path_buf(),
+                facts: vec![
+                    fixtures().join("facts/debian-arm64.json"),
+                    fixtures().join("facts/ubuntu-amd64.json"),
+                ],
+                labels: parse_labels("canary=true,rack=3,name=\"3\"").unwrap(),
+            },
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(
+            text.matches("groups canary, rack3, named; selected canaried")
+                .count(),
+            2,
+            "labels apply to every fixture, typed: {text}"
+        );
+        assert!(text.contains("indeterminate: half"), "{text}");
     }
 
     #[tokio::test]

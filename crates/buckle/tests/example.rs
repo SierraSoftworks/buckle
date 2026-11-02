@@ -574,6 +574,7 @@ fn the_engine_dry_plans_each_host(
     let facts = buckle_core::facts::Facts {
         tree,
         collected_at: Default::default(),
+        stale: Default::default(),
     };
     let identity = HostIdentity {
         id: host.to_owned(),

@@ -37,7 +37,7 @@ async fn run_check(
             ));
         }
         let task_ctx = ctx.in_task(&kind, &name, &[]);
-        let json = match super::context::render_value(&decl.check.spec, &planner.templater, &task_ctx) {
+        let json = match planner.render_check_spec(check, &decl.check.spec, &task_ctx) {
             Ok(j) => j,
             Err(e) => return HealthStatus::fail(format!("the check's spec could not be rendered: {}", e.message())),
         };
@@ -87,6 +87,30 @@ pub(super) async fn run_once(
     results
 }
 
+/// Emits a `HealthChecked` event per result.
+pub(super) async fn report(
+    module: &str,
+    results: &[HealthResult],
+    events: &tokio::sync::mpsc::Sender<ApplyEvent>,
+) {
+    for r in results {
+        let reason = match &r.status {
+            HealthStatus::Pass => None,
+            HealthStatus::Fail { reason } | HealthStatus::Unknown { reason } => {
+                Some(reason.clone())
+            }
+        };
+        let _ = events
+            .send(ApplyEvent::HealthChecked {
+                module: module.to_owned(),
+                check: r.check.clone(),
+                passed: r.status.is_pass(),
+                reason,
+            })
+            .await;
+    }
+}
+
 /// Runs the checks, and while a required (non-waived) check fails and less than
 /// `settle` has elapsed since the first failure, re-runs them every `interval`
 /// of the failing checks. Returns the final results and whether the module is
@@ -106,22 +130,7 @@ pub(super) async fn run_settled(
     let mut first_failure: Option<tokio::time::Instant> = None;
     loop {
         let results = run_once(planner, checks).await;
-        for r in &results {
-            let reason = match &r.status {
-                HealthStatus::Pass => None,
-                HealthStatus::Fail { reason } | HealthStatus::Unknown { reason } => {
-                    Some(reason.clone())
-                }
-            };
-            let _ = events
-                .send(ApplyEvent::HealthChecked {
-                    module: module.to_owned(),
-                    check: r.check.clone(),
-                    passed: r.status.is_pass(),
-                    reason,
-                })
-                .await;
-        }
+        report(module, &results, events).await;
         let failing: Vec<&HealthResult> = results
             .iter()
             .filter(|r| r.counts_as_failure(waived))
@@ -181,7 +190,29 @@ pub(super) async fn run_scope(
         if module.config.health.is_empty() {
             continue;
         }
-        let ctx = planner.module_context(&contexts, &module.config)?;
+        let ctx = match planner.module_context(&contexts, &module.config) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                // A module whose vars do not render cannot run its checks;
+                // report each as unknown rather than failing every module.
+                let reason = format!(
+                    "the module's vars could not be rendered: {}",
+                    planner.scrub(&err.message())
+                );
+                for decl in &module.config.health {
+                    results.push(HealthResult {
+                        module: module.config.name.clone(),
+                        check: decl.display_name().to_owned(),
+                        kind: decl.check.kind.clone(),
+                        required: decl.required,
+                        status: HealthStatus::unknown(reason.clone()),
+                        at: planner.system.now(),
+                        duration_ms: 0,
+                    });
+                }
+                continue;
+            }
+        };
         results.extend(
             run_once(
                 &planner,

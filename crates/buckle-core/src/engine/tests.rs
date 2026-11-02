@@ -94,6 +94,12 @@ struct FileSpec {
     /// A path that must exist before this task can be planned (a "tool").
     #[serde(default)]
     requires: Option<String>,
+    /// Plan (and apply) deleting the path instead of writing it.
+    #[serde(default)]
+    delete: bool,
+    /// Plan a change but find nothing to do at apply time.
+    #[serde(default)]
+    unchanged: bool,
 }
 
 async fn plan_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Planned> {
@@ -104,6 +110,14 @@ async fn plan_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Planned> {
         return Ok(Planned::blocked(format!("{required} is not installed")));
     }
     let existing = cx.system.read(Path::new(&spec.path)).await?;
+    if spec.delete {
+        return Ok(match existing {
+            Some(_) => Planned::change(Diff::Delete {
+                summary: format!("delete {}", spec.path),
+            }),
+            None => Planned::NoOp,
+        });
+    }
     Ok(match existing {
         Some(bytes) if bytes == spec.content.as_bytes() => Planned::NoOp,
         Some(bytes) => Planned::change(Diff::unified(
@@ -140,6 +154,16 @@ async fn apply_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Applied> {
             &["Try again."],
         ));
     }
+    if spec.unchanged {
+        return Ok(Applied::unchanged(format!(
+            "{} was already right",
+            spec.path
+        )));
+    }
+    if spec.delete {
+        cx.system.remove(Path::new(&spec.path), false).await?;
+        return Ok(Applied::changed(format!("deleted {}", spec.path)));
+    }
     cx.system
         .write_atomic(
             Path::new(&spec.path),
@@ -166,6 +190,17 @@ async fn remove_file(cx: &Cx, record: &ResourceRecord) -> crate::Result<Applied>
 
 macro_rules! file_kind {
     ($name:ident, $kind:literal, locks = $locks:expr, platforms = $platforms:expr, caution = $caution:expr, always = $always:expr) => {
+        file_kind!(
+            $name,
+            $kind,
+            locks = $locks,
+            platforms = $platforms,
+            caution = $caution,
+            always = $always,
+            removal = RemovalPolicy::Cleanup
+        );
+    };
+    ($name:ident, $kind:literal, locks = $locks:expr, platforms = $platforms:expr, caution = $caution:expr, always = $always:expr, removal = $removal:expr) => {
         struct $name;
 
         #[async_trait]
@@ -175,6 +210,7 @@ macro_rules! file_kind {
             const LOCKS: &'static [&'static str] = $locks;
             const PLATFORMS: Platforms = $platforms;
             const REMOVAL_CAUTION: bool = $caution;
+            const REMOVAL_DEFAULT: RemovalPolicy = $removal;
 
             fn key(spec: &FileSpec) -> String {
                 spec.path.clone()
@@ -249,6 +285,15 @@ file_kind!(
     always = false
 );
 file_kind!(
+    TestKept,
+    "test.kept",
+    locks = &[],
+    platforms = Platforms::ALL,
+    caution = false,
+    always = false,
+    removal = RemovalPolicy::Leave
+);
+file_kind!(
     TestAlways,
     "test.always",
     locks = &[],
@@ -256,6 +301,192 @@ file_kind!(
     caution = false,
     always = true
 );
+
+/// A `command.run` stand-in keyed (like the real one) by its command line,
+/// with an optional `remove:` command.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+struct CmdSpec {
+    run: Vec<String>,
+    #[serde(default)]
+    remove: Option<Vec<String>>,
+    #[serde(default)]
+    log: String,
+}
+
+struct TestCommand;
+
+#[async_trait]
+impl Task for TestCommand {
+    type Spec = CmdSpec;
+    const KIND: &'static str = "command.run";
+
+    fn key(spec: &CmdSpec) -> String {
+        spec.run.join(" ")
+    }
+
+    async fn plan(&self, _cx: &Cx, spec: &CmdSpec) -> crate::Result<Planned> {
+        Ok(Planned::change(Diff::Opaque {
+            summary: format!("run `{}`", spec.run.join(" ")),
+        }))
+    }
+
+    async fn apply(&self, _cx: &Cx, spec: &CmdSpec, _planned: &Planned) -> crate::Result<Applied> {
+        record(&spec.log, format!("run {}", spec.run.join(" ")));
+        Ok(
+            Applied::changed(format!("ran {}", spec.run.join(" "))).with_artefact(
+                Artefact::Other {
+                    description: format!(
+                        "remove={}",
+                        spec.remove.clone().unwrap_or_default().join(" ")
+                    ),
+                },
+            ),
+        )
+    }
+
+    async fn remove(&self, _cx: &Cx, record: &ResourceRecord) -> crate::Result<Applied> {
+        self::record("removals", format!("undo {}", record.key));
+        Ok(Applied::changed("undone"))
+    }
+}
+
+crate::register_task!(TestCommand);
+
+/// A `file.line` stand-in whose key (like buckle-std's) became the regex
+/// when one is given, and that records the line it wrote.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+struct LineSpec {
+    path: String,
+    line: String,
+    #[serde(default)]
+    regex: Option<String>,
+}
+
+struct TestLine;
+
+#[async_trait]
+impl Task for TestLine {
+    type Spec = LineSpec;
+    const KIND: &'static str = "test.line";
+
+    fn key(spec: &LineSpec) -> String {
+        format!(
+            "{}: {}",
+            spec.path,
+            spec.regex.as_deref().unwrap_or(&spec.line)
+        )
+    }
+
+    async fn plan(&self, cx: &Cx, spec: &LineSpec) -> crate::Result<Planned> {
+        let text = cx
+            .system
+            .read(Path::new(&spec.path))
+            .await?
+            .unwrap_or_default();
+        Ok(
+            if String::from_utf8_lossy(&text)
+                .lines()
+                .any(|l| l == spec.line)
+            {
+                Planned::NoOp
+            } else {
+                Planned::change(Diff::Opaque {
+                    summary: format!("add `{}`", spec.line),
+                })
+            },
+        )
+    }
+
+    async fn apply(&self, cx: &Cx, spec: &LineSpec, _planned: &Planned) -> crate::Result<Applied> {
+        cx.system
+            .write_atomic(
+                Path::new(&spec.path),
+                format!("{}\n", spec.line).as_bytes(),
+                &FilePerms::mode(0o644),
+            )
+            .await?;
+        Ok(Applied::changed("added").with_artefact(Artefact::Line {
+            path: spec.path.clone().into(),
+            marker: serde_json::json!({"Added": {"line": spec.line, "created": false}}).to_string(),
+        }))
+    }
+
+    async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> crate::Result<Applied> {
+        self::record("removals", format!("revert {}", record.key));
+        cx.system
+            .write_atomic(
+                Path::new("/lines/reverted"),
+                b"yes",
+                &FilePerms::mode(0o644),
+            )
+            .await?;
+        Ok(Applied::changed("reverted"))
+    }
+}
+
+crate::register_task!(TestLine);
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct HeaderSpec {
+    token: crate::secrets::SecretField,
+}
+
+/// A check with a secret-capable field, like the http check's headers.
+struct SecretHeaderCheck;
+
+#[async_trait]
+impl crate::health::HealthCheck for SecretHeaderCheck {
+    type Spec = HeaderSpec;
+    const KIND: &'static str = "test.secret_header";
+
+    async fn check(&self, cx: &Cx, spec: &HeaderSpec) -> crate::health::HealthStatus {
+        match spec.token.resolve(&cx.templater, &cx.host) {
+            Ok(_) if spec.token.references_secrets() => crate::health::HealthStatus::Pass,
+            Ok(_) => {
+                crate::health::HealthStatus::fail("the field was rendered before the check saw it")
+            }
+            Err(e) => crate::health::HealthStatus::unknown(e.description()),
+        }
+    }
+}
+
+crate::register_health!(SecretHeaderCheck);
+
+/// A buggy kind whose `plan` writes `path` (a validator scratch file when it
+/// is under the temp dir, a real change otherwise).
+struct TestImpure;
+
+#[async_trait]
+impl Task for TestImpure {
+    type Spec = FileSpec;
+    const KIND: &'static str = "test.impure";
+
+    fn key(spec: &FileSpec) -> String {
+        spec.path.clone()
+    }
+
+    async fn plan(&self, cx: &Cx, spec: &FileSpec) -> crate::Result<Planned> {
+        cx.system
+            .write_atomic(
+                Path::new(&spec.path),
+                b"written while planning",
+                &FilePerms::default(),
+            )
+            .await?;
+        Ok(Planned::NoOp)
+    }
+
+    async fn apply(
+        &self,
+        _cx: &Cx,
+        _spec: &FileSpec,
+        _planned: &Planned,
+    ) -> crate::Result<Applied> {
+        Ok(Applied::unchanged("nothing"))
+    }
+}
+
+crate::register_task!(TestImpure);
 
 /// A systemd-shaped handler kind: `name` is the unit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -447,6 +678,31 @@ impl crate::health::HealthCheck for Flaky {
 
 crate::register_health!(Flaky);
 
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct FilterSpec {
+    expr: String,
+}
+
+/// Like the standard `filter` check: a filt-rs expression over the host.
+struct FilterCheck;
+
+#[async_trait]
+impl crate::health::HealthCheck for FilterCheck {
+    type Spec = FilterSpec;
+    const KIND: &'static str = "test.filter";
+
+    async fn check(&self, cx: &Cx, spec: &FilterSpec) -> crate::health::HealthStatus {
+        let filter = Filter::new(spec.expr.as_str()).unwrap();
+        match cx.host.try_matches(&filter) {
+            Ok(true) => crate::health::HealthStatus::Pass,
+            Ok(false) => crate::health::HealthStatus::fail(format!("`{}` is false", spec.expr)),
+            Err(e) => crate::health::HealthStatus::unknown(e),
+        }
+    }
+}
+
+crate::register_health!(FilterCheck);
+
 /// Mounts `host.facts.test.counter.value` from the fake file `/facts/counter`.
 struct CounterFacts;
 
@@ -455,17 +711,37 @@ impl crate::facts::FactProvider for CounterFacts {
     const NAME: &'static str = "test.counter";
 
     async fn collect(&self, cx: &Cx) -> crate::Result<serde_json::Value> {
-        let value = cx
-            .system
-            .read(Path::new("/facts/counter"))
-            .await?
-            .map(|b| serde_json::Value::String(String::from_utf8_lossy(&b).into_owned()))
-            .unwrap_or(serde_json::Value::Null);
-        Ok(serde_json::json!({ "value": value }))
+        // Like a real provider whose tool is not installed yet: no facts at all.
+        Ok(match cx.system.read(Path::new("/facts/counter")).await? {
+            Some(b) => serde_json::json!({ "value": String::from_utf8_lossy(&b) }),
+            None => serde_json::Value::Null,
+        })
     }
 }
 
 crate::register_facts!(CounterFacts);
+
+/// Mounts `host.facts.test.imds.provider` from `/facts/imds`; fails while that
+/// file says `fail` (an IMDS endpoint timing out).
+struct ImdsFacts;
+
+#[async_trait]
+impl crate::facts::FactProvider for ImdsFacts {
+    const NAME: &'static str = "test.imds";
+
+    async fn collect(&self, cx: &Cx) -> crate::Result<serde_json::Value> {
+        match cx.system.read(Path::new("/facts/imds")).await? {
+            Some(b) if b == b"fail" => Err(crate::error::system(
+                "the metadata endpoint timed out",
+                &["Retry later."],
+            )),
+            Some(b) => Ok(serde_json::json!({ "provider": String::from_utf8_lossy(&b) })),
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+}
+
+crate::register_facts!(ImdsFacts);
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -512,6 +788,7 @@ fn revision_with_vars(
         fleet,
         modules,
         var_files: files,
+        unloaded: Vec::new(),
     })
 }
 
@@ -519,6 +796,7 @@ fn facts(tree: serde_json::Value) -> Facts {
     Facts {
         tree,
         collected_at: HashMap::new(),
+        stale: Default::default(),
     }
 }
 
@@ -593,6 +871,13 @@ fn step<'a>(plan: &'a Plan, module: &str, key: &str) -> &'a Step {
     plan.steps()
         .find(|s| s.task.module == module && s.resource.key == key)
         .unwrap_or_else(|| panic!("no step {module}/{key} in {plan:#?}"))
+}
+
+fn indeterminate<'a>(plan: &'a Plan, module: &str) -> &'a crate::plan::Indeterminate {
+    plan.indeterminate
+        .iter()
+        .find(|i| i.module == module)
+        .unwrap_or_else(|| panic!("{module} is not indeterminate in {plan:#?}"))
 }
 
 fn module_names(plan: &Plan) -> Vec<&str> {
@@ -734,11 +1019,19 @@ async fn var_reference_cycles_are_user_errors_naming_the_cycle() {
             "name: m\nvars: { a: '{{ vars.b }}', b: '{{ vars.c }}', c: '{{ vars.a }}' }\ntasks: [ { test.file: { path: /x, content: '{{ vars.a }}' } } ]\n",
         )],
     );
-    let err = plan_err(&inputs(rev, &FakeSystem::new())).await;
-    assert!(err.is(crate::error::Kind::User));
-    let msg = err.message();
-    assert!(msg.contains("cycle"), "{msg}");
-    assert!(msg.contains("a -> b -> c -> a"), "{msg}");
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    let broken = indeterminate(&plan, "m");
+    assert!(
+        broken.plan_error,
+        "a selected module with broken vars is a plan error for that module"
+    );
+    assert!(broken.reason.contains("cycle"), "{}", broken.reason);
+    assert!(
+        broken.reason.contains("a -> b -> c -> a"),
+        "{}",
+        broken.reason
+    );
+    assert!(plan.modules.is_empty());
 }
 
 #[tokio::test]
@@ -750,8 +1043,10 @@ async fn undefined_var_and_secret_references_in_vars_are_user_errors() {
             "name: m\nvars: { a: '{{ vars.nope }}' }\ntasks: [ { test.file: { path: /x } } ]\n",
         )],
     );
-    let err = plan_err(&inputs(rev, &FakeSystem::new())).await;
-    assert!(err.message().contains("vars.nope"), "{}", err.message());
+    let plan = self::plan(&inputs(rev, &FakeSystem::new())).await;
+    let broken = indeterminate(&plan, "m");
+    assert!(broken.plan_error);
+    assert!(broken.reason.contains("vars.nope"), "{}", broken.reason);
 
     let rev = revision(
         "r1",
@@ -768,14 +1063,21 @@ async fn undefined_var_and_secret_references_in_vars_are_user_errors() {
         &InstallKey::from_bytes([1; 32]),
     ));
     inputs.secrets = Arc::new(store);
-    let err = plan_err(&inputs).await;
-    assert!(err.is(crate::error::Kind::User));
-    assert!(!err.message().contains("hunter2-vars"), "{}", err.message());
+    let plan = self::plan(&inputs).await;
+    let broken = indeterminate(&plan, "m");
+    assert!(broken.plan_error);
+    let json = serde_json::to_string(&plan).unwrap();
+    assert!(!json.contains("hunter2-vars"), "{json}");
     assert!(
-        err.message().contains("could not be rendered"),
+        broken.reason.contains("could not be rendered"),
         "{}",
-        err.message()
+        broken.reason
     );
+    // Applying reports the module as failed without running anything.
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(!outcome.succeeded);
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Failed);
+    assert_eq!(outcome.failed_module.as_deref(), Some("m"));
 }
 
 #[tokio::test]
@@ -837,6 +1139,245 @@ async fn server_labels_override_agent_labels_in_selection() {
     inputs.server_labels = labels(&[("role", serde_json::json!("worker"))]);
     let plan = plan(&inputs).await;
     assert_eq!(module_names(&plan), vec!["workers"]);
+}
+
+// ---------------------------------------------------------------------------
+// Uncertain selection never removes anything
+// ---------------------------------------------------------------------------
+
+/// A host whose IMDS provider fails, with records for every module below.
+fn uncertain_inputs(rev: Arc<Revision>, sys: &FakeSystem, modules: &[&str]) -> Inputs {
+    let mut state = State::default();
+    for m in modules {
+        state.record(record_for(
+            m,
+            "test.file",
+            &format!("/unc/{m}"),
+            RemovalPolicy::Cleanup,
+            "r0",
+        ));
+        let _ = sys
+            .clone()
+            .with_file(format!("/unc/{m}"), "", FilePerms::mode(0o644));
+    }
+    let mut inputs = inputs_with_store(rev, sys, Arc::new(MemoryStateStore::with(state)));
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    inputs
+}
+
+#[tokio::test]
+async fn a_failing_fact_provider_makes_dependent_selection_indeterminate_not_unselected() {
+    let rev = revision(
+        "r1",
+        r#"
+version: 2
+fleet:
+  groups:
+    cloud: 'host.facts.test.imds.provider == "oci"'
+    home: 'host.labels.site == "home"'
+"#,
+        vec![
+            module(
+                "name: oci\nwhen: 'host.facts.test.imds.provider == \"oci\"'\ntasks: [ { test.file: { path: /unc/oci } } ]\n",
+            ),
+            module(
+                "name: cloud\nwhen: 'host.groups contains \"cloud\"'\ntasks: [ { test.file: { path: /unc/cloud } } ]\n",
+            ),
+            module(
+                "name: home\nwhen: 'host.groups contains \"home\"'\ntasks: [ { test.file: { path: /unc/home } } ]\n",
+            ),
+            module("name: after\nneeds: [oci]\ntasks: [ { test.file: { path: /unc/after } } ]\n"),
+        ],
+    );
+    let sys = FakeSystem::new().with_file("/facts/imds", "fail", FilePerms::mode(0o644));
+    let inputs = uncertain_inputs(rev, &sys, &["oci", "cloud", "home", "after"]);
+    let (plan, facts) = Engine::plan(&inputs).await.unwrap();
+    assert!(facts.stale.contains("test.imds"));
+    let names: Vec<&str> = plan
+        .indeterminate
+        .iter()
+        .map(|i| i.module.as_str())
+        .collect();
+    assert_eq!(names, vec!["after", "cloud", "oci"]);
+    assert!(plan.indeterminate.iter().all(|i| !i.plan_error));
+    assert!(
+        indeterminate(&plan, "oci")
+            .reason
+            .contains("host.facts.test.imds"),
+        "{plan:#?}"
+    );
+    assert!(
+        indeterminate(&plan, "cloud").reason.contains("cloud"),
+        "{plan:#?}"
+    );
+    assert!(
+        indeterminate(&plan, "after").reason.contains("needs 'oci'"),
+        "{plan:#?}"
+    );
+    assert_eq!(
+        plan.skipped,
+        vec!["home"],
+        "a decidable selector is still decided"
+    );
+    let removed: Vec<String> = plan
+        .removals
+        .iter()
+        .map(|r| r.resource.to_string())
+        .collect();
+    assert_eq!(removed, vec!["home/test.file[/unc/home]"]);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("'oci' is indeterminate")),
+        "{:?}",
+        plan.warnings
+    );
+
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(
+        outcome.succeeded,
+        "indeterminate modules are reported, not failed: {outcome:#?}"
+    );
+    assert_eq!(status_of(&outcome, "oci"), ModuleStatus::Indeterminate);
+    assert!(sys.exists("/unc/oci") && sys.exists("/unc/cloud") && sys.exists("/unc/after"));
+    let state = inputs.state.load().unwrap();
+    for m in ["oci", "cloud", "after"] {
+        assert!(
+            state
+                .get(&ResourceKey::new(m, "test.file", format!("/unc/{m}")))
+                .is_some(),
+            "{m} keeps its record"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_provider_failure_after_a_good_collection_keeps_selecting_on_the_last_value() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: oci\nwhen: 'host.facts.test.imds.provider == \"oci\"'\ntasks: [ { test.file: { path: /unc/oci } } ]\n",
+        )],
+    );
+    let sys = FakeSystem::new().with_file("/facts/imds", "fail", FilePerms::mode(0o644));
+    let mut inputs = uncertain_inputs(rev, &sys, &["oci"]);
+    let mut seeded = Facts::new();
+    seeded.mount(
+        "test.imds",
+        serde_json::json!({"provider": "oci"}),
+        sys.now() - chrono::Duration::days(1),
+    );
+    inputs.facts = seeded;
+    let (plan, facts) = Engine::plan(&inputs).await.unwrap();
+    assert!(facts.stale.contains("test.imds"));
+    assert_eq!(facts.tree["test"]["imds"]["provider"], "oci");
+    assert!(plan.indeterminate.is_empty(), "{plan:#?}");
+    assert_eq!(module_names(&plan), vec!["oci"]);
+    assert!(plan.removals.is_empty());
+}
+
+#[tokio::test]
+async fn a_task_when_reading_unavailable_facts_keeps_the_resource_unplanned() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /unc/m }\n    when: 'host.facts.test.imds.provider == \"oci\"'\n  - test.file: { path: /unc/plain }\n",
+        )],
+    );
+    let sys = FakeSystem::new().with_file("/facts/imds", "fail", FilePerms::mode(0o644));
+    let inputs = uncertain_inputs(rev, &sys, &["m"]);
+    let plan = plan(&inputs).await;
+    let keys: Vec<&str> = plan.steps().map(|s| s.resource.key.as_str()).collect();
+    assert_eq!(keys, vec!["/unc/plain"]);
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("/unc/m") && w.contains("cannot be decided")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+#[rstest]
+#[case::bare_when_true(None, true)]
+#[case::when_reads_vars(Some("vars.enabled == true"), false)]
+#[tokio::test]
+async fn a_module_whose_vars_fail_to_render_keeps_its_resources(
+    #[case] when: Option<&str>,
+    #[case] plan_error: bool,
+) {
+    let when = when.map(|w| format!("when: '{w}'\n")).unwrap_or_default();
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(&format!(
+                "name: m\n{when}vars: {{ enabled: true, a: '{{{{ vars.nope }}}}' }}\ntasks: [ {{ test.file: {{ path: /unc/m }} }} ]\n"
+            )),
+            module("name: n\nneeds: [m]\ntasks: [ { test.file: { path: /unc/n } } ]\n"),
+        ],
+    );
+    let sys = FakeSystem::new();
+    let mut inputs = uncertain_inputs(rev, &sys, &["m", "n"]);
+    inputs.facts_frozen = true;
+    let plan = plan(&inputs).await;
+    assert_eq!(
+        indeterminate(&plan, "m").plan_error,
+        plan_error,
+        "{plan:#?}"
+    );
+    assert!(indeterminate(&plan, "n").reason.contains("needs 'm'"));
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert_eq!(outcome.succeeded, !plan_error, "{outcome:#?}");
+    assert!(sys.exists("/unc/m") && sys.exists("/unc/n"));
+    assert_eq!(inputs.state.load().unwrap().resources.len(), 2);
+}
+
+#[tokio::test]
+async fn a_module_directory_without_module_yaml_keeps_its_resources() {
+    let mut rev = Arc::try_unwrap(revision("r1", FLEET, vec![module("name: other\n")])).unwrap();
+    rev.unloaded = vec!["half".into()];
+    let rev = Arc::new(rev);
+    let sys = FakeSystem::new();
+    let mut inputs = uncertain_inputs(rev, &sys, &["half"]);
+    inputs.facts_frozen = true;
+    let plan = plan(&inputs).await;
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert!(indeterminate(&plan, "half").reason.contains("module.yaml"));
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert!(sys.exists("/unc/half"));
+}
+
+#[tokio::test]
+async fn removals_can_be_listed_but_not_applied() {
+    let rev = revision("r1", FLEET, vec![module("name: other\n")]);
+    let sys = FakeSystem::new();
+    let mut inputs = uncertain_inputs(rev, &sys, &["gone"]);
+    inputs.facts_frozen = true;
+    let inputs = inputs.with_removals(false);
+    let plan = plan(&inputs).await;
+    assert_eq!(plan.removals.len(), 1);
+    let (outcome, events) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(outcome.removals, 0);
+    assert!(sys.exists("/unc/gone"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::RemovalRun { .. }))
+    );
+    assert_eq!(inputs.state.load().unwrap().resources.len(), 1);
+    // The same plan applied with removals enabled removes it.
+    let inputs = inputs.with_removals(true);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert_eq!(outcome.removals, 1);
+    assert!(!sys.exists("/unc/gone"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,6 +1684,134 @@ async fn handlers_dedupe_order_and_subsume_and_may_belong_to_other_modules() {
     );
 }
 
+fn handler_calls(run: &str) -> Vec<String> {
+    calls(run)
+        .into_iter()
+        .filter(|c| c.starts_with("handler") || c.starts_with("apply:end"))
+        .collect()
+}
+
+#[tokio::test]
+async fn handlers_run_only_when_a_notifying_step_really_changed() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /hc/a, run: hand3, unchanged: true }\n    notify: [restart]\nhandlers:\n  restart: { systemd.restart: { name: m, run: hand3 } }\n",
+        )],
+    );
+    let (outcome, events) = apply(&inputs(rev, &FakeSystem::new())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert!(handler_calls("hand3").is_empty(), "{:?}", calls("hand3"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::HandlerRun { .. }))
+    );
+}
+
+#[tokio::test]
+async fn handlers_dedupe_by_kind_and_target_across_declarations() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: nomad\ntasks:\n  - test.file: { path: /hd/a, run: hand4 }\n    notify: [restart, docker:restart-nomad]\nhandlers:\n  restart: { systemd.restart: { name: nomad, run: hand4 } }\n",
+            ),
+            module(
+                "name: docker\nhandlers:\n  restart-nomad: { systemd.restart: { name: nomad, run: hand4 } }\n",
+            ),
+        ],
+    );
+    let (outcome, _) = apply(&inputs(rev, &FakeSystem::new())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    let restarts: Vec<String> = calls("hand4")
+        .into_iter()
+        .filter(|c| c.starts_with("handler"))
+        .collect();
+    assert_eq!(restarts, vec!["handler nomad:systemd.restart nomad"]);
+}
+
+#[tokio::test]
+async fn a_handler_of_a_later_module_runs_once_at_the_end_of_that_module() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: common\ntasks:\n  - test.file: { path: /hl/common, run: hand5 }\n    notify: [nomad:restart]\n",
+            ),
+            module(
+                "name: nomad\nneeds: [common]\ntasks:\n  - test.file: { path: /hl/nomad, run: hand5 }\n    notify: [restart]\nhandlers:\n  restart: { systemd.restart: { name: nomad, run: hand5 } }\n",
+            ),
+        ],
+    );
+    let inputs = inputs(rev, &FakeSystem::new());
+    let plan = plan(&inputs).await;
+    let common = plan.modules.iter().find(|m| m.module == "common").unwrap();
+    let nomad = plan.modules.iter().find(|m| m.module == "nomad").unwrap();
+    assert!(common.handlers.is_empty(), "{:#?}", common.handlers);
+    assert_eq!(nomad.handlers.len(), 1, "{:#?}", nomad.handlers);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(
+        handler_calls("hand5"),
+        vec![
+            "apply:end common//hl/common",
+            "apply:end nomad//hl/nomad",
+            "handler nomad:systemd.restart nomad",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn removing_a_task_runs_the_handlers_it_notified() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let handlers = "handlers:\n  restart: { systemd.restart: { name: svc, run: hand6 } }\n";
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(&format!(
+            "name: m\ntasks:\n  - test.file: {{ path: /hr/conf, run: hand6 }}\n    notify: [restart]\n{handlers}"
+        ))],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .notifies_of(&ResourceKey::new("m", "test.file", "/hr/conf")),
+        &["m:restart".to_string()]
+    );
+    let before = calls("hand6")
+        .iter()
+        .filter(|c| c.starts_with("handler"))
+        .count();
+
+    let r2 = revision("r2", FLEET, vec![module(&format!("name: m\n{handlers}"))]);
+    let (outcome, events) = apply(&inputs_with_store(r2, &sys, store.clone())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(outcome.removals, 1);
+    assert!(!sys.exists("/hr/conf"));
+    assert_eq!(
+        calls("hand6")
+            .iter()
+            .filter(|c| c.starts_with("handler"))
+            .count(),
+        before + 1,
+        "the removal ran the handler its task notified"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::HandlerRun { handler, .. } if handler == "restart"))
+    );
+    assert!(store.load().unwrap().notifies.is_empty());
+}
+
 #[tokio::test]
 async fn a_failing_handler_fails_its_module() {
     let rev = revision(
@@ -1220,6 +1889,142 @@ async fn modules_needing_fresh_facts_are_deferred_in_plan_and_resolved_in_apply(
     assert_eq!(step(&plan2, "q", "/defer/out").planned, Planned::NoOp);
 }
 
+#[tokio::test]
+async fn a_first_install_defers_modules_whose_vars_read_facts_a_provider_will_produce() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: p\nfacts: { provides: [test.counter] }\ntasks: [ { test.file: { path: /facts/counter, content: \"10.0.0.7\", run: lazy1 } } ]\n",
+            ),
+            module(
+                "name: q\nneeds: [p]\nvars: { addr: '{{ host.facts.test.counter.value }}' }\ntasks: [ { test.file: { path: /lazy/q, content: 'bind={{ vars.addr }}', run: lazy1 } } ]\n",
+            ),
+        ],
+    );
+    let sys = FakeSystem::new().with_file("/lazy/old", "x", FilePerms::mode(0o644));
+    let mut state = State::default();
+    state.record(record_for(
+        "q",
+        "test.file",
+        "/lazy/old",
+        RemovalPolicy::Cleanup,
+        "r0",
+    ));
+    let mut inputs = inputs_with_store(rev, &sys, Arc::new(MemoryStateStore::with(state)));
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let plan = plan(&inputs).await;
+    assert!(plan.indeterminate.is_empty(), "{:#?}", plan.indeterminate);
+    assert_eq!(plan.deferred.len(), 1, "{plan:#?}");
+    assert_eq!(plan.deferred[0].module, "q");
+    assert!(
+        plan.removals.is_empty(),
+        "a deferred module's resources wait for its plan"
+    );
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(sys.file_string("/lazy/q").as_deref(), Some("bind=10.0.0.7"));
+    assert!(
+        !sys.exists("/lazy/old"),
+        "its orphans are computed in the same run"
+    );
+    assert_eq!(outcome.removals, 1);
+}
+
+#[tokio::test]
+async fn a_task_excluded_by_when_never_renders_its_fields() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: '/when/{{ vars.only_on_db }}' }\n    when: 'host.labels.role == \"db\"'\n  - test.file: { path: /when/plain }\n",
+        )],
+    );
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    assert!(plan.indeterminate.is_empty(), "{:#?}", plan.indeterminate);
+    let keys: Vec<&str> = plan.steps().map(|s| s.resource.key.as_str()).collect();
+    assert_eq!(keys, vec!["/when/plain"]);
+}
+
+#[rstest]
+#[case::selected_after_the_refresh("42", true)]
+#[case::unselected_after_the_refresh("41", false)]
+#[tokio::test]
+async fn a_when_reading_provider_facts_is_decided_after_the_provider_applies(
+    #[case] value: &str,
+    #[case] selected: bool,
+) {
+    let run = format!("cond-{value}");
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(&format!(
+                "name: p\nfacts: {{ provides: [test.counter] }}\ntasks: [ {{ test.file: {{ path: /facts/counter, content: \"{value}\", run: {run} }} }} ]\n"
+            )),
+            module(&format!(
+                "name: r\nwhen: 'host.facts.test.counter.value == \"42\"'\ntasks: [ {{ test.file: {{ path: /cond/{value}, content: r, run: {run} }} }} ]\n"
+            )),
+        ],
+    );
+    let sys = FakeSystem::new().with_file(format!("/cond/{value}"), "old", FilePerms::mode(0o644));
+    let mut state = State::default();
+    state.record(record_for(
+        "r",
+        "test.file",
+        &format!("/cond/{value}"),
+        RemovalPolicy::Cleanup,
+        "r0",
+    ));
+    let mut inputs = inputs_with_store(rev, &sys, Arc::new(MemoryStateStore::with(state)));
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let plan = plan(&inputs).await;
+    assert_eq!(plan.deferred.len(), 1, "{plan:#?}");
+    assert!(
+        plan.deferred[0].reason.contains("decided once"),
+        "{:?}",
+        plan.deferred
+    );
+    assert!(
+        plan.removals.is_empty(),
+        "not removed on a guess: {:#?}",
+        plan.removals
+    );
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    if selected {
+        assert_eq!(status_of(&outcome, "r"), ModuleStatus::Applied);
+        assert_eq!(
+            sys.file_string(format!("/cond/{value}")).as_deref(),
+            Some("r")
+        );
+    } else {
+        assert_eq!(status_of(&outcome, "r"), ModuleStatus::Skipped);
+        assert!(
+            !sys.exists(format!("/cond/{value}")),
+            "decided unselected: its resources go"
+        );
+        assert_eq!(outcome.removals, 1);
+    }
+}
+
+#[tokio::test]
+async fn rendered_fields_take_the_type_the_kind_declares() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\nvars: { n: 2 }\ntasks: [ { test.file: { path: /typed, sleep_ms: '{{ vars.n }}', fail_times: '{{ vars.n - 2 }}' } } ]\n",
+        )],
+    );
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    assert!(plan.indeterminate.is_empty(), "{:#?}", plan.indeterminate);
+    assert_eq!(plan.changes(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Tasks: keys, when, select, platforms, always-runs
 // ---------------------------------------------------------------------------
@@ -1233,13 +2038,14 @@ async fn duplicate_resource_keys_are_user_errors_naming_both_tasks() {
             "name: m\ntasks:\n  - test.file: { path: /dup }\n  - test.file: { path: /other }\n  - test.file: { path: /dup }\n    name: second\n",
         )],
     );
-    let err = plan_err(&inputs(rev, &FakeSystem::new())).await;
-    assert!(err.is(crate::error::Kind::User));
-    let msg = err.message();
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    let broken = indeterminate(&plan, "m");
+    assert!(broken.plan_error);
+    let msg = &broken.reason;
     assert!(msg.contains("task #1"), "{msg}");
     assert!(msg.contains("task #3 'second'"), "{msg}");
     assert!(msg.contains("m/test.file[/dup]"), "{msg}");
-    assert!(err.advice().iter().any(|a| a.contains("`id`")));
+    assert!(msg.contains("`id`"), "the advice is kept: {msg}");
 }
 
 #[tokio::test]
@@ -1309,36 +2115,36 @@ tasks:
 }
 
 #[tokio::test]
-async fn unsupported_platforms_block_steps_and_are_warned_about() {
+async fn a_task_kind_the_platform_does_not_support_is_a_plan_error_for_its_module() {
     let rev = revision(
         "r1",
         FLEET,
-        vec![module(
-            "name: m\ntasks:\n  - test.linux: { path: /plat/linux-only, run: plat1 }\n  - test.file: { path: /plat/any, run: plat1 }\n",
-        )],
+        vec![
+            module(
+                "name: m\ntasks:\n  - test.linux: { path: /plat/linux-only, run: plat1 }\n  - test.file: { path: /plat/any, run: plat1 }\n",
+            ),
+            module(
+                "name: guarded\ntasks:\n  - test.linux: { path: /plat/guarded, run: plat1 }\n    when: 'host.labels.os == \"linux\"'\n  - test.file: { path: /plat/other, run: plat1 }\n",
+            ),
+        ],
     );
     let sys = FakeSystem::new().with_platform(Platform::MacOs);
     let inputs = inputs(rev, &sys);
     let plan = plan(&inputs).await;
-    match &step(&plan, "m", "/plat/linux-only").planned {
-        Planned::Blocked { reason } => assert!(reason.contains("macos"), "{reason}"),
-        other => panic!("expected blocked, got {other:?}"),
-    }
-    assert!(
-        plan.warnings.iter().any(|w| w.contains("blocked")),
-        "{:?}",
-        plan.warnings
+    let m = indeterminate(&plan, "m");
+    assert!(m.plan_error);
+    assert!(m.reason.contains("test.linux"), "{}", m.reason);
+    assert!(m.reason.contains("macos"), "{}", m.reason);
+    assert_eq!(
+        module_names(&plan),
+        vec!["guarded"],
+        "a `when` can exclude the platform"
     );
-    assert_eq!(plan.changes(), 1);
     let (outcome, _) = apply_plan(&inputs, &plan).await;
-    assert!(outcome.succeeded);
-    assert!(!sys.exists("/plat/linux-only"));
-    assert!(sys.exists("/plat/any"));
-    assert!(
-        !calls("plat1")
-            .iter()
-            .any(|c| c.contains("linux-only") && c.starts_with("apply"))
-    );
+    assert!(!outcome.succeeded);
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Failed);
+    assert!(!sys.exists("/plat/linux-only") && !sys.exists("/plat/any"));
+    assert!(sys.exists("/plat/other"));
 }
 
 #[tokio::test]
@@ -1353,22 +2159,17 @@ tasks:
   - test.file: { path: /tool/bin, content: bin, run: blk1 }
   - test.file: { path: /tool/conf, content: conf, run: blk1, requires: /tool/bin }
     notify: [restart]
-  - test.linux: { path: /tool/mac, run: blk1 }
 handlers:
   restart: { systemd.restart: { name: tool, run: blk1 } }
 "#,
         )],
     );
-    let sys = FakeSystem::new().with_platform(Platform::MacOs);
+    let sys = FakeSystem::new();
     let inputs = inputs(rev, &sys);
     let plan = plan(&inputs).await;
     assert!(
         matches!(&step(&plan, "m", "/tool/conf").planned, Planned::Blocked { reason } if reason.contains("/tool/bin"))
     );
-    assert!(matches!(
-        step(&plan, "m", "/tool/mac").planned,
-        Planned::Blocked { .. }
-    ));
     assert!(
         plan.modules[0].handlers.is_empty(),
         "nothing changed at plan time notifies the handler"
@@ -1379,12 +2180,6 @@ handlers:
         .find(|w| w.contains("/tool/conf"))
         .unwrap();
     assert!(conf_warning.contains("planned again"), "{conf_warning}");
-    let mac_warning = plan
-        .warnings
-        .iter()
-        .find(|w| w.contains("/tool/mac"))
-        .unwrap();
-    assert!(!mac_warning.contains("planned again"), "{mac_warning}");
 
     let (outcome, events) = apply_plan(&inputs, &plan).await;
     assert!(outcome.succeeded, "{outcome:#?}");
@@ -1393,10 +2188,6 @@ handlers:
         "the blocked step was planned again and applied"
     );
     assert_eq!(sys.file_string("/tool/conf").as_deref(), Some("conf"));
-    assert!(
-        !sys.exists("/tool/mac"),
-        "platform-blocked steps are never planned again"
-    );
     assert!(
         calls("blk1").contains(&"handler m:systemd.restart tool".to_string()),
         "{:?}",
@@ -1428,8 +2219,28 @@ tasks:
         )],
     );
     let sys = FakeSystem::new();
-    let (outcome, _) = apply(&inputs(rev, &sys)).await;
-    assert!(outcome.succeeded);
+    let store = Arc::new(MemoryStateStore::default());
+    let (outcome, _) = apply(&inputs_with_store(rev, &sys, store.clone())).await;
+    assert!(
+        !outcome.succeeded,
+        "a step left blocked needs attention: {outcome:#?}"
+    );
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Blocked);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("/tool2/bin is not installed"),
+        "{outcome:#?}"
+    );
+    assert!(outcome.rolled_back_modules.is_empty());
+    let state = store.load().unwrap();
+    assert_eq!(state.applied_revision, None);
+    assert_eq!(
+        state.runs.last().unwrap().outcome,
+        crate::state::RunOutcome::NeedsAttention
+    );
     assert_eq!(outcome.changes, 0);
     assert!(!sys.exists("/tool2/conf"));
     assert_eq!(
@@ -1440,6 +2251,51 @@ tasks:
         2,
         "plan, then the apply's stale check; no re-plan"
     );
+}
+
+#[tokio::test]
+async fn a_blocked_step_that_plans_a_deletion_once_unblocked_stays_blocked() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /tool3/bin, content: bin, run: blk3 }\n  - test.file: { path: /tool3/victim, run: blk3, requires: /tool3/bin, delete: true }\n",
+        )],
+    );
+    let sys = FakeSystem::new().with_file("/tool3/victim", "precious", FilePerms::mode(0o644));
+    let inputs = inputs(rev, &sys);
+    let plan = plan(&inputs).await;
+    assert!(!plan.is_destructive(), "the reviewed plan deletes nothing");
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(!outcome.succeeded, "{outcome:#?}");
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Blocked);
+    assert!(
+        outcome.error.as_deref().unwrap_or("").contains("deletion"),
+        "{outcome:#?}"
+    );
+    assert_eq!(
+        sys.file_string("/tool3/victim").as_deref(),
+        Some("precious")
+    );
+    assert_eq!(outcome.changes, 1, "only the reviewed change ran");
+}
+
+#[tokio::test]
+async fn after_is_rejected_rather_than_silently_ignored() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /af/a }\n    id: a\n  - test.file: { path: /af/b }\n    after: [a]\n",
+        )],
+    );
+    let report = validate(&rev).unwrap();
+    assert!(
+        report.errors.iter().any(|e| e.message.contains("`after:`")),
+        "{report}"
+    );
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    assert!(indeterminate(&plan, "m").reason.contains("`after:`"));
 }
 
 #[tokio::test]
@@ -1587,6 +2443,179 @@ async fn orphans_become_removals_with_policy_caution_and_origin() {
     );
 }
 
+#[rstest]
+#[case::kind_default(None, None, "test.file", RemovalPolicy::Cleanup)]
+#[case::module_policy_beats_kind(Some("leave"), None, "test.file", RemovalPolicy::Leave)]
+#[case::task_beats_module(Some("leave"), Some("cleanup"), "test.file", RemovalPolicy::Cleanup)]
+#[case::kind_default_leave(None, None, "test.kept", RemovalPolicy::Leave)]
+#[case::module_cleanup_beats_kind_leave(Some("cleanup"), None, "test.kept", RemovalPolicy::Cleanup)]
+#[tokio::test]
+async fn removal_policy_is_task_then_module_then_kind(
+    #[case] module_policy: Option<&str>,
+    #[case] task_policy: Option<&str>,
+    #[case] kind: &str,
+    #[case] expected: RemovalPolicy,
+) {
+    let module_removal = module_policy
+        .map(|p| format!("removal: {{ policy: {p} }}\n"))
+        .unwrap_or_default();
+    let task_removal = task_policy
+        .map(|p| format!("    removal: {p}\n"))
+        .unwrap_or_default();
+    let yaml =
+        format!("name: m\n{module_removal}tasks:\n  - {kind}: {{ path: /pol/x }}\n{task_removal}");
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let inputs = inputs_with_store(
+        revision("r1", FLEET, vec![module(&yaml)]),
+        &sys,
+        store.clone(),
+    );
+    let plan = plan(&inputs).await;
+    assert_eq!(step(&plan, "m", "/pol/x").removal, expected);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+
+    // Dropping the task removes or releases the file according to the policy.
+    let inputs = inputs_with_store(
+        revision("r2", FLEET, vec![module("name: m\n")]),
+        &sys,
+        store,
+    );
+    let plan = self::plan(&inputs).await;
+    assert_eq!(plan.removals[0].policy, expected);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert_eq!(sys.exists("/pol/x"), expected == RemovalPolicy::Leave);
+}
+
+// ---------------------------------------------------------------------------
+// Moved and re-keyed tasks are taken over, not removed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_task_moved_between_modules_keeps_its_resource_and_record() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![
+            module("name: a\ntasks: [ { test.file: { path: /mv/x, content: same, run: mv1 } } ]\n"),
+            module("name: b\n"),
+        ],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+
+    let r2 = revision(
+        "r2",
+        FLEET,
+        vec![
+            module("name: a\n"),
+            module("name: b\ntasks: [ { test.file: { path: /mv/x, content: same, run: mv1 } } ]\n"),
+        ],
+    );
+    let inputs = inputs_with_store(r2, &sys, store.clone());
+    let plan = plan(&inputs).await;
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert_eq!(plan.rehomed.len(), 1);
+    assert_eq!(plan.rehomed[0].kind, crate::plan::RehomeKind::Moved);
+    assert_eq!(plan.rehomed[0].to.to_string(), "b/test.file[/mv/x]");
+    assert_eq!(step(&plan, "b", "/mv/x").planned, Planned::NoOp);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert_eq!(sys.file_string("/mv/x").as_deref(), Some("same"));
+    let state = store.load().unwrap();
+    let keys: Vec<&String> = state.resources.keys().collect();
+    assert_eq!(keys, vec!["b/test.file[/mv/x]"]);
+    assert_eq!(
+        state.resources["b/test.file[/mv/x]"].introduced_in,
+        RevisionId::new("r1"),
+        "the moved record keeps its origin"
+    );
+    assert!(!calls("removals").iter().any(|c| c.contains("/mv/x")));
+}
+
+#[tokio::test]
+async fn a_task_changing_kind_for_the_same_path_is_not_deleted() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /mv/y, content: one, run: mv2 } } ]\n",
+        )],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+
+    // As file.copy → file.template of the same destination.
+    let r2 = revision(
+        "r2",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.locked: { path: /mv/y, content: two, run: mv2 } } ]\n",
+        )],
+    );
+    let inputs = inputs_with_store(r2, &sys, store.clone());
+    let plan = plan(&inputs).await;
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert_eq!(plan.rehomed[0].kind, crate::plan::RehomeKind::Superseded);
+    assert!(
+        plan.rehomed[0].summary.contains("path /mv/y"),
+        "{}",
+        plan.rehomed[0].summary
+    );
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(sys.file_string("/mv/y").as_deref(), Some("two"));
+    let state = store.load().unwrap();
+    let keys: Vec<&String> = state.resources.keys().collect();
+    assert_eq!(keys, vec!["m/test.locked[/mv/y]"]);
+    assert!(!calls("removals").iter().any(|c| c.contains("/mv/y")));
+}
+
+#[rstest]
+#[case::without_id(None, true)]
+#[case::with_id(Some("install-tool"), false)]
+#[tokio::test]
+async fn bumping_a_var_inside_a_command_only_undoes_it_when_the_task_has_no_id(
+    #[case] id: Option<&str>,
+    #[case] orphaned: bool,
+) {
+    let id_line = id.map(|i| format!("    id: {i}\n")).unwrap_or_default();
+    let yaml = |version: &str| {
+        format!(
+            "name: m\nvars: {{ v: '{version}' }}\ntasks:\n  - command.run: {{ run: [install, 'tool-{{{{ vars.v }}}}'], remove: [uninstall, tool], log: cmd-{} }}\n{id_line}",
+            id.unwrap_or("none")
+        )
+    };
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision("r1", FLEET, vec![module(&yaml("1.0"))]);
+    let report = validate(&r1).unwrap();
+    assert_eq!(
+        report.errors.iter().any(|e| e.message.contains("`id`")),
+        orphaned,
+        "{report}"
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+
+    let r2 = revision("r2", FLEET, vec![module(&yaml("1.1"))]);
+    let plan = plan(&inputs_with_store(r2, &sys, store)).await;
+    assert_eq!(!plan.removals.is_empty(), orphaned, "{:#?}", plan.removals);
+    assert_eq!(
+        plan.warnings.iter().any(|w| w.contains("`id`")),
+        orphaned,
+        "{:?}",
+        plan.warnings
+    );
+    assert_eq!(plan.changes(), 1);
+}
+
 #[tokio::test]
 async fn state_persists_across_runs_so_removed_modules_become_orphans() {
     let sys = FakeSystem::new();
@@ -1629,6 +2658,100 @@ async fn state_persists_across_runs_so_removed_modules_become_orphans() {
     assert_eq!(state.resources.len(), 1);
     assert_eq!(state.runs.len(), 2);
     assert_eq!(state.applied_revision, Some(RevisionId::new("r2")));
+}
+
+/// A store that keeps every snapshot it was asked to save, optionally
+/// failing every save.
+#[derive(Default)]
+struct RecordingStore {
+    snapshots: Mutex<Vec<State>>,
+    fail: bool,
+}
+
+impl crate::state::StateStore for RecordingStore {
+    fn load(&self) -> crate::Result<State> {
+        Ok(self
+            .snapshots
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default())
+    }
+    fn save(&self, state: &State) -> crate::Result<()> {
+        if self.fail {
+            return Err(crate::error::system(
+                "the disk is full",
+                &["Free some space."],
+            ));
+        }
+        self.snapshots.lock().unwrap().push(state.clone());
+        Ok(())
+    }
+}
+
+fn three_step_inputs(sys: &FakeSystem, store: Arc<RecordingStore>) -> Inputs {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m
+tasks:
+  - test.file: { path: /sv/1 }
+  - test.file: { path: /sv/2 }
+  - test.file: { path: /sv/3 }
+",
+        )],
+    );
+    Inputs::new(
+        rev,
+        HostIdentity {
+            id: "h1".into(),
+            labels: Labels::new(),
+        },
+        Arc::new(sys.clone()),
+        Arc::new(SecretStore::new()),
+        store,
+    )
+    .with_frozen_facts(default_facts())
+}
+
+#[tokio::test]
+async fn state_is_saved_after_every_step() {
+    let store = Arc::new(RecordingStore::default());
+    let (outcome, _) = apply(&three_step_inputs(&FakeSystem::new(), store.clone())).await;
+    assert!(outcome.succeeded);
+    let counts: Vec<usize> = store
+        .snapshots
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.resources.len())
+        .collect();
+    assert!(counts.starts_with(&[1, 2, 3]), "{counts:?}");
+}
+
+#[tokio::test]
+async fn a_failed_state_save_is_reported_without_failing_the_apply() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(RecordingStore {
+        fail: true,
+        ..Default::default()
+    });
+    let (outcome, _) = apply(&three_step_inputs(&sys, store)).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(outcome.changes, 3);
+    let error = outcome.error.unwrap_or_default();
+    assert!(
+        error.contains("could not be saved") && error.contains("disk is full"),
+        "{error}"
+    );
+    assert_eq!(
+        error.matches("could not be saved").count(),
+        1,
+        "reported once: {error}"
+    );
+    assert!(sys.exists("/sv/3"));
 }
 
 #[tokio::test]
@@ -1862,6 +2985,121 @@ async fn a_failing_module_is_rolled_back_from_the_stable_revision_and_the_run_ha
 }
 
 #[tokio::test]
+async fn rollback_reapplies_the_stable_module_and_removes_what_the_failed_revision_added() {
+    let sys = FakeSystem::new();
+    let stable = revision(
+        "r0",
+        FLEET,
+        vec![module(
+            "name: b\ntasks: [ { test.file: { path: /rb2/b, content: stable, run: rb5 } } ]\n",
+        )],
+    );
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: b\ntasks:\n  - test.file: { path: /rb2/extra, content: x, run: rb5 }\n  - test.file: { path: /rb2/b, content: new, run: rb5, fail_times: 99 }\n",
+        )],
+    );
+    let store = Arc::new(MemoryStateStore::default());
+    let inputs = inputs_with_store(r1, &sys, store.clone()).with_stable_revision(Some(stable));
+    let (outcome, _) = apply(&inputs).await;
+    assert_eq!(outcome.rolled_back_modules, vec!["b"], "{outcome:#?}");
+    assert_eq!(sys.file_string("/rb2/b").as_deref(), Some("stable"));
+    assert!(
+        !sys.exists("/rb2/extra"),
+        "the resource only the failed revision wanted is removed by the rollback"
+    );
+    let state = store.load().unwrap();
+    let keys: Vec<&String> = state.resources.keys().collect();
+    assert_eq!(keys, vec!["b/test.file[/rb2/b]"]);
+    assert_eq!(state.module_revisions["b"], RevisionId::new("r0"));
+}
+
+#[tokio::test]
+async fn rollback_follows_the_stable_revisions_selection() {
+    let sys = FakeSystem::new();
+    // In the stable revision the module did not apply to this host at all.
+    let stable = revision(
+        "r0",
+        FLEET,
+        vec![module(
+            "name: b\nwhen: 'host.labels.role == \"other\"'\ntasks: [ { test.file: { path: /rb3/stable-only, content: s, run: rb6 } } ]\n",
+        )],
+    );
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: b\ntasks:\n  - test.file: { path: /rb3/new, content: n, run: rb6 }\n  - test.file: { path: /rb3/boom, run: rb6, fail_times: 99 }\n",
+        )],
+    );
+    let store = Arc::new(MemoryStateStore::default());
+    let inputs = inputs_with_store(r1, &sys, store.clone()).with_stable_revision(Some(stable));
+    let (outcome, _) = apply(&inputs).await;
+    assert_eq!(
+        status_of(&outcome, "b"),
+        ModuleStatus::RolledBack,
+        "{outcome:#?}"
+    );
+    assert!(
+        !sys.exists("/rb3/stable-only"),
+        "a module the stable revision does not select is not installed by its rollback"
+    );
+    assert!(
+        !sys.exists("/rb3/new"),
+        "what the failed revision added is removed"
+    );
+    assert!(store.load().unwrap().resources.is_empty());
+}
+
+#[tokio::test]
+async fn a_deferred_module_whose_planning_fails_is_not_rolled_back() {
+    let sys = FakeSystem::new();
+    let provider = "name: p\nfacts: { provides: [test.counter] }\ntasks: [ { test.file: { path: /facts/counter, content: \"7\", run: rb7 } } ]\n";
+    let stable = revision(
+        "r0",
+        FLEET,
+        vec![
+            module(provider),
+            module(
+                "name: q\nneeds: [p]\ntasks: [ { test.file: { path: /rb4/q, content: stable, run: rb7 } } ]\n",
+            ),
+        ],
+    );
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(provider),
+            module(
+                "name: q\nneeds: [p]\ntasks: [ { test.render: { src: missing.j2, dest: /rb4/q } } ]\n",
+            ),
+            module("name: z\nneeds: [q]\ntasks: [ { test.file: { path: /rb4/z, run: rb7 } } ]\n"),
+        ],
+    );
+    let mut inputs = inputs(r1, &sys).with_stable_revision(Some(stable));
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let plan = plan(&inputs).await;
+    assert_eq!(plan.deferred.len(), 2, "{plan:#?}");
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(!outcome.succeeded);
+    assert_eq!(status_of(&outcome, "q"), ModuleStatus::Failed);
+    assert!(outcome.rolled_back_modules.is_empty(), "{outcome:#?}");
+    assert!(!sys.exists("/rb4/q"), "the stable q never ran");
+    assert_eq!(status_of(&outcome, "z"), ModuleStatus::NotStarted);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("planning failed"),
+        "{outcome:#?}"
+    );
+}
+
+#[tokio::test]
 async fn without_a_stable_revision_a_failing_module_stays_failed() {
     let sys = FakeSystem::new();
     signal("rb2-release");
@@ -1872,6 +3110,238 @@ async fn without_a_stable_revision_a_failing_module_stays_failed() {
     assert!(outcome.rolled_back_modules.is_empty());
     assert_eq!(status_of(&outcome, "c"), ModuleStatus::NotStarted);
     assert!(!sys.exists("/rb/rb2/b"));
+}
+
+#[tokio::test]
+async fn rekeying_a_line_edit_from_its_line_to_its_regex_does_not_revert_it() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: ssh\ntasks: [ { test.line: { path: /lines/sshd, line: 'PasswordAuthentication no' } } ]\n",
+        )],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+    let r2 = revision(
+        "r2",
+        FLEET,
+        vec![module(
+            "name: ssh\ntasks: [ { test.line: { path: /lines/sshd, line: 'PasswordAuthentication no', regex: '^#?PasswordAuthentication' } } ]\n",
+        )],
+    );
+    let inputs = inputs_with_store(r2, &sys, store.clone());
+    let plan = plan(&inputs).await;
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert_eq!(plan.rehomed.len(), 1, "{plan:#?}");
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert!(!sys.exists("/lines/reverted"));
+    let keys: Vec<String> = store.load().unwrap().resources.keys().cloned().collect();
+    assert_eq!(
+        keys,
+        vec!["ssh/test.line[/lines/sshd: ^#?PasswordAuthentication]"]
+    );
+}
+
+#[tokio::test]
+async fn an_apply_that_changes_nothing_keeps_the_artefacts_already_recorded() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /own/a, content: one } } ]\n",
+        )],
+    );
+    apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    let r2 = revision(
+        "r2",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /own/a, content: two, unchanged: true } } ]\n",
+        )],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r2, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+    let record = store
+        .load()
+        .unwrap()
+        .get(&ResourceKey::new("m", "test.file", "/own/a"))
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        record.artefacts,
+        vec![Artefact::File {
+            path: "/own/a".into()
+        }]
+    );
+    assert_eq!(
+        record.shadow.as_ref().map(|s| s.get().as_str()),
+        Some("one")
+    );
+}
+
+#[tokio::test]
+async fn health_check_fields_marked_secret_keep_their_template_for_the_check() {
+    let rev = revision(
+        "r1",
+        "version: 2\nsecrets: { api_token: { env: API_TOKEN } }\n",
+        vec![module(
+            "name: m\nhealth:\n  - name: api\n    test.secret_header: { token: 'Bearer {{ secrets.api_token }}' }\n",
+        )],
+    );
+    let mut inputs = inputs(rev, &FakeSystem::new());
+    let mut secrets = SecretStore::new();
+    secrets.insert(Secret::new(
+        "api_token",
+        "hunter2-health".into(),
+        &InstallKey::from_bytes([3; 32]),
+    ));
+    inputs.secrets = Arc::new(secrets);
+    let report = Engine::health(&inputs, crate::health::HealthScope::Manual, None)
+        .await
+        .unwrap();
+    assert!(report.results[0].status.is_pass(), "{report:#?}");
+}
+
+#[tokio::test]
+async fn a_task_that_writes_while_planning_fails_loudly_and_changes_nothing() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module("name: bad\ntasks: [ { test.impure: { path: /etc/impure } } ]\n"),
+            module(
+                "name: scratch\ntasks: [ { test.impure: { path: /tmp/buckle-validate/conf } } ]\n",
+            ),
+            module("name: state\ntasks: [ { test.impure: { path: /var/lib/buckle/tmp/x } } ]\n"),
+        ],
+    );
+    let sys = FakeSystem::new();
+    let inputs = inputs(rev, &sys).with_scratch_dir("/var/lib/buckle/tmp");
+    let plan = plan(&inputs).await;
+    let bad = indeterminate(&plan, "bad");
+    assert!(bad.plan_error);
+    assert!(
+        bad.reason.contains("must not change the host"),
+        "{}",
+        bad.reason
+    );
+    assert!(!sys.exists("/etc/impure"));
+    assert_eq!(
+        module_names(&plan),
+        vec!["scratch", "state"],
+        "scratch writes are allowed"
+    );
+    assert!(sys.exists("/tmp/buckle-validate/conf"));
+}
+
+// ---------------------------------------------------------------------------
+// Drift after a failed run
+// ---------------------------------------------------------------------------
+
+/// `run` names the call log, so tests that run in parallel do not count each
+/// other's applies.
+fn drift_modules(rev: &str, run: &str) -> Vec<LoadedModule> {
+    let content = if rev == "r1" { "one" } else { "two" };
+    let fail = if rev == "r1" { 0 } else { 99 };
+    let mut modules = vec![
+        module(&format!(
+            "name: a\ntasks: [ {{ test.file: {{ path: /dr/a, content: {content}, run: {run} }} }} ]\n"
+        )),
+        module(&format!(
+            "name: b\ntasks: [ {{ test.file: {{ path: /dr/b, content: {content}, run: {run}, fail_times: {fail} }} }} ]\n"
+        )),
+        module(&format!(
+            "name: c\nneeds: [b]\ntasks: [ {{ test.file: {{ path: /dr/c, content: c, run: {run} }} }} ]\n"
+        )),
+    ];
+    if rev == "r2" {
+        modules.push(module(&format!(
+            "name: aa\ntasks: [ {{ test.file: {{ path: /dr/aa, content: new, run: {run} }} }} ]\n"
+        )));
+    }
+    modules
+}
+
+#[tokio::test]
+async fn drift_after_a_failed_run_neither_undoes_succeeded_modules_nor_retries_the_failed_one() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision("r1", FLEET, drift_modules("r1", "dr-failed"));
+    let (outcome, _) =
+        apply(&inputs_with_store(r1.clone(), &sys, store.clone()).with_parallelism(1)).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+
+    let r2 = revision("r2", FLEET, drift_modules("r2", "dr-failed"));
+    let (outcome, _) = apply(&inputs_with_store(r2, &sys, store.clone()).with_parallelism(1)).await;
+    assert!(!outcome.succeeded);
+    assert_eq!(status_of(&outcome, "a"), ModuleStatus::Applied);
+    assert_eq!(status_of(&outcome, "aa"), ModuleStatus::Applied);
+    assert_eq!(status_of(&outcome, "b"), ModuleStatus::Failed);
+    let state = store.load().unwrap();
+    assert_eq!(state.applied_revision, Some(RevisionId::new("r1")));
+    assert_eq!(state.module_revisions["a"], RevisionId::new("r2"));
+    assert_eq!(state.module_revisions["b"], RevisionId::new("r1"));
+    assert_eq!(state.failed_modules["b"], RevisionId::new("r2"));
+
+    // Without drift mode, re-planning the applied revision would undo `a`
+    // and remove what the newer revision added: the bug drift mode avoids.
+    let naive = plan(&inputs_with_store(r1.clone(), &sys, store.clone())).await;
+    assert!(!naive.removals.is_empty());
+
+    // The agent drifts against its applied revision.
+    let inputs = inputs_with_store(r1, &sys, store.clone())
+        .with_drift(true)
+        .with_removals(false)
+        .with_parallelism(1);
+    let (plan, _) = Engine::drift(&inputs).await.unwrap();
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    let held: Vec<&str> = plan.held.iter().map(|h| h.module.as_str()).collect();
+    assert_eq!(held, vec!["a", "b"]);
+    assert!(plan.held[1].reason.contains("failed"), "{:#?}", plan.held);
+    assert_eq!(module_names(&plan), vec!["c"]);
+    assert!(plan.is_empty(), "{plan:#?}");
+    let before = calls("dr-failed")
+        .iter()
+        .filter(|c| c.starts_with("apply:start"))
+        .count();
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(
+        calls("dr-failed")
+            .iter()
+            .filter(|c| c.starts_with("apply:start"))
+            .count(),
+        before,
+        "the failed module is not re-applied and nothing else changes"
+    );
+    assert_eq!(sys.file_string("/dr/a").as_deref(), Some("two"));
+    assert!(sys.exists("/dr/aa"));
+    assert_eq!(store.load().unwrap().resources.len(), 4);
+}
+
+#[tokio::test]
+async fn drift_corrects_modules_applied_at_its_revision() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision("r1", FLEET, drift_modules("r1", "dr-corrects"));
+    let (outcome, _) = apply(&inputs_with_store(r1.clone(), &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+    sys.write_atomic(Path::new("/dr/a"), b"hand edit", &FilePerms::mode(0o644))
+        .await
+        .unwrap();
+    let inputs = inputs_with_store(r1, &sys, store).with_drift(true);
+    let (plan, _) = Engine::drift(&inputs).await.unwrap();
+    assert!(plan.held.is_empty());
+    assert_eq!(plan.changes(), 1);
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert_eq!(sys.file_string("/dr/a").as_deref(), Some("one"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1939,6 +3409,82 @@ async fn health_checks_failing_past_settle_make_the_module_unhealthy() {
         "t=0s, 1s, 2s"
     );
     assert!(!outcome.health.unwrap().healthy(&[]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn health_checks_see_the_facts_their_module_just_refreshed() {
+    let rev = revision(
+        "r1",
+        "version: 2\nrollout: { settle: 5s }\n",
+        vec![module(
+            r#"
+name: nomad
+facts: { provides: [test.counter] }
+tasks: [ { test.file: { path: /facts/counter, content: eligible, run: hf1 } } ]
+health:
+  - name: eligible
+    test.filter: { expr: 'host.facts.test.counter.value == "eligible"' }
+    interval: 1s
+"#,
+        )],
+    );
+    let sys = FakeSystem::new();
+    let mut inputs = inputs(rev, &sys);
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let (outcome, events) = apply(&inputs).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(status_of(&outcome, "nomad"), ModuleStatus::Applied);
+    let checked: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            ApplyEvent::HealthChecked { passed, .. } => Some(*passed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checked,
+        vec![true],
+        "passes at once against the refreshed facts"
+    );
+    let refreshed = events
+        .iter()
+        .position(|e| matches!(e, ApplyEvent::FactsRefreshed { .. }))
+        .unwrap();
+    let checked_at = events
+        .iter()
+        .position(|e| matches!(e, ApplyEvent::HealthChecked { .. }))
+        .unwrap();
+    assert!(refreshed < checked_at);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_checks_of_an_unchanged_module_are_reported_but_do_not_gate() {
+    let rev = revision(
+        "r1",
+        "version: 2\nrollout: { settle: 10s }\n",
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /hng/x, content: same, run: hng1 } } ]\nhealth:\n  - name: flaky\n    test.flaky: { run: hng1, pass_after: 100 }\n    interval: 1s\n",
+        )],
+    );
+    let sys = FakeSystem::new().with_file("/hng/x", "same", FilePerms::mode(0o644));
+    let stable = revision("r0", FLEET, vec![module("name: m\n")]);
+    let inputs = inputs(rev, &sys).with_stable_revision(Some(stable));
+    let (outcome, _) = apply(&inputs).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Unchanged);
+    assert!(outcome.rolled_back_modules.is_empty());
+    assert!(sys.exists("/hng/x"));
+    let report = outcome.health.unwrap();
+    assert!(!report.healthy(&[]), "the failing check is still reported");
+    assert_eq!(
+        calls("hng1")
+            .iter()
+            .filter(|c| c.starts_with("health attempt"))
+            .count(),
+        1,
+        "no settle loop for a module this run did not change"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2123,11 +3669,12 @@ async fn secret_values_in_plain_task_fields_are_refused_without_leaking() {
         &InstallKey::from_bytes([9; 32]),
     ));
     inputs.secrets = Arc::new(secrets);
-    let err = plan_err(&inputs).await;
-    assert!(err.is(crate::error::Kind::User));
-    let shown = format!("{} {:?}", err.message(), err);
+    let plan = plan(&inputs).await;
+    let broken = indeterminate(&plan, "s");
+    assert!(broken.plan_error);
+    let shown = serde_json::to_string(&plan).unwrap();
     assert!(!shown.contains(VALUE), "{shown}");
-    assert!(shown.contains("plain values"), "{shown}");
+    assert!(broken.reason.contains("plain values"), "{}", broken.reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -2241,6 +3788,41 @@ async fn validation_with_facts_catches_duplicate_keys_and_bad_var_references() {
         report.errors[0].message.contains("could not be rendered"),
         "{report}"
     );
+}
+
+#[tokio::test]
+async fn validation_with_facts_warns_about_modules_a_host_would_defer() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module("name: p\nfacts: { provides: [test.counter] }\n"),
+            module("name: q\nneeds: [p]\nvars: { v: '{{ host.facts.test.counter.value }}' }\n"),
+            module("name: r\nvars: { v: '{{ vars.nope }}' }\n"),
+        ],
+    );
+    let host = HostIdentity {
+        id: "fixture".into(),
+        labels: Labels::new(),
+    };
+    let (report, summary) = crate::engine::validate_host(&rev, &host, &default_facts())
+        .await
+        .unwrap();
+    assert!(
+        report.warnings.iter().any(|w| w
+            .message
+            .contains("module 'q': would be deferred until 'p'")),
+        "{report}"
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.message.contains("module 'r'") && e.message.contains("vars.nope")),
+        "{report}"
+    );
+    assert_eq!(report.errors.len(), 1, "{report}");
+    assert_eq!(summary.unwrap().selected, vec!["p", "r", "q"]);
 }
 
 #[test]

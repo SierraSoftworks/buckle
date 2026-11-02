@@ -17,6 +17,36 @@ use std::sync::Arc;
 /// scalar JSON values (strings, numbers, booleans).
 pub type Labels = IndexMap<String, serde_json::Value>;
 
+/// A label value given as text (`--labels`, agent.yaml): `true`/`false`
+/// become booleans, `3` and `1.5` numbers, a quoted `"3"` or `'x'` the string
+/// inside the quotes, anything else the text itself.
+pub fn label_value(raw: &str) -> serde_json::Value {
+    let raw = raw.trim();
+    match serde_yaml::from_str::<serde_yaml::Value>(raw) {
+        Ok(serde_yaml::Value::Bool(b)) => serde_json::Value::Bool(b),
+        Ok(serde_yaml::Value::Number(n)) => n
+            .as_i64()
+            .map(serde_json::Value::from)
+            .or_else(|| n.as_u64().map(serde_json::Value::from))
+            .or_else(|| {
+                n.as_f64()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(serde_json::Value::Number)
+            })
+            .unwrap_or_else(|| serde_json::Value::String(raw.to_owned())),
+        Ok(serde_yaml::Value::String(s)) => serde_json::Value::String(s),
+        _ => serde_json::Value::String(raw.to_owned()),
+    }
+}
+
+/// Labels from text values, typed with [`label_value`].
+pub fn typed_labels<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)>) -> Labels {
+    pairs
+        .into_iter()
+        .map(|(k, v)| (k.clone(), label_value(v)))
+        .collect()
+}
+
 /// Variables after overlay resolution.
 pub type Vars = IndexMap<String, serde_json::Value>;
 
@@ -117,10 +147,22 @@ impl HostContext {
         c
     }
 
-    /// Evaluates a selector against this host. Evaluation itself cannot fail;
-    /// parse errors were reported when the filter was built.
+    /// Evaluates a selector against this host, treating an evaluation error as
+    /// "no match". Use [`HostContext::try_matches`] where an error must not be
+    /// mistaken for a definite `false` (module selection, which drives removal).
     pub fn matches(&self, filter: &crate::Filter) -> bool {
-        filter.matches(self).unwrap_or(false)
+        self.try_matches(filter).unwrap_or(false)
+    }
+
+    /// Evaluates a selector against this host, reporting evaluation errors.
+    /// The error text names the filter, never the values it compared.
+    pub fn try_matches(&self, filter: &crate::Filter) -> Result<bool, String> {
+        filter.matches(self).map_err(|e| {
+            format!(
+                "the selector `{}` could not be evaluated: {e}",
+                filter.raw()
+            )
+        })
     }
 
     /// The template context (`host`, `vars`, `module`, `task`) as JSON. Secrets
@@ -305,6 +347,21 @@ fn lookup_path_ci<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case("true", serde_json::json!(true))]
+    #[case("False", serde_json::json!(false))]
+    #[case("3", serde_json::json!(3))]
+    #[case("1.5", serde_json::json!(1.5))]
+    #[case("\"3\"", serde_json::json!("3"))]
+    #[case("'true'", serde_json::json!("true"))]
+    #[case("worker", serde_json::json!("worker"))]
+    #[case("yes", serde_json::json!("yes"))]
+    #[case("", serde_json::json!(""))]
+    #[case("[a]", serde_json::json!("[a]"))]
+    fn label_values_parse_as_typed_scalars(#[case] raw: &str, #[case] expected: serde_json::Value) {
+        assert_eq!(label_value(raw), expected);
+    }
     use crate::Filter;
     use crate::secrets::{InstallKey, Secret, SecretStore};
     use rstest::rstest;
