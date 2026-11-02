@@ -546,7 +546,7 @@ fn dialog(
         let (run, ask) = (run.clone(), ask.clone());
         Callback::from(move |note: String| run.emit((ask.clone(), note)))
     };
-    let label = rollout_label(&d.summary.id);
+    let name = rollout_label(&d.summary.id);
     match ask {
         Ask::Bind(..) => html! {},
         Ask::Approve(phase_name) => {
@@ -577,7 +577,7 @@ fn dialog(
                 ))
             });
             html! {
-                <Confirm title={format!("Approve {phase_name} of rollout {label}")}
+                <Confirm title={format!("Approve {phase_name} of rollout {name}")}
                     confirm_label={format!("Approve {}", count(hosts, "host", "hosts"))}
                     acknowledge={ack} note=true note_placeholder="Why this is safe to go ahead"
                     {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
@@ -598,9 +598,9 @@ fn dialog(
             }
         }
         Ask::Reject => html! {
-            <Confirm title={format!("Reject rollout {label}")} confirm_label="Reject rollout" danger=true note_required=true
+            <Confirm title={format!("Reject rollout {name}")} confirm_label="Reject rollout" danger=true note_required=true
                 note_placeholder="What is wrong with these plans"
-                type_to_confirm={AttrValue::from(label.clone())} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                type_to_confirm={AttrValue::from(name.clone())} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
                 <p>{ "Rejecting ends the rollout here: nothing in the waiting phase is applied, and the rollout is recorded as aborted with your reason. Hosts updated in earlier phases keep the new revision until a later rollout or a rollback changes them." }</p>
             </Confirm>
         },
@@ -610,11 +610,11 @@ fn dialog(
                 "resume" => ("Resume", "Resume rollout", false, "The rollout carries on from where it paused.".to_string(), None),
                 "rollback" => ("Roll back", "Roll back", true, format!(
                     "Applies the previous stable revision to every host this rollout updated ({}), newest phase first. Rolling back is applying, including removal of what this revision added; an irreversible task rolls back only as far as its kind can.",
-                    count(updated(d), "host", "hosts")), Some(label.clone())),
-                _ => ("Abort", "Abort rollout", true, "Stops the rollout where it is, with its state recorded. Hosts already updated keep the new revision.".to_string(), Some(label.clone())),
+                    count(updated(d), "host", "hosts")), Some(name.clone())),
+                _ => ("Abort", "Abort rollout", true, "Stops the rollout where it is, with its state recorded. Hosts already updated keep the new revision.".to_string(), Some(name.clone())),
             };
             html! {
-                <Confirm title={format!("{title} rollout {label}")} confirm_label={label} {danger} note=true
+                <Confirm title={format!("{title} rollout {name}")} confirm_label={label} {danger} note=true
                     type_to_confirm={typed.map(AttrValue::from)} {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
                     <p>{ body }</p>
                 </Confirm>
