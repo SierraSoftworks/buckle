@@ -259,6 +259,9 @@ pub enum ModuleStatus {
     /// The module's selection could not be decided on this host (see
     /// [`crate::plan::Indeterminate`]); it was not applied.
     Indeterminate,
+    /// The module applied what it could but some steps stayed blocked; the
+    /// run needs attention (it does not count as a success).
+    Blocked,
     /// The module was deferred, and its `when` turned out false against the
     /// refreshed facts: not applied, its resources removed as orphans.
     Skipped,

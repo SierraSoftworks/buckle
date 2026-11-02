@@ -66,6 +66,9 @@ pub enum RunOutcome {
     Failed,
     Unhealthy,
     RolledBack,
+    /// Nothing failed, but steps stayed blocked: the revision is not fully
+    /// applied and an operator needs to look.
+    NeedsAttention,
 }
 
 /// The persisted state document.

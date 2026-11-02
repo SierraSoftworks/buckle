@@ -66,6 +66,8 @@ struct ModuleRun {
     health: Vec<HealthResult>,
     /// Set when a task, handler or health gate failed.
     failed: bool,
+    /// Steps still blocked at the end of the module (resource and reason).
+    blocked: Vec<String>,
 }
 
 type ModuleFuture<'a> = Pin<Box<dyn Future<Output = ModuleRun> + Send + 'a>>;
@@ -359,11 +361,13 @@ impl<'a> Executor<'a> {
     /// Runs one module: steps in order, then handlers, then (optionally) the
     /// module's health checks with settle.
     ///
-    /// A step that was `Blocked` at plan time by its own kind (not by the
-    /// platform) is planned again once anything earlier in the run changed,
-    /// because an earlier step may have installed the tool it was missing. If
-    /// it now plans a change, the change is applied and the handlers it
-    /// notifies run alongside the planned ones.
+    /// A step that was `Blocked` at plan time is planned again once anything
+    /// earlier in the run changed, because an earlier step may have installed
+    /// the tool it was missing. If it now plans a change that deletes nothing,
+    /// the change is applied and the handlers it notifies run alongside the
+    /// planned ones; a deletion was never reviewed, so it stays blocked. A
+    /// module that ends with blocked steps is `Blocked`: the run needs
+    /// attention and does not count as a success.
     async fn run_module(
         &self,
         planner: &Planner<'_>,
@@ -381,12 +385,15 @@ impl<'a> Executor<'a> {
         let mut changes = 0usize;
         let mut health = Vec::new();
         let mut late_changes: Vec<Step> = Vec::new();
+        let mut blocked: Vec<String> = Vec::new();
 
         let finish = |status: ModuleStatus,
                       error: Option<String>,
                       changes: usize,
-                      health: Vec<HealthResult>| ModuleRun {
+                      health: Vec<HealthResult>,
+                      blocked: Vec<String>| ModuleRun {
             failed: matches!(status, ModuleStatus::Failed | ModuleStatus::Unhealthy),
+            blocked,
             outcome: ModuleOutcome {
                 module: module.clone(),
                 status,
@@ -407,9 +414,7 @@ impl<'a> Executor<'a> {
                 buckle.changed = tracing::field::Empty,
             );
             let replanned: Option<Planned> = match &step.planned {
-                Planned::Blocked { .. }
-                    if !rs.platform_blocked && self.changed_so_far.load(Ordering::Relaxed) > 0 =>
-                {
+                Planned::Blocked { .. } if self.changed_so_far.load(Ordering::Relaxed) > 0 => {
                     let mut cx = rs.cx.clone();
                     cx.previous = self
                         .with_state(|s| s.get(&step.resource).cloned())
@@ -425,6 +430,13 @@ impl<'a> Executor<'a> {
                         ))
                         .await;
                     match replan {
+                        Ok(Planned::Change { diff }) if diff.is_destructive() => {
+                            tracing::warn!(parent: &span, "the blocked step now plans a deletion, which was never reviewed; leaving it blocked");
+                            Some(Planned::blocked(format!(
+                                "once unblocked it plans a deletion ({}), which needs a reviewed plan",
+                                diff.summary()
+                            )))
+                        }
                         Ok(planned) => {
                             tracing::info!(parent: &span, change = planned.is_change(), "planned the blocked step again after earlier changes");
                             Some(planned)
@@ -441,6 +453,7 @@ impl<'a> Executor<'a> {
             match planned {
                 Planned::Blocked { reason } => {
                     span.record("buckle.changed", false);
+                    blocked.push(format!("{} is blocked: {reason}", step.resource));
                     self.emit(ApplyEvent::StepFinished {
                         module: module.clone(),
                         task_id: step.task.id.clone(),
@@ -489,6 +502,7 @@ impl<'a> Executor<'a> {
                                 Some(format!("{} failed: {message}", step.resource)),
                                 changes,
                                 health,
+                                blocked,
                             );
                         }
                     }
@@ -529,6 +543,7 @@ impl<'a> Executor<'a> {
                         Some(format!("planning handlers failed: {message}")),
                         changes,
                         health,
+                        blocked,
                     );
                 }
             }
@@ -546,16 +561,25 @@ impl<'a> Executor<'a> {
                     status: ModuleStatus::Failed,
                 })
                 .await;
-                return finish(ModuleStatus::Failed, Some(message), changes, health);
+                return finish(
+                    ModuleStatus::Failed,
+                    Some(message),
+                    changes,
+                    health,
+                    blocked,
+                );
             }
         }
 
-        let mut status = if changes > 0 {
+        let mut status = if !blocked.is_empty() {
+            ModuleStatus::Blocked
+        } else if changes > 0 {
             ModuleStatus::Applied
         } else {
             ModuleStatus::Unchanged
         };
-        let mut error = None;
+        let mut error =
+            (!blocked.is_empty()).then(|| format!("needs attention: {}", blocked.join("; ")));
         let config = planner.revision.module(&module).map(|m| &m.config);
         // Providers the module declares re-run now, so that its own health
         // checks (and the modules planned after it) see what it changed.
@@ -591,7 +615,7 @@ impl<'a> Executor<'a> {
                     status,
                 })
                 .await;
-                return finish(status, error, changes, health);
+                return finish(status, error, changes, health, blocked);
             }
             let (results, healthy) = checks::run_settled(
                 planner,
@@ -625,7 +649,7 @@ impl<'a> Executor<'a> {
             status,
         })
         .await;
-        finish(status, error, changes, health)
+        finish(status, error, changes, health, blocked)
     }
 
     /// Rolls `module` back to the stable revision with the current facts:
@@ -704,6 +728,7 @@ impl<'a> Executor<'a> {
                 },
                 health: Vec::new(),
                 failed: false,
+                blocked: Vec::new(),
             },
         };
         if run.failed {
@@ -844,6 +869,8 @@ impl<'a> Executor<'a> {
         // without halting it (nothing of theirs ran); indeterminate ones are
         // reported and left alone.
         let mut plan_errors: Vec<String> = Vec::new();
+        // Modules that finished with blocked steps: the run needs attention.
+        let mut blocked_modules: Vec<String> = Vec::new();
         // Orphans of deferred modules, known once they are planned.
         let mut late_removals: Vec<(crate::plan::Removal, super::planner::RichRemoval)> =
             Vec::new();
@@ -976,6 +1003,8 @@ impl<'a> Executor<'a> {
             if run.failed {
                 failed.push(name.clone());
                 halted = true;
+            } else if !run.blocked.is_empty() {
+                blocked_modules.push(name.clone());
             }
             results.push(run.outcome);
             let facts = self.facts();
@@ -1061,12 +1090,17 @@ impl<'a> Executor<'a> {
             errors.extend(removal_errors);
         }
 
-        let succeeded = !halted && errors.is_empty() && plan_errors.is_empty();
+        let succeeded =
+            !halted && errors.is_empty() && plan_errors.is_empty() && blocked_modules.is_empty();
         let failed_module = failed.first().or(plan_errors.first()).cloned();
         let error = {
             let mut parts: Vec<String> = results
                 .iter()
-                .filter(|r| failed.contains(&r.module) || plan_errors.contains(&r.module))
+                .filter(|r| {
+                    failed.contains(&r.module)
+                        || plan_errors.contains(&r.module)
+                        || blocked_modules.contains(&r.module)
+                })
                 .filter_map(|r| {
                     r.error
                         .clone()
@@ -1089,6 +1123,8 @@ impl<'a> Executor<'a> {
             .any(|r| failed.contains(&r.module) && r.status == ModuleStatus::Unhealthy)
         {
             RunOutcome::Unhealthy
+        } else if failed.is_empty() && plan_errors.is_empty() && errors.is_empty() {
+            RunOutcome::NeedsAttention
         } else {
             RunOutcome::Failed
         };

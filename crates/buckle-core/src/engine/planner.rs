@@ -142,9 +142,6 @@ pub(super) struct RichStep {
     pub spec: ErasedSpec,
     pub cx: Cx,
     pub retry: RetryPolicy,
-    /// Blocked by the engine because the kind does not support this platform
-    /// (never planned again), as opposed to blocked by the task itself.
-    pub platform_blocked: bool,
 }
 
 pub(super) struct RichHandler {
@@ -612,6 +609,11 @@ impl<'a> Planner<'a> {
             if matches!(early, Some(Ok(false))) {
                 continue;
             }
+            let platform = self.system.platform();
+            if !task.platforms().contains(platform) {
+                // Design §14: a plan error naming the kind, not a runtime failure.
+                return Err(unsupported_platform(&label, &decl.kind, platform));
+            }
             let json = self.render_spec(task, &decl.spec, &render_ctx).map_err(|e| {
                 crate::error::wrap_user(e, format!("{label} has a field that could not be rendered."), &[
                     "Check the template expressions in the task's fields against the host's facts and vars.",
@@ -686,7 +688,6 @@ impl<'a> Planner<'a> {
         prepared: PreparedModule,
         contexts: &Contexts,
     ) -> crate::Result<RichModulePlan> {
-        let platform = self.system.platform();
         let module = prepared.name.clone();
         let mut steps = Vec::new();
         let mut rich = Vec::new();
@@ -704,14 +705,7 @@ impl<'a> Planner<'a> {
                 buckle.task.key = %pt.key.key,
                 buckle.changed = tracing::field::Empty,
             );
-            let platform_blocked = !pt.task.platforms().contains(platform);
             let planned = async {
-                if platform_blocked {
-                    return Ok::<_, crate::Error>(Planned::blocked(format!(
-                        "the {} task kind does not support {platform}",
-                        pt.decl.kind
-                    )));
-                }
                 pt.task.plan(&pt.cx, &pt.spec).await.map_err(|e| {
                     crate::error::wrap_user(
                         e,
@@ -742,7 +736,6 @@ impl<'a> Planner<'a> {
                 spec: pt.spec,
                 cx: pt.cx,
                 retry: pt.decl.retry.clone(),
-                platform_blocked,
             });
         }
         let (handler_runs, handlers) = self
@@ -851,12 +844,10 @@ impl<'a> Planner<'a> {
                     .map(str::to_owned)
             });
             let cx = self.cx(&owner_name, owner.source.clone(), task_ctx, Mode::Plan);
-            let planned = if !task.platforms().contains(platform) {
-                Planned::blocked(format!(
-                    "the {} task kind does not support {platform}",
-                    decl.kind
-                ))
-            } else {
+            if !task.platforms().contains(platform) {
+                return Err(unsupported_platform(&label, &decl.kind, platform));
+            }
+            let planned = {
                 task.plan(&cx, &spec)
                     .instrument(tracing::info_span!("task.plan", buckle.module = %owner_name, buckle.task.kind = %decl.kind, buckle.task.key = %handler))
                     .await
@@ -1137,6 +1128,16 @@ fn handler_priority(kind: &str) -> u8 {
         "systemd.reload" => 2,
         _ => 3,
     }
+}
+
+fn unsupported_platform(label: &str, kind: &str, platform: crate::Platform) -> crate::Error {
+    crate::error::user(
+        format!("{label} uses the {kind} task kind, which does not support {platform}."),
+        &[
+            "Give the task (or its module) a `when` that excludes this platform.",
+            "Run `buckle catalog` to see which platforms each kind supports.",
+        ],
+    )
 }
 
 fn task_label(module: &str, index: usize, decl: &TaskDecl) -> String {
@@ -1457,12 +1458,6 @@ pub(super) async fn plan_with(
         deferred,
     );
     plan.skipped = skipped;
-    let platform_blocked: BTreeSet<ResourceKey> = planned
-        .iter()
-        .flat_map(|m| m.plan.steps.iter().zip(m.steps.iter()))
-        .filter(|(_, rs)| rs.platform_blocked)
-        .map(|(s, _)| s.resource.clone())
-        .collect();
     let mut indeterminate = selection.indeterminate;
     indeterminate.extend(problems);
     indeterminate.sort_by(|a, b| a.module.cmp(&b.module));
@@ -1470,7 +1465,7 @@ pub(super) async fn plan_with(
         .with_indeterminate(indeterminate)
         .with_rehomed(rehomed)
         .with_held(held);
-    plan.warnings = warnings(&plan, &platform_blocked);
+    plan.warnings = warnings(&plan);
     plan.warnings.extend(prepared_warnings);
     Ok(RichPlan {
         plan,
@@ -1500,7 +1495,7 @@ fn ancestors(revision: &Revision, name: &str) -> BTreeSet<String> {
 
 /// Operator-facing warnings: indeterminate modules, removals, always-run
 /// steps, blocked steps.
-pub(super) fn warnings(plan: &Plan, platform_blocked: &BTreeSet<ResourceKey>) -> Vec<String> {
+pub(super) fn warnings(plan: &Plan) -> Vec<String> {
     let mut out = Vec::new();
     for i in &plan.indeterminate {
         if i.plan_error {
@@ -1537,14 +1532,10 @@ pub(super) fn warnings(plan: &Plan, platform_blocked: &BTreeSet<ResourceKey>) ->
             ));
         }
         if let Planned::Blocked { reason } = &step.planned {
-            if platform_blocked.contains(&step.resource) {
-                out.push(format!("{} is blocked: {reason}", step.resource));
-            } else {
-                out.push(format!(
-                    "{} is blocked: {reason} (planned again at apply time once earlier steps have run)",
-                    step.resource
-                ));
-            }
+            out.push(format!(
+                "{} is blocked: {reason} (planned again at apply time once earlier steps have run; applied then only if the new plan deletes nothing)",
+                step.resource
+            ));
         }
     }
     out

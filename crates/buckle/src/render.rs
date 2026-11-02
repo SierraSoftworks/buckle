@@ -266,6 +266,7 @@ fn status_word(status: ModuleStatus) -> &'static str {
         ModuleStatus::Deferred => "deferred",
         ModuleStatus::Indeterminate => "indeterminate",
         ModuleStatus::Skipped => "skipped",
+        ModuleStatus::Blocked => "BLOCKED",
     }
 }
 

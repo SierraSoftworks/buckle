@@ -94,6 +94,9 @@ struct FileSpec {
     /// A path that must exist before this task can be planned (a "tool").
     #[serde(default)]
     requires: Option<String>,
+    /// Plan (and apply) deleting the path instead of writing it.
+    #[serde(default)]
+    delete: bool,
 }
 
 async fn plan_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Planned> {
@@ -104,6 +107,14 @@ async fn plan_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Planned> {
         return Ok(Planned::blocked(format!("{required} is not installed")));
     }
     let existing = cx.system.read(Path::new(&spec.path)).await?;
+    if spec.delete {
+        return Ok(match existing {
+            Some(_) => Planned::change(Diff::Delete {
+                summary: format!("delete {}", spec.path),
+            }),
+            None => Planned::NoOp,
+        });
+    }
     Ok(match existing {
         Some(bytes) if bytes == spec.content.as_bytes() => Planned::NoOp,
         Some(bytes) => Planned::change(Diff::unified(
@@ -139,6 +150,10 @@ async fn apply_file(cx: &Cx, spec: &FileSpec) -> crate::Result<Applied> {
             format!("transient failure #{attempt} writing {}", spec.path),
             &["Try again."],
         ));
+    }
+    if spec.delete {
+        cx.system.remove(Path::new(&spec.path), false).await?;
+        return Ok(Applied::changed(format!("deleted {}", spec.path)));
     }
     cx.system
         .write_atomic(
@@ -1827,36 +1842,36 @@ tasks:
 }
 
 #[tokio::test]
-async fn unsupported_platforms_block_steps_and_are_warned_about() {
+async fn a_task_kind_the_platform_does_not_support_is_a_plan_error_for_its_module() {
     let rev = revision(
         "r1",
         FLEET,
-        vec![module(
-            "name: m\ntasks:\n  - test.linux: { path: /plat/linux-only, run: plat1 }\n  - test.file: { path: /plat/any, run: plat1 }\n",
-        )],
+        vec![
+            module(
+                "name: m\ntasks:\n  - test.linux: { path: /plat/linux-only, run: plat1 }\n  - test.file: { path: /plat/any, run: plat1 }\n",
+            ),
+            module(
+                "name: guarded\ntasks:\n  - test.linux: { path: /plat/guarded, run: plat1 }\n    when: 'host.labels.os == \"linux\"'\n  - test.file: { path: /plat/other, run: plat1 }\n",
+            ),
+        ],
     );
     let sys = FakeSystem::new().with_platform(Platform::MacOs);
     let inputs = inputs(rev, &sys);
     let plan = plan(&inputs).await;
-    match &step(&plan, "m", "/plat/linux-only").planned {
-        Planned::Blocked { reason } => assert!(reason.contains("macos"), "{reason}"),
-        other => panic!("expected blocked, got {other:?}"),
-    }
-    assert!(
-        plan.warnings.iter().any(|w| w.contains("blocked")),
-        "{:?}",
-        plan.warnings
+    let m = indeterminate(&plan, "m");
+    assert!(m.plan_error);
+    assert!(m.reason.contains("test.linux"), "{}", m.reason);
+    assert!(m.reason.contains("macos"), "{}", m.reason);
+    assert_eq!(
+        module_names(&plan),
+        vec!["guarded"],
+        "a `when` can exclude the platform"
     );
-    assert_eq!(plan.changes(), 1);
     let (outcome, _) = apply_plan(&inputs, &plan).await;
-    assert!(outcome.succeeded);
-    assert!(!sys.exists("/plat/linux-only"));
-    assert!(sys.exists("/plat/any"));
-    assert!(
-        !calls("plat1")
-            .iter()
-            .any(|c| c.contains("linux-only") && c.starts_with("apply"))
-    );
+    assert!(!outcome.succeeded);
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Failed);
+    assert!(!sys.exists("/plat/linux-only") && !sys.exists("/plat/any"));
+    assert!(sys.exists("/plat/other"));
 }
 
 #[tokio::test]
@@ -1871,22 +1886,17 @@ tasks:
   - test.file: { path: /tool/bin, content: bin, run: blk1 }
   - test.file: { path: /tool/conf, content: conf, run: blk1, requires: /tool/bin }
     notify: [restart]
-  - test.linux: { path: /tool/mac, run: blk1 }
 handlers:
   restart: { systemd.restart: { name: tool, run: blk1 } }
 "#,
         )],
     );
-    let sys = FakeSystem::new().with_platform(Platform::MacOs);
+    let sys = FakeSystem::new();
     let inputs = inputs(rev, &sys);
     let plan = plan(&inputs).await;
     assert!(
         matches!(&step(&plan, "m", "/tool/conf").planned, Planned::Blocked { reason } if reason.contains("/tool/bin"))
     );
-    assert!(matches!(
-        step(&plan, "m", "/tool/mac").planned,
-        Planned::Blocked { .. }
-    ));
     assert!(
         plan.modules[0].handlers.is_empty(),
         "nothing changed at plan time notifies the handler"
@@ -1897,12 +1907,6 @@ handlers:
         .find(|w| w.contains("/tool/conf"))
         .unwrap();
     assert!(conf_warning.contains("planned again"), "{conf_warning}");
-    let mac_warning = plan
-        .warnings
-        .iter()
-        .find(|w| w.contains("/tool/mac"))
-        .unwrap();
-    assert!(!mac_warning.contains("planned again"), "{mac_warning}");
 
     let (outcome, events) = apply_plan(&inputs, &plan).await;
     assert!(outcome.succeeded, "{outcome:#?}");
@@ -1911,10 +1915,6 @@ handlers:
         "the blocked step was planned again and applied"
     );
     assert_eq!(sys.file_string("/tool/conf").as_deref(), Some("conf"));
-    assert!(
-        !sys.exists("/tool/mac"),
-        "platform-blocked steps are never planned again"
-    );
     assert!(
         calls("blk1").contains(&"handler m:systemd.restart tool".to_string()),
         "{:?}",
@@ -1946,8 +1946,28 @@ tasks:
         )],
     );
     let sys = FakeSystem::new();
-    let (outcome, _) = apply(&inputs(rev, &sys)).await;
-    assert!(outcome.succeeded);
+    let store = Arc::new(MemoryStateStore::default());
+    let (outcome, _) = apply(&inputs_with_store(rev, &sys, store.clone())).await;
+    assert!(
+        !outcome.succeeded,
+        "a step left blocked needs attention: {outcome:#?}"
+    );
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Blocked);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("/tool2/bin is not installed"),
+        "{outcome:#?}"
+    );
+    assert!(outcome.rolled_back_modules.is_empty());
+    let state = store.load().unwrap();
+    assert_eq!(state.applied_revision, None);
+    assert_eq!(
+        state.runs.last().unwrap().outcome,
+        crate::state::RunOutcome::NeedsAttention
+    );
     assert_eq!(outcome.changes, 0);
     assert!(!sys.exists("/tool2/conf"));
     assert_eq!(
@@ -1958,6 +1978,33 @@ tasks:
         2,
         "plan, then the apply's stale check; no re-plan"
     );
+}
+
+#[tokio::test]
+async fn a_blocked_step_that_plans_a_deletion_once_unblocked_stays_blocked() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /tool3/bin, content: bin, run: blk3 }\n  - test.file: { path: /tool3/victim, run: blk3, requires: /tool3/bin, delete: true }\n",
+        )],
+    );
+    let sys = FakeSystem::new().with_file("/tool3/victim", "precious", FilePerms::mode(0o644));
+    let inputs = inputs(rev, &sys);
+    let plan = plan(&inputs).await;
+    assert!(!plan.is_destructive(), "the reviewed plan deletes nothing");
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(!outcome.succeeded, "{outcome:#?}");
+    assert_eq!(status_of(&outcome, "m"), ModuleStatus::Blocked);
+    assert!(
+        outcome.error.as_deref().unwrap_or("").contains("deletion"),
+        "{outcome:#?}"
+    );
+    assert_eq!(
+        sys.file_string("/tool3/victim").as_deref(),
+        Some("precious")
+    );
+    assert_eq!(outcome.changes, 1, "only the reviewed change ran");
 }
 
 #[tokio::test]
