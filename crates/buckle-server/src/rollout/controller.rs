@@ -744,9 +744,16 @@ impl Controller {
             format!("{host}: {} → {} ({why})", from.as_str(), state.as_str())
         };
         tracing::info!(buckle.rollout = %rollout, buckle.host = %host, buckle.phase = %phase, from = from.as_str(), to = state.as_str(), "rollout host transition");
+        // Ordinary progress (planned, applying, baking, ...) reaches the UI
+        // as a live host event from the checkpoint; only outcomes (healthy,
+        // failed, held, skipped, rolled back, missed) go to the audit log.
+        let action = format!("rollout.host.{}", state.as_str());
+        if buckle_api::is_progress_action("controller", &action) {
+            return;
+        }
         self.audit(
             "controller",
-            &format!("rollout.host.{}", state.as_str()),
+            &action,
             &rollout,
             message,
             serde_json::json!({"host": host, "phase": phase, "from": from.as_str(), "to": state.as_str()}),
@@ -757,6 +764,20 @@ impl Controller {
     fn set_rollout_state(&mut self, ri: usize, state: RolloutState, actor: &str, why: &str) {
         let live = &mut self.live[ri];
         if live.record.state == state {
+            return;
+        }
+        // The display moving between planning, rolling and baking as waves
+        // come and go is progress: live events only, not the audit log.
+        let progress = |s: RolloutState| {
+            matches!(
+                s,
+                RolloutState::Planning | RolloutState::Rolling | RolloutState::Baking
+            )
+        };
+        if why.is_empty() && progress(live.record.state) && progress(state) {
+            tracing::debug!(buckle.rollout = %live.record.id, from = ?live.record.state, to = ?state, "rollout progress");
+            live.record.state = state;
+            live.dirty = true;
             return;
         }
         let from = live.record.state;

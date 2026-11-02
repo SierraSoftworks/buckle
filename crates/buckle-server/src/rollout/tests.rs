@@ -1177,8 +1177,6 @@ async fn every_transition_is_audited() {
     let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
     for expected in [
         "rollout.planning",
-        "rollout.host.planned",
-        "rollout.host.applying",
         "rollout.host.healthy",
         "rollout.completed",
         "revision.promoted",
@@ -1188,6 +1186,14 @@ async fn every_transition_is_audited() {
             "missing {expected} in {actions:?}"
         );
     }
+    // Progress transitions are live events only (security lane: audit noise).
+    for progress in buckle_api::PROGRESS_ACTIONS {
+        assert!(
+            !actions.contains(progress),
+            "{progress} in the audit log: {actions:?}"
+        );
+    }
+    assert!(!actions.contains(&"rollout.baking"), "{actions:?}");
 }
 
 #[tokio::test(start_paused = true)]
