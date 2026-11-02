@@ -206,7 +206,7 @@ fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
                 <span class="mono" title={r.revision.clone()}>{ format!("revision {}", commit(&r.revision)) }</span>
                 <span class="mono" title={r.plan_digest.clone()}>{ format!("plan {}", short(&r.plan_digest)) }</span>
                 if let (Some(id), false) = (&r.rollout_id, in_rollout) {
-                    <RouteLink to={Route::Rollout { id: id.clone() }}>{ format!("rollout {}", rollout_label(id)) }</RouteLink>
+                    <RouteLink to={Route::rollout(id)}>{ format!("rollout {}", rollout_label(id)) }</RouteLink>
                 }
                 if r.trace_id.is_some() { <TraceLink id={r.trace_id.clone()} url={r.trace_url.clone()} /> }
             </span>

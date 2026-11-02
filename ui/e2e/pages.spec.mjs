@@ -13,11 +13,38 @@ describe("every page renders in demo mode", () => {
     const labels = await page.locator(".tile .tile__label").allTextContents();
     for (const want of ["Healthy", "Failing", "Held", "Offline", "Drifted"]) assert.ok(labels.includes(want), want);
     assert.match(await page.locator('.tile[data-state="healthy"] .tile__age').textContent(), /old/);
-    // The active rollout as a pipeline, the attention list, recent revisions.
-    await page.locator(".pipeline--compact a.block").first().waitFor();
+    // The latest rollout with its controls, the fleet on its stages (hosts
+    // outside it last), the attention list, recent revisions.
+    await page.getByTestId("rollout-controls").getByRole("button", { name: "Pause" }).waitFor();
+    await page.locator('.overview__fleet .stage[data-stage="not in this rollout"] a.block').first().waitFor();
+    const drawn = await page.locator(".overview__fleet a.block").count();
+    const total = Number(await page.locator(".tile--plain .tile__value").textContent());
+    assert.equal(drawn, total, "every host in the fleet is on the map");
     assert.match(await page.locator(".attention").textContent(), /awaiting registration approval/);
     assert.match(await page.locator(".attention").textContent(), /expected 2\.0\.0-dev\.5/);
     assert.equal(await page.locator(".revlist__item").count(), 5);
+    await close();
+  });
+
+  test("the overview approves and pauses the latest rollout in place", async () => {
+    const { page, close } = await open("/");
+    const controls = page.getByTestId("rollout-controls");
+    await controls.getByRole("button", { name: "Approve cloud…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Approve cloud of rollout #42" });
+    assert.match(await dialog.getByTestId("approval-summary").textContent(), /12 hosts/);
+    await dialog.getByRole("checkbox", { name: /I have reviewed/ }).check();
+    await dialog.getByRole("button", { name: "Approve 12 hosts" }).click();
+    await page.getByRole("status").filter({ hasText: "Approved cloud: 2 plans bound." }).waitFor();
+    await controls.getByRole("button", { name: "Pause" }).click();
+    await page.getByRole("dialog", { name: "Pause rollout #42" }).getByRole("button", { name: "Pause rollout" }).click();
+    await controls.getByRole("button", { name: "Resume" }).waitFor();
+    await close();
+  });
+
+  test("a viewer sees the latest rollout without its controls", async () => {
+    const { page, close } = await open("/", { flags: "role=viewer" });
+    await page.locator(".overview__fleet a.block").first().waitFor();
+    assert.equal(await page.getByTestId("rollout-controls").count(), 0);
     await close();
   });
 
@@ -145,7 +172,7 @@ describe("every page renders in demo mode", () => {
 describe("empty and not-permitted states", () => {
   test("an empty fleet says what to do next on every page", async () => {
     for (const [path, text] of [
-      ["/", "No rollout in progress"],
+      ["/", "No stages yet"],
       ["/hosts", "No hosts have enrolled"],
       ["/rollouts", "No rollouts yet"],
       ["/revisions", "No revisions yet"],

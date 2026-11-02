@@ -97,9 +97,25 @@ pub fn short(id: &str) -> &str {
 }
 
 /// How a rollout is named to people: its `word.word.word` name, or `#id`
-/// for an id that has none.
+/// for an id that has none. A name (from a `/rollouts/<name>` URL) is its
+/// own label.
 pub fn rollout_label(id: &str) -> String {
+    if buckle_api::RolloutName::parse(id).is_some() {
+        return id.to_string();
+    }
     buckle_api::rollout_name(id).unwrap_or_else(|| format!("#{id}"))
+}
+
+/// The name of the rollout an audit subject is, when the subject is a
+/// rollout id (a UUID): hosts and commits are subjects too, and a commit's
+/// hex digits would otherwise name a rollout.
+pub fn subject_rollout_name(subject: &str) -> Option<String> {
+    let uuid = subject.len() == 36
+        && subject.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    uuid.then(|| buckle_api::rollout_name(subject)).flatten()
 }
 
 /// The first seven characters of a commit, the way `git log --oneline` shows it.
@@ -176,6 +192,22 @@ mod tests {
         let id = "3f2a9c1e-8b4d-4f6a-9c2e-1d7b5a3e9f01";
         assert_eq!(rollout_label(id), buckle_api::rollout_name(id).unwrap());
         assert_eq!(rollout_label("42"), "#42");
+        let name = buckle_api::rollout_name(id).unwrap();
+        assert_eq!(rollout_label(&name), name, "a name labels itself");
+    }
+
+    #[test]
+    fn only_a_rollout_id_subject_is_named() {
+        let id = "3f2a9c1e-8b4d-4f6a-9c2e-1d7b5a3e9f01";
+        assert_eq!(subject_rollout_name(id), buckle_api::rollout_name(id));
+        for other in [
+            "pi-1",
+            "3f2a9c1e8b4d4f6a9c2e1d7b5a3e9f0112345678",
+            "0aa1b2c",
+            "42",
+        ] {
+            assert_eq!(subject_rollout_name(other), None, "{other}");
+        }
     }
 
     #[test]

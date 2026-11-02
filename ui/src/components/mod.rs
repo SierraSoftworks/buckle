@@ -29,4 +29,6 @@ pub use pipeline::Pipeline;
 pub use plan::PlanGroupView;
 pub use run_report::RunReportView;
 pub use toast::{ToastHost, use_toast};
-pub use ui::{Button, Empty, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh, TraceLink};
+pub use ui::{
+    Button, Empty, ErrorState, HoverTip, Kind, Loading, PageHead, Panel, Pill, Refresh, TraceLink,
+};

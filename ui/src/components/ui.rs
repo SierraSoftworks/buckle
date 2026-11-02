@@ -80,6 +80,73 @@ pub fn pill(props: &PillProps) -> Html {
 }
 
 #[derive(Properties, PartialEq)]
+pub struct HoverTipProps {
+    /// What is hovered or focused.
+    pub children: Html,
+    /// What the popover shows; nothing (and no popover) when empty.
+    #[prop_or_default]
+    pub tip: Html,
+    #[prop_or_default]
+    pub label: Option<AttrValue>,
+}
+
+/// A popover under its trigger while it is hovered or focused, positioned
+/// against the viewport so that a scrolling table does not clip it.
+#[function_component(HoverTip)]
+pub fn hover_tip(props: &HoverTipProps) -> Html {
+    let at = use_state(|| None::<(f64, f64)>);
+    // Measured through a ref: Yew delegates events, so an event's current
+    // target is the root, not this trigger.
+    let node = use_node_ref();
+    let show = {
+        let (at, node) = (at.clone(), node.clone());
+        move || {
+            if let Some(el) = node.cast::<web_sys::Element>() {
+                let r = el.get_bounding_client_rect();
+                // Kept on screen: the popover is at most `TIP_WIDTH` wide.
+                let width = web_sys::window()
+                    .and_then(|w| w.inner_width().ok())
+                    .and_then(|w| w.as_f64())
+                    .unwrap_or(f64::MAX);
+                at.set(Some((
+                    r.left().min(width - TIP_WIDTH - 8.0).max(8.0),
+                    r.bottom(),
+                )));
+            }
+        }
+    };
+    let (enter, focus) = {
+        let (a, b) = (show.clone(), show);
+        (
+            Callback::from(move |_: MouseEvent| a()),
+            Callback::from(move |_: FocusEvent| b()),
+        )
+    };
+    let hide = {
+        let at = at.clone();
+        Callback::from(move |_: Event| at.set(None))
+    };
+    if props.tip == Html::default() {
+        return props.children.clone();
+    }
+    html! {
+        <span class="tip" tabindex="0" ref={node} aria-label={props.label.clone()}
+            onmouseenter={enter} onfocus={focus}
+            onmouseleave={hide.reform(|e: MouseEvent| e.into())} onblur={hide.reform(|e: FocusEvent| e.into())}>
+            { props.children.clone() }
+            if let Some((x, y)) = *at {
+                <span class="tip__pop" role="tooltip" style={format!("left: {x:.0}px; top: {:.0}px", y + 4.0)}>
+                    { props.tip.clone() }
+                </span>
+            }
+        </span>
+    }
+}
+
+/// The widest a [`HoverTip`] popover grows (`.tip__pop`'s `max-width`).
+const TIP_WIDTH: f64 = 360.0;
+
+#[derive(Properties, PartialEq)]
 pub struct PanelProps {
     #[prop_or_default]
     pub title: Option<AttrValue>,

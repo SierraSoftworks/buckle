@@ -13,11 +13,12 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::app::Route;
 use crate::components::{
-    Button, Empty, ErrorState, JsonTree, Loading, PageHead, Panel, Pill, Refresh, TraceLink,
+    Button, Empty, ErrorState, JsonTree, Loading, PageHead, Panel, Pill, Refresh, RouteLink,
+    TraceLink,
 };
 use crate::hooks::{use_debounced, use_fetch, use_now};
 use crate::logic::filter::{AUDIT_FIELDS, Check, and, check, equals};
-use crate::logic::format::{relative, timestamp};
+use crate::logic::format::{relative, subject_rollout_name, timestamp};
 use crate::logic::tone::outcome_tone;
 use crate::store::use_live;
 
@@ -42,6 +43,19 @@ const EXAMPLES: &[(&str, &str)] = &[
     ),
     ("Last hour", "at > now() - 1h"),
 ];
+
+/// The `word.word.word` name of the rollout an entry is about.
+fn rollout_subject(e: &AuditEntry) -> Option<String> {
+    e.subject.as_deref().and_then(subject_rollout_name)
+}
+
+/// An entry's message, with its rollout's id written as the rollout's name.
+fn message(e: &AuditEntry) -> String {
+    match (&e.subject, rollout_subject(e)) {
+        (Some(id), Some(name)) => e.message.replace(id.as_str(), &name),
+        _ => e.message.clone(),
+    }
+}
 
 #[function_component(Audit)]
 pub fn audit() -> Html {
@@ -231,12 +245,17 @@ pub fn audit() -> Html {
                                     <td><button type="button" class="link-btn" title="Filter by this actor" onclick={narrow("actor", e.actor.clone())}>{ e.actor.clone() }</button></td>
                                     <td><button type="button" class="link-btn mono" title="Filter by this action" onclick={narrow("action", e.action.clone())}>{ e.action.clone() }</button></td>
                                     <td><Pill tone={outcome_tone(&e.outcome)} label={e.outcome.clone()} /></td>
-                                    <td>{ match &e.subject {
-                                        Some(s) => html! { <button type="button" class="link-btn mono" title="Filter by this subject" onclick={narrow("subject", s.clone())}>{ s.clone() }</button> },
-                                        None => html! { <span class="muted">{ "—" }</span> },
+                                    <td>{ match (&e.subject, rollout_subject(e)) {
+                                        (Some(s), Some(name)) => html! { <span class="audit__rollout">
+                                            <RouteLink to={Route::rollout(s)} classes="mono" title={format!("Rollout {s}")}>{ name }</RouteLink>
+                                            <button type="button" class="link-btn link-btn--aside small" title={format!("Filter by this rollout ({s})")}
+                                                aria-label={format!("Filter by rollout {s}")} onclick={narrow("subject", s.clone())}>{ "filter" }</button>
+                                        </span> },
+                                        (Some(s), None) => html! { <button type="button" class="link-btn mono" title="Filter by this subject" onclick={narrow("subject", s.clone())}>{ s.clone() }</button> },
+                                        (None, _) => html! { <span class="muted">{ "—" }</span> },
                                     } }</td>
                                     <td>
-                                        { e.message.clone() }
+                                        { message(e) }
                                         if e.detail.is_some() {
                                             <button type="button" class="link-btn link-btn--aside small" aria-expanded={open.to_string()} onclick={toggle}>
                                                 { if open { "hide detail" } else { "detail" } }
