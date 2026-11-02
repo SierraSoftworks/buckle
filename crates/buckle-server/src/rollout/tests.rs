@@ -31,6 +31,9 @@ struct Script {
     /// On the next Apply, answer as the agent does: a PlanResult whose error
     /// starts with "stale plan" carrying this fresh digest.
     stale_plan_result: Option<String>,
+    /// Refuse every Apply as stale, each time with a new fresh digest (a
+    /// plan that is never deterministic).
+    stale_plan_always: bool,
     local_rollback_on_bake: bool,
     /// The local rollback itself fails.
     local_rollback_fails: bool,
@@ -285,7 +288,11 @@ impl Harness {
                         if s.silent_apply {
                             continue;
                         }
-                        if let Some(fresh) = s.stale_plan_result.clone() {
+                        let fresh = s
+                            .stale_plan_result
+                            .clone()
+                            .or_else(|| s.stale_plan_always.then(|| format!("{}-fresh", s.digest)));
+                        if let Some(fresh) = fresh {
                             {
                                 let mut sc = script.lock().unwrap();
                                 sc.stale_plan_result = None;
@@ -1264,6 +1271,42 @@ async fn an_agent_reported_stale_plan_needs_reapproval_for_that_host() {
         applies.iter().all(|a| !a.2.plan_digest.is_empty()),
         "Apply always carries a digest"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_plan_that_is_stale_on_every_apply_fails_the_host() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.stale_plan_always = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    let (r, hosts) = h
+        .wait(&id, "failed", |_, hs| {
+            host(hs, "a").state == HostPhase::Failed
+        })
+        .await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.wave, Some(1), "a refused apply does not start a new wave");
+    assert_eq!(
+        r.runtime.phases[0].started, 0,
+        "the wave slot is given back"
+    );
+    let error = a.runtime.error.clone().unwrap_or_default();
+    assert!(error.contains("stale plan"), "{error}");
+    assert!(
+        error.contains(a.plan_digest.as_deref().unwrap_or_default()),
+        "names the fresh digest: {error}"
+    );
+    assert_eq!(
+        h.applies().len(),
+        super::controller::MAX_STALE_REFUSALS as usize
+    );
+    assert_ne!(r.state, RolloutState::Completed);
 }
 
 /// A passing baseline answer from `host` to its last baseline request.
