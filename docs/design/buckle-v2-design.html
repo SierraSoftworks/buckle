@@ -205,7 +205,7 @@ pre .fname { display: block; color: var(--code-cm); margin-bottom: 8px; font-siz
 <div class="tenets">
   <div class="tenet"><div class="t">Lightweight</div><p>One static binary (musl) for agent and server. Agent idles at a few MB RSS: one gRPC stream, one timer, no interpreter. Bootstrapping is <code>buckle install agent --server …</code>.</p></div>
   <div class="tenet"><div class="t">Fast</div><p>Modules run as a dependency DAG with parallel execution; tasks declare resource locks (e.g. <code>apt</code>) so unrelated work overlaps. Plan is a pure read phase; apply touches only what changed.</p></div>
-  <div class="tenet"><div class="t">Observable</div><p>One trace per rollout spanning server and every agent (W3C context over gRPC metadata). Spans per module, task and health check with change counts; metrics for apply time, drift and health; the UI links straight to the trace.</p></div>
+  <div class="tenet"><div class="t">Observable</div><p>One trace per rollout spanning server and every agent (W3C trace context in gRPC metadata and in the <code>Apply</code>, <code>Rollback</code> and <code>RunHealth</code> messages). Spans per module, task and health check with change counts; OTLP gauges for rollout hosts and connected agents; the UI shows the trace id and links it when a trace URL template is configured.</p></div>
   <div class="tenet"><div class="t">Operable at scale</div><p>Phased rollouts with bake time and failure budgets, automatic pause, one-click rollback to the last stable revision, drift detection and correction, and removal cleanup so hosts converge instead of accumulating debris.</p></div>
 </div>
 
@@ -214,7 +214,7 @@ pre .fname { display: block; color: var(--code-cm); margin-bottom: 8px; font-siz
 <thead><tr><th>Ask</th><th>Where</th><th>Short answer</th></tr></thead>
 <tbody>
 <tr><td>1 server on Nomad, Tailscale-only, Git watching</td><td><a href="#topology">02</a>, <a href="#server">09</a></td><td><code>buckle server</code> binds to the tailnet address, polls Git with gix (plus a webhook), and turns each commit into a revision.</td></tr>
-<tr><td>2 persistent agents, local-dir mode</td><td><a href="#engine">04</a>, <a href="#protocol">08</a></td><td><code>buckle agent</code> keeps one bidirectional gRPC stream open; <code>--source DIR</code> runs the same engine against a local directory.</td></tr>
+<tr><td>2 persistent agents, local-dir mode</td><td><a href="#engine">04</a>, <a href="#protocol">08</a></td><td><code>buckle agent</code> keeps one bidirectional gRPC stream open; <code>source: DIR</code> in agent.yaml (or <code>buckle install agent --source DIR</code>) runs the same engine against a local directory instead.</td></tr>
 <tr><td>3 integrated health checks</td><td><a href="#health">07</a></td><td>Modules declare <code>health:</code> checks. They run at three moments of a rollout (baseline before a host is touched, the bake window after apply, before the next phase starts) and once per periodic drift check, which gives the server its baseline fleet health between rollouts. No separate steady-state loop.</td></tr>
 <tr><td>4 phased, feedback-controlled rollouts</td><td><a href="#rollout">10</a></td><td>Phases select hosts with filt-rs expressions over facts and labels; parallelism, bake, failure budgets, pause and rollback are policy.</td></tr>
 <tr><td>5 OIDC web UI</td><td><a href="#ui">12</a></td><td>Yew UI embedded in the binary, analytics-style cookie + PKCE OIDC, filt-rs ACLs, rollout pipeline and fleet views.</td></tr>
@@ -223,7 +223,7 @@ pre .fname { display: block; color: var(--code-cm); margin-bottom: 8px; font-siz
 <tr><td>8 plan mode with sign-off</td><td><a href="#plan">11</a></td><td>Plans are first-class, deduplicated by digest across hosts, and a phase can require approval before apply.</td></tr>
 <tr><td>9 filt-rs everywhere</td><td><a href="#config">03</a></td><td>Module <code>when</code>, task <code>when</code>, group membership, phase selection, ACLs and health assertions are all filt-rs.</td></tr>
 <tr><td>10 long-lived TCP protocol</td><td><a href="#protocol">08</a></td><td>gRPC over HTTP/2 (tonic): one bidirectional session stream plus content-addressed blob fetches.</td></tr>
-<tr><td>11 reference configuration</td><td><a href="#example">15</a></td><td><code>examples/nomad-cluster</code> ports the ten live infra-ansible roles, dropping the bugs the audit found.</td></tr>
+<tr><td>11 reference configuration</td><td><a href="#example">15</a></td><td><code>examples/nomad-cluster</code> is a fictional fleet that exercises every module kind the real estate needs; the faithful port of the live infra-ansible roles, with the audit's bugs fixed, is a separate private repository.</td></tr>
 <tr><td>12 structurally unprintable secrets</td><td><a href="#secrets">06</a></td><td>A sealed <code>Secret</code> type that only sinks can open; plans diff redacted shadows stored in agent state.</td></tr>
 <tr><td>13 cross-platform, Linux first</td><td><a href="#platforms">14</a></td><td>Task kinds declare platform support; Debian and Ubuntu on arm64 and amd64 are tested in CI from day one.</td></tr>
 </tbody></table></div>
@@ -323,8 +323,8 @@ pre .fname { display: block; color: var(--code-cm); margin-bottom: 8px; font-siz
 <div class="card decision"><div class="tag">Decision · agreed</div><p><b>One binary, one build.</b> The release artefact is the full <code>buckle</code> binary with agent, server and embedded UI; there is no slim agent variant. Target size is under 15 MB stripped (musl, LTO, <code>codegen-units = 1</code>, <code>panic = "abort"</code>, release-mode Trunk build of the UI, symbols published separately as the reference repos do). CI reports the binary size per platform; a feature flag to drop the server from the agent build is reconsidered only if the full binary ends up well over 15 MB.</p></div>
 <div class="card decision"><div class="tag">Decision · agreed</div><p><b>Tailscale is the preferred transport and identity, never a requirement.</b> Listen addresses are explicit in server config (the node's 100.x address, <code>0.0.0.0</code> inside a Nomad task with a Tailscale sidecar, or a LAN address). Two agent authentication modes are enabled together and chosen per connection:</p>
 <ul>
-<li><b>Tailscale.</b> When the peer address is a tailnet address and a local tailscaled socket exists, the server asks <code>/localapi/v0/whois?addr=</code> which node is on the other end and uses the node name as the host identity. Transport encryption comes from WireGuard; TLS is optional.</li>
-<li><b>Token.</b> Everywhere else (private LANs, hosts without Tailscale, local development). <code>buckle install agent --server … --token &lt;bootstrap&gt;</code> enrols the host: on the first Hello the server exchanges the bootstrap token for a per-host token (random, stored hashed server-side, persisted by the agent at mode 0600) which identifies the host from then on; the bootstrap token can be rotated or revoked without touching enrolled hosts. Host identity is <code>host_id</code> from agent.yaml, else the system hostname. Transport is TLS on the gRPC listener: a certificate from config, or one the server generates on first start whose fingerprint <code>install agent</code> pins (<code>--ca-fingerprint</code>, printed by <code>buckle server fingerprint</code>); plaintext is allowed only when server config says so explicitly.</li>
+<li><b>Tailscale.</b> When the peer address is a tailnet address and a local tailscaled socket exists, the server asks <code>/localapi/v0/whois?addr=</code> which node is on the other end and uses the node name as the host identity; the agent's claimed <code>host_id</code> must equal it. Whois proves who a peer is, not that it belongs to the fleet (nodes shared in from other tailnets reach the listener too), so <code>agents.tailscale.allowed_tags</code> / <code>allowed_users</code> name the nodes trusted as agents: a node matching neither list is refused, and with both lists empty a new tailnet node registers as <em>pending</em> for an admin even under <code>registration: auto</code>. Transport encryption comes from WireGuard; TLS is optional.</li>
+<li><b>Token.</b> Everywhere else (private LANs, hosts without Tailscale, local development). <code>buckle install agent --server … --token &lt;bootstrap&gt;</code> enrols the host: on the first Hello the server exchanges the bootstrap token for a per-host token (random, stored hashed server-side, persisted by the agent at mode 0600) which identifies the host from then on; the bootstrap token can be rotated or revoked without touching enrolled hosts. Host identity is <code>host_id</code> from agent.yaml, else the system hostname. Transport is TLS on the gRPC listener: a certificate from config, or one the server generates on first start whose fingerprint <code>install agent</code> pins (<code>--ca-fingerprint</code>, printed by <code>buckle server --print-fingerprint</code>); plaintext needs both ends to say so explicitly: <code>listen.tls.mode: none</code> on the server and <code>tls.insecure_plaintext: true</code> with an <code>http://</code> URL in agent.yaml (an <code>https://</code> URL combined with <code>insecure_plaintext</code> is refused rather than silently downgraded).</li>
 </ul>
 <p>Agents never depend on the Tailscale binary: the <code>tailscale</code> fact provider yields <code>null</code> when it is absent and selectors fall through. The server runs on a tailnet in this deployment, but nothing in the protocol assumes it.</p></div>
 </section>
@@ -354,6 +354,9 @@ modules/
 fleet:
   # Groups are derived, never enumerated. Agents report labels + facts; the
   # server (or the local engine) evaluates these and exposes host.groups.
+  # Label values are typed like YAML scalars: `canary=true` is a boolean,
+  # `rack=3` a number, `rack="3"` a string (the CLI, agent.yaml, the UI and the
+  # server all apply the same rule, so a selector picks the same hosts everywhere).
   groups:
     nomad:   'host.labels.role == "worker"'
     home:    'host.labels.site == "home"'
@@ -361,14 +364,14 @@ fleet:
     canary:  'host.labels.canary == true'
 
 vars:                                     # a list of overlays, applied in order; later wins. Omitted = {}
-  - file: vars/defaults.yaml              # no `when` means it applies to every host
+  - file: vars/defaults.yaml              # no `when` means it applies to every host; `file:` is relative to the repo root and may not leave it (no absolute path, no `..`)
   - when: 'host.groups contains "home"'
     file: vars/home.yaml
   - when: 'host.facts.cloud.provider == "azure"'
     file: vars/azure.yaml
   - when: 'host.groups contains "nomad"'
     values:                               # inline overlay
-      nomad_node_class: '{{ "rpi" if host.facts.arch == "aarch64" else "cloud" }}'
+      nomad_node_class: '{{ "rpi" if host.facts.hardware.arch == "aarch64" else "cloud" }}'
 
 secrets:                                  # references only, never values
   admin_password:        { file: /secrets/admin_password }   # Nomad `template` renders Nomad Variables here
@@ -388,7 +391,7 @@ rollout:                                  # see section 10
 <h3>module.yaml</h3>
 <pre><code class="language-yaml"><span class="fname">modules/nomad/module.yaml</span>name: nomad
 description: Nomad client registered with the cluster over the tailnet.
-when: 'host.groups contains "nomad" &amp;&amp; host.facts.os.family == "debian" &amp;&amp; host.facts.arch in ["x86_64", "aarch64"]'
+when: 'host.groups contains "nomad" &amp;&amp; host.facts.os.family == "debian" &amp;&amp; host.facts.hardware.arch in ["x86_64", "aarch64"]'
 needs: [tailscale, docker]                # ordering + fact dependency (tailscale provides host.facts.tailscale.*)
 tags: [config]
 
@@ -432,23 +435,24 @@ health:
   - name: unit
     systemd: { unit: nomad, state: active }
   - name: eligible
-    filter: 'host.facts.nomad.eligibility == "eligible"'   # filt-rs over refreshed facts
+    filter: { expr: 'host.facts.nomad.eligibility == "eligible"' }   # filt-rs over refreshed facts
 
 removal:
-  policy: cleanup                         # cleanup (default) | leave
+  policy: cleanup                         # the module's default for its tasks: cleanup | leave (absent: each kind's own default)
 </code></pre>
+<p>Module rules the loader and validator enforce: the directory name must equal <code>name</code>; <code>needs</code> must resolve, form a DAG, and name modules that are selected on every host this module is (otherwise planning that host is an error naming both modules); every file is read with unknown fields rejected (<code>deny_unknown_fields</code>), including each task and health spec; a task is one kind key plus the reserved keys <code>id</code>, <code>name</code>, <code>when</code>, <code>notify</code>, <code>tags</code>, <code>removal</code>, <code>retry</code>; and <code>after</code> is reserved but <em>not implemented</em> (a task that sets it is rejected, see <a href="#engine">04</a>). A directory under <code>modules/</code> without a <code>module.yaml</code> is not silently ignored: its module is indeterminate and resources recorded under that name are kept. Templates are the <code>*.j2</code> files under a module's <code>files/</code> directory (there is no separate templates directory); <code>file.copy</code> and <code>file.template</code> read their <code>src</code> relative to <code>files/</code>.</p>
 
 <h3>Expressions: filt-rs for logic, Jinja for text</h3>
-<p>Two languages, each doing the thing it is good at. filt-rs decides <em>whether</em> (module and task <code>when</code>, groups, phase selection, health assertions, ACLs). Templates decide <em>what text</em> (file contents and the string fields of task specs). A task string field is templated only when it contains <code>{{</code>, so plain values cost nothing.</p>
+<p>Two languages, each doing the thing it is good at. filt-rs decides <em>whether</em> (module and task <code>when</code>, groups, phase selection, health assertions, ACLs). Templates decide <em>what text</em> (file contents and the string fields of task specs). A task string field is templated only when it contains <code>{{</code> (or <code>{%</code>), so plain values cost nothing. A rendered field is then converted to the scalar type its schema declares when that type is not a string (an integer, number or boolean) and the text parses as one, so <code>size_mb: "{{ vars.swap_mb }}"</code> reaches the task as the number 512. Undefined variables are errors (strict mode), and secrets are refused in plain fields and in vars: only the few fields typed as secret-capable (<a href="#secrets">06</a>) keep their raw template for the task to open through a sink.</p>
 <div class="grid2">
 <div class="card"><h4>filt-rs context</h4>
 <p>Flat dotted keys over a case-insensitive map, exactly like mail-backup's <code>Metadata</code>. Buckle builds it from the facts tree, labels, groups, vars and (metadata-only) secrets:</p>
 <ul>
-<li><code>host.id</code>, <code>host.labels.*</code>, <code>host.groups</code> (tuple)</li>
-<li><code>host.facts.os.{family,id,codename,version}</code>, <code>host.facts.arch</code>, <code>host.facts.mem.total_mb</code>, <code>host.facts.swap.total_mb</code>, <code>host.facts.tailscale.{hostname,ips,tags}</code>, <code>host.facts.cloud.{provider,region,…}</code></li>
+<li><code>host.id</code>, <code>host.labels.*</code> (typed: <code>canary=true</code> is a boolean, <code>rack=3</code> a number, <code>rack="3"</code> a string), <code>host.groups</code> (tuple)</li>
+<li><code>host.facts.os.{family,id,codename,version,pretty_name,kernel}</code>, <code>host.facts.hardware.{arch,cpus}</code>, <code>host.facts.hardware.mem.total_mb</code>, <code>host.facts.hardware.swap.total_mb</code>, <code>host.facts.hardware.disk.&lt;name&gt;.{mount,fstype,total_mb,free_mb,free_percent}</code> (<code>root</code> for <code>/</code>), <code>host.facts.tailscale.{hostname,ips,tags,online}</code>, <code>host.facts.cloud.{provider,region,…}</code>, and the other providers in <a href="#registry">05</a>. Facts are flat dotted leaves: a list can be tested with <code>contains</code> but not indexed, which is why providers also expose flat keys such as <code>disk.root.free_percent</code></li>
 <li><code>vars.*</code> (scalars and lists)</li>
 <li><code>secrets.NAME</code> as a filt-rs <code>Secret</code> value (comparable, redacts to <code>[REDACTED]</code> if ever displayed), plus <code>secrets.NAME.present</code> and <code>secrets.NAME.fingerprint</code> (see <a href="#secrets">06</a>)</li>
-<li><code>task.tags</code>, <code>module.name</code> for run-time selectors (<code>buckle apply --select 'task.tags contains "network"'</code>)</li>
+<li><code>task.kind</code>, <code>task.id</code>, <code>task.tags</code>, <code>module.name</code>, <code>module.tags</code> for run-time selectors (<code>buckle apply --select 'task.tags contains "network"'</code>); tasks excluded by <code>--select</code> still count as desired, so their resources are never treated as orphans</li>
 </ul></div>
 <div class="card decision"><div class="tag">Decision · agreed</div>
 <p><b>Templates move from Go templates to Jinja2 (<code>minijinja</code>), and <code>gotmpl</code> leaves the dependency tree entirely.</b> Two languages in total: filt-rs for logic, minijinja for text. The audit found 18 Jinja templates in infra-ansible, two of them 550 and 819 lines, using <code>.items()</code>, <code>default</code>, <code>regex_replace</code>, <code>to_json</code>, <code>ternary</code>, <code>comment</code> and whitespace control. With minijinja plus a dozen custom filters they port almost verbatim. minijinja is a small, well-maintained crate with no runtime dependencies, supports a custom object model (needed for secret-aware rendering) and can be sandboxed (no includes outside the module).</p>
@@ -459,25 +463,30 @@ removal:
 <ol>
 <li>Facts (<code>host.facts.*</code>) are read-only and collected by fact providers.</li>
 <li>Module <code>vars:</code> defaults.</li>
-<li>Fleet <code>vars</code> overlays in list order; an overlay without <code>when</code> always applies, and an omitted <code>vars</code> is the empty set.</li>
+<li>Fleet <code>vars</code> overlays in list order; an overlay without <code>when</code> always applies, its <code>when</code> may read facts, labels, groups and the vars layered so far, and an omitted <code>vars</code> is the empty set. An overlay is inline <code>values</code> or a <code>file</code>; the file path is relative to the repository root and must stay inside it (absolute paths and <code>..</code> are rejected when the revision loads), and it must contain a mapping.</li>
 <li>Agent-local overrides from <code>/etc/buckle/agent.yaml</code> (<code>vars:</code>), for the rare host-specific value.</li>
 </ol>
-<p>Values are typed YAML (strings, numbers, bools, lists, maps), so a template loop over a list of snapshot paths is a real loop rather than Python repr hoping to be TOML. Vars can reference other vars and facts with templates; evaluation is lazy and cycle-checked, and a reference to an undefined var or secret is a plan error for the module that uses it (the Ansible <code>undef()</code> behaviour, made explicit).</p>
+<p>Values are typed YAML (strings, numbers, bools, lists, maps), so a template loop over a list of snapshot paths is a real loop rather than Python repr hoping to be TOML. Vars can reference other vars and facts with templates; each var is rendered lazily after the vars it references, a reference cycle is an error that names the cycle, and vars cannot reference secrets. A reference to an undefined var or fact, or a template that does not render, is a plan error scoped to the module that uses it (the Ansible <code>undef()</code> behaviour, made explicit): the plan lists the module as indeterminate with <code>plan_error</code> set, applying reports it failed, and the other modules still plan and apply. When the failing template reads facts that a module this one <code>needs</code> will provide during the same run (<code>facts.provides</code>), the module is deferred until those facts are refreshed instead of failing on a first install.</p>
 
 <h3>Agent configuration</h3>
-<pre><code class="language-yaml"><span class="fname">/etc/buckle/agent.yaml  (written by `buckle install agent`)</span>server: https://buckle.example.ts.net:7700   # or a LAN address; or:  source: /srv/buckle-config
-# host_id: pi-1                              # defaults to the Tailscale node name, else the system hostname
+<pre><code class="language-yaml"><span class="fname">/etc/buckle/agent.yaml  (written by `buckle install agent`)</span>server: https://buckle.example.ts.net:7700   # or a LAN address; or:  source: /srv/buckle-config  (exactly one of the two)
+# host_id: pi-1                              # defaults to the system hostname; over Tailscale it must equal the node name the tailnet reports
+# bootstrap_token: …                         # first enrolment only; `install agent --token` writes it (file mode 0600 when present)
 # tls: { ca_fingerprint: "sha256:…" }       # pinned by `buckle install agent` when the server uses a generated certificate
-# the per-host token issued at enrolment lives in state_dir, not here
-labels: { role: worker, site: home }   # seed labels reported on connect; labels set in the UI override these
-state_dir: /var/lib/buckle
+#      { ca_file: /etc/buckle/ca.pem }      # or trust a CA bundle instead of the system roots
+#      { insecure_plaintext: true }         # http:// URLs only (a tailnet); refused together with an https:// URL
+# the per-host token issued at enrolment lives in state_dir (mode 0600), not here
+labels: { role: worker, site: home }   # seed labels reported on connect (typed like YAML scalars); labels set in the UI override these
+state_dir: /var/lib/buckle             # C:\ProgramData\buckle on Windows
 drift:
-  interval: 15m           # re-plan against the assigned revision
+  interval: 15m           # re-plan the applied revision (drift mode, section 04)
   correct: true           # false = report only
+# vars: { swap_mb: 512 }  # host-specific variable overrides: the last layer of the vars precedence
 telemetry:
   otlp_endpoint: http://127.0.0.1:4317
+  # otlp_headers: { x-honeycomb-team: "…" }
 </code></pre>
-<div class="card question"><div class="tag">Your call</div><p>Host identity. Proposal: the Tailscale node name when the agent authenticates via whois, else <code>host_id</code> from agent.yaml, else the system hostname. This matches infra-ansible, which already sets the system hostname to the tailnet name. Is the Tailscale name the identity you want to see in the UI and in traces?</p></div>
+<div class="card question"><div class="tag">Your call</div><p>Host identity. Proposal: the Tailscale node name when the agent authenticates via whois, else <code>host_id</code> from agent.yaml, else the system hostname. As built, the agent always claims <code>host_id</code> from agent.yaml or else the system hostname, and under whois the server requires that claim to equal the tailnet node name (a mismatch is refused, not renamed), so a host whose hostname differs from its node name needs <code>host_id</code> set. This matches infra-ansible, which already sets the system hostname to the tailnet name. Is the Tailscale name the identity you want to see in the UI and in traces?</p></div>
 </section>
 
 <!-- ============ 4. ENGINE ============ -->
