@@ -300,8 +300,9 @@ pub struct HostRuntime {
     /// Modules the plan defers to apply time (their plan is unknown yet).
     #[serde(default)]
     pub deferred_modules: Vec<String>,
-    /// The host was held (or skipped by `baseline: skip`) at baseline; if it
-    /// was never applied it moves to the stragglers stage on promotion.
+    /// The host was held at baseline (`baseline: hold`); if it was never
+    /// applied (still held, or released by an operator's skip) it moves to
+    /// the stragglers stage on promotion.
     #[serde(default)]
     pub held_at_baseline: bool,
 }

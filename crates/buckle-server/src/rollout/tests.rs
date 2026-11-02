@@ -2519,6 +2519,7 @@ async fn the_baseline_policy_skips_or_ignores_an_unhealthy_host(
     let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
     assert_eq!(host(&hosts, "a").state, expected);
     assert_eq!(host(&hosts, "b").state, HostPhase::Healthy);
+    assert_eq!(host(&hosts, "a").phase, "web", "excluded, not a straggler");
     let applied_a = h.applies().iter().any(|x| x.1 == "a");
     assert_eq!(applied_a, expected == HostPhase::Healthy);
 }

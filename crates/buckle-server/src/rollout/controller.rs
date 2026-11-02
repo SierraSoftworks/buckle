@@ -1355,7 +1355,6 @@ impl Controller {
                             }
                             BaselinePolicy::Skip => {
                                 self.live[ri].hosts[hi].runtime.error = Some(why.clone());
-                                self.live[ri].hosts[hi].runtime.held_at_baseline = true;
                                 self.set_host_state(ri, hi, HostPhase::Skipped, &why);
                             }
                             BaselinePolicy::Ignore => self.send_apply(ri, hi),
@@ -3202,7 +3201,8 @@ impl Controller {
         for hi in 0..self.live[ri].hosts.len() {
             let h = &self.live[ri].hosts[hi];
             // Hosts not updated during their phase: missed, still planning,
-            // held at baseline, or released from a baseline hold by a skip.
+            // held at baseline, or released from a baseline hold by an
+            // operator's skip (`baseline: skip` excludes a host for good).
             let not_updated = matches!(
                 h.state,
                 HostPhase::Missed | HostPhase::PlanPending | HostPhase::Planned | HostPhase::Held
