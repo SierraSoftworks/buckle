@@ -1158,3 +1158,28 @@ async fn an_upgrade_when_idle_waits_for_queued_operations(#[case] when_idle: boo
         "the queued assignment runs first only when the upgrade waits for idle"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_check_failing_at_the_end_of_the_bake_is_followed_through_settle() {
+    let fake = FakeRunner::new();
+    let (h, mut session) = rolled_out(fake.clone()).await;
+    let started = tokio::time::Instant::now();
+    // Healthy at the first sample of a 60 s bake, failing from the second
+    // (30 s) on: settle (2 m) runs out well after the window closes.
+    fake.with_health(move |revision, scope| {
+        let late = tokio::time::Instant::now() - started >= Duration::from_secs(20);
+        crate::testing::health(
+            scope,
+            !(revision.0 == "rev1" && scope == HealthScope::Bake && late),
+        )
+    });
+    session.send(bake_request("bake-1", 60)).await;
+    let rollback = session.expect(rollback_msg).await;
+    let elapsed = tokio::time::Instant::now() - started;
+    assert!(
+        elapsed >= Duration::from_secs(150) && elapsed < Duration::from_secs(200),
+        "settle (2m) after the first failing sample: {elapsed:?}"
+    );
+    assert_eq!(rollback.modules, vec!["m".to_string()]);
+    h.stop().await.expect("clean exit");
+}

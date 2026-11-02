@@ -274,6 +274,7 @@ impl RunningAgent {
             rejected_backoff_max: Duration::from_secs(1),
             event_spacing: Duration::from_millis(10),
             shutdown_grace: Duration::from_secs(5),
+            welcome_timeout: Duration::from_secs(10),
         };
         let agent = Agent::new(config, transport, runner, Arc::new(NoUpdates), options)
             .expect("the agent starts");

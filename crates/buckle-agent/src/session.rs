@@ -1737,7 +1737,11 @@ impl Shared {
             let Some(next) = schedule.next_due() else {
                 break;
             };
-            if next > deadline {
+            // Past the window, a required check that is still failing keeps
+            // being sampled until it recovers or fails past settle: the
+            // server judges it on the same settle clock (design §07), so the
+            // agent must not stop just short of the rollback.
+            if next > deadline && failing_since.is_empty() {
                 break;
             }
             tokio::select! {
