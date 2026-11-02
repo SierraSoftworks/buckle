@@ -1,5 +1,12 @@
 //! Host views shared by the gRPC and HTTP fronts.
 
+mod report;
+
+pub use report::{
+    error_view, event_key, finished_progress, outcome_error, pending_report, progress,
+    result_error, run_report, run_state,
+};
+
 use crate::source::cache::RevisionCache;
 use crate::store::{HostRecord, Store, kv::keys};
 use buckle_api::{

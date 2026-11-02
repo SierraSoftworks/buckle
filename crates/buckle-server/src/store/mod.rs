@@ -27,7 +27,7 @@ pub use kv::Kv;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
-pub use runs::{RunRecord, Runs};
+pub use runs::{RUNNING, RunEvent, RunRecord, Runs};
 
 use buckle_core::Result;
 use chrono::{DateTime, Utc};
@@ -211,6 +211,29 @@ CREATE TABLE host_drift (
     detected_at TEXT NOT NULL,
     PRIMARY KEY (host_id, module, kind, key)
 );
+"#,
+    // 4: run reports. Runs get a stable id and keep the agent's full
+    // ApplyOutcome; a run is recorded as `running` from its first apply
+    // event, and its events are kept per run (the latest per step).
+    r#"
+ALTER TABLE runs ADD COLUMN run_id TEXT;
+ALTER TABLE runs ADD COLUMN outcome_json TEXT;
+UPDATE runs SET run_id = 'run-' || id WHERE run_id IS NULL;
+CREATE UNIQUE INDEX runs_run_id ON runs(run_id);
+CREATE INDEX runs_rollout ON runs(rollout, host);
+
+CREATE TABLE run_events (
+    run_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    module TEXT,
+    step_id TEXT,
+    state TEXT,
+    event TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (run_id, key)
+);
+CREATE INDEX run_events_seq ON run_events(run_id, seq);
 "#,
 ];
 

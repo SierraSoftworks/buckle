@@ -68,6 +68,7 @@ fn trusting(tags: &[&str], users: &[&str]) -> crate::config::TailscaleConfig {
 struct Server {
     addr: SocketAddr,
     store: Store,
+    events: EventBus,
     data: tempfile::TempDir,
     revisions: Arc<RevisionCache>,
     guard: Arc<SessionGuard>,
@@ -150,7 +151,7 @@ async fn server_full(
             ..Default::default()
         },
         whois,
-        events,
+        events: events.clone(),
         clock,
         server_version: "2.0.0-test".into(),
         guard: guard.clone(),
@@ -161,6 +162,7 @@ async fn server_full(
     Server {
         addr,
         store,
+        events,
         data,
         revisions,
         guard,
@@ -642,6 +644,124 @@ async fn next_ack(stream: &mut tonic::Streaming<ServerMessage>) -> Vec<u64> {
             return a.report_ids;
         }
     }
+}
+
+fn apply_event(digest: &str, event: buckle_core::engine::ApplyEvent) -> AgentMessage {
+    AgentMessage {
+        msg: Some(agent_message::Msg::Apply(buckle_proto::v1::ApplyEvent {
+            revision: "r1".into(),
+            plan_digest: digest.into(),
+            event_json: serde_json::to_vec(&event).unwrap(),
+            ..Default::default()
+        })),
+    }
+}
+
+async fn next_progress(
+    rx: &mut tokio::sync::broadcast::Receiver<buckle_api::LiveEvent>,
+) -> buckle_api::RunProgress {
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a live event")
+            .expect("the bus is open");
+        if let buckle_api::LiveEvent::RunProgress { progress } = event {
+            return progress;
+        }
+    }
+}
+
+#[tokio::test]
+async fn apply_events_open_a_run_that_the_result_completes() {
+    use buckle_core::engine::ApplyEvent;
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    tx.send(apply_event(
+        "d1",
+        ApplyEvent::ModuleStarted { module: "m".into() },
+    ))
+    .await
+    .unwrap();
+    let first = next_progress(&mut live).await;
+    assert_eq!(first.module.as_deref(), Some("m"));
+    assert_eq!(first.module_state, Some(buckle_api::ModuleState::Running));
+    tx.send(apply_event(
+        "d1",
+        ApplyEvent::StepStarted {
+            module: "m".into(),
+            task_id: "t".into(),
+            id: "file.copy[/x]".into(),
+            kind: "file.copy".into(),
+        },
+    ))
+    .await
+    .unwrap();
+    let step = next_progress(&mut live).await;
+    assert_eq!(step.run_id, first.run_id, "one run for the apply");
+    assert_eq!(step.step.as_deref(), Some("file.copy[/x]"));
+    assert_eq!(step.step_state, Some(buckle_api::StepState::Running));
+
+    let run_id = first.run_id.clone();
+    let open_run = s
+        .store
+        .call(|db| db.runs().open_for_host("pi-1"))
+        .await
+        .unwrap()
+        .expect("a running run");
+    assert_eq!(open_run.id, run_id);
+    let events = s
+        .store
+        .call(move |db| db.runs().events(&open_run.id))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::Result(buckle_proto::v1::ApplyResult {
+            revision: "r1".into(),
+            plan_digest: "d1".into(),
+            succeeded: false,
+            error: "boom".into(),
+            report_id: 9,
+            outcome_json: br#"{"plan_digest":"d1","succeeded":false,"changes":0,"removals":0,"duration_ms":5,"module_results":[],"failed_module":"m","rolled_back_modules":[],"not_started":[],"health":null,"error":"boom","error_detail":{"kind":"user","message":"boom","advice":["try again"]}}"#.to_vec(),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![9]);
+    let done = next_progress(&mut live).await;
+    assert_eq!(done.run_id, run_id);
+    assert_eq!(done.run_state, buckle_api::RunState::Failed);
+    assert_eq!(
+        done.error.map(|e| e.advice),
+        Some(vec!["try again".to_string()])
+    );
+    let (open, runs) = s
+        .store
+        .call(|db| {
+            Ok((
+                db.runs().open_for_host("pi-1")?,
+                db.runs().for_host("pi-1", 10)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert!(open.is_none(), "the result closed the run");
+    assert_eq!(runs.len(), 1, "the result completed the open run");
+    assert_eq!(runs[0].id, run_id);
+    assert!(runs[0].outcome_json.is_some());
+
+    // The next apply of another plan is a new run.
+    tx.send(apply_event(
+        "d2",
+        ApplyEvent::ModuleStarted { module: "m".into() },
+    ))
+    .await
+    .unwrap();
+    assert_ne!(next_progress(&mut live).await.run_id, run_id);
 }
 
 #[tokio::test]

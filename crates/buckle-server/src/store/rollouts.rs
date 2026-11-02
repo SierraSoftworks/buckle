@@ -284,6 +284,34 @@ impl<'c> Rollouts<'c> {
             .collect())
     }
 
+    /// The host row of `host` in `rollout`.
+    pub fn host(&self, rollout: &str, host: &str) -> Result<Option<RolloutHostRecord>> {
+        let raw = self
+            .conn
+            .query_row(
+                &format!("SELECT {H_COLUMNS} FROM rollout_hosts WHERE rollout = ?1 AND host = ?2"),
+                params![rollout, host],
+                h_row,
+            )
+            .optional()
+            .map_err(db_error)?;
+        raw.map(h_record).transpose()
+    }
+
+    /// The rollout whose plan `plan_digest` `host` is about to apply or
+    /// applying: the newest one holding that plan for the host in a state
+    /// that leads to an apply. Used to attach a run to its rollout.
+    pub fn applying_with_plan(&self, host: &str, plan_digest: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT rh.rollout FROM rollout_hosts rh JOIN rollouts r ON r.id = rh.rollout WHERE rh.host = ?1 AND rh.plan_digest = ?2 AND rh.state IN ('planned', 'baseline', 'held', 'applying', 'rolling_back') ORDER BY r.started_at DESC, rh.rowid DESC LIMIT 1",
+                params![host, plan_digest],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
     /// Removes a host row (a forgotten host).
     pub fn delete_host(&self, rollout: &str, host: &str) -> Result<()> {
         self.conn
