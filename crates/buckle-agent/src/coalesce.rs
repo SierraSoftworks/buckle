@@ -2,9 +2,13 @@
 //! most once per 100 ms (10 per second per host). Events arriving faster are
 //! buffered and coalesced per step, keeping only the latest event for each
 //! step, module, handler, removal or check; the server stores the last event
-//! per step anyway, and every event still goes to tracing. When the apply
-//! ends, up to one more second of buffered events is flushed and the rest is
-//! dropped: the ApplyResult that follows carries the full module breakdown.
+//! per step anyway, and every event still goes to tracing. A failed or
+//! blocked step's event is never replaced by a later event of the same step
+//! (a rollback re-runs it). When the apply ends, up to one more second of
+//! buffered events is flushed; after that only failed and blocked steps'
+//! events still go out (at the same spacing) and the rest is dropped. The
+//! ApplyResult that follows is never coalesced or cut: it carries the full
+//! module and step breakdown and is the authoritative record of the run.
 
 use crate::sink::ReportSink;
 use crate::transport::Report;
@@ -47,6 +51,15 @@ pub fn coalesce_key(event: &ApplyEvent) -> String {
     }
 }
 
+/// Events a later event of the same step must not replace: a failure or a
+/// block is what the reader needs to see even when the step runs again.
+fn keeps_its_place(event: &ApplyEvent) -> bool {
+    matches!(
+        event,
+        ApplyEvent::StepFailed { .. } | ApplyEvent::StepBlocked { .. }
+    )
+}
+
 /// Forwards events from `events` to `sink` until the channel closes,
 /// honouring [`EVENT_SPACING`]. Returns `(sent, dropped)`.
 pub async fn forward(
@@ -61,6 +74,7 @@ pub async fn forward(
     let mut last_sent: Option<Instant> = None;
     let mut sent = 0usize;
     let mut superseded = 0usize;
+    let mut unique = 0usize;
 
     let send = |at: chrono::DateTime<chrono::Utc>, event: ApplyEvent| {
         let sink = sink.clone();
@@ -95,10 +109,17 @@ pub async fn forward(
             event = events.recv() => match event {
                 Some(event) => {
                     tracing::debug!(event = ?event, "apply event");
-                    let key = coalesce_key(&event);
-                    if pending.shift_remove(&key).is_some() {
-                        superseded += 1;
-                    }
+                    let key = if keeps_its_place(&event) {
+                        // Never replaced: under its own key.
+                        unique += 1;
+                        format!("{}#{unique}", coalesce_key(&event))
+                    } else {
+                        let key = coalesce_key(&event);
+                        if pending.shift_remove(&key).is_some() {
+                            superseded += 1;
+                        }
+                        key
+                    };
                     pending.insert(key, (chrono::Utc::now(), event));
                 }
                 None => break,
@@ -107,12 +128,16 @@ pub async fn forward(
         }
     }
 
-    // Final flush: at most one more second of events, then drop the rest.
+    // Final flush: at most one more second of events, then only failures and
+    // blocks (few, and what a reader most needs), still spaced.
     let budget = (Duration::from_secs(1).as_millis() / spacing.as_millis().max(1)) as usize;
     let mut flushed = 0usize;
-    while flushed < budget
-        && let Some((_, (at, event))) = pending.shift_remove_index(0)
-    {
+    let mut cut = 0usize;
+    while let Some((_, (at, event))) = pending.shift_remove_index(0) {
+        if flushed >= budget && !keeps_its_place(&event) {
+            cut += 1;
+            continue;
+        }
         if let Some(t) = last_sent.map(|t| t + spacing) {
             tokio::time::sleep_until(t).await;
         }
@@ -121,7 +146,7 @@ pub async fn forward(
         flushed += 1;
         last_sent = Some(Instant::now());
     }
-    let dropped = superseded + pending.len();
+    let dropped = superseded + cut;
     if dropped > 0 {
         tracing::debug!(
             sent,
@@ -168,6 +193,73 @@ mod tests {
                 status: ModuleStatus::Applied
             })
         );
+    }
+
+    fn failed(i: usize) -> ApplyEvent {
+        ApplyEvent::StepFailed {
+            module: "m".into(),
+            task_id: format!("t{i}"),
+            id: format!("file.copy[t{i}]"),
+            kind: "file.copy".into(),
+            error: "boom".into(),
+            error_detail: None,
+        }
+    }
+
+    async fn forward_all(events: Vec<ApplyEvent>) -> (Vec<ApplyEvent>, usize) {
+        let (tx, rx) = mpsc::channel(4096);
+        let (report_tx, mut report_rx) = mpsc::channel(4096);
+        let sink = ReportSink::default();
+        sink.attach(report_tx);
+        for e in events {
+            tx.send(e).await.expect("send");
+        }
+        drop(tx);
+        let (_, dropped) = forward(rx, sink, RevisionId::new("r"), "d".into(), EVENT_SPACING).await;
+        let mut out = Vec::new();
+        while let Ok(Report::ApplyEvent { event, .. }) = report_rx.try_recv() {
+            out.push(event);
+        }
+        (out, dropped)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failures_survive_the_end_of_a_burst() {
+        let mut events = Vec::new();
+        for i in 0..200 {
+            events.push(step(i, false));
+            events.push(step(i, true));
+        }
+        events.push(failed(500));
+        let (sent, dropped) = forward_all(events).await;
+        assert!(dropped > 0, "the burst was cut");
+        assert!(
+            sent.len() <= 12,
+            "still about a second of events: {}",
+            sent.len()
+        );
+        assert!(
+            matches!(sent.last(), Some(ApplyEvent::StepFailed { .. })),
+            "the failure is sent even past the flush budget: {sent:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_is_never_replaced_by_a_later_event_of_the_same_step() {
+        // The rollback runs the same step again right after it failed.
+        let (sent, _) = forward_all(vec![
+            step(1, false),
+            failed(1),
+            step(1, false),
+            step(1, true),
+        ])
+        .await;
+        assert!(
+            sent.iter()
+                .any(|e| matches!(e, ApplyEvent::StepFailed { .. })),
+            "{sent:?}"
+        );
+        assert!(matches!(sent.last(), Some(ApplyEvent::StepFinished { .. })));
     }
 
     #[tokio::test(start_paused = true)]

@@ -53,6 +53,10 @@ impl std::fmt::Debug for FleetService {
     }
 }
 
+/// The largest agent message the server decodes (tonic's default is 4 MiB):
+/// an ApplyResult of a host with thousands of steps must still arrive whole.
+pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Serves `service` on `listener` until `cancel` trips.
 pub async fn serve(
     service: FleetService,
@@ -76,7 +80,9 @@ pub async fn serve(
     }
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     builder
-        .add_service(FleetServer::new(service))
+        // An ApplyResult carries the whole outcome (every module and step) and
+        // is the authoritative record of a run: never refuse one for its size.
+        .add_service(FleetServer::new(service).max_decoding_message_size(MAX_AGENT_MESSAGE_BYTES))
         .serve_with_incoming_shutdown(incoming, cancel.cancelled_owned())
         .await
         .map_err(|e| {

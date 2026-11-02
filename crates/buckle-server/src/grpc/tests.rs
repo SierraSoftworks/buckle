@@ -645,6 +645,28 @@ async fn next_ack(stream: &mut tonic::Streaming<ServerMessage>) -> Vec<u64> {
 }
 
 #[tokio::test]
+async fn an_apply_result_larger_than_tonics_default_limit_is_accepted() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    // A host with thousands of steps: well over tonic's 4 MiB default.
+    let outcome = serde_json::json!({ "padding": "x".repeat(6 * 1024 * 1024) });
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::Result(buckle_proto::v1::ApplyResult {
+            revision: "r1".into(),
+            plan_digest: "d1".into(),
+            succeeded: true,
+            report_id: 7,
+            outcome_json: serde_json::to_vec(&outcome).unwrap(),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![7]);
+}
+
+#[tokio::test]
 async fn durable_reports_are_acknowledged_and_stored_once() {
     let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
     let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
