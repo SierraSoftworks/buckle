@@ -741,3 +741,100 @@ async fn an_apply_re_plans_with_the_select_of_the_approved_plan() {
     );
     h.stop().await.expect("clean exit");
 }
+
+#[tokio::test(start_paused = true)]
+async fn facts_refreshed_while_planning_are_reported_and_top_up_secrets() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        ..Default::default()
+    })
+    .await;
+    h.fleet.set_secrets(vec![
+        pb::SecretValue {
+            name: "db".into(),
+            value: b"hunter2".to_vec(),
+            fingerprint: "01020304".into(),
+        },
+        pb::SecretValue {
+            name: "old".into(),
+            value: b"s3cret".to_vec(),
+            fingerprint: "0a0b0c0d".into(),
+        },
+    ]);
+    h.fleet.add_revision(
+        "stable1",
+        bundle(&format!(
+            "{FLEET_YAML}secrets:\n  old: {{ file: /secrets/old }}\n"
+        )),
+    );
+    let digest = h.fleet.add_revision(
+        "rev1",
+        bundle(&format!(
+            "{FLEET_YAML}secrets:\n  db: {{ file: /secrets/db }}\n"
+        )),
+    );
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(Some("stable1"), None)).await;
+    session
+        .expect(|m| matches!(m, pb::agent_message::Msg::Facts(_)).then_some(()))
+        .await;
+    session.send(assign("rev1", &digest)).await;
+
+    // The engine refreshes a provider while planning: the change is reported
+    // straight away, not at the next facts pass ten minutes later.
+    let mut facts = buckle_core::facts::Facts::new();
+    facts.mount(
+        "os",
+        serde_json::json!({ "family": "debian" }),
+        chrono::Utc::now(),
+    );
+    fake.with_plan_facts(facts);
+    let asked = tokio::time::Instant::now();
+    session.send(request_plan("rev1")).await;
+    session
+        .expect(|m| match m {
+            pb::agent_message::Msg::Facts(f) => {
+                let tree: serde_json::Value = serde_json::from_slice(&f.json).ok()?;
+                (tree["os"]["family"] == "debian").then_some(())
+            }
+            _ => None,
+        })
+        .await;
+    assert!(tokio::time::Instant::now() - asked < Duration::from_secs(60));
+    session.expect(plan_result).await;
+
+    // Missing secrets were requested for the assigned and the stable revision.
+    let store = Store::new(h.state_dir());
+    let key = store.install_key().expect("key");
+    wait_until(|| {
+        store
+            .load_secrets(&rev("rev1"), &key)
+            .ok()
+            .flatten()
+            .is_some()
+            && store
+                .load_secrets(&rev("stable1"), &key)
+                .ok()
+                .flatten()
+                .is_some()
+    })
+    .await;
+    let stable = store
+        .load_secrets(&rev("stable1"), &key)
+        .expect("load")
+        .expect("stable topped up");
+    assert!(stable.get("old").is_some());
+    // An unchanged re-plan reports nothing new.
+    session.send(request_plan("rev1")).await;
+    let between = session.collect_until(|m| plan_result(m).is_some()).await;
+    assert!(
+        between
+            .iter()
+            .all(|(_, m)| !matches!(m, pb::agent_message::Msg::Facts(_))),
+        "unchanged facts are not re-sent"
+    );
+    h.stop().await.expect("clean exit");
+}

@@ -150,6 +150,7 @@ pub struct FakeRunner {
     health: Mutex<HealthFn>,
     events_per_apply: Mutex<Vec<ApplyEvent>>,
     facts: Mutex<Facts>,
+    plan_facts: Mutex<Option<Facts>>,
     calls: Mutex<Vec<Call>>,
     changed: Notify,
 }
@@ -163,6 +164,7 @@ impl Default for FakeRunner {
             health: Mutex::new(Box::new(|_, scope| health(scope, true))),
             events_per_apply: Mutex::new(Vec::new()),
             facts: Mutex::new(Facts::new()),
+            plan_facts: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
             changed: Notify::new(),
         }
@@ -219,6 +221,13 @@ impl FakeRunner {
     /// Returns these facts from `facts`.
     pub fn with_facts(&self, facts: Facts) -> &Self {
         *lock(&self.facts) = facts;
+        self
+    }
+
+    /// Returns these facts from `plan`, as the engine does when a provider's
+    /// TTL expired during planning (otherwise `plan` hands back the context's).
+    pub fn with_plan_facts(&self, facts: Facts) -> &Self {
+        *lock(&self.plan_facts) = Some(facts);
         self
     }
 
@@ -284,7 +293,10 @@ impl Runner for FakeRunner {
             waived_checks: ctx.waived_checks.clone(),
             force: ctx.force,
         });
-        Ok((self.plan_for(&revision.id), ctx.facts.clone()))
+        let facts = lock(&self.plan_facts)
+            .clone()
+            .unwrap_or_else(|| ctx.facts.clone());
+        Ok((self.plan_for(&revision.id), facts))
     }
 
     async fn apply(

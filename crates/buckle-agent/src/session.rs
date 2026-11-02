@@ -165,6 +165,8 @@ struct Data {
     /// The selector each recent plan digest was made with (only selected
     /// plans are remembered).
     selects: HashMap<String, String>,
+    /// The facts tree last reported to a server.
+    reported_facts: Option<serde_json::Value>,
 }
 
 struct Shared {
@@ -1109,11 +1111,36 @@ impl Shared {
         }
     }
 
+    /// Keeps `facts` (from a facts pass, or refreshed by the engine while
+    /// planning) and reports them when they differ from what the server last
+    /// saw (or when `force`). A change after the first report may select more
+    /// modules, so missing secrets are requested too.
     async fn remember_facts(&self, facts: Facts) {
-        let mut data = self.data.lock().await;
-        if data.agent.facts != facts {
-            data.agent.facts = facts;
-            self.save_agent(&data);
+        self.remember_facts_and_report(facts, false).await
+    }
+
+    async fn remember_facts_and_report(&self, facts: Facts, force: bool) {
+        let connected = self.connected.load(Ordering::SeqCst);
+        let (report, top_up) = {
+            let mut data = self.data.lock().await;
+            if data.agent.facts != facts {
+                data.agent.facts = facts;
+                self.save_agent(&data);
+            }
+            let changed = data.reported_facts.as_ref() != Some(&data.agent.facts.tree);
+            if !connected || !(changed || force) {
+                (None, false)
+            } else {
+                let seen_before = data.reported_facts.is_some();
+                data.reported_facts = Some(data.agent.facts.tree.clone());
+                (Some(data.agent.facts.clone()), changed && seen_before)
+            }
+        };
+        if let Some(facts) = report {
+            self.sink.send(Report::Facts(facts)).await;
+        }
+        if top_up {
+            self.top_up_secrets().await;
         }
     }
 
@@ -1762,16 +1789,7 @@ impl Shared {
     async fn facts(&self, force_report: bool) {
         let previous = self.data.lock().await.agent.facts.clone();
         match self.runner.facts(&previous).await {
-            Ok(facts) => {
-                let changed = facts.tree != previous.tree;
-                self.remember_facts(facts.clone()).await;
-                if changed || force_report {
-                    self.sink.send(Report::Facts(facts)).await;
-                }
-                if changed && !previous.tree.is_null() {
-                    self.top_up_secrets().await;
-                }
-            }
+            Ok(facts) => self.remember_facts_and_report(facts, force_report).await,
             Err(err) => tracing::warn!(error = %err.description(), "could not collect facts"),
         }
     }
@@ -1783,14 +1801,35 @@ impl Shared {
         if !self.connected.load(Ordering::SeqCst) {
             return;
         }
-        let candidates: Vec<(RevisionId, Arc<Revision>)> = {
+        // The assigned and applied revisions, and the stable one (a local or
+        // module rollback renders it with the host's current selection).
+        let ids: Vec<RevisionId> = {
             let data = self.data.lock().await;
-            [data.agent.applied_revision.clone(), data.assigned.clone()]
-                .into_iter()
-                .flatten()
-                .filter_map(|id| data.revisions.get(&id).map(|r| (id, r.clone())))
-                .collect()
+            let mut ids: Vec<RevisionId> = [
+                data.agent.applied_revision.clone(),
+                data.assigned.clone(),
+                data.agent.stable_revision.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            ids.sort();
+            ids.dedup();
+            ids
         };
+        let mut candidates: Vec<(RevisionId, Arc<Revision>)> = Vec::new();
+        for id in ids {
+            if !self.store.has_revision(&id) && !self.data.lock().await.revisions.contains_key(&id)
+            {
+                continue;
+            }
+            match self.ensure_revision(&id, None).await {
+                Ok(rev) => candidates.push((id, rev)),
+                Err(err) => {
+                    tracing::debug!(revision = %id.short(), error = %err.description(), "cannot check a revision's secrets")
+                }
+            }
+        }
         for (id, rev) in candidates {
             let held = self.secrets_for(&id).await;
             let missing: Vec<String> = rev
