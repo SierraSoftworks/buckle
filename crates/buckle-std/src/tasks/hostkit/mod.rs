@@ -449,3 +449,169 @@ pub fn written(
     applied.shadow = shadow;
     applied
 }
+
+/// A UTF-8 text file read from the host, with its metadata.
+pub struct TextFile {
+    pub meta: FileMeta,
+    pub text: String,
+}
+
+/// Reads a text file for in-place editing. `Ok(None)` when it does not exist;
+/// directories and non-UTF-8 files are user errors.
+pub async fn load_text(cx: &Cx, path: &Path) -> Result<Option<TextFile>> {
+    let Some(meta) = cx.system.stat(path).await? else {
+        return Ok(None);
+    };
+    if meta.kind == FileKind::Directory {
+        return Err(error::user(
+            format!("{} is a directory, not a file.", path.display()),
+            &["Point `path` at a file."],
+        ));
+    }
+    let bytes = cx.system.read(path).await?.unwrap_or_default();
+    let text = String::from_utf8(bytes).map_err(|_| {
+        error::user(
+            format!(
+                "{} is not valid UTF-8 text, so it cannot be edited line by line.",
+                path.display()
+            ),
+            &["Use file.copy or file.template to manage binary files."],
+        )
+    })?;
+    Ok(Some(TextFile { meta, text }))
+}
+
+/// Writes edited text back, keeping the file's mode and ownership (or using
+/// `default_perms` for a new file), optionally backing the old content up first.
+pub async fn save_text(
+    cx: &Cx,
+    path: &Path,
+    new_text: &str,
+    existing: Option<&TextFile>,
+    backup: bool,
+    default_perms: &FilePerms,
+) -> Result<()> {
+    let perms = match existing {
+        Some(file) => {
+            if backup {
+                backup_file(cx, path, &file.meta, file.text.as_bytes()).await?;
+            }
+            perms_of(&file.meta)
+        }
+        None => default_perms.clone(),
+    };
+    cx.system
+        .write_atomic(path, new_text.as_bytes(), &perms)
+        .await
+}
+
+/// A diff between two texts of a host file: unified when small, else a summary.
+pub fn text_diff(summary: impl Into<String>, old: &str, new: &str) -> buckle_core::plan::Diff {
+    if old.len() <= SHADOW_LIMIT && new.len() <= SHADOW_LIMIT {
+        buckle_core::plan::Diff::unified(
+            summary,
+            &Redacted::plain(old.to_owned()),
+            &Redacted::plain(new.to_owned()),
+        )
+    } else {
+        buckle_core::plan::Diff::Update {
+            summary: summary.into(),
+            unified: None,
+        }
+    }
+}
+
+/// Where `insert_after` / `insert_before` place new lines: the index to insert
+/// at. `after` and `before` are regular expressions, or the literals `EOF` and
+/// `BOF`; with neither, lines go at the end. A pattern that matches nothing
+/// falls back to the end of the file. The last match wins, as in Ansible.
+pub fn insertion_index(
+    lines: &[String],
+    after: Option<&str>,
+    before: Option<&str>,
+) -> Result<usize> {
+    if let Some(pattern) = after {
+        if pattern == "EOF" {
+            return Ok(lines.len());
+        }
+        let re = compile_regex(pattern, "insert_after")?;
+        return Ok(lines
+            .iter()
+            .rposition(|l| re.is_match(l))
+            .map(|i| i + 1)
+            .unwrap_or(lines.len()));
+    }
+    if let Some(pattern) = before {
+        if pattern == "BOF" {
+            return Ok(0);
+        }
+        let re = compile_regex(pattern, "insert_before")?;
+        return Ok(lines
+            .iter()
+            .rposition(|l| re.is_match(l))
+            .unwrap_or(lines.len()));
+    }
+    Ok(lines.len())
+}
+
+/// How long a download may take before it is abandoned.
+pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// GETs `url` and returns the body, turning transport and status failures into
+/// user errors that name the URL.
+pub async fn http_get(cx: &Cx, url: &str, headers: &[(String, String)]) -> Result<Vec<u8>> {
+    let mut request = buckle_core::system::HttpRequest::get(url).timeout(DOWNLOAD_TIMEOUT);
+    for (name, value) in headers {
+        request = request.header(name.clone(), value.clone());
+    }
+    let response = cx.system.http(request).await?;
+    if (200..300).contains(&response.status) {
+        return Ok(response.body);
+    }
+    Err(error::user(
+        format!("GET {url} returned HTTP {}.", response.status),
+        &[
+            "Check the URL, and any credentials the server needs.",
+            "For GitHub, a rate-limited or private repository needs a token (see `token_env` on github.release).",
+        ],
+    ))
+}
+
+/// Whether `s` looks like a SHA-256 digest in hex.
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Extracts a SHA-256 from the text of a `.sha256` or `SHA256SUMS` file.
+///
+/// A single-line file may hold a bare digest or `digest  name`. A multi-line
+/// file is searched for the line naming one of `names` (a leading `*` or `./`
+/// on the name is ignored).
+pub fn parse_sha256_text(text: &str, names: &[&str]) -> Option<String> {
+    let entries: Vec<(&str, Option<&str>)> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            let digest = parts.next()?;
+            let name = parts
+                .next()
+                .map(|n| n.trim_start_matches('*').trim_start_matches("./"));
+            is_sha256_hex(digest).then_some((digest, name))
+        })
+        .collect();
+    if let [(digest, _)] = entries.as_slice() {
+        return Some(digest.to_ascii_lowercase());
+    }
+    entries
+        .iter()
+        .find(|(_, name)| name.is_some_and(|n| names.contains(&n)))
+        .map(|(digest, _)| digest.to_ascii_lowercase())
+}
+
+/// The last path segment of a URL, without query or fragment.
+pub fn url_basename(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.rsplit('/').next().unwrap_or(path).to_owned()
+}
