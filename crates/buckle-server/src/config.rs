@@ -196,6 +196,9 @@ pub struct GitSource {
     pub credentials: Option<GitCredentials>,
     #[serde(default)]
     pub webhook_secret: Option<String>,
+    /// How long one fetch may take before it is interrupted (default 2m).
+    #[serde(default = "GitSource::default_fetch_timeout", with = "humantime_serde")]
+    pub fetch_timeout: Duration,
 }
 
 impl std::fmt::Debug for GitSource {
@@ -204,6 +207,7 @@ impl std::fmt::Debug for GitSource {
             .field("url", &redact_url(&self.url))
             .field("branch", &self.branch)
             .field("poll", &self.poll)
+            .field("fetch_timeout", &self.fetch_timeout)
             .field("credentials", &self.credentials)
             .field(
                 "webhook_secret",
@@ -213,11 +217,17 @@ impl std::fmt::Debug for GitSource {
     }
 }
 
-/// A URL with any embedded password replaced, for logs.
+/// A URL with any embedded password replaced, for logs. A user name with
+/// no password is replaced too, since tokens are often passed that way
+/// (`https://ghp_…@github.com/…`).
 pub fn redact_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut u) if u.password().is_some() => {
             let _ = u.set_password(Some("***"));
+            u.to_string()
+        }
+        Ok(mut u) if !u.username().is_empty() => {
+            let _ = u.set_username("***");
             u.to_string()
         }
         _ => url.to_owned(),
@@ -230,6 +240,9 @@ impl GitSource {
     }
     fn default_poll() -> Duration {
         Duration::from_secs(30)
+    }
+    fn default_fetch_timeout() -> Duration {
+        Duration::from_secs(120)
     }
 }
 
@@ -669,6 +682,14 @@ secrets:
         assert_eq!(
             redact_url("https://user:pw@github.com/x.git"),
             "https://user:***@github.com/x.git"
+        );
+        assert_eq!(
+            redact_url("https://ghp_token@github.com/x.git"),
+            "https://***@github.com/x.git"
+        );
+        assert_eq!(
+            cfg.source.git.as_ref().unwrap().fetch_timeout,
+            Duration::from_secs(120)
         );
     }
 

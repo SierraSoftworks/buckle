@@ -50,20 +50,36 @@ impl RevisionCache {
 
     /// Remembers an already-loaded revision.
     pub fn insert(&self, id: &str, revision: Arc<Revision>) {
-        if let Ok(mut m) = self.loaded.lock() {
-            m.insert(id.to_owned(), revision);
-        }
+        self.loaded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(sanitize(id), revision);
     }
 
     /// The revision, loading it from disk (extracting the tarball when the
-    /// tree is missing) on first use.
+    /// tree is missing) on first use. Cached under the same sanitised id
+    /// that names its directory, so two spellings of an id cannot load one
+    /// tree under different names.
     pub async fn load(&self, id: &str) -> Result<Arc<Revision>> {
-        if let Some(r) = self.loaded.lock().ok().and_then(|m| m.get(id).cloned()) {
+        let key = sanitize(id);
+        if key.is_empty() {
+            return Err(buckle_core::error::user(
+                format!("'{id}' is not a revision id."),
+                &["Revision ids are commit ids or tree digests (letters and digits)."],
+            ));
+        }
+        if let Some(r) = self
+            .loaded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .cloned()
+        {
             return Ok(r);
         }
         let dir = self.dir(id);
         let tarball = self.tarball(id);
-        let rev_id = id.to_owned();
+        let rev_id = key.clone();
         let revision = tokio::task::spawn_blocking(move || -> Result<Revision> {
             if !dir.join("buckle.yaml").is_file() && tarball.is_file() {
                 super::tarball::extract(&tarball, &dir)?;
@@ -90,4 +106,26 @@ fn sanitize(id: &str) -> String {
     id.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn revisions_are_cached_under_their_sanitised_id() {
+        let data = tempfile::tempdir().unwrap();
+        let cache = RevisionCache::new(data.path());
+        let dir = cache.dir("abc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("buckle.yaml"), "version: 2\n").unwrap();
+        let plain = cache.load("abc").await.unwrap();
+        let odd = cache.load("a/b.c").await.unwrap();
+        assert!(Arc::ptr_eq(&plain, &odd), "one tree, one cache entry");
+        assert_eq!(odd.id.0, "abc");
+        assert!(
+            cache.load("../..").await.is_err(),
+            "nothing names the root itself"
+        );
+    }
 }

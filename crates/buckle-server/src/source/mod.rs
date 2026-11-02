@@ -82,6 +82,19 @@ impl RevisionBuilder {
             .await
     }
 
+    /// Announces an already stored revision again, as if it were new (the
+    /// branch moved back to it). Returns its record, if it is stored.
+    pub async fn reannounce(&self, id: &str) -> Result<Option<RevisionRecord>> {
+        let id = id.to_owned();
+        let record = self.store.call(move |db| db.revisions().get(&id)).await?;
+        if let Some(record) = &record
+            && let Some(f) = &self.on_added
+        {
+            f(record);
+        }
+        Ok(record)
+    }
+
     /// Builds a revision from `tree` (which is moved under the revision
     /// cache) and stores it. Returns the stored record.
     pub async fn build(
