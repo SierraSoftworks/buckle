@@ -89,6 +89,17 @@ impl Content<'_> {
     }
 }
 
+/// What a validation run found out, short of a failed check (an error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Checked {
+    /// No validator applies, or it passed.
+    Passed,
+    /// The explicit validator's program is not installed. Only returned while
+    /// planning, where the step is Blocked and planned again at apply time once
+    /// earlier steps (such as the package that ships the tool) have run.
+    ToolMissing(String),
+}
+
 /// Checks `content` (the candidate for `dest`) with the validator. Errors
 /// when the validator fails (the destination is untouched); the validator's
 /// output is withheld when the content is sensitive.
@@ -97,9 +108,9 @@ pub async fn check(
     dest: &Path,
     explicit: Option<&[String]>,
     content: Content<'_>,
-) -> Result<()> {
+) -> Result<Checked> {
     let Some(validator) = validator_for(dest, explicit) else {
-        return Ok(());
+        return Ok(Checked::Passed);
     };
     if !validator.argv.iter().any(|a| a.contains("{path}")) {
         return Err(error::user(
@@ -110,15 +121,33 @@ pub async fn check(
         ));
     }
     let Some(program) = validator.argv.first() else {
-        return Ok(());
+        return Ok(Checked::Passed);
     };
-    if !validator.explicit && cx.system.which(program).await?.is_none() {
-        tracing::warn!(
-            dest = %dest.display(),
-            validator = %program,
-            "the automatic validator is not installed; skipping validation"
-        );
-        return Ok(());
+    if cx.system.which(program).await?.is_none() {
+        if !validator.explicit {
+            tracing::warn!(
+                dest = %dest.display(),
+                validator = %program,
+                "the automatic validator is not installed; skipping validation"
+            );
+            return Ok(Checked::Passed);
+        }
+        return match cx.mode {
+            buckle_core::task::Mode::Plan => Ok(Checked::ToolMissing(format!(
+                "`{program}` (the validator for {}) is not installed; the content is checked again at apply time once earlier steps have run",
+                dest.display()
+            ))),
+            buckle_core::task::Mode::Apply => Err(error::user(
+                format!(
+                    "The validator `{program}` for {} is not installed.",
+                    dest.display()
+                ),
+                &[
+                    "Install it in an earlier task of the same module (for example the package that ships it).",
+                    "Or drop the `validate` entry if the check is not wanted.",
+                ],
+            )),
+        };
     }
     let tmp = scratch_path(cx, dest, &content.digest());
     if let Some(parent) = tmp.parent() {
@@ -152,7 +181,7 @@ pub async fn check(
     let _ = cx.system.remove(&tmp, false).await;
     let out = outcome?;
     if out.success() {
-        return Ok(());
+        return Ok(Checked::Passed);
     }
     let detail = if content.is_sensitive() {
         "Its output is withheld because the file contains secrets.".to_owned()

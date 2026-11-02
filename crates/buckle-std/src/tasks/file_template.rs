@@ -192,14 +192,17 @@ impl Task for FileTemplate {
     #[instrument(name = "task.file.template.plan", skip_all, fields(src = %spec.src, dest = %spec.dest.display()))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         let inspection = self.inspect(cx, spec).await?;
-        if inspection.planned.is_change() && content_changes(&inspection) {
-            hostkit::validate::check(
+        if inspection.planned.is_change()
+            && content_changes(&inspection)
+            && let hostkit::validate::Checked::ToolMissing(reason) = hostkit::validate::check(
                 cx,
                 &spec.dest,
                 spec.validate.as_deref(),
                 hostkit::validate::Content::Rendered(&inspection.rendered),
             )
-            .await?;
+            .await?
+        {
+            return Ok(Planned::blocked(reason));
         }
         Ok(inspection.planned)
     }

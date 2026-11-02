@@ -249,14 +249,17 @@ impl Task for FileBlock {
             Outcome::NoOp => Planned::NoOp,
             Outcome::Blocked(reason) => Planned::blocked(reason),
             Outcome::Change { diff, new_text, .. } => {
-                hostkit::validate::check(
+                match hostkit::validate::check(
                     cx,
                     &spec.path,
                     spec.validate.as_deref(),
                     hostkit::validate::Content::Bytes(new_text.as_bytes()),
                 )
-                .await?;
-                Planned::change(diff)
+                .await?
+                {
+                    hostkit::validate::Checked::ToolMissing(reason) => Planned::blocked(reason),
+                    hostkit::validate::Checked::Passed => Planned::change(diff),
+                }
             }
         })
     }

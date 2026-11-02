@@ -146,14 +146,17 @@ impl Task for FileCopy {
     #[instrument(name = "task.file.copy.plan", skip_all, fields(src = %spec.src, dest = %spec.dest.display()))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         let inspection = self.inspect(cx, spec).await?;
-        if inspection.planned.is_change() && content_differs(&inspection) {
-            hostkit::validate::check(
+        if inspection.planned.is_change()
+            && content_differs(&inspection)
+            && let hostkit::validate::Checked::ToolMissing(reason) = hostkit::validate::check(
                 cx,
                 &spec.dest,
                 spec.validate.as_deref(),
                 hostkit::validate::Content::Bytes(&inspection.content),
             )
-            .await?;
+            .await?
+        {
+            return Ok(Planned::blocked(reason));
         }
         Ok(inspection.planned)
     }
@@ -527,14 +530,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_automatic_validator_is_skipped_but_an_explicit_one_is_required() {
+    async fn a_missing_automatic_validator_is_skipped_but_an_explicit_one_blocks_the_plan() {
         let sys = FakeSystem::new().with_dir("/etc/sudoers.d", FilePerms::mode(0o750));
-        let c = cx_src(&sys, sudoers_source());
+        let planning = cx_plan(&sys, sudoers_source());
         let auto: Spec = spec(json!({"src": "sudoers/deploy", "dest": "/etc/sudoers.d/deploy"}));
-        assert_eq!(plan_class(&FileCopy, &c, &auto).await, Class::Change);
+        assert_eq!(plan_class(&FileCopy, &planning, &auto).await, Class::Change);
         let explicit: Spec = spec(
             json!({"src": "sudoers/deploy", "dest": "/etc/sudoers.d/deploy", "validate": ["visudo", "-cf", "{path}"]}),
         );
-        assert!(FileCopy.plan(&c, &explicit).await.is_err());
+        // Planning is Blocked (an earlier step may install the tool); applying
+        // without it is an error, and nothing is written.
+        assert_eq!(
+            plan_class(&FileCopy, &planning, &explicit).await,
+            Class::Blocked
+        );
+        let applying = cx_src(&sys, sudoers_source());
+        assert!(
+            FileCopy
+                .apply(&applying, &explicit, &Planned::NoOp)
+                .await
+                .is_err()
+        );
+        assert!(!sys.exists("/etc/sudoers.d/deploy"));
     }
 }
