@@ -96,8 +96,28 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
     }
 
     let mut var_files = indexmap::IndexMap::new();
-    for overlay in &fleet.vars {
+    for (index, overlay) in fleet.vars.iter().enumerate() {
         if let Some(file) = &overlay.file {
+            let escapes = file.is_absolute()
+                || file.has_root()
+                || file.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                    )
+                });
+            if escapes {
+                return Err(crate::error::user(
+                    format!(
+                        "The vars overlay {} in buckle.yaml names the file '{}', which is outside the configuration.",
+                        index + 1,
+                        file.display()
+                    ),
+                    &[
+                        "Give overlay files as paths relative to the directory of buckle.yaml, without '..'.",
+                    ],
+                ));
+            }
             let path = root.join(file);
             let yaml = std::fs::read_to_string(&path).map_err(|e| {
                 crate::error::wrap_user(
@@ -173,6 +193,25 @@ mod tests {
         let rev = load_dir(dir.path(), RevisionId::new("t")).unwrap();
         assert_eq!(rev.modules.len(), 1);
         assert_eq!(rev.unloaded, vec!["half"]);
+    }
+
+    #[rstest::rstest]
+    #[case("/etc/passwd")]
+    #[case("../outside.yaml")]
+    #[case("vars/../../outside.yaml")]
+    fn vars_overlay_files_must_stay_inside_the_revision(#[case] file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("buckle.yaml"),
+            format!("version: 2\nvars:\n  - file: '{file}'\n"),
+        )
+        .unwrap();
+        let err = load_dir(dir.path(), RevisionId::new("t")).unwrap_err();
+        assert!(
+            err.description().contains("outside the configuration"),
+            "{}",
+            err.description()
+        );
     }
 
     #[test]

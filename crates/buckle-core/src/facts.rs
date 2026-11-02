@@ -73,9 +73,29 @@ pub fn registry() -> &'static HashMap<&'static str, &'static dyn DynFactProvider
                     panic!("two fact providers are registered as '{}'", reg.0.name());
                 }
             }
+            if let Err(problem) = check_mounts(map.keys().copied()) {
+                panic!("{problem}");
+            }
             map
         });
     &REGISTRY
+}
+
+/// Refuses provider names whose mount points nest (`cloud` and `cloud.oci`):
+/// one provider's collection would overwrite or be overwritten by the other's.
+pub fn check_mounts<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let mut names: Vec<&str> = names.into_iter().collect();
+    names.sort_unstable();
+    for (i, a) in names.iter().enumerate() {
+        for b in &names[i + 1..] {
+            if b.starts_with(&format!("{a}.")) {
+                return Err(format!(
+                    "the fact providers '{a}' and '{b}' mount at overlapping paths (host.facts.{a} contains host.facts.{b}); rename one"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A collected facts document with per-provider timestamps for TTL handling.
@@ -250,6 +270,14 @@ mod tests {
         }
     }
     crate::register_facts!(FlakyFacts);
+
+    #[test]
+    fn provider_mount_points_must_not_nest() {
+        assert!(check_mounts(["os", "cloud.oci", "cloud.azure", "cloudy"]).is_ok());
+        let err = check_mounts(["cloud.oci", "os", "cloud"]).unwrap_err();
+        assert!(err.contains("'cloud' and 'cloud.oci'"), "{err}");
+        assert!(check_mounts(registry().keys().copied()).is_ok());
+    }
 
     #[tokio::test]
     async fn a_failing_provider_keeps_its_last_good_value_and_is_retried() {

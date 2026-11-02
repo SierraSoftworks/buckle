@@ -360,10 +360,29 @@ impl Plan {
     }
 
     pub fn compute_digest(&self) -> Digest {
+        /// A removal without its origin: hosts that applied the same resource
+        /// in different revisions still share the plan.
+        #[derive(Serialize)]
+        struct RemovalContent<'a> {
+            resource: &'a ResourceKey,
+            policy: RemovalPolicy,
+            summary: &'a str,
+            caution: bool,
+        }
+        let removals: Vec<RemovalContent<'_>> = self
+            .removals
+            .iter()
+            .map(|r| RemovalContent {
+                resource: &r.resource,
+                policy: r.policy,
+                summary: &r.summary,
+                caution: r.caution,
+            })
+            .collect();
         #[derive(Serialize)]
         struct Content<'a> {
             modules: &'a [ModulePlan],
-            removals: &'a [Removal],
+            removals: &'a [RemovalContent<'a>],
             deferred: &'a [Deferred],
             #[serde(skip_serializing_if = "<[Indeterminate]>::is_empty")]
             indeterminate: &'a [Indeterminate],
@@ -374,7 +393,7 @@ impl Plan {
         }
         Digest::of_json(&Content {
             modules: &self.modules,
-            removals: &self.removals,
+            removals: &removals,
             deferred: &self.deferred,
             indeterminate: &self.indeterminate,
             rehomed: &self.rehomed,
@@ -463,6 +482,32 @@ mod tests {
         );
         assert_eq!(a.digest, b.digest);
         assert_ne!(a.digest, c.digest);
+    }
+
+    #[test]
+    fn removal_origins_do_not_split_the_digest() {
+        let removal = |origin: &str| Removal {
+            resource: ResourceKey::new("m", "file.copy", "/gone"),
+            policy: RemovalPolicy::Cleanup,
+            summary: "delete /gone".into(),
+            caution: false,
+            introduced_in: Some(RevisionId::new(origin)),
+        };
+        let a = Plan::new(
+            RevisionId::new("r"),
+            "a",
+            vec![],
+            vec![removal("r1")],
+            vec![],
+        );
+        let b = Plan::new(
+            RevisionId::new("r"),
+            "b",
+            vec![],
+            vec![removal("r7")],
+            vec![],
+        );
+        assert_eq!(a.digest, b.digest);
     }
 
     #[test]

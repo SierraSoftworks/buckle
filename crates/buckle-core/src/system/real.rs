@@ -145,6 +145,45 @@ impl RealSystem {
     }
 }
 
+fn kernel_hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        nix::unistd::gethostname()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// Whether `path` is a file this process could execute: on Unix a regular
+/// file with an execute bit; elsewhere any file (PATHEXT decides).
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Creates (or truncates) `path` with mode 0600, writes `bytes` and fsyncs.
 async fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -187,14 +226,19 @@ impl System for RealSystem {
         Platform::current()
     }
 
+    /// The kernel's hostname (`gethostname`), then `$HOSTNAME`, then
+    /// `/etc/hostname`. A shell exports `HOSTNAME` but a service manager does
+    /// not, and `/etc/hostname` can disagree with the running kernel, so the
+    /// kernel wins. On Windows the computer name (`COMPUTERNAME`) comes first.
     fn hostname(&self) -> String {
-        std::env::var("HOSTNAME")
-            .ok()
-            .filter(|h| !h.is_empty())
+        kernel_hostname()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|h| !h.trim().is_empty())
             .or_else(|| {
                 std::fs::read_to_string("/etc/hostname")
                     .ok()
                     .map(|s| s.trim().to_owned())
+                    .filter(|h| !h.is_empty())
             })
             .unwrap_or_else(|| "localhost".to_owned())
     }
@@ -346,6 +390,10 @@ impl System for RealSystem {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
+        // Its own process group, so a timeout can kill everything it started
+        // (a shell's children included), not just the direct child.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn().map_err(|e| {
             crate::error::wrap_user(
                 e,
@@ -359,11 +407,21 @@ impl System for RealSystem {
             let _ = pipe.write_all(stdin).await;
             drop(pipe);
         }
+        let pid = child.id();
         let wait = child.wait_with_output();
         let (result, timed_out) = match command.timeout {
             Some(t) => match tokio::time::timeout(t, wait).await {
                 Ok(r) => (r, false),
                 Err(_) => {
+                    #[cfg(unix)]
+                    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+                        let _ = nix::sys::signal::killpg(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    let _ = pid;
                     return Ok(Output {
                         code: None,
                         stdout: Vec::new(),
@@ -386,7 +444,7 @@ impl System for RealSystem {
     async fn which(&self, program: &str) -> crate::Result<Option<PathBuf>> {
         if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
             let p = PathBuf::from(program);
-            return Ok(if p.exists() { Some(p) } else { None });
+            return Ok(is_executable(&p).then_some(p));
         }
         // On Windows an executable is found by name plus one of the PATHEXT
         // extensions (`sh` resolves to `sh.exe`); elsewhere the bare name is the file.
@@ -408,7 +466,7 @@ impl System for RealSystem {
         for dir in std::env::split_paths(&path) {
             for ext in &extensions {
                 let candidate = dir.join(format!("{program}{ext}"));
-                if candidate.is_file() {
+                if is_executable(&candidate) {
                     return Ok(Some(candidate));
                 }
             }
@@ -656,6 +714,64 @@ mod tests {
             .await
             .unwrap();
         assert!(out.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let sys = RealSystem::new();
+        let out = sys
+            .run(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("sleep 30 & echo $! > {}; wait", pidfile.display()))
+                    .timeout(Duration::from_millis(300)),
+            )
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut alive = true;
+        for _ in 0..100 {
+            // Reaped by init once killed; ESRCH means gone.
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+                || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|s| s.contains(") Z "))
+                    .unwrap_or(true)
+            {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive, "the shell's background child was killed too");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn which_requires_the_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let sys = RealSystem::new();
+        assert_eq!(sys.which(tool.to_str().unwrap()).await.unwrap(), None);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(sys.which(tool.to_str().unwrap()).await.unwrap(), Some(tool));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostname_prefers_the_kernel() {
+        let kernel = nix::unistd::gethostname().unwrap().into_string().unwrap();
+        assert_eq!(RealSystem::new().hostname(), kernel.trim());
     }
 
     #[tokio::test]

@@ -46,7 +46,7 @@ unicase.workspace = true
 url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
+nix = { workspace = true, features = ["hostname"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true

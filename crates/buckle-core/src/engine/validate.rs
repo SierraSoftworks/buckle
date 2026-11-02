@@ -308,6 +308,9 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             }
         }
         let check_decl = |report: &mut ValidationReport, decl: &TaskDecl, location: &str| {
+            if let Some(problem) = after_unsupported(decl) {
+                report.error(Some(name), location, problem);
+            }
             if crate::task::registry().get(decl.kind.as_str()).is_none() {
                 report.error(
                     Some(name),
@@ -410,6 +413,14 @@ pub async fn validate_with_facts(
         Err(err) => report.error(None, format!("host {}", host.id), err.message()),
     }
     Ok(report)
+}
+
+/// `after:` is parsed but not implemented: tasks of a module run strictly in
+/// order. Rather than silently ignoring it, it is rejected.
+pub fn after_unsupported(decl: &TaskDecl) -> Option<String> {
+    decl.after.as_ref().map(|_| {
+        "sets `after:`, which this Buckle does not support: the tasks of a module run one at a time in the order they are written; remove `after:` and order the tasks instead".to_owned()
+    })
 }
 
 /// `command.run` is keyed by its rendered command line, so editing the

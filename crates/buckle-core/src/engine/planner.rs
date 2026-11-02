@@ -608,6 +608,12 @@ impl<'a> Planner<'a> {
                     &["Run `buckle catalog` to list the task kinds this Buckle knows about."],
                 )
             })?;
+            if let Some(problem) = super::validate::after_unsupported(decl) {
+                return Err(crate::error::user(
+                    format!("{label} {problem}."),
+                    &["Run `buckle validate` to find every such task."],
+                ));
+            }
             if let Some(problem) = super::validate::command_run_without_id(decl) {
                 warnings.push(format!("{label} {problem}"));
             }

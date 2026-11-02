@@ -234,8 +234,9 @@ pub struct GroupInfo {
     pub members: Vec<String>,
 }
 
-/// An HTTP request issued by a task or health check.
-#[derive(Debug, Clone, Default)]
+/// An HTTP request issued by a task or health check. Its `Debug` shows
+/// header names but never their values (they carry tokens).
+#[derive(Clone, Default)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
@@ -244,6 +245,26 @@ pub struct HttpRequest {
     pub timeout: Option<Duration>,
     /// Accept any TLS certificate (for local self-signed endpoints in health checks).
     pub insecure: bool,
+}
+
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field(
+                "header_names",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("body_bytes", &self.body.as_ref().map(Vec::len))
+            .field("timeout", &self.timeout)
+            .field("insecure", &self.insecure)
+            .finish()
+    }
 }
 
 impl HttpRequest {
@@ -437,6 +458,15 @@ mod tests {
             yaml.contains("'0640'") || yaml.contains("\"0640\""),
             "{yaml}"
         );
+    }
+
+    #[test]
+    fn http_request_debug_shows_header_names_but_never_values() {
+        let req =
+            HttpRequest::get("https://api.example/x").header("Authorization", "Bearer s3cret");
+        let dbg = format!("{req:?}");
+        assert!(dbg.contains("Authorization"), "{dbg}");
+        assert!(!dbg.contains("s3cret"), "{dbg}");
     }
 
     #[test]

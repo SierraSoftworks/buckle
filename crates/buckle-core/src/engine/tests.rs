@@ -2281,6 +2281,24 @@ async fn a_blocked_step_that_plans_a_deletion_once_unblocked_stays_blocked() {
 }
 
 #[tokio::test]
+async fn after_is_rejected_rather_than_silently_ignored() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /af/a }\n    id: a\n  - test.file: { path: /af/b }\n    after: [a]\n",
+        )],
+    );
+    let report = validate(&rev).unwrap();
+    assert!(
+        report.errors.iter().any(|e| e.message.contains("`after:`")),
+        "{report}"
+    );
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    assert!(indeterminate(&plan, "m").reason.contains("`after:`"));
+}
+
+#[tokio::test]
 async fn always_running_steps_are_flagged() {
     let rev = revision(
         "r1",
