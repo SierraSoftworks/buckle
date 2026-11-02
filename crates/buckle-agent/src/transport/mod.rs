@@ -41,6 +41,9 @@ pub struct Hello {
     pub arch: String,
     /// Whether `token` is the bootstrap token (first contact).
     pub bootstrap: bool,
+    /// Revisions whose apply is running, or whose result is not yet
+    /// acknowledged (it follows the Welcome).
+    pub unreported_apply_revisions: Vec<RevisionId>,
 }
 
 impl std::fmt::Debug for Hello {
@@ -55,6 +58,10 @@ impl std::fmt::Debug for Hello {
             .field("platform", &self.platform)
             .field("arch", &self.arch)
             .field("bootstrap", &self.bootstrap)
+            .field(
+                "unreported_apply_revisions",
+                &self.unreported_apply_revisions,
+            )
             .finish()
     }
 }

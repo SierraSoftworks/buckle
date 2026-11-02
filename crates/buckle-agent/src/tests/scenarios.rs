@@ -510,7 +510,7 @@ async fn local_rollback_does_not_trigger_when_health_is_fine() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn local_rollback_does_not_trigger_when_the_server_was_already_gone() {
+async fn an_approved_apply_whose_session_ended_before_it_started_is_skipped() {
     let runner = FakeRunner::new();
     let plan = plan_with_changes(&rev("rev1"), 1);
     runner.with_plans(&rev("rev1"), vec![plan.clone()]);
@@ -557,23 +557,45 @@ async fn local_rollback_does_not_trigger_when_the_server_was_already_gone() {
     h.fleet.set_unreachable(true);
     session.close();
 
-    tokio::time::timeout(
-        Duration::from_secs(3600),
-        runner.wait_for(|calls| {
-            calls
-                .iter()
-                .any(|c| matches!(c, Call::Apply { revision, .. } if revision.0 == "rev1"))
-        }),
-    )
-    .await
-    .expect("the approved apply ran");
+    // The apply belonged to the dead session: it never runs (the server
+    // re-sends it after the reconnect), so nothing arms the watchdog and
+    // nothing rolls back.
     tokio::time::sleep(Duration::from_secs(1200)).await;
+    assert!(
+        !runner
+            .applies()
+            .iter()
+            .any(|c| matches!(c, Call::Apply { revision, .. } if revision.0 == "rev1")),
+        "the orphaned apply was skipped"
+    );
     assert_eq!(
         stable_applies(&runner),
         1,
         "only the initial rollout of the stable revision"
     );
     assert_eq!(Store::new(h.state_dir()).load_agent_state().watchdog, None);
+
+    // The next Hello still shows the stable revision and no apply in flight.
+    h.fleet.set_unreachable(false);
+    let mut next = h.sessions.accept().await;
+    assert_eq!(next.hello.applied_revision, "stable1");
+    assert!(
+        !next
+            .hello
+            .unreported_apply_revisions
+            .contains(&"rev1".to_string())
+    );
+    // The re-sent apply runs on the new session.
+    next.send(welcome(Some("stable1"), None)).await;
+    next.send(pb::server_message::Msg::Apply(apply(
+        "rev1",
+        plan.digest.as_str(),
+    )))
+    .await;
+    let result = next
+        .expect(|m| apply_result(m).filter(|r| r.revision == "rev1"))
+        .await;
+    assert!(result.succeeded);
     h.stop().await.expect("clean exit");
 }
 

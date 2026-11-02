@@ -91,6 +91,7 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
             approval_key: key,
             options: rollout::ControllerOptions {
                 disconnect_timeout: config.agents.disconnect_timeout,
+                apply_timeout: config.agents.apply_timeout,
             },
         },
         cancel.clone(),

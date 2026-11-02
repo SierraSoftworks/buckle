@@ -55,6 +55,10 @@ message Hello {
   string platform = 7;
   string arch = 8;
   bool bootstrap = 9;
+  // Revisions whose Apply is running now, or ran and whose ApplyResult the
+  // server has not acknowledged yet (it follows the Welcome). A server
+  // waiting on such an apply waits for the result instead of re-sending it.
+  repeated string unreported_apply_revisions = 10;
 }
 
 message Facts {

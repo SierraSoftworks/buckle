@@ -281,6 +281,9 @@ pub struct HostRuntime {
     /// A rollback the host ran on its own failed; both results are recorded.
     #[serde(default)]
     pub needs_attention: bool,
+    /// How often the Apply was re-sent after reconnects without being run.
+    #[serde(default)]
+    pub apply_resends: u32,
 }
 
 /// One `rollout_hosts` row.

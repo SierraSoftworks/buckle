@@ -50,6 +50,11 @@ pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
         platform: hello.platform.clone(),
         arch: hello.arch.clone(),
         bootstrap: hello.bootstrap,
+        unreported_apply_revisions: hello
+            .unreported_apply_revisions
+            .iter()
+            .map(|r| r.0.clone())
+            .collect(),
     }
 }
 

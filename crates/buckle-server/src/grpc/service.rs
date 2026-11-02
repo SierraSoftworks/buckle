@@ -769,6 +769,8 @@ impl Fleet for FleetService {
                 .then(|| hello.applied_revision.clone()),
             last_plan_digest: (!hello.last_plan_digest.is_empty())
                 .then(|| hello.last_plan_digest.clone()),
+            unreported_apply_revisions: hello.unreported_apply_revisions.clone(),
+            new_session: true,
         });
         self.publish_host(&host).await;
 

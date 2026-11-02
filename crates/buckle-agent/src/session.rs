@@ -5,11 +5,13 @@
 //! Operations (assign, plan, apply, rollback, health, drift, facts, upgrade,
 //! watchdog checks) run one at a time on a worker task, in the order they
 //! were queued, so the session keeps heartbeating while an apply runs and
-//! `busy` in the heartbeat reflects the worker. Plan and health requests
-//! queued by a session that has since ended are skipped (the server asks again
-//! after the reconnect); approved applies (still bound to their plan digest),
-//! rollbacks, assignments and upgrades run regardless, and the next Hello
-//! tells the server what was applied.
+//! `busy` in the heartbeat reflects the worker. Plan, health, apply and
+//! rollback requests queued by a session that has since ended are skipped
+//! without a report: the server re-sends them after the reconnect (an apply
+//! with the same plan digest and approval token, unless Hello shows the target
+//! revision applied or the apply's result still unreported). An apply that
+//! has started runs to completion and its result is durable. Assignments and
+//! upgrades run regardless.
 
 use crate::backoff::Backoff;
 use crate::coalesce;
@@ -173,6 +175,8 @@ struct Shared {
     watchdog: Mutex<Option<Watchdog>>,
     watchdog_wake: Notify,
     watchdog_queued: AtomicBool,
+    /// The revision an Apply is running for, for Hello.
+    applying: Mutex<Option<RevisionId>>,
 }
 
 enum SessionEnd {
@@ -288,6 +292,7 @@ impl Agent {
                 watchdog: Mutex::new(None),
                 watchdog_wake: Notify::new(),
                 watchdog_queued: AtomicBool::new(false),
+                applying: Mutex::new(None),
             }),
         })
     }
@@ -440,7 +445,20 @@ impl Shared {
                 self.config.bootstrap_token.is_some(),
             ),
         };
+        let mut unreported: Vec<RevisionId> = data
+            .agent
+            .unacked_reports
+            .iter()
+            .filter_map(DurableReport::apply_revision)
+            .cloned()
+            .collect();
+        if let Some(running) = self.applying.lock().ok().and_then(|g| g.clone()) {
+            unreported.push(running);
+        }
+        unreported.sort();
+        unreported.dedup();
         Hello {
+            unreported_apply_revisions: unreported,
             host_id: self.host_id.clone(),
             agent_version: self.options.agent_version.clone(),
             labels: self.config.labels.clone(),
@@ -496,11 +514,20 @@ impl Shared {
                     Some(Instruction::Ack { report_ids }) => self.on_ack(&report_ids).await,
                     Some(other) => {
                         if let Some(op) = op_for(other) {
-                            // Plans and health answers are only useful to the
-                            // session that asked; the server asks again after
-                            // a reconnect. Approved applies, rollbacks,
-                            // assignments and upgrades still run.
-                            let bound = matches!(op, Op::Plan { .. } | Op::Health { .. });
+                            // Plans, health answers, applies and rollbacks
+                            // belong to the session that asked: one that has
+                            // not started when its session ends is skipped,
+                            // and the server re-sends it after the reconnect
+                            // (an apply that never ran has no result and no
+                            // watchdog to arm). Assignments and upgrades
+                            // still run.
+                            let bound = matches!(
+                                op,
+                                Op::Plan { .. }
+                                    | Op::Health { .. }
+                                    | Op::Apply { .. }
+                                    | Op::Rollback { .. }
+                            );
                             queue.push(op, bound.then_some(generation));
                         }
                     }
@@ -523,6 +550,9 @@ impl Shared {
             }
         };
         self.connected.store(false, Ordering::SeqCst);
+        // Operations this session queued are now orphaned, even while no
+        // new session can be opened.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.sink.detach();
         session_cancel.cancel();
         self.watchdog_wake.notify_one();
@@ -593,6 +623,12 @@ impl Shared {
         queue.push(Op::Facts { force_report: true }, None);
     }
 
+    fn set_applying(&self, revision: Option<RevisionId>) {
+        if let Ok(mut guard) = self.applying.lock() {
+            *guard = revision;
+        }
+    }
+
     async fn on_ack(&self, ids: &[u64]) {
         let mut data = self.data.lock().await;
         if data.agent.acknowledge(ids) {
@@ -628,7 +664,17 @@ impl Shared {
             if let Some(generation) = queued.generation
                 && generation != self.generation.load(Ordering::SeqCst)
             {
-                tracing::debug!(op = ?queued.op, "skipping an operation queued by a session that has ended");
+                match &queued.op {
+                    Op::Apply { revision, .. } | Op::Rollback { revision, .. } => {
+                        tracing::info!(revision = %revision.short(), "skipping an apply whose session ended before it started; the server re-sends it");
+                    }
+                    op => {
+                        tracing::debug!(
+                            ?op,
+                            "skipping an operation queued by a session that has ended"
+                        )
+                    }
+                }
                 continue;
             }
             self.busy.store(true, Ordering::SeqCst);
@@ -662,9 +708,11 @@ impl Shared {
             } => {
                 let span = tracing::info_span!("agent.apply", revision = %revision.short(), force);
                 set_parent_from_traceparent(&span, traceparent.as_deref());
+                self.set_applying(Some(revision.clone()));
                 self.apply(revision, plan_digest, waived_checks, force)
                     .instrument(span)
-                    .await
+                    .await;
+                self.set_applying(None);
             }
             Op::Rollback {
                 revision,

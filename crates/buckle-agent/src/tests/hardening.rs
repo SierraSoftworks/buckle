@@ -123,6 +123,11 @@ async fn a_welcome_during_an_apply_keeps_the_stable_revision_and_the_engine_stat
     // The session drops mid-apply and the next one names a stable revision.
     first.close();
     let mut second = h.sessions.accept().await;
+    assert_eq!(
+        second.hello.unreported_apply_revisions,
+        vec!["rev1".to_string()],
+        "the running apply is announced so the server waits for its result"
+    );
     second.send(welcome(Some("stable1"), None)).await;
     let store = Store::new(h.state_dir());
     wait_until(|| store.load_agent_state().stable_revision == Some(rev("stable1"))).await;
@@ -202,6 +207,10 @@ async fn an_apply_result_without_a_session_is_delivered_on_the_next_one_until_ac
     h.fleet.set_unreachable(false);
     let mut second = h.sessions.accept().await;
     assert_eq!(second.hello.applied_revision, "rev1");
+    assert_eq!(
+        second.hello.unreported_apply_revisions,
+        vec!["rev1".to_string()]
+    );
     second.send(welcome(None, None)).await;
     let result = second.expect(apply_result).await;
     assert!(result.succeeded);

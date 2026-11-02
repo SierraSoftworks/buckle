@@ -34,6 +34,8 @@ struct Script {
     local_rollback_on_bake: bool,
     /// The local rollback itself fails.
     local_rollback_fails: bool,
+    /// Never answer baseline checks (the test answers them).
+    silent_baseline: bool,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -183,6 +185,12 @@ impl Harness {
     }
 
     fn connect(&mut self, host: &str, applied: Option<&str>) {
+        self.attach(host);
+        self.connect_with(host, applied, vec![]);
+    }
+
+    /// Attaches a scripted session for `host` without announcing it.
+    fn attach(&mut self, host: &str) {
         let (id, mut rx) = self.sessions.attach(host);
         self.session_ids.insert(host.to_owned(), id);
         let handle = self.handle.clone();
@@ -210,6 +218,9 @@ impl Harness {
                     })),
                     SMsg::Health(h) => {
                         let scope = HealthScope::try_from(h.scope).unwrap();
+                        if scope == HealthScope::Baseline && s.silent_baseline {
+                            continue;
+                        }
                         let fail = match scope {
                             HealthScope::Baseline => s.baseline_fail,
                             HealthScope::Bake => s.bake_fail,
@@ -298,10 +309,16 @@ impl Harness {
                 }
             }
         });
+    }
+
+    /// Connects `host` with a Hello naming `unreported` apply revisions.
+    fn connect_with(&mut self, host: &str, applied: Option<&str>, unreported: Vec<String>) {
         self.handle.connected(Connected {
             host: host.to_owned(),
             applied_revision: applied.map(str::to_owned),
             last_plan_digest: None,
+            unreported_apply_revisions: unreported,
+            new_session: true,
         });
     }
 
@@ -1140,4 +1157,189 @@ async fn an_agent_reported_stale_plan_needs_reapproval_for_that_host() {
         applies.iter().all(|a| !a.2.plan_digest.is_empty()),
         "Apply always carries a digest"
     );
+}
+
+/// A passing baseline answer from `host` to its last baseline request.
+fn answer_baseline(h: &Harness, host: &str) {
+    let request_id = h
+        .sent(|x, m| {
+            x == host && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Baseline as i32)
+        })
+        .into_iter()
+        .filter_map(|(_, _, m)| match m {
+            SMsg::Health(r) => Some(r.request_id),
+            _ => None,
+        })
+        .next_back()
+        .expect("a baseline request");
+    h.handle.agent_message(
+        host,
+        AMsg::Health(HealthReport {
+            scope: HealthScope::Baseline as i32,
+            request_id,
+            revision: String::new(),
+            results: vec![pb::HealthResult {
+                module: "web".into(),
+                check: "http".into(),
+                kind: "http".into(),
+                required: true,
+                passed: true,
+                ..Default::default()
+            }],
+        }),
+    );
+}
+
+const ONE_PHASE_TWO_WIDE: &str = "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', parallel: 2, max_failures: 0 }\n";
+
+#[tokio::test(start_paused = true)]
+async fn a_baseline_answer_while_paused_does_not_apply() {
+    let mut h = Harness::new().await;
+    h.revision("r1", ONE_PHASE_TWO_WIDE).await;
+    for x in ["a", "b"] {
+        h.enrol(x, "web").await;
+        h.connect(x, None);
+    }
+    h.script("a", |s| s.silent_baseline = true);
+    h.script("b", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r1").await;
+    h.wait(&id, "a in baseline and paused", |r, hs| {
+        r.state == RolloutState::Paused && host(hs, "a").state == HostPhase::Baseline
+    })
+    .await;
+    answer_baseline(&h, "a");
+    h.idle(60).await;
+    assert!(
+        h.applies().iter().all(|a| a.1 != "a"),
+        "a paused rollout applies nothing"
+    );
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Planned);
+
+    // Resuming starts it again from its baseline.
+    h.script("a", |s| s.silent_baseline = false);
+    h.command(Command::Resume {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "a applied", |_, hs| {
+        matches!(host(hs, "a").state, HostPhase::Baking | HostPhase::Healthy)
+    })
+    .await;
+    assert_eq!(h.applies().iter().filter(|a| a.1 == "a").count(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_baseline_answer_during_a_rollback_does_not_apply() {
+    let mut h = Harness::new().await;
+    h.revision("r1", ONE_PHASE_TWO_WIDE).await;
+    h.revision("r2", ONE_PHASE_TWO_WIDE).await;
+    for x in ["a", "b"] {
+        h.enrol(x, "web").await;
+        h.connect(x, None);
+    }
+    let first = h.start("r1").await;
+    h.wait_state(&first, RolloutState::Completed).await;
+    h.script("a", |s| s.silent_baseline = true);
+    h.script("b", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r2").await;
+    h.wait(&id, "a in baseline and paused", |r, hs| {
+        r.state == RolloutState::Paused && host(hs, "a").state == HostPhase::Baseline
+    })
+    .await;
+    h.command(Command::Rollback {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    answer_baseline(&h, "a");
+    h.idle(120).await;
+    assert!(
+        h.applies()
+            .iter()
+            .all(|a| !(a.1 == "a" && a.2.revision == "r2")),
+        "the new revision is never applied to a host the rollback skips"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_applying_host_that_reconnects_off_target_gets_the_same_apply_again() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.silent_apply = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "applying", |_, hs| {
+        host(hs, "a").state == HostPhase::Applying
+    })
+    .await;
+
+    // The agent skipped the apply (its session died first) and reconnects
+    // on the old revision with nothing in flight: the same Apply again.
+    h.disconnect("a");
+    h.idle(5).await;
+    h.connect("a", None);
+    h.idle(5).await;
+    let applies = h.applies();
+    assert_eq!(applies.len(), 2);
+    assert_eq!(applies[0].2.plan_digest, applies[1].2.plan_digest);
+    assert_eq!(applies[0].2.approval_token, applies[1].2.approval_token);
+    assert!(!applies[1].2.approval_token.is_empty());
+
+    // A reconnect that announces the apply as running waits for its result.
+    h.disconnect("a");
+    h.idle(5).await;
+    h.attach("a");
+    h.connect_with("a", None, vec!["r1".into()]);
+    h.idle(5).await;
+    assert_eq!(h.applies().len(), 2);
+
+    // The result arrives: the host bakes.
+    h.script("a", |s| s.silent_apply = false);
+    h.disconnect("a");
+    h.idle(5).await;
+    h.connect("a", None);
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Healthy);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_applying_host_that_never_reports_fails_after_the_apply_timeout() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.silent_apply = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "applying", |_, hs| {
+            host(hs, "a").state == HostPhase::Applying
+        })
+        .await;
+    let sent = host(&hosts, "a").runtime.apply_started_at.unwrap();
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Failed);
+    assert!(
+        a.runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("no apply result"),
+        "{:?}",
+        a.runtime.error
+    );
+    assert!(r.runtime.pause.unwrap().at - sent >= chrono::Duration::minutes(30));
 }
