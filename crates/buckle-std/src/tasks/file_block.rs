@@ -34,7 +34,8 @@ use tracing::instrument;
 ///
 /// The marker lines delimit what Buckle owns, so removal deletes everything
 /// between them, and a file Buckle created is deleted if that leaves it empty.
-/// Two blocks in one file need different `marker`s.
+/// Two blocks in one file need different `marker`s. Edits of one file are
+/// serialised across modules.
 ///
 /// `validate` is a command (argv) that checks the new content before it
 /// replaces the file (and while planning); `{path}` stands for a private
@@ -259,11 +260,12 @@ impl Task for FileBlock {
 
     #[instrument(name = "task.file.block.apply", skip_all, fields(path = %spec.path.display(), state = ?spec.state))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
+        let _guard = hostkit::lock_path(&spec.path).await;
         match self.inspect(cx, spec).await? {
-            Outcome::NoOp => Ok(Applied::unchanged(format!(
-                "{} already up to date",
-                spec.path.display()
-            ))),
+            Outcome::NoOp => Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("{} already up to date", spec.path.display())),
+            )),
             Outcome::Blocked(reason) => Err(error::user(
                 format!("Cannot edit {}: {reason}.", spec.path.display()),
                 &["Set `create: true` or create the file in an earlier task."],
@@ -292,9 +294,16 @@ impl Task for FileBlock {
                 .await?;
                 let mut applied = Applied::changed(diff.summary().to_owned());
                 if spec.state == Ensure::Present {
+                    // A file Buckle created on an earlier apply stays Buckle's.
+                    let created_before =
+                        hostkit::ownership::previous_artefacts(cx).iter().any(|a| {
+                            matches!(a, Artefact::Line { path, marker }
+                            if *path == spec.path
+                                && serde_json::from_str::<Marker>(marker).is_ok_and(|m| m.created))
+                        });
                     let marker = serde_json::to_string(&Marker {
                         marker: spec.marker.clone(),
-                        created,
+                        created: created || created_before,
                     })
                     .map_err(|e| {
                         error::wrap_system(
@@ -324,6 +333,7 @@ impl Task for FileBlock {
         let Some((path, marker)) = block_artefact(record) else {
             return Ok(Applied::skipped("no block was recorded to remove"));
         };
+        let _guard = hostkit::lock_path(&path).await;
         let Some(file) = hostkit::load_text(cx, &path).await? else {
             return Ok(Applied::unchanged(format!(
                 "{} no longer exists",

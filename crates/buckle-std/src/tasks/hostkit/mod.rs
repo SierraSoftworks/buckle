@@ -361,6 +361,33 @@ pub async fn remove_recorded_file(cx: &Cx, record: &ResourceRecord) -> Result<Ap
     }
 }
 
+/// Serialises read-modify-write edits of one file across tasks and modules.
+///
+/// `Task::LOCKS` is static, so the executor cannot lock on a path; editors
+/// (`file.line`, `file.block`, `ssh.authorized_key`) instead hold this
+/// in-process lock, keyed by the path, from reading the file to writing it
+/// back. Two modules editing `/etc/ssh/sshd_config` therefore never lose each
+/// other's line, while edits of different files still run in parallel.
+pub async fn lock_path(path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex, Weak};
+    type Table = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: LazyLock<Table> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    let lock = {
+        let mut table = LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+        table.retain(|_, w| w.strong_count() > 0);
+        match table.get(path).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                table.insert(path.to_path_buf(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
 /// Splits text into lines without their terminators.
 pub fn split_lines(text: &str) -> Vec<String> {
     text.lines().map(str::to_owned).collect()

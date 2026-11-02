@@ -51,9 +51,15 @@ use tracing::instrument;
 /// `visudo -cf {path}` and `sshd -t -f {path}` (when those tools are
 /// installed); `validate: []` turns that off.
 ///
-/// Removal reverts the edit: a line Buckle added is deleted again, a line it
+/// Removal reverts the edit: a line Buckle added is deleted again (one
+/// occurrence only, so an identical line another task owns stays), a line it
 /// replaced is restored to its original text, and a file it created is deleted
 /// when it ends up empty. Edits made by `state: absent` are not restored.
+///
+/// The resource is identified by `path` and `regex` when a `regex` is given
+/// (else by `path` and `line`), so changing the `line` of a regex task updates
+/// the same line in place and removal still restores the text from before
+/// Buckle's first edit. Edits of one file are serialised across modules.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Spec {
     /// Absolute path of the file to edit.
@@ -268,9 +274,9 @@ impl Task for FileLine {
         format!(
             "{}: {}",
             spec.path.display(),
-            spec.line
+            spec.regex
                 .as_deref()
-                .or(spec.regex.as_deref())
+                .or(spec.line.as_deref())
                 .unwrap_or_default()
         )
     }
@@ -302,11 +308,12 @@ impl Task for FileLine {
 
     #[instrument(name = "task.file.line.apply", skip_all, fields(path = %spec.path.display(), state = ?spec.state))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
+        let _guard = hostkit::lock_path(&spec.path).await;
         match self.inspect(cx, spec).await? {
-            Outcome::NoOp => Ok(Applied::unchanged(format!(
-                "{} already up to date",
-                spec.path.display()
-            ))),
+            Outcome::NoOp => Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("{} already up to date", spec.path.display())),
+            )),
             Outcome::Blocked(reason) => Err(error::user(
                 format!("Cannot edit {}: {reason}.", spec.path.display()),
                 &["Set `create: true` or create the file in an earlier task."],
@@ -334,6 +341,7 @@ impl Task for FileLine {
                 )
                 .await?;
                 let mut applied = Applied::changed(diff.summary().to_owned());
+                let marker = marker.map(|m| merge_marker(previous_marker(cx, &spec.path), m));
                 if let Some(marker) = marker {
                     applied = applied.with_artefact(Artefact::Line {
                         path: spec.path.clone(),
@@ -364,6 +372,16 @@ impl Task for FileLine {
     }
 
     async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
+        if let Some((path, _)) = line_artefact(record) {
+            let _guard = hostkit::lock_path(&path).await;
+            return self.revert(cx, record).await;
+        }
+        self.revert(cx, record).await
+    }
+}
+
+impl FileLine {
+    async fn revert(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
         let Some((path, marker)) = line_artefact(record) else {
             return Ok(Applied::skipped(
                 "no edit was recorded to revert (removed lines are not restored)",
@@ -378,14 +396,14 @@ impl Task for FileLine {
         let mut lines = hostkit::split_lines(&file.text);
         match &marker {
             Marker::Added { line, created } => {
-                let before = lines.len();
-                lines.retain(|l| l != line);
-                if lines.len() == before {
+                // One occurrence only: an identical line may belong to another task.
+                let Some(index) = lines.iter().rposition(|l| l == line) else {
                     return Ok(Applied::skipped(format!(
                         "the line is no longer in {}, nothing to revert",
                         path.display()
                     )));
-                }
+                };
+                lines.remove(index);
                 if *created && lines.iter().all(|l| l.trim().is_empty()) {
                     cx.system.remove(&path, false).await?;
                     return Ok(Applied::changed(format!(
@@ -417,6 +435,41 @@ impl Task for FileLine {
             "reverted the edit in {}",
             path.display()
         )))
+    }
+}
+
+/// The edit an earlier apply of this resource recorded for `path`.
+fn previous_marker(cx: &Cx, path: &std::path::Path) -> Option<Marker> {
+    hostkit::ownership::previous_artefacts(cx)
+        .iter()
+        .find_map(|a| match a {
+            Artefact::Line { path: p, marker } if p == path => serde_json::from_str(marker).ok(),
+            _ => None,
+        })
+}
+
+/// Combines this apply's edit with the one recorded before, so that removal
+/// reverts to the state before Buckle's *first* edit: a line Buckle added and
+/// now rewrites is still an added line; a line it replaced and now rewrites
+/// again still restores the original text.
+fn merge_marker(previous: Option<Marker>, now: Marker) -> Marker {
+    match (previous, now) {
+        (Some(Marker::Added { line: old, created }), Marker::Replaced { line, original })
+            if original == old =>
+        {
+            Marker::Added { line, created }
+        }
+        (
+            Some(Marker::Replaced {
+                line: old,
+                original: first,
+            }),
+            Marker::Replaced { line, original },
+        ) if original == old => Marker::Replaced {
+            line,
+            original: first,
+        },
+        (_, now) => now,
     }
 }
 
@@ -651,5 +704,59 @@ mod tests {
             sys.file_string("/etc/ssh/sshd_config").unwrap(),
             "PermitRootLogn no\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_value_change_updates_in_place_and_removal_restores_the_first_original() {
+        let sys =
+            FakeSystem::new().with_file("/etc/conf", "#Port 22\nother\n", FilePerms::default());
+        let first: Spec = s(json!({"line": "Port 2222", "regex": "^#?Port "}));
+        let second: Spec = s(json!({"line": "Port 2200", "regex": "^#?Port "}));
+        assert_eq!(
+            FileLine::key(&first),
+            FileLine::key(&second),
+            "keyed on the regex"
+        );
+        let a = apply(&FileLine, &cx(&sys), &first).await;
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .previous(record("file.line", "k", &a))
+            .build();
+        let b = apply(&FileLine, &c, &second).await;
+        assert_eq!(sys.file_string("/etc/conf").unwrap(), "Port 2200\nother\n");
+        FileLine
+            .remove(&cx(&sys), &record("file.line", "k", &b))
+            .await
+            .unwrap();
+        assert_eq!(sys.file_string("/etc/conf").unwrap(), "#Port 22\nother\n");
+    }
+
+    #[tokio::test]
+    async fn removing_an_added_line_deletes_one_occurrence_only() {
+        let sys = FakeSystem::new().with_file("/etc/conf", "a\n", FilePerms::default());
+        let added = apply(&FileLine, &cx(&sys), &s(json!({"line": "x"}))).await;
+        // Another module's identical line appears later.
+        put(&sys, "/etc/conf", "a\nx\nb\nx\n").await;
+        FileLine
+            .remove(&cx(&sys), &record("file.line", "k", &added))
+            .await
+            .unwrap();
+        assert_eq!(sys.file_string("/etc/conf").unwrap(), "a\nx\nb\n");
+    }
+
+    #[tokio::test]
+    async fn concurrent_edits_of_one_file_do_not_lose_lines() {
+        let sys = FakeSystem::new().with_file("/etc/conf", "", FilePerms::default());
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let c = cx(&sys);
+            handles.push(tokio::spawn(async move {
+                let spec: Spec = spec(json!({"path": "/etc/conf", "line": format!("line{i}")}));
+                FileLine.apply(&c, &spec, &Planned::NoOp).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(sys.file_string("/etc/conf").unwrap().lines().count(), 8);
     }
 }

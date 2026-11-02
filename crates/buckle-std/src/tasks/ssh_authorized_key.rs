@@ -344,6 +344,8 @@ impl Task for SshAuthorizedKey {
 
     #[instrument(name = "task.ssh.authorized_key.apply", skip_all, fields(user = %spec.user, state = ?spec.state))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
+        let target = self.target(cx, spec).await?;
+        let _guard = hostkit::lock_path(&target.file).await;
         let i = self.inspect(cx, spec).await?;
         if !i.planned.is_change() {
             return Ok(hostkit::ownership::carry_forward(
@@ -432,6 +434,7 @@ impl Task for SshAuthorizedKey {
         }
         let mut removed = 0;
         for (path, markers) in by_file {
+            let _guard = hostkit::lock_path(&path).await;
             let Some(file) = hostkit::load_text(cx, &path).await? else {
                 continue;
             };
