@@ -10,7 +10,7 @@ use buckle_core::task::{Applied, Artefact, Cx, Task};
 use buckle_core::{Digest, Platforms, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Sets a kernel parameter and keeps it set across reboots.
 ///
@@ -566,6 +566,5 @@ mod tests {
             s.file(&cx),
             PathBuf::from("/etc/sysctl.d/90-buckle-web.conf")
         );
-        let _ = Path::new("");
     }
 }

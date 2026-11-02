@@ -203,3 +203,108 @@ pub(crate) mod testkit {
         serde_json::from_value(json).expect("test spec parses")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use buckle_core::task::lookup;
+    use buckle_core::{Platform, Platforms};
+    use serde_json::json;
+
+    /// Every kind this lane owns, with a minimal valid spec.
+    fn kinds() -> Vec<(&'static str, serde_json::Value, &'static [&'static str])> {
+        vec![
+            (
+                "apt.repository",
+                json!({"name": "x", "uri": "https://x.example", "suites": ["s"]}),
+                &["apt"],
+            ),
+            ("apt.package", json!({"name": "nginx"}), &["apt"]),
+            ("apt.update", json!({}), &["apt"]),
+            (
+                "systemd.unit",
+                json!({"name": "nomad", "enabled": true}),
+                &["systemd"],
+            ),
+            (
+                "systemd.dropin",
+                json!({"unit": "nomad.service", "content": "[Service]\n"}),
+                &["systemd"],
+            ),
+            ("systemd.daemon_reload", json!({}), &["systemd"]),
+            ("systemd.restart", json!({"name": "nomad"}), &["systemd"]),
+            ("systemd.reload", json!({"name": "nomad"}), &["systemd"]),
+            (
+                "sysctl.param",
+                json!({"name": "vm.swappiness", "value": 10}),
+                &["sysctl"],
+            ),
+            (
+                "ufw.default",
+                json!({"direction": "incoming", "policy": "deny"}),
+                &["ufw"],
+            ),
+            (
+                "ufw.rule",
+                json!({"rule": "allow", "to_port": 22}),
+                &["ufw"],
+            ),
+            ("ufw.state", json!({"enabled": true}), &["ufw"]),
+        ]
+    }
+
+    #[test]
+    fn every_kind_is_registered_linux_only_documented_and_has_a_schema() {
+        for (kind, spec, locks) in kinds() {
+            let task = lookup(kind).unwrap_or_else(|e| panic!("{kind}: {}", e.description()));
+            assert_eq!(task.locks(), locks, "{kind}");
+            assert_eq!(task.platforms(), Platforms::LINUX, "{kind}");
+            assert!(!task.platforms().contains(Platform::MacOs), "{kind}");
+            assert!(!task.description().is_empty(), "{kind} has no description");
+            let parsed = task
+                .parse(spec)
+                .unwrap_or_else(|e| panic!("{kind}: {}", e.description()));
+            assert!(!task.key(&parsed).is_empty(), "{kind} has an empty key");
+            assert!(!task.describe(&parsed).is_empty(), "{kind}");
+            let schema = serde_json::to_value(task.schema()).unwrap();
+            assert!(schema.is_object(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_with_the_kind_named() {
+        for (kind, mut spec, _) in kinds() {
+            spec.as_object_mut()
+                .unwrap()
+                .insert("bogus".into(), json!(1));
+            let err = lookup(kind).unwrap().parse(spec).unwrap_err();
+            assert!(
+                err.description().contains(kind),
+                "{kind}: {}",
+                err.description()
+            );
+        }
+    }
+
+    #[test]
+    fn handlers_default_to_leave_and_packages_carry_a_removal_caution() {
+        use buckle_core::model::RemovalPolicy;
+        for kind in [
+            "systemd.daemon_reload",
+            "systemd.restart",
+            "systemd.reload",
+            "apt.update",
+        ] {
+            assert_eq!(
+                lookup(kind).unwrap().removal_default(),
+                RemovalPolicy::Leave,
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            lookup("apt.package").unwrap().removal_default(),
+            RemovalPolicy::Cleanup
+        );
+        assert!(lookup("apt.package").unwrap().removal_caution());
+        assert!(!lookup("ufw.rule").unwrap().removal_caution());
+    }
+}

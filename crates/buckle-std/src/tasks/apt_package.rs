@@ -526,6 +526,7 @@ mod tests {
         assert!(apt_lines[0].starts_with("apt-get update"), "{apt_lines:?}");
         assert!(apt_lines[1].ends_with("nomad=1.7.5-1"), "{apt_lines:?}");
         assert_eq!(apt.version_of("nomad").as_deref(), Some("1.7.5-1"));
+        assert_eq!(apt.updates(), 1);
         assert_eq!(AptPackage.plan(&cx, &s).await.unwrap(), Planned::NoOp);
     }
 
@@ -671,7 +672,11 @@ mod tests {
     fn kind_metadata() {
         assert_eq!(AptPackage::KIND, "apt.package");
         assert_eq!(AptPackage::LOCKS, &["apt"]);
-        assert!(AptPackage::REMOVAL_CAUTION);
+        assert!(
+            buckle_core::task::lookup("apt.package")
+                .unwrap()
+                .removal_caution()
+        );
         assert_eq!(AptPackage::key(&spec(json!({"names": ["a", "b"]}))), "a,b");
     }
 }

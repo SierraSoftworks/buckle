@@ -45,15 +45,6 @@ impl PkgState {
     pub(crate) fn is_installed(&self) -> bool {
         matches!(self, PkgState::Installed { .. })
     }
-
-    pub(crate) fn version(&self) -> Option<&str> {
-        match self {
-            PkgState::Installed { version, .. }
-            | PkgState::ConfigFiles { version }
-            | PkgState::Broken { version, .. } => Some(version.as_str()).filter(|v| !v.is_empty()),
-            PkgState::NotInstalled => None,
-        }
-    }
 }
 
 /// Parses one status line such as `install ok installed 1.22.1-9+deb12u1`.

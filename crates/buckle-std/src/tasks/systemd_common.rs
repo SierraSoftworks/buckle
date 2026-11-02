@@ -64,10 +64,6 @@ impl UnitStatus {
         matches!(self.active.as_str(), "active" | "reloading")
     }
 
-    pub(crate) fn exists(&self) -> bool {
-        !self.load.is_empty() && self.load != "not-found"
-    }
-
     pub(crate) fn describe(&self) -> String {
         format!(
             "{} ({}), unit file {}",
@@ -235,26 +231,24 @@ mod tests {
         "LoadState=loaded\nActiveState=activating\nSubState=auto-restart\nUnitFileState=enabled\n";
 
     #[rstest]
-    #[case(ENABLED_RUNNING, true, true, true, false, true)]
-    #[case(DISABLED_DEAD, false, false, false, false, true)]
-    #[case(MASKED, false, false, false, true, true)]
-    #[case(MISSING, false, false, false, false, false)]
-    #[case(STATIC_UNIT, false, true, true, false, true)]
-    #[case(CRASH_LOOP, true, true, false, false, true)]
+    #[case(ENABLED_RUNNING, true, true, true, false)]
+    #[case(DISABLED_DEAD, false, false, false, false)]
+    #[case(MASKED, false, false, false, true)]
+    #[case(MISSING, false, false, false, false)]
+    #[case(STATIC_UNIT, false, true, true, false)]
+    #[case(CRASH_LOOP, true, true, false, false)]
     fn systemctl_show_output_parses(
         #[case] text: &str,
         #[case] enabled: bool,
         #[case] running: bool,
         #[case] active: bool,
         #[case] masked: bool,
-        #[case] exists: bool,
     ) {
         let s = UnitStatus::parse(text);
         assert_eq!(s.is_enabled(), enabled, "{s:?}");
         assert_eq!(s.is_running(), running, "{s:?}");
         assert_eq!(s.is_active(), active, "{s:?}");
         assert_eq!(s.is_masked(), masked, "{s:?}");
-        assert_eq!(s.exists(), exists, "{s:?}");
     }
 
     #[test]

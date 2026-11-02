@@ -261,13 +261,12 @@ impl Task for SystemdUnit {
         for (verb, unit) in &plan {
             run_checked(cx, systemctl(&[verb, unit])).await?;
         }
-        Ok(Applied::changed(format!(
-            "{}",
+        Ok(Applied::changed(
             plan.iter()
                 .map(|(v, u)| format!("{v} {u}"))
                 .collect::<Vec<_>>()
-                .join(", ")
-        )))
+                .join(", "),
+        ))
     }
 }
 

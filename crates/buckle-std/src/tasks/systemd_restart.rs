@@ -71,7 +71,7 @@ mod tests {
         let cx = cx(&sys);
         let s: Spec = spec(json!({"name": "nomad.service"}));
         let planned = SystemdRestart.plan(&cx, &s).await.unwrap();
-        assert_eq!(planned.is_change(), true);
+        assert!(planned.is_change());
         let applied = SystemdRestart.apply(&cx, &s, &planned).await.unwrap();
         assert_eq!(applied.summary, "restarted nomad.service");
         assert_eq!(sys.command_lines(), vec!["systemctl restart nomad.service"]);
