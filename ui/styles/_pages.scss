@@ -8,6 +8,16 @@
   gap: 0.75rem;
 }
 
+.overview__rollout {
+  margin-top: 1rem;
+}
+
+.overview__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
 .tile {
   display: flex;
   flex-direction: column;
@@ -431,6 +441,10 @@
 
 .table--audit td:nth-child(6) {
   min-width: 18rem;
+}
+
+.audit__rollout {
+  white-space: nowrap;
 }
 
 // Reference

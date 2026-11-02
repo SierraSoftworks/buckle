@@ -111,7 +111,7 @@ fn row(r: &RolloutSummary, now: chrono::DateTime<chrono::Utc>) -> Html {
         .unwrap_or_else(|| "—".into());
     html! {
         <tr>
-            <td><RouteLink to={Route::Rollout { id: r.id.clone() }} classes="strong">{ rollout_label(&r.id) }</RouteLink></td>
+            <td><RouteLink to={Route::rollout(&r.id)} classes="strong">{ rollout_label(&r.id) }</RouteLink></td>
             <td>
                 <Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} title={r.pause_reason.clone()} />
                 if let Some(p) = &r.current_phase { <span class="muted small">{ format!(" {p}") }</span> }

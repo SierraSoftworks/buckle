@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use buckle_api::{
-    HostRolloutState, PhaseState, PlanGroup, RolloutDetail, RolloutHost, RolloutPhase,
+    HostRolloutState, HostSummary, PhaseState, PlanGroup, RolloutDetail, RolloutHost, RolloutPhase,
 };
 
 /// The fewest blocks a row holds: a stage column is never narrower than its
@@ -287,6 +287,127 @@ pub fn gate_check_tone(phase: &RolloutPhase, check: &str) -> super::tone::Tone {
     } else {
         Tone::Neutral
     }
+}
+
+/// The stage the fleet map puts hosts the rollout did not include in.
+pub const OUTSIDE_STAGE: &str = "not in this rollout";
+
+/// The fleet laid over a rollout's stages, for the Overview's map: the
+/// rollout's hosts that are still in the fleet where the rollout put them,
+/// and every other host in a trailing [`OUTSIDE_STAGE`].
+pub fn fleet_map(detail: &RolloutDetail, fleet: &[HostSummary]) -> RolloutDetail {
+    let known: BTreeSet<&str> = fleet.iter().map(|h| h.id.as_str()).collect();
+    let mut map = detail.clone();
+    for phase in &mut map.phases {
+        phase.hosts.retain(|h| known.contains(h.host.as_str()));
+    }
+    let placed: BTreeSet<&str> = detail
+        .phases
+        .iter()
+        .flat_map(|p| &p.hosts)
+        .map(|h| h.host.as_str())
+        .collect();
+    let outside: Vec<RolloutHost> = fleet
+        .iter()
+        .filter(|h| !placed.contains(h.id.as_str()))
+        .map(|h| RolloutHost {
+            host: h.id.clone(),
+            phase: OUTSIDE_STAGE.into(),
+            wave: None,
+            state: HostRolloutState::Pending,
+            plan_digest: None,
+            plan_changes: None,
+            plan_removals: None,
+            failed_module: None,
+            failed_checks: vec![],
+            waived_checks: vec![],
+            error: None,
+            updated_at: h.last_seen.unwrap_or(h.first_seen),
+            bake_until: None,
+            needs_approval: false,
+            needs_attention: false,
+            error_detail: None,
+            run_id: None,
+        })
+        .collect();
+    if !outside.is_empty() {
+        map.phases.push(RolloutPhase {
+            name: OUTSIDE_STAGE.into(),
+            state: PhaseState::Pending,
+            parallel: String::new(),
+            approval: "auto".into(),
+            bake_seconds: 0,
+            max_failures: String::new(),
+            virtual_stage: true,
+            hosts: outside,
+            approved_by: None,
+            approved_at: None,
+            bake_until: None,
+            health_checks: vec![],
+        });
+    }
+    map
+}
+
+/// Where one check of a phase's health gate stands on one host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStanding {
+    Failing,
+    Waived,
+    Passing,
+    /// The host has not been held to it yet (or was skipped).
+    Pending,
+}
+
+impl CheckStanding {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Failing => "failing",
+            Self::Waived => "waived",
+            Self::Passing => "passing",
+            Self::Pending => "not checked",
+        }
+    }
+
+    pub fn tone(self) -> super::tone::Tone {
+        use super::tone::Tone;
+        match self {
+            Self::Failing => Tone::Danger,
+            Self::Waived => Tone::Mute,
+            Self::Passing => Tone::Ok,
+            Self::Pending => Tone::Neutral,
+        }
+    }
+}
+
+/// How each check of `phase`'s health gate stands on `host`, in the gate's
+/// order, followed by any failing check the gate does not list.
+pub fn host_checks(phase: &RolloutPhase, host: &RolloutHost) -> Vec<(String, CheckStanding)> {
+    let checked = matches!(
+        host.state,
+        HostRolloutState::Healthy | HostRolloutState::Baking
+    );
+    let extra = host
+        .failed_checks
+        .iter()
+        .filter(|c| !phase.health_checks.contains(c));
+    phase
+        .health_checks
+        .iter()
+        .chain(extra)
+        .map(|c| {
+            let standing = if host.failed_checks.contains(c) {
+                CheckStanding::Failing
+            } else if host.waived_checks.contains(c) {
+                CheckStanding::Waived
+            } else if checked {
+                CheckStanding::Passing
+            } else {
+                CheckStanding::Pending
+            };
+            (c.clone(), standing)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -655,5 +776,54 @@ mod tests {
         assert_eq!(gate_check_tone(&home, "nomad/unit"), Tone::Neutral);
         home.state = PhaseState::Done;
         assert_eq!(gate_check_tone(&home, "nomad/unit"), Tone::Ok);
+    }
+
+    #[test]
+    fn a_hosts_checks_stand_by_its_own_failures_waivers_and_state() {
+        use CheckStanding::*;
+        let mut home = phase("home", PhaseState::Running, "auto", vec![]);
+        home.health_checks = vec!["nomad/unit".into(), "caddy/http".into()];
+        let standings = |h: &RolloutHost| -> Vec<CheckStanding> {
+            host_checks(&home, h).into_iter().map(|(_, s)| s).collect()
+        };
+        let cases = [
+            (
+                HostRolloutState::Healthy,
+                vec![],
+                vec![],
+                vec![Passing, Passing],
+            ),
+            (
+                HostRolloutState::Applying,
+                vec![],
+                vec![],
+                vec![Pending, Pending],
+            ),
+            (
+                HostRolloutState::Failed,
+                vec!["caddy/http"],
+                vec![],
+                vec![Pending, Failing],
+            ),
+            (
+                HostRolloutState::Baking,
+                vec![],
+                vec!["nomad/unit"],
+                vec![Waived, Passing],
+            ),
+            // A failing check outside the gate is listed after it.
+            (
+                HostRolloutState::Held,
+                vec!["docker/daemon"],
+                vec![],
+                vec![Pending, Pending, Failing],
+            ),
+        ];
+        for (state, failed, waived, want) in cases {
+            let mut h = host("pi-1", "home", state, 0);
+            h.failed_checks = failed.into_iter().map(Into::into).collect();
+            h.waived_checks = waived.into_iter().map(Into::into).collect();
+            assert_eq!(standings(&h), want, "{state:?}");
+        }
     }
 }

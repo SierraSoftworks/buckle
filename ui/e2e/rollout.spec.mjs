@@ -56,11 +56,15 @@ describe("the rollout pipeline", () => {
     await close();
   });
 
-  test("each stage shows its health gate, red where a host fails a check", async () => {
+  test("a host's state shows its health gate on hover, red where it fails a check", async () => {
     const { page, close } = await open("/rollouts/42");
-    const home = page.locator('[data-stage="home"] .gate-checks');
-    await home.getByText("backup/marker").waitFor();
-    const api = home.locator(".pill", { hasText: "nomad/api" });
+    await page.locator(".stage a.block").first().waitFor();
+    assert.equal(await page.locator(".stage .gate-checks").count(), 0, "no check pills on the stages");
+    const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });
+    await row.locator(".tip").hover();
+    const tip = page.getByTestId("host-health-tip");
+    await tip.getByText("backup/marker").waitFor();
+    const api = tip.locator('[data-check="nomad/api"] .pill');
     assert.match(await api.getAttribute("class"), /tone-danger/, "pi-5 failed nomad/api");
     const gate = page.getByTestId("health-gate");
     await gate.getByText("nomad/unit").waitFor();

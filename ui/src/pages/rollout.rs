@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use buckle_api::{
     ApproveRequest, ContinueRequest, FleetPlan, HealthResultDto, HostRolloutState, LiveEvent,
     PlanGroup, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
+    RolloutSummary,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -17,13 +18,13 @@ use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::ui::Copyable;
 use crate::components::{
-    Button, Confirm, Countdown, Empty, ErrorBlock, ErrorState, Kind, Loading, PageHead, Panel,
-    Pill, Pipeline, PlanViews, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
+    Button, Confirm, Countdown, Empty, ErrorBlock, ErrorState, HoverTip, Kind, Loading, PageHead,
+    Panel, Pill, Pipeline, PlanViews, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::format::{count, first_line, relative, rollout_label, short, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
-use crate::logic::pipeline::{GateKind, GateState, layout};
+use crate::logic::pipeline::{self, GateKind, GateState, host_checks, layout};
 use crate::logic::plan::{ApprovalScope, approval_scope};
 use crate::logic::run::RolloutActivity;
 use crate::logic::tone::{
@@ -44,7 +45,7 @@ const MAX_ACTIVITY_REPORTS: usize = 24;
 
 /// The decision an open dialog is asking about.
 #[derive(Clone, PartialEq)]
-enum Ask {
+pub(crate) enum Ask {
     Approve(String),
     /// Confirmed: the phase and exactly the digests the dialog showed.
     Bind(String, Vec<String>),
@@ -58,23 +59,32 @@ enum Ask {
 pub fn rollout_page(props: &Props) -> Html {
     let now = use_now(5);
     let auth = use_auth();
-    let toast = use_toast();
     let detail = use_fetch(
         props.id.clone(),
         |id| async move { api::rollout(&id).await },
     );
-    // A rollout opened by name (`/rollouts/word.word.word`) settles on its
-    // id, which its live updates and links use.
+    // The rollout's id, which its live updates are matched on, once known:
+    // the URL may name it instead (`/rollouts/word.word.word`).
+    let id = detail
+        .data
+        .as_ref()
+        .map(|d| d.1.summary.id.clone())
+        .unwrap_or_else(|| props.id.clone());
+    // The URL settles on the rollout's name (or its id, without one).
     {
         let navigator = use_navigator();
         let canonical = detail
             .data
             .as_ref()
-            .map(|d| d.1.summary.id.clone())
-            .filter(|id| *id != props.id);
-        use_effect_with(canonical, move |id| {
-            if let (Some(id), Some(n)) = (id, navigator) {
-                n.replace(&Route::Rollout { id: id.clone() });
+            .map(|d| Route::rollout(&d.1.summary.id))
+            .filter(|r| {
+                *r != Route::Rollout {
+                    id: props.id.clone(),
+                }
+            });
+        use_effect_with(canonical, move |route| {
+            if let (Some(route), Some(n)) = (route, navigator) {
+                n.replace(route);
             }
             || ()
         });
@@ -92,7 +102,9 @@ pub fn rollout_page(props: &Props) -> Html {
         .map(|events| {
             events
                 .iter()
-                .filter(|e| matches!(&***e, LiveEvent::RolloutChanged { rollout } if rollout.id == props.id))
+                .filter(
+                    |e| matches!(&***e, LiveEvent::RolloutChanged { rollout } if rollout.id == id),
+                )
                 .count()
         })
         .unwrap_or(0);
@@ -136,11 +148,11 @@ pub fn rollout_page(props: &Props) -> Html {
     let redraw = use_force_update();
     let (activity, to_ask) = {
         let mut t = tracker.borrow_mut();
-        t.sync(&props.id, store.epoch, &applying, &store.log);
+        t.sync(&id, store.epoch, &applying, &store.log);
         (t.describe(), t.to_ask(&applying, MAX_ACTIVITY_REPORTS))
     };
     {
-        let (tracker, id) = (tracker.clone(), props.id.clone());
+        let (tracker, id) = (tracker.clone(), id.clone());
         let (epoch, seq) = (store.epoch, store.log.seq);
         use_effect_with(to_ask, move |hosts| {
             if !hosts.is_empty() {
@@ -162,9 +174,7 @@ pub fn rollout_page(props: &Props) -> Html {
             || ()
         });
     }
-    let ask = use_state(|| None::<Ask>);
-    let busy = use_state(|| false);
-    let error = use_state(|| None::<String>);
+    let actions = use_rollout_actions(id.clone(), detail.set.clone());
     let focus_phase = use_state(|| None::<String>);
 
     let Some(d) = live else {
@@ -185,6 +195,117 @@ pub fn rollout_page(props: &Props) -> Html {
     let hosts: BTreeMap<String, _> = fleet
         .map(|f| f.hosts.into_iter().map(|h| (h.id.clone(), h)).collect())
         .unwrap_or_default();
+    let open = actions.open.clone();
+
+    let s = &d.summary;
+    let admin = auth.is_admin();
+    let finished = rollout_finished(s.state);
+
+    let subtitle = html! {
+        <div class="rollout-meta">
+            <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
+            <span class="mono" title={s.revision.clone()}>{ short(&s.revision) }</span>
+            <span>{ format!("“{}”", first_line(&s.revision_message)) }</span>
+            <span class="muted">{ format!("{} · started {}", s.triggered_by, relative(s.started_at, now)) }</span>
+            if let Some(f) = s.finished_at { <span class="muted">{ format!("finished {}", relative(f, now)) }</span> }
+            <TraceLink id={s.trace_id.clone()} url={s.trace_url.clone()} />
+            if s.name.is_some() { <Copyable text={s.id.clone()} label={format!("{}…", short(&s.id))} /> }
+        </div>
+    };
+
+    let pipeline = layout(&d);
+    let wanting = wanting_approval(&pipeline);
+    let focused = focus_phase
+        .as_ref()
+        .and_then(|n| wanting.iter().find(|p| &p.name == n))
+        .or_else(|| {
+            wanting
+                .iter()
+                .find(|p| p.state == buckle_api::PhaseState::AwaitingApproval)
+        })
+        .or(wanting.first())
+        .copied();
+
+    let head_actions = html! { <>
+        <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
+        if admin { { controls(s, focused.filter(|p| !scope_of(p, &plan_groups).digests.is_empty()).map(|p| p.name.as_str()), &open) } }
+    </> };
+
+    let approval = match focused {
+        Some(phase) if !finished => {
+            approval_pane(phase, &wanting, &d, &plan_groups, admin, &focus_phase)
+        }
+        _ => all_plans(&plan_groups, d.fleet.as_ref()),
+    };
+
+    let dialog = actions.dialog(&d, &plan_groups);
+
+    html! {
+        <div class="page page--wide">
+            <PageHead title={format!("Rollout {}", rollout_label(&s.id))} {subtitle} actions={head_actions} />
+            if let Some(reason) = &s.pause_reason {
+                <div class={classes!("banner", if s.state == RolloutState::Paused { "banner--warn" } else { "banner--info" })} role="status">
+                    <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
+                    if admin && s.state == RolloutState::Paused {
+                        <span class="muted">{ " Retry, continue or skip the failed host below, or resume, roll back or abort the rollout." }</span>
+                    }
+                </div>
+            }
+            <Panel title="Pipeline" subtitle={format!("{} hosts in {} stages · {}/{} done", s.hosts_total, d.phases.len(), s.hosts_done, s.hosts_total)}>
+                <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
+            </Panel>
+            { approval }
+            <Panel title="Hosts" subtitle="Each host's apply timeline, health during bake and run report">
+                <HostTable detail={d.clone()} admin={admin && !finished} on_ask={open.clone()} {activity} {now} />
+            </Panel>
+            <Panel title="Timeline" subtitle="Rollout and phase transitions">
+                { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), now) }
+            </Panel>
+            { dialog }
+        </div>
+    }
+}
+
+/// The decisions an operator can take on a rollout, and the dialog that
+/// confirms the one asked about: shared by this page and the Overview's
+/// latest rollout card.
+pub(crate) struct RolloutActions {
+    ask: Option<Ask>,
+    busy: bool,
+    error: Option<String>,
+    pub open: Callback<Ask>,
+    close: Callback<()>,
+    run: Callback<(Ask, String)>,
+}
+
+impl RolloutActions {
+    /// The open dialog, if one is.
+    pub fn dialog(&self, d: &RolloutDetail, plans: &[PlanGroup]) -> Html {
+        self.ask
+            .as_ref()
+            .map(|a| {
+                dialog(
+                    a,
+                    d,
+                    plans,
+                    self.busy,
+                    self.error.clone(),
+                    &self.run,
+                    &self.close,
+                )
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Runs a confirmed decision on rollout `id`, hands the rollout it answers
+/// with to `set`, and says how it went.
+#[hook]
+pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> RolloutActions {
+    let toast = use_toast();
+    let ask = use_state(|| None::<Ask>);
+    let busy = use_state(|| false);
+    let error = use_state(|| None::<String>);
 
     let open = {
         let (ask, error) = (ask.clone(), error.clone());
@@ -197,17 +318,15 @@ pub fn rollout_page(props: &Props) -> Html {
         let ask = ask.clone();
         Callback::from(move |_| ask.set(None))
     };
-
-    // Runs an action, puts its answer on the page, and says how it went.
     let run = {
         let (busy, error, ask, set, toast) = (
             busy.clone(),
             error.clone(),
             ask.clone(),
-            detail.set.clone(),
+            set.clone(),
             toast.clone(),
         );
-        let id = props.id.clone();
+        let id = id.clone();
         Callback::from(move |(what, note): (Ask, String)| {
             let (busy, error, ask, set, toast, id) = (
                 busy.clone(),
@@ -281,25 +400,53 @@ pub fn rollout_page(props: &Props) -> Html {
         })
     };
 
-    let s = &d.summary;
-    let admin = auth.is_admin();
-    let finished = rollout_finished(s.state);
-    let subtitle = html! {
-        <div class="rollout-meta">
-            <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
-            <span class="mono" title={s.revision.clone()}>{ short(&s.revision) }</span>
-            <span>{ format!("“{}”", first_line(&s.revision_message)) }</span>
-            <span class="muted">{ format!("{} · started {}", s.triggered_by, relative(s.started_at, now)) }</span>
-            if let Some(f) = s.finished_at { <span class="muted">{ format!("finished {}", relative(f, now)) }</span> }
-            <TraceLink id={s.trace_id.clone()} url={s.trace_url.clone()} />
-            if s.name.is_some() { <Copyable text={s.id.clone()} label={format!("{}…", short(&s.id))} /> }
-        </div>
-    };
+    RolloutActions {
+        ask: (*ask).clone(),
+        busy: *busy,
+        error: (*error).clone(),
+        open,
+        close,
+        run,
+    }
+}
 
-    let pipeline = layout(&d);
-    // Phases an approval is wanted for: reached and waiting, or gated and
-    // not yet approved, or holding hosts whose plan changed since.
-    let wanting: Vec<&RolloutPhase> = pipeline
+/// The rollout-wide decisions for its state: approve the phase waiting for
+/// it (`approve`, once it has plans to bind), reject a rollout held at a
+/// gate, pause or resume, roll back, abort. Nothing once it has finished.
+pub(crate) fn controls(s: &RolloutSummary, approve: Option<&str>, open: &Callback<Ask>) -> Html {
+    if rollout_finished(s.state) {
+        return html! {};
+    }
+    let ask = |a: Ask| {
+        let o = open.clone();
+        Callback::from(move |_: MouseEvent| o.emit(a.clone()))
+    };
+    let act = |a: &'static str| ask(Ask::Action(a));
+    html! { <>
+        if let Some(phase) = approve {
+            <Button kind={Kind::Primary} onclick={ask(Ask::Approve(phase.to_string()))}>
+                { format!("Approve {phase}…") }
+            </Button>
+        }
+        if s.state == RolloutState::AwaitingApproval {
+            <Button kind={Kind::Danger} onclick={ask(Ask::Reject)}>{ "Reject…" }</Button>
+        }
+        if s.state == RolloutState::Paused {
+            <Button kind={Kind::Primary} onclick={act("resume")}>{ "Resume" }</Button>
+        } else if s.state != RolloutState::RollingBack {
+            <Button onclick={act("pause")}>{ "Pause" }</Button>
+        }
+        if matches!(s.state, RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking) {
+            <Button kind={Kind::Danger} onclick={act("rollback")}>{ "Roll back…" }</Button>
+        }
+        <Button kind={Kind::Danger} onclick={act("abort")}>{ "Abort…" }</Button>
+    </> }
+}
+
+/// Phases an approval is wanted for: reached and waiting, or gated and not
+/// yet approved, or holding hosts whose plan changed since.
+pub(crate) fn wanting_approval<'a>(pipeline: &pipeline::Pipeline<'a>) -> Vec<&'a RolloutPhase> {
+    pipeline
         .stages
         .iter()
         .filter(|st| {
@@ -312,103 +459,7 @@ pub fn rollout_page(props: &Props) -> Html {
                 && st.counts.total > 0
         })
         .map(|st| st.phase)
-        .collect();
-    let focused = focus_phase
-        .as_ref()
-        .and_then(|n| wanting.iter().find(|p| &p.name == n))
-        .or_else(|| {
-            wanting
-                .iter()
-                .find(|p| p.state == buckle_api::PhaseState::AwaitingApproval)
-        })
-        .or(wanting.first())
-        .copied();
-
-    let actions = if admin && !finished {
-        let o = open.clone();
-        let act = move |a: &'static str| {
-            let o = o.clone();
-            Callback::from(move |_: MouseEvent| {
-                o.emit(if a == "reject" {
-                    Ask::Reject
-                } else {
-                    Ask::Action(a)
-                })
-            })
-        };
-        // Approving the phase the approval pane shows sits with the
-        // rollout's other controls, as does rejecting a rollout held at a gate.
-        let approve = focused.map(|phase| {
-            let ready = !scope_of(phase, &plan_groups).digests.is_empty();
-            let (o, name) = (open.clone(), phase.name.clone());
-            html! {
-                <Button kind={Kind::Primary} disabled={!ready}
-                    onclick={Callback::from(move |_: MouseEvent| o.emit(Ask::Approve(name.clone())))}>
-                    { format!("Approve {}…", phase.name) }
-                </Button>
-            }
-        });
-        let reject = (focused.is_some() && s.state == RolloutState::AwaitingApproval).then(|| {
-            html! {
-                <Button kind={Kind::Danger} onclick={act("reject")}>{ "Reject…" }</Button>
-            }
-        });
-        html! { <>
-            { approve.unwrap_or_default() }
-            { reject.unwrap_or_default() }
-            if s.state == RolloutState::Paused {
-                <Button kind={Kind::Primary} onclick={act("resume")}>{ "Resume" }</Button>
-            } else if s.state != RolloutState::RollingBack {
-                <Button onclick={act("pause")}>{ "Pause" }</Button>
-            }
-            if matches!(s.state, RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking) {
-                <Button kind={Kind::Danger} onclick={act("rollback")}>{ "Roll back…" }</Button>
-            }
-            <Button kind={Kind::Danger} onclick={act("abort")}>{ "Abort…" }</Button>
-        </> }
-    } else {
-        html! {}
-    };
-    let actions = html! { <>
-        <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
-        { actions }
-    </> };
-
-    let approval = match focused {
-        Some(phase) if !finished => {
-            approval_pane(phase, &wanting, &d, &plan_groups, admin, &focus_phase)
-        }
-        _ => all_plans(&plan_groups, d.fleet.as_ref()),
-    };
-
-    let dialog = ask
-        .as_ref()
-        .map(|a| dialog(a, &d, &plan_groups, *busy, (*error).clone(), &run, &close));
-
-    html! {
-        <div class="page page--wide">
-            <PageHead title={format!("Rollout {}", rollout_label(&s.id))} {subtitle} {actions} />
-            if let Some(reason) = &s.pause_reason {
-                <div class={classes!("banner", if s.state == RolloutState::Paused { "banner--warn" } else { "banner--info" })} role="status">
-                    <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
-                    if admin && s.state == RolloutState::Paused {
-                        <span class="muted">{ " Retry, continue or skip the failed host below, or resume, roll back or abort the rollout." }</span>
-                    }
-                </div>
-            }
-            <Panel title="Pipeline" subtitle={format!("{} hosts in {} stages · {}/{} done", s.hosts_total, d.phases.len(), s.hosts_done, s.hosts_total)}>
-                <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
-            </Panel>
-            { approval }
-            <Panel title="Hosts" subtitle="Each host's apply timeline, health during bake and run report">
-                <HostTable detail={d.clone()} admin={admin && !finished} on_ask={open.clone()} {activity} {now} />
-            </Panel>
-            <Panel title="Timeline" subtitle="Rollout and phase transitions">
-                { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), now) }
-            </Panel>
-            { dialog.unwrap_or_default() }
-        </div>
-    }
+        .collect()
 }
 
 /// Whether an operator can force apply a host in this state: it is not
@@ -445,7 +496,7 @@ fn approval_hosts(phase: &RolloutPhase) -> Vec<&RolloutHost> {
         .collect()
 }
 
-fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalScope {
+pub(crate) fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalScope {
     approval_scope(&approval_hosts(phase), plans)
 }
 
@@ -729,6 +780,30 @@ fn tone_of_event(kind: &str) -> Tone {
     }
 }
 
+/// A host's state pill's popover: how it stands on each check of its
+/// phase's health gate, and the headline of its error.
+fn health_tip(phase: &RolloutPhase, h: &RolloutHost) -> Html {
+    let checks = host_checks(phase, h);
+    let headline = host_error_headline(h);
+    if checks.is_empty() && headline.is_none() {
+        return html! {};
+    }
+    html! { <>
+        if let Some(headline) = headline { <span>{ headline }</span> }
+        if !checks.is_empty() {
+            <span class="tip__head">{ format!("Health gate of {}", phase.name) }</span>
+            <ul class="tip-checks" data-testid="host-health-tip">
+                { for checks.into_iter().map(|(check, standing)| html! {
+                    <li data-check={check.clone()}>
+                        <Pill tone={standing.tone()} label={standing.label()} />
+                        <span class="mono">{ check }</span>
+                    </li>
+                }) }
+            </ul>
+        }
+    </> }
+}
+
 #[derive(Properties, PartialEq)]
 struct HostTableProps {
     detail: RolloutDetail,
@@ -771,7 +846,9 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td><RouteLink to={Route::Host { id: h.host.clone() }} classes="mono strong">{ h.host.clone() }</RouteLink></td>
                                 <td>{ phase.name.clone() }{ h.wave.map(|w| html! { <span class="muted small">{ format!(" · wave {w}") }</span> }).unwrap_or_default() }</td>
                                 <td>
-                                    <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} title={host_error_headline(h)} />
+                                    <HoverTip tip={health_tip(phase, h)} label={format!("{}: {}", h.host, host_state_label(h.state))}>
+                                        <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} />
+                                    </HoverTip>
                                     if h.needs_approval { <span class="badge badge--info">{ "needs approval" }</span> }
                                     if h.needs_attention {
                                         <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>

@@ -77,7 +77,7 @@ pub fn revisions() -> Html {
                         ));
                         ask.set(None);
                         if let Some(n) = navigator {
-                            n.push(&Route::Rollout { id: r.id });
+                            n.push(&Route::rollout(&r.id));
                         }
                     }
                     Err(e) => {
@@ -117,7 +117,7 @@ pub fn revisions() -> Html {
                                     if r.is_stable { <span class="badge badge--ok">{ "stable" }</span> }
                                     <Pill tone={if rejected { Tone::Danger } else { Tone::Ok }} label={if rejected { "rejected" } else { "valid" }} />
                                     { match rollout {
-                                        Some(o) => html! { <RouteLink to={Route::Rollout { id: o.id.clone() }}>
+                                        Some(o) => html! { <RouteLink to={Route::rollout(&o.id)}>
                                             <Pill tone={rollout_state_tone(o.state)} label={format!("rollout {} {}", rollout_label(&o.id), rollout_state_label(o.state))} />
                                         </RouteLink> },
                                         None => html! {},

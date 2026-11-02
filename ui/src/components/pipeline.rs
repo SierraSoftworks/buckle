@@ -16,10 +16,12 @@ use super::link::RouteLink;
 use super::ui::Pill;
 use crate::app::Route;
 use crate::logic::format::{config_duration, relative, short};
-use crate::logic::pipeline::{Gate, GateKind, GateState, Stage, gate_check_tone, layout};
+use crate::logic::pipeline::{
+    Gate, GateKind, GateState, OUTSIDE_STAGE, Stage, gate_check_tone, layout,
+};
 use crate::logic::tone::{
     LEGEND, Tone, block_look, host_error_headline, host_error_tone, host_state_class,
-    host_state_label, phase_state_label, phase_state_tone,
+    host_state_label, outside_block_look, phase_state_label, phase_state_tone,
 };
 
 #[derive(Properties, PartialEq)]
@@ -44,7 +46,7 @@ pub fn pipeline(props: &PipelineProps) -> Html {
     let stages = p.stages.iter().enumerate().map(|(i, stage)| {
         html! {
             <div class="pipeline__step" role="listitem">
-                { gate(&stage.gate, i == 0, props.now) }
+                if stage.phase.name != OUTSIDE_STAGE { { gate(&stage.gate, i == 0, props.now) } }
                 { column(stage, props) }
             </div>
         }
@@ -138,8 +140,11 @@ pub fn health_gate(phase: &RolloutPhase) -> Html {
 }
 
 fn column(stage: &Stage, props: &PipelineProps) -> Html {
-    let (compact, now) = (props.compact, props.now);
+    let now = props.now;
     let phase = stage.phase;
+    if phase.name == OUTSIDE_STAGE {
+        return outside_column(stage, props);
+    }
     let c = &stage.counts;
     let mut tally = vec![format!("{}/{} healthy", c.healthy, c.total)];
     if c.active > 0 {
@@ -187,7 +192,6 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
                     }
                     { bake }
                 </div>
-                if !compact { { health_gate(phase) } }
             </header>
             if stage.counts.total == 0 {
                 <p class="stage__empty muted">{ "No hosts" }</p>
@@ -196,6 +200,44 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
                     { for stage.hosts().map(|h| block(h, props.hosts.get(&h.host), props.activity.get(&h.host), now)) }
                 </div>
             }
+        </section>
+    }
+}
+
+/// The fleet map's trailing stage: hosts the rollout did not include
+/// (registered since, or not selected by any phase), by their own health.
+fn outside_column(stage: &Stage, props: &PipelineProps) -> Html {
+    let style = format!("--per-row: {}", stage.per_row);
+    html! {
+        <section class="stage stage--virtual stage--outside" data-stage={OUTSIDE_STAGE} aria-label="Hosts not in this rollout">
+            <header class="stage__head">
+                <div class="stage__title">
+                    <h3 class="stage__name">{ "Not in this rollout" }</h3>
+                </div>
+                <div class="stage__meta">
+                    <span>{ crate::logic::format::count(stage.counts.total, "host", "hosts") }</span>
+                </div>
+                <div class="stage__meta muted">
+                    <span>{ "registered since, or in no phase" }</span>
+                </div>
+            </header>
+            <div class="stage__blocks" {style} role="list">
+                { for stage.hosts().map(|h| {
+                    let look = outside_block_look(props.hosts.get(&h.host));
+                    html! {
+                        <RouteLink to={Route::Host { id: h.host.clone() }}
+                            classes={classes!(look.classes.clone())}
+                            label={format!("{}: {}", h.host, look.label)}
+                            data_host={h.host.clone()} data_state="outside">
+                            <span class="block__tip" aria-hidden="true">
+                                <strong class="block__name">{ h.host.clone() }</strong>
+                                <span class="block__state">{ look.label.clone() }</span>
+                                <span class="muted">{ format!("seen {}", relative(h.updated_at, props.now)) }</span>
+                            </span>
+                        </RouteLink>
+                    }
+                }) }
+            </div>
         </section>
     }
 }

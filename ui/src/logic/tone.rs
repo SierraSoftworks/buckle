@@ -155,6 +155,25 @@ pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook 
     BlockLook { classes, label }
 }
 
+/// How a host outside the rollout on a fleet map looks: coloured by its own
+/// health, since the rollout has no state for it.
+pub fn outside_block_look(host: Option<&HostSummary>) -> BlockLook {
+    let health = host.map(|h| h.health).unwrap_or(HealthSummary::Unknown);
+    let class = match health {
+        HealthSummary::Healthy => "block--healthy",
+        HealthSummary::Failing => "block--failed",
+        HealthSummary::Held => "block--held",
+        HealthSummary::Unknown => "block--pending",
+    };
+    let mut classes = vec!["block", class];
+    let mut label = format!("not in this rollout, {}", health_label(health));
+    if host.is_some_and(|h| h.connection == Connection::Offline) {
+        classes.push("block--offline");
+        label.push_str(", offline");
+    }
+    BlockLook { classes, label }
+}
+
 pub fn rollout_state_label(state: RolloutState) -> &'static str {
     match state {
         RolloutState::Detected => "detected",

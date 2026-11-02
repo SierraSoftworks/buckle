@@ -35,6 +35,16 @@ pub enum Route {
     NotFound,
 }
 
+impl Route {
+    /// A rollout's page, addressed by its `word.word.word` name where it has
+    /// one (the API resolves names) and by its id otherwise.
+    pub fn rollout(id: &str) -> Route {
+        Route::Rollout {
+            id: buckle_api::rollout_name(id).unwrap_or_else(|| id.to_string()),
+        }
+    }
+}
+
 /// Who is using the UI, as `/me` said.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Session {
