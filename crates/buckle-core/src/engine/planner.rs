@@ -1674,10 +1674,13 @@ pub(super) async fn dry_run(
         ));
     }
     let agent_vars = Vars::new();
+    // Kinds are checked against the platform the facts describe, not the one
+    // running `buckle validate`.
+    let platform = crate::Platform::from_facts(facts).unwrap_or_else(crate::Platform::current);
     let planner = Planner::new(
         revision,
         host.clone(),
-        Arc::new(crate::system::RealSystem::new()),
+        Arc::new(crate::system::RealSystem::new().with_platform(platform)),
         Arc::new(secrets),
         None,
         Arc::new(Vec::new()),
