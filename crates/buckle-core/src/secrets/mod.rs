@@ -9,9 +9,32 @@
 //! Rendered content that touched a secret is [`Sensitive`] and has the same
 //! property; content proven secret-free (or rendered with tokens in place of
 //! values) is [`Redacted`] and may be shown anywhere.
+//!
+//! The places that open a secret, all greppable by `Witness`:
+//!
+//! * [`sinks`] — [`sinks::FileSink`] (rendered files), [`sinks::ProcessEnvSink`]
+//!   (child process environment and stdin) and [`sinks::TransportSink`]
+//!   (server-to-agent assignment via [`SecretStore::export`], and the agent's
+//!   [`cache`]). [`sinks::Sink`] is sealed.
+//! * the template renderer (`crate::template`), for real renders.
+//! * [`redact`], which searches command output for known values.
+//!
+//! Around them: [`providers`] resolve references (`env`, `file`, and the
+//! development-only, allowlisted `exec`); [`SecretField`] is the spec field
+//! type for the few task fields that may hold secrets; [`redact_known`]
+//! scrubs text Buckle did not render itself.
 
+pub mod cache;
+pub mod field;
 pub mod providers;
+pub mod redact;
 pub mod sinks;
+
+#[cfg(test)]
+mod leak_tests;
+
+pub use field::SecretField;
+pub use redact::redact_known;
 
 use crate::model::SecretRef;
 use hmac::{Hmac, KeyInit, Mac};
@@ -24,6 +47,16 @@ use std::sync::Arc;
 
 /// The key used to fingerprint secret values. Fingerprints are HMAC-SHA256 so
 /// that a low-entropy secret cannot be brute-forced from its fingerprint.
+///
+/// ```
+/// use buckle_core::secrets::{InstallKey, Secret};
+///
+/// let key = InstallKey::from_bytes([7u8; 32]);
+/// let a = Secret::new("db", "hunter2".into(), &key);
+/// let b = Secret::new("db", "hunter2".into(), &key);
+/// assert_eq!(a.fingerprint(), b.fingerprint());
+/// assert_eq!(format!("{key:?}"), "InstallKey(..)");
+/// ```
 pub struct InstallKey(SecretBox<[u8; 32]>);
 
 impl Clone for InstallKey {
@@ -33,6 +66,7 @@ impl Clone for InstallKey {
 }
 
 impl InstallKey {
+    /// Wraps 32 bytes of key material.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(SecretBox::new(Box::new(bytes)))
     }
@@ -79,13 +113,21 @@ impl InstallKey {
     }
 
     fn fingerprint(&self, value: &str) -> Fingerprint {
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.0.expose_secret())
-            .expect("HMAC accepts any key length");
-        mac.update(value.as_bytes());
-        let out = mac.finalize().into_bytes();
+        let out = self.mac(&[], value.as_bytes());
         let mut short = [0u8; 4];
         short.copy_from_slice(&out[..4]);
         Fingerprint(short)
+    }
+
+    /// HMAC-SHA256 of `domain || bytes` under this key. Fingerprints use an
+    /// empty domain (so they stay stable); other uses, such as the agent's
+    /// cache integrity tag, pass a distinct domain string.
+    pub(crate) fn mac(&self, domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.0.expose_secret())
+            .expect("HMAC accepts any key length");
+        mac.update(domain);
+        mac.update(bytes);
+        mac.finalize().into_bytes().into()
     }
 }
 
@@ -102,8 +144,36 @@ impl fmt::Debug for InstallKey {
 pub struct Fingerprint([u8; 4]);
 
 impl Fingerprint {
+    /// The eight lowercase hex characters operators see.
     pub fn as_hex(&self) -> String {
         hex::encode(self.0)
+    }
+
+    /// Parses the eight-hex-character form (as shown in tokens, plans and the
+    /// UI). Case-insensitive; anything else is a user error.
+    ///
+    /// ```
+    /// use buckle_core::secrets::Fingerprint;
+    ///
+    /// let fp = Fingerprint::parse("3F9A00b2").unwrap();
+    /// assert_eq!(fp.as_hex(), "3f9a00b2");
+    /// assert!(Fingerprint::parse("3f9a").is_err());
+    /// ```
+    pub fn parse(s: &str) -> crate::Result<Fingerprint> {
+        Fingerprint::try_from(s.trim().to_owned()).map_err(|_| {
+            crate::error::user(
+                format!("'{s}' is not a secret fingerprint."),
+                &["A fingerprint is the 8 hexadecimal characters after the '@' in «secret:NAME@FINGERPRINT»."],
+            )
+        })
+    }
+}
+
+impl std::str::FromStr for Fingerprint {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> crate::Result<Self> {
+        Fingerprint::parse(s)
     }
 }
 
@@ -148,6 +218,17 @@ impl Secret {
     /// Seals `value` under `name`, fingerprinting it with `key`.
     pub fn new(name: impl Into<Arc<str>>, value: String, key: &InstallKey) -> Self {
         let fingerprint = key.fingerprint(&value);
+        Self::with_fingerprint(name, fingerprint, value)
+    }
+
+    /// Seals `value` with a fingerprint computed elsewhere (by the server, for a
+    /// secret delivered to an agent). Crate-private so that only the transport
+    /// and cache paths, which carry the fingerprint alongside the value, use it.
+    pub(crate) fn with_fingerprint(
+        name: impl Into<Arc<str>>,
+        fingerprint: Fingerprint,
+        value: String,
+    ) -> Self {
         Self {
             name: name.into(),
             fingerprint,
@@ -155,10 +236,12 @@ impl Secret {
         }
     }
 
+    /// The name the secret is declared under in `buckle.yaml`.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// The keyed fingerprint of the value.
     pub fn fingerprint(&self) -> Fingerprint {
         self.fingerprint
     }
@@ -209,42 +292,144 @@ impl PartialEq for Secret {
 }
 
 /// The resolved secrets available to a host or a local run.
+///
+/// `Debug` lists reference tokens; `Serialize` emits a map of name to
+/// fingerprint. Neither ever contains a value.
+///
+/// ```
+/// use buckle_core::secrets::{InstallKey, Secret, SecretStore};
+///
+/// let key = InstallKey::from_bytes([7u8; 32]);
+/// let mut store = SecretStore::new();
+/// store.insert(Secret::new("db", "hunter2".into(), &key));
+/// let json = serde_json::to_string(&store).unwrap();
+/// assert!(json.starts_with(r#"{"db":""#));
+/// assert!(!json.contains("hunter2"));
+/// assert!(!format!("{store:?}").contains("hunter2"));
+/// ```
 #[derive(Clone, Default, Debug)]
 pub struct SecretStore {
     secrets: IndexMap<String, Secret>,
 }
 
+impl Serialize for SecretStore {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.secrets.len()))?;
+        for (name, secret) in &self.secrets {
+            map.serialize_entry(name, &secret.fingerprint())?;
+        }
+        map.end()
+    }
+}
+
 impl SecretStore {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Adds or replaces the secret with this name.
     pub fn insert(&mut self, secret: Secret) {
         self.secrets.insert(secret.name().to_owned(), secret);
     }
 
+    /// The secret with this (exact) name.
     pub fn get(&self, name: &str) -> Option<&Secret> {
         self.secrets.get(name)
     }
 
+    /// Whether a secret with this name is present.
     pub fn contains(&self, name: &str) -> bool {
         self.secrets.contains_key(name)
     }
 
+    /// Secret names, in insertion order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.secrets.keys().map(String::as_str)
     }
 
+    /// Secrets, in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = &Secret> {
         self.secrets.values()
     }
 
+    /// The number of secrets.
     pub fn len(&self) -> usize {
         self.secrets.len()
     }
 
+    /// Whether the store holds no secrets.
     pub fn is_empty(&self) -> bool {
         self.secrets.is_empty()
+    }
+
+    /// Opens every secret for transport: `(name, fingerprint, value bytes)`.
+    ///
+    /// Used by the server when assigning secrets to a host (the result goes
+    /// straight into the assignment message) and by the agent when caching
+    /// them. Requires a [`sinks::Sink`] so that every call site is greppable;
+    /// pass [`sinks::TransportSink`]. The returned bytes are plaintext: hand
+    /// them to the wire encoder and drop them.
+    ///
+    /// ```
+    /// use buckle_core::secrets::sinks::TransportSink;
+    /// use buckle_core::secrets::{InstallKey, Secret, SecretStore};
+    ///
+    /// let key = InstallKey::from_bytes([7u8; 32]);
+    /// let mut store = SecretStore::new();
+    /// store.insert(Secret::new("db", "hunter2".into(), &key));
+    /// let wire = store.export(&TransportSink);
+    /// let back = SecretStore::import(&key, wire.into_iter().map(|(n, _, v)| (n, v))).unwrap();
+    /// assert_eq!(back.get("db"), store.get("db"));
+    /// ```
+    pub fn export(&self, sink: &dyn sinks::Sink) -> Vec<(String, Fingerprint, Vec<u8>)> {
+        self.secrets
+            .values()
+            .map(|s| {
+                (
+                    s.name().to_owned(),
+                    s.fingerprint(),
+                    s.reveal(sink.witness()).as_bytes().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// Seals transported values, fingerprinting them with `key`. Use this
+    /// when the receiving side's key is the one fingerprints must agree with
+    /// (a local run, or an agent sharing the server's key); use
+    /// [`SecretStore::import_fingerprinted`] to keep the sender's fingerprints.
+    ///
+    /// A value that is not UTF-8 is a system error naming the secret: every
+    /// exported value came from a `Secret`, so this means corruption.
+    pub fn import(
+        key: &InstallKey,
+        items: impl IntoIterator<Item = (String, Vec<u8>)>,
+    ) -> crate::Result<SecretStore> {
+        let mut store = SecretStore::new();
+        for (name, bytes) in items {
+            let value = utf8_value(&name, bytes)?;
+            store.insert(Secret::new(name, value, key));
+        }
+        Ok(store)
+    }
+
+    /// Seals transported values under the fingerprints the sender computed.
+    ///
+    /// This is what an agent in server mode uses for its assignment: plans
+    /// show the server's fingerprints, so a rotation yields the same plan
+    /// digest on every host that uses the secret (design §11). The agent does
+    /// not need the server's [`InstallKey`].
+    pub fn import_fingerprinted(
+        items: impl IntoIterator<Item = (String, Fingerprint, Vec<u8>)>,
+    ) -> crate::Result<SecretStore> {
+        let mut store = SecretStore::new();
+        for (name, fingerprint, bytes) in items {
+            let value = utf8_value(&name, bytes)?;
+            store.insert(Secret::with_fingerprint(name, fingerprint, value));
+        }
+        Ok(store)
     }
 
     /// The subset of secrets with the given names (missing names are skipped).
@@ -256,6 +441,28 @@ impl SecretStore {
             }
         }
         out
+    }
+}
+
+fn utf8_value(name: &str, bytes: Vec<u8>) -> crate::Result<String> {
+    String::from_utf8(bytes).map_err(|_| {
+        crate::error::system(
+            format!("The transported value of the secret '{name}' is not valid UTF-8."),
+            &["The secret was corrupted in transit or in the agent's cache; resynchronise the host with the server."],
+        )
+    })
+}
+
+impl fmt::Display for SecretStore {
+    /// The reference tokens, comma-separated.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, secret) in self.secrets.values().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(&secret.token())?;
+        }
+        Ok(())
     }
 }
 
@@ -277,14 +484,18 @@ impl<T> Redacted<T> {
         Redacted(value)
     }
 
+    /// The displayable content.
     pub fn get(&self) -> &T {
         &self.0
     }
 
+    /// Unwraps the displayable content.
     pub fn into_inner(self) -> T {
         self.0
     }
 
+    /// Transforms the content. The caller is responsible for not mixing a
+    /// secret value in; the result is still asserted displayable.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Redacted<U> {
         Redacted(f(self.0))
     }
@@ -330,16 +541,19 @@ impl Sensitive<String> {
         crate::Digest::of(self.0.as_bytes())
     }
 
+    /// The length in bytes (safe to show: "412 bytes, contains secrets").
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Whether the content is empty.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
 
 impl Sensitive<Vec<u8>> {
+    /// The digest of the real bytes: safe to store and compare for drift.
     pub fn digest(&self) -> crate::Digest {
         crate::Digest::of(&self.0)
     }
@@ -351,15 +565,25 @@ impl<T> fmt::Debug for Sensitive<T> {
     }
 }
 
+impl<T> fmt::Display for Sensitive<T> {
+    /// A placeholder, like `Debug`: the content is never formatted.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Sensitive(..)")
+    }
+}
+
 /// A rendered string that is either safe or sensitive depending on whether the
 /// template referenced a secret.
 #[derive(Debug, Clone)]
 pub enum Rendered {
+    /// The template touched no secret; the text is displayable.
     Plain(String),
+    /// The template revealed at least one secret.
     Sensitive(Sensitive<String>),
 }
 
 impl Rendered {
+    /// The digest of the real content, for drift detection.
     pub fn digest(&self) -> crate::Digest {
         match self {
             Rendered::Plain(s) => crate::Digest::of(s.as_bytes()),
@@ -367,8 +591,17 @@ impl Rendered {
         }
     }
 
+    /// Whether a secret was revealed into this content.
     pub fn is_sensitive(&self) -> bool {
         matches!(self, Rendered::Sensitive(_))
+    }
+
+    /// The content when it is displayable, `None` when it is sensitive.
+    pub fn as_plain(&self) -> Option<&str> {
+        match self {
+            Rendered::Plain(s) => Some(s),
+            Rendered::Sensitive(_) => None,
+        }
     }
 }
 
@@ -379,6 +612,7 @@ pub struct Resolver {
 }
 
 impl Resolver {
+    /// A resolver with no providers, fingerprinting under `key`.
     pub fn new(key: InstallKey) -> Self {
         Self {
             key,
@@ -386,11 +620,13 @@ impl Resolver {
         }
     }
 
+    /// Adds a provider. Providers are consulted in the order added.
     pub fn with_provider(mut self, provider: impl providers::SecretProvider + 'static) -> Self {
         self.providers.push(Box::new(provider));
         self
     }
 
+    /// The key fingerprints are computed under.
     pub fn key(&self) -> &InstallKey {
         &self.key
     }
@@ -408,6 +644,7 @@ impl Resolver {
         Ok(store)
     }
 
+    /// Resolves one reference with the first provider that handles it.
     pub async fn resolve_one(&self, name: &str, reference: &SecretRef) -> crate::Result<Secret> {
         for provider in &self.providers {
             if !provider.handles(reference) {
