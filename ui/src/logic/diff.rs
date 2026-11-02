@@ -81,36 +81,53 @@ pub enum Segment<'a> {
         name: &'a str,
         fingerprint: &'a str,
     },
+    /// `«fact:PATH»`: a host value that varies across the fleet
+    /// (`host.id`, `host.facts.os.codename`), in a fleet-wide plan.
+    Fact {
+        raw: &'a str,
+        path: &'a str,
+    },
 }
 
 const OPEN: char = '\u{ab}';
 const CLOSE: char = '\u{bb}';
-const PREFIX: &str = "\u{ab}secret:";
+const SECRET: &str = "\u{ab}secret:";
+const FACT: &str = buckle_api::FACT_TOKEN_PREFIX;
 
-/// Splits text around secret reference tokens.
+/// Splits text around secret and fact tokens.
 pub fn segments(text: &str) -> Vec<Segment<'_>> {
     let mut out = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find(PREFIX) {
+    let next = |s: &str| {
+        [SECRET, FACT]
+            .into_iter()
+            .filter_map(|p| s.find(p).map(|i| (i, p)))
+            .min()
+    };
+    while let Some((start, prefix)) = next(rest) {
         let Some(len) = rest[start..].find(CLOSE) else {
             break;
         };
         let raw = &rest[start..start + len + CLOSE.len_utf8()];
-        let inner = &raw[PREFIX.len()..raw.len() - CLOSE.len_utf8()];
+        let inner = &raw[prefix.len()..raw.len() - CLOSE.len_utf8()];
         if inner.contains(OPEN) {
             // Not a token: an opening guillemet inside it. Keep it as text.
-            out.push(Segment::Text(&rest[..start + PREFIX.len()]));
-            rest = &rest[start + PREFIX.len()..];
+            out.push(Segment::Text(&rest[..start + prefix.len()]));
+            rest = &rest[start + prefix.len()..];
             continue;
         }
-        let (name, fingerprint) = inner.rsplit_once('@').unwrap_or((inner, ""));
         if start > 0 {
             out.push(Segment::Text(&rest[..start]));
         }
-        out.push(Segment::Secret {
-            raw,
-            name,
-            fingerprint,
+        out.push(if prefix == FACT {
+            Segment::Fact { raw, path: inner }
+        } else {
+            let (name, fingerprint) = inner.rsplit_once('@').unwrap_or((inner, ""));
+            Segment::Secret {
+                raw,
+                name,
+                fingerprint,
+            }
         });
         rest = &rest[start + raw.len()..];
     }
@@ -198,6 +215,26 @@ mod tests {
         assert_eq!(
             segments("x «secret:broken"),
             vec![Segment::Text("x «secret:broken")]
+        );
+    }
+
+    #[test]
+    fn fact_tokens_are_split_out_alongside_secrets() {
+        assert_eq!(
+            segments("name = «fact:host.id» key = «secret:k@1»"),
+            vec![
+                Segment::Text("name = "),
+                Segment::Fact {
+                    raw: "«fact:host.id»",
+                    path: "host.id"
+                },
+                Segment::Text(" key = "),
+                Segment::Secret {
+                    raw: "«secret:k@1»",
+                    name: "k",
+                    fingerprint: "1"
+                },
+            ]
         );
     }
 

@@ -7,6 +7,7 @@ pub mod blueprint;
 pub mod diff;
 pub mod filter;
 pub mod fleet;
+pub mod fleet_plan;
 pub mod format;
 pub mod labels;
 pub mod live;

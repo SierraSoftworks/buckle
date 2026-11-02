@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    ApproveRequest, ContinueRequest, HealthResultDto, HostRolloutState, LiveEvent, PlanGroup,
-    RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
+    ApproveRequest, ContinueRequest, FleetPlan, HealthResultDto, HostRolloutState, LiveEvent,
+    PlanGroup, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -18,7 +18,7 @@ use crate::app::{Route, use_auth};
 use crate::components::ui::Copyable;
 use crate::components::{
     Button, Confirm, Countdown, Empty, ErrorBlock, ErrorState, Kind, Loading, PageHead, Panel,
-    Pill, Pipeline, PlanGroupView, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
+    Pill, Pipeline, PlanViews, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::format::{count, first_line, relative, rollout_label, short, timestamp};
@@ -360,7 +360,7 @@ pub fn rollout_page(props: &Props) -> Html {
             &open,
             &focus_phase,
         ),
-        _ => all_plans(&plan_groups),
+        _ => all_plans(&plan_groups, d.fleet.as_ref()),
     };
 
     let dialog = ask
@@ -488,11 +488,9 @@ fn approval_pane(
             if scope.groups.is_empty() {
                 <Empty title="No plans yet" message="Plans arrive as the hosts answer; this phase can be approved once they have." />
             }
-            <div class="plans">
-                { for scope.groups.iter().enumerate().map(|(n, i)| html! {
-                    <PlanGroupView group={plans[*i].clone()} focus={focus_names.clone()} open={n == 0 || plans[*i].destructive} />
-                }) }
-            </div>
+            <PlanViews fleet={d.fleet.as_ref().map(|f| f.restrict(&scope.hosts))}
+                groups={scope.groups.iter().map(|i| plans[*i].clone()).collect::<Vec<_>>()}
+                focus={focus_names.clone()} open_first=true />
             if !phase.health_checks.is_empty() {
                 <div class="approval__gate" data-testid="health-gate">
                     <h4 class="subhead">{ "Health gate" }</h4>
@@ -524,15 +522,13 @@ fn approval_pane(
     }
 }
 
-fn all_plans(plans: &[PlanGroup]) -> Html {
+fn all_plans(plans: &[PlanGroup], fleet: Option<&FleetPlan>) -> Html {
     if plans.is_empty() {
         return html! {};
     }
     html! {
         <Panel title="Plans" subtitle={format!("{} across the rollout", count(plans.len(), "distinct plan", "distinct plans"))}>
-            <div class="plans">
-                { for plans.iter().map(|g| html! { <PlanGroupView group={g.clone()} /> }) }
-            </div>
+            <PlanViews fleet={fleet.cloned()} groups={plans.to_vec()} />
         </Panel>
     }
 }

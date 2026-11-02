@@ -262,18 +262,9 @@
     padding-left: 1.4rem;
   }
 
-  &__variants,
-  &__render {
+  &__variants {
     flex-basis: 100%;
     margin: 0.2rem 0 0 1.4rem;
-  }
-
-  &__variants {
-    margin-bottom: 0;
-  }
-
-  &__render select {
-    margin-left: 0.3rem;
   }
 
   &__preview {

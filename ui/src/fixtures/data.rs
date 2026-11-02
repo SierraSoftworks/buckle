@@ -6,11 +6,11 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    AuditEntry, Catalog, Connection, DiffKind, DriftItem, HandlerView, HealthResultDto,
-    HealthSummary, HostDetail, HostRolloutState as S, HostStatus, HostSummary, KindDescriptor, Me,
-    ModuleNote, ModuleView, PhaseState, PlanGroup, PlanView, RemovalView, ResourceSummary,
-    RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase,
-    RolloutState, RolloutSummary, StepOutcome, StepView,
+    AuditEntry, Catalog, Connection, DiffKind, DriftItem, FleetHost, FleetPlan, HandlerView,
+    HealthResultDto, HealthSummary, HostDetail, HostRolloutState as S, HostStatus, HostSummary,
+    KindDescriptor, Me, ModuleNote, ModuleView, PhaseState, PlanGroup, PlanView, RemovalView,
+    ResourceSummary, RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutHost,
+    RolloutPhase, RolloutState, RolloutSummary, StepOutcome, StepView,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
@@ -598,7 +598,7 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
         },
         phases,
         plans: plans(),
-        fleet: None,
+        fleet: Some(fleet_plan()),
         events,
     }
 }
@@ -995,6 +995,18 @@ fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
                     ),
                     NOMAD_DIFF,
                 ),
+                with_diff(
+                    step(
+                        "nomad",
+                        "file.template",
+                        "/etc/nomad.d/client.hcl",
+                        Some((DiffKind::Update, "1 line changed")),
+                    ),
+                    &format!(
+                        "--- current\n+++ planned\n@@ -1,3 +1,3 @@\n name = \"{host}\"\n-advertise {{ http = \"0.0.0.0\" }}\n+advertise {{ http = \"{}\" }}\n datacenter = \"home\"\n",
+                        tailnet_ip(host)
+                    ),
+                ),
                 step("nomad", "systemd.unit", "nomad", None),
             ],
             handlers: vec![HandlerView {
@@ -1087,6 +1099,37 @@ fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
             vec![]
         },
     }
+}
+
+/// A host's (made up) tailnet address.
+fn tailnet_ip(host: &str) -> String {
+    let n = host
+        .bytes()
+        .fold(7u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    format!("100.64.{}.{}", n % 7, 10 + n % 200)
+}
+
+/// The demo rollout's plans as one union, each host planning its own copy
+/// (so the per-host template above differs only by fact values).
+pub fn fleet_plan() -> FleetPlan {
+    let hosts: Vec<FleetHost> = plans()
+        .iter()
+        .flat_map(|g| {
+            let plan = g.plan.clone().unwrap_or_default();
+            let has = |m: &str| plan.modules.iter().any(|x| x.module == m);
+            let (grey, nomad) = (has("cleanup"), has("nomad"));
+            g.hosts.iter().map(move |h| FleetHost {
+                host: h.clone(),
+                plan: Some(plan_doc(h, &g.digest, grey, nomad)),
+                context: json!({
+                    "id": h,
+                    "labels": {},
+                    "facts": {"tailscale": {"ip": tailnet_ip(h)}, "os": {"codename": "bookworm"}},
+                }),
+            })
+        })
+        .collect();
+    FleetPlan::build(&hosts)
 }
 
 pub fn plans() -> Vec<PlanGroup> {
