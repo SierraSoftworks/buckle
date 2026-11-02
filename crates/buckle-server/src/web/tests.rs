@@ -334,6 +334,32 @@ async fn hosts_can_be_relabelled_approved_and_previewed() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
 
+#[actix_web::test]
+async fn forgetting_a_host_closes_its_agent_session() {
+    let e = env(WebConfig {
+        admin_acl: acl("true"),
+        ..Default::default()
+    })
+    .await;
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    let live = e.state.agent_sessions.register("pi-1", 1);
+    let other = e.state.agent_sessions.register("pi-2", 2);
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::delete()
+            .uri("/api/v1/hosts/pi-1")
+            .cookie(cookie)
+            .insert_header((auth::CSRF_HEADER, token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(live.is_cancelled(), "the forgotten host's stream is closed");
+    assert!(!other.is_cancelled());
+}
+
 async fn next_chunk(body: &mut actix_web::body::BoxBody) -> String {
     let chunk = tokio::time::timeout(
         std::time::Duration::from_secs(10),

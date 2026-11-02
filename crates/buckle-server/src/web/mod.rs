@@ -40,6 +40,8 @@ pub struct AppState {
     /// Cookies carry `Secure` (and the binding cookie `__Host-`).
     pub secure_cookies: bool,
     pub server_version: String,
+    /// Live agent sessions, so forgetting a host closes its stream.
+    pub agent_sessions: Arc<crate::grpc::LiveSessions>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -79,6 +81,7 @@ impl AppState {
             catalog: catalog::build(&server_version),
             secure_cookies,
             server_version,
+            agent_sessions: Default::default(),
         }
     }
 

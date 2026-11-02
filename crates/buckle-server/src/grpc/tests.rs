@@ -4,12 +4,14 @@ use super::*;
 use crate::clock::TokioClock;
 use crate::config::{AgentAuth, AgentsConfig, Registration};
 use crate::events::EventBus;
+use crate::grpc::SessionGuard;
 use crate::rollout::{ControllerDeps, ControllerOptions, Sessions};
 use crate::secrets::ServerSecrets;
 use crate::source::cache::RevisionCache;
 use crate::source::{CommitInfo, RevisionBuilder};
-use crate::store::Store;
+use crate::store::{NewHost, Store};
 use async_trait::async_trait;
+use buckle_api::HostStatus;
 use buckle_core::secrets::InstallKey;
 use buckle_proto::v1::fleet_client::FleetClient;
 use buckle_proto::v1::{
@@ -40,6 +42,7 @@ struct Server {
     store: Store,
     data: tempfile::TempDir,
     revisions: Arc<RevisionCache>,
+    guard: Arc<SessionGuard>,
     cancel: CancellationToken,
 }
 
@@ -54,6 +57,16 @@ async fn server(
     whois: Option<Arc<dyn Whois>>,
     auth: Vec<AgentAuth>,
 ) -> Server {
+    server_with(registration, whois, auth, SessionGuard::default()).await
+}
+
+async fn server_with(
+    registration: Registration,
+    whois: Option<Arc<dyn Whois>>,
+    auth: Vec<AgentAuth>,
+    guard: SessionGuard,
+) -> Server {
+    let guard = Arc::new(guard);
     let data = tempfile::tempdir().unwrap();
     let store = Store::in_memory().await.unwrap();
     let sessions = Arc::new(Sessions::new());
@@ -94,6 +107,7 @@ async fn server(
         events,
         clock,
         server_version: "2.0.0-test".into(),
+        guard: guard.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -103,6 +117,7 @@ async fn server(
         store,
         data,
         revisions,
+        guard,
         cancel,
     }
 }
@@ -223,12 +238,187 @@ async fn a_bad_token_is_rejected() {
 }
 
 #[tokio::test]
-async fn an_agent_older_than_the_minimum_is_rejected() {
+async fn an_agent_older_than_the_minimum_is_rejected_and_can_enrol_once_upgraded() {
     let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
     let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "1.9.0")).await;
     let r = expect_rejected(reply);
     assert!(!r.retry);
     assert!(r.reason.contains("older"));
+    let stored = s.store.call(|db| db.hosts().get("pi-1")).await.unwrap();
+    assert!(stored.is_none(), "a refused agent leaves no record behind");
+
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    assert_eq!(expect_welcome(reply).issued_token.len(), 64);
+}
+
+#[tokio::test]
+async fn the_bootstrap_token_cannot_claim_a_host_registered_over_the_tailnet() {
+    // A host the tailnet registered, then the same name over token auth.
+    let plain = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let store = plain.store.clone();
+    store
+        .call(|db| {
+            db.hosts().create(&NewHost {
+                id: "tail-1".into(),
+                status: HostStatus::Active,
+                token_hash: None,
+                auth_method: "tailscale".into(),
+                at: chrono::Utc::now(),
+            })?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (_tx, _stream, reply) = open(plain.addr, hello("tail-1", "boot", "2.0.0")).await;
+    let r = expect_rejected(reply);
+    assert!(r.reason.contains("already registered"), "{}", r.reason);
+    let host = store
+        .call(|db| db.hosts().get("tail-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(host.token_hash, None, "no token was issued for it");
+}
+
+#[tokio::test]
+async fn bootstrap_guesses_are_throttled_per_address() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    for _ in 0..crate::grpc::guard::ENROLMENT_ATTEMPTS_PER_MINUTE {
+        let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "guess", "2.0.0")).await;
+        assert!(expect_rejected(reply).reason.contains("not recognised"));
+    }
+    // Even the right token waits now.
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let r = expect_rejected(reply);
+    assert!(r.retry);
+    assert!(r.reason.contains("Too many"), "{}", r.reason);
+}
+
+#[tokio::test]
+async fn a_stream_that_never_says_hello_is_closed() {
+    let s = server_with(
+        Registration::Auto,
+        None,
+        vec![AgentAuth::Token],
+        SessionGuard {
+            hello_timeout: std::time::Duration::from_millis(100),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut client = FleetClient::connect(format!("http://{}", s.addr))
+        .await
+        .unwrap();
+    let (_tx, rx) = tokio::sync::mpsc::channel::<AgentMessage>(1);
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.session(ReceiverStream::new(rx)),
+    )
+    .await
+    .expect("the server answers without a Hello")
+    .unwrap()
+    .into_inner();
+    let reply = stream.message().await.unwrap().unwrap().msg.unwrap();
+    assert!(expect_rejected(reply).reason.contains("Hello"));
+}
+
+#[tokio::test]
+async fn closing_a_host_ends_its_live_session() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let (_tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    assert!(s.guard.sessions.is_live("pi-1"));
+    assert!(s.guard.sessions.close("pi-1"));
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+        .await
+        .expect("the stream ends");
+    assert!(matches!(end, Ok(None) | Err(_)), "{end:?}");
+}
+
+async fn fetch_revision_code(addr: SocketAddr, token: &str, revision: &str) -> tonic::Code {
+    let mut client = FleetClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(FetchRevisionRequest {
+        revision: revision.into(),
+    });
+    request
+        .metadata_mut()
+        .insert(buckle_proto::TOKEN_METADATA_KEY, token.parse().unwrap());
+    match client.fetch_revision(request).await {
+        Ok(mut s) => match s.get_mut().message().await {
+            Ok(_) => tonic::Code::Ok,
+            Err(e) => e.code(),
+        },
+        Err(e) => e.code(),
+    }
+}
+
+async fn build_revision(s: &Server, id: &str) -> crate::store::RevisionRecord {
+    let tree = s.data.path().join(format!("tree-{id}"));
+    std::fs::create_dir_all(tree.join("modules/m")).unwrap();
+    std::fs::write(tree.join("buckle.yaml"), "version: 2\n").unwrap();
+    std::fs::write(
+        tree.join("modules/m/module.yaml"),
+        format!("name: m\n# {id}\n"),
+    )
+    .unwrap();
+    RevisionBuilder::new(s.store.clone(), s.revisions.clone(), EventBus::default())
+        .build(
+            CommitInfo {
+                id: id.into(),
+                author: "a".into(),
+                message: "m".into(),
+                time: chrono::Utc::now(),
+            },
+            tree,
+            "git",
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn only_active_hosts_fetch_and_only_revisions_meant_for_them() {
+    let s = server(Registration::Approve, None, vec![AgentAuth::Token]).await;
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let welcome = expect_welcome(reply);
+    assert_eq!(welcome.status, "pending");
+    let token = welcome.issued_token;
+    build_revision(&s, "aaa").await;
+    build_revision(&s, "bbb").await;
+    s.store
+        .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "aaa"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fetch_revision_code(s.addr, &token, "aaa").await,
+        tonic::Code::PermissionDenied,
+        "a pending host fetches nothing"
+    );
+    s.store
+        .call(|db| db.hosts().set_status("pi-1", HostStatus::Active))
+        .await
+        .unwrap();
+    assert_eq!(
+        fetch_revision_code(s.addr, &token, "aaa").await,
+        tonic::Code::Ok
+    );
+    assert_eq!(
+        fetch_revision_code(s.addr, &token, "bbb").await,
+        tonic::Code::PermissionDenied,
+        "a revision nobody assigned it"
+    );
+    s.store
+        .call(|db| db.hosts().set_status("pi-1", HostStatus::Paused))
+        .await
+        .unwrap();
+    assert_eq!(
+        fetch_revision_code(s.addr, &token, "aaa").await,
+        tonic::Code::PermissionDenied,
+        "a paused host fetches nothing"
+    );
 }
 
 #[tokio::test]
@@ -278,6 +468,10 @@ async fn revisions_stream_in_chunks_with_total_and_digest() {
             tree,
             "git",
         )
+        .await
+        .unwrap();
+    s.store
+        .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "abc"))
         .await
         .unwrap();
 

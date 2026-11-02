@@ -628,6 +628,11 @@ async fn host_forget(state: Data, admin: Administrative, path: web::Path<String>
         None,
     )
     .await;
+    // A forgotten host keeps no session: its agent reconnects and, being
+    // unknown, registers afresh.
+    if state.agent_sessions.close(&id) {
+        tracing::info!(buckle.host = %id, "closed the session of a forgotten host");
+    }
     state.controller.host_changed(&id);
     Ok(HttpResponse::NoContent().finish())
 }
