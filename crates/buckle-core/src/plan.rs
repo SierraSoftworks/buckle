@@ -139,9 +139,20 @@ impl Diff {
         old: &Redacted<String>,
         new: &Redacted<String>,
     ) -> Diff {
+        Self::unified_with_context(summary, old, new, 3)
+    }
+
+    /// [`Diff::unified`] with `context` lines around each change; zero shows
+    /// only the changed lines (for files whose other lines are sensitive).
+    pub fn unified_with_context(
+        summary: impl Into<String>,
+        old: &Redacted<String>,
+        new: &Redacted<String>,
+        context: usize,
+    ) -> Diff {
         let text = similar::TextDiff::from_lines(old.get().as_str(), new.get().as_str())
             .unified_diff()
-            .context_radius(3)
+            .context_radius(context)
             .header("current", "planned")
             .to_string();
         Diff::Update {
@@ -522,6 +533,31 @@ mod tests {
         };
         assert!(u.get().contains("-b"));
         assert!(u.get().contains("+c"));
+    }
+
+    #[test]
+    fn unified_diffs_can_omit_context() {
+        let old = Redacted::plain("a\nb\nc\nd\n".to_string());
+        let new = Redacted::plain("a\nb\nX\nd\n".to_string());
+        let Diff::Update {
+            unified: Some(u), ..
+        } = Diff::unified_with_context("1 line", &old, &new, 0)
+        else {
+            panic!()
+        };
+        assert!(
+            u.get().contains("-c") && u.get().contains("+X"),
+            "{}",
+            u.get()
+        );
+        assert!(!u.get().contains(" b"), "no context lines: {}", u.get());
+        let Diff::Update {
+            unified: Some(u), ..
+        } = Diff::unified("1 line", &old, &new)
+        else {
+            panic!()
+        };
+        assert!(u.get().contains(" b"));
     }
 
     #[test]

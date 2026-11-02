@@ -175,36 +175,6 @@ fn yaml_key(key: &serde_yaml::Value) -> String {
     }
 }
 
-/// Renders every string scalar in `value` that contains template syntax with
-/// [`Templater::render_plain`] and returns the result as JSON. A reference to a
-/// secret is an error: task spec fields are plain strings that end up in plans.
-pub fn render_value(
-    value: &serde_yaml::Value,
-    templater: &Templater,
-    ctx: &HostContext,
-) -> crate::Result<serde_json::Value> {
-    match value {
-        serde_yaml::Value::String(s) if Templater::needs_render(s) => {
-            Ok(serde_json::Value::String(templater.render_plain(s, ctx)?))
-        }
-        serde_yaml::Value::Sequence(items) => Ok(serde_json::Value::Array(
-            items
-                .iter()
-                .map(|v| render_value(v, templater, ctx))
-                .collect::<crate::Result<Vec<_>>>()?,
-        )),
-        serde_yaml::Value::Mapping(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                out.insert(yaml_key(k), render_value(v, templater, ctx)?);
-            }
-            Ok(serde_json::Value::Object(out))
-        }
-        serde_yaml::Value::Tagged(tagged) => render_value(&tagged.value, templater, ctx),
-        other => Ok(yaml_to_json(other)),
-    }
-}
-
 /// Collects the template strings inside a JSON value.
 fn template_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
     match value {

@@ -37,7 +37,7 @@ async fn run_check(
             ));
         }
         let task_ctx = ctx.in_task(&kind, &name, &[]);
-        let json = match super::context::render_value(&decl.check.spec, &planner.templater, &task_ctx) {
+        let json = match planner.render_check_spec(check, &decl.check.spec, &task_ctx) {
             Ok(j) => j,
             Err(e) => return HealthStatus::fail(format!("the check's spec could not be rendered: {}", e.message())),
         };

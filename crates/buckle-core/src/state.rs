@@ -34,10 +34,16 @@ impl ResourceRecord {
     /// Everything this resource is known to own (see [`Artefact::identity`]
     /// and [`crate::task::key_identity`]).
     pub fn identities(&self) -> std::collections::BTreeSet<String> {
-        crate::task::key_identity(&self.key.key)
+        let mut ids: std::collections::BTreeSet<String> = crate::task::key_identity(&self.key.key)
             .into_iter()
             .chain(self.artefacts.iter().filter_map(Artefact::identity))
-            .collect()
+            .collect();
+        for a in &self.artefacts {
+            if let (Artefact::Line { path, .. }, Some(line)) = (a, a.line_text()) {
+                ids.insert(format!("line-text:{}:{line}", path.to_string_lossy()));
+            }
+        }
+        ids
     }
 }
 

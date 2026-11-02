@@ -301,6 +301,23 @@ impl<'a> Planner<'a> {
         Ok(json)
     }
 
+    /// Renders a health check's spec like a task spec: fields the check's
+    /// schema marks secret-capable keep their template for the check to
+    /// resolve through a sink; scalar fields take their declared type.
+    pub fn render_check_spec(
+        &self,
+        check: &'static dyn crate::health::DynHealthCheck,
+        spec: &serde_yaml::Value,
+        ctx: &HostContext,
+    ) -> crate::Result<serde_json::Value> {
+        let mut json = context::yaml_to_json(spec);
+        let schema = serde_json::to_value(check.schema()).unwrap_or_default();
+        crate::secrets::field::render_spec_strings(&mut json, &schema, &mut |s| {
+            self.templater.render_plain(s, ctx)
+        })?;
+        Ok(json)
+    }
+
     pub fn cx(&self, module: &str, source: Arc<dyn Source>, host: HostContext, mode: Mode) -> Cx {
         Cx {
             mode,
@@ -724,7 +741,7 @@ impl<'a> Planner<'a> {
                 },
                 resource: pt.key.clone(),
                 planned,
-                locks: pt.task.locks().iter().map(|l| l.to_string()).collect(),
+                locks: pt.task.locks_for(&pt.spec),
                 notifies: pt.decl.notify.clone(),
                 always_runs: pt.task.always_runs(&pt.spec),
                 removal: removal_policy(pt.decl.removal, prepared.removal, pt.task),
@@ -919,7 +936,12 @@ impl<'a> Planner<'a> {
             .iter()
             .flat_map(|p| p.desired_keys().cloned())
             .collect();
-        let (out, moved) = self.find_rehomes(state, &desired, exclude_modules);
+        let claims: HashMap<ResourceKey, Vec<String>> = prepared
+            .iter()
+            .flat_map(|p| p.tasks.iter())
+            .map(|t| (t.key.clone(), crate::task::spec_identities(&t.spec.json)))
+            .collect();
+        let (out, moved) = self.find_rehomes(state, &desired, &claims, exclude_modules);
         for (to, record) in moved {
             let record = Arc::new(record);
             for task in prepared.iter_mut().flat_map(|p| p.tasks.iter_mut()) {
@@ -937,6 +959,7 @@ impl<'a> Planner<'a> {
         &self,
         state: &State,
         desired: &[ResourceKey],
+        claims: &HashMap<ResourceKey, Vec<String>>,
         exclude_modules: &BTreeSet<String>,
     ) -> (Vec<Rehome>, Vec<(ResourceKey, ResourceRecord)>) {
         let desired_set: BTreeSet<&ResourceKey> = desired.iter().collect();
@@ -948,6 +971,7 @@ impl<'a> Planner<'a> {
                 .entry((key.kind.as_str(), key.key.as_str()))
                 .or_insert(key);
             let mut ids: Vec<String> = crate::task::key_identity(&key.key).into_iter().collect();
+            ids.extend(claims.get(key).cloned().unwrap_or_default());
             if let Some(record) = state.get(key) {
                 taken.insert(key);
                 ids.extend(record.identities());
@@ -992,7 +1016,8 @@ impl<'a> Planner<'a> {
                     kind: RehomeKind::Superseded,
                     summary: format!(
                         "superseded by {to}, which manages the same {}: forgotten without cleanup",
-                        id.replacen(':', " ", 1)
+                        id.replacen("line-text:", "line in ", 1)
+                            .replacen(':', " ", 1)
                     ),
                 });
             }
@@ -1014,7 +1039,7 @@ impl<'a> Planner<'a> {
             .map(|r| r.key.module.clone())
             .filter(|m| m != module)
             .collect();
-        let (rehomes, _) = self.find_rehomes(state, desired, &others);
+        let (rehomes, _) = self.find_rehomes(state, desired, &HashMap::new(), &others);
         let skip: BTreeSet<ResourceKey> = rehomes.into_iter().map(|r| r.from).collect();
         self.removals(state, desired, &others, &skip)
     }
@@ -1652,7 +1677,7 @@ pub(super) async fn dry_run(
         }
         for (index, decl) in module.config.health.iter().enumerate() {
             let check = crate::health::lookup(&decl.check.kind)?;
-            let json = context::render_value(&decl.check.spec, &planner.templater, &ctx).map_err(|e| {
+            let json = planner.render_check_spec(check, &decl.check.spec, &ctx).map_err(|e| {
                 crate::error::wrap_user(
                     e,
                     format!("Health check #{} of module '{}' has a field that could not be rendered.", index + 1, module.config.name),

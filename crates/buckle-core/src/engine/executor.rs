@@ -238,12 +238,13 @@ impl<'a> Executor<'a> {
                 content_digest: applied
                     .and_then(|a| a.content_digest.clone())
                     .or_else(|| existing.as_ref().and_then(|e| e.content_digest.clone())),
-                artefacts: match applied {
-                    Some(a) => a.artefacts.clone(),
-                    None => existing
-                        .as_ref()
-                        .map(|e| e.artefacts.clone())
-                        .unwrap_or_default(),
+                // An apply that changed nothing, or reported no artefacts,
+                // does not wipe what the resource is known to own.
+                artefacts: match (applied, existing.as_ref()) {
+                    (Some(a), _) if a.changed && !a.artefacts.is_empty() => a.artefacts.clone(),
+                    (_, Some(e)) if !e.artefacts.is_empty() => e.artefacts.clone(),
+                    (Some(a), _) => a.artefacts.clone(),
+                    (None, _) => Vec::new(),
                 },
                 removal: step.removal,
                 revision: revision.clone(),
@@ -379,7 +380,7 @@ impl<'a> Executor<'a> {
         if rh.planned.is_change() {
             let mut cx = rh.cx.clone();
             cx.mode = Mode::Apply;
-            let locks: Vec<String> = rh.task.locks().iter().map(|l| l.to_string()).collect();
+            let locks: Vec<String> = rh.task.locks_for(&rh.spec);
             let result = async {
                 let _guards = self.locks.acquire(&locks).await;
                 self.apply_with_retry(

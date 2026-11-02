@@ -193,6 +193,14 @@ pub trait Task: Send + Sync + 'static {
         Self::key(spec)
     }
 
+    /// The locks a particular spec needs; by default [`Task::LOCKS`]. A kind
+    /// can add spec-specific locks such as `file:/etc/hosts` so that two
+    /// tasks editing the same file serialise across modules.
+    fn locks(spec: &Self::Spec) -> Vec<String> {
+        let _ = spec;
+        Self::LOCKS.iter().map(|l| (*l).to_owned()).collect()
+    }
+
     /// Whether this task runs on every apply because it has no idempotency
     /// guard (a `command.run` without `creates`, `unless` or `changed_when`).
     /// Plans flag such steps so the author sees the smell.
@@ -313,12 +321,54 @@ pub enum Artefact {
         subsystem: String,
         id: String,
     },
+    /// A path that existed before Buckle touched it (Buckle manages only its
+    /// permissions): removal leaves it alone.
+    Adopted {
+        path: PathBuf,
+    },
     Other {
         description: String,
     },
 }
 
+/// The description prefix buckle-std uses for an [`Artefact::Other`] that
+/// marks an adopted path (before [`Artefact::Adopted`] existed).
+pub const ADOPTED_OTHER_PREFIX: &str = "adopted (existed before Buckle; permissions only): ";
+
 impl Artefact {
+    /// The adopted path, for [`Artefact::Adopted`] and for the legacy
+    /// [`Artefact::Other`] whose description starts with
+    /// [`ADOPTED_OTHER_PREFIX`]. Removal must leave such a path alone.
+    pub fn adopted_path(&self) -> Option<PathBuf> {
+        match self {
+            Artefact::Adopted { path } => Some(path.clone()),
+            Artefact::Other { description } => description
+                .strip_prefix(ADOPTED_OTHER_PREFIX)
+                .map(PathBuf::from),
+            _ => None,
+        }
+    }
+
+    /// The text of the line a `file.line`-style [`Artefact::Line`] added or
+    /// replaced, read from its JSON marker (`{"Added": {"line": …}}`), if any.
+    pub fn line_text(&self) -> Option<String> {
+        fn find(v: &serde_json::Value) -> Option<String> {
+            match v {
+                serde_json::Value::Object(map) => map
+                    .get("line")
+                    .and_then(|l| l.as_str().map(str::to_owned))
+                    .or_else(|| map.values().find_map(find)),
+                _ => None,
+            }
+        }
+        match self {
+            Artefact::Line { marker, .. } => {
+                serde_json::from_str(marker).ok().as_ref().and_then(find)
+            }
+            _ => None,
+        }
+    }
+
     /// A namespaced identity for overlap checks between resources
     /// (`path:/etc/x`, `package:apt:nomad`, `user:sierra`…), or `None` for
     /// [`Artefact::Other`].
@@ -336,9 +386,37 @@ impl Artefact {
                 format!("line:{}:{marker}", path.to_string_lossy())
             }
             Artefact::Rule { subsystem, id } => format!("rule:{subsystem}:{id}"),
-            Artefact::Other { .. } => return None,
+            Artefact::Adopted { path } => format!("path:{}", path.to_string_lossy()),
+            Artefact::Other { .. } => match self.adopted_path() {
+                Some(path) => format!("path:{}", path.to_string_lossy()),
+                None => return None,
+            },
         })
     }
+}
+
+/// Identities a desired spec claims from its fields: an absolute `path` or
+/// `dest` names a filesystem path, and a `path` with a `line` names that line
+/// in that file (so re-keying a `file.line` from its line to its regex is a
+/// take-over, not a removal that reverts the line just written).
+pub fn spec_identities(spec: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for field in ["path", "dest"] {
+        if let Some(id) = spec
+            .get(field)
+            .and_then(|v| v.as_str())
+            .and_then(key_identity)
+        {
+            out.push(id);
+        }
+    }
+    if let (Some(path), Some(line)) = (
+        spec.get("path").and_then(|v| v.as_str()),
+        spec.get("line").and_then(|v| v.as_str()),
+    ) {
+        out.push(format!("line-text:{path}:{line}"));
+    }
+    out
 }
 
 /// The identity a resource key implies on its own: an absolute path names a
@@ -383,6 +461,11 @@ pub trait DynTask: Send + Sync {
     fn parse(&self, raw: serde_json::Value) -> crate::Result<ErasedSpec>;
     fn key(&self, spec: &ErasedSpec) -> String;
     fn describe(&self, spec: &ErasedSpec) -> String;
+    /// See [`Task::locks`]. Defaults to [`DynTask::locks`].
+    fn locks_for(&self, spec: &ErasedSpec) -> Vec<String> {
+        let _ = spec;
+        self.locks().iter().map(|l| (*l).to_owned()).collect()
+    }
     /// See [`Task::always_runs`]. Defaults to `false`.
     fn always_runs(&self, spec: &ErasedSpec) -> bool {
         let _ = spec;
@@ -455,6 +538,11 @@ impl<T: Task> DynTask for T {
         spec.downcast::<T::Spec>()
             .map(T::always_runs)
             .unwrap_or(false)
+    }
+    fn locks_for(&self, spec: &ErasedSpec) -> Vec<String> {
+        spec.downcast::<T::Spec>()
+            .map(<T as Task>::locks)
+            .unwrap_or_else(|| T::LOCKS.iter().map(|l| (*l).to_owned()).collect())
     }
     async fn plan(&self, cx: &Cx, spec: &ErasedSpec) -> crate::Result<Planned> {
         let spec = spec
@@ -571,6 +659,84 @@ mod tests {
         }
     }
     crate::register_task!(Touch);
+
+    /// A kind that locks the file it edits.
+    struct Edit;
+
+    #[async_trait]
+    impl Task for Edit {
+        type Spec = TouchSpec;
+        const KIND: &'static str = "test.edit";
+        const LOCKS: &'static [&'static str] = &["edit"];
+        fn key(spec: &TouchSpec) -> String {
+            spec.path.clone()
+        }
+        fn locks(spec: &TouchSpec) -> Vec<String> {
+            vec!["edit".into(), format!("file:{}", spec.path)]
+        }
+        async fn plan(&self, _cx: &Cx, _spec: &TouchSpec) -> crate::Result<Planned> {
+            Ok(Planned::NoOp)
+        }
+        async fn apply(&self, _: &Cx, _: &TouchSpec, _: &Planned) -> crate::Result<Applied> {
+            Ok(Applied::unchanged("nothing"))
+        }
+    }
+    crate::register_task!(Edit);
+
+    #[test]
+    fn locks_may_depend_on_the_spec() {
+        let spec = serde_json::json!({"path": "/etc/hosts"});
+        let edit = lookup("test.edit").unwrap();
+        assert_eq!(
+            edit.locks_for(&edit.parse(spec.clone()).unwrap()),
+            vec!["edit", "file:/etc/hosts"]
+        );
+        let touch = lookup("test.touch").unwrap();
+        assert_eq!(touch.locks_for(&touch.parse(spec).unwrap()), vec!["fs"]);
+    }
+
+    #[test]
+    fn adopted_paths_are_recognised_in_both_shapes() {
+        assert_eq!(
+            Artefact::Adopted {
+                path: "/etc/x".into()
+            }
+            .adopted_path(),
+            Some(PathBuf::from("/etc/x"))
+        );
+        let legacy = Artefact::Other {
+            description: format!("{ADOPTED_OTHER_PREFIX}/etc/y"),
+        };
+        assert_eq!(legacy.adopted_path(), Some(PathBuf::from("/etc/y")));
+        assert_eq!(legacy.identity().as_deref(), Some("path:/etc/y"));
+        assert_eq!(
+            Artefact::Other {
+                description: "x".into()
+            }
+            .adopted_path(),
+            None
+        );
+        let json = serde_json::to_value(Artefact::Adopted { path: "/a".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "adopted", "path": "/a"}));
+    }
+
+    #[test]
+    fn line_artefacts_expose_their_line_text() {
+        let a = Artefact::Line {
+            path: "/etc/ssh/sshd_config".into(),
+            marker: r#"{"Replaced":{"line":"PasswordAuthentication no","original":"x"}}"#.into(),
+        };
+        assert_eq!(a.line_text().as_deref(), Some("PasswordAuthentication no"));
+        assert_eq!(
+            spec_identities(
+                &serde_json::json!({"path": "/etc/ssh/sshd_config", "line": "PasswordAuthentication no", "regex": "^P"})
+            ),
+            vec![
+                "path:/etc/ssh/sshd_config",
+                "line-text:/etc/ssh/sshd_config:PasswordAuthentication no"
+            ]
+        );
+    }
 
     #[test]
     fn registry_finds_registered_kinds_and_rejects_unknown_ones() {

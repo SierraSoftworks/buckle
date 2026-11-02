@@ -352,6 +352,106 @@ impl Task for TestCommand {
 
 crate::register_task!(TestCommand);
 
+/// A `file.line` stand-in whose key (like buckle-std's) became the regex
+/// when one is given, and that records the line it wrote.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+struct LineSpec {
+    path: String,
+    line: String,
+    #[serde(default)]
+    regex: Option<String>,
+}
+
+struct TestLine;
+
+#[async_trait]
+impl Task for TestLine {
+    type Spec = LineSpec;
+    const KIND: &'static str = "test.line";
+
+    fn key(spec: &LineSpec) -> String {
+        format!(
+            "{}: {}",
+            spec.path,
+            spec.regex.as_deref().unwrap_or(&spec.line)
+        )
+    }
+
+    async fn plan(&self, cx: &Cx, spec: &LineSpec) -> crate::Result<Planned> {
+        let text = cx
+            .system
+            .read(Path::new(&spec.path))
+            .await?
+            .unwrap_or_default();
+        Ok(
+            if String::from_utf8_lossy(&text)
+                .lines()
+                .any(|l| l == spec.line)
+            {
+                Planned::NoOp
+            } else {
+                Planned::change(Diff::Opaque {
+                    summary: format!("add `{}`", spec.line),
+                })
+            },
+        )
+    }
+
+    async fn apply(&self, cx: &Cx, spec: &LineSpec, _planned: &Planned) -> crate::Result<Applied> {
+        cx.system
+            .write_atomic(
+                Path::new(&spec.path),
+                format!("{}\n", spec.line).as_bytes(),
+                &FilePerms::mode(0o644),
+            )
+            .await?;
+        Ok(Applied::changed("added").with_artefact(Artefact::Line {
+            path: spec.path.clone().into(),
+            marker: serde_json::json!({"Added": {"line": spec.line, "created": false}}).to_string(),
+        }))
+    }
+
+    async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> crate::Result<Applied> {
+        self::record("removals", format!("revert {}", record.key));
+        cx.system
+            .write_atomic(
+                Path::new("/lines/reverted"),
+                b"yes",
+                &FilePerms::mode(0o644),
+            )
+            .await?;
+        Ok(Applied::changed("reverted"))
+    }
+}
+
+crate::register_task!(TestLine);
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct HeaderSpec {
+    token: crate::secrets::SecretField,
+}
+
+/// A check with a secret-capable field, like the http check's headers.
+struct SecretHeaderCheck;
+
+#[async_trait]
+impl crate::health::HealthCheck for SecretHeaderCheck {
+    type Spec = HeaderSpec;
+    const KIND: &'static str = "test.secret_header";
+
+    async fn check(&self, cx: &Cx, spec: &HeaderSpec) -> crate::health::HealthStatus {
+        match spec.token.resolve(&cx.templater, &cx.host) {
+            Ok(_) if spec.token.references_secrets() => crate::health::HealthStatus::Pass,
+            Ok(_) => {
+                crate::health::HealthStatus::fail("the field was rendered before the check saw it")
+            }
+            Err(e) => crate::health::HealthStatus::unknown(e.description()),
+        }
+    }
+}
+
+crate::register_health!(SecretHeaderCheck);
+
 /// A systemd-shaped handler kind: `name` is the unit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 struct UnitSpec {
@@ -2862,6 +2962,102 @@ async fn without_a_stable_revision_a_failing_module_stays_failed() {
     assert!(outcome.rolled_back_modules.is_empty());
     assert_eq!(status_of(&outcome, "c"), ModuleStatus::NotStarted);
     assert!(!sys.exists("/rb/rb2/b"));
+}
+
+#[tokio::test]
+async fn rekeying_a_line_edit_from_its_line_to_its_regex_does_not_revert_it() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: ssh\ntasks: [ { test.line: { path: /lines/sshd, line: 'PasswordAuthentication no' } } ]\n",
+        )],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+    let r2 = revision(
+        "r2",
+        FLEET,
+        vec![module(
+            "name: ssh\ntasks: [ { test.line: { path: /lines/sshd, line: 'PasswordAuthentication no', regex: '^#?PasswordAuthentication' } } ]\n",
+        )],
+    );
+    let inputs = inputs_with_store(r2, &sys, store.clone());
+    let plan = plan(&inputs).await;
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    assert_eq!(plan.rehomed.len(), 1, "{plan:#?}");
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded);
+    assert!(!sys.exists("/lines/reverted"));
+    let keys: Vec<String> = store.load().unwrap().resources.keys().cloned().collect();
+    assert_eq!(
+        keys,
+        vec!["ssh/test.line[/lines/sshd: ^#?PasswordAuthentication]"]
+    );
+}
+
+#[tokio::test]
+async fn an_apply_that_changes_nothing_keeps_the_artefacts_already_recorded() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /own/a, content: one } } ]\n",
+        )],
+    );
+    apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    let r2 = revision(
+        "r2",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /own/a, content: two, unchanged: true } } ]\n",
+        )],
+    );
+    let (outcome, _) = apply(&inputs_with_store(r2, &sys, store.clone())).await;
+    assert!(outcome.succeeded);
+    let record = store
+        .load()
+        .unwrap()
+        .get(&ResourceKey::new("m", "test.file", "/own/a"))
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        record.artefacts,
+        vec![Artefact::File {
+            path: "/own/a".into()
+        }]
+    );
+    assert_eq!(
+        record.shadow.as_ref().map(|s| s.get().as_str()),
+        Some("one")
+    );
+}
+
+#[tokio::test]
+async fn health_check_fields_marked_secret_keep_their_template_for_the_check() {
+    let rev = revision(
+        "r1",
+        "version: 2\nsecrets: { api_token: { env: API_TOKEN } }\n",
+        vec![module(
+            "name: m\nhealth:\n  - name: api\n    test.secret_header: { token: 'Bearer {{ secrets.api_token }}' }\n",
+        )],
+    );
+    let mut inputs = inputs(rev, &FakeSystem::new());
+    let mut secrets = SecretStore::new();
+    secrets.insert(Secret::new(
+        "api_token",
+        "hunter2-health".into(),
+        &InstallKey::from_bytes([3; 32]),
+    ));
+    inputs.secrets = Arc::new(secrets);
+    let report = Engine::health(&inputs, crate::health::HealthScope::Manual, None)
+        .await
+        .unwrap();
+    assert!(report.results[0].status.is_pass(), "{report:#?}");
 }
 
 // ---------------------------------------------------------------------------
