@@ -54,6 +54,10 @@ struct Env {
 }
 
 async fn env(web_config: WebConfig) -> Env {
+    env_with(web_config, |_| {}).await
+}
+
+async fn env_with(web_config: WebConfig, adjust: impl FnOnce(&mut AppState)) -> Env {
     let data = tempfile::tempdir().unwrap();
     let store = Store::in_memory().await.unwrap();
     let revisions = Arc::new(RevisionCache::new(data.path()));
@@ -73,7 +77,7 @@ async fn env(web_config: WebConfig) -> Env {
     )
     .await
     .unwrap();
-    let state = web::Data::new(AppState::new(
+    let mut state = AppState::new(
         store.clone(),
         revisions,
         controller,
@@ -82,7 +86,9 @@ async fn env(web_config: WebConfig) -> Env {
         Some("hook-secret".into()),
         Some(Arc::new(Notify::new())),
         "2.0.0-test".into(),
-    ));
+    );
+    adjust(&mut state);
+    let state = web::Data::new(state);
     Env {
         _data: data,
         store,
@@ -878,4 +884,172 @@ async fn every_protected_route_is_401_without_a_session() {
         let resp = test::call_service(&app, req.uri(uri).to_request()).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{m} {uri}");
     }
+}
+
+// ------------------------------------------------------------ hardening
+
+#[actix_web::test]
+async fn path_acls_see_the_decoded_path_and_ambiguous_paths_are_refused() {
+    let e = env(WebConfig {
+        user_acl: acl(r#"path != "/api/v1/fleet""#),
+        ..Default::default()
+    })
+    .await;
+    let app = test::init_service(app(e.state.clone())).await;
+    for (uri, expected) in [
+        ("/api/v1/fleet", StatusCode::FORBIDDEN),
+        ("/api/v1/fl%65et", StatusCode::FORBIDDEN),
+        ("/api/v1/hosts", StatusCode::OK),
+        ("/api/v1/hosts%2Fpi-1", StatusCode::BAD_REQUEST),
+        ("/api/v1/auth/%2e%2e/fleet", StatusCode::BAD_REQUEST),
+        ("/%61pi/v1/fleet", StatusCode::FORBIDDEN),
+    ] {
+        let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        assert_eq!(resp.status(), expected, "{uri}");
+    }
+}
+
+#[actix_web::test]
+async fn signing_out_revokes_the_session_and_ends_its_event_stream() {
+    let idp = idp().await;
+    let e = env_with(oidc_web(&idp), |s| {
+        s.sse_recheck = std::time::Duration::from_millis(100);
+    })
+    .await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let session = Cookie::new(
+        auth::SESSION_COOKIE,
+        mint(&PROVIDER, &idp.server.uri(), None, &[]),
+    );
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/events")
+            .cookie(session.clone())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().boxed();
+    assert!(next_chunk(&mut body).await.contains("connected"));
+
+    let (csrf_cookie, token) = csrf(&app).await;
+    let out = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/auth/logout")
+            .cookie(session.clone())
+            .cookie(csrf_cookie)
+            .insert_header((auth::CSRF_HEADER, token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(out.status(), StatusCode::NO_CONTENT);
+
+    let again = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/fleet")
+            .cookie(session)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        again.status(),
+        StatusCode::UNAUTHORIZED,
+        "a copy of the cookie no longer works"
+    );
+
+    let mut said_why = false;
+    let mut closed = false;
+    for _ in 0..20 {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| Pin::new(&mut body).poll_next(cx)),
+        )
+        .await
+        .expect("the stream moves");
+        match next {
+            None => {
+                closed = true;
+                break;
+            }
+            Some(chunk) => {
+                said_why |= String::from_utf8_lossy(&chunk.unwrap()).contains("session_ended");
+            }
+        }
+    }
+    assert!(said_why, "the stream says why it ends");
+    assert!(closed, "and then ends");
+}
+
+#[actix_web::test]
+async fn unknown_key_ids_refetch_the_key_set_at_most_once_a_minute() {
+    let idp = idp().await;
+    let client = super::oidc::OidcClient::new(oidc_web(&idp).oidc.unwrap());
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("nobody-knows-me".into());
+    let now = chrono::Utc::now().timestamp();
+    let forged = jsonwebtoken::encode(
+        &header,
+        &serde_json::json!({"iss": idp.server.uri(), "aud": CLIENT_ID, "sub": "x", "exp": now + 60}),
+        &jsonwebtoken::EncodingKey::from_rsa_der(&FORGER.der),
+    )
+    .unwrap();
+    for _ in 0..5 {
+        assert!(client.validate(&forged, None).await.is_err());
+    }
+    let fetches = idp
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/jwks")
+        .count();
+    assert_eq!(fetches, 2, "the initial fetch and one forced refetch");
+}
+
+#[actix_web::test]
+async fn a_discovery_document_for_another_issuer_is_refused() {
+    let idp = idp().await;
+    let mut config = oidc_web(&idp).oidc.unwrap();
+    config.endpoint = format!("{}/", idp.server.uri());
+    let tolerant = super::oidc::OidcClient::new(config);
+    assert!(
+        tolerant.discovery().await.is_ok(),
+        "a trailing slash is the same issuer"
+    );
+
+    let other = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": "https://evil.example",
+            "authorization_endpoint": format!("{}/authorize", other.uri()),
+            "token_endpoint": format!("{}/token", other.uri()),
+            "jwks_uri": format!("{}/jwks", other.uri()),
+        })))
+        .mount(&other)
+        .await;
+    let mut config = oidc_web(&idp).oidc.unwrap();
+    config.endpoint = other.uri();
+    let err = super::oidc::OidcClient::new(config)
+        .discovery()
+        .await
+        .unwrap_err();
+    assert!(
+        err.description().contains("issuer"),
+        "{}",
+        err.description()
+    );
+}
+
+#[actix_web::test]
+async fn an_empty_webhook_secret_verifies_nothing() {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"").unwrap();
+    mac.update(b"body");
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    assert!(!crate::source::verify_webhook_signature("", b"body", &sig));
 }

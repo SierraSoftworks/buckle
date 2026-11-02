@@ -219,6 +219,10 @@ fn io_error(e: std::io::Error) -> buckle_core::Error {
 /// Verifies a GitHub-style `X-Hub-Signature-256: sha256=<hex>` header over
 /// `body` in constant time.
 pub fn verify_webhook_signature(secret: &str, body: &[u8], header: &str) -> bool {
+    // An empty key would make every signature computable by anyone.
+    if secret.is_empty() {
+        return false;
+    }
     let Some(hex_sig) = header.trim().strip_prefix("sha256=") else {
         return false;
     };

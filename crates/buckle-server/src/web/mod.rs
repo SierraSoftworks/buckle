@@ -33,6 +33,8 @@ pub struct AppState {
     pub web: WebConfig,
     pub oidc: Option<Arc<oidc::OidcClient>>,
     pub pending: auth::PendingAuths,
+    /// Sessions signed out before their token expired.
+    pub revoked: auth::RevokedSessions,
     pub limiter: auth::RateLimiter,
     pub webhook_secret: Option<String>,
     pub source_trigger: Option<Arc<Notify>>,
@@ -42,6 +44,8 @@ pub struct AppState {
     pub server_version: String,
     /// Live agent sessions, so forgetting a host closes its stream.
     pub agent_sessions: Arc<crate::grpc::LiveSessions>,
+    /// How often an event stream re-checks the session it was opened with.
+    pub sse_recheck: std::time::Duration,
 }
 
 impl std::fmt::Debug for AppState {
@@ -75,6 +79,7 @@ impl AppState {
             events,
             web,
             pending: auth::PendingAuths::default(),
+            revoked: auth::RevokedSessions::default(),
             limiter: auth::RateLimiter::new(30, std::time::Duration::from_secs(60)),
             webhook_secret,
             source_trigger,
@@ -82,6 +87,7 @@ impl AppState {
             secure_cookies,
             server_version,
             agent_sessions: Default::default(),
+            sse_recheck: std::time::Duration::from_secs(30),
         }
     }
 

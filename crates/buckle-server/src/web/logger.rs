@@ -16,16 +16,28 @@ const REDACTED_PARAMS: &[&str] = &[
     "session_state",
 ];
 
+/// Whether a raw (still percent-encoded) query key names a sensitive
+/// parameter. The key is decoded first, so `%63ode` is `code`.
+fn sensitive(raw_key: &str) -> bool {
+    let key: String = url::form_urlencoded::parse(raw_key.as_bytes())
+        .next()
+        .map(|(k, _)| k.into_owned())
+        .unwrap_or_default();
+    REDACTED_PARAMS.contains(&key.trim().to_ascii_lowercase().as_str())
+}
+
 /// The query string with sensitive parameters masked.
 pub fn redact_query(query: &str) -> String {
     query
         .split('&')
         .filter(|p| !p.is_empty())
-        .map(|pair| match pair.split_once('=') {
-            Some((k, _)) if REDACTED_PARAMS.contains(&k.to_ascii_lowercase().as_str()) => {
-                format!("{k}=REDACTED")
+        .map(|pair| {
+            let key = pair.split_once('=').map_or(pair, |(k, _)| k);
+            if sensitive(key) {
+                format!("{key}=REDACTED")
+            } else {
+                pair.to_owned()
             }
-            _ => pair.to_owned(),
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -61,6 +73,9 @@ mod tests {
         "code=REDACTED&state=REDACTED&return_to=/x"
     )]
     #[case("token=t", "token=REDACTED")]
+    #[case("%63ode=abc&st%61te=xyz", "%63ode=REDACTED&st%61te=REDACTED")]
+    #[case("ID_TOKEN=t", "ID_TOKEN=REDACTED")]
+    #[case("refresh%5Ftoken=t", "refresh%5Ftoken=REDACTED")]
     #[case("limit=10", "limit=10")]
     #[case("", "")]
     fn sensitive_query_parameters_are_masked(#[case] raw: &str, #[case] expected: &str) {

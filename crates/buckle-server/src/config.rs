@@ -60,13 +60,20 @@ impl ServerConfig {
     }
 
     pub fn validate(&self) -> buckle_core::Result<()> {
-        if self.web.oidc.is_none() && self.web.user_acl.is_none() {
-            // Allowed: local development with no auth. Nothing to check.
-        }
-        if let Some(oidc) = &self.web.oidc
-            && self.web.base_url.is_none()
+        if let Some(git) = &self.source.git
+            && git
+                .webhook_secret
+                .as_deref()
+                .is_some_and(|s| s.trim().is_empty())
         {
-            let _ = oidc;
+            return Err(buckle_core::error::user(
+                "`source.git.webhook_secret` is empty, so anyone could sign webhook calls.",
+                &[
+                    "Set it to a long random value (and the same in the webhook), or remove it to disable the webhook.",
+                ],
+            ));
+        }
+        if self.web.oidc.is_some() && self.web.base_url.is_none() {
             return Err(buckle_core::error::user(
                 "`web.base_url` is required when OIDC is configured, so the callback URL can be built.",
                 &[
@@ -396,8 +403,17 @@ pub enum Registration {
 pub struct WebConfig {
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Take the client address (for `client_ip` in ACLs and sign-in rate
+    /// limits) from `X-Forwarded-For`, as written by `trusted_proxy_hops`
+    /// reverse proxies in front of the server.
     #[serde(default)]
     pub trust_proxy: bool,
+    /// How many reverse proxies in front of the server append to
+    /// `X-Forwarded-For` (default 1). The client address is the entry that
+    /// many places from the right; entries further left are whatever the
+    /// client sent and are never trusted.
+    #[serde(default)]
+    pub trusted_proxy_hops: Option<u32>,
     /// Who may read. Absent means everyone the OIDC provider authenticates (or everyone, without OIDC).
     #[serde(default)]
     pub user_acl: Option<filt_rs::Filter>,
@@ -669,6 +685,16 @@ secrets:
             cfg.secrets.providers.env.as_ref().unwrap().deny,
             vec!["AWS_*".to_string()]
         );
+    }
+
+    #[test]
+    fn an_empty_webhook_secret_is_refused() {
+        let yaml = EXAMPLE.replace(
+            "    poll: 30s\n",
+            "    poll: 30s\n    webhook_secret: \"\"\n",
+        );
+        let err = with_env(&yaml).unwrap_err();
+        assert!(err.description().contains("webhook_secret"));
     }
 
     #[test]
