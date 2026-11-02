@@ -1,0 +1,39 @@
+[package]
+name = "buckle-agent"
+description = "The long-running Buckle agent: connects to a server or watches a directory, plans, applies, checks health and reports."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+buckle-core.workspace = true
+buckle-proto.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+human-errors.workspace = true
+indexmap.workspace = true
+humantime-serde.workspace = true
+notify.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+buckle-core = { workspace = true, features = ["testing"] }
+pretty_assertions.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

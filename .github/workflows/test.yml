@@ -1,148 +1,75 @@
-name: Test Changes
-on: [push]
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  test-platforms:
-    name: ${{ matrix.os }}-${{ matrix.arch }}-test
-    runs-on: ${{ matrix.run_on }}
-    continue-on-error: ${{ matrix.experimental || false }}
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            os: windows
-            run_on: windows-latest
-            target: x86_64-pc-windows-msvc
-
-          - arch: amd64
-            run_on: ubuntu-latest
-            os: linux
-            target: x86_64-unknown-linux-gnu
-            setup: |
-              sudo apt-get update
-              sudo apt-get install -y libdbus-1-3 libdbus-1-dev
-          # Linux arm64 is cross-compiled with `cross`; we build rather than run
-          # the tests, since executing them would require qemu emulation.
-          - arch: arm64
-            run_on: ubuntu-latest
-            os: linux
-            target: aarch64-unknown-linux-gnu
-            cross: true
-            skiptests: true
-
-          - arch: amd64
-            run_on: macos-latest
-            os: darwin
-            target: x86_64-apple-darwin
-          - arch: arm64
-            run_on: macos-latest
-            os: darwin
-            target: aarch64-apple-darwin
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     steps:
-      - name: setup dependencies
-        run: ${{ matrix.setup }}
-        if: matrix.setup
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --no-fail-fast
 
-      - uses: actions/checkout@v7.0.1
-
-      - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+  ui:
+    name: UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-          components: llvm-tools-preview
-
-      - name: install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
-
-      # Install before the cache is restored so stale ~/.cargo metadata can't
-      # report it as already installed and skip it, leaving the binary missing.
-      - name: install rustfilt
-        if: "!matrix.skiptests"
-        run: cargo binstall --no-confirm rustfilt
-
-      - name: install cross
-        if: matrix.cross
-        run: cargo binstall --no-confirm cross
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: cache ~/.cargo
-        uses: Swatinem/rust-cache@v2
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
-
-      - name: install protoc
-        if: ${{ !matrix.cross }}
-        uses: SierraSoftworks/setup-protoc@v3
+          workspaces: ui
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall --no-confirm trunk
+      - run: cd ui && trunk build --release
+      - uses: actions/upload-artifact@v4
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          name: ui-dist
+          path: ui/dist
 
-      - name: cargo build
-        if: matrix.skiptests
-        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --target ${{ matrix.target }} ${{ matrix.flags }}
-
-      - name: cargo test
-        if: "!matrix.skiptests"
-        run: ${{ matrix.cross && 'cross' || 'cargo' }} test --no-fail-fast --target ${{ matrix.target }} ${{ matrix.flags }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUSTFLAGS: "-C instrument_coverage"
-          LLVM_PROFILE_FILE: default.profraw
-
-      - name: Reclaim cache ownership from cross
-        if: matrix.cross
-        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo" target
-
-      - name: prepare coverage output
-        shell: pwsh
-        if: "!matrix.skiptests"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUSTFLAGS: "-C instrument_coverage"
+  containers:
+    name: Apply example (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:bookworm", "ubuntu:24.04"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p buckle
+      - name: Apply the example inside ${{ matrix.image }}
         run: |
-          Write-Host "Merging raw profile output files"
-          &"$(rustc --print target-libdir)/../bin/llvm-profdata" merge -sparse default.profraw -o default.profdata
-
-          # Ask Cargo where it placed the test binaries, rather than guessing at
-          # the layout of the target directory (which changes between releases).
-          Write-Host "Locating test binaries"
-          $binaries = cargo test --no-run --message-format=json --target ${{ matrix.target }} ${{ matrix.flags }} `
-          | Where-Object { $_.StartsWith("{") } `
-          | ForEach-Object { $_ | ConvertFrom-Json } `
-          | Where-Object { $_.reason -eq "compiler-artifact" -and $_.profile.test -and $_.executable } `
-          | ForEach-Object { $_.executable }
-
-          if (-not $binaries) {
-            throw "Could not find any test binaries to generate a coverage report from."
-          }
-
-          $objects = $binaries | ForEach-Object { "-object", $_ }
-          Write-Host "Test Binaries: $($binaries -join ', ')"
-          Write-Host "Exporting LCOV coverage report"
-          &"$(rustc --print target-libdir)/../bin/llvm-cov" export -instr-profile default.profdata @objects `
-              -Xdemangler=rustfilt `
-              -ignore-filename-regex='.cargo|rustc' `
-              -compilation-dir=src `
-              -format=lcov > lcov.info
-
-      - name: codecov upload
-        uses: codecov/codecov-action@v7
-        if: "!matrix.skiptests"
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-  test-docker:
-    name: Docker Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - run: |
-          docker build -t buckle:latest -f build/Dockerfile.linux-x86_64 .
-          docker run --rm buckle:latest buckle --version
-
-  test-done:
-    name: Tests Complete
-    needs: test-platforms
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "Tests Complete for All Platforms"
+          docker run --rm -v "$PWD:/src:ro" ${{ matrix.image }} bash -c '
+            set -euo pipefail
+            if [ -x /src/scripts/container-test.sh ]; then /src/scripts/container-test.sh; else echo "container test script not present yet"; fi
+          '

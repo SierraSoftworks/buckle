@@ -1,0 +1,53 @@
+[package]
+name = "buckle-core"
+description = "Buckle's configuration model, planner, executor and the traits that tasks, fact providers and health checks implement."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+## In-memory `System` fake and fixture helpers for tests in other crates.
+testing = []
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+ciborium.workspace = true
+filt-rs.workspace = true
+futures.workspace = true
+hex.workspace = true
+hmac.workspace = true
+human-errors.workspace = true
+humantime-serde.workspace = true
+indexmap.workspace = true
+inventory.workspace = true
+minijinja.workspace = true
+rand.workspace = true
+regex.workspace = true
+schemars.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+unicase.workspace = true
+url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true

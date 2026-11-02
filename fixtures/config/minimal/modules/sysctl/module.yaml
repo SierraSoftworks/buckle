@@ -1,0 +1,5 @@
+name: sysctl
+when: 'host.facts.os.family == "debian"'
+needs: [motd]
+tasks:
+  - sysctl.param: { name: vm.swappiness, value: '{{ vars.swappiness }}' }

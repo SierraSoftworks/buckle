@@ -1,0 +1,33 @@
+// Buckle UI theme. Lane 9 (UI) owns this file; the token names below are the
+// contract the components use. Dark first, with a light theme through the same
+// custom properties, in the mould of the analytics UI.
+:root {
+  --bg: #0f141a;
+  --surface: #161c24;
+  --surface-2: #1e2630;
+  --fg: #e4e9ef;
+  --fg-2: #98a4b3;
+  --line: #2c3642;
+  --brand: #d9a24a;
+  --ok: #4cbf7f;
+  --warn: #e0a93a;
+  --danger: #ef6b63;
+  --info: #7aaef0;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg: #f2f4f7;
+  --surface: #ffffff;
+  --surface-2: #e9edf2;
+  --fg: #141a22;
+  --fg-2: #5a6675;
+  --line: #cfd6df;
+  --brand: #9a6a1f;
+  color-scheme: light;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}

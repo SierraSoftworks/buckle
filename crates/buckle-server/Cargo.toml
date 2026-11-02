@@ -1,0 +1,51 @@
+[package]
+name = "buckle-server"
+description = "The Buckle server: watches Git, builds revisions, orchestrates phased rollouts and serves the API and UI."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+buckle-core.workspace = true
+buckle-proto.workspace = true
+buckle-api.workspace = true
+actix-web.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+filt-rs.workspace = true
+futures.workspace = true
+gix.workspace = true
+hex.workspace = true
+hmac.workspace = true
+human-errors.workspace = true
+indexmap.workspace = true
+humantime-serde.workspace = true
+include_dir.workspace = true
+jsonwebtoken.workspace = true
+notify.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+buckle-core = { workspace = true, features = ["testing"] }
+pretty_assertions.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+wiremock.workspace = true

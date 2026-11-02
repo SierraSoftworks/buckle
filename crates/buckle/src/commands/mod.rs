@@ -1,0 +1,166 @@
+//! The command-line interface. Each subcommand delegates to a library crate;
+//! this crate only parses arguments and wires dependencies together.
+
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+pub mod agent;
+pub mod catalog;
+pub mod install;
+pub mod local;
+pub mod server;
+
+/// Lightweight fleet configuration with phased, health-gated rollouts.
+#[derive(Parser, Debug)]
+#[command(name = "buckle", version = crate::telemetry::version(), about, long_about = None, propagate_version = true)]
+pub struct Cli {
+    /// OpenTelemetry OTLP endpoint for traces and metrics.
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT", global = true)]
+    pub otel_endpoint: Option<String>,
+
+    /// Also write spans and logs to stdout.
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Show what applying a configuration directory would change on this host.
+    Plan(local::PlanArgs),
+    /// Apply a configuration directory to this host.
+    Apply(local::ApplyArgs),
+    /// Run the health checks of the modules applied to this host.
+    Health(local::HealthArgs),
+    /// Print the facts collected about this host as JSON.
+    Facts(local::FactsArgs),
+    /// Validate a configuration directory without touching the host.
+    Validate(local::ValidateArgs),
+    /// Run the long-lived agent.
+    Agent(agent::AgentArgs),
+    /// Run the fleet server.
+    Server(server::ServerArgs),
+    /// Install Buckle as a service on this host.
+    Install(install::InstallArgs),
+    /// List the task kinds, fact providers and health checks built into this binary.
+    Catalog(catalog::CatalogArgs),
+    /// Update this binary to the latest release.
+    Update(UpdateArgs),
+    /// Convert a Buckle 1.x package directory into a v2 module tree.
+    Migrate(MigrateArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct UpdateArgs {
+    /// Install this release instead of the latest one.
+    #[arg(long = "to", value_name = "VERSION")]
+    pub to_version: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct MigrateArgs {
+    /// The Buckle 1.x configuration directory.
+    #[arg(long, value_name = "DIR")]
+    pub from: PathBuf,
+    /// Where to write the v2 configuration.
+    #[arg(long, value_name = "DIR")]
+    pub to: PathBuf,
+}
+
+pub async fn run(cli: Cli) -> buckle_core::Result<i32> {
+    match cli.command {
+        Command::Plan(args) => local::plan(args).await,
+        Command::Apply(args) => local::apply(args).await,
+        Command::Health(args) => local::health(args).await,
+        Command::Facts(args) => local::facts(args).await,
+        Command::Validate(args) => local::validate(args).await,
+        Command::Agent(args) => agent::run(args).await,
+        Command::Server(args) => server::run(args).await,
+        Command::Install(args) => install::run(args).await,
+        Command::Catalog(args) => catalog::run(args),
+        Command::Update(_) => Err(not_yet("buckle update")),
+        Command::Migrate(_) => Err(not_yet("buckle migrate")),
+    }
+}
+
+fn not_yet(what: &str) -> buckle_core::Error {
+    buckle_core::error::system(
+        format!("{what} is not implemented yet."),
+        &["This part of Buckle is still being built."],
+    )
+}
+
+/// A cancellation token that trips on SIGINT or SIGTERM.
+pub fn shutdown_token() -> tokio_util::sync::CancellationToken {
+    let token = tokio_util::sync::CancellationToken::new();
+    let trip = token.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = term.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ctrl_c.await;
+        }
+        tracing::warn!("shutdown requested");
+        trip.cancel();
+    });
+    token
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn subcommands_parse_their_documented_flags() {
+        let cli = Cli::parse_from([
+            "buckle",
+            "plan",
+            "--config",
+            "/srv/cfg",
+            "--labels",
+            "role=worker,site=home",
+            "--output",
+            "json",
+        ]);
+        match cli.command {
+            Command::Plan(args) => {
+                assert_eq!(args.config, PathBuf::from("/srv/cfg"));
+                assert_eq!(args.labels.get("site").map(String::as_str), Some("home"));
+                assert_eq!(args.output, local::OutputFormat::Json);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let cli = Cli::parse_from(["buckle", "agent", "--config", "/etc/buckle/agent.yaml"]);
+        assert!(matches!(cli.command, Command::Agent(_)));
+        let cli = Cli::parse_from([
+            "buckle",
+            "install",
+            "agent",
+            "--server",
+            "https://b:7700",
+            "--token",
+            "t",
+            "--label",
+            "role=worker",
+        ]);
+        assert!(matches!(cli.command, Command::Install(_)));
+    }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "buckle-api"
+description = "Framework-free data transfer types for Buckle's HTTP API, shared by the server and the WebAssembly UI."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

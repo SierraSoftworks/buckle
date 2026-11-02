@@ -1,0 +1,281 @@
+syntax = "proto3";
+
+package buckle.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// The fleet protocol between Buckle agents and the Buckle server.
+//
+// One long-lived bidirectional Session stream per agent carries control and
+// reporting messages; bulk content (revision trees, large blobs) is fetched
+// through separate server-streaming calls so it never blocks the session.
+service Fleet {
+  // The long-lived session. The agent speaks first with Hello.
+  rpc Session(stream AgentMessage) returns (stream ServerMessage);
+
+  // The tarball (gzip) of a revision's modules/, vars/ and buckle.yaml.
+  rpc FetchRevision(FetchRevisionRequest) returns (stream Chunk);
+
+  // A single large file by content digest.
+  rpc FetchBlob(FetchBlobRequest) returns (stream Chunk);
+
+  // Secrets the host needs for modules it selected after its facts changed.
+  rpc FetchSecrets(FetchSecretsRequest) returns (SecretBundle);
+}
+
+// ---------------------------------------------------------------- agent → server
+
+message AgentMessage {
+  oneof msg {
+    Hello hello = 1;
+    Facts facts = 2;
+    Heartbeat heartbeat = 3;
+    PlanResult plan = 4;
+    ApplyEvent apply = 5;
+    ApplyResult result = 6;
+    HealthReport health = 7;
+    Drift drift = 8;
+    LocalRollback rollback = 9;
+  }
+}
+
+message Hello {
+  string host_id = 1;
+  string agent_version = 2;
+  // Seed labels from agent.yaml; server labels override them.
+  map<string, string> labels = 3;
+  // Revision currently applied, if any.
+  string applied_revision = 4;
+  // Digest of the last plan the agent produced, if any.
+  string last_plan_digest = 5;
+  // Per-host token issued at enrolment, or the bootstrap token on first contact.
+  string token = 6;
+  // Operating system and architecture, for the UI before facts arrive.
+  string platform = 7;
+  string arch = 8;
+  bool bootstrap = 9;
+}
+
+message Facts {
+  // The facts document as JSON.
+  bytes json = 1;
+  google.protobuf.Timestamp collected_at = 2;
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp at = 1;
+  // Liveness only; health travels in HealthReport.
+  string applied_revision = 2;
+  bool busy = 3;
+}
+
+message PlanResult {
+  string revision = 1;
+  string digest = 2;
+  // The redacted plan as JSON (buckle_core::plan::Plan).
+  bytes plan_json = 3;
+  uint32 changes = 4;
+  uint32 removals = 5;
+  bool destructive = 6;
+  repeated string deferred_modules = 7;
+  // Set when planning itself failed.
+  string error = 8;
+}
+
+message ApplyEvent {
+  string revision = 1;
+  string plan_digest = 2;
+  google.protobuf.Timestamp at = 3;
+  // buckle_core::engine::ApplyEvent as JSON.
+  bytes event_json = 4;
+}
+
+message ApplyResult {
+  string revision = 1;
+  string plan_digest = 2;
+  bool succeeded = 3;
+  google.protobuf.Duration duration = 4;
+  uint32 changes = 5;
+  uint32 removals = 6;
+  string applied_revision = 7;
+  string failed_module = 8;
+  repeated string rolled_back_modules = 9;
+  repeated string not_started_modules = 10;
+  string error = 11;
+  // buckle_core::engine::ApplyOutcome as JSON, for the full module breakdown.
+  bytes outcome_json = 12;
+  // Checks that failed (module/check), for the operator's continue decision.
+  repeated string failed_checks = 13;
+}
+
+enum HealthScope {
+  HEALTH_SCOPE_UNSPECIFIED = 0;
+  HEALTH_SCOPE_BASELINE = 1;
+  HEALTH_SCOPE_BAKE = 2;
+  HEALTH_SCOPE_ROLLOUT = 3;
+  HEALTH_SCOPE_DRIFT = 4;
+  HEALTH_SCOPE_MANUAL = 5;
+}
+
+message HealthResult {
+  string module = 1;
+  string check = 2;
+  string kind = 3;
+  bool required = 4;
+  bool passed = 5;
+  // Set when the check could not run (unknown) rather than failed.
+  bool unknown = 6;
+  string reason = 7;
+  google.protobuf.Timestamp at = 8;
+  uint32 duration_ms = 9;
+}
+
+message HealthReport {
+  HealthScope scope = 1;
+  // Which RunHealth request this answers, when any.
+  string request_id = 2;
+  string revision = 3;
+  repeated HealthResult results = 4;
+}
+
+message Drift {
+  string revision = 1;
+  // Non-empty plan digest and summary when something changed under us.
+  string plan_digest = 2;
+  uint32 changes = 3;
+  uint32 removals = 4;
+  bool corrected = 5;
+  bytes plan_json = 6;
+}
+
+message LocalRollback {
+  string from_revision = 1;
+  string to_revision = 2;
+  string reason = 3;
+  google.protobuf.Timestamp at = 4;
+  // Modules re-applied, or empty for a whole-revision rollback.
+  repeated string modules = 5;
+  repeated HealthResult evidence = 6;
+}
+
+// ---------------------------------------------------------------- server → agent
+
+message ServerMessage {
+  oneof msg {
+    Welcome welcome = 1;
+    Assign assign = 2;
+    RequestPlan plan = 3;
+    Apply apply = 4;
+    Rollback rollback = 5;
+    RunHealth health = 6;
+    Ping ping = 7;
+    Upgrade upgrade = 8;
+    Rejected rejected = 9;
+  }
+}
+
+message Welcome {
+  string server_version = 1;
+  string session_id = 2;
+  // The fleet's current stable revision; the agent caches it for local rollback.
+  string stable_revision = 3;
+  // Per-host token to persist (set on enrolment or rotation).
+  string issued_token = 4;
+  // Effective labels after server overrides.
+  map<string, string> labels = 5;
+  // Host status as the server sees it: pending, active, paused.
+  string status = 6;
+  SecretBundle secrets = 7;
+}
+
+message Assign {
+  string revision = 1;
+  bool stable = 2;
+  SecretBundle secrets = 3;
+  // Digest of the revision tarball, for cache validation.
+  string tree_digest = 4;
+}
+
+message RequestPlan {
+  string revision = 1;
+  // Optional task selector (filt-rs) to restrict the plan.
+  string select = 2;
+}
+
+message Apply {
+  string revision = 1;
+  // The plan digest the operator approved; the agent refuses a different fresh plan.
+  string plan_digest = 2;
+  string approval_token = 3;
+  // Checks waived for this run (module/check), for `continue`.
+  repeated string waived_checks = 4;
+  string rollout_id = 5;
+  string phase = 6;
+  // Operator forced an apply despite a failing baseline.
+  bool force = 7;
+}
+
+message Rollback {
+  string revision = 1;
+  string reason = 2;
+  string rollout_id = 3;
+}
+
+message RunHealth {
+  string request_id = 1;
+  HealthScope scope = 2;
+  // Modules to check; empty means every applied module.
+  repeated string modules = 3;
+  // For bake: repeat until this instant.
+  google.protobuf.Timestamp until = 4;
+}
+
+message Ping {
+  google.protobuf.Timestamp at = 1;
+}
+
+message Upgrade {
+  string version = 1;
+  // Only when the agent is idle.
+  bool when_idle = 2;
+}
+
+message Rejected {
+  // Why the session is being closed: unknown host, bad token, version too old, paused.
+  string reason = 1;
+  bool retry = 2;
+}
+
+// ---------------------------------------------------------------- content
+
+message FetchRevisionRequest {
+  string revision = 1;
+}
+
+message FetchBlobRequest {
+  string digest = 1;
+}
+
+message Chunk {
+  bytes data = 1;
+  // Total size, sent on the first chunk.
+  uint64 total = 2;
+  // Digest of the whole payload, sent on the last chunk.
+  string digest = 3;
+}
+
+message FetchSecretsRequest {
+  string revision = 1;
+  repeated string names = 2;
+}
+
+message SecretValue {
+  string name = 1;
+  bytes value = 2;
+  string fingerprint = 3;
+}
+
+message SecretBundle {
+  repeated SecretValue secrets = 1;
+}

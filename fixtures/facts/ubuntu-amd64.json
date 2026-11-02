@@ -1,0 +1,8 @@
+{
+  "os": { "family": "debian", "id": "ubuntu", "codename": "noble", "version": "24.04", "kernel": "6.8.0" },
+  "arch": "x86_64",
+  "hardware": { "cpus": 2, "mem": { "total_mb": 4096 }, "swap": { "total_mb": 1024 } },
+  "net": { "hostname": "az-1", "fqdn": "az-1.example.ts.net" },
+  "tailscale": { "hostname": "az-1.example.ts.net", "ips": ["100.64.0.11"], "tags": ["tag:worker"], "online": true },
+  "cloud": { "provider": "azure", "region": "westeurope", "sku": "Standard_B2s" }
+}
