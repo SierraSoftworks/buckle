@@ -151,6 +151,7 @@ pub struct FakeRunner {
     events_per_apply: Mutex<Vec<ApplyEvent>>,
     facts: Mutex<Facts>,
     plan_facts: Mutex<Option<Facts>>,
+    applied_secrets: Mutex<Vec<(RevisionId, Vec<String>)>>,
     calls: Mutex<Vec<Call>>,
     changed: Notify,
 }
@@ -165,6 +166,7 @@ impl Default for FakeRunner {
             events_per_apply: Mutex::new(Vec::new()),
             facts: Mutex::new(Facts::new()),
             plan_facts: Mutex::new(None),
+            applied_secrets: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             changed: Notify::new(),
         }
@@ -234,6 +236,11 @@ impl FakeRunner {
     /// Every call so far.
     pub fn calls(&self) -> Vec<Call> {
         lock(&self.calls).clone()
+    }
+
+    /// The names of the secrets each apply was given, in order.
+    pub fn applied_secrets(&self) -> Vec<(RevisionId, Vec<String>)> {
+        lock(&self.applied_secrets).clone()
     }
 
     /// The applies so far.
@@ -312,6 +319,11 @@ impl Runner for FakeRunner {
             waived_checks: ctx.waived_checks.clone(),
             force: ctx.force,
         });
+        {
+            let mut names: Vec<String> = ctx.secrets.iter().map(|s| s.name().to_owned()).collect();
+            names.sort();
+            lock(&self.applied_secrets).push((revision.id.clone(), names));
+        }
         if let Some(f) = lock(&self.apply_error).as_ref()
             && let Some(err) = f(plan)
         {

@@ -304,19 +304,31 @@ impl Store {
             .unwrap_or(false)
     }
 
-    /// Deletes cached revision trees and secrets except those in `keep`.
+    /// Deletes cached revision trees and secrets except those in `keep`,
+    /// including secrets of revisions whose tree was never cached.
     pub fn prune_revisions(&self, keep: &[&RevisionId]) {
-        let Ok(entries) = std::fs::read_dir(self.root.join("revisions")) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || keep.iter().any(|k| k.0 == name) {
-                continue;
+        if let Ok(entries) = std::fs::read_dir(self.root.join("revisions")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || keep.iter().any(|k| k.0 == name) {
+                    continue;
+                }
+                tracing::debug!(revision = %name, "pruning cached revision");
+                let _ = std::fs::remove_dir_all(entry.path());
             }
-            tracing::debug!(revision = %name, "pruning cached revision");
-            let _ = std::fs::remove_dir_all(entry.path());
-            let _ = std::fs::remove_file(self.root.join("secrets").join(format!("{name}.cbor")));
+        }
+        if let Ok(entries) = std::fs::read_dir(self.root.join("secrets")) {
+            for entry in entries.flatten() {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                let Some(name) = file.strip_suffix(".cbor") else {
+                    continue;
+                };
+                if name.starts_with('.') || keep.iter().any(|k| k.0 == name) {
+                    continue;
+                }
+                tracing::debug!(revision = %name, "pruning cached secrets");
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 

@@ -62,7 +62,9 @@ pub struct AgentOptions {
     pub rejected_backoff_max: Duration,
     /// Minimum spacing between ApplyEvent messages (100 ms, i.e. 10/s).
     pub event_spacing: Duration,
-    /// How long shutdown waits for a running operation.
+    /// How often shutdown logs that it is still waiting for the running
+    /// operation (it waits for it to finish however long it takes; queued
+    /// operations are dropped).
     pub shutdown_grace: Duration,
     /// How long a new session may go without a Welcome before the agent
     /// gives up on it and reconnects with backoff (30 s).
@@ -197,6 +199,9 @@ struct Shared {
     watchdog_queued: AtomicBool,
     /// The revision an Apply is running for, for Hello.
     applying: Mutex<Option<RevisionId>>,
+    /// Shutting down (or restarting after an upgrade): queued operations are
+    /// dropped; the running one finishes.
+    stopping: AtomicBool,
     /// The server refused the stored per-host token: present the bootstrap
     /// token instead (a forgotten host registers afresh, design §08).
     use_bootstrap: AtomicBool,
@@ -391,6 +396,7 @@ impl Agent {
                 watchdog_queued: AtomicBool::new(false),
                 applying: Mutex::new(None),
                 use_bootstrap: AtomicBool::new(false),
+                stopping: AtomicBool::new(false),
             }),
         })
     }
@@ -498,12 +504,21 @@ impl Agent {
 
         ticker_cancel.cancel();
         let _ = ticker.await;
+        // Take no new operations, but let a running one (an apply above all)
+        // finish: stopping mid-apply leaves the host half-changed.
+        shared.stopping.store(true, Ordering::SeqCst);
         drop(queue);
-        if tokio::time::timeout(shared.options.shutdown_grace, worker)
-            .await
-            .is_err()
-        {
-            tracing::warn!("an operation was still running at shutdown");
+        let mut worker = worker;
+        let waiting_since = Instant::now();
+        loop {
+            match tokio::time::timeout(shared.options.shutdown_grace, &mut worker).await {
+                Ok(_) => break,
+                Err(_) => tracing::warn!(
+                    waited = ?waiting_since.elapsed(),
+                    busy = shared.busy.load(Ordering::SeqCst),
+                    "waiting for the running operation to finish before exiting"
+                ),
+            }
         }
         result
     }
@@ -848,6 +863,10 @@ impl Shared {
     ) {
         while let Some(queued) = rx.recv().await {
             len.fetch_sub(1, Ordering::SeqCst);
+            if self.stopping.load(Ordering::SeqCst) || self.stop.is_cancelled() {
+                tracing::info!(op = ?queued.op, "not starting an operation: the agent is stopping");
+                continue;
+            }
             if let Some(generation) = queued.generation
                 && generation != self.generation.load(Ordering::SeqCst)
             {
@@ -1074,14 +1093,7 @@ impl Shared {
             revision.clone(),
         )?);
         let mut data = self.data.lock().await;
-        let keep: Vec<RevisionId> = [
-            data.agent.applied_revision.clone(),
-            data.agent.stable_revision.clone(),
-            data.assigned.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let keep = self.keep_list(&data);
         data.revisions.retain(|id, _| keep.contains(id));
         data.revisions.insert(revision.clone(), loaded.clone());
         Ok(loaded)
@@ -1094,9 +1106,14 @@ impl Shared {
         waived_checks: Vec<String>,
         force: bool,
     ) -> RunContext {
-        let secrets = self.secrets_for(revision).await;
-        let mut data = self.data.lock().await;
-        let stable_revision = self.stable_revision_for(&mut data, revision);
+        let stable_revision = self.stable_revision_for(revision).await;
+        // The engine renders a failing module's stable version with these
+        // secrets too, so the stable revision's are merged in.
+        let secrets = match &stable_revision {
+            Some(stable) => self.rollback_secrets(&stable.id, revision).await,
+            None => self.secrets_for(revision).await,
+        };
+        let data = self.data.lock().await;
         RunContext {
             host: buckle_core::selectors::HostIdentity {
                 id: self.host_id.clone(),
@@ -1114,19 +1131,23 @@ impl Shared {
     }
 
     /// The cached stable revision to roll a failing module back to, when one is
-    /// known, cached and not the revision being applied. Loads it on first use.
-    fn stable_revision_for(
+    /// known, cached and not the revision being applied. Loads it on first use,
+    /// outside the data lock.
+    async fn stable_revision_for(
         &self,
-        data: &mut Data,
         revision: &RevisionId,
     ) -> Option<Arc<buckle_core::engine::Revision>> {
-        let stable = data.agent.stable_revision.clone()?;
-        if &stable == revision {
-            return None;
-        }
-        if let Some(loaded) = data.revisions.get(&stable) {
-            return Some(loaded.clone());
-        }
+        let stable = {
+            let data = self.data.lock().await;
+            let stable = data.agent.stable_revision.clone()?;
+            if &stable == revision {
+                return None;
+            }
+            if let Some(loaded) = data.revisions.get(&stable) {
+                return Some(loaded.clone());
+            }
+            stable
+        };
         if !self.store.has_revision(&stable) {
             tracing::debug!(stable = %stable.short(), "stable revision not cached; module rollback disabled for this run");
             return None;
@@ -1138,10 +1159,24 @@ impl Shared {
                 return None;
             }
         };
-        match buckle_core::engine::loader::load_dir(&dir, stable.clone()) {
+        let loaded = {
+            let (dir, id) = (dir, stable.clone());
+            tokio::task::spawn_blocking(move || buckle_core::engine::loader::load_dir(&dir, id))
+                .await
+                .map_err(|e| {
+                    buckle_core::error::wrap_system(e, "Loading the stable revision panicked.", &[])
+                })
+                .and_then(|r| r)
+        };
+        match loaded {
             Ok(loaded) => {
                 let loaded = Arc::new(loaded);
-                data.revisions.insert(stable, loaded.clone());
+                self.data
+                    .lock()
+                    .await
+                    .revisions
+                    .entry(stable)
+                    .or_insert_with(|| loaded.clone());
                 Some(loaded)
             }
             Err(err) => {
@@ -1151,10 +1186,6 @@ impl Shared {
         }
     }
 
-    /// Keeps `facts` (from a facts pass, or refreshed by the engine while
-    /// planning) and reports them when they differ from what the server last
-    /// saw (or when `force`). A change after the first report may select more
-    /// modules, so missing secrets are requested too.
     async fn remember_facts(&self, facts: Facts) {
         self.remember_facts_and_report(facts, false).await
     }
@@ -1214,22 +1245,22 @@ impl Shared {
                 data.assigned = Some(revision.clone());
             }
         }
-        match self
+        let fetched = self
             .ensure_revision(&revision, tree_digest.as_deref())
-            .await
+            .await;
         {
+            // Prune whether or not the fetch worked: secrets cached for a
+            // revision whose tree never arrived go too once it is no longer
+            // wanted.
+            let mut data = self.data.lock().await;
+            let keep = self.keep_list(&data);
+            let refs: Vec<&RevisionId> = keep.iter().collect();
+            self.store.prune_revisions(&refs);
+            data.secrets.retain(|id, _| keep.contains(id));
+        }
+        match fetched {
             Ok(_) => {
                 tracing::info!(revision = %revision.short(), stable, "revision assigned");
-                let data = self.data.lock().await;
-                let keep: Vec<&RevisionId> = [
-                    &data.agent.applied_revision,
-                    &data.agent.stable_revision,
-                    &data.assigned,
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                self.store.prune_revisions(&keep);
             }
             Err(err) => {
                 tracing::error!(revision = %revision.short(), error = %err.description(), "could not fetch the assigned revision");
@@ -1722,18 +1753,40 @@ impl Shared {
     }
 
     /// The secrets to render the stable revision with when rolling back: the
-    /// stable revision's own, topped up with the current ones (a secret the
-    /// stable revision needs may only have been delivered with a later one).
+    /// union of the stable revision's and the current revision's (a secret
+    /// the stable revision needs may only have been delivered with a later
+    /// one). Where both hold a name, the current value wins: it is the one
+    /// the host's services were last given, and a rotated-away value may no
+    /// longer be valid.
     async fn rollback_secrets(
         &self,
         stable: &RevisionId,
         current: &RevisionId,
     ) -> Arc<SecretStore> {
-        let mut merged = (*self.secrets_for(current).await).clone();
-        for secret in self.secrets_for(stable).await.iter() {
+        let mut merged = (*self.secrets_for(stable).await).clone();
+        for secret in self.secrets_for(current).await.iter() {
             merged.insert(secret.clone());
         }
         Arc::new(merged)
+    }
+
+    /// Revisions whose trees and secrets must stay cached.
+    fn keep_list(&self, data: &Data) -> Vec<RevisionId> {
+        let mut keep: Vec<RevisionId> = [
+            data.agent.applied_revision.clone(),
+            data.agent.stable_revision.clone(),
+            data.assigned.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        // The watchdog's fallback (and the revision it watches) must survive
+        // a change of stable revision while it is armed.
+        if let Some(w) = &data.agent.watchdog {
+            keep.push(w.to.clone());
+            keep.push(w.from.clone());
+        }
+        keep
     }
 
     /// Health reasons may echo secret values (a URL with a token, command
@@ -1817,6 +1870,7 @@ impl Shared {
             Ok(report) => report,
             Err(err) => health_error_report(HealthScope::Drift, &err),
         };
+        let report = self.scrub_report(&revision, report).await;
         self.sink
             .send(Report::Health {
                 request_id: None,
@@ -1964,7 +2018,11 @@ impl Shared {
                         )
                         .await;
                     match self.runner.health(rev, &ctx, HealthScope::Bake, None).await {
-                        Ok(report) => watchdog.observe(&report, Instant::now()),
+                        Ok(report) => {
+                            // Evidence ends up in agent.json and the report.
+                            let report = self.scrub_report(&watchdog.state.from, report).await;
+                            watchdog.observe(&report, Instant::now())
+                        }
                         Err(err) => {
                             tracing::warn!(error = %err.description(), "the watchdog could not run health checks")
                         }
@@ -2009,7 +2067,8 @@ impl Shared {
         tracing::warn!(from = %from.short(), to = %to.short(), %reason, "rolling back to the cached stable revision");
         let result = async {
             let rev = self.ensure_revision(&to, None).await?;
-            let ctx = self.context(&to, None, Vec::new(), true).await;
+            let mut ctx = self.context(&to, None, Vec::new(), true).await;
+            ctx.secrets = self.rollback_secrets(&to, &from).await;
             let (plan, facts) = self.runner.plan(rev.clone(), &ctx).await?;
             self.remember_facts(facts).await;
             Ok::<_, buckle_core::Error>(self.run_apply(rev, &ctx, &plan, false, true).await)

@@ -886,3 +886,233 @@ async fn a_session_without_a_welcome_times_out_and_reconnects() {
     );
     h.stop().await.expect("clean exit");
 }
+
+fn secret(name: &str, value: &[u8], fingerprint: &str) -> pb::SecretValue {
+    pb::SecretValue {
+        name: name.into(),
+        value: value.to_vec(),
+        fingerprint: fingerprint.into(),
+    }
+}
+
+fn assign_with(
+    revision: &str,
+    digest: &str,
+    secrets: Vec<pb::SecretValue>,
+) -> pb::server_message::Msg {
+    pb::server_message::Msg::Assign(pb::Assign {
+        revision: revision.into(),
+        tree_digest: digest.into(),
+        secrets: Some(pb::SecretBundle { secrets }),
+        ..Default::default()
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_the_running_apply_and_starts_nothing_new() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    let (mut h, runner) = gated(fake.clone()).await;
+    let session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    let later = h.fleet.add_revision("rev2", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    runner.started.notified().await;
+    // Queued behind the running apply.
+    session.send(assign("rev2", &later)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    h.shutdown.cancel();
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert!(
+        h.handle.as_ref().is_some_and(|j| !j.is_finished()),
+        "still waiting for the apply after five minutes"
+    );
+    runner.release.notify_one();
+    assert_eq!(h.join().await.expect("clean exit"), 0);
+    let store = Store::new(h.state_dir());
+    assert_eq!(store.load_agent_state().applied_revision, Some(rev("rev1")));
+    assert!(
+        !store.has_revision(&rev("rev2")),
+        "the queued assignment never started"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_watchdog_fallback_survives_a_new_stable_revision() {
+    let fake = FakeRunner::new();
+    let (h, session) = rolled_out(fake.clone()).await;
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.load_agent_state().watchdog.is_some()).await;
+    // A newer stable revision arrives while the watchdog still points at
+    // stable1: stable1's tree must stay for the fallback.
+    let digest = h.fleet.add_revision("stable2", bundle(FLEET_YAML));
+    session
+        .send(pb::server_message::Msg::Assign(pb::Assign {
+            revision: "stable2".into(),
+            stable: true,
+            tree_digest: digest,
+            ..Default::default()
+        }))
+        .await;
+    wait_until(|| store.has_revision(&rev("stable2"))).await;
+    assert!(store.has_revision(&rev("stable1")));
+    assert_eq!(
+        store.load_agent_state().watchdog.map(|w| w.to),
+        Some(rev("stable1"))
+    );
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn secrets_of_a_revision_that_never_arrived_are_pruned_once_unwanted() {
+    let mut h = Harness::start(Setup::default()).await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    // rev-gone is not on the server: its tree never arrives, its secrets do.
+    session
+        .send(assign_with(
+            "rev-gone",
+            "",
+            vec![secret("db", b"hunter2", "01020304")],
+        ))
+        .await;
+    session.expect(plan_result).await;
+    let secrets = h.state_dir().join("secrets/rev-gone.cbor");
+    assert!(secrets.is_file());
+    let digest = h.fleet.add_revision("rev2", bundle(FLEET_YAML));
+    session.send(assign("rev2", &digest)).await;
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.has_revision(&rev("rev2"))).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!secrets.exists(), "pruned with the revision it belonged to");
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn health_reasons_never_carry_secret_values() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    fake.with_health(|_, scope| HealthReport {
+        scope,
+        results: vec![buckle_core::health::HealthResult {
+            module: "m".into(),
+            check: "api".into(),
+            kind: "http".into(),
+            required: true,
+            status: buckle_core::health::HealthStatus::fail(
+                "GET https://user:hunter2@api/health returned 401",
+            ),
+            at: chrono::Utc::now(),
+            duration_ms: 1,
+        }],
+    });
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    session
+        .send(assign_with(
+            "rev1",
+            &digest,
+            vec![secret("db", b"hunter2", "01020304")],
+        ))
+        .await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    session.expect(apply_result).await;
+    session
+        .send(pb::server_message::Msg::Health(pb::RunHealth {
+            request_id: "h1".into(),
+            scope: pb::HealthScope::Manual as i32,
+            ..Default::default()
+        }))
+        .await;
+    let report = session.expect(health_report).await;
+    let reason = &report.results[0].reason;
+    assert!(!reason.contains("hunter2"), "{reason}");
+    assert!(
+        reason.contains("401"),
+        "the rest of the reason stays: {reason}"
+    );
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_local_rollback_renders_the_stable_revision_with_both_revisions_secrets() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    fake.with_plans(&rev("stable1"), vec![plan_with_changes(&rev("stable1"), 1)]);
+    fake.with_health(|revision, scope| crate::testing::health(scope, revision.0 != "rev1"));
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        ..Default::default()
+    })
+    .await;
+    h.fleet.add_revision("stable1", bundle(FLEET_YAML));
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    let mut session = h.sessions.accept().await;
+    session
+        .send(pb::server_message::Msg::Welcome(pb::Welcome {
+            stable_revision: "stable1".into(),
+            status: "active".into(),
+            secrets: Some(pb::SecretBundle {
+                secrets: vec![secret("old", b"o", "0a0a0a0a")],
+            }),
+            ..Default::default()
+        }))
+        .await;
+    session
+        .send(assign_with(
+            "rev1",
+            &digest,
+            vec![secret("new", b"n", "0b0b0b0b")],
+        ))
+        .await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    assert!(session.expect(apply_result).await.succeeded);
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.has_revision(&rev("stable1"))).await;
+    h.fleet.set_unreachable(true);
+    session.close();
+    tokio::time::timeout(
+        Duration::from_secs(3600),
+        fake.wait_for(|calls| {
+            calls
+                .iter()
+                .any(|c| matches!(c, Call::Apply { revision, .. } if revision.0 == "stable1"))
+        }),
+    )
+    .await
+    .expect("rolled back");
+    let seen = fake.applied_secrets();
+    let stable = seen
+        .iter()
+        .find(|(r, _)| r.0 == "stable1")
+        .expect("the rollback apply");
+    assert_eq!(stable.1, vec!["new".to_string(), "old".to_string()]);
+    h.stop().await.expect("clean exit");
+}
