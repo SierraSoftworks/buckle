@@ -1130,6 +1130,7 @@ impl Fleet for FleetService {
                 .then(|| hello.last_plan_digest.clone()),
             unreported_apply_revisions: hello.unreported_apply_revisions.clone(),
             new_session: true,
+            capabilities: hello.capabilities.clone(),
         });
         self.publish_host(&host).await;
 

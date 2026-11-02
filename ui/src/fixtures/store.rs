@@ -671,9 +671,17 @@ pub fn rollout_host_action(
                     h.state = HostRolloutState::Skipped;
                     h.error = Some(format!("Skipped by {}: {note}", actor()));
                 }
-                ("force", HostRolloutState::Held) => {
+                (
+                    "force",
+                    HostRolloutState::Held
+                    | HostRolloutState::Planned
+                    | HostRolloutState::Failed
+                    | HostRolloutState::Healthy
+                    | HostRolloutState::Skipped
+                    | HostRolloutState::Pending,
+                ) => {
                     h.state = HostRolloutState::Applying;
-                    h.error = Some(format!("Forced past a failing baseline by {}.", actor()));
+                    h.error = None;
                 }
                 (_, state) => {
                     return Err(ApiError::Conflict(format!(

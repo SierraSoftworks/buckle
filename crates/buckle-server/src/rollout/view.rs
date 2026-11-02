@@ -46,9 +46,12 @@ pub fn needs_approval(
     let Some(digest) = &host.plan_digest else {
         return false;
     };
-    !approvals
-        .iter()
-        .any(|a| a.phase == phase.name && a.plan_digests.iter().any(|d| d == digest))
+    let intent = host.runtime.approval_digest.as_deref();
+    !approvals.iter().any(|a| {
+        a.phase == phase.name
+            && (a.plan_digests.iter().any(|d| d == digest)
+                || intent.is_some_and(|i| a.approval_digests.iter().any(|d| d == i)))
+    })
 }
 
 /// The host row as the UI sees it.

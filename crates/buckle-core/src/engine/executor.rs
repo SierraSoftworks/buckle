@@ -108,7 +108,10 @@ pub(super) async fn apply(
     let facts = collect_facts(inputs, &planner).await;
     let state = inputs.state.load()?;
     let rich = plan_with(&planner, &facts, &state).await?;
-    if rich.plan.digest != plan.digest {
+    // The handed plan binds what the apply does (its intent), not the text
+    // it renders: a re-plan that only differs in content (a fact, a clock, a
+    // fingerprint) runs from the fresh plan.
+    if rich.plan.intent_digest() != plan.intent_digest() {
         return Err(crate::error::wrap_user(
             super::StalePlan {
                 planned: plan.digest.clone(),

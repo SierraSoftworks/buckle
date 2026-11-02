@@ -448,6 +448,102 @@ impl Plan {
         })
     }
 
+    /// The digest of what the plan intends, without any rendered text: per
+    /// module its steps (resource, task, outcome and diff kind, whether it
+    /// always runs, its removal policy and notifies) and handlers, plus the
+    /// removals, re-homes, deferred, indeterminate and held modules.
+    /// Summaries, diffs, previews and reasons are left out, so a re-plan
+    /// whose only differences are content (a fact value, a secret
+    /// fingerprint, a clock) keeps it, while a new resource, a new delete or
+    /// a new removal changes it. Approvals bind this digest.
+    pub fn intent_digest(&self) -> Digest {
+        #[derive(Serialize)]
+        struct StepIntent<'a> {
+            resource: &'a ResourceKey,
+            task: &'a str,
+            outcome: &'static str,
+            always_runs: bool,
+            removal: RemovalPolicy,
+            notifies: &'a [String],
+        }
+        #[derive(Serialize)]
+        struct ModuleIntent<'a> {
+            module: &'a str,
+            needs: &'a [String],
+            steps: Vec<StepIntent<'a>>,
+            handlers: Vec<(&'a str, &'a str, &'a str)>,
+        }
+        #[derive(Serialize)]
+        struct Intent<'a> {
+            modules: Vec<ModuleIntent<'a>>,
+            removals: Vec<(&'a ResourceKey, RemovalPolicy, bool)>,
+            rehomed: Vec<(&'a ResourceKey, &'a ResourceKey, RehomeKind)>,
+            deferred: Vec<(&'a str, &'a [String])>,
+            indeterminate: Vec<(&'a str, bool)>,
+            held: Vec<&'a str>,
+        }
+        fn outcome(planned: &Planned) -> &'static str {
+            match planned {
+                Planned::NoOp => "noop",
+                Planned::Blocked { .. } => "blocked",
+                Planned::Change { diff } => match diff {
+                    Diff::Create { .. } => "create",
+                    Diff::Update { .. } => "update",
+                    Diff::Delete { .. } => "delete",
+                    Diff::Opaque { .. } => "run",
+                },
+            }
+        }
+        Digest::of_json(&Intent {
+            modules: self
+                .modules
+                .iter()
+                .map(|m| ModuleIntent {
+                    module: &m.module,
+                    needs: &m.needs,
+                    steps: m
+                        .steps
+                        .iter()
+                        .map(|s| StepIntent {
+                            resource: &s.resource,
+                            task: &s.task.id,
+                            outcome: outcome(&s.planned),
+                            always_runs: s.always_runs,
+                            removal: s.removal,
+                            notifies: &s.notifies,
+                        })
+                        .collect(),
+                    handlers: m
+                        .handlers
+                        .iter()
+                        .map(|h| (h.module.as_str(), h.handler.as_str(), h.kind.as_str()))
+                        .collect(),
+                })
+                .collect(),
+            removals: self
+                .removals
+                .iter()
+                .map(|r| (&r.resource, r.policy, r.caution))
+                .collect(),
+            rehomed: self
+                .rehomed
+                .iter()
+                .map(|r| (&r.from, &r.to, r.kind))
+                .collect(),
+            deferred: self
+                .deferred
+                .iter()
+                .map(|d| (d.module.as_str(), d.waiting_on.as_slice()))
+                .collect(),
+            indeterminate: self
+                .indeterminate
+                .iter()
+                .map(|i| (i.module.as_str(), i.plan_error))
+                .collect(),
+            held: self.held.iter().map(|h| h.module.as_str()).collect(),
+        })
+    }
+
     pub fn changes(&self) -> usize {
         self.modules.iter().map(ModulePlan::changes).sum()
     }
@@ -529,6 +625,63 @@ mod tests {
         );
         assert_eq!(a.digest, b.digest);
         assert_ne!(a.digest, c.digest);
+    }
+
+    fn update(summary: &str, unified: &str) -> Planned {
+        Planned::change(Diff::Update {
+            summary: summary.into(),
+            unified: Some(Redacted::new(unified.into())),
+        })
+    }
+
+    fn one_step(planned: Planned) -> Plan {
+        Plan::new(
+            RevisionId::new("r"),
+            "h",
+            vec![module("m", vec![step("m", "/x", planned)])],
+            vec![],
+            vec![],
+        )
+    }
+
+    #[rstest::rstest]
+    #[case::summary_and_diff_text(
+        update("index is 6h 1m old", "-a\n+b"),
+        update("index is 6h 9m old", "-a\n+c"),
+        true
+    )]
+    #[case::blocked_reason(
+        Planned::blocked("apt is locked"),
+        Planned::blocked("dpkg is locked"),
+        true
+    )]
+    #[case::update_becomes_noop(update("u", "-a\n+b"), Planned::NoOp, false)]
+    #[case::update_becomes_delete(update("u", "-a\n+b"), Planned::change(Diff::Delete { summary: "u".into() }), false)]
+    #[case::create_becomes_run(Planned::change(Diff::Create { summary: "c".into(), preview: None }), Planned::change(Diff::Opaque { summary: "c".into() }), false)]
+    fn intent_digest_ignores_text_but_not_actions(
+        #[case] a: Planned,
+        #[case] b: Planned,
+        #[case] same: bool,
+    ) {
+        let (a, b) = (one_step(a), one_step(b));
+        assert_eq!(a.intent_digest() == b.intent_digest(), same);
+    }
+
+    #[test]
+    fn intent_digest_changes_with_new_resources_and_removals() {
+        let base = one_step(Planned::NoOp);
+        let mut added = base.clone();
+        added.modules[0].steps.push(step("m", "/y", Planned::NoOp));
+        let mut removing = base.clone();
+        removing.removals.push(Removal {
+            resource: ResourceKey::new("m", "file.copy", "/gone"),
+            policy: RemovalPolicy::Cleanup,
+            summary: "delete /gone".into(),
+            caution: false,
+            introduced_in: None,
+        });
+        assert_ne!(base.intent_digest(), added.intent_digest());
+        assert_ne!(base.intent_digest(), removing.intent_digest());
     }
 
     #[test]

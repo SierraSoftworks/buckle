@@ -88,6 +88,8 @@ pub struct Connected {
     /// already connected host (e.g. it was resumed): its Hello facts are
     /// stale, so nothing is re-sent on their account.
     pub new_session: bool,
+    /// Optional behaviours the agent announced (`Hello.capabilities`).
+    pub capabilities: Vec<String>,
 }
 
 /// Operator actions (design §10 "Paused offers four operator decisions").
@@ -372,6 +374,10 @@ fn decode_pending_report(value: &str) -> Option<(String, u64, agent_message::Msg
 }
 
 /// The HMAC approval token the Apply message carries.
+fn non_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_owned())
+}
+
 pub fn approval_token(key: &[u8; 32], rollout: &str, phase: &str, digest: &str) -> String {
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) else {
         return String::new();
@@ -470,6 +476,8 @@ struct Controller {
     /// A dropped session leaves the link before its disconnect reaches the
     /// controller; until then the host is not taken for offline.
     online: HashSet<String>,
+    /// What each host's agent announced in its last Hello (`force_plan`, …).
+    capabilities: HashMap<String, Vec<String>>,
     /// Each host's status and effective labels as last seen, so a host
     /// update that changes neither (e.g. notes) is not acted on.
     host_seen: HashMap<String, (HostStatus, BTreeMap<String, String>)>,
@@ -696,6 +704,7 @@ impl Controller {
             stable_dirty: false,
             excluded,
             online: HashSet::new(),
+            capabilities: HashMap::new(),
             host_seen,
             flush_retry: None,
             flush_failures: 0,
@@ -1015,6 +1024,10 @@ impl Controller {
     async fn on_connected(&mut self, c: Connected) {
         let now = self.now();
         self.online.insert(c.host.clone());
+        if c.new_session {
+            self.capabilities
+                .insert(c.host.clone(), c.capabilities.clone());
+        }
         for ri in 0..self.live.len() {
             let Some(hi) = self.live[ri].find(&c.host) else {
                 continue;
@@ -1198,18 +1211,51 @@ impl Controller {
                     plan.digest
                 );
                 if refusals >= MAX_STALE_REFUSALS {
+                    // Re-planning again would only race the host once more:
+                    // it waits for an operator to force apply, retry or skip.
                     let error = format!(
                         "{message}; the plan changed on {refusals} apply attempts \
-                         and is not deterministic"
+                         and is not deterministic: force apply, retry or skip the host"
                     );
                     h.plan_digest = Some(plan.digest.clone());
                     h.plan = serde_json::from_slice(&plan.plan_json).ok();
+                    h.runtime.approval_digest = non_empty(&plan.approval_digest);
                     h.runtime.error = Some(error.clone());
-                    self.fail_host(ri, hi, &error);
+                    self.set_host_state(ri, hi, HostPhase::Held, "the plan is not deterministic");
                     continue;
                 }
                 h.state = HostPhase::PlanPending;
                 stale_error = Some(message);
+            } else if h.state == HostPhase::Applying && plan.error.is_empty() && !stale {
+                // The agent is about to run a plan other than the stored one
+                // (a force apply, or content that changed under an approved
+                // intent): record what it really applies.
+                let forced = h.runtime.force_plan;
+                let from = h.plan_digest.clone().unwrap_or_default();
+                let h = &mut self.live[ri].hosts[hi];
+                h.plan_digest = Some(plan.digest.clone());
+                h.plan = serde_json::from_slice(&plan.plan_json).ok();
+                h.runtime.approval_digest = non_empty(&plan.approval_digest);
+                h.runtime.plan_changes = Some(plan.changes);
+                h.runtime.plan_removals = Some(plan.removals);
+                h.runtime.destructive = plan.destructive;
+                h.runtime.deferred_modules = plan.deferred_modules.clone();
+                self.touch_host(ri, hi);
+                if !forced && !from.is_empty() && from != plan.digest {
+                    let host = host.to_owned();
+                    self.command_audit(
+                        "controller",
+                        "rollout.host.plan_content_changed",
+                        ri,
+                        format!(
+                            "{host}: applying {} under the approval of {}: the plan's content changed, its resources and actions did not",
+                            short(&plan.digest),
+                            short(&from)
+                        ),
+                        serde_json::json!({"host": host, "approved": from, "applied": plan.digest}),
+                    );
+                }
+                continue;
             } else if !matches!(h.state, HostPhase::PlanPending | HostPhase::Planned) {
                 continue;
             }
@@ -1231,6 +1277,7 @@ impl Controller {
                 let h = &mut self.live[ri].hosts[hi];
                 h.plan_digest = Some(plan.digest.clone());
                 h.plan = plan_json;
+                h.runtime.approval_digest = non_empty(&plan.approval_digest);
                 h.runtime.plan_changes = Some(plan.changes);
                 h.runtime.plan_removals = Some(plan.removals);
                 h.runtime.destructive = plan.destructive;
@@ -1273,11 +1320,16 @@ impl Controller {
                 HostPhase::Applying
                     if result.revision == target
                         && (result.plan_digest.is_empty()
+                            || self.live[ri].hosts[hi].runtime.force_plan
                             || self.live[ri].hosts[hi].plan_digest.as_deref()
                                 == Some(result.plan_digest.as_str())) =>
                 {
                     self.live[ri].hosts[hi].result =
                         serde_json::to_value(ResultView::from(&result)).ok();
+                    if !result.plan_digest.is_empty() {
+                        self.live[ri].hosts[hi].plan_digest = Some(result.plan_digest.clone());
+                    }
+                    self.live[ri].hosts[hi].runtime.force_plan = false;
                     // The agent accepted and ran the approved plan.
                     self.live[ri].hosts[hi].runtime.stale_refusals = 0;
                     if result.succeeded {
@@ -1995,10 +2047,22 @@ impl Controller {
             } => {
                 let ri = self.find_rollout(&rollout)?;
                 let hi = self.find_host(ri, &host)?;
-                if self.live[ri].hosts[hi].state != HostPhase::Held {
+                let state = self.live[ri].hosts[hi].state;
+                if !matches!(
+                    state,
+                    HostPhase::Held
+                        | HostPhase::Planned
+                        | HostPhase::Failed
+                        | HostPhase::Healthy
+                        | HostPhase::Skipped
+                        | HostPhase::Missed
+                ) {
                     return Err(CommandError::conflict(
-                        format!("Host '{host}' is not held at baseline."),
-                        &[],
+                        format!(
+                            "Host '{host}' is {}, so it cannot be force applied now.",
+                            state.as_str()
+                        ),
+                        &["Wait for the host's plan or apply to finish, then force it."],
                     ));
                 }
                 if !self.connected(&host) {
@@ -2007,21 +2071,62 @@ impl Controller {
                         &["Wait for the agent to reconnect, then force it again."],
                     ));
                 }
+                // Applying whatever the host plans needs an agent that can
+                // skip its digest check; an older one still applies a host
+                // held at baseline with its approved plan.
+                let force_plan = self
+                    .capabilities
+                    .get(&host)
+                    .is_some_and(|c| c.iter().any(|c| c == "force_plan"));
+                if !force_plan && state != HostPhase::Held {
+                    return Err(CommandError::conflict(
+                        format!("Host '{host}' runs an agent that cannot force apply a plan."),
+                        &["Upgrade the host's Buckle agent, or retry the host to re-plan it."],
+                    ));
+                }
+                let released = self.live[ri].hosts[hi].runtime.released;
+                self.live[ri].hosts[hi].runtime.released = true;
                 if !self.may_apply(ri, hi) {
+                    self.live[ri].hosts[hi].runtime.released = released;
                     return Err(CommandError::conflict(
                         format!("Rollout '{rollout}' is not running, so nothing is applied."),
                         &["Resume the rollout first, then force the host."],
                     ));
                 }
+                let what = match state {
+                    HostPhase::Held if self.live[ri].hosts[hi].runtime.held_at_baseline => {
+                        "past its failing baseline"
+                    }
+                    HostPhase::Planned => "without approval",
+                    HostPhase::Healthy => "again",
+                    _ => "with whatever it plans now",
+                };
                 self.command_audit(
                     actor,
                     "rollout.host.force",
                     ri,
-                    format!("{actor} forced {host} past its failing baseline. {note}"),
-                    serde_json::json!({"host": host, "note": note}),
+                    format!("{actor} force applied {host} {what}. {note}"),
+                    serde_json::json!({"host": host, "note": note, "from": state.as_str(), "force_plan": force_plan}),
                 );
-                self.live[ri].hosts[hi].runtime.force = true;
+                {
+                    let h = &mut self.live[ri].hosts[hi];
+                    h.runtime.force = true;
+                    h.runtime.force_plan = force_plan;
+                    h.runtime.failed_checks.clear();
+                    h.runtime.failed_module = None;
+                    h.runtime.error = None;
+                    h.runtime.error_detail = None;
+                    h.runtime.needs_attention = false;
+                    h.runtime.failing_since.clear();
+                    h.runtime.request_id = None;
+                    h.runtime.bake_until = None;
+                    h.runtime.stale_refusals = 0;
+                    if state != HostPhase::Held {
+                        h.runtime.attempts += 1;
+                    }
+                }
                 self.send_apply(ri, hi);
+                self.unpause_if_cleared(ri, actor);
                 Ok(rollout)
             }
         }
@@ -2083,18 +2188,31 @@ impl Controller {
                 ],
             ));
         }
+        // The intents of the approved plans, so that a host whose re-plan
+        // only changes content stays covered.
+        let mut intents: Vec<String> = hosts
+            .iter()
+            .filter_map(|&i| {
+                let h = &self.live[ri].hosts[i];
+                let covered = h.plan_digest.as_ref().is_some_and(|d| digests.contains(d));
+                covered.then(|| h.runtime.approval_digest.clone()).flatten()
+            })
+            .collect();
+        intents.sort();
+        intents.dedup();
         let now = self.now();
         let id = self.live[ri].record.id.clone();
-        let (p2, a2, d2, n2) = (
+        let (p2, a2, d2, i2, n2) = (
             phase.to_owned(),
             actor.to_owned(),
             digests.clone(),
+            intents.clone(),
             note.to_owned(),
         );
         let id2 = id.clone();
         let approval_id = self
             .store
-            .call(move |db| db.approvals().add(&id2, &p2, &a2, &d2, &n2, now))
+            .call(move |db| db.approvals().add(&id2, &p2, &a2, &d2, &i2, &n2, now))
             .await
             .map_err(CommandError::internal)?;
         self.live[ri].approvals.push(ApprovalRecord {
@@ -2103,6 +2221,7 @@ impl Controller {
             phase: phase.to_owned(),
             approver: actor.to_owned(),
             plan_digests: digests.clone(),
+            approval_digests: intents,
             note: note.to_owned(),
             at: now,
         });
@@ -2365,6 +2484,7 @@ impl Controller {
             h.runtime.attempts += 1;
             h.runtime.stale_refusals = 0;
             h.runtime.released = true;
+            h.runtime.force_plan = false;
             h.plan_digest = None;
         }
         self.set_host_state(ri, hi, HostPhase::PlanPending, "re-planning");
@@ -2568,6 +2688,8 @@ impl Controller {
             force: h.runtime.force,
             traceparent: traceparent_of(&span).unwrap_or_default(),
             select: PLAN_SELECT.to_owned(),
+            force_plan: h.runtime.force_plan,
+            approval_digest: h.runtime.approval_digest.clone().unwrap_or_default(),
         }
     }
 
@@ -2586,8 +2708,12 @@ impl Controller {
             .call(move |db| db.runs().for_host(&host, 20))
             .await
             .ok()?;
-        runs.into_iter()
-            .find(|r| r.plan_digest == digest && r.revision == revision && r.finished_at >= since)
+        let any_digest = h.runtime.force_plan || h.runtime.approval_digest.is_some();
+        runs.into_iter().find(|r| {
+            (any_digest || r.plan_digest == digest)
+                && r.revision == revision
+                && r.finished_at >= since
+        })
     }
 
     /// Re-sends the Apply of a host that reconnected without having run it.

@@ -59,6 +59,9 @@ message Hello {
   // server has not acknowledged yet (it follows the Welcome). A server
   // waiting on such an apply waits for the result instead of re-sending it.
   repeated string unreported_apply_revisions = 10;
+  // Optional behaviours this agent understands (e.g. "force_plan"), so the
+  // server can offer them only where they work.
+  repeated string capabilities = 11;
 }
 
 message Facts {
@@ -89,6 +92,10 @@ message PlanResult {
   // The plan is still valid: applying it reports those modules as failed and
   // runs the others.
   repeated string module_errors = 9;
+  // Digest of the plan's intent (resources, actions, removals, deferred
+  // modules) without rendered text; what an approval binds. Empty from
+  // agents that predate it.
+  string approval_digest = 10;
 }
 
 message ApplyEvent {
@@ -297,6 +304,12 @@ message Apply {
   // The task selector of the RequestPlan whose plan was approved; the agent
   // re-plans with it so the digest can match. Empty: the whole revision.
   string select = 9;
+  // Apply whatever the host plans now, without comparing digests: an
+  // operator's force apply. Needs the "force_plan" capability.
+  bool force_plan = 10;
+  // The approved intent digest (PlanResult.approval_digest). When set, the
+  // agent compares it with its fresh plan's intent instead of plan_digest.
+  string approval_digest = 11;
 }
 
 message Rollback {

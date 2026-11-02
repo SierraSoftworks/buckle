@@ -14,6 +14,9 @@ pub struct ApprovalRecord {
     /// The OIDC subject (or `anonymous` without OIDC).
     pub approver: String,
     pub plan_digests: Vec<String>,
+    /// The intent digests of the approved plans, from agents that report
+    /// them; a host whose fresh plan keeps one of these stays approved.
+    pub approval_digests: Vec<String>,
     pub note: String,
     pub at: DateTime<Utc>,
 }
@@ -29,19 +32,21 @@ impl<'c> Approvals<'c> {
     }
 
     /// Records an approval and returns its id.
+    #[allow(clippy::too_many_arguments)]
     pub fn add(
         &self,
         rollout: &str,
         phase: &str,
         approver: &str,
         digests: &[String],
+        intents: &[String],
         note: &str,
         at: DateTime<Utc>,
     ) -> Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO approvals (rollout, phase, approver, plan_digests, note, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![rollout, phase, approver, to_json(&digests)?, note, ts(at)],
+                "INSERT INTO approvals (rollout, phase, approver, plan_digests, approval_digests, note, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![rollout, phase, approver, to_json(&digests)?, to_json(&intents)?, note, ts(at)],
             )
             .map_err(db_error)?;
         Ok(self.conn.last_insert_rowid())
@@ -51,7 +56,7 @@ impl<'c> Approvals<'c> {
     pub fn for_rollout(&self, rollout: &str) -> Result<Vec<ApprovalRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, rollout, phase, approver, plan_digests, note, at FROM approvals WHERE rollout = ?1 ORDER BY id")
+            .prepare("SELECT id, rollout, phase, approver, plan_digests, approval_digests, note, at FROM approvals WHERE rollout = ?1 ORDER BY id")
             .map_err(db_error)?;
         let rows = stmt
             .query_map(params![rollout], |r| {
@@ -63,23 +68,27 @@ impl<'c> Approvals<'c> {
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
                 ))
             })
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
         rows.into_iter()
-            .map(|(id, rollout, phase, approver, digests, note, at)| {
-                Ok(ApprovalRecord {
-                    id,
-                    rollout,
-                    phase,
-                    approver,
-                    plan_digests: from_json(&digests)?,
-                    note,
-                    at: parse_ts(&at)?,
-                })
-            })
+            .map(
+                |(id, rollout, phase, approver, digests, intents, note, at)| {
+                    Ok(ApprovalRecord {
+                        id,
+                        rollout,
+                        phase,
+                        approver,
+                        plan_digests: from_json(&digests)?,
+                        approval_digests: from_json(&intents)?,
+                        note,
+                        at: parse_ts(&at)?,
+                    })
+                },
+            )
             .collect()
     }
 }

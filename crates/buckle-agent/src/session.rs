@@ -107,6 +107,7 @@ enum Op {
     Apply {
         revision: RevisionId,
         plan_digest: Option<String>,
+        approval_digest: Option<String>,
         waived_checks: Vec<String>,
         force: bool,
         traceparent: Option<String>,
@@ -957,6 +958,7 @@ impl Shared {
             Op::Apply {
                 revision,
                 plan_digest,
+                approval_digest,
                 waived_checks,
                 force,
                 traceparent,
@@ -975,9 +977,16 @@ impl Shared {
                 );
                 set_parent_from_traceparent(&span, traceparent.as_deref());
                 self.set_applying(Some(revision.clone()));
-                self.apply(revision, plan_digest, select, waived_checks, force)
-                    .instrument(span)
-                    .await;
+                self.apply(
+                    revision,
+                    plan_digest,
+                    approval_digest,
+                    select,
+                    waived_checks,
+                    force,
+                )
+                .instrument(span)
+                .await;
                 self.set_applying(None);
             }
             Op::Rollback {
@@ -1470,6 +1479,7 @@ impl Shared {
         &self,
         revision: RevisionId,
         plan_digest: Option<String>,
+        approval_digest: Option<String>,
         select: Option<String>,
         waived_checks: Vec<String>,
         force: bool,
@@ -1509,20 +1519,39 @@ impl Shared {
             }
         };
         self.remember_facts(facts).await;
-        // The approved digest binds the apply; `force` only overrides the
-        // server's baseline hold, never this check.
-        if let Some(approved) = &plan_digest
-            && !crate::bundle::digests_match(approved, plan.digest.as_str())
+        // The approval binds the apply: its intent digest when the server
+        // sent one, else the full plan digest. `force` only overrides the
+        // server's baseline hold, never this check; only a force apply (no
+        // digest at all) skips it.
+        let binding = match (&approval_digest, &plan_digest) {
+            (Some(intent), _) => Some((intent, plan.intent_digest())),
+            (None, Some(full)) => Some((full, plan.digest.clone())),
+            (None, None) => None,
+        };
+        if let Some((approved, fresh)) = &binding
+            && !crate::bundle::digests_match(approved, fresh.as_str())
         {
-            tracing::warn!(approved = %approved, fresh = %plan.digest, "refusing a stale plan");
+            tracing::warn!(approved = %approved, fresh = %fresh, "refusing a stale plan");
             self.remember_plan(&plan).await;
+            // Named by the plan digest the operator saw, when there is one.
+            let approved_digest = plan_digest.clone().unwrap_or_else(|| (*approved).clone());
             self.sink
                 .send(Report::StalePlan {
                     plan,
-                    approved_digest: approved.clone(),
+                    approved_digest,
                 })
                 .await;
             return;
+        }
+        // The plan about to run differs from the one the server holds (a
+        // force apply, or content that changed under an approved intent):
+        // report it first so the server records what was really applied.
+        if plan_digest
+            .as_deref()
+            .is_none_or(|d| !crate::bundle::digests_match(d, plan.digest.as_str()))
+        {
+            self.remember_plan(&plan).await;
+            self.sink.send(Report::Plan(plan.clone())).await;
         }
         let outcome = self.run_apply(rev.clone(), &ctx, &plan, true, true).await;
         tracing::info!(
@@ -2281,6 +2310,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
         Instruction::Apply {
             revision,
             plan_digest,
+            approval_digest,
             waived_checks,
             force,
             traceparent,
@@ -2290,6 +2320,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
         } => Op::Apply {
             revision,
             plan_digest,
+            approval_digest,
             waived_checks,
             force,
             traceparent,

@@ -53,6 +53,11 @@ struct Script {
     silent_rollback: bool,
     /// The plan defers these modules to apply time.
     deferred: Vec<String>,
+    /// The intent digest the agent reports with its plans; an Apply binding
+    /// it runs whatever the fresh plan (`digest`) is, as a current agent does.
+    intent: String,
+    /// The agent announces no capabilities (it predates force apply).
+    legacy_agent: bool,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -237,6 +242,7 @@ impl Harness {
                         removals: u32::from(s.destructive),
                         deferred_modules: s.deferred.clone(),
                         plan_json: b"{}".to_vec(),
+                        approval_digest: s.intent.clone(),
                         ..Default::default()
                     })),
                     SMsg::Health(h) => {
@@ -284,14 +290,31 @@ impl Harness {
                             }],
                         }));
                     }
-                    SMsg::Apply(a) => {
+                    SMsg::Apply(mut a) => {
                         if s.silent_apply {
                             continue;
+                        }
+                        // A force apply, or an Apply binding the plan's
+                        // unchanged intent, runs the fresh plan: the agent
+                        // reports it, then its result.
+                        let bound_intent =
+                            !a.approval_digest.is_empty() && a.approval_digest == s.intent;
+                        if a.force_plan || (bound_intent && a.plan_digest != s.digest) {
+                            reply(AMsg::Plan(PlanResult {
+                                revision: a.revision.clone(),
+                                digest: s.digest.clone(),
+                                changes: 1,
+                                plan_json: b"{}".to_vec(),
+                                approval_digest: s.intent.clone(),
+                                ..Default::default()
+                            }));
+                            a.plan_digest = s.digest.clone();
                         }
                         let fresh = s
                             .stale_plan_result
                             .clone()
-                            .or_else(|| s.stale_plan_always.then(|| format!("{}-fresh", s.digest)));
+                            .or_else(|| s.stale_plan_always.then(|| format!("{}-fresh", s.digest)))
+                            .filter(|_| !a.force_plan && !bound_intent);
                         if let Some(fresh) = fresh {
                             {
                                 let mut sc = script.lock().unwrap();
@@ -362,12 +385,18 @@ impl Harness {
 
     /// Connects `host` with a Hello naming `unreported` apply revisions.
     fn connect_with(&mut self, host: &str, applied: Option<&str>, unreported: Vec<String>) {
+        let legacy = self.scripts[host].lock().unwrap().legacy_agent;
         self.handle.connected(Connected {
             host: host.to_owned(),
             applied_revision: applied.map(str::to_owned),
             last_plan_digest: None,
             unreported_apply_revisions: unreported,
             new_session: true,
+            capabilities: if legacy {
+                vec![]
+            } else {
+                vec!["force_plan".into(), "approval_digest".into()]
+            },
         });
     }
 
@@ -1304,7 +1333,7 @@ async fn an_agent_reported_stale_plan_needs_reapproval_for_that_host() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_plan_that_is_stale_on_every_apply_fails_the_host() {
+async fn a_plan_that_is_stale_on_every_apply_holds_the_host() {
     let mut h = Harness::new().await;
     h.revision(
         "r1",
@@ -1316,9 +1345,7 @@ async fn a_plan_that_is_stale_on_every_apply_fails_the_host() {
     h.connect("a", None);
     let id = h.start("r1").await;
     let (r, hosts) = h
-        .wait(&id, "failed", |_, hs| {
-            host(hs, "a").state == HostPhase::Failed
-        })
+        .wait(&id, "held", |_, hs| host(hs, "a").state == HostPhase::Held)
         .await;
     let a = host(&hosts, "a");
     assert_eq!(a.wave, Some(1), "a refused apply does not start a new wave");
@@ -3195,4 +3222,139 @@ async fn a_durable_report_is_confirmed_only_after_its_reaction_is_saved() {
         .filter(|a| a == "rollout.host.failed")
         .count();
     assert_eq!(failed, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Force apply and intent-bound approvals
+// ---------------------------------------------------------------------------
+
+const ONE_PHASE: &str =
+    "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', max_failures: 0 }\n";
+
+/// A one-host rollout of `phases`, with `script` applied to the host before
+/// it connects; returns the rollout id once `ready` holds for the host.
+async fn one_host(
+    h: &mut Harness,
+    phases: &str,
+    script: impl FnOnce(&mut Script),
+    ready: fn(&RolloutHostRecord) -> bool,
+) -> String {
+    h.revision("r1", phases).await;
+    h.enrol("a", "web").await;
+    h.script("a", script);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "host ready", |_, hs| ready(host(hs, "a")))
+        .await;
+    id
+}
+
+fn force(id: &str) -> Command {
+    Command::Force {
+        rollout: id.to_owned(),
+        host: "a".into(),
+        note: "operator says so".into(),
+    }
+}
+
+#[rstest::rstest]
+#[case::non_deterministic_plan(ONE_PHASE, (|s: &mut Script| s.stale_plan_always = true) as fn(&mut Script), HostPhase::Held)]
+#[case::failed_apply(ONE_PHASE, (|s: &mut Script| s.apply_fail = Some(vec![])) as fn(&mut Script), HostPhase::Failed)]
+#[case::awaiting_approval(
+    "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n",
+    (|_: &mut Script| {}) as fn(&mut Script),
+    HostPhase::Planned
+)]
+#[tokio::test(start_paused = true)]
+async fn force_apply_runs_whatever_the_host_plans_now(
+    #[case] phases: &str,
+    #[case] script: fn(&mut Script),
+    #[case] from: HostPhase,
+) {
+    let mut h = Harness::new().await;
+    let ready: fn(&RolloutHostRecord) -> bool = match from {
+        HostPhase::Held => |a| a.state == HostPhase::Held,
+        HostPhase::Failed => |a| a.state == HostPhase::Failed,
+        _ => |a| a.state == HostPhase::Planned,
+    };
+    let id = one_host(&mut h, phases, script, ready).await;
+    let before = h.applies().len();
+    // The forced apply itself succeeds.
+    h.script("a", |s| {
+        s.apply_fail = None;
+        s.stale_plan_always = false;
+        s.digest = "plan-now".into();
+    });
+    h.command(force(&id)).await.unwrap();
+    let (_, hosts) = h
+        .wait(&id, "healthy", |_, hs| {
+            host(hs, "a").state == HostPhase::Healthy
+        })
+        .await;
+    let applies = h.applies();
+    assert_eq!(applies.len(), before + 1);
+    assert!(
+        applies.last().unwrap().2.force_plan,
+        "the Apply binds no digest"
+    );
+    assert_eq!(
+        host(&hosts, "a").plan_digest.as_deref(),
+        Some("plan-now"),
+        "the applied plan is recorded"
+    );
+    assert!(
+        h.audit_actions(&id)
+            .await
+            .contains(&"rollout.host.force".to_owned())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn force_apply_is_refused_for_an_agent_that_cannot_skip_its_digest_check() {
+    let mut h = Harness::new().await;
+    let id = one_host(
+        &mut h,
+        ONE_PHASE,
+        |s| {
+            s.apply_fail = Some(vec![]);
+            s.legacy_agent = true;
+        },
+        |a| a.state == HostPhase::Failed,
+    )
+    .await;
+    let err = h.command(force(&id)).await.expect_err("refused");
+    assert_eq!(err.kind, CommandErrorKind::Conflict);
+    assert!(!h.applies().last().unwrap().2.force_plan);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approval_covers_a_replan_that_only_changes_content() {
+    let mut h = Harness::new().await;
+    let id = one_host(
+        &mut h,
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n",
+        |s| s.intent = "intent-1".into(),
+        |a| a.state == HostPhase::Planned,
+    )
+    .await;
+    // The host's content drifts after the plan was reviewed.
+    h.script("a", |s| s.digest = "plan-b".into());
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "web".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let applies = h.applies();
+    assert_eq!(applies.len(), 1, "no re-approval round");
+    assert_eq!(applies[0].2.approval_digest, "intent-1");
+    assert_eq!(host(&hosts, "a").plan_digest.as_deref(), Some("plan-b"));
+    assert!(
+        h.audit_actions(&id)
+            .await
+            .contains(&"rollout.host.plan_content_changed".to_owned())
+    );
 }

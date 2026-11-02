@@ -9,7 +9,6 @@ use buckle_agent::transport::Report;
 use buckle_api::{HealthResultDto, HostRolloutState, RolloutState};
 use buckle_core::health::HealthScope;
 use buckle_integration::{Fleet, WAIT, World, eventually, rollout_host};
-use reqwest::StatusCode;
 use rstest::rstest;
 
 /// The checked `app` at revision `n`; from revision 2 it also writes the
@@ -81,15 +80,6 @@ async fn a_host_unhealthy_before_the_change_is_handled_per_the_baseline_policy(
                     .any(|h| h.scope == "baseline" && h.check == "healthy" && h.status == "fail"),
                 "{health:?}"
             );
-            // Only a held host can be forced.
-            let (status, body) = world
-                .api()
-                .post(
-                    &format!("/api/v1/rollouts/{id}/hosts/ok-1/force"),
-                    serde_json::json!({}),
-                )
-                .await;
-            assert_eq!(status, StatusCode::CONFLICT, "{body}");
             // The operator forces it; the change repairs it and it completes.
             world
                 .api()

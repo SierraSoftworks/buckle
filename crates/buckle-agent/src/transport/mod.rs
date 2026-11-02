@@ -176,8 +176,13 @@ pub enum Instruction {
         /// The revision to apply.
         revision: RevisionId,
         /// The approved plan digest, or `None` for an automatic apply (local
-        /// mode only), which applies whatever the fresh plan is.
+        /// mode) or an operator's force apply, which applies whatever the
+        /// fresh plan is.
         plan_digest: Option<String>,
+        /// The approved intent digest ([`buckle_core::plan::Plan::intent_digest`]).
+        /// When set it binds the apply instead of `plan_digest`, so a fresh
+        /// plan that differs only in rendered content still applies.
+        approval_digest: Option<String>,
         /// Checks waived for this run (`module/check`).
         waived_checks: Vec<String>,
         /// The operator forced the apply despite a failing baseline.
