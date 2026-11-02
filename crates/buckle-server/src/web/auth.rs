@@ -5,9 +5,12 @@
 //! the id token in the HttpOnly session cookie (re-validated each request);
 //! without it, an anonymous principal. `user_acl` decides whether the
 //! request may proceed at all (absent: anyone authenticated) and
-//! `admin_acl` whether it carries administrative rights (absent: nobody),
-//! both evaluated over [`AclRequest`]. Mutating requests also need the
-//! double-submit CSRF token.
+//! `admin_acl` whether it carries administrative rights, both evaluated
+//! over [`AclRequest`]. An absent `admin_acl` means nobody when OIDC is
+//! configured, and everybody when it is not: omitting `oidc` turns
+//! authentication off for local development (design §12), and the ACLs
+//! that are given still see the request's metadata. Mutating requests also
+//! need the double-submit CSRF token.
 //!
 //! ACLs see the path the router dispatches on: percent-decoded, with any
 //! path that could be read two ways (an encoded `/` or `\`, a `.` or `..`
@@ -243,9 +246,9 @@ pub async fn resolve(state: &AppState, req: &HttpRequest) -> Result<Principal, A
     })
 }
 
-/// Evaluates `user_acl` (absent: allowed) and `admin_acl` (absent: denied)
-/// for a request carrying `claims`. An expression that fails to evaluate
-/// counts as not matching.
+/// Evaluates `user_acl` (absent: allowed) and `admin_acl` (absent: denied
+/// with OIDC, allowed without it) for a request carrying `claims`. An
+/// expression that fails to evaluate counts as not matching.
 pub fn evaluate(
     web: &crate::config::WebConfig,
     req: &HttpRequest,
@@ -267,11 +270,12 @@ pub fn evaluate(
         .as_ref()
         .map(|f| f.matches(&acl).unwrap_or(false))
         .unwrap_or(true);
-    let is_admin = web
-        .admin_acl
-        .as_ref()
-        .map(|f| f.matches(&acl).unwrap_or(false))
-        .unwrap_or(false);
+    let is_admin = match &web.admin_acl {
+        Some(f) => f.matches(&acl).unwrap_or(false),
+        // Without sign-in nobody can be told apart, so an absent ACL keeps
+        // the local-development promise that everything is permitted.
+        None => web.oidc.is_none(),
+    };
     (allowed, is_admin)
 }
 

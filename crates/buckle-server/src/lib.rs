@@ -190,11 +190,6 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         )
     })?;
     tracing::info!(address = %config.listen.http, "serving the API and UI");
-    if config.web.oidc.is_some() && config.web.user_acl.is_none() {
-        tracing::warn!(
-            "web.oidc is configured without web.user_acl: anyone the identity provider signs in may read the fleet"
-        );
-    }
     let mut state = web::AppState::new(
         store,
         revisions,

@@ -118,17 +118,21 @@ fn admin() -> Result<(), ApiError> {
 }
 
 pub fn me() -> Result<Option<Me>, ApiError> {
+    let viewer = flag("role").as_deref() == Some("viewer");
     match flag("auth").as_deref() {
         Some("expired") => Err(ApiError::Unauthorized),
-        Some("off") => Ok(None),
+        // A server without OIDC; with `role=viewer`, one whose admin_acl does
+        // not match the request.
+        Some("off") => Ok(Some(Me::anonymous(!viewer))),
         _ => {
             let mut me = data::me();
-            if flag("role").as_deref() == Some("viewer") {
+            if viewer {
                 me = Me {
                     name: "Victor Viewer".into(),
                     email: Some("victor@example.com".into()),
                     subject: "victor".into(),
                     is_admin: false,
+                    anonymous: false,
                 };
             }
             Ok(Some(me))

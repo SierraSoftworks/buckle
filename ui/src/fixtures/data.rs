@@ -46,6 +46,7 @@ pub fn me() -> Me {
         email: Some("alice@example.com".into()),
         subject: "alice".into(),
         is_admin: true,
+        anonymous: false,
     }
 }
 

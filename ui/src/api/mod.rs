@@ -216,8 +216,9 @@ async fn write<B: Serialize, T: DeserializeOwned>(
 
 // ------------------------------------------------------------------ session
 
-/// `GET /me`: `Some` for a signed-in user, `None` when the server has no
-/// sign-in configured (everything is then permitted).
+/// `GET /me`: who is asking and whether they may act. A server without
+/// sign-in answers with [`Me::anonymous`] set; one from before that field
+/// answered 204, read here as `None` (everything permitted).
 pub async fn me() -> Result<Option<Me>, ApiError> {
     demo!(demo_store::me());
     let response = send::<()>(Method::Get, "/me", None).await?;

@@ -102,16 +102,20 @@ pub const PROTECTED: &[(&str, &str)] = &[
 
 // ------------------------------------------------------------------ auth
 
+/// `GET /me`: who the caller is and whether they may act (`is_admin`).
+/// Without OIDC the caller is anonymous, and `is_admin` is what
+/// `admin_acl` (absent: allowed) makes of the request's metadata.
 async fn me(state: Data, req: HttpRequest) -> ApiResult {
-    if state.oidc.is_none() {
-        return Ok(HttpResponse::NoContent().finish());
-    }
     let p = auth::resolve(&state, &req).await?;
+    if !p.authenticated {
+        return Ok(HttpResponse::Ok().json(Me::anonymous(p.is_admin)));
+    }
     Ok(HttpResponse::Ok().json(Me {
         name: p.name,
         email: p.email,
         subject: p.subject,
         is_admin: p.is_admin,
+        anonymous: false,
     }))
 }
 

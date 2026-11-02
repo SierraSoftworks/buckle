@@ -49,6 +49,15 @@ describe("session", () => {
     await close();
   });
 
+  test("without sign-in, admin_acl still decides who may act", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "auth=off&role=viewer" });
+    await page.getByText("no sign-in", { exact: true }).waitFor();
+    await page.getByText("read only", { exact: true }).waitFor();
+    await page.getByText("Approving needs an administrator (admin_acl).").waitFor();
+    assert.equal(await page.getByRole("button", { name: "Review and approve…" }).count(), 0);
+    await close();
+  });
+
   test("the session is shown and signing out leaves", async () => {
     const { page, close } = await open("/");
     await page.getByText("Alice Operator").waitFor();

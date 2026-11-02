@@ -145,16 +145,45 @@ where
 
 // ------------------------------------------------------------ without OIDC
 
+async fn me(
+    app: &impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<impl MessageBody>,
+        Error = actix_web::Error,
+    >,
+    req: test::TestRequest,
+) -> buckle_api::Me {
+    let resp = test::call_service(app, req.uri("/api/v1/me").to_request()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    test::read_body_json(resp).await
+}
+
 #[actix_web::test]
-async fn me_is_204_without_oidc() {
-    let e = env(WebConfig::default()).await;
-    let app = test::init_service(app(e.state.clone())).await;
-    let resp = test::call_service(
+async fn without_oidc_me_is_anonymous_and_says_whether_admin_acl_matched() {
+    let open = env(WebConfig::default()).await;
+    let app = test::init_service(app(open.state.clone())).await;
+    let me_open = me(&app, test::TestRequest::get()).await;
+    assert!(me_open.anonymous);
+    assert!(
+        me_open.is_admin,
+        "no oidc and no admin_acl: everything is permitted"
+    );
+
+    let gated = env(WebConfig {
+        admin_acl: acl(r#"headers.x-team == "ops""#),
+        ..Default::default()
+    })
+    .await;
+    let app = test::init_service(super::app(gated.state.clone())).await;
+    let outsider = me(&app, test::TestRequest::get()).await;
+    assert!(outsider.anonymous);
+    assert!(!outsider.is_admin, "admin_acl still sees request metadata");
+    let ops = me(
         &app,
-        test::TestRequest::get().uri("/api/v1/me").to_request(),
+        test::TestRequest::get().insert_header(("x-team", "ops")),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(ops.is_admin);
 }
 
 #[actix_web::test]
@@ -187,7 +216,7 @@ async fn acls_apply_to_request_metadata_without_oidc() {
 }
 
 #[actix_web::test]
-async fn admin_routes_are_403_without_admin_acl() {
+async fn without_oidc_an_absent_admin_acl_permits_admin_routes() {
     let e = env(WebConfig::default()).await;
     add_host(&e.store, "pi-1", HostStatus::Pending).await;
     let app = test::init_service(app(e.state.clone())).await;
@@ -203,9 +232,49 @@ async fn admin_routes_are_403_without_admin_acl() {
     .await;
     assert_eq!(
         resp.status(),
-        StatusCode::FORBIDDEN,
-        "admin_acl absent means nobody"
+        StatusCode::OK,
+        "local development: sign-in is off"
     );
+    let page: buckle_api::Page<buckle_api::AuditEntry> = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/v1/audit").to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.items[0].actor, "anonymous");
+}
+
+#[actix_web::test]
+async fn with_oidc_an_absent_admin_acl_means_nobody_is_admin() {
+    let idp = idp().await;
+    let e = env(WebConfig {
+        admin_acl: None,
+        ..oidc_web(&idp)
+    })
+    .await;
+    add_host(&e.store, "pi-1", HostStatus::Pending).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let session = Cookie::new(
+        auth::SESSION_COOKIE,
+        mint(&PROVIDER, &idp.server.uri(), None, &["admins"]),
+    );
+    let who = me(&app, test::TestRequest::get().cookie(session.clone())).await;
+    assert!(!who.anonymous);
+    assert!(!who.is_admin, "admin_acl absent with sign-in on: nobody");
+    let (csrf_cookie, token) = csrf(&app).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/approve")
+            .cookie(session)
+            .cookie(csrf_cookie)
+            .insert_header((auth::CSRF_HEADER, token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[actix_web::test]

@@ -430,11 +430,44 @@ pub struct WebConfig {
     /// Who may read. Absent means everyone the OIDC provider authenticates (or everyone, without OIDC).
     #[serde(default)]
     pub user_acl: Option<filt_rs::Filter>,
-    /// Who may approve, pause, roll back and manage hosts. Absent means nobody.
+    /// Who may approve, pause, roll back and manage hosts. Absent means
+    /// nobody when `oidc` is configured, and everyone without it (sign-in
+    /// is then off, for local development).
     #[serde(default)]
     pub admin_acl: Option<filt_rs::Filter>,
+    /// Sign-in. Absent turns authentication off: every request is
+    /// anonymous, and the ACLs see only its metadata.
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+}
+
+impl WebConfig {
+    /// What the server should warn about at start-up: settings that leave
+    /// the UI more open, or more closed, than an operator may expect.
+    pub fn startup_warnings(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        match (&self.oidc, &self.user_acl, &self.admin_acl) {
+            (Some(_), user, admin) => {
+                if user.is_none() {
+                    out.push(
+                        "web.oidc is configured without web.user_acl: anyone the identity provider signs in may read the fleet",
+                    );
+                }
+                if admin.is_none() {
+                    out.push(
+                        "web.oidc is configured without web.admin_acl: nobody may approve, pause, roll back or manage hosts",
+                    );
+                }
+            }
+            (None, _, None) => out.push(
+                "web.oidc is not configured: sign-in is off and every request may approve, pause, roll back and manage hosts",
+            ),
+            (None, _, Some(_)) => out.push(
+                "web.oidc is not configured: sign-in is off; web.admin_acl sees only request metadata",
+            ),
+        }
+        out
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -756,6 +789,37 @@ secrets:
         assert_eq!(t.otlp_headers["x-api-key"], "k3y");
         assert!(!format!("{t:?}").contains("k3y"));
         assert!(TelemetryConfig::peek(&dir.path().join("missing.yaml")).is_none());
+    }
+
+    #[rstest]
+    #[case(true, false, false, &["without web.user_acl", "without web.admin_acl"])]
+    #[case(true, true, true, &[])]
+    #[case(true, true, false, &["without web.admin_acl"])]
+    #[case(false, false, false, &["every request may approve"])]
+    #[case(false, false, true, &["only request metadata"])]
+    fn startup_warnings_name_what_is_open_or_shut(
+        #[case] oidc: bool,
+        #[case] user_acl: bool,
+        #[case] admin_acl: bool,
+        #[case] expected: &[&str],
+    ) {
+        let web = WebConfig {
+            base_url: Some("https://buckle.example".into()),
+            user_acl: user_acl.then(|| filt_rs::Filter::new("true").unwrap()),
+            admin_acl: admin_acl.then(|| filt_rs::Filter::new("true").unwrap()),
+            oidc: oidc.then(|| OidcConfig {
+                endpoint: "https://auth.example".into(),
+                client_id: "c".into(),
+                client_secret: "s".into(),
+                scopes: vec![],
+            }),
+            ..Default::default()
+        };
+        let warnings = web.startup_warnings();
+        assert_eq!(warnings.len(), expected.len(), "{warnings:?}");
+        for (w, e) in warnings.iter().zip(expected) {
+            assert!(w.contains(e), "{w:?} should mention {e:?}");
+        }
     }
 
     #[test]

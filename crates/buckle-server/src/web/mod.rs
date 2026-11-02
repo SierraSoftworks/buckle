@@ -140,6 +140,9 @@ pub async fn serve(
     listener: std::net::TcpListener,
     cancel: CancellationToken,
 ) -> buckle_core::Result<()> {
+    for warning in state.web.startup_warnings() {
+        tracing::warn!("{warning}");
+    }
     let state = web::Data::new(state);
     let server = actix_web::HttpServer::new(move || app(state.clone()))
         .disable_signals()

@@ -40,8 +40,11 @@ pub enum Route {
 pub enum Session {
     Loading,
     SignedIn(Me),
-    /// The server has no sign-in configured: everything is permitted.
-    Open,
+    /// The server has no sign-in configured. `admin` is whether its
+    /// `admin_acl` (absent: everyone) admits this request's metadata.
+    Open {
+        admin: bool,
+    },
     /// On the way to the sign-in page.
     Redirecting,
     Forbidden(String),
@@ -59,7 +62,7 @@ impl Auth {
     pub fn is_admin(&self) -> bool {
         match &self.session {
             Session::SignedIn(me) => me.is_admin,
-            Session::Open => true,
+            Session::Open { admin } => *admin,
             _ => false,
         }
     }
@@ -80,8 +83,10 @@ pub fn app() -> Html {
         use_effect_with((), move |_| {
             spawn_local(async move {
                 session.set(match api::me().await {
+                    Ok(Some(me)) if me.anonymous => Session::Open { admin: me.is_admin },
                     Ok(Some(me)) => Session::SignedIn(me),
-                    Ok(None) => Session::Open,
+                    // A server from before `Me::anonymous` answered 204.
+                    Ok(None) => Session::Open { admin: true },
                     Err(ApiError::Unauthorized) => {
                         crate::auth::begin_login();
                         Session::Redirecting
@@ -123,7 +128,7 @@ pub fn app() -> Html {
                 </div>
             </div>
         },
-        Session::SignedIn(_) | Session::Open => html! {
+        Session::SignedIn(_) | Session::Open { .. } => html! {
             <LiveProvider>
                 <Shell>
                     <Switch<Route> render={switch} />
