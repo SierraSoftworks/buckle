@@ -385,6 +385,7 @@ mod tests {
         let rollout = RolloutDetail {
             summary: RolloutSummary {
                 id: "42".into(),
+                name: None,
                 revision: "r".into(),
                 revision_message: "m".into(),
                 state: RolloutState::Rolling,

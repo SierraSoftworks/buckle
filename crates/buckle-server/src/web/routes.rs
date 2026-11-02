@@ -909,6 +909,35 @@ async fn start_rollout(
 
 // ------------------------------------------------------------------ rollouts
 
+/// The id of the rollout a path names, by id or by name (`word.word.word`,
+/// see [`buckle_api::RolloutName::parse`]). A key that is neither passes
+/// through for the handler's own "no rollout" answer.
+async fn resolve_rollout(state: &AppState, key: String) -> Result<String, ApiError> {
+    let Some(name) = buckle_api::RolloutName::parse(&key) else {
+        return Ok(key);
+    };
+    let k = key.clone();
+    let (exists, ids) = state
+        .store
+        .call(move |db| {
+            Ok((
+                db.rollouts().get(&k)?.is_some(),
+                db.rollouts().ids_named(&name)?,
+            ))
+        })
+        .await?;
+    match ids.as_slice() {
+        _ if exists => Ok(key),
+        [id] => Ok(id.clone()),
+        [] => Err(ApiError::not_found(format!("No rollout named '{name}'."))),
+        many => Err(ApiError::conflict(format!(
+            "{} rollouts are named '{name}'; use one of their ids: {}.",
+            many.len(),
+            many.join(", ")
+        ))),
+    }
+}
+
 async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::RolloutDetail, ApiError> {
     let i2 = id.to_owned();
     let found = state
@@ -1054,7 +1083,8 @@ async fn rollouts(state: Data, _: Authenticated, q: web::Query<PageQuery>) -> Ap
 }
 
 async fn rollout(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
-    Ok(HttpResponse::Ok().json(rollout_detail(&state, &path.into_inner()).await?))
+    let id = resolve_rollout(&state, path.into_inner()).await?;
+    Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))
 }
 
 /// The host's run in a rollout: the plan as pending before it starts, live
@@ -1065,6 +1095,7 @@ async fn rollout_host_report(
     path: web::Path<(String, String)>,
 ) -> ApiResult {
     let (rollout, host) = path.into_inner();
+    let rollout = resolve_rollout(&state, rollout).await?;
     let (r, h) = (rollout.clone(), host.clone());
     let (row, run) = state
         .store
@@ -1107,7 +1138,8 @@ async fn rollout_host_report(
 }
 
 async fn rollout_plans(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
-    Ok(HttpResponse::Ok().json(rollout_detail(&state, &path.into_inner()).await?.plans))
+    let id = resolve_rollout(&state, path.into_inner()).await?;
+    Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?.plans))
 }
 
 async fn rollout_approve(
@@ -1116,7 +1148,7 @@ async fn rollout_approve(
     path: web::Path<String>,
     body: web::Json<ApproveRequest>,
 ) -> ApiResult {
-    let id = path.into_inner();
+    let id = resolve_rollout(&state, path.into_inner()).await?;
     let b = body.into_inner();
     state
         .controller
@@ -1143,7 +1175,7 @@ async fn rollout_reject(
     path: web::Path<String>,
     body: web::Json<RejectRequest>,
 ) -> ApiResult {
-    let id = path.into_inner();
+    let id = resolve_rollout(&state, path.into_inner()).await?;
     let reason = body.into_inner().reason.trim().to_owned();
     if reason.is_empty() {
         return Err(ApiError::bad_request(
@@ -1183,6 +1215,7 @@ async fn rollout_action(
     body: Option<web::Json<ActionRequest>>,
 ) -> ApiResult {
     let (id, action) = path.into_inner();
+    let id = resolve_rollout(&state, id).await?;
     let note = body.map(|b| b.into_inner().note).unwrap_or_default();
     let rollout = id.clone();
     let command = match action.as_str() {
@@ -1207,6 +1240,7 @@ async fn rollout_host_action(
     body: Option<web::Json<ActionRequest>>,
 ) -> ApiResult {
     let (id, host, action) = path.into_inner();
+    let id = resolve_rollout(&state, id).await?;
     let note = body.map(|b| b.into_inner().note).unwrap_or_default();
     let rollout = id.clone();
     let command = match action.as_str() {
@@ -1238,6 +1272,7 @@ async fn rollout_continue(
     body: web::Json<ContinueRequest>,
 ) -> ApiResult {
     let (id, host) = path.into_inner();
+    let id = resolve_rollout(&state, id).await?;
     let b = body.into_inner();
     state
         .controller

@@ -314,6 +314,7 @@ mod tests {
     fn summary(id: &str, state: RolloutState) -> RolloutSummary {
         RolloutSummary {
             id: id.into(),
+            name: None,
             revision: "rev".into(),
             revision_message: "m".into(),
             state,

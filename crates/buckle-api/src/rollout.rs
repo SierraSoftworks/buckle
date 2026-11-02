@@ -113,6 +113,10 @@ pub struct RolloutPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutSummary {
     pub id: String,
+    /// The memorable `word.word.word` form of `id` ([`crate::rollout_name`]),
+    /// accepted wherever the API takes a rollout id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub revision: String,
     pub revision_message: String,
     pub state: RolloutState,

@@ -6,15 +6,18 @@ pub mod audit;
 pub mod auth;
 pub mod catalog;
 pub mod fleet;
+pub mod name;
 pub mod plan;
 pub mod revision;
 pub mod rollout;
 pub mod run;
+mod words;
 
 pub use audit::*;
 pub use auth::*;
 pub use catalog::*;
 pub use fleet::*;
+pub use name::*;
 pub use plan::*;
 pub use revision::*;
 pub use rollout::*;

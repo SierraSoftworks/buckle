@@ -10,7 +10,9 @@ use crate::components::{
     Button, Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
-use crate::logic::format::{commit, first_line, relative, short_duration, timestamp};
+use crate::logic::format::{
+    commit, first_line, relative, rollout_label, short_duration, timestamp,
+};
 use crate::logic::live::apply_rollouts;
 use crate::logic::tone::{rollout_state_label, rollout_state_tone};
 
@@ -109,7 +111,7 @@ fn row(r: &RolloutSummary, now: chrono::DateTime<chrono::Utc>) -> Html {
         .unwrap_or_else(|| "—".into());
     html! {
         <tr>
-            <td><RouteLink to={Route::Rollout { id: r.id.clone() }} classes="strong">{ format!("#{}", r.id) }</RouteLink></td>
+            <td><RouteLink to={Route::Rollout { id: r.id.clone() }} classes="strong">{ rollout_label(&r.id) }</RouteLink></td>
             <td>
                 <Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} title={r.pause_reason.clone()} />
                 if let Some(p) = &r.current_phase { <span class="muted small">{ format!(" {p}") }</span> }

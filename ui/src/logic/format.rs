@@ -96,6 +96,12 @@ pub fn short(id: &str) -> &str {
     }
 }
 
+/// How a rollout is named to people: its `word.word.word` name, or `#id`
+/// for an id that has none.
+pub fn rollout_label(id: &str) -> String {
+    buckle_api::rollout_name(id).unwrap_or_else(|| format!("#{id}"))
+}
+
 /// The first seven characters of a commit, the way `git log --oneline` shows it.
 pub fn commit(id: &str) -> &str {
     match id.char_indices().nth(7) {
@@ -163,6 +169,13 @@ mod tests {
         assert_eq!(age(Some(now - Duration::seconds(200)), now), "3m");
         // A reading stamped a moment in the future (clock skew) is not negative.
         assert_eq!(age(Some(now + Duration::seconds(3)), now), "0s");
+    }
+
+    #[test]
+    fn rollouts_are_labelled_by_name_or_by_id() {
+        let id = "3f2a9c1e-8b4d-4f6a-9c2e-1d7b5a3e9f01";
+        assert_eq!(rollout_label(id), buckle_api::rollout_name(id).unwrap());
+        assert_eq!(rollout_label("42"), "#42");
     }
 
     #[test]

@@ -2117,6 +2117,27 @@ impl Controller {
 
     // ------------------------------------------------------------ rollout lifecycle
 
+    /// A fresh rollout id whose name no earlier rollout has, so that a name
+    /// keeps finding one rollout (a clash is 1 in 2^33 per pair; the retries
+    /// only bound the loop).
+    async fn new_rollout_id(&self) -> Result<String, CommandError> {
+        for _ in 0..8 {
+            let id = new_id();
+            let Some(name) = buckle_api::RolloutName::of(&id) else {
+                return Ok(id);
+            };
+            let taken = self
+                .store
+                .call(move |db| db.rollouts().ids_named(&name))
+                .await
+                .map_err(CommandError::internal)?;
+            if taken.is_empty() {
+                return Ok(id);
+            }
+        }
+        Ok(new_id())
+    }
+
     async fn start(
         &mut self,
         revision: &str,
@@ -2146,7 +2167,7 @@ impl Controller {
             .map_err(CommandError::internal)?;
         let policy = rev.fleet.rollout.clone();
         let now = self.now();
-        let id = new_id();
+        let id = self.new_rollout_id().await?;
         let busy = self
             .live
             .iter()
