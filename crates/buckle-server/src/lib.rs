@@ -12,6 +12,7 @@ pub mod secrets;
 pub mod source;
 pub mod store;
 pub mod views;
+pub mod web;
 
 pub use config::ServerConfig;
 

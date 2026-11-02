@@ -103,7 +103,7 @@ tempfile = "3.27"
 wiremock = "0.6.5"
 tracing-subscriber = "0.3.23"
 pretty_assertions = "1.4"
-rsa = "0.9"
+rsa = { version = "0.9", features = ["getrandom", "sha2"] }
 
 [profile.release]
 lto = "fat"

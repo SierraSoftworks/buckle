@@ -271,3 +271,19 @@ impl<'c> Rollouts<'c> {
         Ok(())
     }
 }
+
+impl Rollouts<'_> {
+    /// The most recent healthy row for a host (what it last converged to).
+    pub fn latest_healthy_for_host(&self, host: &str) -> Result<Option<RolloutHostRecord>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {H_COLUMNS} FROM rollout_hosts WHERE host = ?1 AND state = 'healthy' ORDER BY updated_at DESC LIMIT 1"),
+                params![host],
+                h_row,
+            )
+            .optional()
+            .map_err(db_error)?
+            .map(h_record)
+            .transpose()
+    }
+}
