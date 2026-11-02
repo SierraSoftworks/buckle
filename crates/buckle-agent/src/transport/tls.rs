@@ -1,6 +1,6 @@
 //! Certificate pinning for servers that generate their own certificate.
 //!
-//! `buckle server fingerprint` prints the SHA-256 fingerprint of the server's
+//! `buckle server --print-fingerprint` prints the SHA-256 fingerprint of the server's
 //! certificate as `sha256:<hex>`; `buckle install agent --ca-fingerprint`
 //! pins it. The [`PinnedCertVerifier`] then accepts exactly that certificate
 //! (whatever names it carries, since a generated certificate rarely matches
@@ -32,7 +32,7 @@ pub fn parse_fingerprint(text: &str) -> buckle_core::Result<[u8; 32]> {
         buckle_core::error::wrap_user(
             e,
             format!("The pinned certificate fingerprint '{text}' is not valid hex."),
-            &["Copy the fingerprint printed by `buckle server fingerprint`, e.g. `sha256:3f1c…`."],
+            &["Copy the fingerprint printed by `buckle server --print-fingerprint`, e.g. `sha256:3f1c…`."],
         )
     })?;
     bytes.try_into().map_err(|_| {
