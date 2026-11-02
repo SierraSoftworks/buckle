@@ -217,12 +217,23 @@ pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> Run
         })
     };
 
-    let mut report = match &fetch.data {
+    // While another run is being fetched, the previous answer is not this
+    // source's (a host's runs are fetched by id; a rollout's by host).
+    let answers = |r: &RunReport| match &source {
+        Some(RunSource::Host { host, run }) => r.host == *host && r.id == *run,
+        Some(RunSource::Rollout { host, .. }) => r.host == *host,
+        None => false,
+    };
+    let current = fetch
+        .data
+        .as_ref()
+        .filter(|d| d.1.as_ref().is_none_or(answers));
+    let mut report = match current {
         Some(data) => data.1.clone(),
         None => seed,
     };
     let mut stale = false;
-    if let (Some(data), Some(watch)) = (&fetch.data, source.as_ref().map(RunSource::watch))
+    if let (Some(data), Some(watch)) = (current, source.as_ref().map(RunSource::watch))
         && let Some(events) = live.log.since(data.0)
     {
         for event in events {
@@ -236,7 +247,7 @@ pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> Run
     }
 
     // Once per fetched answer: the next answer has a newer sequence number.
-    let stale_at = stale.then(|| fetch.data.as_ref().map(|d| d.0)).flatten();
+    let stale_at = stale.then(|| current.map(|d| d.0)).flatten();
     {
         let reload = fetch.reload.clone();
         use_effect_with(stale_at, move |at| {
@@ -249,7 +260,7 @@ pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> Run
 
     RunFeed {
         report,
-        settled: fetch.data.is_some(),
+        settled: current.is_some(),
         error: fetch.error.clone(),
         reload: fetch.reload.clone(),
     }

@@ -480,6 +480,21 @@ fn runs_panel(props: &RunsProps) -> Html {
     }
     runs.retain(|r| !r.id.is_empty());
 
+    // The select shows the run shown, also after "Show the newest" or a
+    // recent-runs row changed it (an option's `selected` attribute does not
+    // move a select the reader has already changed).
+    let select = use_node_ref();
+    {
+        let select = select.clone();
+        let value = shown.clone().unwrap_or_default();
+        use_effect_with((value, runs.len()), move |(value, _)| {
+            if let Some(el) = select.cast::<HtmlSelectElement>() {
+                el.set_value(value);
+            }
+            || ()
+        });
+    }
+
     let onchange = {
         let (on_pick, newest) = (props.on_pick.clone(), props.newest.clone());
         Callback::from(move |e: Event| {
@@ -492,7 +507,7 @@ fn runs_panel(props: &RunsProps) -> Html {
         html! {
             <label class="run-picker">
                 <span class="muted small">{ "Run" }</span>
-                <select class="input" aria-label="Run to show" {onchange}>
+                <select class="input" aria-label="Run to show" ref={select.clone()} {onchange}>
                     if let (false, Some(s)) = (listed, &shown) {
                         <option value={s.clone()} selected=true>{ "newest" }</option>
                     }

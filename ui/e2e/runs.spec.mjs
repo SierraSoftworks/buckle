@@ -102,11 +102,13 @@ describe("a host's latest run", () => {
     await report.getByRole("button", { name: "Show the newest" }).click();
     await report.getByRole("heading", { name: "Latest run" }).waitFor();
     await eventually(async () => assert.equal(await report.locator(".run").getAttribute("data-run"), "pi-5-7c2e1f0"));
+    assert.equal(await picker.inputValue(), "pi-5-7c2e1f0", "the picker follows");
 
     // The recent-runs table opens a run's report too.
     await page.locator('tr[data-run="pi-5-5d4a9b2"]').getByRole("button", { name: /Show the report of the run started/ }).click();
     await eventually(async () => assert.equal(await report.locator(".run").getAttribute("data-run"), "pi-5-5d4a9b2"));
     assert.equal(await report.locator(".run").getAttribute("data-state"), "succeeded");
+    assert.equal(await picker.inputValue(), "pi-5-5d4a9b2");
     await close();
   });
 
