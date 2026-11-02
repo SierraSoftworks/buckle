@@ -584,6 +584,7 @@ mod tests {
             resources: vec![],
             recent_runs: vec![],
             health_results: vec![],
+            health_checks: vec![],
             drift: vec![],
             latest_run: Some(report),
         };

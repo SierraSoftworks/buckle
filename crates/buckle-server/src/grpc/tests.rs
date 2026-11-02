@@ -764,6 +764,61 @@ async fn apply_events_open_a_run_that_the_result_completes() {
     assert_ne!(next_progress(&mut live).await.run_id, run_id);
 }
 
+#[tokio::test]
+async fn health_readings_belong_to_the_rollout_that_applied_their_revision() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    tx.send(module_started("d1")).await.unwrap();
+    let run = next_progress(&mut live).await.run_id;
+    s.store
+        .call(move |db| db.runs().set_rollout(&run, "ro-1"))
+        .await
+        .unwrap();
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::Health(buckle_proto::v1::HealthReport {
+            scope: buckle_proto::v1::HealthScope::Drift as i32,
+            revision: "r1".into(),
+            results: vec![buckle_proto::v1::HealthResult {
+                module: "m".into(),
+                check: "api".into(),
+                kind: "http".into(),
+                required: true,
+                passed: false,
+                reason: "503".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    let checks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let checks = s.store.call(|db| db.health().checks("pi-1")).await.unwrap();
+            if !checks.is_empty() {
+                return checks;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the readings are stored");
+    assert_eq!(checks[0].status, "fail");
+    let epoch = &checks[0].history[0];
+    assert_eq!(
+        (epoch.rollout_id.as_deref(), epoch.revision.as_str()),
+        (Some("ro-1"), "r1")
+    );
+    let events = s
+        .store
+        .call(|db| db.health().for_host("pi-1", 10))
+        .await
+        .unwrap();
+    assert_eq!(events[0].rollout.as_deref(), Some("ro-1"));
+}
+
 fn module_started(digest: &str) -> AgentMessage {
     apply_event(
         digest,

@@ -382,8 +382,15 @@ impl<'c> Hosts<'c> {
         Ok(())
     }
 
-    /// Forgets the host, its facts, its drift and the reports it sent.
+    /// Forgets the host, its facts, its drift, its health and the reports it
+    /// sent.
     pub fn delete(&self, id: &str) -> Result<bool> {
+        self.conn
+            .execute("DELETE FROM health_events WHERE host = ?1", params![id])
+            .map_err(db_error)?;
+        self.conn
+            .execute("DELETE FROM health_status WHERE host = ?1", params![id])
+            .map_err(db_error)?;
         self.conn
             .execute("DELETE FROM host_facts WHERE host_id = ?1", params![id])
             .map_err(db_error)?;

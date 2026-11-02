@@ -313,6 +313,17 @@ impl<'c> Runs<'c> {
         Ok(self.page(host, None, 1)?.0.into_iter().next())
     }
 
+    /// The newest run of `host` that applied `revision`.
+    pub fn latest_for_revision(&self, host: &str, revision: &str) -> Result<Option<RunRecord>> {
+        Ok(self
+            .query(
+                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND revision = ?2 ORDER BY id DESC LIMIT 1"),
+                params![host, revision],
+            )?
+            .into_iter()
+            .next())
+    }
+
     /// The run recorded after `run` on the same host, if any (it bounds the
     /// health results that belong to `run`).
     pub fn next_after(&self, run: &RunRecord) -> Result<Option<RunRecord>> {

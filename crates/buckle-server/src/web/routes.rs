@@ -529,19 +529,23 @@ fn health_dto(h: crate::store::HealthEventRecord) -> HealthResultDto {
         status: h.status,
         reason: h.reason,
         at: h.at,
-        rollout_id: None,
+        rollout_id: h.rollout,
     }
 }
 
+/// The most health results a run report carries: the newest of its window,
+/// which for the host's latest run is open-ended.
+const RUN_HEALTH_LIMIT: u32 = 2000;
+
 /// The report of a stored run: its rollout's plan (when the run follows
 /// one), its events, its outcome and the health results recorded from its
-/// start until the host's next run.
+/// start until the host's next run (bake, pre-phase and drift readings).
 async fn stored_report(
     state: &AppState,
     run: crate::store::RunRecord,
 ) -> Result<buckle_api::RunReport, ApiError> {
     let r = run.clone();
-    let (events, plan, next, health) = state
+    let (events, plan, health) = state
         .store
         .call(move |db| {
             let plan = match &r.rollout {
@@ -552,11 +556,12 @@ async fn stored_report(
                     .and_then(|h| h.plan),
                 None => None,
             };
+            let until = db.runs().next_after(&r)?.map(|n| n.started_at);
             Ok((
                 db.runs().events(&r.id)?,
                 plan,
-                db.runs().next_after(&r)?,
-                db.health().for_host(&r.host, 500)?,
+                db.health()
+                    .between(&r.host, r.started_at, until, RUN_HEALTH_LIMIT)?,
             ))
         })
         .await?;
@@ -566,15 +571,10 @@ async fn stored_report(
         .outcome_json
         .as_deref()
         .and_then(|j| serde_json::from_str(j).ok());
-    let until = next.map(|n| n.started_at);
+    // Baseline readings judge the revision before this one.
     let health: Vec<HealthResultDto> = health
         .into_iter()
-        .rev()
-        .filter(|h| {
-            matches!(h.scope.as_str(), "bake" | "rollout")
-                && h.at >= run.started_at
-                && until.is_none_or(|u| h.at < u)
-        })
+        .filter(|h| matches!(h.scope.as_str(), "bake" | "rollout" | "drift"))
         .map(health_dto)
         .collect();
     let mut report =
@@ -586,7 +586,7 @@ async fn stored_report(
 async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
     let id = path.into_inner();
     let summary = summary_or_404(&state, &id).await?;
-    let (facts, row, runs, health, drift, latest) = state
+    let (facts, row, runs, health, checks, drift, latest) = state
         .store
         .call(move |db| {
             Ok((
@@ -595,6 +595,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
                 // Newest first, the run in progress included.
                 db.runs().page(&id, None, 20)?.0,
                 db.health().for_host(&id, 100)?,
+                db.health().checks(&id)?,
                 db.drift().for_host(&id)?,
                 db.runs().latest_for_host(&id)?,
             ))
@@ -615,6 +616,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         drift,
         recent_runs: runs.into_iter().map(|r| run_dto(&state, r)).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
+        health_checks: checks,
         latest_run,
     }))
 }
