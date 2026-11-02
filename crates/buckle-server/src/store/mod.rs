@@ -27,7 +27,7 @@ pub use kv::Kv;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
-pub use runs::{RUNNING, RunEvent, RunRecord, Runs};
+pub use runs::{ABANDONED, RUNNING, RunEvent, RunRecord, Runs};
 
 use buckle_core::Result;
 use chrono::{DateTime, Utc};

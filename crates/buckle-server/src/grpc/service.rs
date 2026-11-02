@@ -904,6 +904,12 @@ fn open_run(
 /// before its result arrived), or records it when there is none. Returns
 /// the stored run.
 fn finish_run(db: &crate::store::Db<'_>, mut result: RunRecord) -> buckle_core::Result<RunRecord> {
+    // A run of another plan still open will get no result of its own.
+    if let Some(open) = db.runs().open_for_host(&result.host)?
+        && open.plan_digest != result.plan_digest
+    {
+        db.runs().abandon(&open.id, result.finished_at)?;
+    }
     match db.runs().unresolved(&result.host, &result.plan_digest)? {
         Some(open) => {
             result.id = open.id;
@@ -1050,7 +1056,7 @@ impl Fleet for FleetService {
         };
         let host = authed.host.clone();
         let now = self.now();
-        {
+        let abandoned = {
             let (h, hello2) = (host.clone(), hello.clone());
             let labels: BTreeMap<String, String> = hello.labels.clone().into_iter().collect();
             self.store
@@ -1064,10 +1070,20 @@ impl Fleet for FleetService {
                         Some(hello2.applied_revision.as_str()),
                         Some(hello2.last_plan_digest.as_str()),
                         now,
-                    )
+                    )?;
+                    // A run the new session does not say is still running
+                    // (or reporting) will get no more events or result.
+                    db.runs()
+                        .abandon_unless_unreported(&h, &hello2.unreported_apply_revisions, now)
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(internal)?
+        };
+        if let Some(run) = abandoned {
+            tracing::info!(buckle.host = %host, run = %run.id, "the agent reconnected without the run's apply; the run is closed as abandoned");
+            self.events.publish(LiveEvent::RunProgress {
+                progress: crate::views::finished_progress(&run, None),
+            });
         }
         let (session_id, rx) = self.sessions.attach(&host);
         let closed = self.guard.sessions.register(&host, session_id);

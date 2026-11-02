@@ -14,8 +14,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 /// The outcome of a run that has not finished.
 pub const RUNNING: &str = "running";
 
-/// The error of a run another run superseded before its result arrived.
-pub const ABANDONED: &str = "the host started another apply before this run's result arrived";
+/// The error of a run whose result will not come: the host started another
+/// apply, reported another plan's result, or reconnected without it.
+pub const ABANDONED: &str = "the run stopped before its result arrived: the host moved on to another apply or reconnected without this one";
 
 /// One row of `runs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,8 +227,8 @@ impl<'c> Runs<'c> {
             .next())
     }
 
-    /// Closes an open run whose result never arrived because another run
-    /// started (its result may still arrive and complete it).
+    /// Closes an open run whose result will not come (it may still arrive
+    /// and complete it).
     pub fn abandon(&self, run_id: &str, at: DateTime<Utc>) -> Result<()> {
         self.conn
             .execute(
@@ -236,6 +237,26 @@ impl<'c> Runs<'c> {
             )
             .map_err(db_error)?;
         Ok(())
+    }
+
+    /// Abandons the host's open run unless its revision is one of
+    /// `unreported` (a new session's Hello lists the applies still running or
+    /// whose result is on its way; any other open run's result will not
+    /// come). Returns the run it closed.
+    pub fn abandon_unless_unreported(
+        &self,
+        host: &str,
+        unreported: &[String],
+        at: DateTime<Utc>,
+    ) -> Result<Option<RunRecord>> {
+        let Some(open) = self.open_for_host(host)? else {
+            return Ok(None);
+        };
+        if unreported.contains(&open.revision) {
+            return Ok(None);
+        }
+        self.abandon(&open.id, at)?;
+        self.get(host, &open.id)
     }
 
     /// One run of a host.
