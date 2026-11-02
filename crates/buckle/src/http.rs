@@ -114,14 +114,19 @@ mod tests {
     #[tokio::test]
     async fn construction_is_infallible_and_errors_surface_per_request() {
         let client = ReqwestClient::new();
+        // `.invalid` never resolves (RFC 2606), so this fails offline and fast; the
+        // point is that the failure names the request, not client initialisation.
         let err = client
-            .send(HttpRequest {
-                method: "FETCH".into(),
-                url: "https://example.invalid/".into(),
-                ..Default::default()
-            })
+            .send(HttpRequest::get("https://example.invalid/"))
             .await
-            .expect_err("an invalid method is rejected");
-        assert!(err.description().contains("FETCH"), "{err}");
+            .expect_err("an unresolvable host fails the request");
+        assert!(
+            err.description().contains("example.invalid"),
+            "the error names the request: {err}"
+        );
+        assert!(
+            !err.description().contains("could not be initialised"),
+            "construction problems are not reported for a plain request failure: {err}"
+        );
     }
 }
