@@ -1342,14 +1342,18 @@ impl<'a> Executor<'a> {
                 })
                 .collect()
         };
+        // What the leftover handlers did, by owner, for owners that have no
+        // outcome yet (they never started: their outcome is built below).
+        let mut leftover_ran: HashMap<String, Vec<StepOutcome>> = HashMap::new();
         if !leftovers.is_empty() {
             let contexts = planner.contexts(&self.facts());
             for (owner, notes) in leftovers {
                 let (ran, result) = self
                     .run_notified(planner, &owner, None, &notes, &contexts)
                     .await;
-                if let Some(existing) = results.iter_mut().find(|r| r.module == owner) {
-                    existing.handlers.extend(ran);
+                match results.iter_mut().find(|r| r.module == owner) {
+                    Some(existing) => merge_handlers(&mut existing.handlers, ran),
+                    None => leftover_ran.entry(owner).or_default().extend(ran),
                 }
                 if let Err(report) = result {
                     errors.push(report);
@@ -1379,6 +1383,17 @@ impl<'a> Executor<'a> {
                     .map(|h| StepOutcome::planned_handler(h, StepState::NotRun))
                     .collect();
             }
+            // Handlers other modules' changes notified ran anyway.
+            if let Some(ran) = leftover_ran.remove(name) {
+                merge_handlers(&mut outcome.handlers, ran);
+            }
+            results.push(outcome);
+        }
+        // Owners that are neither in the plan's order nor reported (none
+        // expected): keep what their handlers did rather than drop it.
+        for (owner, ran) in leftover_ran {
+            let mut outcome = ModuleOutcome::new(owner, ModuleStatus::NotStarted);
+            outcome.handlers = ran;
             results.push(outcome);
         }
 
@@ -1552,6 +1567,17 @@ impl<'a> Executor<'a> {
             tracing::warn!(error = %e.description(), "the outcome of the run could not be kept for `buckle status`");
         }
         Ok(outcome)
+    }
+}
+
+/// Puts the outcomes of handlers that ran into `handlers`, replacing the
+/// planned (not run) entry of the same handler.
+fn merge_handlers(handlers: &mut Vec<StepOutcome>, ran: Vec<StepOutcome>) {
+    for h in ran {
+        match handlers.iter_mut().find(|x| x.id == h.id) {
+            Some(existing) => *existing = h,
+            None => handlers.push(h),
+        }
     }
 }
 
