@@ -92,6 +92,7 @@ jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_c
 rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
 notify = "9.0.0-rc.7"
 base64 = "0.23.1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 percent-encoding = "2.3.2"
 
 # CLI
@@ -106,6 +107,8 @@ tempfile = "3.27"
 wiremock = "0.6.5"
 tracing-subscriber = "0.3.23"
 pretty_assertions = "1.4"
+rsa = { version = "0.9", features = ["getrandom", "sha2"] }
+actix-http = "3.11"
 
 [profile.release]
 lto = "fat"

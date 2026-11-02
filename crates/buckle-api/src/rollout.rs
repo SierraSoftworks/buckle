@@ -69,6 +69,10 @@ pub struct RolloutHost {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bake_until: Option<DateTime<Utc>>,
+    /// The host's current plan is not covered by an approval of its phase
+    /// (never approved, or the plan changed after approval).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_approval: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
