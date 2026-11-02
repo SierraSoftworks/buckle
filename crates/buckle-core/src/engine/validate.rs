@@ -113,15 +113,28 @@ impl std::fmt::Display for ValidationReport {
 }
 
 static SECRET_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)").expect("static regex compiles")
+    // `secrets` must start a word (not `mysecrets.x`, not `host.secrets.x`);
+    // the regex crate has no look-behind, so the boundary is matched as a
+    // non-capturing prefix.
+    regex::Regex::new(
+        r#"(?:^|[^A-Za-z0-9_.])secrets\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*(?:"([^"]+)"|'([^']+)')\s*\])"#,
+    )
+    .expect("static regex compiles")
 });
 
-/// The secret names referenced by a piece of text (`secrets.NAME`, with or
-/// without `.present` / `.fingerprint`).
+/// The secret names referenced by a piece of text: `secrets.NAME` (with or
+/// without `.present` / `.fingerprint`) and the subscript forms
+/// `secrets["NAME"]` / `secrets['NAME']`. `secrets` must begin a word, so
+/// `mysecrets.x` and `host.secrets.x` are not references.
 pub fn secret_references(text: &str) -> BTreeSet<String> {
     SECRET_REF
         .captures_iter(text)
-        .filter_map(|c| c.get(1).map(|m| m.as_str().to_owned()))
+        .filter_map(|c| {
+            c.get(1)
+                .or_else(|| c.get(2))
+                .or_else(|| c.get(3))
+                .map(|m| m.as_str().to_owned())
+        })
         .collect()
 }
 

@@ -46,8 +46,15 @@ impl ServerConfig {
 
     pub fn parse(text: &str) -> buckle_core::Result<Self> {
         let mut value: serde_yaml::Value = serde_yaml::from_str(text).to_human_error()?;
-        interpolate_env(&mut value, &|name| std::env::var(name).ok())?;
-        let config: ServerConfig = serde_yaml::from_value(value).to_human_error()?;
+        let used = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        interpolate_env(&mut value, &|name| {
+            used.borrow_mut().insert(name.to_owned());
+            std::env::var(name).ok()
+        })?;
+        let mut config: ServerConfig = serde_yaml::from_value(value).to_human_error()?;
+        // Whatever server.yaml reads from the environment is the server's
+        // own configuration; fleet secrets may not read it back out.
+        config.secrets.reserved_env = used.into_inner();
         config.validate()?;
         Ok(config)
     }
@@ -434,6 +441,10 @@ impl OidcConfig {
 pub struct SecretsConfig {
     #[serde(default)]
     pub providers: ProvidersConfig,
+    /// Environment variables server.yaml interpolates (filled in by
+    /// [`ServerConfig::parse`]); the env provider never reads them.
+    #[serde(skip)]
+    pub reserved_env: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -442,15 +453,49 @@ pub struct ProvidersConfig {
     #[serde(default)]
     pub file: Option<FileProviderConfig>,
     #[serde(default)]
-    pub env: Option<EmptyConfig>,
+    pub env: Option<EnvProviderConfig>,
     /// Development only: commands the exec provider may run.
     #[serde(default)]
     pub exec: Option<ExecProviderConfig>,
 }
 
+/// `secrets.providers.env`: which of the server's environment variables
+/// fleet secrets may read (`{ env: NAME }` in buckle.yaml).
+///
+/// Entries are exact names or prefixes ending in `*`. The server never hands
+/// out [`EnvProviderConfig::ALWAYS_DENIED`], any variable server.yaml itself
+/// interpolates (`${{ env.NAME }}`), or anything in `deny`; when `allow` is
+/// given, only matching variables are read at all.
+///
+/// ```yaml
+/// secrets:
+///   providers:
+///     env:
+///       allow: ["FLEET_*"]          # optional; absent means any not denied
+///       deny: [AWS_SECRET_ACCESS_KEY]
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EmptyConfig {}
+pub struct EnvProviderConfig {
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl EnvProviderConfig {
+    /// The server's own variables, denied whatever the configuration says.
+    pub const ALWAYS_DENIED: &'static [&'static str] = &[
+        "BUCKLE_*",
+        "OIDC_CLIENT_SECRET",
+        "GIT_TOKEN",
+        "GIT_WEBHOOK_SECRET",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    ];
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -608,6 +653,21 @@ secrets:
         assert_eq!(
             redact_url("https://user:pw@github.com/x.git"),
             "https://user:***@github.com/x.git"
+        );
+    }
+
+    #[test]
+    fn interpolated_variables_are_reserved_from_the_env_provider() {
+        // SAFETY: the variable is unique to this test.
+        unsafe { std::env::set_var("BUCKLE_CFG_TEST_TOKEN", "boot") };
+        let cfg = ServerConfig::parse(
+            "listen: { grpc: \"127.0.0.1:0\", http: \"127.0.0.1:0\" }\nsource: { path: /x }\nagents: { bootstrap_token: \"${{ env.BUCKLE_CFG_TEST_TOKEN }}\" }\nsecrets: { providers: { env: { deny: [AWS_*] } } }\n",
+        )
+        .unwrap();
+        assert!(cfg.secrets.reserved_env.contains("BUCKLE_CFG_TEST_TOKEN"));
+        assert_eq!(
+            cfg.secrets.providers.env.as_ref().unwrap().deny,
+            vec!["AWS_*".to_string()]
         );
     }
 
