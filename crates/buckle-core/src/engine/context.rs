@@ -64,6 +64,47 @@ pub fn fact_references(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether the fact path `path` (below `host.facts.`) lies under one of the
+/// provider mount points `providers`, compared case-insensitively.
+pub fn provided_by(path: &str, providers: &[String]) -> bool {
+    let path = path.to_ascii_lowercase();
+    providers.iter().any(|p| {
+        let p = p.to_ascii_lowercase();
+        path == p || path.starts_with(&format!("{p}.")) || p.starts_with(&format!("{path}."))
+    })
+}
+
+/// Every fact path a module's text mentions: its vars, task and handler
+/// specs and `when`s, and the fleet's vars overlays (which feed its vars).
+pub fn module_fact_references(revision: &Revision, module: &ModuleConfig) -> Vec<String> {
+    fn strings<'a>(value: &'a serde_yaml::Value, out: &mut Vec<&'a str>) {
+        match value {
+            serde_yaml::Value::String(s) => out.push(s),
+            serde_yaml::Value::Sequence(items) => items.iter().for_each(|v| strings(v, out)),
+            serde_yaml::Value::Mapping(map) => map.values().for_each(|v| strings(v, out)),
+            serde_yaml::Value::Tagged(t) => strings(&t.value, out),
+            _ => {}
+        }
+    }
+    let mut texts: Vec<&str> = Vec::new();
+    module.vars.values().for_each(|v| strings(v, &mut texts));
+    for decl in module.tasks.iter().chain(module.handlers.values()) {
+        strings(&decl.spec, &mut texts);
+        if let Some(w) = &decl.when {
+            texts.push(w.raw());
+        }
+    }
+    for overlay in &revision.fleet.vars {
+        overlay.values.values().for_each(|v| strings(v, &mut texts));
+        if let Some(file) = &overlay.file
+            && let Some(content) = revision.var_files.get(file)
+        {
+            strings(content, &mut texts);
+        }
+    }
+    texts.into_iter().flat_map(fact_references).collect()
+}
+
 /// Whether a selector mentions `vars.*`.
 pub fn reads_vars(text: &str) -> bool {
     VARS_REF.is_match(text)

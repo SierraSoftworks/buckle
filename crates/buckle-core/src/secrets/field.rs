@@ -181,6 +181,10 @@ impl schemars::JsonSchema for SecretField {
 /// (or `definitions`) and `allOf`/`anyOf`/`oneOf` are followed; a value whose
 /// position the schema does not describe is rendered like any other string.
 ///
+/// A rendered string whose schema position only admits integers, numbers or
+/// booleans (no string) is converted to that type when it parses as one, so
+/// `size_mb: "{{ vars.n }}"` reaches an integer field as `512`, not `"512"`.
+///
 /// ```
 /// use buckle_core::secrets::field::render_spec_strings;
 /// use buckle_core::secrets::SecretField;
@@ -232,7 +236,8 @@ fn walk(
     match value {
         Value::String(s) => {
             if Templater::needs_render(s) {
-                *s = render(s)?;
+                let rendered = render(s)?;
+                *value = coerce(rendered, &flat);
             }
         }
         Value::Array(items) => {
@@ -264,6 +269,49 @@ fn walk(
         _ => {}
     }
     Ok(())
+}
+
+/// Converts a rendered string to the scalar type its schema position wants,
+/// when every schema there excludes strings and the text parses as that type.
+fn coerce(rendered: String, schemas: &[&serde_json::Value]) -> serde_json::Value {
+    use serde_json::Value;
+    let mut types: Vec<&str> = Vec::new();
+    for schema in schemas {
+        match schema.get("type") {
+            Some(Value::String(t)) => types.push(t),
+            Some(Value::Array(ts)) => types.extend(ts.iter().filter_map(Value::as_str)),
+            _ => {}
+        }
+    }
+    if types.is_empty() || types.contains(&"string") {
+        return Value::String(rendered);
+    }
+    let text = rendered.trim();
+    if types.contains(&"integer") {
+        if let Ok(i) = text.parse::<i64>() {
+            return Value::from(i);
+        }
+        if let Ok(u) = text.parse::<u64>() {
+            return Value::from(u);
+        }
+    }
+    if types.contains(&"number")
+        && let Ok(f) = text.parse::<f64>()
+        && let Some(n) = serde_json::Number::from_f64(f)
+    {
+        return Value::Number(n);
+    }
+    if types.contains(&"boolean") {
+        match text.to_ascii_lowercase().as_str() {
+            "true" => return Value::Bool(true),
+            "false" => return Value::Bool(false),
+            _ => {}
+        }
+    }
+    if types.contains(&"null") && matches!(text, "" | "none" | "null" | "None") {
+        return Value::Null;
+    }
+    Value::String(rendered)
 }
 
 /// Resolves `$ref`s and expands `allOf`/`anyOf`/`oneOf` into `out`.
@@ -429,6 +477,61 @@ mod tests {
         assert_eq!(spec["auth"]["user"], "ada");
         let parsed: Spec = serde_json::from_value(spec).unwrap();
         assert!(parsed.password.unwrap().references_secrets());
+    }
+
+    #[test]
+    fn rendered_strings_take_the_scalar_type_their_field_wants() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Spec {
+            size_mb: u64,
+            offset: i32,
+            ratio: f64,
+            enabled: bool,
+            maybe: Option<u32>,
+            name: String,
+            mode: Option<String>,
+            sizes: Vec<u16>,
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(Spec)).unwrap();
+        let mut spec = serde_json::json!({
+            "size_mb": "{{ n }}",
+            "offset": "{{ neg }}",
+            "ratio": "{{ r }}",
+            "enabled": "{{ yes }}",
+            "maybe": "{{ empty }}",
+            "name": "{{ n }}",
+            "mode": "{{ n }}",
+            "sizes": ["{{ n }}", 7],
+        });
+        let values: BTreeMap<&str, &str> = [
+            ("{{ n }}", "512"),
+            ("{{ neg }}", "-3"),
+            ("{{ r }}", "0.5"),
+            ("{{ yes }}", "True"),
+            ("{{ empty }}", ""),
+        ]
+        .into();
+        render_spec_strings(&mut spec, &schema, &mut |s: &str| Ok(values[s].to_owned())).unwrap();
+        assert_eq!(
+            spec,
+            serde_json::json!({
+                "size_mb": 512,
+                "offset": -3,
+                "ratio": 0.5,
+                "enabled": true,
+                "maybe": null,
+                "name": "512",
+                "mode": "512",
+                "sizes": [512, 7],
+            })
+        );
+        let parsed: Spec = serde_json::from_value(spec).unwrap();
+        assert_eq!(parsed.size_mb, 512);
+        // Text that does not parse stays a string, so the kind reports a type error.
+        let mut bad = serde_json::json!({"size_mb": "{{ n }}"});
+        render_spec_strings(&mut bad, &schema, &mut |_| Ok("lots".into())).unwrap();
+        assert_eq!(bad["size_mb"], "lots");
     }
 
     #[test]

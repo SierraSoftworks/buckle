@@ -163,6 +163,9 @@ pub(super) struct RichModulePlan {
     pub handlers: Vec<RichHandler>,
     pub ctx: Arc<HostContext>,
     pub source: Arc<dyn Source>,
+    /// Resources of tasks not planned (excluded by `--select`, or with an
+    /// undecidable `when`) that stay in the desired set.
+    pub unselected: Vec<ResourceKey>,
 }
 
 pub(super) struct RichRemoval {
@@ -178,7 +181,19 @@ pub(super) struct RichPlan {
     pub removals: Vec<RichRemoval>,
     /// Every selected module (planned or deferred) in dependency order.
     pub order: Vec<String>,
+    /// What each module in `order` waits for before it may start: its
+    /// `needs`, plus the provider modules a deferred module waits on.
     pub needs: HashMap<String, Vec<String>>,
+    /// The desired resource keys of the planned modules.
+    pub desired: Vec<ResourceKey>,
+}
+
+/// What a deferred module turned out to be once planned at apply time.
+pub(super) enum DeferredPlan {
+    Planned(RichModulePlan),
+    /// Its `when` is false against the refreshed facts.
+    Unselected,
+    Indeterminate(String),
 }
 
 /// Module selection for a host.
@@ -186,9 +201,16 @@ pub(super) struct Selection<'a> {
     /// Selected modules in dependency order.
     pub order: Vec<&'a LoadedModule>,
     pub skipped: Vec<String>,
-    /// Modules whose selection could not be decided or that could not be
-    /// planned, sorted by name.
+    /// Modules whose selection could not be decided, sorted by name.
     pub indeterminate: Vec<Indeterminate>,
+    /// Selected modules (in `order`) whose vars could not be rendered, with
+    /// the reason: a plan error for the module, unless the vars read facts a
+    /// provider module will produce in this run (then it is deferred).
+    pub broken: HashMap<String, String>,
+    /// Modules whose `when` is false but reads facts that selected modules
+    /// provide, with those provider modules: decided after they apply when
+    /// they change something, else skipped.
+    pub conditional: Vec<(&'a LoadedModule, Vec<String>)>,
 }
 
 /// Plans one revision for one host. Built from [`Inputs`] (or, for rollback,
@@ -372,6 +394,16 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// A module-scoped failure for a plan: the scrubbed message and advice.
+    pub fn failure(&self, err: &crate::Error) -> String {
+        let advice = err.advice();
+        if advice.is_empty() {
+            self.scrub(&err.message())
+        } else {
+            self.scrub(&format!("{} ({})", err.message(), advice.join(" ")))
+        }
+    }
+
     /// Evaluates every module's `when`, checks that selected modules only need
     /// selected modules, and orders them along the DAG. A module whose
     /// selection cannot be decided (its `when` errs or reads unavailable facts,
@@ -380,6 +412,8 @@ impl<'a> Planner<'a> {
     pub fn select(&self, contexts: &Contexts) -> crate::Result<Selection<'a>> {
         let mut selected: HashMap<&str, &'a LoadedModule> = HashMap::new();
         let mut skipped = Vec::new();
+        let mut broken: HashMap<String, String> = HashMap::new();
+        let mut unselected: Vec<&'a LoadedModule> = Vec::new();
         let mut indeterminate: Vec<Indeterminate> = self
             .revision
             .unloaded
@@ -417,17 +451,43 @@ impl<'a> Planner<'a> {
                 Decision::Yes => {
                     selected.insert(cfg.name.as_str(), module);
                 }
-                Decision::No => skipped.push(cfg.name.clone()),
+                Decision::No => unselected.push(module),
                 Decision::Unknown(reason) => indeterminate.push(Indeterminate {
                     module: cfg.name.clone(),
                     reason,
                     plan_error: false,
                 }),
-                Decision::Broken(reason) => indeterminate.push(Indeterminate {
-                    module: cfg.name.clone(),
-                    reason,
-                    plan_error: true,
-                }),
+                Decision::Broken(reason) => {
+                    selected.insert(cfg.name.as_str(), module);
+                    broken.insert(cfg.name.clone(), reason);
+                }
+            }
+        }
+        // A `when` that reads facts a selected module provides may change once
+        // that module applies; such modules are decided by the planner.
+        let mut conditional = Vec::new();
+        for module in unselected {
+            let refs = module
+                .config
+                .when
+                .as_ref()
+                .map(|w| context::fact_references(w.raw()))
+                .unwrap_or_default();
+            let mut providers: Vec<String> = selected
+                .values()
+                .filter(|p| {
+                    !p.config.facts.provides.is_empty()
+                        && refs
+                            .iter()
+                            .any(|r| context::provided_by(r, &p.config.facts.provides))
+                })
+                .map(|p| p.config.name.clone())
+                .collect();
+            providers.sort();
+            if providers.is_empty() {
+                skipped.push(module.config.name.clone());
+            } else {
+                conditional.push((module, providers));
             }
         }
         // A module that needs an indeterminate module cannot run either.
@@ -497,6 +557,8 @@ impl<'a> Planner<'a> {
                 .collect(),
             skipped,
             indeterminate,
+            broken,
+            conditional,
         })
     }
 
@@ -526,8 +588,30 @@ impl<'a> Planner<'a> {
             if let Some(problem) = super::validate::command_run_without_id(decl) {
                 warnings.push(format!("{label} {problem}"));
             }
+            // `when` is decided before the task's fields are rendered, so a
+            // task excluded by `when` never needs its templates to render. A
+            // `when` that reads `task.id` of a task without an explicit `id`
+            // is decided after rendering, once the id (its key) is known.
             let provisional = decl.id.clone().unwrap_or_default();
             let render_ctx = ctx.in_task(&decl.kind, &provisional, &decl.tags);
+            let decide = |task_ctx: &HostContext| -> Option<Result<bool, String>> {
+                let when = decl.when.as_ref()?;
+                Some(
+                    contexts
+                        .uncertainty(when)
+                        .map(Err)
+                        .unwrap_or_else(|| task_ctx.try_matches(when)),
+                )
+            };
+            let late_when = decl.id.is_none()
+                && decl
+                    .when
+                    .as_ref()
+                    .is_some_and(|w| w.raw().to_ascii_lowercase().contains("task.id"));
+            let early = if late_when { None } else { decide(&render_ctx) };
+            if matches!(early, Some(Ok(false))) {
+                continue;
+            }
             let json = self.render_spec(task, &decl.spec, &render_ctx).map_err(|e| {
                 crate::error::wrap_user(e, format!("{label} has a field that could not be rendered."), &[
                     "Check the template expressions in the task's fields against the host's facts and vars.",
@@ -546,20 +630,14 @@ impl<'a> Planner<'a> {
             // A `when` that cannot be decided keeps the resource (it stays in
             // the desired set) without planning it.
             let mut undecided = false;
-            if let Some(when) = &decl.when {
-                let doubt = contexts
-                    .uncertainty(when)
-                    .map(Err)
-                    .unwrap_or_else(|| task_ctx.try_matches(when));
-                match doubt {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(reason) => {
-                        warnings.push(format!(
-                            "{key} is kept but not planned: its `when` cannot be decided ({reason})"
-                        ));
-                        undecided = true;
-                    }
+            match if late_when { decide(&task_ctx) } else { early } {
+                None | Some(Ok(true)) => {}
+                Some(Ok(false)) => continue,
+                Some(Err(reason)) => {
+                    warnings.push(format!(
+                        "{key} is kept but not planned: its `when` cannot be decided ({reason})"
+                    ));
+                    undecided = true;
                 }
             }
             if let Some(previous) = seen.insert(key.clone(), index) {
@@ -612,6 +690,12 @@ impl<'a> Planner<'a> {
         let module = prepared.name.clone();
         let mut steps = Vec::new();
         let mut rich = Vec::new();
+        let unselected: Vec<ResourceKey> = prepared
+            .tasks
+            .iter()
+            .filter(|t| !t.selected)
+            .map(|t| t.key.clone())
+            .collect();
         for pt in prepared.tasks.into_iter().filter(|t| t.selected) {
             let span = tracing::info_span!(
                 "task.plan",
@@ -676,6 +760,7 @@ impl<'a> Planner<'a> {
             handlers,
             ctx: prepared.ctx,
             source: prepared.source,
+            unselected,
         })
     }
 
@@ -813,28 +898,6 @@ impl<'a> Planner<'a> {
         Ok(entries.into_iter().map(|e| (e.run, e.rich)).unzip())
     }
 
-    /// Prepares and plans one module against `facts` (for deferred modules and
-    /// rollback). `honour_select` is false for rollback, which re-applies the
-    /// whole module.
-    pub async fn plan_one(
-        &self,
-        name: &str,
-        facts: &Facts,
-        state: &State,
-        honour_select: bool,
-    ) -> crate::Result<RichModulePlan> {
-        let module = self.revision.module(name).ok_or_else(|| {
-            crate::error::user(
-                format!("The revision {} has no module '{name}'.", self.revision.id),
-                &["The module was removed from the configuration; nothing can be planned for it."],
-            )
-        })?;
-        let contexts = self.contexts(facts);
-        let ctx = self.module_context(&contexts, &module.config)?;
-        let prepared = self.prepare(module, ctx, &contexts, honour_select, state)?;
-        self.plan_module(prepared, &contexts).await
-    }
-
     /// Records that left the desired set but were taken over by a desired
     /// resource, so must not be removed: the same kind and key in another
     /// module (a moved task: the record is re-keyed and kept), or a desired
@@ -851,11 +914,31 @@ impl<'a> Planner<'a> {
             .iter()
             .flat_map(|p| p.desired_keys().cloned())
             .collect();
+        let (out, moved) = self.find_rehomes(state, &desired, exclude_modules);
+        for (to, record) in moved {
+            let record = Arc::new(record);
+            for task in prepared.iter_mut().flat_map(|p| p.tasks.iter_mut()) {
+                if task.key == to {
+                    task.cx.previous = Some(record.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Planner::rehomes`] over a desired set: the re-homes, and for moved
+    /// records the record re-keyed to its new owner.
+    pub fn find_rehomes(
+        &self,
+        state: &State,
+        desired: &[ResourceKey],
+        exclude_modules: &BTreeSet<String>,
+    ) -> (Vec<Rehome>, Vec<(ResourceKey, ResourceRecord)>) {
         let desired_set: BTreeSet<&ResourceKey> = desired.iter().collect();
         let mut by_kind_key: HashMap<(&str, &str), &ResourceKey> = HashMap::new();
         let mut by_identity: HashMap<String, &ResourceKey> = HashMap::new();
         let mut taken: BTreeSet<&ResourceKey> = BTreeSet::new();
-        for key in &desired {
+        for key in desired {
             by_kind_key
                 .entry((key.kind.as_str(), key.key.as_str()))
                 .or_insert(key);
@@ -909,15 +992,63 @@ impl<'a> Planner<'a> {
                 });
             }
         }
-        for (to, record) in moved {
-            let record = Arc::new(record);
-            for task in prepared.iter_mut().flat_map(|p| p.tasks.iter_mut()) {
-                if task.key == to {
-                    task.cx.previous = Some(record.clone());
-                }
+        (out, moved)
+    }
+
+    /// Orphans of one module (for a deferred module decided at apply time):
+    /// its records outside `desired` that no desired resource took over.
+    pub fn module_orphans(
+        &self,
+        state: &State,
+        module: &str,
+        desired: &[ResourceKey],
+    ) -> Vec<(Removal, RichRemoval)> {
+        let others: BTreeSet<String> = state
+            .resources
+            .values()
+            .map(|r| r.key.module.clone())
+            .filter(|m| m != module)
+            .collect();
+        let (rehomes, _) = self.find_rehomes(state, desired, &others);
+        let skip: BTreeSet<ResourceKey> = rehomes.into_iter().map(|r| r.from).collect();
+        self.removals(state, desired, &others, &skip)
+    }
+
+    /// Plans a deferred module once the facts it waited for are refreshed:
+    /// decides its `when` again, then plans it (with its orphans) or reports it
+    /// unselected (all its resources are orphans) or indeterminate.
+    pub async fn plan_deferred(
+        &self,
+        name: &str,
+        facts: &Facts,
+        state: &State,
+        desired: &[ResourceKey],
+    ) -> crate::Result<(DeferredPlan, Vec<(Removal, RichRemoval)>)> {
+        let module = self.revision.module(name).ok_or_else(|| {
+            crate::error::user(
+                format!("The revision {} has no module '{name}'.", self.revision.id),
+                &["The module was removed from the configuration; nothing can be planned for it."],
+            )
+        })?;
+        let contexts = self.contexts(facts);
+        let ctx = self.module_context(&contexts, &module.config)?;
+        match contexts.decide(module.config.when.as_ref(), &ctx) {
+            Decision::Yes | Decision::Broken(_) => {
+                let prepared = self.prepare(module, ctx, &contexts, true, state)?;
+                let mut all: Vec<ResourceKey> = desired.to_vec();
+                all.extend(prepared.desired_keys().cloned());
+                let plan = self.plan_module(prepared, &contexts).await?;
+                Ok((
+                    DeferredPlan::Planned(plan),
+                    self.module_orphans(state, name, &all),
+                ))
             }
+            Decision::No => Ok((
+                DeferredPlan::Unselected,
+                self.module_orphans(state, name, desired),
+            )),
+            Decision::Unknown(reason) => Ok((DeferredPlan::Indeterminate(reason), Vec::new())),
         }
-        out
     }
 
     /// Orphans: resources in state that no selected module wants any more,
@@ -1059,14 +1190,15 @@ pub(super) async fn plan_with(
 ) -> crate::Result<RichPlan> {
     let contexts = planner.contexts(facts);
     let mut selection = planner.select(&contexts)?;
+    let revision = planner.revision;
 
     // Drift re-plans only what this host has applied at this revision.
     let mut held: Vec<Held> = Vec::new();
     if planner.drift {
-        let revision = &planner.revision.id;
+        let id = &revision.id;
         selection.order.retain(|m| {
             let name = &m.config.name;
-            if state.module_at(name, revision) {
+            if state.module_at(name, id) {
                 return true;
             }
             let reason = match (
@@ -1076,8 +1208,8 @@ pub(super) async fn plan_with(
                 (Some(failed), _) => {
                     format!("its last run failed (revision {failed}); drift does not re-apply it")
                 }
-                (None, Some(other)) => format!("it is applied at revision {other}, not {revision}"),
-                (None, None) => format!("it has not been applied at revision {revision}"),
+                (None, Some(other)) => format!("it is applied at revision {other}, not {id}"),
+                (None, None) => format!("it has not been applied at revision {id}"),
             };
             held.push(Held {
                 module: name.clone(),
@@ -1085,82 +1217,229 @@ pub(super) async fn plan_with(
             });
             false
         });
+        let (keep, unapplied): (Vec<_>, Vec<_>) = std::mem::take(&mut selection.conditional)
+            .into_iter()
+            .partition(|(m, _)| state.module_at(&m.config.name, id));
+        selection.conditional = keep;
+        selection
+            .skipped
+            .extend(unapplied.into_iter().map(|(m, _)| m.config.name.clone()));
     }
 
-    let mut prepared = Vec::with_capacity(selection.order.len());
+    // Pass 1: render and parse every selected module. A failure is scoped to
+    // its module (decided in pass 2: deferred or a plan error).
+    let mut failures: HashMap<String, String> = selection.broken.clone();
+    let mut prepared: Vec<PreparedModule> = Vec::with_capacity(selection.order.len());
     for module in &selection.order {
-        let ctx = planner.module_context(&contexts, &module.config)?;
-        prepared.push(planner.prepare(module, ctx, &contexts, true, state)?);
+        if failures.contains_key(&module.config.name) {
+            continue;
+        }
+        let attempt = planner
+            .module_context(&contexts, &module.config)
+            .and_then(|ctx| planner.prepare(module, ctx, &contexts, true, state));
+        match attempt {
+            Ok(p) => prepared.push(p),
+            Err(err) => {
+                failures.insert(module.config.name.clone(), planner.failure(&err));
+            }
+        }
     }
-    let desired: Vec<ResourceKey> = prepared
-        .iter()
-        .flat_map(|p| p.desired_keys().cloned())
-        .collect();
-    let order: Vec<String> = prepared.iter().map(|p| p.name.clone()).collect();
     let prepared_warnings: Vec<String> = prepared
         .iter()
         .flat_map(|p| p.warnings.iter().cloned())
         .collect();
-    let needs: HashMap<String, Vec<String>> = prepared
+    let provides: HashMap<String, Vec<String>> = selection
+        .order
         .iter()
-        .map(|p| (p.name.clone(), p.needs.clone()))
-        .collect();
-    let provides: HashMap<String, Vec<String>> = prepared
-        .iter()
-        .map(|p| (p.name.clone(), p.provides.clone()))
+        .map(|m| (m.config.name.clone(), m.config.facts.provides.clone()))
         .collect();
 
-    let undecided: BTreeSet<String> = selection
+    let mut undecided: BTreeSet<String> = selection
         .indeterminate
         .iter()
         .map(|i| i.module.clone())
         .chain(held.iter().map(|h| h.module.clone()))
+        .chain(failures.keys().cloned())
+        .chain(
+            selection
+                .conditional
+                .iter()
+                .map(|(m, _)| m.config.name.clone()),
+        )
         .collect();
     let rehomed = planner.rehomes(state, &mut prepared, &undecided);
-    let rehomed_from: BTreeSet<ResourceKey> = rehomed.iter().map(|r| r.from.clone()).collect();
+    let mut rehomed_from: BTreeSet<ResourceKey> = rehomed.iter().map(|r| r.from.clone()).collect();
 
+    // Pass 2: plan in dependency order, deferring modules that wait for facts
+    // a provider module produces in this run.
+    let mut by_name: HashMap<String, PreparedModule> =
+        prepared.into_iter().map(|p| (p.name.clone(), p)).collect();
     let mut planned: Vec<RichModulePlan> = Vec::new();
     let mut deferred: Vec<Deferred> = Vec::new();
-    for module in prepared {
+    let mut problems: Vec<Indeterminate> = Vec::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut needs: HashMap<String, Vec<String>> = HashMap::new();
+    let pending = |name: &str, planned: &[RichModulePlan], deferred: &[Deferred]| {
+        provides.get(name).is_some_and(|p| !p.is_empty())
+            && (deferred.iter().any(|d| d.module == name)
+                || planned
+                    .iter()
+                    .any(|m| m.plan.module == name && m.plan.changes() > 0))
+    };
+    for module in &selection.order {
+        let name = module.config.name.clone();
+        if let Some(dep) = module
+            .config
+            .needs
+            .iter()
+            .find(|d| problems.iter().any(|p| &p.module == *d))
+        {
+            problems.push(Indeterminate {
+                module: name,
+                reason: format!("it needs '{dep}', which could not be planned"),
+                plan_error: false,
+            });
+            continue;
+        }
         let mut waiting_on = Vec::new();
         let mut reasons = Vec::new();
-        for dep in &module.needs {
+        for dep in &module.config.needs {
             if deferred.iter().any(|d| &d.module == dep) {
                 waiting_on.push(dep.clone());
                 reasons.push(format!("waits for {dep}, which is deferred"));
-            } else if provides.get(dep).is_some_and(|p| !p.is_empty())
-                && planned
-                    .iter()
-                    .any(|m| &m.plan.module == dep && m.plan.changes() > 0)
-            {
+            } else if pending(dep, &planned, &deferred) {
                 waiting_on.push(dep.clone());
                 reasons.push(format!("waits for facts from {dep}"));
             }
         }
+        if let Some(reason) = failures.get(&name) {
+            // A render failure that reads facts a provider it needs has yet to
+            // produce is expected on a first install: wait for the provider.
+            let refs = context::module_fact_references(revision, &module.config);
+            let providers: Vec<String> = ancestors(revision, &name)
+                .into_iter()
+                .filter(|p| {
+                    pending(p, &planned, &deferred)
+                        && refs
+                            .iter()
+                            .any(|r| context::provided_by(r, &provides[p.as_str()]))
+                })
+                .collect();
+            if providers.is_empty() && reasons.is_empty() {
+                problems.push(Indeterminate {
+                    module: name,
+                    reason: reason.clone(),
+                    plan_error: true,
+                });
+                continue;
+            }
+            for p in providers {
+                if !waiting_on.contains(&p) {
+                    reasons.push(format!("reads facts that {p} provides"));
+                    waiting_on.push(p);
+                }
+            }
+        }
         if !reasons.is_empty() {
+            let mut waits = module.config.needs.clone();
+            waits.extend(
+                waiting_on
+                    .iter()
+                    .filter(|w| !module.config.needs.contains(w))
+                    .cloned(),
+            );
+            needs.insert(name.clone(), waits);
+            order.push(name.clone());
             deferred.push(Deferred {
-                module: module.name.clone(),
+                module: name,
                 waiting_on,
                 reason: reasons.join("; "),
             });
             continue;
         }
-        planned.push(planner.plan_module(module, &contexts).await?);
+        let Some(prepared) = by_name.remove(&name) else {
+            continue;
+        };
+        match planner.plan_module(prepared, &contexts).await {
+            Ok(m) => {
+                needs.insert(name.clone(), module.config.needs.clone());
+                order.push(name);
+                planned.push(m);
+            }
+            Err(err) => problems.push(Indeterminate {
+                module: name,
+                reason: format!("planning failed: {}", planner.failure(&err)),
+                plan_error: true,
+            }),
+        }
     }
+    // Modules whose `when` reads facts a changing provider produces are
+    // decided after that provider applies; otherwise they are skipped.
+    let mut skipped = selection.skipped;
+    for (module, providers) in &selection.conditional {
+        let name = module.config.name.clone();
+        let waiting_on: Vec<String> = providers
+            .iter()
+            .filter(|p| pending(p, &planned, &deferred))
+            .cloned()
+            .collect();
+        if waiting_on.is_empty() {
+            undecided.remove(&name);
+            skipped.push(name);
+            continue;
+        }
+        let mut waits = module.config.needs.clone();
+        waits.extend(
+            waiting_on
+                .iter()
+                .filter(|w| !module.config.needs.contains(w))
+                .cloned(),
+        );
+        needs.insert(name.clone(), waits);
+        order.push(name.clone());
+        deferred.push(Deferred {
+            module: name,
+            reason: format!(
+                "its `when` reads facts from {}; decided once {} applied",
+                waiting_on.join(", "),
+                if waiting_on.len() == 1 {
+                    "it has"
+                } else {
+                    "they have"
+                }
+            ),
+            waiting_on,
+        });
+    }
+    // Planned modules' desired keys (deferred modules' resources are excluded
+    // from orphans below and decided at apply time).
+    let desired: Vec<ResourceKey> = planned
+        .iter()
+        .flat_map(|m| m.plan.steps.iter().map(|s| s.resource.clone()))
+        .chain(by_name.values().flat_map(|p| p.desired_keys().cloned()))
+        .collect();
+    let desired: Vec<ResourceKey> = {
+        // Unselected-by-`--select` tasks stay desired too.
+        let mut all = desired;
+        for m in &planned {
+            all.extend(m.unselected.iter().cloned());
+        }
+        all
+    };
 
     let exclude: BTreeSet<String> = deferred
         .iter()
         .map(|d| d.module.clone())
         .chain(undecided.iter().cloned())
+        .chain(problems.iter().map(|p| p.module.clone()))
         .collect();
     // Drift never removes what a revision other than its own recorded.
-    let mut rehomed_from = rehomed_from;
     if planner.drift {
         rehomed_from.extend(
             state
                 .resources
                 .values()
-                .filter(|r| r.revision != planner.revision.id)
+                .filter(|r| r.revision != revision.id)
                 .map(|r| r.key.clone()),
         );
     }
@@ -1169,35 +1448,54 @@ pub(super) async fn plan_with(
         .into_iter()
         .unzip();
 
-    let task_warnings: Vec<String> = prepared_warnings;
     let module_plans: Vec<ModulePlan> = planned.iter().map(|m| m.plan.clone()).collect();
     let mut plan = Plan::new(
-        planner.revision.id.clone(),
+        revision.id.clone(),
         planner.host.id.clone(),
         module_plans,
         removals,
         deferred,
     );
-    plan.skipped = selection.skipped;
+    plan.skipped = skipped;
     let platform_blocked: BTreeSet<ResourceKey> = planned
         .iter()
         .flat_map(|m| m.plan.steps.iter().zip(m.steps.iter()))
         .filter(|(_, rs)| rs.platform_blocked)
         .map(|(s, _)| s.resource.clone())
         .collect();
+    let mut indeterminate = selection.indeterminate;
+    indeterminate.extend(problems);
+    indeterminate.sort_by(|a, b| a.module.cmp(&b.module));
     let mut plan = plan
-        .with_indeterminate(selection.indeterminate)
+        .with_indeterminate(indeterminate)
         .with_rehomed(rehomed)
         .with_held(held);
     plan.warnings = warnings(&plan, &platform_blocked);
-    plan.warnings.extend(task_warnings);
+    plan.warnings.extend(prepared_warnings);
     Ok(RichPlan {
         plan,
         modules: planned,
         removals: rich_removals,
         order,
         needs,
+        desired,
     })
+}
+
+/// Every module `name` needs, directly or transitively.
+fn ancestors(revision: &Revision, name: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![name.to_owned()];
+    while let Some(current) = stack.pop() {
+        if let Some(m) = revision.module(&current) {
+            for need in &m.config.needs {
+                if out.insert(need.clone()) {
+                    stack.push(need.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Operator-facing warnings: indeterminate modules, removals, always-run

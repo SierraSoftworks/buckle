@@ -551,13 +551,11 @@ impl crate::facts::FactProvider for CounterFacts {
     const NAME: &'static str = "test.counter";
 
     async fn collect(&self, cx: &Cx) -> crate::Result<serde_json::Value> {
-        let value = cx
-            .system
-            .read(Path::new("/facts/counter"))
-            .await?
-            .map(|b| serde_json::Value::String(String::from_utf8_lossy(&b).into_owned()))
-            .unwrap_or(serde_json::Value::Null);
-        Ok(serde_json::json!({ "value": value }))
+        // Like a real provider whose tool is not installed yet: no facts at all.
+        Ok(match cx.system.read(Path::new("/facts/counter")).await? {
+            Some(b) => serde_json::json!({ "value": String::from_utf8_lossy(&b) }),
+            None => serde_json::Value::Null,
+        })
     }
 }
 
@@ -1603,6 +1601,142 @@ async fn modules_needing_fresh_facts_are_deferred_in_plan_and_resolved_in_apply(
     assert_eq!(step(&plan2, "q", "/defer/out").planned, Planned::NoOp);
 }
 
+#[tokio::test]
+async fn a_first_install_defers_modules_whose_vars_read_facts_a_provider_will_produce() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: p\nfacts: { provides: [test.counter] }\ntasks: [ { test.file: { path: /facts/counter, content: \"10.0.0.7\", run: lazy1 } } ]\n",
+            ),
+            module(
+                "name: q\nneeds: [p]\nvars: { addr: '{{ host.facts.test.counter.value }}' }\ntasks: [ { test.file: { path: /lazy/q, content: 'bind={{ vars.addr }}', run: lazy1 } } ]\n",
+            ),
+        ],
+    );
+    let sys = FakeSystem::new().with_file("/lazy/old", "x", FilePerms::mode(0o644));
+    let mut state = State::default();
+    state.record(record_for(
+        "q",
+        "test.file",
+        "/lazy/old",
+        RemovalPolicy::Cleanup,
+        "r0",
+    ));
+    let mut inputs = inputs_with_store(rev, &sys, Arc::new(MemoryStateStore::with(state)));
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let plan = plan(&inputs).await;
+    assert!(plan.indeterminate.is_empty(), "{:#?}", plan.indeterminate);
+    assert_eq!(plan.deferred.len(), 1, "{plan:#?}");
+    assert_eq!(plan.deferred[0].module, "q");
+    assert!(
+        plan.removals.is_empty(),
+        "a deferred module's resources wait for its plan"
+    );
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(sys.file_string("/lazy/q").as_deref(), Some("bind=10.0.0.7"));
+    assert!(
+        !sys.exists("/lazy/old"),
+        "its orphans are computed in the same run"
+    );
+    assert_eq!(outcome.removals, 1);
+}
+
+#[tokio::test]
+async fn a_task_excluded_by_when_never_renders_its_fields() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: '/when/{{ vars.only_on_db }}' }\n    when: 'host.labels.role == \"db\"'\n  - test.file: { path: /when/plain }\n",
+        )],
+    );
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    assert!(plan.indeterminate.is_empty(), "{:#?}", plan.indeterminate);
+    let keys: Vec<&str> = plan.steps().map(|s| s.resource.key.as_str()).collect();
+    assert_eq!(keys, vec!["/when/plain"]);
+}
+
+#[rstest]
+#[case::selected_after_the_refresh("42", true)]
+#[case::unselected_after_the_refresh("41", false)]
+#[tokio::test]
+async fn a_when_reading_provider_facts_is_decided_after_the_provider_applies(
+    #[case] value: &str,
+    #[case] selected: bool,
+) {
+    let run = format!("cond-{value}");
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(&format!(
+                "name: p\nfacts: {{ provides: [test.counter] }}\ntasks: [ {{ test.file: {{ path: /facts/counter, content: \"{value}\", run: {run} }} }} ]\n"
+            )),
+            module(&format!(
+                "name: r\nwhen: 'host.facts.test.counter.value == \"42\"'\ntasks: [ {{ test.file: {{ path: /cond/{value}, content: r, run: {run} }} }} ]\n"
+            )),
+        ],
+    );
+    let sys = FakeSystem::new().with_file(format!("/cond/{value}"), "old", FilePerms::mode(0o644));
+    let mut state = State::default();
+    state.record(record_for(
+        "r",
+        "test.file",
+        &format!("/cond/{value}"),
+        RemovalPolicy::Cleanup,
+        "r0",
+    ));
+    let mut inputs = inputs_with_store(rev, &sys, Arc::new(MemoryStateStore::with(state)));
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let plan = plan(&inputs).await;
+    assert_eq!(plan.deferred.len(), 1, "{plan:#?}");
+    assert!(
+        plan.deferred[0].reason.contains("decided once"),
+        "{:?}",
+        plan.deferred
+    );
+    assert!(
+        plan.removals.is_empty(),
+        "not removed on a guess: {:#?}",
+        plan.removals
+    );
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    if selected {
+        assert_eq!(status_of(&outcome, "r"), ModuleStatus::Applied);
+        assert_eq!(
+            sys.file_string(format!("/cond/{value}")).as_deref(),
+            Some("r")
+        );
+    } else {
+        assert_eq!(status_of(&outcome, "r"), ModuleStatus::Skipped);
+        assert!(
+            !sys.exists(format!("/cond/{value}")),
+            "decided unselected: its resources go"
+        );
+        assert_eq!(outcome.removals, 1);
+    }
+}
+
+#[tokio::test]
+async fn rendered_fields_take_the_type_the_kind_declares() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\nvars: { n: 2 }\ntasks: [ { test.file: { path: /typed, sleep_ms: '{{ vars.n }}', fail_times: '{{ vars.n - 2 }}' } } ]\n",
+        )],
+    );
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    assert!(plan.indeterminate.is_empty(), "{:#?}", plan.indeterminate);
+    assert_eq!(plan.changes(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Tasks: keys, when, select, platforms, always-runs
 // ---------------------------------------------------------------------------
@@ -1616,13 +1750,14 @@ async fn duplicate_resource_keys_are_user_errors_naming_both_tasks() {
             "name: m\ntasks:\n  - test.file: { path: /dup }\n  - test.file: { path: /other }\n  - test.file: { path: /dup }\n    name: second\n",
         )],
     );
-    let err = plan_err(&inputs(rev, &FakeSystem::new())).await;
-    assert!(err.is(crate::error::Kind::User));
-    let msg = err.message();
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    let broken = indeterminate(&plan, "m");
+    assert!(broken.plan_error);
+    let msg = &broken.reason;
     assert!(msg.contains("task #1"), "{msg}");
     assert!(msg.contains("task #3 'second'"), "{msg}");
     assert!(msg.contains("m/test.file[/dup]"), "{msg}");
-    assert!(err.advice().iter().any(|a| a.contains("`id`")));
+    assert!(msg.contains("`id`"), "the advice is kept: {msg}");
 }
 
 #[tokio::test]
@@ -2972,11 +3107,12 @@ async fn secret_values_in_plain_task_fields_are_refused_without_leaking() {
         &InstallKey::from_bytes([9; 32]),
     ));
     inputs.secrets = Arc::new(secrets);
-    let err = plan_err(&inputs).await;
-    assert!(err.is(crate::error::Kind::User));
-    let shown = format!("{} {:?}", err.message(), err);
+    let plan = plan(&inputs).await;
+    let broken = indeterminate(&plan, "s");
+    assert!(broken.plan_error);
+    let shown = serde_json::to_string(&plan).unwrap();
     assert!(!shown.contains(VALUE), "{shown}");
-    assert!(shown.contains("plain values"), "{shown}");
+    assert!(broken.reason.contains("plain values"), "{}", broken.reason);
 }
 
 // ---------------------------------------------------------------------------

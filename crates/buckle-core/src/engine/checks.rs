@@ -190,7 +190,29 @@ pub(super) async fn run_scope(
         if module.config.health.is_empty() {
             continue;
         }
-        let ctx = planner.module_context(&contexts, &module.config)?;
+        let ctx = match planner.module_context(&contexts, &module.config) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                // A module whose vars do not render cannot run its checks;
+                // report each as unknown rather than failing every module.
+                let reason = format!(
+                    "the module's vars could not be rendered: {}",
+                    planner.scrub(&err.message())
+                );
+                for decl in &module.config.health {
+                    results.push(HealthResult {
+                        module: module.config.name.clone(),
+                        check: decl.display_name().to_owned(),
+                        kind: decl.check.kind.clone(),
+                        required: decl.required,
+                        status: HealthStatus::unknown(reason.clone()),
+                        at: planner.system.now(),
+                        duration_ms: 0,
+                    });
+                }
+                continue;
+            }
+        };
         results.extend(
             run_once(
                 &planner,

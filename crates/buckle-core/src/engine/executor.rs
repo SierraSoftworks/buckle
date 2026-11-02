@@ -10,7 +10,8 @@
 
 use super::checks;
 use super::planner::{
-    Contexts, Planner, RichHandler, RichModulePlan, RichPlan, RichStep, collect_facts, plan_with,
+    Contexts, DeferredPlan, Planner, RichHandler, RichModulePlan, RichPlan, RichStep,
+    collect_facts, plan_with,
 };
 use super::{ApplyEvent, ApplyOutcome, Inputs, ModuleOutcome, ModuleStatus};
 use crate::Digest;
@@ -843,6 +844,9 @@ impl<'a> Executor<'a> {
         // without halting it (nothing of theirs ran); indeterminate ones are
         // reported and left alone.
         let mut plan_errors: Vec<String> = Vec::new();
+        // Orphans of deferred modules, known once they are planned.
+        let mut late_removals: Vec<(crate::plan::Removal, super::planner::RichRemoval)> =
+            Vec::new();
         for i in &rich.plan.indeterminate {
             results.push(ModuleOutcome {
                 module: i.module.clone(),
@@ -884,9 +888,38 @@ impl<'a> Executor<'a> {
                     }
                     if !module_plans.contains_key(name) && deferred.contains(name) {
                         let state = self.with_state(|s| s.clone());
-                        match planner.plan_one(name, &self.facts(), &state, true).await {
-                            Ok(planned) => {
+                        match planner
+                            .plan_deferred(name, &self.facts(), &state, &rich.desired)
+                            .await
+                        {
+                            Ok((DeferredPlan::Planned(planned), orphans)) => {
                                 module_plans.insert(name.clone(), Arc::new(planned));
+                                late_removals.extend(orphans);
+                            }
+                            Ok((DeferredPlan::Unselected, orphans)) => {
+                                // Not selected after all: its resources are
+                                // orphans; its dependents cannot run.
+                                started_modules.insert(name.clone());
+                                late_removals.extend(orphans);
+                                results.push(ModuleOutcome {
+                                    module: name.clone(),
+                                    status: ModuleStatus::Skipped,
+                                    changes: 0,
+                                    duration_ms: 0,
+                                    error: None,
+                                });
+                                continue;
+                            }
+                            Ok((DeferredPlan::Indeterminate(reason), _)) => {
+                                started_modules.insert(name.clone());
+                                results.push(ModuleOutcome {
+                                    module: name.clone(),
+                                    status: ModuleStatus::Indeterminate,
+                                    changes: 0,
+                                    duration_ms: 0,
+                                    error: Some(reason),
+                                });
+                                continue;
                             }
                             Err(err) => {
                                 let message = self.scrub(&err.message());
@@ -1019,6 +1052,12 @@ impl<'a> Executor<'a> {
                 .run_removals(planner, &contexts, &rich.plan.removals, &rich.removals)
                 .await;
             removed = count;
+            errors.extend(removal_errors);
+            let (plans, riches): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut late_removals).into_iter().unzip();
+            let (count, removal_errors) =
+                self.run_removals(planner, &contexts, &plans, &riches).await;
+            removed += count;
             errors.extend(removal_errors);
         }
 
