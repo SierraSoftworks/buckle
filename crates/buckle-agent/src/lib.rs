@@ -52,7 +52,14 @@ pub async fn run_with_version(
 ) -> buckle_core::Result<i32> {
     config.validate()?;
     let transport: Arc<dyn transport::Transport> = match &config.source {
-        Some(source) => Arc::new(transport::local::LocalTransport::new(source.clone())),
+        Some(source) => {
+            let store = store::Store::new(&config.state_dir);
+            store.ensure()?;
+            Arc::new(
+                transport::local::LocalTransport::new(source.clone())
+                    .with_secrets(store.install_key()?, config.local_secret_exec.clone()),
+            )
+        }
         None => Arc::new(transport::grpc::GrpcTransport::new(&config)?),
     };
     let state = Arc::new(store::Store::new(&config.state_dir).state_store());

@@ -35,6 +35,12 @@ pub struct AgentConfig {
     pub vars: IndexMap<String, serde_yaml::Value>,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// In local mode (`source`), programs the `exec` secret provider may run
+    /// (e.g. `op`). Never read from agent.yaml: only an explicit command-line
+    /// flag (`buckle agent --allow-secret-exec op`) enables it, as on the
+    /// server (design §06, "exec exists only behind an explicit allowlist").
+    #[serde(skip)]
+    pub local_secret_exec: Vec<String>,
 }
 
 impl AgentConfig {

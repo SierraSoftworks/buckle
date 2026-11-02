@@ -3,11 +3,19 @@
 //! debounce) becomes an Assign of a synthetic revision whose id is the digest
 //! of the tree's contents, followed by RequestPlan and an automatic Apply.
 //! Reports are logged.
+//!
+//! With no server to deliver them, the agent resolves the fleet's `secrets:`
+//! itself (design §06, "In local mode the agent resolves with its own
+//! providers"): the `env` and `file` providers, plus `exec` for the programs
+//! allowed on the command line.
 
 use super::{Hello, Instruction, Report, RevisionSource, Session, Transport, Welcome, WireSecret};
 use crate::bundle::tree_digest;
 use async_trait::async_trait;
 use buckle_core::plan::RevisionId;
+use buckle_core::secrets::providers::{EnvProvider, ExecProvider, FileProvider};
+use buckle_core::secrets::sinks::TransportSink;
+use buckle_core::secrets::{InstallKey, Resolver, SecretStore};
 use notify::Watcher;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,6 +28,7 @@ pub const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(2);
 pub struct LocalTransport {
     source: PathBuf,
     debounce: Duration,
+    secrets: Option<std::sync::Arc<Resolver>>,
 }
 
 impl LocalTransport {
@@ -28,7 +37,22 @@ impl LocalTransport {
         Self {
             source: source.into(),
             debounce: DEFAULT_DEBOUNCE,
+            secrets: None,
         }
+    }
+
+    /// Resolves the fleet's secrets with the `env` and `file` providers
+    /// (fingerprinted under `key`), and `exec` for the programs in
+    /// `exec_allow` when it is not empty.
+    pub fn with_secrets(mut self, key: InstallKey, exec_allow: Vec<String>) -> Self {
+        let mut resolver = Resolver::new(key)
+            .with_provider(EnvProvider)
+            .with_provider(FileProvider::default());
+        if !exec_allow.is_empty() {
+            resolver = resolver.with_provider(ExecProvider::new(exec_allow));
+        }
+        self.secrets = Some(std::sync::Arc::new(resolver));
+        self
     }
 
     /// Uses another debounce period.
@@ -112,12 +136,47 @@ pub fn log_report(report: &Report) {
     }
 }
 
-fn assignment(revision: RevisionId) -> [Instruction; 3] {
+/// Resolves `names` (every declared secret when `None`) from the
+/// `secrets:` of the buckle.yaml in `source`. A secret that cannot be
+/// resolved is logged and left out, so the modules that use it fail to plan
+/// with a message naming it.
+async fn resolve_secrets(
+    resolver: &Resolver,
+    source: &std::path::Path,
+    names: Option<&[String]>,
+) -> buckle_core::Result<Vec<WireSecret>> {
+    use buckle_core::error::HumanizableResult;
+    let text = std::fs::read_to_string(source.join("buckle.yaml")).to_human_error()?;
+    let fleet = buckle_core::model::FleetConfig::parse(&text)?;
+    let mut store = SecretStore::new();
+    for (name, reference) in &fleet.secrets {
+        if names.is_some_and(|n| !n.contains(name)) {
+            continue;
+        }
+        match resolver.resolve_one(name, reference).await {
+            Ok(secret) => store.insert(secret),
+            Err(err) => {
+                tracing::warn!(secret = %name, error = %err.description(), "a secret could not be resolved")
+            }
+        }
+    }
+    Ok(store
+        .export(&TransportSink)
+        .into_iter()
+        .map(|(name, fingerprint, value)| WireSecret {
+            name,
+            value,
+            fingerprint: fingerprint.as_hex(),
+        })
+        .collect())
+}
+
+fn assignment(revision: RevisionId, secrets: Vec<WireSecret>) -> [Instruction; 3] {
     [
         Instruction::Assign {
             revision: revision.clone(),
             stable: true,
-            secrets: Vec::new(),
+            secrets,
             tree_digest: None,
         },
         Instruction::RequestPlan {
@@ -193,6 +252,7 @@ impl Transport for LocalTransport {
         });
 
         let debounce = self.debounce;
+        let resolver = self.secrets.clone();
         tokio::spawn(async move {
             let _watcher = watcher;
             let mut last: Option<String> = None;
@@ -210,7 +270,16 @@ impl Transport for LocalTransport {
                     Ok(digest) if last.as_deref() != Some(digest.as_str()) => {
                         tracing::info!(revision = %&digest[..8], "configuration changed");
                         last = Some(digest.clone());
-                        for instruction in assignment(RevisionId(digest)) {
+                        let secrets = match &resolver {
+                            Some(resolver) => resolve_secrets(resolver, &source, None)
+                                .await
+                                .unwrap_or_else(|err| {
+                                    tracing::warn!(error = %err.description(), "could not resolve the configuration's secrets");
+                                    Vec::new()
+                                }),
+                            None => Vec::new(),
+                        };
+                        for instruction in assignment(RevisionId(digest), secrets) {
                             if instruction_tx.send(instruction).await.is_err() {
                                 return;
                             }
@@ -253,8 +322,54 @@ impl Transport for LocalTransport {
     async fn fetch_secrets(
         &self,
         _revision: &RevisionId,
-        _names: &[String],
+        names: &[String],
     ) -> buckle_core::Result<Vec<WireSecret>> {
-        Ok(Vec::new())
+        match &self.secrets {
+            Some(resolver) => resolve_secrets(resolver, &self.source, Some(names)).await,
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_mode_resolves_declared_secrets_with_the_file_provider() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let vault = tempfile::tempdir().expect("tempdir");
+        let path = vault.path().join("db");
+        std::fs::write(&path, "hunter2\n").expect("write");
+        std::fs::write(
+            source.path().join("buckle.yaml"),
+            format!(
+                "version: 2\nsecrets:\n  db: {{ file: {} }}\n  gone: {{ file: {} }}\n",
+                path.display(),
+                vault.path().join("missing").display()
+            ),
+        )
+        .expect("write");
+        let transport = LocalTransport::new(source.path())
+            .with_secrets(InstallKey::from_bytes([3; 32]), Vec::new());
+        let got = transport
+            .fetch_secrets(
+                &RevisionId::new("r"),
+                &["db".to_string(), "gone".to_string()],
+            )
+            .await
+            .expect("resolved");
+        assert_eq!(got.len(), 1, "a missing secret is left out");
+        assert_eq!(got[0].name, "db");
+        assert_eq!(got[0].value, b"hunter2", "one trailing newline trimmed");
+        assert_eq!(got[0].fingerprint.len(), 8);
+        // Without a resolver (the default), nothing is resolved.
+        assert!(
+            LocalTransport::new(source.path())
+                .fetch_secrets(&RevisionId::new("r"), &["db".to_string()])
+                .await
+                .expect("ok")
+                .is_empty()
+        );
     }
 }

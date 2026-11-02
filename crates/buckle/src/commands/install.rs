@@ -88,6 +88,7 @@ pub async fn run(args: InstallArgs) -> buckle_core::Result<i32> {
                 drift: Default::default(),
                 vars: Default::default(),
                 telemetry: Default::default(),
+                local_secret_exec: Vec::new(),
             };
             config.validate()?;
             let options = buckle_agent::InstallOptions {
