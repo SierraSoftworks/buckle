@@ -177,10 +177,12 @@ pub fn note(n: &ModuleNote, glyph: &str, class: &str, scope: Html) -> Html {
 }
 
 fn body(plan: &PlanView) -> Html {
-    let warnings = (!plan.warnings.is_empty()).then(|| html! {
-        <ul class="plan__warnings">
-            { for plan.warnings.iter().map(|w| html! { <li>{ icons::alert() }{ secret_text(w) }</li> }) }
-        </ul>
+    let warnings = (!plan.warnings.is_empty()).then(|| {
+        warnings_block(
+            plan.warnings.len(),
+            html! {},
+            html! { { for plan.warnings.iter().map(|w| warning(w, html! {})) } },
+        )
     });
     // A module with nothing to apply is left out; the rest open to their
     // diffs from a heading that counts them.
@@ -269,6 +271,31 @@ pub fn tally(t: Tally) -> Html {
             { part(t.remove, "remove", "-", "to remove").unwrap_or_default() }
             { part(t.blocked, "blocked", "!", "blocked").unwrap_or_default() }
         </span>
+    }
+}
+
+/// The plan's warnings, as a block like a module's: counted in its heading,
+/// listed one per line when opened.
+pub fn warnings_block(n: usize, hosts: Html, items: Html) -> Html {
+    block(
+        "plan-module--warnings",
+        html! { <>
+            <span class="plan-module__icon">{ icons::alert() }</span>
+            <h4 class="plan-module__name">{ "Warnings" }</h4>
+            <span class="plan-module__aside"><span class="muted">{ count(n, "warning", "warnings") }</span>{ hosts }</span>
+        </> },
+        html! { <ul class="steps">{ items }</ul> },
+    )
+}
+
+/// One warning: its text flowing (and wrapping) as one run, placeholders
+/// inline, then the hosts it applies to.
+pub fn warning(text: &str, scope: Html) -> Html {
+    html! {
+        <li class="step step--warning">
+            <span class="step__text">{ secret_text(text) }</span>
+            { scope }
+        </li>
     }
 }
 

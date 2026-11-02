@@ -8,11 +8,12 @@ use std::rc::Rc;
 use buckle_api::{FleetPlan, FleetStep, PlanGroup, Shared};
 use yew::prelude::*;
 
-use super::diff::{FactExemplars, secret_text};
+use super::diff::FactExemplars;
 use super::icons;
 use super::plan::{
     DEFERRED_NOTE, HELD_NOTE, INDETERMINATE_NOTE, block, handler, module_head, note, notes_head,
-    rehome, rehomed_block, removal, removals_block, step_class, step_detail, step_line,
+    rehome, rehomed_block, removal, removals_block, step_class, step_detail, step_line, warning,
+    warnings_block,
 };
 use crate::logic::fleet_plan::{hosts_changed, scope_label, summarise};
 use crate::logic::format::count;
@@ -73,10 +74,14 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
             ..Default::default()
         }))
     });
-    let warnings = (!p.warnings.is_empty()).then(|| html! {
-        <ul class="plan__warnings">
-            { for p.warnings.iter().map(|w| html! { <li>{ icons::alert() }{ secret_text(&w.value) }{ shared_scope(all, w) }</li> }) }
-        </ul>
+    // A warning names its hosts only where they differ from the block's.
+    let warnings = (!p.warnings.is_empty()).then(|| {
+        let warned = union(&p.warnings);
+        warnings_block(
+            p.warnings.len(),
+            scope(all, &warned),
+            html! { { for p.warnings.iter().map(|w| warning(&w.value, scope_within(all, &warned, &w.hosts))) } },
+        )
     });
     // Modules that change nothing anywhere are left out; the rest are
     // headed by what they change on how many hosts, a line within naming

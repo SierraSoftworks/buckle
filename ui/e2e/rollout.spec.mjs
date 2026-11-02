@@ -138,6 +138,17 @@ describe("approving a phase", () => {
       /4 changed · \d+ unchanged/,
     );
 
+    // Warnings are one block too, each a single wrapping line of text.
+    const warnings = fleet.locator("details.plan-module--warnings");
+    assert.match(await warnings.locator("> summary").textContent(), /2 warnings/);
+    await warnings.locator("> summary").click();
+    const long = warnings.locator(".step__text", { hasText: "released: left in place" });
+    await long.waitFor();
+    assert.equal(await long.locator(".fact").count(), 1, "the host's name reads as a placeholder");
+    const box = await long.boundingBox();
+    const pane = await fleet.boundingBox();
+    assert.ok(box.x + box.width <= pane.x + pane.width + 1, "a long warning wraps inside the plan");
+
     // Opening a module shows its diffs, host values as placeholders.
     await nomadHead.click();
     const client = fleet.locator('li[data-resource="file.template[/etc/nomad.d/client.hcl]"]');
