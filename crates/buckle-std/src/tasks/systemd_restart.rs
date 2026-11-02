@@ -43,7 +43,10 @@ impl Task for SystemdRestart {
     }
 
     #[tracing::instrument(name = "task.systemd.restart.plan", skip_all, fields(unit = %spec.name))]
-    async fn plan(&self, _cx: &Cx, spec: &Spec) -> Result<Planned> {
+    async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
+        if let Some(blocked) = super::systemd_common::unavailable(cx).await? {
+            return Ok(blocked);
+        }
         Ok(Planned::change(Diff::Opaque {
             summary: format!("restart {}", spec.name),
         }))
@@ -67,7 +70,12 @@ mod tests {
 
     #[tokio::test]
     async fn restarts_the_named_unit() {
-        let sys = FakeSystem::new().on_command_ok("systemctl", &["restart"], "");
+        let sys = FakeSystem::new()
+            .with_dir(
+                "/run/systemd/system",
+                buckle_core::system::FilePerms::mode(0o755),
+            )
+            .on_command_ok("systemctl", &["restart"], "");
         let cx = cx(&sys);
         let s: Spec = spec(json!({"name": "nomad.service"}));
         let planned = SystemdRestart.plan(&cx, &s).await.unwrap();
@@ -80,12 +88,17 @@ mod tests {
 
     #[tokio::test]
     async fn failures_surface_and_removal_is_a_noop() {
-        let sys = FakeSystem::new().on_command_fail(
-            "systemctl",
-            &["restart"],
-            5,
-            "Failed to restart nomad.service: Unit nomad.service not found.",
-        );
+        let sys = FakeSystem::new()
+            .with_dir(
+                "/run/systemd/system",
+                buckle_core::system::FilePerms::mode(0o755),
+            )
+            .on_command_fail(
+                "systemctl",
+                &["restart"],
+                5,
+                "Failed to restart nomad.service: Unit nomad.service not found.",
+            );
         let cx = cx(&sys);
         let s: Spec = spec(json!({"name": "nomad.service"}));
         let err = SystemdRestart

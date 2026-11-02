@@ -2,7 +2,7 @@
 
 use super::hostkit::ownership::previous_artefacts;
 use super::sys_exec::run_checked;
-use super::systemd_common::{UnitStatus, show, systemctl};
+use super::systemd_common::{UnitStatus, show, show_for_plan, systemctl};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::state::ResourceRecord;
@@ -189,7 +189,10 @@ impl Task for SystemdUnit {
     #[tracing::instrument(name = "task.systemd.unit.plan", skip_all, fields(unit = %spec.name))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         validate(spec)?;
-        let status = show(cx, &spec.name).await?;
+        let status = match show_for_plan(cx, &spec.name).await? {
+            Ok(status) => status,
+            Err(blocked) => return Ok(blocked),
+        };
         match steps(spec, &status) {
             Err(reason) => Ok(Planned::blocked(reason)),
             Ok(steps) if steps.is_empty() => Ok(Planned::NoOp),

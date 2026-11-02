@@ -272,6 +272,9 @@ impl Task for AptRepository {
     #[tracing::instrument(name = "task.apt.repository.plan", skip_all, fields(repository = %spec.name))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         spec.validate()?;
+        if let Some(blocked) = super::apt_common::unavailable(cx, false).await? {
+            return Ok(blocked);
+        }
         let wanted = spec.render();
         let path = spec.sources_path();
         let current = cx

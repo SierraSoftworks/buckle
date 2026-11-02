@@ -69,6 +69,26 @@ pub(crate) fn parse_simulated_removals(text: &str) -> Vec<String> {
     out
 }
 
+/// `Some(Blocked)` when apt cannot be used on this host (`apt-get` or
+/// `dpkg-query` missing: not a Debian-family system, or a stripped image).
+pub(crate) async fn unavailable(
+    cx: &Cx,
+    need_dpkg: bool,
+) -> Result<Option<buckle_core::plan::Planned>> {
+    let mut tools = vec!["apt-get"];
+    if need_dpkg {
+        tools.push("dpkg-query");
+    }
+    for tool in tools {
+        if cx.system.which(tool).await?.is_none() {
+            return Ok(Some(buckle_core::plan::Planned::blocked(format!(
+                "`{tool}` is not installed on this host; apt tasks need a Debian or Ubuntu system"
+            ))));
+        }
+    }
+    Ok(None)
+}
+
 /// What `dpkg-query -W -f='${Status} ${Version}\n'` says about a package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PkgState {

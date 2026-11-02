@@ -155,6 +155,9 @@ impl Task for AptPackage {
     #[tracing::instrument(name = "task.apt.package.plan", skip_all, fields(packages = %Self::key(spec)))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         let pkgs = spec.packages()?;
+        if let Some(blocked) = super::apt_common::unavailable(cx, true).await? {
+            return Ok(blocked);
+        }
         let mut actions: Vec<String> = Vec::new();
         let mut blocked: Vec<String> = Vec::new();
         let mut upgrades = false;

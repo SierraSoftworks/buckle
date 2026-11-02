@@ -984,6 +984,64 @@ mod registry_tests {
         }
     }
 
+    /// Planning on a host without the tool a kind shells out to is Blocked
+    /// with advice, never a plan error (a minimal container image).
+    #[rstest::rstest]
+    #[case("apt.package", json!({"name": "nginx"}))]
+    #[case("apt.package", json!({"name": "nginx", "state": "absent"}))]
+    #[case("apt.update", json!({}))]
+    #[case("apt.repository", json!({"name": "x", "uri": "https://x.example", "suites": ["s"]}))]
+    #[case("systemd.unit", json!({"name": "nomad", "enabled": true}))]
+    #[case("systemd.dropin", json!({"unit": "nomad.service", "content": "[Service]\n"}))]
+    #[case("systemd.daemon_reload", json!({}))]
+    #[case("systemd.restart", json!({"name": "nomad"}))]
+    #[case("systemd.reload", json!({"name": "nomad"}))]
+    #[case("docker.image", json!({"name": "i:1"}))]
+    #[case("hostname.set", json!({"name": "web-1"}))]
+    #[case("swap.file", json!({"path": "/swapfile", "size_mb": 10}))]
+    #[case("user.account", json!({"name": "u"}))]
+    #[case("user.group", json!({"name": "g"}))]
+    #[tokio::test]
+    async fn a_missing_tool_at_plan_time_is_blocked_not_an_error(
+        #[case] kind: &str,
+        #[case] raw: serde_json::Value,
+    ) {
+        let sys = buckle_core::testing::FakeSystem::new().with_hostname("old");
+        let cx = super::testkit::cx(&sys);
+        let task = lookup(kind).unwrap();
+        let spec = task.parse(raw).unwrap();
+        match task.plan(&cx, &spec).await {
+            Ok(buckle_core::plan::Planned::Blocked { reason }) => {
+                assert!(!reason.is_empty(), "{kind}")
+            }
+            other => panic!("{kind}: expected Blocked, got {other:?}"),
+        }
+        assert!(
+            sys.commands_run().is_empty(),
+            "{kind} ran a command it does not have"
+        );
+    }
+
+    /// Kinds that need no tool to plan still plan without one.
+    #[rstest::rstest]
+    #[case("sysctl.param", json!({"name": "vm.swappiness", "value": 10}))]
+    #[case("cron.job", json!({"name": "j", "schedule": "@daily", "command": "x"}))]
+    #[case("ufw.rule", json!({"rule": "allow", "to_port": 22}))]
+    #[case("command.run", json!({"run": ["x"], "unless": ["missing-probe"]}))]
+    #[tokio::test]
+    async fn kinds_that_need_no_tool_to_plan_do_not_fail_without_one(
+        #[case] kind: &str,
+        #[case] raw: serde_json::Value,
+    ) {
+        let sys = buckle_core::testing::FakeSystem::new();
+        let cx = super::testkit::cx(&sys);
+        let task = lookup(kind).unwrap();
+        let spec = task.parse(raw).unwrap();
+        task.plan(&cx, &spec)
+            .await
+            .unwrap_or_else(|e| panic!("{kind}: {}", e.description()));
+    }
+
     #[test]
     fn locks_platforms_and_cautions_match_the_catalogue() {
         let get = |k| lookup(k).unwrap();

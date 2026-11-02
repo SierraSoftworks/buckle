@@ -203,18 +203,47 @@ impl CommandRun {
             return Ok(Some(format!("{} exists", path.display())));
         }
         if let Some(unless) = &spec.unless {
-            let out = cx.system.run(self.build(cx, spec, unless)?).await?;
+            let out = self.probe(cx, self.build(cx, spec, unless)?).await?;
             if out.success() {
                 return Ok(Some(format!("`{}` succeeded", unless.display())));
             }
         }
         if let Some(only_if) = &spec.only_if {
-            let out = cx.system.run(self.build(cx, spec, only_if)?).await?;
+            let out = self.probe(cx, self.build(cx, spec, only_if)?).await?;
             if !out.success() {
                 return Ok(Some(format!("`{}` did not succeed", only_if.display())));
             }
         }
         Ok(None)
+    }
+
+    /// Runs an `unless` / `only_if` probe. A probe whose program is not
+    /// installed behaves as a shell would report it, exiting 127 ("command not
+    /// found"), rather than failing the plan: `unless: [nomad, version]`
+    /// before nomad is installed means "not installed yet, run".
+    async fn probe(&self, cx: &Cx, command: Command) -> Result<Output> {
+        let not_found = || Output {
+            code: Some(127),
+            stdout: Vec::new(),
+            stderr: format!("{}: command not found", command.program).into_bytes(),
+            timed_out: false,
+        };
+        let present = if command.program.contains('/') {
+            cx.system
+                .stat(std::path::Path::new(&command.program))
+                .await?
+                .is_some()
+        } else {
+            cx.system.which(&command.program).await?.is_some()
+        };
+        if !present {
+            return Ok(not_found());
+        }
+        match cx.system.run(command.clone()).await {
+            Ok(out) => Ok(out),
+            // The program vanished between the lookup and the start.
+            Err(_) => Ok(not_found()),
+        }
     }
 
     fn changed(spec: &Spec, out: &Output) -> bool {
@@ -821,5 +850,28 @@ mod tests {
         let text = format!("{} {:?}", err.description(), err);
         assert!(!text.contains("tok-123-secret"), "{text}");
         assert!(text.contains("secret:api@"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_whose_program_is_missing_exits_127_instead_of_failing_the_plan() {
+        let sys = FakeSystem::new();
+        let c = cx(&sys);
+        let unless: Spec = serde_json::from_value(
+            json!({"run": ["install-nomad"], "unless": ["nomad", "version"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_class(&CommandRun, &c, &unless).await,
+            Class::Change,
+            "not installed yet: run"
+        );
+        let only_if: Spec =
+            serde_json::from_value(json!({"run": ["x"], "only_if": ["/usr/local/bin/missing"]}))
+                .unwrap();
+        assert_eq!(
+            plan_class(&CommandRun, &c, &only_if).await,
+            Class::NoOp,
+            "127 is not success"
+        );
     }
 }
