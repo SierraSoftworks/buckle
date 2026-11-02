@@ -57,13 +57,17 @@ stub_secrets() {
   done < <(sed -nE 's/.*\{[[:space:]]*env:[[:space:]]*"?([^" ,}]+)"?.*/\1/p' "$config")
 }
 
-# Minimal images ship without a CA bundle, which an HTTPS call to GitHub needs.
-ensure_ca_certificates() {
-  [ -s /etc/ssl/certs/ca-certificates.crt ] && return 0
+# Minimal images ship without a CA bundle, which an HTTPS call to GitHub needs,
+# and without procps, whose `sysctl` the example's kernel settings inspect.
+ensure_base_tools() {
+  local missing=()
+  [ -s /etc/ssl/certs/ca-certificates.crt ] || missing+=(ca-certificates)
+  command -v sysctl >/dev/null || missing+=(procps)
+  [ ${#missing[@]} -eq 0 ] && return 0
   command -v apt-get >/dev/null || return 0
-  echo "== installing ca-certificates (minimal images have none)"
-  { apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates; } >/dev/null ||
-    echo "warning: could not install ca-certificates; HTTPS tasks may fail to plan" >&2
+  echo "== installing ${missing[*]} (minimal images have none)"
+  { apt-get update -qq && apt-get install -y -qq --no-install-recommends "${missing[@]}"; } >/dev/null ||
+    echo "warning: could not install ${missing[*]}; some tasks may fail to plan" >&2
 }
 
 run_inner() {
@@ -84,7 +88,7 @@ run_inner() {
   # shellcheck disable=SC1091
   echo "== $(. /etc/os-release && echo "$PRETTY_NAME") on $(uname -m), $("$bin" --version)"
   stub_secrets
-  [ "$offline" = 1 ] || ensure_ca_certificates
+  [ "$offline" = 1 ] || ensure_base_tools
 
   local facts=() f
   for f in "$repo"/fixtures/facts/*.json; do facts+=(--facts "$f"); done
