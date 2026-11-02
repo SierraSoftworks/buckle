@@ -5,7 +5,7 @@
 //! (`--ok`, `--danger`, …) and the stylesheet maps it onto the active theme.
 
 use buckle_api::{
-    Connection, HealthSummary, HostRolloutState, HostStatus, HostSummary, PhaseState,
+    Connection, ErrorKind, HealthSummary, HostRolloutState, HostStatus, HostSummary, PhaseState,
     RevisionStatus, RolloutHost, RolloutState,
 };
 
@@ -285,6 +285,54 @@ pub fn outcome_tone(outcome: &str) -> Tone {
     }
 }
 
+/// The tag on an error block: who should act on it.
+pub fn error_kind_label(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::User => "user",
+        ErrorKind::System => "system",
+    }
+}
+
+pub fn error_kind_title(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::User => "Something the configuration author or an operator can fix",
+        ErrorKind::System => "Something in Buckle or on the host that needs investigating",
+    }
+}
+
+pub fn error_kind_class(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::User => "error-block--user",
+        ErrorKind::System => "error-block--system",
+    }
+}
+
+/// How loudly a rollout host's `error` is shown. The field carries notes as
+/// well as failures (why a host was skipped, held or has no plan), and a
+/// skip reason drawn in red would read as a failure.
+pub fn host_error_tone(entry: &RolloutHost) -> Tone {
+    if entry.needs_attention {
+        return Tone::Danger;
+    }
+    match entry.state {
+        HostRolloutState::Failed => Tone::Danger,
+        HostRolloutState::Held => Tone::Warn,
+        HostRolloutState::RolledBack => Tone::Mute,
+        _ => Tone::Neutral,
+    }
+}
+
+/// A rollout host's error in one line, for a tooltip: the structured
+/// headline when there is one, the reported string otherwise.
+pub fn host_error_headline(entry: &RolloutHost) -> Option<String> {
+    entry
+        .error_detail
+        .as_ref()
+        .map(|e| e.message.clone())
+        .or_else(|| entry.error.clone())
+        .filter(|e| !e.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +475,37 @@ mod tests {
             !block_look(&entry(HostRolloutState::Failed), None)
                 .classes
                 .contains(&"block--attention")
+        );
+    }
+
+    #[test]
+    fn a_host_error_is_only_red_when_something_failed() {
+        let mut skipped = entry(HostRolloutState::Skipped);
+        skipped.error = Some("Skipped by bob: board swap.".into());
+        assert_eq!(host_error_tone(&skipped), Tone::Neutral);
+        assert_eq!(host_error_tone(&entry(HostRolloutState::Held)), Tone::Warn);
+        assert_eq!(
+            host_error_tone(&entry(HostRolloutState::Failed)),
+            Tone::Danger
+        );
+        let mut stuck = entry(HostRolloutState::RolledBack);
+        stuck.needs_attention = true;
+        assert_eq!(host_error_tone(&stuck), Tone::Danger);
+    }
+
+    #[test]
+    fn a_tooltip_prefers_the_structured_headline() {
+        let mut e = entry(HostRolloutState::Failed);
+        assert_eq!(host_error_headline(&e), None);
+        e.error = Some("a: b: c".into());
+        assert_eq!(host_error_headline(&e).as_deref(), Some("a: b: c"));
+        e.error_detail = Some(buckle_api::ErrorView::user("nomad failed"));
+        assert_eq!(host_error_headline(&e).as_deref(), Some("nomad failed"));
+        assert_eq!(error_kind_label(ErrorKind::User), "user");
+        assert_eq!(error_kind_label(ErrorKind::System), "system");
+        assert_ne!(
+            error_kind_class(ErrorKind::User),
+            error_kind_class(ErrorKind::System)
         );
     }
 

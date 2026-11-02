@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{HostSummary, RolloutDetail, RolloutHost, RolloutPhase};
+use buckle_api::{HostRolloutState, HostSummary, RolloutDetail, RolloutHost, RolloutPhase};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
@@ -18,7 +18,8 @@ use crate::app::Route;
 use crate::logic::format::{config_duration, relative, short};
 use crate::logic::pipeline::{Gate, GateKind, GateState, Stage, gate_check_tone, layout};
 use crate::logic::tone::{
-    LEGEND, block_look, host_state_class, host_state_label, phase_state_label, phase_state_tone,
+    LEGEND, Tone, block_look, host_error_headline, host_error_tone, host_state_class,
+    host_state_label, phase_state_label, phase_state_tone,
 };
 
 #[derive(Properties, PartialEq)]
@@ -30,6 +31,10 @@ pub struct PipelineProps {
     /// Smaller blocks and no legend, for the Overview.
     #[prop_or_default]
     pub compact: bool,
+    /// What each applying host is doing (`nomad › file.template[…]`), for
+    /// its block's tooltip.
+    #[prop_or_default]
+    pub activity: BTreeMap<String, String>,
     pub now: DateTime<Utc>,
 }
 
@@ -40,7 +45,7 @@ pub fn pipeline(props: &PipelineProps) -> Html {
         html! {
             <div class="pipeline__step" role="listitem">
                 { gate(&stage.gate, i == 0, props.now) }
-                { column(stage, &props.hosts, props.compact, props.now) }
+                { column(stage, props) }
             </div>
         }
     });
@@ -132,12 +137,8 @@ pub fn health_gate(phase: &RolloutPhase) -> Html {
     }
 }
 
-fn column(
-    stage: &Stage,
-    hosts: &BTreeMap<String, HostSummary>,
-    compact: bool,
-    now: DateTime<Utc>,
-) -> Html {
+fn column(stage: &Stage, props: &PipelineProps) -> Html {
+    let (compact, now) = (props.compact, props.now);
     let phase = stage.phase;
     let c = &stage.counts;
     let mut tally = vec![format!("{}/{} healthy", c.healthy, c.total)];
@@ -192,16 +193,25 @@ fn column(
                 <p class="stage__empty muted">{ "No hosts" }</p>
             } else {
                 <div class="stage__blocks" {style} role="list">
-                    { for stage.hosts().map(|h| block(h, hosts.get(&h.host), now)) }
+                    { for stage.hosts().map(|h| block(h, props.hosts.get(&h.host), props.activity.get(&h.host), now)) }
                 </div>
             }
         </section>
     }
 }
 
-fn block(entry: &RolloutHost, host: Option<&HostSummary>, now: DateTime<Utc>) -> Html {
+fn block(
+    entry: &RolloutHost,
+    host: Option<&HostSummary>,
+    activity: Option<&String>,
+    now: DateTime<Utc>,
+) -> Html {
     let look = block_look(entry, host);
+    let activity = activity.filter(|_| entry.state == HostRolloutState::Applying);
     let mut detail: Vec<Html> = Vec::new();
+    if let Some(now) = activity {
+        detail.push(html! { <span class="block__activity">{ "running " }<span class="mono">{ now.clone() }</span></span> });
+    }
     if let Some(wave) = entry.wave {
         detail.push(html! { <span>{ format!("wave {wave}") }</span> });
     }
@@ -222,15 +232,25 @@ fn block(entry: &RolloutHost, host: Option<&HostSummary>, now: DateTime<Utc>) ->
     if entry.needs_attention {
         detail.push(html! { <span class="block__error">{ "needs attention: its own rollback failed" }</span> });
     }
-    if let Some(error) = &entry.error {
-        detail.push(html! { <span class="block__error">{ error.clone() }</span> });
+    // The headline only: the full error, causes and advice are in the
+    // host's row and report.
+    if let Some(error) = host_error_headline(entry) {
+        let class = if host_error_tone(entry) == Tone::Danger {
+            "block__error"
+        } else {
+            "block__note"
+        };
+        detail.push(html! { <span class={class}>{ error }</span> });
     }
     detail.push(html! { <span class="muted">{ format!("updated {}", relative(entry.updated_at, now)) }</span> });
 
     html! {
         <RouteLink to={Route::Host { id: entry.host.clone() }}
             classes={classes!(look.classes.clone())}
-            label={format!("{}: {}", entry.host, look.label)}
+            label={match activity {
+                Some(now) => format!("{}: {}, running {now}", entry.host, look.label),
+                None => format!("{}: {}", entry.host, look.label),
+            }}
             data_host={entry.host.clone()}
             data_state={host_state_label(entry.state).replace(' ', "-")}>
             <span class="block__tip" aria-hidden="true">

@@ -1,0 +1,539 @@
+// Run reports and structured errors: what a host did, module by module and
+// step by step, and why something failed.
+@use 'tokens' as *;
+
+// A structured error: the message as the headline, then its causes and the
+// advice. The tone class on the block (`tone-danger`, `tone-warn`, …) sets
+// `--tone`, so a skip reason is not drawn as a failure.
+.error-block {
+  margin: 0.45rem 0;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--tone, var(--danger)) 30%, var(--line));
+  border-left: 3px solid var(--tone, var(--danger));
+  border-radius: var(--radius-sm);
+  background: var(--tone-soft, var(--danger-soft));
+  font-size: 0.84rem;
+  line-height: 1.45;
+
+  &__context {
+    margin: 0 0 0.2rem;
+    color: var(--fg-2);
+    font-size: 0.76rem;
+    overflow-wrap: anywhere;
+  }
+
+  &__head {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  &__icon {
+    display: inline-flex;
+    padding-top: 0.1rem;
+    color: var(--tone, var(--danger));
+  }
+
+  &__message {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    color: var(--fg);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+
+  &__kind {
+    flex-shrink: 0;
+    padding: 0 0.4rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    color: var(--fg-2);
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    line-height: 1.7;
+    text-transform: uppercase;
+    cursor: help;
+  }
+
+  &--system &__kind {
+    border-color: color-mix(in srgb, var(--warn) 50%, transparent);
+    color: var(--warn);
+  }
+
+  &__section {
+    margin: 0.45rem 0 0 1.5rem;
+  }
+
+  &__label {
+    margin: 0 0 0.1rem;
+    color: var(--fg-2);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  &__causes,
+  &__advice {
+    margin: 0;
+    padding-left: 1.2rem;
+
+    li {
+      margin: 0.1rem 0;
+      overflow-wrap: anywhere;
+    }
+  }
+
+  &__causes li::marker {
+    color: var(--fg-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__raw {
+    margin: 0;
+    color: var(--fg);
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  &--compact {
+    margin: 0.3rem 0 0;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.78rem;
+  }
+
+  &--compact &__raw {
+    font-size: 0.76rem;
+  }
+}
+
+// A run report.
+.run {
+  &__summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem 0.9rem;
+    font-size: 0.84rem;
+  }
+
+  &__counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    list-style: none;
+  }
+
+  &__meta {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.25rem 0.75rem;
+    color: var(--fg-2);
+  }
+
+  &__progress {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.55rem;
+
+    .progress {
+      max-width: 320px;
+    }
+
+    .progress__bar {
+      background: var(--active);
+      transition: width 300ms ease;
+    }
+  }
+
+  &__toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin: 0.75rem 0 0.45rem;
+  }
+
+  &__expand {
+    display: flex;
+    gap: 0.25rem;
+  }
+
+  &__section-title {
+    margin: 0.9rem 0 0.35rem;
+    font-size: 0.85rem;
+  }
+}
+
+.run-count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.2rem;
+  padding: 0 0.5rem;
+  border-radius: 999px;
+  background: var(--tone-soft);
+  color: var(--tone);
+  font-size: 0.78rem;
+  font-weight: 550;
+  line-height: 1.7;
+  white-space: nowrap;
+
+  &__n {
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  &--zero {
+    background: transparent;
+    color: var(--fg-3);
+    font-weight: 450;
+  }
+}
+
+.run-modules {
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.run-module {
+  border-bottom: 1px solid var(--line);
+  border-left: 3px solid transparent;
+
+  &:last-child {
+    border-bottom: none;
+  }
+
+  &--failed,
+  &--unhealthy {
+    border-left-color: var(--danger);
+  }
+
+  &--blocked,
+  &--indeterminate {
+    border-left-color: var(--warn);
+  }
+
+  &--rolled-back {
+    border-left-color: var(--mute);
+  }
+
+  &--running {
+    border-left-color: var(--active);
+  }
+
+  &__row {
+    display: grid;
+    grid-template-columns: 1rem 7.5rem minmax(0, 1fr) auto 4.5rem;
+    align-items: center;
+    gap: 0.6rem;
+    width: 100%;
+    padding: 0.45rem 0.7rem 0.45rem 0.5rem;
+    border: none;
+    background: none;
+    color: var(--fg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover {
+      background: var(--surface-2);
+    }
+
+    .pill {
+      justify-self: start;
+    }
+  }
+
+  &__chevron {
+    display: inline-flex;
+    color: var(--fg-3);
+    transition: transform var(--transition);
+
+    .icon {
+      width: 14px;
+      height: 14px;
+    }
+  }
+
+  &.is-open &__chevron {
+    transform: rotate(90deg);
+  }
+
+  &__title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.15rem 0.6rem;
+    min-width: 0;
+  }
+
+  &__name {
+    font-weight: 600;
+  }
+
+  &--unchanged &__name,
+  &--not-started &__name,
+  &--skipped &__name,
+  &--pending &__name {
+    color: var(--fg-2);
+    font-weight: 500;
+  }
+
+  &__current {
+    color: var(--active);
+    font-size: 0.8rem;
+    overflow-wrap: anywhere;
+  }
+
+  &__note {
+    color: var(--fg-2);
+    font-size: 0.8rem;
+  }
+
+  &__changes,
+  &__duration {
+    color: var(--fg-2);
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  &__duration {
+    text-align: right;
+  }
+
+  &__body {
+    padding: 0 0.7rem 0.65rem 2.1rem;
+
+    > .run-module__note {
+      margin: 0 0 0.3rem;
+    }
+  }
+
+  &__sub {
+    margin: 0.6rem 0 0.2rem;
+    color: var(--fg-2);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+}
+
+.run-steps {
+  list-style: none;
+}
+
+.run-step {
+  display: grid;
+  grid-template-columns: 1.1rem minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 0.15rem 0.6rem;
+  padding: 0.35rem 0.4rem;
+  border-bottom: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 0.84rem;
+
+  &:last-child {
+    border-bottom: none;
+  }
+
+  &__glyph {
+    color: var(--tone);
+    font-family: var(--font-mono);
+    font-weight: 700;
+    text-align: center;
+  }
+
+  &__main {
+    min-width: 0;
+  }
+
+  &__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.15rem 0.5rem;
+  }
+
+  &__name {
+    font-weight: 600;
+  }
+
+  &__kind {
+    margin: 0;
+  }
+
+  &__key {
+    color: var(--fg);
+    overflow-wrap: anywhere;
+  }
+
+  &__state {
+    color: var(--fg-3);
+    font-size: 0.74rem;
+  }
+
+  &__summary,
+  &__result {
+    margin: 0.1rem 0 0;
+    overflow-wrap: anywhere;
+  }
+
+  &__summary {
+    color: var(--fg-2);
+  }
+
+  &__result {
+    color: var(--fg);
+
+    &::before {
+      content: "↳ ";
+      color: var(--fg-3);
+    }
+  }
+
+  &__duration {
+    color: var(--fg-2);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  &--running {
+    background: var(--active-soft);
+
+    .run-step__glyph {
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+
+    .run-step__state {
+      color: var(--active);
+      font-weight: 600;
+    }
+  }
+
+  &--failed {
+    background: var(--danger-soft);
+
+    .run-step__state {
+      color: var(--danger);
+      font-weight: 600;
+    }
+  }
+
+  &--blocked .run-step__state {
+    color: var(--warn);
+    font-weight: 600;
+  }
+
+  &--rolled-back .run-step__state {
+    color: var(--mute);
+  }
+
+  &--pending .run-step__key,
+  &--unchanged .run-step__key {
+    color: var(--fg-2);
+  }
+
+  &--skipped,
+  &--not-run {
+    .run-step__name,
+    .run-step__key,
+    .run-step__summary {
+      color: var(--fg-3);
+      text-decoration: line-through;
+      text-decoration-color: color-mix(in srgb, var(--fg-3) 60%, transparent);
+    }
+  }
+}
+
+// A module's health results in this run.
+.run-health {
+  list-style: none;
+
+  &__item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.25rem 0.6rem;
+    padding: 0.3rem 0.4rem;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.82rem;
+
+    &:last-child {
+      border-bottom: none;
+    }
+  }
+
+  &__reason {
+    flex: 1;
+    min-width: 12rem;
+    color: var(--fg-2);
+  }
+}
+
+.run-removals {
+  margin-top: 0.25rem;
+
+  .run-steps {
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--line));
+    border-radius: var(--radius);
+    background: var(--bg);
+  }
+}
+
+// A host page's run section: the picker beside the title, or under it when
+// there is no room.
+.run-panel > .panel__head {
+  flex-wrap: wrap;
+
+  .panel__actions {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+}
+
+.run-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+
+  .input {
+    width: auto;
+    max-width: min(22rem, 100%);
+    min-height: 28px;
+    padding: 0.15rem 0.4rem;
+    font-size: 0.82rem;
+  }
+}
+
+@media (max-width: $small) {
+  // The name takes the line; the count and time follow it, together.
+  .run-module__row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 0.6rem;
+  }
+
+  .run-module__title {
+    flex: 1 1 8rem;
+  }
+
+  .run-module__body {
+    padding-left: 0.8rem;
+  }
+
+  .error-block__section {
+    margin-left: 0.4rem;
+  }
+}

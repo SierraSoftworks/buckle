@@ -1,31 +1,37 @@
 //! Host detail (design §12): the facts tree, what Buckle owns on the host,
-//! health per rollout and scope with reasons, drift diffs and recent runs,
-//! and, for admins, the controls: server labels with a live preview of the
+//! health per rollout and scope with reasons, drift diffs, the latest run
+//! module by module and step by step (live while it applies, with any older
+//! run a pick away), and, for admins, the controls: server labels with a live preview of the
 //! groups and phase they produce, registration approval, pause and resume,
 //! notes, and forget.
 
 use std::collections::BTreeMap;
 
-use buckle_api::{Connection, HealthResultDto, HostDetail, HostPatch, HostPreview, HostStatus};
+use buckle_api::{
+    Connection, HealthResultDto, HostDetail, HostPatch, HostPreview, HostStatus, LiveEvent,
+    RunReport, RunSummary,
+};
 use chrono::{DateTime, Utc};
-use web_sys::{HtmlInputElement, HtmlTextAreaElement};
+use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, DiffView, Empty, ErrorState, JsonTree, Kind, Loading, PageHead, Panel, Pill,
-    Refresh, RouteLink, TraceLink, use_toast,
+    Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind, Loading, PageHead,
+    Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
 };
-use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
+use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::format::{commit, relative, relative_opt, short, short_duration, timestamp};
 use crate::logic::labels::{Change, Row, changes, collect, effective, rows};
 use crate::logic::live::{apply_fleet, apply_host_detail};
+use crate::logic::run::{apply_run_list, newest_run, run_label};
 use crate::logic::tone::{
     Tone, check_status_tone, health_label, health_tone, host_status_label, host_status_tone,
     outcome_tone,
 };
+use crate::store::use_live;
 
 #[derive(Properties, PartialEq)]
 pub struct Props {
@@ -53,6 +59,29 @@ pub fn host_page(props: &Props) -> Html {
     let ask = use_state(|| None::<Ask>);
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
+    // The run the report shows: `None` follows the newest.
+    let picked = use_state_eq(|| None::<String>);
+    {
+        let picked = picked.clone();
+        use_effect_with(props.id.clone(), move |_| {
+            picked.set(None);
+            || ()
+        });
+    }
+    let store = use_live();
+    // A run that started since the detail was fetched is the newest.
+    let newest = live.as_ref().and_then(|d| {
+        let events = detail
+            .data
+            .as_ref()
+            .and_then(|f| store.log.since(f.0))
+            .unwrap_or_default();
+        newest_run(
+            d.latest_run.as_ref().map(|r| r.id.as_str()),
+            &d.summary.id,
+            events.iter().map(|e| &**e),
+        )
+    });
 
     let Some(d) = live else {
         return html! {
@@ -229,10 +258,21 @@ pub fn host_page(props: &Props) -> Html {
                     }) }
                 </Panel>
             }
+            <RunsPanel host={h.id.clone()} latest={d.latest_run.clone()} newest={newest.clone()}
+                picked={(*picked).clone()} on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             <Panel title="Owned resources" subtitle="What Buckle manages on this host, and what removal would do">
                 { resources(&d, now) }
             </Panel>
-            <Panel title="Recent runs">{ runs(&d, now) }</Panel>
+            <Panel title="Recent runs">{ runs(&d, now, (*picked).clone().or(newest.clone()), &{
+                let picked = picked.clone();
+                let newest = newest.clone();
+                Callback::from(move |run: String| {
+                    picked.set((Some(&run) != newest.as_ref()).then_some(run));
+                    if let Some(el) = crate::util::window().document().and_then(|d| d.get_element_by_id("run-report")) {
+                        el.scroll_into_view();
+                    }
+                })
+            }) }</Panel>
             <Panel title="Facts" subtitle={d.facts_at.map(|at| format!("refreshed {}", relative(at, now))).unwrap_or_default()}>
                 if d.facts.is_null() {
                     <Empty title="No facts yet" message="Facts arrive with the agent's first session." />
@@ -337,7 +377,12 @@ fn resources(d: &HostDetail, now: DateTime<Utc>) -> Html {
     }
 }
 
-fn runs(d: &HostDetail, now: DateTime<Utc>) -> Html {
+fn runs(
+    d: &HostDetail,
+    now: DateTime<Utc>,
+    shown: Option<String>,
+    view: &Callback<String>,
+) -> Html {
     if d.recent_runs.is_empty() {
         return html! { <Empty title="No runs yet" /> };
     }
@@ -347,25 +392,156 @@ fn runs(d: &HostDetail, now: DateTime<Utc>) -> Html {
                 <thead><tr>
                     <th scope="col">{ "Started" }</th><th scope="col">{ "Revision" }</th><th scope="col">{ "Plan" }</th>
                     <th scope="col">{ "Outcome" }</th><th scope="col">{ "Changes" }</th><th scope="col">{ "Took" }</th><th scope="col">{ "Trace" }</th>
+                    <th scope="col"><span class="visually-hidden">{ "Report" }</span></th>
                 </tr></thead>
                 <tbody>
                     { for d.recent_runs.iter().map(|r| html! {
-                        <tr>
+                        <tr class={classes!((!r.id.is_empty() && shown.as_deref() == Some(r.id.as_str())).then_some("is-open"))}
+                            data-run={(!r.id.is_empty()).then(|| r.id.clone())}>
                             <td title={timestamp(r.started_at)}>{ relative(r.started_at, now) }</td>
                             <td class="mono" title={r.revision.clone()}>{ commit(&r.revision) }</td>
                             <td class="mono" title={r.plan_digest.clone()}>{ short(&r.plan_digest) }</td>
                             <td>
                                 <Pill tone={outcome_tone(&r.outcome)} label={r.outcome.replace('_', " ")} />
-                                if let Some(e) = &r.error { <span class="cell-sub">{ e.clone() }</span> }
+                                if let Some(e) = &r.error { <ErrorBlock raw={e.clone()} tone={outcome_tone(&r.outcome)} compact=true /> }
                             </td>
                             <td>{ format!("{} · {} removals", r.changes, r.removals) }</td>
-                            <td>{ short_duration(r.finished_at.signed_duration_since(r.started_at).num_seconds()) }</td>
+                            <td>{ if r.finished_at > r.started_at { short_duration(r.finished_at.signed_duration_since(r.started_at).num_seconds()) } else { "—".into() } }</td>
                             <td><TraceLink id={r.trace_id.clone()} url={r.trace_url.clone()} /></td>
+                            <td>
+                                if !r.id.is_empty() {
+                                    <button type="button" class="btn btn--subtle btn--small"
+                                        aria-label={format!("Show the report of the run started {}", relative(r.started_at, now))}
+                                        onclick={{ let (view, id) = (view.clone(), r.id.clone()); Callback::from(move |_: MouseEvent| view.emit(id.clone())) }}>
+                                        { "Report" }
+                                    </button>
+                                }
+                            </td>
                         </tr>
                     }) }
                 </tbody>
             </table>
         </div>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct RunsProps {
+    host: String,
+    /// The detail's latest run, kept current.
+    latest: Option<RunReport>,
+    /// The newest run heard of (a run may have started since the detail).
+    newest: Option<String>,
+    /// The run the reader picked; `None` follows the newest.
+    picked: Option<String>,
+    on_pick: Callback<Option<String>>,
+}
+
+/// The report of the host's newest run, live, or of an older one picked
+/// from the host's runs.
+#[function_component(RunsPanel)]
+fn runs_panel(props: &RunsProps) -> Html {
+    let now = use_now(30);
+    let shown = props.picked.clone().or_else(|| props.newest.clone());
+    let older = props.picked.is_some() && props.picked != props.newest;
+    let feed = use_run_report(
+        shown.clone().map(|run| RunSource::Host {
+            host: props.host.clone(),
+            run,
+        }),
+        props.latest.clone(),
+    );
+
+    // The picker's list, with states kept current, fetched again when a run
+    // it does not list starts.
+    let list = use_fetch(
+        props.host.clone(),
+        |id| async move { api::host_runs(&id).await },
+    );
+    let store = use_live();
+    let mut runs: Vec<RunSummary> = list.value().cloned().unwrap_or_default();
+    let mut unknown = false;
+    if let Some(events) = list.data.as_ref().and_then(|d| store.log.since(d.0)) {
+        for event in events {
+            if let LiveEvent::RunProgress { progress } = &*event {
+                unknown |= !apply_run_list(&mut runs, &props.host, progress);
+            }
+        }
+    }
+    {
+        let reload = list.reload.clone();
+        let at = unknown.then(|| list.data.as_ref().map(|d| d.0)).flatten();
+        use_effect_with(at, move |at| {
+            if at.is_some() {
+                reload.emit(());
+            }
+            || ()
+        });
+    }
+    runs.retain(|r| !r.id.is_empty());
+
+    // The select shows the run shown, also after "Show the newest" or a
+    // recent-runs row changed it (an option's `selected` attribute does not
+    // move a select the reader has already changed).
+    let select = use_node_ref();
+    {
+        let select = select.clone();
+        let value = shown.clone().unwrap_or_default();
+        use_effect_with((value, runs.len()), move |(value, _)| {
+            if let Some(el) = select.cast::<HtmlSelectElement>() {
+                el.set_value(value);
+            }
+            || ()
+        });
+    }
+
+    let onchange = {
+        let (on_pick, newest) = (props.on_pick.clone(), props.newest.clone());
+        Callback::from(move |e: Event| {
+            let run = e.target_unchecked_into::<HtmlSelectElement>().value();
+            on_pick.emit((Some(&run) != newest.as_ref()).then_some(run));
+        })
+    };
+    let picker = (!runs.is_empty()).then(|| {
+        let listed = shown.as_ref().is_some_and(|s| runs.iter().any(|r| &r.id == s));
+        html! {
+            <label class="run-picker">
+                <span class="muted small">{ "Run" }</span>
+                <select class="input" aria-label="Run to show" ref={select.clone()} {onchange}>
+                    if let (false, Some(s)) = (listed, &shown) {
+                        <option value={s.clone()} selected=true>{ "newest" }</option>
+                    }
+                    { for runs.iter().enumerate().map(|(i, r)| {
+                        let state = r.state.map(run_label).map(str::to_string).unwrap_or_else(|| r.outcome.replace('_', " "));
+                        let label = format!("{}{} · {state} · {}", if i == 0 { "newest · " } else { "" }, relative(r.started_at, now), commit(&r.revision));
+                        html! { <option value={r.id.clone()} selected={shown.as_deref() == Some(r.id.as_str())}>{ label }</option> }
+                    }) }
+                </select>
+            </label>
+        }
+    });
+    let back = older.then(|| {
+        let on_pick = props.on_pick.clone();
+        html! { <Button small=true kind={Kind::Subtle} onclick={Callback::from(move |_| on_pick.emit(None))}>{ "Show the newest" }</Button> }
+    });
+
+    let body = match (&shown, &feed.report, &feed.error) {
+        (None, _, _) => html! {
+            <Empty title="No runs yet" message="A report appears here once the host applies a revision: every module and step, live while it runs." />
+        },
+        (Some(_), Some(report), _) => html! { <RunReportView report={report.clone()} /> },
+        (Some(_), None, Some(e)) => {
+            html! { <ErrorState error={e.clone()} retry={feed.reload.clone()} /> }
+        }
+        (Some(_), None, None) if feed.settled => html! { <Empty title="No report for this run" /> },
+        (Some(_), None, None) => html! { <Loading label="Loading the run…" /> },
+    };
+    html! {
+        <Panel title={if older { "Run report" } else { "Latest run" }} id="run-report" class="run-panel"
+            subtitle={if older { "An older run of this host, module by module" } else { "The host's newest run, module by module and step by step" }}
+            actions={html! { <>{ back.unwrap_or_default() }{ picker.unwrap_or_default() }</> }}>
+            { body }
+        </Panel>
     }
 }
 
