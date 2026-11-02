@@ -5,8 +5,6 @@
 //! rest is a click away, or all of it with "expand all". The same view shows
 //! a run in progress, so a live update only changes states.
 
-use std::collections::BTreeMap;
-
 use buckle_api::{HealthResultDto, ModuleReport, RemovalReport, RunReport, StepReport, StepState};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -41,12 +39,13 @@ pub fn run_report(props: &RunReportProps) -> Html {
     let now = use_now(if live { 1 } else { 30 });
     // What the reader opened or closed; everything else follows the
     // defaults, so a module that starts running opens by itself.
-    let overrides = use_state_eq(BTreeMap::<String, bool>::new);
+    // A list rather than a map: a run has a handful of modules.
+    let overrides = use_state_eq(Vec::<(String, bool)>::new);
     let problems_only = use_state_eq(|| false);
     {
         let (overrides, problems_only) = (overrides.clone(), problems_only.clone());
         use_effect_with(r.id.clone(), move |_| {
-            overrides.set(BTreeMap::new());
+            overrides.set(Vec::new());
             problems_only.set(false);
             || ()
         });
@@ -54,8 +53,9 @@ pub fn run_report(props: &RunReportProps) -> Html {
 
     let is_open = |m: &ModuleReport| {
         overrides
-            .get(&m.name)
-            .copied()
+            .iter()
+            .find(|(name, _)| *name == m.name)
+            .map(|(_, open)| *open)
             .unwrap_or_else(|| expanded_by_default(m))
     };
     let set_all = |open: bool| {
@@ -96,8 +96,12 @@ pub fn run_report(props: &RunReportProps) -> Html {
                         let toggle = {
                             let (overrides, name) = (overrides.clone(), m.name.clone());
                             Callback::from(move |_: MouseEvent| {
-                                let mut next = (*overrides).clone();
-                                next.insert(name.clone(), !open);
+                                let mut next: Vec<(String, bool)> = (*overrides)
+                                    .iter()
+                                    .filter(|(n, _)| *n != name)
+                                    .cloned()
+                                    .collect();
+                                next.push((name.clone(), !open));
                                 overrides.set(next);
                             })
                         };
@@ -108,7 +112,7 @@ pub fn run_report(props: &RunReportProps) -> Html {
             if !removals.is_empty() {
                 <section class="run-removals" aria-label="Removals">
                     <h4 class="run__section-title">{ "Removals" }<span class="muted">{ " · resources the revision no longer declares" }</span></h4>
-                    <ol class="run-steps run-steps--removals">{ for removals.iter().map(|x| removal_row(x)) }</ol>
+                    <ol class="run-steps run-steps--removals">{ for removals.iter().map(|x| removal_row(x, now, live)) }</ol>
                 </section>
             }
         </> }
@@ -280,13 +284,13 @@ fn module_row(
                         <p class="muted small">{ empty }</p>
                     } else {
                         <ol class="run-steps" aria-label={format!("Steps of {}", m.name)}>
-                            { for m.steps.iter().map(|s| step_row(s, now, live)) }
+                            { for m.steps.iter().map(|s| step_row(s, now, live, false)) }
                         </ol>
                     }
                     if !m.handlers.is_empty() {
                         <h5 class="run-module__sub">{ "Handlers" }</h5>
                         <ol class="run-steps run-steps--handlers" aria-label={format!("Handlers of {}", m.name)}>
-                            { for m.handlers.iter().map(|s| step_row(s, now, live)) }
+                            { for m.handlers.iter().map(|s| step_row(s, now, live, false)) }
                         </ol>
                     }
                     if !m.health.is_empty() {
@@ -299,7 +303,7 @@ fn module_row(
     }
 }
 
-fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool) -> Html {
+fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool, caution: bool) -> Html {
     let slug = step_slug(s.state);
     let running = s.state == StepState::Running;
     let took = elapsed_ms(
@@ -319,6 +323,9 @@ fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool) -> Html {
                     <span class="badge run-step__kind">{ s.kind.clone() }</span>
                     <span class="run-step__key mono">{ step_key(&s.kind, &s.id).to_string() }</span>
                     if s.destructive { <span class="badge badge--danger">{ icons::alert() }{ "destructive" }</span> }
+                    if caution {
+                        <span class="badge badge--warn" title="This kind's removal can take unrelated things down (dependent packages, files owned by a user).">{ icons::alert() }{ "caution" }</span>
+                    }
                     <span class="run-step__state">{ step_label(s.state) }</span>
                 </div>
                 if !s.summary.is_empty() { <p class="run-step__summary">{ secret_text(&s.summary) }</p> }
@@ -332,26 +339,25 @@ fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool) -> Html {
     }
 }
 
-fn removal_row(x: &RemovalReport) -> Html {
-    let slug = step_slug(x.state);
-    html! {
-        <li class={classes!("run-step", format!("run-step--{slug}"))} data-step={x.resource.clone()} data-state={slug}>
-            <span class={classes!("run-step__glyph", step_tone(x.state).class())} aria-hidden="true">{ step_glyph(x.state) }</span>
-            <div class="run-step__main">
-                <div class="run-step__head">
-                    <span class="badge run-step__kind">{ x.kind.clone() }</span>
-                    <span class="run-step__key mono">{ x.resource.clone() }</span>
-                    if x.caution {
-                        <span class="badge badge--warn" title="This kind's removal can take unrelated things down (dependent packages, files owned by a user).">{ icons::alert() }{ "caution" }</span>
-                    }
-                    <span class="run-step__state">{ step_label(x.state) }</span>
-                </div>
-                if !x.summary.is_empty() { <p class="run-step__summary">{ secret_text(&x.summary) }</p> }
-                <ErrorBlock error={x.error.clone()} tone={error_tone(step_tone(x.state))} />
-            </div>
-            <span class="run-step__duration" />
-        </li>
-    }
+/// A removal, drawn as the step it is: its resource as the key, and a
+/// caution badge where its kind's removal can take more with it.
+fn removal_row(x: &RemovalReport, now: DateTime<Utc>, live: bool) -> Html {
+    let step = StepReport {
+        id: x.resource.clone(),
+        kind: x.kind.clone(),
+        name: None,
+        summary: x.summary.clone(),
+        state: x.state,
+        result: None,
+        diff: None,
+        destructive: false,
+        handler: false,
+        started_at: None,
+        finished_at: None,
+        duration_ms: None,
+        error: x.error.clone(),
+    };
+    step_row(&step, now, live, x.caution)
 }
 
 fn health(results: &[HealthResultDto], now: DateTime<Utc>) -> Html {

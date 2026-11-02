@@ -275,18 +275,23 @@ pub async fn host_health(id: &str) -> Result<Vec<HealthResultDto>, ApiError> {
 /// or as the bare list servers answered with before run reports.
 pub async fn host_runs(id: &str) -> Result<Vec<RunSummary>, ApiError> {
     demo!(demo_store::host_runs(id));
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum Runs {
-        Page(Page<RunSummary>),
-        List(Vec<RunSummary>),
-    }
-    Ok(
-        match get::<Runs>(&format!("/hosts/{}/runs?limit=50", enc(id))).await? {
-            Runs::Page(page) => page.items,
-            Runs::List(list) => list,
-        },
+    let text = send::<()>(
+        Method::Get,
+        &format!("/hosts/{}/runs?limit=50", enc(id)),
+        None,
     )
+    .await?
+    .text()
+    .await
+    .map_err(net)?;
+    // Told apart by their first character rather than an untagged enum,
+    // whose buffering costs the bundle more than this whole route.
+    let parsed = if text.trim_start().starts_with('[') {
+        serde_json::from_str(&text)
+    } else {
+        serde_json::from_str::<Page<RunSummary>>(&text).map(|page| page.items)
+    };
+    parsed.map_err(|e| ApiError::Server(format!("The server's answer was unreadable: {e}")))
 }
 
 /// `GET /hosts/{id}/runs/{run}`: one run, module by module and step by step.

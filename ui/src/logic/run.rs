@@ -571,14 +571,16 @@ pub fn track(current: Option<Activity>, p: &RunProgress) -> Option<Activity> {
     }
 }
 
-/// What each host of a rollout is doing: from the reports held, kept current
-/// by the updates since, and from the updates alone for hosts without one.
+/// What each host of a rollout is doing, described for its block: from the
+/// reports held, kept current by the updates since, and from the updates
+/// alone for hosts without one. (A plain list while it is built: a rollout
+/// applies a handful of hosts at once, and the bundle is smaller for it.)
 pub fn activities<'a>(
     mut reports: Vec<RunReport>,
     rollout: &str,
     events: impl IntoIterator<Item = &'a LiveEvent>,
-) -> BTreeMap<String, Activity> {
-    let mut tracked: BTreeMap<String, Option<Activity>> = reports
+) -> BTreeMap<String, String> {
+    let mut tracked: Vec<(String, Option<Activity>)> = reports
         .iter()
         .map(|r| (r.host.clone(), activity(r)))
         .collect();
@@ -589,21 +591,25 @@ pub fn activities<'a>(
         if p.rollout_id.as_deref().is_some_and(|r| r != rollout) {
             continue;
         }
+        let slot = match tracked.iter().position(|(h, _)| *h == p.host) {
+            Some(i) => i,
+            None => {
+                tracked.push((p.host.clone(), None));
+                tracked.len() - 1
+            }
+        };
         let held = reports
             .iter_mut()
             .find(|r| r.host == p.host && r.id == p.run_id);
-        let now = match held {
-            Some(report) => match apply_progress(report, p) {
-                Applied::Changed => activity(report),
-                _ => track(tracked.get(&p.host).cloned().flatten(), p),
-            },
-            None => track(tracked.get(&p.host).cloned().flatten(), p),
+        let now = match held.map(|report| (apply_progress(report, p), report)) {
+            Some((Applied::Changed, report)) => activity(report),
+            _ => track(tracked[slot].1.take(), p),
         };
-        tracked.insert(p.host.clone(), now);
+        tracked[slot].1 = now;
     }
     tracked
         .into_iter()
-        .filter_map(|(host, a)| a.map(|a| (host, a)))
+        .filter_map(|(host, a)| a.map(|a| (host, a.describe())))
         .collect()
 }
 
@@ -1108,8 +1114,8 @@ pub(crate) mod tests {
         let map = activities(vec![held], "42", &events);
         // pi-1's held report was moved on by the update: two steps running,
         // the first is named.
-        assert_eq!(map["pi-1"].describe(), "nomad › file.copy[b]");
-        assert_eq!(map["pi-2"].describe(), "nomad › apt.package[nomad]");
+        assert_eq!(map["pi-1"], "nomad › file.copy[b]");
+        assert_eq!(map["pi-2"], "nomad › apt.package[nomad]");
         assert!(!map.contains_key("pi-3"), "another rollout's host");
     }
 

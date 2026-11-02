@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use buckle_api::{
     ApproveRequest, ContinueRequest, HealthResultDto, HostRolloutState, LiveEvent, PlanGroup,
-    RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState, RunReport,
+    RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -111,13 +111,13 @@ pub fn rollout_page(props: &Props) -> Html {
         })
         .unwrap_or_default();
     let reports = use_fetch((props.id.clone(), applying), |(id, hosts)| async move {
-        let all =
-            futures::future::join_all(hosts.iter().map(|h| api::rollout_host_report(&id, h))).await;
-        Ok::<_, ApiError>(
-            all.into_iter()
-                .filter_map(Result::ok)
-                .collect::<Vec<RunReport>>(),
-        )
+        let mut reports = Vec::new();
+        for host in &hosts {
+            if let Ok(report) = api::rollout_host_report(&id, host).await {
+                reports.push(report);
+            }
+        }
+        Ok::<_, ApiError>(reports)
     });
     let activity: BTreeMap<String, String> = reports
         .data
@@ -125,9 +125,6 @@ pub fn rollout_page(props: &Props) -> Html {
         .map(|data| {
             let events = store.log.since(data.0).unwrap_or_default();
             activities(data.1.clone(), &props.id, events.iter().map(|e| &**e))
-                .into_iter()
-                .map(|(host, a)| (host, a.describe()))
-                .collect()
         })
         .unwrap_or_default();
     let ask = use_state(|| None::<Ask>);
