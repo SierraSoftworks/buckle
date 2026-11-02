@@ -205,7 +205,7 @@ pre .fname { display: block; color: var(--code-cm); margin-bottom: 8px; font-siz
 <div class="tenets">
   <div class="tenet"><div class="t">Lightweight</div><p>One static binary (musl) for agent and server. Agent idles at a few MB RSS: one gRPC stream, one timer, no interpreter. Bootstrapping is <code>buckle install agent --server …</code>.</p></div>
   <div class="tenet"><div class="t">Fast</div><p>Modules run as a dependency DAG with parallel execution; tasks declare resource locks (e.g. <code>apt</code>) so unrelated work overlaps. Plan is a pure read phase; apply touches only what changed.</p></div>
-  <div class="tenet"><div class="t">Observable</div><p>One trace per rollout spanning server and every agent (W3C context over gRPC metadata). Spans per module, task and health check with change counts; metrics for apply time, drift and health; the UI links straight to the trace.</p></div>
+  <div class="tenet"><div class="t">Observable</div><p>One trace per rollout spanning server and every agent (W3C trace context in gRPC metadata and in the <code>Apply</code>, <code>Rollback</code> and <code>RunHealth</code> messages). Spans per module, task and health check with change counts; OTLP gauges for rollout hosts and connected agents; the UI shows the trace id and links it when a trace URL template is configured.</p></div>
   <div class="tenet"><div class="t">Operable at scale</div><p>Phased rollouts with bake time and failure budgets, automatic pause, one-click rollback to the last stable revision, drift detection and correction, and removal cleanup so hosts converge instead of accumulating debris.</p></div>
 </div>
 
@@ -214,7 +214,7 @@ pre .fname { display: block; color: var(--code-cm); margin-bottom: 8px; font-siz
 <thead><tr><th>Ask</th><th>Where</th><th>Short answer</th></tr></thead>
 <tbody>
 <tr><td>1 server on Nomad, Tailscale-only, Git watching</td><td><a href="#topology">02</a>, <a href="#server">09</a></td><td><code>buckle server</code> binds to the tailnet address, polls Git with gix (plus a webhook), and turns each commit into a revision.</td></tr>
-<tr><td>2 persistent agents, local-dir mode</td><td><a href="#engine">04</a>, <a href="#protocol">08</a></td><td><code>buckle agent</code> keeps one bidirectional gRPC stream open; <code>--source DIR</code> runs the same engine against a local directory.</td></tr>
+<tr><td>2 persistent agents, local-dir mode</td><td><a href="#engine">04</a>, <a href="#protocol">08</a></td><td><code>buckle agent</code> keeps one bidirectional gRPC stream open; <code>source: DIR</code> in agent.yaml (or <code>buckle install agent --source DIR</code>) runs the same engine against a local directory instead.</td></tr>
 <tr><td>3 integrated health checks</td><td><a href="#health">07</a></td><td>Modules declare <code>health:</code> checks. They run at three moments of a rollout (baseline before a host is touched, the bake window after apply, before the next phase starts) and once per periodic drift check, which gives the server its baseline fleet health between rollouts. No separate steady-state loop.</td></tr>
 <tr><td>4 phased, feedback-controlled rollouts</td><td><a href="#rollout">10</a></td><td>Phases select hosts with filt-rs expressions over facts and labels; parallelism, bake, failure budgets, pause and rollback are policy.</td></tr>
 <tr><td>5 OIDC web UI</td><td><a href="#ui">12</a></td><td>Yew UI embedded in the binary, analytics-style cookie + PKCE OIDC, filt-rs ACLs, rollout pipeline and fleet views.</td></tr>
@@ -223,7 +223,7 @@ pre .fname { display: block; color: var(--code-cm); margin-bottom: 8px; font-siz
 <tr><td>8 plan mode with sign-off</td><td><a href="#plan">11</a></td><td>Plans are first-class, deduplicated by digest across hosts, and a phase can require approval before apply.</td></tr>
 <tr><td>9 filt-rs everywhere</td><td><a href="#config">03</a></td><td>Module <code>when</code>, task <code>when</code>, group membership, phase selection, ACLs and health assertions are all filt-rs.</td></tr>
 <tr><td>10 long-lived TCP protocol</td><td><a href="#protocol">08</a></td><td>gRPC over HTTP/2 (tonic): one bidirectional session stream plus content-addressed blob fetches.</td></tr>
-<tr><td>11 reference configuration</td><td><a href="#example">15</a></td><td><code>examples/nomad-cluster</code> ports the ten live infra-ansible roles, dropping the bugs the audit found.</td></tr>
+<tr><td>11 reference configuration</td><td><a href="#example">15</a></td><td><code>examples/nomad-cluster</code> is a fictional fleet that exercises every module kind the real estate needs; the faithful port of the live infra-ansible roles, with the audit's bugs fixed, is a separate private repository.</td></tr>
 <tr><td>12 structurally unprintable secrets</td><td><a href="#secrets">06</a></td><td>A sealed <code>Secret</code> type that only sinks can open; plans diff redacted shadows stored in agent state.</td></tr>
 <tr><td>13 cross-platform, Linux first</td><td><a href="#platforms">14</a></td><td>Task kinds declare platform support; Debian and Ubuntu on arm64 and amd64 are tested in CI from day one.</td></tr>
 </tbody></table></div>
@@ -323,8 +323,8 @@ pre .fname { display: block; color: var(--code-cm); margin-bottom: 8px; font-siz
 <div class="card decision"><div class="tag">Decision · agreed</div><p><b>One binary, one build.</b> The release artefact is the full <code>buckle</code> binary with agent, server and embedded UI; there is no slim agent variant. Target size is under 15 MB stripped (musl, LTO, <code>codegen-units = 1</code>, <code>panic = "abort"</code>, release-mode Trunk build of the UI, symbols published separately as the reference repos do). CI reports the binary size per platform; a feature flag to drop the server from the agent build is reconsidered only if the full binary ends up well over 15 MB.</p></div>
 <div class="card decision"><div class="tag">Decision · agreed</div><p><b>Tailscale is the preferred transport and identity, never a requirement.</b> Listen addresses are explicit in server config (the node's 100.x address, <code>0.0.0.0</code> inside a Nomad task with a Tailscale sidecar, or a LAN address). Two agent authentication modes are enabled together and chosen per connection:</p>
 <ul>
-<li><b>Tailscale.</b> When the peer address is a tailnet address and a local tailscaled socket exists, the server asks <code>/localapi/v0/whois?addr=</code> which node is on the other end and uses the node name as the host identity. Transport encryption comes from WireGuard; TLS is optional.</li>
-<li><b>Token.</b> Everywhere else (private LANs, hosts without Tailscale, local development). <code>buckle install agent --server … --token &lt;bootstrap&gt;</code> enrols the host: on the first Hello the server exchanges the bootstrap token for a per-host token (random, stored hashed server-side, persisted by the agent at mode 0600) which identifies the host from then on; the bootstrap token can be rotated or revoked without touching enrolled hosts. Host identity is <code>host_id</code> from agent.yaml, else the system hostname. Transport is TLS on the gRPC listener: a certificate from config, or one the server generates on first start whose fingerprint <code>install agent</code> pins (<code>--ca-fingerprint</code>, printed by <code>buckle server fingerprint</code>); plaintext is allowed only when server config says so explicitly.</li>
+<li><b>Tailscale.</b> When the peer address is a tailnet address and a local tailscaled socket exists, the server asks <code>/localapi/v0/whois?addr=</code> which node is on the other end and uses the node name as the host identity; the agent's claimed <code>host_id</code> must equal it. Whois proves who a peer is, not that it belongs to the fleet (nodes shared in from other tailnets reach the listener too), so <code>agents.tailscale.allowed_tags</code> / <code>allowed_users</code> name the nodes trusted as agents: a node matching neither list is refused, and with both lists empty a new tailnet node registers as <em>pending</em> for an admin even under <code>registration: auto</code>. Transport encryption comes from WireGuard; TLS is optional.</li>
+<li><b>Token.</b> Everywhere else (private LANs, hosts without Tailscale, local development). <code>buckle install agent --server … --token &lt;bootstrap&gt;</code> enrols the host: on the first Hello the server exchanges the bootstrap token for a per-host token (random, stored hashed server-side, persisted by the agent at mode 0600) which identifies the host from then on; the bootstrap token can be rotated or revoked without touching enrolled hosts. Host identity is <code>host_id</code> from agent.yaml, else the system hostname. Transport is TLS on the gRPC listener: a certificate from config, or one the server generates on first start whose fingerprint <code>install agent</code> pins (<code>--ca-fingerprint</code>, printed by <code>buckle server --print-fingerprint</code>); plaintext needs both ends to say so explicitly: <code>listen.tls.mode: none</code> on the server and <code>tls.insecure_plaintext: true</code> with an <code>http://</code> URL in agent.yaml (an <code>https://</code> URL combined with <code>insecure_plaintext</code> is refused rather than silently downgraded).</li>
 </ul>
 <p>Agents never depend on the Tailscale binary: the <code>tailscale</code> fact provider yields <code>null</code> when it is absent and selectors fall through. The server runs on a tailnet in this deployment, but nothing in the protocol assumes it.</p></div>
 </section>
@@ -354,6 +354,9 @@ modules/
 fleet:
   # Groups are derived, never enumerated. Agents report labels + facts; the
   # server (or the local engine) evaluates these and exposes host.groups.
+  # Label values are typed like YAML scalars: `canary=true` is a boolean,
+  # `rack=3` a number, `rack="3"` a string (the CLI, agent.yaml, the UI and the
+  # server all apply the same rule, so a selector picks the same hosts everywhere).
   groups:
     nomad:   'host.labels.role == "worker"'
     home:    'host.labels.site == "home"'
@@ -361,14 +364,14 @@ fleet:
     canary:  'host.labels.canary == true'
 
 vars:                                     # a list of overlays, applied in order; later wins. Omitted = {}
-  - file: vars/defaults.yaml              # no `when` means it applies to every host
+  - file: vars/defaults.yaml              # no `when` means it applies to every host; `file:` is relative to the repo root and may not leave it (no absolute path, no `..`)
   - when: 'host.groups contains "home"'
     file: vars/home.yaml
   - when: 'host.facts.cloud.provider == "azure"'
     file: vars/azure.yaml
   - when: 'host.groups contains "nomad"'
     values:                               # inline overlay
-      nomad_node_class: '{{ "rpi" if host.facts.arch == "aarch64" else "cloud" }}'
+      nomad_node_class: '{{ "rpi" if host.facts.hardware.arch == "aarch64" else "cloud" }}'
 
 secrets:                                  # references only, never values
   admin_password:        { file: /secrets/admin_password }   # Nomad `template` renders Nomad Variables here
@@ -388,7 +391,7 @@ rollout:                                  # see section 10
 <h3>module.yaml</h3>
 <pre><code class="language-yaml"><span class="fname">modules/nomad/module.yaml</span>name: nomad
 description: Nomad client registered with the cluster over the tailnet.
-when: 'host.groups contains "nomad" &amp;&amp; host.facts.os.family == "debian" &amp;&amp; host.facts.arch in ["x86_64", "aarch64"]'
+when: 'host.groups contains "nomad" &amp;&amp; host.facts.os.family == "debian" &amp;&amp; host.facts.hardware.arch in ["x86_64", "aarch64"]'
 needs: [tailscale, docker]                # ordering + fact dependency (tailscale provides host.facts.tailscale.*)
 tags: [config]
 
@@ -432,23 +435,24 @@ health:
   - name: unit
     systemd: { unit: nomad, state: active }
   - name: eligible
-    filter: 'host.facts.nomad.eligibility == "eligible"'   # filt-rs over refreshed facts
+    filter: { expr: 'host.facts.nomad.eligibility == "eligible"' }   # filt-rs over refreshed facts
 
 removal:
-  policy: cleanup                         # cleanup (default) | leave
+  policy: cleanup                         # the module's default for its tasks: cleanup | leave (absent: each kind's own default)
 </code></pre>
+<p>Module rules the loader and validator enforce: the directory name must equal <code>name</code>; <code>needs</code> must resolve, form a DAG, and name modules that are selected on every host this module is (otherwise planning that host is an error naming both modules); every file is read with unknown fields rejected (<code>deny_unknown_fields</code>), including each task and health spec; a task is one kind key plus the reserved keys <code>id</code>, <code>name</code>, <code>when</code>, <code>notify</code>, <code>tags</code>, <code>removal</code>, <code>retry</code>; and <code>after</code> is reserved but <em>not implemented</em> (a task that sets it is rejected, see <a href="#engine">04</a>). A directory under <code>modules/</code> without a <code>module.yaml</code> is not silently ignored: its module is indeterminate and resources recorded under that name are kept. Templates are the <code>*.j2</code> files under a module's <code>files/</code> directory (there is no separate templates directory); <code>file.copy</code> and <code>file.template</code> read their <code>src</code> relative to <code>files/</code>.</p>
 
 <h3>Expressions: filt-rs for logic, Jinja for text</h3>
-<p>Two languages, each doing the thing it is good at. filt-rs decides <em>whether</em> (module and task <code>when</code>, groups, phase selection, health assertions, ACLs). Templates decide <em>what text</em> (file contents and the string fields of task specs). A task string field is templated only when it contains <code>{{</code>, so plain values cost nothing.</p>
+<p>Two languages, each doing the thing it is good at. filt-rs decides <em>whether</em> (module and task <code>when</code>, groups, phase selection, health assertions, ACLs). Templates decide <em>what text</em> (file contents and the string fields of task specs). A task string field is templated only when it contains <code>{{</code> (or <code>{%</code>), so plain values cost nothing. A rendered field is then converted to the scalar type its schema declares when that type is not a string (an integer, number or boolean) and the text parses as one, so <code>size_mb: "{{ vars.swap_mb }}"</code> reaches the task as the number 512. Undefined variables are errors (strict mode), and secrets are refused in plain fields and in vars: only the few fields typed as secret-capable (<a href="#secrets">06</a>) keep their raw template for the task to open through a sink.</p>
 <div class="grid2">
 <div class="card"><h4>filt-rs context</h4>
 <p>Flat dotted keys over a case-insensitive map, exactly like mail-backup's <code>Metadata</code>. Buckle builds it from the facts tree, labels, groups, vars and (metadata-only) secrets:</p>
 <ul>
-<li><code>host.id</code>, <code>host.labels.*</code>, <code>host.groups</code> (tuple)</li>
-<li><code>host.facts.os.{family,id,codename,version}</code>, <code>host.facts.arch</code>, <code>host.facts.mem.total_mb</code>, <code>host.facts.swap.total_mb</code>, <code>host.facts.tailscale.{hostname,ips,tags}</code>, <code>host.facts.cloud.{provider,region,…}</code></li>
+<li><code>host.id</code>, <code>host.labels.*</code> (typed: <code>canary=true</code> is a boolean, <code>rack=3</code> a number, <code>rack="3"</code> a string), <code>host.groups</code> (tuple)</li>
+<li><code>host.facts.os.{family,id,codename,version,pretty_name,kernel}</code>, <code>host.facts.hardware.{arch,cpus}</code>, <code>host.facts.hardware.mem.total_mb</code>, <code>host.facts.hardware.swap.total_mb</code>, <code>host.facts.hardware.disk.&lt;name&gt;.{mount,fstype,total_mb,free_mb,free_percent}</code> (<code>root</code> for <code>/</code>), <code>host.facts.tailscale.{hostname,ips,tags,online}</code>, <code>host.facts.cloud.{provider,region,…}</code>, and the other providers in <a href="#registry">05</a>. Facts are flat dotted leaves: a list can be tested with <code>contains</code> but not indexed, which is why providers also expose flat keys such as <code>disk.root.free_percent</code></li>
 <li><code>vars.*</code> (scalars and lists)</li>
 <li><code>secrets.NAME</code> as a filt-rs <code>Secret</code> value (comparable, redacts to <code>[REDACTED]</code> if ever displayed), plus <code>secrets.NAME.present</code> and <code>secrets.NAME.fingerprint</code> (see <a href="#secrets">06</a>)</li>
-<li><code>task.tags</code>, <code>module.name</code> for run-time selectors (<code>buckle apply --select 'task.tags contains "network"'</code>)</li>
+<li><code>task.kind</code>, <code>task.id</code>, <code>task.tags</code>, <code>module.name</code>, <code>module.tags</code> for run-time selectors (<code>buckle apply --select 'task.tags contains "network"'</code>); tasks excluded by <code>--select</code> still count as desired, so their resources are never treated as orphans</li>
 </ul></div>
 <div class="card decision"><div class="tag">Decision · agreed</div>
 <p><b>Templates move from Go templates to Jinja2 (<code>minijinja</code>), and <code>gotmpl</code> leaves the dependency tree entirely.</b> Two languages in total: filt-rs for logic, minijinja for text. The audit found 18 Jinja templates in infra-ansible, two of them 550 and 819 lines, using <code>.items()</code>, <code>default</code>, <code>regex_replace</code>, <code>to_json</code>, <code>ternary</code>, <code>comment</code> and whitespace control. With minijinja plus a dozen custom filters they port almost verbatim. minijinja is a small, well-maintained crate with no runtime dependencies, supports a custom object model (needed for secret-aware rendering) and can be sandboxed (no includes outside the module).</p>
@@ -459,25 +463,30 @@ removal:
 <ol>
 <li>Facts (<code>host.facts.*</code>) are read-only and collected by fact providers.</li>
 <li>Module <code>vars:</code> defaults.</li>
-<li>Fleet <code>vars</code> overlays in list order; an overlay without <code>when</code> always applies, and an omitted <code>vars</code> is the empty set.</li>
+<li>Fleet <code>vars</code> overlays in list order; an overlay without <code>when</code> always applies, its <code>when</code> may read facts, labels, groups and the vars layered so far, and an omitted <code>vars</code> is the empty set. An overlay is inline <code>values</code> or a <code>file</code>; the file path is relative to the repository root and must stay inside it (absolute paths and <code>..</code> are rejected when the revision loads), and it must contain a mapping.</li>
 <li>Agent-local overrides from <code>/etc/buckle/agent.yaml</code> (<code>vars:</code>), for the rare host-specific value.</li>
 </ol>
-<p>Values are typed YAML (strings, numbers, bools, lists, maps), so a template loop over a list of snapshot paths is a real loop rather than Python repr hoping to be TOML. Vars can reference other vars and facts with templates; evaluation is lazy and cycle-checked, and a reference to an undefined var or secret is a plan error for the module that uses it (the Ansible <code>undef()</code> behaviour, made explicit).</p>
+<p>Values are typed YAML (strings, numbers, bools, lists, maps), so a template loop over a list of snapshot paths is a real loop rather than Python repr hoping to be TOML. Vars can reference other vars and facts with templates; each var is rendered lazily after the vars it references, a reference cycle is an error that names the cycle, and vars cannot reference secrets. A reference to an undefined var or fact, or a template that does not render, is a plan error scoped to the module that uses it (the Ansible <code>undef()</code> behaviour, made explicit): the plan lists the module as indeterminate with <code>plan_error</code> set, applying reports it failed, and the other modules still plan and apply. When the failing template reads facts that a module this one <code>needs</code> will provide during the same run (<code>facts.provides</code>), the module is deferred until those facts are refreshed instead of failing on a first install.</p>
 
 <h3>Agent configuration</h3>
-<pre><code class="language-yaml"><span class="fname">/etc/buckle/agent.yaml  (written by `buckle install agent`)</span>server: https://buckle.example.ts.net:7700   # or a LAN address; or:  source: /srv/buckle-config
-# host_id: pi-1                              # defaults to the Tailscale node name, else the system hostname
+<pre><code class="language-yaml"><span class="fname">/etc/buckle/agent.yaml  (written by `buckle install agent`)</span>server: https://buckle.example.ts.net:7700   # or a LAN address; or:  source: /srv/buckle-config  (exactly one of the two)
+# host_id: pi-1                              # defaults to the system hostname; over Tailscale it must equal the node name the tailnet reports
+# bootstrap_token: …                         # first enrolment only; `install agent --token` writes it (file mode 0600 when present)
 # tls: { ca_fingerprint: "sha256:…" }       # pinned by `buckle install agent` when the server uses a generated certificate
-# the per-host token issued at enrolment lives in state_dir, not here
-labels: { role: worker, site: home }   # seed labels reported on connect; labels set in the UI override these
-state_dir: /var/lib/buckle
+#      { ca_file: /etc/buckle/ca.pem }      # or trust a CA bundle instead of the system roots
+#      { insecure_plaintext: true }         # http:// URLs only (a tailnet); refused together with an https:// URL
+# the per-host token issued at enrolment lives in state_dir (mode 0600), not here
+labels: { role: worker, site: home }   # seed labels reported on connect (typed like YAML scalars); labels set in the UI override these
+state_dir: /var/lib/buckle             # C:\ProgramData\buckle on Windows
 drift:
-  interval: 15m           # re-plan against the assigned revision
+  interval: 15m           # re-plan the applied revision (drift mode, section 04)
   correct: true           # false = report only
+# vars: { swap_mb: 512 }  # host-specific variable overrides: the last layer of the vars precedence
 telemetry:
   otlp_endpoint: http://127.0.0.1:4317
+  # otlp_headers: { x-honeycomb-team: "…" }
 </code></pre>
-<div class="card question"><div class="tag">Your call</div><p>Host identity. Proposal: the Tailscale node name when the agent authenticates via whois, else <code>host_id</code> from agent.yaml, else the system hostname. This matches infra-ansible, which already sets the system hostname to the tailnet name. Is the Tailscale name the identity you want to see in the UI and in traces?</p></div>
+<div class="card question"><div class="tag">Your call</div><p>Host identity. Proposal: the Tailscale node name when the agent authenticates via whois, else <code>host_id</code> from agent.yaml, else the system hostname. As built, the agent always claims <code>host_id</code> from agent.yaml or else the system hostname, and under whois the server requires that claim to equal the tailnet node name (a mismatch is refused, not renamed), so a host whose hostname differs from its node name needs <code>host_id</code> set. This matches infra-ansible, which already sets the system hostname to the tailnet name. Is the Tailscale name the identity you want to see in the UI and in traces?</p></div>
 </section>
 
 <!-- ============ 4. ENGINE ============ -->
@@ -515,70 +524,102 @@ telemetry:
   <path d="M902 120 V 160 H 940" marker-end="url(#ar2)"/>
   <text x="948" y="164" fill="currentColor" stroke="none" font-size="11">state + report</text>
 </svg>
-<figcaption>Plan produces a <code>Plan</code> value (steps, diffs, digest). Apply consumes exactly that value, so what the operator approved is what runs; a changed system between plan and apply is detected by re-checking each step's precondition and surfaces as a <em>stale plan</em> error rather than a surprise.</figcaption>
+<figcaption>Plan produces a <code>Plan</code> value (steps, diffs, digest). Apply re-plans the host and refuses to run unless the fresh plan has the digest of the plan it was handed, so what the operator approved is what runs; a host or configuration that changed in between surfaces as a <em>stale plan</em> error rather than a surprise.</figcaption>
 </figure>
 
 <h3>Scheduling</h3>
 <ul>
-<li><b>Modules</b> form a DAG from <code>needs</code>. Independent modules run concurrently (bounded by <code>--parallelism</code>, default CPU count).</li>
-<li><b>Tasks</b> within a module run in order. A task may set <code>after: [id]</code> to run concurrently with earlier siblings when order does not matter; this is rare and opt-in.</li>
-<li><b>Locks.</b> Each task kind declares the resource locks it needs (<code>apt.*</code> → <code>apt</code>; <code>systemd.daemon_reload</code> → <code>systemd</code>). The scheduler serialises holders of the same lock across modules, so <code>docker</code> and <code>nomad</code> install packages one at a time while their file tasks overlap.</li>
-<li><b>Handlers</b> are collected during apply and run once at the end of the module that owns them, deduplicated by (kind, target), ordered <code>daemon_reload</code> → <code>restart</code> → <code>reload</code>; a restart subsumes a reload of the same unit. Handlers are module-scoped, so <code>docker</code> and <code>nomad</code> each restarting <code>nomad</code> is two explicit declarations, not a name collision. A module may call another module's handler as <code>nomad:restart</code>.</li>
-<li><b>Fact refresh.</b> A module that declares <code>facts.provides: [tailscale]</code> causes those providers to re-run after it applies; modules that <code>need</code> it are planned afterwards. In plan-only mode they are reported as <em>deferred</em> with the reason, instead of being planned against stale facts.</li>
+<li><b>Modules</b> form a DAG from <code>needs</code>. Independent modules run concurrently, bounded by the engine's <code>parallelism</code> (the CPU count; there is no command-line flag for it).</li>
+<li><b>Tasks</b> within a module run strictly in order, one at a time. <code>after:</code> is reserved but <em>not implemented</em>: a task that sets it is rejected by <code>buckle validate</code> and at plan time, with advice to order the tasks instead, rather than silently ignored.</li>
+<li><b>Locks.</b> Each task kind declares the resource locks it needs (<code>apt.*</code> → <code>apt</code>; <code>systemd.*</code> → <code>systemd</code>; the table is in section <a href="#registry">05</a>). The scheduler serialises holders of the same lock across modules, so <code>docker</code> and <code>nomad</code> install packages one at a time while their file tasks overlap. The editors of shared files (<code>file.line</code>, <code>file.block</code>, <code>ssh.authorized_key</code>) additionally hold a per-path lock inside the task, because kind locks are static: two modules editing <code>/etc/ssh/sshd_config</code> never lose each other's line.</li>
+<li><b>Fact refresh and deferral.</b> Vars and task fields are rendered lazily, per module, when that module is planned, so a render failure is scoped to its module, and a rendered string takes the scalar type the kind's schema declares (section <a href="#config">03</a>). A module that declares <code>facts.provides: [tailscale]</code> causes those providers to re-run after it applies, before its own health checks; modules that <code>need</code> it are planned afterwards. A dependent whose vars, fields or <code>when</code> read facts such a provider will produce is <em>deferred</em> with the reason, instead of failing or being planned against stale facts: plan-only mode reports it as deferred, apply plans it once the facts are refreshed, and a deferred module whose <code>when</code> then turns out false is skipped and its resources are removed as orphans. A provider that fails keeps its last good value and is marked stale; one that has never produced a value makes the modules reading it indeterminate (below).</li>
+<li><b>State is saved after every step</b> (and every removal), atomically, so a crash costs at most the step in flight. A failed save is reported on the result; it never turns a change the host already took into an error.</li>
 </ul>
+
+<h3>Handlers</h3>
+<ul>
+<li><b>Only steps that really changed something notify.</b> A step that was planned as a change but whose apply reported no change does not fire its handlers, and a no-op never does.</li>
+<li><b>Deduplicated by (kind, target)</b> and ordered <code>daemon_reload</code> → <code>restart</code> → <code>reload</code> → everything else in notification order; a restart of a unit subsumes a reload of the same unit. Two handlers that restart <code>nomad</code> are one restart.</li>
+<li><b>Module-scoped.</b> <code>docker</code> and <code>nomad</code> each restarting <code>nomad</code> is two explicit declarations, not a name collision, and a task may notify another module's handler as <code>nomad:restart</code>. When the owning module has not started and needs the notifying module, the notification waits and runs once at the end of the owner (with the owner's vars, deduplicated against its own); otherwise it runs at the end of the notifying module. If the owner never runs (the run halted, or it turned out unselected) the handler still runs at the end of the run, because the change that notified it was made. A plan shows a cross-module handler under the module it will run in.</li>
+<li><b>Removals run the handlers their task notified</b> (the names are kept in state beside the resource), once, after the removals, and only those that still exist in the revision.</li>
+</ul>
+
+<h3>Selection safety</h3>
+<p>Removal makes a wrong "not selected" expensive, so the planner never guesses. A module's selection is <em>indeterminate</em>, not false, when its <code>when</code> cannot be evaluated; when it reads facts of a provider that failed without ever producing a value (or <code>host.groups</code> while some group's membership is uncertain for that reason); when its vars cannot be rendered and its <code>when</code> reads vars; when its directory has no <code>module.yaml</code>; or when it <code>needs</code> an indeterminate module. An indeterminate module is never applied and everything recorded under its name is kept: it is left out of the orphan computation, listed in <code>Plan.indeterminate</code> with the reason, repeated in the plan's warnings, reported as a warning by <code>buckle validate --facts</code>, and reported by apply with status <code>indeterminate</code>. A module that is selected but cannot be planned (a var or field does not render, a task kind does not support the platform, planning a task errors) is recorded the same way with <code>plan_error</code> set: applying reports that module failed and the run unsuccessful, nothing of it runs, its resources are kept, and the other modules still run. A task whose own <code>when</code> cannot be decided is kept in the desired set, so its resource is not an orphan, but is not planned, with a warning.</p>
+<p>A task kind that does not support the host's platform is a plan error naming the kind and advising a <code>when</code>, scoped to its module like any other. <code>buckle validate --facts</code> judges the platform from the facts file's <code>os</code> (a Debian fixture plans as Linux even when validation runs on macOS).</p>
+
+<h3>Plan mode cannot write</h3>
+<p>Planning may read anything and run read-only probes (<code>unless</code>, version checks), but everything that runs in plan mode goes through a guard that refuses writes, permission changes, removals, symlinks and renames outside the system's temp directory and the agent's scratch directory <code>&lt;state_dir&gt;/tmp</code> (where <code>validate:</code> commands get their private copies). A task that writes while planning fails loudly as a bug in the kind instead of changing a host during a "dry" plan or a server preview.</p>
+
+<h3>Blocked steps</h3>
+<p>A task whose tool is missing (no <code>apt-get</code>, no <code>systemctl</code> as PID 1, an explicit <code>validate</code> program that is not installed yet) plans as <em>Blocked</em> with the reason, not as an error, so a plan can be read on any machine. At apply, a blocked step is planned again once anything earlier in the run changed, because an earlier step may have installed the tool. If it now plans a change that deletes nothing, the change is applied and the handlers it notifies run with the planned ones; a deletion was never reviewed, so it stays blocked. A module that ends with blocked steps has status <code>blocked</code>; nothing failed and nothing is rolled back, but the revision is not fully applied, so the run is not a success: its recorded outcome is <code>needs_attention</code> and the server marks the host for an operator.</p>
 
 <h3>Plan data model</h3>
 <pre><code class="language-rust"><span class="fname">buckle-core/src/plan.rs</span>pub struct Plan {
     pub revision: RevisionId,
-    pub host: HostId,
-    pub digest: Digest,                 // stable hash of steps; identical plans dedupe in the UI
-    pub modules: Vec&lt;ModulePlan&gt;,
+    pub host: String,
+    pub digest: Digest,                 // stable hash of the content below, not of host or revision: identical plans dedupe in the UI
+    pub modules: Vec&lt;ModulePlan&gt;,       // selected modules in dependency order, each with its steps and handlers
     pub removals: Vec&lt;Removal&gt;,         // resources in state but not in the desired set
     pub deferred: Vec&lt;Deferred&gt;,        // modules waiting on facts a sibling provides
-}
+    pub skipped: Vec&lt;String&gt;,           // evaluated but not selected
+    pub warnings: Vec&lt;String&gt;,
+    pub indeterminate: Vec&lt;Indeterminate&gt;, // selection or planning undecidable: never applied, resources kept (plan_error: selected but failed to plan)
+    pub rehomed: Vec&lt;Rehome&gt;,           // records a desired resource took over: moved to another module, or superseded by a re-keyed task
+    pub held: Vec&lt;Held&gt;,                // drift plans only: modules not applied at this revision, left alone
+}   // the digest covers modules, removals (without their origin), deferred, indeterminate, rehomed and held
 
 pub struct Step {
-    pub task: TaskRef,                  // module, task id, kind
-    pub outcome: Planned,               // NoOp | Change(Diff) | Blocked(reason)
-    pub locks: &amp;'static [&amp;'static str],
-    pub notifies: Vec&lt;HandlerRef&gt;,
+    pub task: TaskRef,                  // module, task id, kind, name
+    pub resource: ResourceKey,          // module/kind[key]
+    pub planned: Planned,               // NoOp | Change { diff } | Blocked { reason }
+    pub locks: Vec&lt;String&gt;,
+    pub notifies: Vec&lt;String&gt;,          // handlers notified when the step changes something
+    pub always_runs: bool,              // a command.run with no creates/unless/changed_when
+    pub removal: RemovalPolicy,         // task &gt; module &gt; kind
 }
 
 pub enum Diff {
-    Create { summary: String, preview: Redacted&lt;String&gt; },
-    Update { summary: String, unified: Redacted&lt;String&gt; },   // text diff of shadows, never raw secrets
+    Create { summary: String, preview: Option&lt;Redacted&lt;String&gt;&gt; },
+    Update { summary: String, unified: Option&lt;Redacted&lt;String&gt;&gt; },   // text diff of shadows, never raw secrets
     Delete { summary: String },
     Opaque { summary: String },          // e.g. "run `nomad node eligibility`"; nothing to diff
 }
 </code></pre>
-<p><code>Redacted&lt;T&gt;</code> is a newtype that can only be constructed by the secret-aware renderer (section 06); the plan is therefore safe to log, serialise to the server and show in the UI by construction.</p>
+<p><code>Redacted&lt;T&gt;</code> is a newtype produced by the secret-aware renderer, by the scrubber that searches text for known secret values, or by <code>Redacted::plain</code>, a greppable assertion for data that came from the repository or from facts; the plan is therefore safe to log, serialise to the server and show in the UI by construction.</p>
 
 <h3>Agent state and removal</h3>
-<p>Every applied task writes a <code>ResourceRecord</code> to <code>/var/lib/buckle/state.cbor</code> (atomic write via temp file and rename, as mail-backup does). The record is the memory that makes removal possible.</p>
+<p>Every applied task writes a <code>ResourceRecord</code> to <code>&lt;state_dir&gt;/state.cbor</code> (CBOR; a 0600 temp file in the same directory, fsynced, renamed over the old file, then the directory fsynced). The record is the memory that makes removal possible.</p>
 <pre><code class="language-rust"><span class="fname">buckle-core/src/state.rs</span>pub struct ResourceRecord {
-    pub key: ResourceKey,               // "nomad/file.template[/etc/nomad.d/nomad.hcl]"
-    pub kind: &amp;'static str,
+    pub key: ResourceKey,               // module, kind, key: "nomad/file.template[/etc/nomad.d/nomad.hcl]"
     pub spec_digest: Digest,
     pub shadow: Option&lt;Redacted&lt;String&gt;&gt;, // redacted render of file content, used for plan diffs
+    pub content_digest: Option&lt;Digest&gt;,   // digest of the real content written, to detect drift without reading secrets back
     pub artefacts: Vec&lt;Artefact&gt;,       // paths written, packages installed, units enabled, users created
-    pub removal: RemovalPolicy,         // Cleanup | Leave
+    pub removal: RemovalPolicy,         // Cleanup | Leave, as resolved when the resource was last applied
     pub revision: RevisionId,
     pub applied_at: DateTime&lt;Utc&gt;,
+    pub introduced_in: RevisionId,      // the revision that first created the resource
 }
+// State also keeps: applied_revision, the last 50 runs, cached facts, module_revisions (the revision each module last
+// applied, or was rolled back to), failed_modules (the revision each failed on), and notifies (handlers per resource).
 </code></pre>
-<p>On every plan, the engine computes <code>desired = selected modules × their tasks</code> and <code>orphans = state − desired</code>. Each orphan whose policy is <code>Cleanup</code> becomes a <code>Removal</code> step that calls the task kind's <code>remove(record)</code>: delete the file we wrote (only if its digest still matches what we wrote, otherwise flag drift and leave it), disable and stop a unit whose file we created, remove an apt repository we added, drop a sysctl line, revert a <code>file.line</code>. Removals run after all applies, in reverse dependency order, and notify the handlers the original task notified.</p>
+<p>On every plan, the engine computes <code>desired = selected modules × their tasks</code> and <code>orphans = state − desired</code>, leaving out the records of modules whose selection is indeterminate, deferred or held, and the records that were re-homed (below). Each orphan whose policy is <code>Cleanup</code> becomes a <code>Removal</code> step that calls the task kind's <code>remove(record)</code>: delete the file we wrote (only if its digest still matches what we wrote, otherwise flag drift and leave it), disable and stop a unit whose file we created, remove an apt repository we added, drop a sysctl line, revert a <code>file.line</code>. Removals run after all applies and only when nothing halted, dependents before their dependencies, and then run the handlers the original task notified.</p>
+<p><b>Re-homing.</b> A changed config must not delete what a new resource now manages. Before computing orphans the engine matches each record that left the desired set against the desired resources. A task that <em>moved</em> to another module (same kind and key) has its record re-keyed to the new module and kept, with its original <code>introduced_in</code> and shadow, and the moved task plans against that record. A task <em>re-keyed</em> to another kind or key that manages the same artefact (a <code>file.copy</code> replaced by a <code>file.template</code> of the same path; the same package, user, unit or line) <em>supersedes</em> the old record, which is forgotten without running its cleanup, since that cleanup would delete what the new resource manages. Both are listed in <code>Plan.rehomed</code> and as "not removed" warnings.</p>
 <div class="card decision"><div class="tag">Decision</div>
-<p><b>Everything Buckle applied is removed when it leaves the config, unless the author opts out.</b> The default is <code>removal: cleanup</code> for every task kind: files, units (disable, stop, delete the unit file Buckle wrote), apt repositories and packages, users and groups, sysctl entries, ufw rules, cron jobs. <code>command.run</code> is the one kind that cannot infer an inverse; it cleans up when the author gives a <code>remove:</code> command and is otherwise reported as <em>no cleanup defined</em>. Opt out per task or per module with <code>removal: leave</code>, which records the resource as released rather than deleted.</p>
-<p>Removals are always flagged as warnings in the plan and in the UI: each one is listed with the module it belonged to, the revision that introduced it, what the kind will do (<code>apt remove nomad</code>, <code>userdel --remove sierra</code>), and the kinds whose removal can take unrelated things down (packages, users, groups) get an explicit caution. <code>approval: if_destructive</code> treats any removal as destructive, so a phase with that policy stops for sign-off whenever a module or task disappears. Local mode prints the same warnings and <code>buckle apply</code> asks for confirmation before removing a package, user or group unless <code>--yes</code> is given.</p></div>
+<p><b>Everything Buckle applied is removed when it leaves the config, unless the author opts out.</b> The default is <code>removal: cleanup</code> for every task kind: files, units (disable, stop, delete the unit file Buckle wrote), apt repositories and packages, users and groups, sysctl entries, ufw rules, cron jobs. The exceptions are the handler-style kinds (<code>apt.update</code>, <code>systemd.daemon_reload</code>, <code>systemd.restart</code>, <code>systemd.reload</code>), which have nothing to undo and default to <code>leave</code>. <code>command.run</code> is the one kind that cannot infer an inverse; it cleans up when the author gives a <code>remove:</code> command (and must then carry an explicit <code>id</code>, because it is otherwise keyed by its rendered command and editing the command would run the old <code>remove:</code>) and is otherwise reported as <em>no cleanup defined</em>. Opt out with <code>removal: leave</code>, which records the resource as released rather than deleted. The policy that applies is the task's own <code>removal</code>, else the module's <code>removal.policy</code>, else the kind's default.</p>
+<p>Removals are always flagged as warnings in the plan and in the UI: each one is listed with the module it belonged to, the revision that introduced it, what the kind will do (<code>apt remove nomad</code>, <code>userdel --remove sierra</code>), and the kinds whose removal can take unrelated things down (packages, users, groups) get an explicit caution. <code>approval: if_destructive</code> treats a plan with any cleanup removal, or any step that deletes, as destructive, so a phase with that policy stops for sign-off whenever a module or task disappears. Local mode prints the same warnings and <code>buckle apply</code> asks for confirmation before removing a package, user or group unless <code>--yes</code> is given (without a terminal and without <code>--yes</code> it refuses).</p></div>
 
 <h3>Drift</h3>
-<p>The agent re-plans against its assigned revision every <code>drift.interval</code> and runs its applied modules' health checks in the same pass (section <a href="#health">07</a>). A non-empty plan means something changed under us. With <code>drift.correct: true</code> the agent applies it (and reports "corrected drift" with the diff summary); otherwise it reports drift and the host shows amber in the UI. External edits to a file Buckle manages are visible as a diff against the recorded shadow, which also tells the operator exactly what the hand edit was.</p>
+<p>The agent re-plans the revision it has applied every <code>drift.interval</code> and runs its applied modules' health checks in the same pass (section <a href="#health">07</a>). A non-empty plan means something changed under us. With <code>drift.correct: true</code> the agent applies it (and reports "corrected drift" with the diff summary), unless the host is paused or a module was rolled back and the server has yet to decide; otherwise it reports drift and the host shows amber in the UI. External edits to a file Buckle manages are visible as a diff against the recorded shadow, which also tells the operator exactly what the hand edit was.</p>
+<p>The pass plans in <em>drift mode</em>, because a revision can be partly applied: a failed run leaves the host's applied revision behind while the modules that succeeded moved on, and a rolled-back module is back on the stable revision. State therefore records per module the revision it last applied and the revision it last failed on. Drift mode plans only the modules applied at the revision being checked and lists every other module (applied at another revision, failed last time, never applied) in <code>Plan.held</code> with the reason, leaving it alone; and it never treats a resource recorded at another revision as an orphan. The agent's unattended correction never executes removals at all, so an uncertain selection cannot delete anything and only an operator-approved apply removes (removals still appear in the drift plan).</p>
 
 <h3>Failure handling</h3>
 <ul>
-<li><b>Module-scoped rollback, then halt.</b> When a module fails, either because a task errors or because one of its required health checks stays failing past <code>settle</code> after the module (and its handlers) applied, the agent re-applies that module from the previous stable revision (its files, units, removals and handlers), records the rollback against the module, and stops making further changes on this host: modules not yet started in this run are left untouched, modules that already applied and passed their checks stay. The run result is <em>failed</em>, naming the module and the checks or task that failed. The agent does not continue past the failure on its own; that is the operator's call (section <a href="#rollout">10</a>).</li>
+<li><b>Module-scoped rollback, then halt.</b> When a module fails, either because a task or handler errors or because one of its required health checks stays failing past <code>settle</code> after the module (and its handlers) applied, the run halts: modules already running drain, nothing new starts, removals are skipped, and each failed module is rolled back from the stable revision. The rollback follows the <em>stable revision's</em> own view of this host: it evaluates the stable revision's selection with the current facts; when the stable revision selects the module it is re-applied from it (files, units, handlers, health) and recorded at the stable revision, and when it does not (the module is new in the failed revision) rolling back means removing what the failed revision put in place; the module's resources that the stable revision no longer wants are removed too, unless a resource of the stable revision took them over. If the stable selection of the module is indeterminate, or no stable revision is cached, nothing is rolled back and the failure is left for an operator. Modules that already applied and passed their checks stay. The result names the module and the checks or task that failed, and the recorded run outcome is one of <code>failed</code>, <code>unhealthy</code>, <code>rolled_back</code> (a rollback succeeded) or <code>needs_attention</code>. The agent does not continue past the failure on its own; that is the operator's call (section <a href="#rollout">10</a>).</li>
 <li>Retries are per task (<code>retry: { limit: 3, delay: 5s }</code>), kept from v1 but moved to the task level where transient failures actually happen (downloads, apt locks).</li>
-<li>Health checks run per module as soon as that module and its handlers complete (so a failure is attributed to the module that caused it), then keep running for the bake window after the whole run. A required check failing in either place triggers the module-scoped rollback above. The server treats unhealthy like failed for rollout purposes.</li>
+<li><b>Health settle.</b> A module's checks run as soon as it and its handlers complete (the providers it declares in <code>facts.provides</code> are refreshed first, and the checks see the facts refreshed so far, not the plan-time snapshot), so a failure is attributed to the module that caused it. When the module changed something, a failing required check is re-run at its <code>interval</code> until <code>settle</code> (default 2 m) has elapsed since its first failure, so a restarting service is not blamed; failing past that marks the module unhealthy and triggers the rollback above. A module that changed nothing runs its checks once and reports them without gating, since nothing this run did can have broken it, and waived checks (a <em>continue</em>) report but no longer count. The agent then keeps checking for the bake window after the whole run, and the same rollback applies if a required check fails past <code>settle</code> there (section <a href="#protocol">08</a>). The server treats unhealthy like failed for rollout purposes.</li>
+<li><b>Plan errors and blocked steps</b> do not halt the run (nothing of the module ran); they make it unsuccessful: <code>failed</code> for a module that could not be planned, <code>needs_attention</code> for blocked steps.</li>
 <li><code>command.run</code> is the escape hatch and is designed to stay plannable: <code>creates:</code>, <code>unless:</code> (a probe that runs in plan mode) or <code>changed_when:</code> make it idempotent, and a command without any of them is reported in the plan as <em>always runs</em> so the author sees the smell.</li>
 </ul>
 </section>
@@ -590,29 +631,37 @@ pub enum Diff {
 
 <pre><code class="language-rust"><span class="fname">buckle-core/src/task.rs</span>/// A typed, idempotent operation. Implementations are unit structs registered with `register_task!`.
 pub trait Task: Send + Sync + 'static {
-    /// Deserialised from the YAML under the task's kind key. Must be `JsonSchema`
-    /// so `buckle validate` and editors get a schema for free.
-    type Spec: DeserializeOwned + Serialize + JsonSchema + Send + Sync;
+    /// Deserialised from the YAML under the task's kind key, after the engine has rendered its string
+    /// scalars. Must be `JsonSchema` (it feeds `buckle catalog`, the schema-driven coercion of rendered
+    /// fields and the marking of secret-capable fields); every spec also rejects unknown fields.
+    type Spec: DeserializeOwned + Serialize + JsonSchema + Send + Sync + 'static;
 
     const KIND: &amp;'static str;                       // "file.template"
-    const LOCKS: &amp;'static [&amp;'static str] = &amp;[];      // "apt", "systemd", "dpkg"
-    const REMOVAL_DEFAULT: RemovalPolicy = RemovalPolicy::Cleanup;   // every kind; authors opt out with `removal: leave`
-    const REMOVAL_CAUTION: bool = false;                            // true for apt.package, user.*: plan flags the removal as high impact
+    const LOCKS: &amp;'static [&amp;'static str] = &amp;[];      // "apt", "systemd", "ufw"
     const PLATFORMS: Platforms = Platforms::ALL;    // Linux | MacOs | Windows bitset
+    const REMOVAL_DEFAULT: RemovalPolicy = RemovalPolicy::Cleanup;   // Leave for the handler-style kinds; authors opt out with `removal: leave`
+    const REMOVAL_CAUTION: bool = false;            // true for apt.package, user.*: plan flags the removal as high impact
+    const DESCRIPTION: &amp;'static str = "";           // one line, shown by `buckle catalog`
 
     /// Stable identity for state tracking and removal: "/etc/nomad.d/nomad.hcl", "nomad", "net.ipv4.ip_forward".
     fn key(spec: &amp;Self::Spec) -> String;
+    /// A human summary of the desired state, for plans.
+    fn describe(spec: &amp;Self::Spec) -> String { Self::key(spec) }
+    /// The locks this spec needs; by default `LOCKS`.
+    fn locks(spec: &amp;Self::Spec) -> Vec&lt;String&gt;;
+    /// True for a task with no idempotency guard (command.run without creates, unless or changed_when).
+    fn always_runs(spec: &amp;Self::Spec) -> bool { false }
 
-    /// Inspect the system. Pure: no writes. Returns NoOp, Change(diff) or Blocked(reason).
-    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec) -> Result&lt;Planned, Error&gt;;
+    /// Inspect the system. Pure: no writes (the plan-mode guard enforces it). Returns NoOp, Change(diff) or Blocked(reason).
+    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec) -> Result&lt;Planned&gt;;
 
-    /// Make it so. Only called when `plan` returned Change. Returns the artefacts to record.
-    async fn apply(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec, planned: &amp;Planned) -> Result&lt;Applied, Error&gt;;
+    /// Make it so. Only called when `plan` returned Change. Returns what to record: artefacts, shadow, content digest.
+    async fn apply(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec, planned: &amp;Planned) -> Result&lt;Applied&gt;;
 
-    /// Undo a previously applied resource. Default: nothing to do.
-    async fn remove(&amp;self, cx: &amp;Cx, record: &amp;ResourceRecord) -> Result&lt;Applied, Error&gt; {
-        let _ = (cx, record);
-        Ok(Applied::skipped("this task kind does not support removal"))
+    /// What `remove` would do for a recorded resource (shown as a plan warning), and doing it.
+    fn describe_removal(&amp;self, record: &amp;ResourceRecord) -> String;
+    async fn remove(&amp;self, cx: &amp;Cx, record: &amp;ResourceRecord) -> Result&lt;Applied&gt; {
+        Ok(Applied::skipped("this task kind does not define a cleanup"))
     }
 }
 
@@ -621,11 +670,20 @@ pub trait Task: Send + Sync + 'static {
 pub trait DynTask: Send + Sync {
     fn kind(&amp;self) -> &amp;'static str;
     fn locks(&amp;self) -> &amp;'static [&amp;'static str];
+    fn platforms(&amp;self) -> Platforms;
+    fn removal_default(&amp;self) -> RemovalPolicy;
+    fn removal_caution(&amp;self) -> bool;
+    fn description(&amp;self) -> &amp;'static str;
     fn schema(&amp;self) -> schemars::Schema;
-    fn parse(&amp;self, raw: serde_yaml::Value, tpl: &amp;Templater) -> Result&lt;Box&lt;dyn ErasedSpec&gt;, Error&gt;;
-    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;dyn ErasedSpec) -> Result&lt;Planned, Error&gt;;
-    async fn apply(&amp;self, cx: &amp;Cx, spec: &amp;dyn ErasedSpec, planned: &amp;Planned) -> Result&lt;Applied, Error&gt;;
-    async fn remove(&amp;self, cx: &amp;Cx, record: &amp;ResourceRecord) -> Result&lt;Applied, Error&gt;;
+    fn parse(&amp;self, raw: serde_json::Value) -> Result&lt;ErasedSpec&gt;;   // errors name the kind and the field
+    fn key(&amp;self, spec: &amp;ErasedSpec) -> String;
+    fn describe(&amp;self, spec: &amp;ErasedSpec) -> String;
+    fn locks_for(&amp;self, spec: &amp;ErasedSpec) -> Vec&lt;String&gt;;
+    fn always_runs(&amp;self, spec: &amp;ErasedSpec) -> bool;
+    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;ErasedSpec) -> Result&lt;Planned&gt;;
+    async fn apply(&amp;self, cx: &amp;Cx, spec: &amp;ErasedSpec, planned: &amp;Planned) -> Result&lt;Applied&gt;;
+    fn describe_removal(&amp;self, record: &amp;ResourceRecord) -> String;
+    async fn remove(&amp;self, cx: &amp;Cx, record: &amp;ResourceRecord) -> Result&lt;Applied&gt;;
 }
 
 pub struct TaskRegistration(&amp;'static dyn DynTask);
@@ -649,15 +707,17 @@ pub fn registry() -> &amp;'static HashMap&lt;&amp;'static str, &amp;'static dyn 
 }
 </code></pre>
 
-<pre><code class="language-rust"><span class="fname">buckle-std/src/tasks/systemd/unit.rs  (registration site)</span>pub struct SystemdUnit;
+<pre><code class="language-rust"><span class="fname">buckle-std/src/tasks/systemd_unit.rs  (registration site, condensed)</span>pub struct SystemdUnit;
 buckle_core::register_task!(SystemdUnit);
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
     #[serde(default)] pub enabled: Option&lt;bool&gt;,
     #[serde(default)] pub active: Option&lt;bool&gt;,
     #[serde(default)] pub masked: Option&lt;bool&gt;,
+    #[serde(default)] pub daemon_reload: bool,
 }
 
 impl Task for SystemdUnit {
@@ -669,73 +729,105 @@ impl Task for SystemdUnit {
     fn key(spec: &amp;Spec) -> String { spec.name.clone() }
 
     #[instrument(name = "task.systemd.unit.plan", skip_all, fields(unit = %spec.name))]
-    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;Spec) -> Result&lt;Planned, Error&gt; {
-        let state = cx.sys().systemctl_show(&amp;spec.name).await?;      // via the mockable System trait
-        let mut changes = vec![];
-        if let Some(enabled) = spec.enabled &amp;&amp; state.enabled != enabled { changes.push(format!("enabled: {} → {enabled}", state.enabled)); }
-        if let Some(active) = spec.active &amp;&amp; state.active != active   { changes.push(format!("active: {} → {active}", state.active)); }
-        Ok(if changes.is_empty() { Planned::NoOp } else { Planned::change(Diff::Opaque { summary: changes.join(", ") }) })
+    async fn plan(&amp;self, cx: &amp;Cx, spec: &amp;Spec) -> Result&lt;Planned&gt; {
+        // `systemctl show` through the mockable System trait. No systemctl, or systemd not running as PID 1
+        // (a container), is Blocked with the reason, not an error.
+        let status = match show_for_plan(cx, &amp;spec.name).await? { Ok(status) =&gt; status, Err(blocked) =&gt; return Ok(blocked) };
+        match steps(spec, &amp;status) {                      // enable / start / mask / … for the fields the spec sets
+            Err(reason) =&gt; Ok(Planned::blocked(reason)),
+            Ok(steps) if steps.is_empty() =&gt; Ok(Planned::NoOp),
+            Ok(steps) =&gt; Ok(Planned::change(Diff::Opaque { summary: describe(&amp;steps, &amp;status) })),
+        }
     }
-    // apply(), remove() omitted
+    // apply() runs the steps and records Artefact::Unit { enabled, started } for what Buckle itself did; remove() undoes only that
 }
 </code></pre>
 
-<p>The <code>Cx</code> context carries the <code>System</code> trait object (filesystem, processes, package manager probes), the templater, the secret sinks, the facts snapshot and the span. Tests implement <code>System</code> in memory, which is how the v1 <code>Launcher</code>/<code>FileWriter</code> mocks grow up. Fact providers and health checks use the same registration shape:</p>
+<p>The <code>Cx</code> context carries the mode (plan or apply), the <code>System</code> trait object (files, processes, HTTP, users, the clock; in plan mode the write-guarded view), the host context (labels, groups, facts, vars, secret metadata), the templater, the module's <code>files/</code> source, the host's secrets, the waived checks and the resource's previous record from state, so a task knows what Buckle itself installed, enabled or wrote before. Tests implement <code>System</code> in memory, which is how the v1 <code>Launcher</code>/<code>FileWriter</code> mocks grow up. Fact providers and health checks use the same registration shape:</p>
 
 <pre><code class="language-rust"><span class="fname">buckle-core/src/facts.rs · buckle-core/src/health.rs</span>pub trait FactProvider: Send + Sync + 'static {
-    const NAME: &amp;'static str;                    // "os", "tailscale", "cloud.oci"
+    const NAME: &amp;'static str;                    // mount point under host.facts: "os", "tailscale", "cloud" (dots nest; mounts may not overlap)
     const TTL: Duration = Duration::from_secs(300);
     const PLATFORMS: Platforms = Platforms::ALL;
-    /// Returns a JSON tree mounted at host.facts.&lt;NAME&gt;. Failure yields Null, never aborts a run.
-    async fn collect(&amp;self, cx: &amp;Cx) -> Result&lt;serde_json::Value, Error&gt;;
+    const DESCRIPTION: &amp;'static str = "";
+    /// Returns a JSON tree mounted at host.facts.&lt;NAME&gt;. An error keeps the last good value and marks the
+    /// provider stale, never aborting a run; a provider that has never succeeded is "unavailable", which makes
+    /// the selectors that read it uncertain (section 04).
+    async fn collect(&amp;self, cx: &amp;Cx) -> Result&lt;serde_json::Value&gt;;
 }
 buckle_core::register_facts!(TailscaleFacts);
 
 pub trait HealthCheck: Send + Sync + 'static {
-    type Spec: DeserializeOwned + JsonSchema + Send + Sync;
-    const KIND: &amp;'static str;                    // "http", "tcp", "systemd", "command", "filter"
-    async fn check(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec) -> HealthResult;   // Pass | Fail { reason } | Unknown
+    type Spec: DeserializeOwned + Serialize + JsonSchema + Send + Sync + 'static;
+    const KIND: &amp;'static str;                    // "http", "tcp", "systemd", "command", "filter", "file"
+    const PLATFORMS: Platforms = Platforms::ALL;
+    const DESCRIPTION: &amp;'static str = "";
+    async fn check(&amp;self, cx: &amp;Cx, spec: &amp;Self::Spec) -> HealthStatus;   // Pass | Fail { reason } | Unknown { reason }
 }
 buckle_core::register_health!(HttpCheck);
 </code></pre>
 
 <h3>Standard library: tasks</h3>
-<p>Derived from the 211 module invocations in infra-ansible. Everything the live roles use maps onto one of these; Ansible names are shown for orientation.</p>
+<p>Thirty kinds, derived from the 211 module invocations in infra-ansible: everything the live roles use maps onto one of these, and Ansible names are shown for orientation. <code>buckle catalog</code> prints the same list from the binary (<code>--json</code> adds each kind's JSON schema) and <code>GET /api/v1/catalog</code> serves it to the UI. Every kind accepts the common keys <code>id</code>, <code>name</code>, <code>when</code>, <code>notify</code>, <code>tags</code>, <code>removal</code> and <code>retry</code> (<code>{ limit, delay }</code>) beside its own fields, and <strong>every spec rejects unknown fields</strong>, so a misspelt key is an error naming the kind and the field. <code>mode</code>, <code>owner</code> and <code>group</code> sit directly in the spec of the kinds that write files (mode as an octal string such as <code>"0644"</code>; a field left out is not changed). Defaults are in parentheses; a field without one is either required or optional and unset, which the kind's schema in <code>buckle catalog --json</code> says.</p>
+<p>A task whose tool is missing at plan time (<code>apt-get</code>, <code>systemctl</code> as PID 1, <code>docker</code>, <code>hostnamectl</code> and <code>hostname</code>, an explicit <code>validate</code> program) plans as <em>Blocked</em> with the reason rather than failing, so a plan can be read on a minimal image; blocked steps are planned again at apply once earlier steps have changed something (section <a href="#engine">04</a>). The automatic <code>visudo</code> and <code>sshd</code> validators are skipped when those programs are not installed; an explicit validator is required.</p>
 <div class="scroll"><table>
-<thead><tr><th>Kind</th><th>Replaces</th><th>Notes</th></tr></thead>
+<thead><tr><th>Kind</th><th>Replaces</th><th>Platforms · locks · removal</th><th>Spec fields</th><th>Behaviour</th></tr></thead>
 <tbody>
-<tr><td><code>file.copy</code>, <code>file.template</code></td><td>copy, template</td><td>owner/group/mode, <code>validate</code> command with <code>{path}</code>, backup-on-change option; template renders are secret-aware</td></tr>
-<tr><td><code>file.directory</code>, <code>file.absent</code>, <code>file.symlink</code></td><td>file</td><td>recursive mode, idempotent removal</td></tr>
-<tr><td><code>file.line</code>, <code>file.block</code></td><td>lineinfile, blockinfile</td><td><code>regex</code> replace-or-append, <code>absent</code>, <code>insert_after</code>, marker blocks; removal reverts the edit</td></tr>
-<tr><td><code>file.download</code></td><td>get_url</td><td><code>checksum</code> (sha256 or URL to .sha256), <code>etag</code> cache, atomic write</td></tr>
-<tr><td><code>archive.extract</code></td><td>unarchive</td><td>tar.gz/zip, from URL or path, <code>include</code> filter, strip components</td></tr>
-<tr><td><code>github.release</code></td><td>uri + set_fact + get_url + command probes</td><td>Resolves <code>latest</code> through the API (with optional token), maps arch via a per-task table, compares an installed-version probe, downloads with checksum, installs to a path. One task replaces 6 to 8 Ansible tasks per binary</td></tr>
-<tr><td><code>apt.repository</code>, <code>apt.package</code>, <code>apt.update</code></td><td>deb822_repository, get_url (keys), apt, package</td><td>deb822 sources with keyring download, package present/absent/version/latest, <code>.deb</code> from URL; shared <code>apt</code> lock</td></tr>
-<tr><td><code>systemd.unit</code>, <code>systemd.dropin</code>, <code>systemd.daemon_reload</code>, <code>systemd.restart</code>, <code>systemd.reload</code></td><td>systemd, service</td><td>handlers are just tasks; dropin writes <code>*.service.d/*.conf</code> and implies daemon-reload</td></tr>
-<tr><td><code>user.account</code>, <code>user.group</code>, <code>ssh.authorized_key</code></td><td>user, group, authorized_key</td><td>password hashes are <code>Secret</code>; groups append; <code>system</code> users</td></tr>
-<tr><td><code>sysctl.param</code></td><td>sysctl</td><td>writes <code>/etc/sysctl.d/90-buckle-&lt;module&gt;.conf</code> and applies live</td></tr>
-<tr><td><code>ufw.default</code>, <code>ufw.rule</code>, <code>ufw.state</code></td><td>ufw</td><td>rules keyed by (direction, proto, port, from, to, interface); removal deletes the rule</td></tr>
-<tr><td><code>hostname.set</code>, <code>swap.file</code>, <code>cron.job</code></td><td>hostname, dd+mkswap+fstab, cron</td><td><code>swap.file</code> owns the file, fstab line and <code>swapon</code> as one resource</td></tr>
-<tr><td><code>command.run</code></td><td>command</td><td><code>creates</code> / <code>unless</code> / <code>changed_when</code> / <code>remove</code>; env from vars and secrets through the process sink; stdout/stderr captured to the span</td></tr>
-<tr><td><code>docker.image</code></td><td>command docker pull</td><td>pull with digest comparison; needed for the eBPF profiler unit</td></tr>
+<tr><th colspan="5">Files, downloads and archives</th></tr>
+<tr><td><code>file.copy</code></td><td>copy</td><td>all · no lock · cleanup</td><td><code>src</code>, <code>dest</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>backup</code> (<code>false</code>), <code>validate</code></td><td>Atomic write; unified diff for text, a digest change for binary files. <code>src</code> is relative to the module's <code>files/</code>. <code>validate</code> is an argv containing <code>{path}</code>, run against a private copy under <code>&lt;state_dir&gt;/tmp</code> before the file is replaced (a failure leaves the destination untouched); without it, <code>/etc/sudoers</code>, <code>/etc/sudoers.d/*</code> and files named <code>sshd_config</code> are checked with <code>visudo -cf</code> and <code>sshd -t -f</code> when those tools are installed, and <code>validate: []</code> turns that off. Removal deletes <code>dest</code> only while its content still matches what Buckle wrote.</td></tr>
+<tr><td><code>file.template</code></td><td>template</td><td>all · no lock · cleanup</td><td><code>src</code>, <code>dest</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>validate</code>, <code>backup</code> (<code>false</code>)</td><td>Secret-aware double render (section <a href="#secrets">06</a>). A new file whose render touched a secret and that has no <code>mode</code> is created 0600; the validator's output is withheld when the file contains secrets. Same <code>validate</code> rules as <code>file.copy</code>. Removal deletes <code>dest</code> only while its content still matches.</td></tr>
+<tr><td><code>file.directory</code></td><td>file</td><td>all · no lock · cleanup</td><td><code>path</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>recurse</code> (<code>false</code>)</td><td>Creates missing parents. <code>recurse</code> applies the permissions to existing contents and affects permissions only, never removal (the mode applies to files too, so prefer <code>owner</code> and <code>group</code>). Removal deletes the directory only if Buckle created it and it is empty; a pre-existing directory whose permissions Buckle adjusted is recorded as <em>adopted</em> and never deleted.</td></tr>
+<tr><td><code>file.absent</code></td><td>file (state: absent)</td><td>all · no lock · cleanup</td><td><code>path</code>, <code>recursive</code> (<code>false</code>)</td><td>Idempotent. A symlink is removed as a link; a non-empty directory is blocked unless <code>recursive</code>, and a recursive delete is refused for <code>/</code>, any top-level directory, well-known system directories, paths containing <code>..</code> and empty or whitespace-padded paths. Nothing to undo on removal.</td></tr>
+<tr><td><code>file.symlink</code></td><td>file (state: link)</td><td>unix · no lock · cleanup</td><td><code>path</code>, <code>target</code>, <code>force</code> (<code>false</code>)</td><td>A link pointing elsewhere is replaced; anything else at <code>path</code> blocks unless <code>force</code> (a file or empty directory only). Removal deletes the link if it still points where Buckle pointed it.</td></tr>
+<tr><td><code>file.line</code></td><td>lineinfile</td><td>all · per-path edit lock · cleanup</td><td><code>path</code>, <code>line</code>, <code>regex</code>, <code>state</code> (<code>present</code>), <code>insert_after</code>, <code>insert_before</code>, <code>create</code> (<code>false</code>), <code>backup</code> (<code>false</code>), <code>validate</code></td><td>Replaces the <em>last</em> line matching <code>regex</code>, else appends <code>line</code> unless it is already present; <code>state: absent</code> deletes every match. The resource is keyed by <code>path</code> and <code>regex</code> when a <code>regex</code> is given (else <code>path</code> and <code>line</code>), so changing <code>line</code> updates the same line in place and removal still restores the text from before Buckle's first edit. Removal reverts the edit: an added line is deleted once, a replaced line restored, a file Buckle created deleted if left empty. Sensitive paths (<code>/etc/ssh</code>, <code>/etc/environment</code>, <code>/etc/fstab</code>, sudoers, <code>~/.ssh</code>, shadow files) get zero-context diffs, and the replaced text is kept in a 0600 file under <code>&lt;state_dir&gt;/stash/file.line/</code> instead of in state. Same <code>validate</code> rules as <code>file.copy</code>.</td></tr>
+<tr><td><code>file.block</code></td><td>blockinfile</td><td>all · per-path edit lock · cleanup</td><td><code>path</code>, <code>block</code>, <code>marker</code> (<code># {mark} BUCKLE MANAGED BLOCK</code>), <code>state</code> (<code>present</code>), <code>insert_after</code>, <code>insert_before</code>, <code>create</code> (<code>false</code>), <code>backup</code> (<code>false</code>), <code>validate</code></td><td>The marker lines delimit what Buckle owns, so removal deletes everything between them (and a file Buckle created, if that leaves it empty); two blocks in one file need different markers. <code>insert_after</code> / <code>insert_before</code> take a pattern or <code>EOF</code> / <code>BOF</code> and matter only on first insertion. Same <code>validate</code> rules as <code>file.copy</code>.</td></tr>
+<tr><td><code>file.download</code></td><td>get_url</td><td>all · no lock · cleanup</td><td><code>url</code>, <code>dest</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>checksum</code>, <code>headers</code>, <code>force</code> (<code>false</code>)</td><td><code>checksum</code> is <code>sha256:&lt;hex&gt;</code>, a bare digest or the URL of a <code>.sha256</code> / <code>SHA256SUMS</code> file; the download is verified before anything is written. Without a checksum an existing <code>dest</code> is never re-downloaded unless <code>force</code>. <code>headers</code> values may reference secrets. Removal deletes <code>dest</code> only while it still matches.</td></tr>
+<tr><td><code>archive.extract</code></td><td>unarchive</td><td>all · no lock · cleanup</td><td><code>src</code>, <code>dest</code>, <code>strip_components</code> (<code>0</code>), <code>include</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>creates</code>, <code>force</code> (<code>false</code>)</td><td><code>.tar</code>, <code>.tar.gz</code>/<code>.tgz</code>, <code>.zip</code> from a URL, an absolute host path or a module file; the format is detected from the content. Entries escaping <code>dest</code> and writes beneath a symlink the archive created are rejected; the archive is held in memory (1 GiB cap). Give remote archives a <code>creates</code> path (relative to <code>dest</code>) so plans do not download them. A symlink entry never replaces an existing file, directory or foreign symlink unless <code>force</code> (otherwise the plan is blocked). Removal deletes the extracted files only if every one is still as extracted.</td></tr>
+<tr><td><code>github.release</code></td><td>uri + set_fact + get_url + probes</td><td>all · no lock · cleanup</td><td><code>repo</code>, <code>version</code> (<code>latest</code>), <code>asset</code>, <code>arch_map</code>, <code>dest</code>, <code>mode</code>, <code>owner</code>, <code>group</code>, <code>probe</code>, <code>probe_regex</code>, <code>checksum_asset</code>, <code>token_env</code>, <code>extract</code></td><td><code>asset</code> may use <code>{version}</code>, <code>{tag}</code>, <code>{arch}</code>, <code>{os}</code>; <code>arch_map</code> extends the defaults <code>x86_64: amd64</code>, <code>aarch64: arm64</code>, and an unmapped architecture is <em>blocked</em>, not failed. The plan compares the version <code>probe</code> prints with the wanted release; <code>latest</code> asks the GitHub API on every plan (60 requests an hour without the token named by <code>token_env</code>). Archive assets need <code>extract</code>. One task replaces 6 to 8 Ansible tasks per binary.</td></tr>
+<tr><th colspan="5">Packages, services and kernel</th></tr>
+<tr><td><code>apt.repository</code></td><td>deb822_repository, get_url (keys)</td><td>linux · <code>apt</code> · cleanup</td><td><code>name</code>, <code>uri</code>, <code>uris</code>, <code>suites</code>, <code>components</code> (<code>[main]</code>), <code>signed_by</code>, <code>architectures</code> (all), <code>types</code> (<code>[deb]</code>), <code>enabled</code> (<code>true</code>), <code>auth</code></td><td>Writes <code>/etc/apt/sources.list.d/&lt;name&gt;.sources</code> and downloads the key (<code>signed_by.url</code> armoured, <code>signed_by.keyring_url</code> binary, or <code>signed_by.path</code> for a keyring already on the host). <code>auth</code> (<code>login</code>, <code>password</code>, which may reference secrets) writes <code>/etc/apt/auth.conf.d/&lt;name&gt;.conf</code> mode 0600 for private repositories and never appears in plans. Runs <code>apt-get update</code> once on apply; removal deletes both files (keeping a sources file edited by hand) and updates.</td></tr>
+<tr><td><code>apt.package</code></td><td>apt, package</td><td>linux · <code>apt</code> · cleanup, <em>caution</em></td><td><code>name</code>, <code>names</code>, <code>state</code> (<code>present</code>), <code>version</code>, <code>deb</code>, <code>update_cache</code> (<code>false</code>), <code>install_recommends</code> (<code>true</code>), <code>remove_dependents</code> (<code>false</code>)</td><td><code>state</code> is <code>present</code>, <code>latest</code> or <code>absent</code>; <code>version</code> accepts <code>*</code> wildcards; <code>deb</code> installs a <code>.deb</code> from a URL and needs <code>name</code>. Held packages are blocked, not changed. Removing (by <code>state: absent</code> or on removal) is first simulated with <code>apt-get -s remove</code>; if apt would take other packages along, the task is blocked with the list (and a removal is skipped) unless <code>remove_dependents: true</code>. Removal removes only the packages this resource installed itself.</td></tr>
+<tr><td><code>apt.update</code></td><td>apt (update_cache)</td><td>linux · <code>apt</code> · <em>leave</em></td><td><code>max_age</code> (<code>1h</code>)</td><td>Runs <code>apt-get update</code> when the index is older than <code>max_age</code> (the newest of the lists directory, apt's success stamp and Buckle's own stamp); <code>0s</code> refreshes on every run.</td></tr>
+<tr><td><code>systemd.unit</code></td><td>systemd, service</td><td>linux · <code>systemd</code> · cleanup</td><td><code>name</code>, <code>enabled</code>, <code>active</code>, <code>masked</code>, <code>daemon_reload</code> (<code>false</code>)</td><td>Each of <code>enabled</code>, <code>active</code>, <code>masked</code> is optional and unmanaged when omitted (<code>masked</code> cannot be combined with <code>enabled: true</code> or <code>active: true</code>). A unit whose file an earlier task writes is treated as disabled and inactive. Removal undoes only what Buckle did: stops the unit if Buckle started it, disables it if Buckle enabled it, unmasks it if Buckle masked it.</td></tr>
+<tr><td><code>systemd.dropin</code></td><td>systemd drop-in files</td><td>linux · <code>systemd</code> · cleanup</td><td><code>unit</code>, <code>name</code> (<code>override.conf</code>), <code>content</code>, <code>perms</code> (<code>{mode, owner, group}; 0644</code>)</td><td>Writes <code>/etc/systemd/system/&lt;unit&gt;.d/&lt;name&gt;</code> (<code>content</code> is a template, no secrets) and runs <code>daemon-reload</code>; the unit is not restarted (notify a <code>systemd.restart</code> handler). Removal deletes the drop-in unless it was edited by hand, then reloads.</td></tr>
+<tr><td><code>systemd.daemon_reload</code></td><td>handler</td><td>linux · <code>systemd</code> · <em>leave</em></td><td>no fields</td><td>Always plans a change; the engine runs it once per module, before restarts and reloads.</td></tr>
+<tr><td><code>systemd.restart</code></td><td>handler</td><td>linux · <code>systemd</code> · <em>leave</em></td><td><code>name</code></td><td><code>systemctl restart</code>; a restart subsumes a reload of the same unit in the same module.</td></tr>
+<tr><td><code>systemd.reload</code></td><td>handler</td><td>linux · <code>systemd</code> · <em>leave</em></td><td><code>name</code></td><td><code>systemctl reload-or-restart</code>: the unit re-reads its configuration, or restarts if it cannot reload.</td></tr>
+<tr><td><code>sysctl.param</code></td><td>sysctl</td><td>linux · <code>sysctl</code> · cleanup</td><td><code>name</code>, <code>value</code>, <code>persist</code> (<code>true</code>), <code>file</code> (<code>/etc/sysctl.d/90-buckle-&lt;module&gt;.conf</code>)</td><td><code>value</code> may be a string, number or boolean. Applies live (<code>sysctl -w</code>) and persists; the plan reads the live value from <code>/proc/sys</code>, so planning needs no <code>sysctl</code> binary. Every <code>sysctl.param</code> of a module shares the file. Removal deletes the line (and the file when only comments remain) but cannot restore the live value.</td></tr>
+<tr><td><code>ufw.default</code></td><td>ufw</td><td>linux · <code>ufw</code> · cleanup</td><td><code>direction</code>, <code>policy</code>, <code>allow_lockout</code> (<code>false</code>)</td><td><code>direction</code> is <code>incoming</code>, <code>outgoing</code> or <code>routed</code>; <code>policy</code> is <code>allow</code>, <code>deny</code> or <code>reject</code>. Setting <code>incoming</code> to deny/reject on an active firewall is blocked unless a rule on the host, or a <code>ufw.rule</code> earlier in the same plan, allows or limits incoming SSH or all traffic on a management interface such as <code>tailscale0</code>; <code>allow_lockout: true</code> overrides. Removal restores the policy that was in place before Buckle changed it.</td></tr>
+<tr><td><code>ufw.rule</code></td><td>ufw</td><td>linux · <code>ufw</code> · cleanup</td><td><code>rule</code>, <code>direction</code> (<code>in</code>), <code>to_port</code>, <code>proto</code>, <code>from_ip</code>, <code>to_ip</code>, <code>interface</code>, <code>comment</code></td><td><code>rule</code> is <code>allow</code>, <code>deny</code>, <code>reject</code> or <code>limit</code>. At least one selector is required, so a rule cannot accidentally open everything; a list or range of ports needs <code>proto</code>. Identified by direction, protocol, port, addresses and interface (not action or comment); a rule with the same selectors but another action is replaced. Removal deletes exactly this rule (v4 and v6) and restores any rule it replaced.</td></tr>
+<tr><td><code>ufw.state</code></td><td>ufw</td><td>linux · <code>ufw</code> · cleanup</td><td><code>enabled</code>, <code>logging</code>, <code>allow_lockout</code> (<code>false</code>)</td><td><code>ufw --force enable</code>. Enabling is blocked unless a rule on the host, or a <code>ufw.rule</code> earlier in the same plan, allows or limits incoming SSH (the <code>Port</code>s of sshd_config, default 22/tcp) or all traffic on a management interface; <code>allow_lockout: true</code> overrides. <code>logging</code> is <code>off</code>, <code>on</code>, <code>low</code>, <code>medium</code>, <code>high</code> or <code>full</code>. Removal disables ufw if Buckle enabled it and restores the previous logging level.</td></tr>
+<tr><th colspan="5">Users, host settings and commands</th></tr>
+<tr><td><code>user.group</code></td><td>group</td><td>linux · <code>users</code> · cleanup, <em>caution</em></td><td><code>name</code>, <code>gid</code>, <code>system</code> (<code>false</code>), <code>state</code> (<code>present</code>)</td><td>Removal deletes the group, only if Buckle created it.</td></tr>
+<tr><td><code>user.account</code></td><td>user</td><td>linux · <code>users</code> · cleanup, <em>caution</em></td><td><code>name</code>, <code>uid</code>, <code>group</code>, <code>groups</code>, <code>shell</code>, <code>home</code>, <code>create_home</code> (<code>true; false for system accounts</code>), <code>system</code> (<code>false</code>), <code>password</code>, <code>comment</code>, <code>state</code> (<code>present</code>), <code>remove_home</code> (<code>false</code>)</td><td><code>groups</code> are appended and never removed. <code>password</code> is a pre-hashed crypt value that may reference secrets; it is applied with <code>chpasswd -e</code> over stdin through the secret sink and compared with <code>/etc/shadow</code> by digest, never shown. Removal runs <code>userdel</code> (with <code>-r</code> only when <code>remove_home</code>) if Buckle created the account.</td></tr>
+<tr><td><code>ssh.authorized_key</code></td><td>authorized_key</td><td>unix · per-path edit lock · cleanup</td><td><code>user</code>, <code>key</code>, <code>state</code> (<code>present</code>), <code>exclusive</code> (<code>false</code>)</td><td><code>key</code> is one or more <code>authorized_keys</code> lines; a key is identified by type and body, so changing its options or comment updates the line. <code>exclusive</code> removes every other key. Keeps <code>.ssh</code> at 0700 and the file at 0600, owned by the user. Removal deletes the lines Buckle added.</td></tr>
+<tr><td><code>hostname.set</code></td><td>hostname</td><td>linux · no lock · cleanup</td><td><code>name</code></td><td>Compares the kernel hostname and <code>/etc/hostname</code>; applies with <code>hostnamectl</code> (falling back to <code>hostname</code>). Blocked when neither tool exists. Removal does nothing: the previous name is unknown.</td></tr>
+<tr><td><code>swap.file</code></td><td>dd + mkswap + fstab</td><td>linux · <code>fstab</code> · cleanup</td><td><code>path</code>, <code>size_mb</code>, <code>swappiness</code></td><td>One resource owns the file, its <code>/etc/fstab</code> line and the <code>swapon</code> state; a file of the wrong size is swapped off and recreated. A data file at the path is blocked, not formatted. <code>swappiness</code> is applied live and persisted in <code>/etc/sysctl.d/99-buckle-swap.conf</code>. Removal runs <code>swapoff</code> and deletes the line and the file, but only for a swap file Buckle created.</td></tr>
+<tr><td><code>cron.job</code></td><td>cron</td><td>unix · no lock · cleanup</td><td><code>name</code>, <code>user</code> (<code>root</code>), <code>schedule</code>, <code>command</code>, <code>state</code> (<code>present</code>)</td><td>Owns the file <code>/etc/cron.d/&lt;name&gt;</code> (mode 0644); <code>schedule</code> is five fields or an <code>@</code> alias; unescaped <code>%</code> in <code>command</code> is escaped for you.</td></tr>
+<tr><td><code>command.run</code></td><td>command</td><td>all · no lock · cleanup (a <code>remove</code> command, else <em>no cleanup defined</em>)</td><td><code>run</code>, <code>creates</code>, <code>unless</code>, <code>only_if</code>, <code>changed_when</code> (<code>always</code>), <code>env</code>, <code>cwd</code>, <code>timeout</code>, <code>remove</code>, <code>capture</code> (<code>redacted</code>)</td><td><code>run</code>, <code>unless</code>, <code>only_if</code> and <code>remove</code> are an argv list or a string run with <code>sh -c</code>. <code>unless</code> and <code>only_if</code> probes run in plan mode and must be read-only. <code>changed_when</code> is <code>always</code>, <code>never</code>, <code>output_contains:&lt;text&gt;</code> or <code>exit:&lt;code&gt;</code>. <code>env</code> values may reference secrets and are handed over through the process-environment sink; when one does, output is not captured unless <code>capture: always</code> (otherwise stdout and stderr, scrubbed of known secrets, go to the span, 4 KiB each; <code>never</code> records nothing). A task with <code>remove:</code> must carry an explicit <code>id</code>. A command with no guard is flagged <em>always runs</em>.</td></tr>
+<tr><td><code>docker.image</code></td><td>command docker pull</td><td>all · <code>docker</code> · cleanup</td><td><code>name</code>, <code>pull</code> (<code>missing</code>), <code>state</code> (<code>present</code>)</td><td><code>pull: always</code> refreshes a moving tag on every apply and reports a change only if the digests differ, but always appears as pending in plans. Blocked when <code>docker</code> is not on the PATH. Removal runs <code>docker image rm</code> for an image Buckle pulled; an image in use is left.</td></tr>
 </tbody></table></div>
-<p>Later platforms add <code>brew.package</code>, <code>launchd.service</code>, <code>winget.package</code>, <code>windows.service</code>, <code>registry.value</code>; the file, command, download, archive and github tasks are already cross-platform.</p>
+<p>Handler-style kinds (<code>systemd.daemon_reload</code>, <code>systemd.restart</code>, <code>systemd.reload</code>) and <code>apt.update</code> default to <em>leave</em>; every other kind defaults to <em>cleanup</em>. The removal of <code>apt.package</code>, <code>user.account</code> and <code>user.group</code> is flagged with a caution. Later platforms add <code>brew.package</code>, <code>launchd.service</code>, <code>winget.package</code>, <code>windows.service</code>, <code>registry.value</code>; the file, command, download, archive and github tasks are already cross-platform.</p>
 
 <h3>Standard library: facts</h3>
+<p>Ten providers, each mounted at <code>host.facts.&lt;name&gt;</code> and refreshed per TTL. Providers read the host only through the <code>System</code> trait and tolerate missing tools: a missing source yields <code>null</code> for that key, not an error.</p>
 <div class="scroll"><table>
-<thead><tr><th>Provider</th><th>Keys</th><th>Source</th></tr></thead>
+<thead><tr><th>Provider</th><th>Keys</th><th>Platforms · TTL</th><th>Source</th></tr></thead>
 <tbody>
-<tr><td><code>os</code></td><td>family, id, codename, version, kernel</td><td><code>/etc/os-release</code>, <code>uname</code>; <code>os_info</code> on macOS/Windows</td></tr>
-<tr><td><code>hardware</code></td><td>arch, cpus, mem.total_mb, swap.total_mb, disks[]</td><td><code>sysinfo</code></td></tr>
-<tr><td><code>net</code></td><td>hostname, fqdn, interfaces[], default_route</td><td>netlink / getifaddrs</td></tr>
-<tr><td><code>tailscale</code></td><td>hostname, ips, tags, online</td><td><code>tailscale status --json</code>, LocalAPI if present</td></tr>
-<tr><td><code>cloud.oci</code>, <code>cloud.azure</code></td><td>provider, region, shape/sku, id, fault_domain</td><td>IMDS, 2 s timeout, cached 1 h</td></tr>
-<tr><td><code>users</code></td><td>accounts[{name, uid, gid, home, shell}]</td><td>getent passwd</td></tr>
-<tr><td><code>systemd</code></td><td>units[{name, active, enabled}]</td><td><code>systemctl list-units</code>, used by health and plans</td></tr>
-<tr><td><code>nomad</code>, <code>docker</code></td><td>version, eligibility, images[]</td><td>only when the binary exists</td></tr>
-<tr><td><code>script.&lt;name&gt;</code></td><td>whatever the script prints</td><td>Executable JSON emitters in <code>facts.d/</code> of a module; the v1 config-script idea, typed</td></tr>
+<tr><td><code>os</code></td><td><code>family</code> (debian, rhel, alpine, arch, macos, windows, unknown), <code>id</code>, <code>codename</code>, <code>version</code>, <code>pretty_name</code>, <code>kernel</code></td><td>all · 1 h</td><td><code>/etc/os-release</code> and <code>uname -r</code>; <code>sw_vers</code> on macOS</td></tr>
+<tr><td><code>hardware</code></td><td><code>arch</code>, <code>cpus</code>, <code>mem.total_mb</code>, <code>swap.total_mb</code>, <code>disks[]</code> (<code>mount</code>, <code>fstype</code>, <code>total_mb</code>, <code>free_mb</code>, <code>free_percent</code>) and the flat <code>disk.&lt;name&gt;.*</code> with the same fields (<code>root</code> for <code>/</code>, otherwise the mount path with separators turned into <code>_</code>)</td><td>linux · 5 min</td><td><code>uname -m</code>, <code>/proc/cpuinfo</code>, <code>/proc/meminfo</code>, <code>df -P -k -T</code> (pseudo filesystems left out)</td></tr>
+<tr><td><code>net</code></td><td><code>hostname</code>, <code>fqdn</code>, <code>interfaces[]</code> (<code>name</code>, <code>state</code>, <code>mac</code>, <code>mtu</code>, <code>addresses[]</code>), <code>addresses</code> (global-scope, flat), <code>default_route</code></td><td>linux · 5 min</td><td><code>hostname -f</code>, <code>ip -j addr</code>, <code>ip -j route show default</code></td></tr>
+<tr><td><code>tailscale</code></td><td><code>hostname</code>, <code>ips</code>, <code>tags</code>, <code>online</code>, <code>backend_state</code>, <code>tailnet</code>; <code>null</code> when not installed</td><td>all · 5 min</td><td><code>tailscale status --json</code></td></tr>
+<tr><td><code>cloud</code></td><td>OCI: <code>provider</code>, <code>region</code>, <code>shape</code>, <code>id</code>, <code>fault_domain</code>, <code>display_name</code>; Azure: <code>provider</code>, <code>region</code>, <code>sku</code>, <code>id</code>, <code>name</code>, <code>zone</code>; <code>null</code> elsewhere</td><td>all · 1 h</td><td>link-local IMDS at 169.254.169.254, 2 s timeout per probe; one provider covers both clouds</td></tr>
+<tr><td><code>users</code></td><td><code>accounts[]</code> (<code>name</code>, <code>uid</code>, <code>gid</code>, <code>home</code>, <code>shell</code>), <code>names</code> (flat, for <code>contains</code>)</td><td>all · 10 min</td><td>the local user database through <code>System</code></td></tr>
+<tr><td><code>systemd</code></td><td><code>version</code>, <code>units[]</code> (<code>name</code>, <code>load</code>, <code>active</code>, <code>sub</code>), flat <code>active</code> and <code>failed</code> name lists; <code>null</code> without systemd</td><td>linux · 1 min</td><td><code>systemctl --version</code>, <code>systemctl list-units --all</code></td></tr>
+<tr><td><code>nomad</code></td><td><code>version</code>, <code>eligibility</code>, <code>drain</code>, <code>status</code>; <code>null</code> unless <code>nomad</code> is on the PATH</td><td>all · 1 min</td><td><code>nomad version</code>, <code>nomad node status -self -json</code></td></tr>
+<tr><td><code>docker</code></td><td><code>version</code>, <code>running</code>; <code>null</code> unless <code>docker</code> is on the PATH</td><td>all · 1 min</td><td><code>docker version --format</code></td></tr>
+<tr><td><code>script.&lt;name&gt;</code></td><td>whatever the script prints (JSON)</td><td>unix · 5 min</td><td>every executable in <code>&lt;state_dir&gt;/facts.d/</code> (a host-level directory, not a module's), 10 s timeout; a failing script contributes <code>null</code> and a warning</td></tr>
 </tbody></table></div>
-<div class="card decision"><div class="tag">Decision</div><p><b>Fact providers never fail a run.</b> A provider error yields <code>null</code> under its key and a warning span; selectors that depend on it evaluate to false. This keeps a broken IMDS endpoint from blocking an unrelated apply, at the cost that the author must write <code>host.facts.cloud.provider == "oci"</code> rather than relying on presence.</p></div>
+<h3>Standard library: health checks</h3>
+<p>Six kinds, all registered like tasks and facts and all with a JSON schema in the catalogue: <code>http</code>, <code>tcp</code>, <code>command</code>, <code>filter</code> and <code>file</code> on every platform, <code>systemd</code> on Linux. A check returns pass, fail or unknown; its reason is scrubbed of known secret values before it leaves the check. The fields of each are tabulated in section <a href="#health">07</a>.</p>
+<div class="card decision"><div class="tag">Decision</div><p><b>Fact providers never fail a run, and a guess is never a removal.</b> A provider error keeps its last good value and marks the provider stale, with a warning span; a provider that has never produced a value is <em>unavailable</em>. Selectors that read an unavailable provider are uncertain, so the modules that depend on them are <em>indeterminate</em> (section <a href="#engine">04</a>): not applied, and their resources kept, rather than silently unselected and removed. A provider that answers successfully with <code>null</code> (no cloud, no Tailscale, no Nomad) is a normal fact, so the author still writes <code>host.facts.cloud.provider == "oci"</code>, which is false there.</p></div>
 </section>
 
 <!-- ============ 6. SECRETS ============ -->
@@ -778,11 +870,11 @@ buckle_core::register_health!(HttpCheck);
 
 <pre><code class="language-rust"><span class="fname">buckle-core/src/secrets/mod.rs</span>pub struct Secret {
     name: Arc&lt;str&gt;,
-    fingerprint: Fingerprint,           // first 8 hex of HMAC-SHA256(install_key, value)
-    value: secrecy::SecretBox&lt;str&gt;,     // zeroised on drop
+    fingerprint: Fingerprint,           // first 4 bytes (8 hex) of HMAC-SHA256(install_key, value)
+    value: Arc&lt;secrecy::SecretString&gt;, // zeroised on drop
 }
 
-impl fmt::Debug for Secret { fn fmt(&amp;self, f: &amp;mut fmt::Formatter) -> fmt::Result { write!(f, "secret:{}@{}", self.name, self.fingerprint) } }
+impl fmt::Debug for Secret { fn fmt(&amp;self, f: &amp;mut fmt::Formatter) -> fmt::Result { write!(f, "«secret:{}@{}»", self.name, self.fingerprint) } }
 impl fmt::Display for Secret { /* same */ }
 impl Serialize for Secret { /* serialises the reference token, never the value */ }
 // deliberately NOT implemented: Clone into String, Deref&lt;Target=str&gt;, AsRef&lt;str&gt;, Into&lt;String&gt;, PartialEq&lt;str&gt;
@@ -797,18 +889,16 @@ impl Secret {
 
 pub mod sinks {
     pub struct Witness(());                            // cannot be built outside this module
-    pub struct Sensitive&lt;T&gt;(T);                        // output that contained a secret; also unprintable
-    impl Sensitive&lt;String&gt; {
-        pub fn write_atomic(self, path: &amp;Path, mode: u32) -> io::Result&lt;()&gt; { /* temp file + rename */ }
-        pub fn digest(&amp;self) -> Digest { /* sha256 of the real bytes, safe to store and compare */ }
-    }
-    pub trait Sink { fn witness(&amp;self) -> Witness { Witness(()) } }   // only implementors defined here
-    pub struct FileSink; pub struct ProcessEnvSink;
-}
+    pub struct Sensitive&lt;T&gt;(T);                        // output that contained a secret; also unprintable, comparable by digest
+    pub trait Sink { fn witness(&amp;self) -&gt; Witness { Witness(()) } }   // sealed: only the implementors defined here
+    pub struct FileSink;         // render → atomic write with a mode (also a validator's private copy)
+    pub struct ProcessEnvSink;   // a child process's environment and stdin
+    pub struct TransportSink;    // server → agent assignment, and the agent's secret cache at rest
+}   // the template renderer and the output scrubber hold a Witness too; all of them are greppable by it
 </code></pre>
 
 <h3>Rendering templates twice</h3>
-<p>minijinja sees secrets as a custom object. In <code>Mode::Redacted</code> the object renders as <code>«secret:nomad_server@3f9a»</code>; in <code>Mode::Real</code> the renderer, which is itself a sink, reveals the value. The real render is returned as <code>Sensitive&lt;String&gt;</code>, which can only be written to disk or compared by digest. The redacted render is a plain <code>Redacted&lt;String&gt;</code> and becomes the shadow in state and the text shown in plans. Vars that are derived from secrets through templates (a URL with a token in it) inherit sensitivity: any template that touched a secret produces <code>Sensitive</code>, so the taint cannot be laundered through an intermediate var.</p>
+<p>minijinja sees secrets as a custom object. In <code>Mode::Redacted</code> the object renders as <code>«secret:nomad_server@3f9a»</code>; in <code>Mode::Real</code> the renderer, which is itself a sink, reveals the value. The real render is returned as <code>Sensitive&lt;String&gt;</code>, which can only be written to disk or compared by digest. The redacted render is a plain <code>Redacted&lt;String&gt;</code> and becomes the shadow in state and the text shown in plans. A template that touched a secret always yields <code>Sensitive</code> output, and the taint cannot be laundered through an intermediate var because there is no way in: secrets are refused in vars and in ordinary task fields (a plain render that reaches one is an error). Only the few fields typed as <code>SecretField</code> keep their raw template through spec rendering (the schema marks them <code>x-buckle-secret</code>) and are opened by the task itself through a sink: the values of <code>command.run</code> <code>env</code>, <code>user.account</code> <code>password</code>, <code>file.download</code> and <code>http</code> check <code>headers</code>, and <code>apt.repository</code> <code>auth.password</code>.</p>
 
 <h3>What the operator sees</h3>
 <div class="diff"><span class="del">- servers = ["«secret:nomad_server@3f9a»"]</span>
@@ -816,11 +906,29 @@ pub mod sinks {
   datacenter = "dc1"
 <span class="del">- node_class = "cloud"</span>
 <span class="add">+ node_class = "rpi"</span></div>
-<p>A rotated secret shows up as a fingerprint change on exactly the lines that use it; everything else in the diff is real. A file that contains a secret and has drifted on disk shows <em>content changed outside Buckle (digest 9a1f… → 02c7…)</em> rather than the hand edit, because reading the file back would mean handling plaintext outside a sink.</p>
+<p>A rotated secret shows up as a fingerprint change on exactly the lines that use it; everything else in the diff is real. That holds while the file on disk is still what Buckle wrote (its digest equals the one recorded at write time). A file that contains a secret and has drifted on disk shows <em>content changed (digest 9a1f… → 02c7…)</em> with a redacted preview of the new content rather than the hand edit, because reading the file back would mean handling plaintext outside a sink.</p>
 
-<div class="card decision"><div class="tag">Decision</div><p><b>Secrets are resolved on the server and delivered per host, scoped to the modules the host selects.</b> Agents hold no provider credentials. The server evaluates each host's module selection with the host's last reported facts, collects the secret references those modules use, resolves them and sends values inside the assignment over the Tailscale-encrypted stream. If an agent's local evaluation selects a module the server did not predict (facts changed), it asks for the missing names and the server checks the request against the revision before answering. In local mode (<code>--source DIR</code>) the agent resolves with its own providers.</p></div>
+<div class="card decision"><div class="tag">Decision</div><p><b>Secrets are resolved on the server and delivered per host, scoped to the modules the host selects.</b> Agents hold no provider credentials. The server evaluates each host's module selection with the host's last reported facts, collects the secret references those modules use, resolves them and sends values inside the assignment over the Tailscale-encrypted stream. If an agent's local evaluation selects a module the server did not predict (facts changed), it asks for the missing names and the server checks the request against the revision before answering. In local mode (<code>source: DIR</code> in agent.yaml) the agent resolves with its own providers.</p></div>
 <div class="card decision"><div class="tag">Decision · agreed</div><p><b>Filters see secrets as filt-rs <code>Secret</code> values.</b> Authors are trusted, so <code>secrets.NAME == "x"</code> and the other comparisons work in <code>when</code> expressions; filt-rs's <code>secrecy</code> feature renders the value as <code>[REDACTED]</code> on Display and Debug, so a selector that ends up in a log or a plan cannot carry it. <code>secrets.NAME.present</code> and <code>secrets.NAME.fingerprint</code> remain for the common "is it configured" and "did it rotate" cases. Filter error messages contain only filter text, never target values, so a bad expression is safe to show in the UI.</p></div>
-<div class="card decision"><div class="tag">Decision · agreed</div><p><b>Providers for v2.0 are <code>file</code> and <code>env</code>; Nomad delivers the values.</b> The server's Nomad job uses <code>template</code> stanzas over Nomad Variables (or Vault) to render one file per secret into the task's secrets directory, or <code>env = true</code> to inject them as environment variables; <code>buckle.yaml</code> references them with <code>{ file: /secrets/NAME }</code> or <code>{ env: NAME }</code>. Nomad re-renders on variable change and can signal the task, so rotation needs no Buckle-side integration. The <code>file</code> provider re-reads on each resolution (no caching), and values are trimmed of a single trailing newline. <code>exec</code> exists only behind an explicit allowlist in server config for local development, where <code>op read</code> is convenient; it is off by default and not part of the production story. Agents resolve nothing themselves in server mode.</p></div>
+<div class="card decision"><div class="tag">Decision · agreed</div><p><b>Providers for v2.0 are <code>file</code> and <code>env</code>; Nomad delivers the values.</b> The server's Nomad job uses <code>template</code> stanzas over Nomad Variables (or Vault) to render one file per secret into the task's secrets directory, or <code>env = true</code> to inject them as environment variables; <code>buckle.yaml</code> references them with <code>{ file: /secrets/NAME }</code> or <code>{ env: NAME }</code>. Nomad re-renders on variable change and can signal the task, so rotation needs no Buckle-side integration. The <code>file</code> provider re-reads on each resolution (no caching), and values are trimmed of a single trailing newline. <code>exec</code> exists only behind an explicit allowlist for local development, where <code>op read</code> is convenient: <code>secrets.providers.exec.allow</code> in server config, or <code>--allow-secret-exec PROGRAM</code> on a local-mode agent. It is off by default and not part of the production story. Agents resolve nothing themselves in server mode.</p></div>
+
+<h3>Every other place a value could surface</h3>
+<ul>
+<li><b>Host diffs.</b> When a task diffs a text file on the host (<code>file.copy</code>, <code>file.template</code>, <code>file.line</code>, <code>file.block</code>, <code>cron.job</code>, <code>ssh.authorized_key</code>), the unified diff is first run through the scrubber, which knows every secret value the host holds and searches for each in its plain, JSON-escaped, URL-encoded and base64 forms (base64 only where the secret starts the encoded block; hex and shell quoting are not recognised), so a secret already sitting in the file shows as its token. Files that are sensitive by path (<code>/etc/environment</code>, <code>/etc/fstab</code>, the shadow files, sudoers, anything under <code>/etc/ssh</code> or <code>/etc/netplan</code>, <code>~/.ssh/*</code>) get <em>zero-context</em> diffs, changed lines only, and a file whose recorded shadow ever held a secret token never has its current content shown.</li>
+<li><b>The <code>file.line</code> stash.</b> The text a line edit replaces in a sensitive file is not kept in agent state, which is reported to the server: it goes to a 0600 file named by its digest under <code>&lt;state_dir&gt;/stash/file.line/</code>, and the record keeps only the digest, so removal can still restore the original line.</li>
+<li><b>Command output.</b> What <code>command.run</code> prints is scrubbed before it reaches a span, an error or a plan, and when its environment carried a secret it is not captured at all unless the task sets <code>capture: always</code>. A <code>validate</code> command's output is withheld when the file under test contains secrets.</li>
+<li><b>Health reasons.</b> A failing check's reason (a command's stdout, an HTTP body that echoes a secret) goes through the same scrubber before it leaves the check, so neither the UI, the server's health events nor the logs carry it.</li>
+<li><b>At rest on the agent.</b> The state directory is mode 0700 (on Windows an ACL restricted to Administrators and SYSTEM); the per-host token, the install key and <code>agent.json</code> are 0600; the cached secrets are 0600 CBOR with an HMAC tag that detects truncation or substitution. The cached stable revision's tree is verified against <code>stable_tree_digest</code>, the digest of the stable tarball that <code>Welcome</code> and <code>HostUpdate</code> carry, and so is every re-fetch of it, so a damaged or swapped cache is fetched again rather than applied.</li>
+</ul>
+
+<h3>Providers and delivery</h3>
+<ul>
+<li><b><code>file</code> confinement.</b> With <code>secrets.providers.file.root</code> set, relative paths resolve under it and anything that leaves it is refused: an absolute path elsewhere, a <code>..</code> component, or a symlink that resolves outside the (canonicalised) root. Without a root the server warns at start-up that fleet secrets may read any file it can.</li>
+<li><b><code>env</code> allow and deny lists.</b> <code>secrets.providers.env.allow</code> (when set, the only variables that may be read) and <code>deny</code> take exact names or a prefix ending in <code>*</code>, and deny wins. The server never hands out its own credentials whatever the lists say: <code>BUCKLE_*</code>, <code>OIDC_CLIENT_SECRET</code>, <code>GIT_TOKEN</code>, <code>GIT_WEBHOOK_SECRET</code>, the <code>OTEL_EXPORTER_OTLP_*HEADERS</code> variables, and every variable server.yaml itself interpolates with <code>${{ env.NAME }}</code>.</li>
+<li><b>Scoped delivery and <code>FetchSecrets</code>.</b> Each host receives only the secrets referenced by the modules its labels, facts and groups select (their task specs, handlers and templates) and by the vars overlays that match it. A <code>when</code> that tests a secret is evaluated on the server with the resolved value, so a module's secrets go only to the hosts the module selects. <code>FetchSecrets</code> (like <code>FetchRevision</code> and <code>FetchBlob</code>) answers only for an active host and only for the stable revision or a revision one of its rollouts assigns it; it returns just the requested names that the revision declares <em>and</em> that the host's own selection references, and silently grants nothing else. The fingerprint travels with each value, so a rotation yields the same plan digest on every host that uses the secret.</li>
+<li><b>Local mode.</b> <code>buckle plan</code> and <code>buckle apply</code> resolve <code>secrets:</code> with the <code>env</code> and <code>file</code> providers of the invoking process. An agent that watches a local directory resolves with the same two, and with <code>exec</code> only for the programs named on its command line, <code>buckle agent --allow-secret-exec op</code> (repeatable; refused for an agent that talks to a server, and never read from agent.yaml). An <code>exec</code> reference runs the exact allow-listed program with stdin closed, a 30 s timeout, and quotes only stderr in an error.</li>
+</ul>
+
 </section>
 
 <!-- ============ 7. HEALTH ============ -->
@@ -829,22 +937,23 @@ pub mod sinks {
 <p class="lede">Health is part of the module, not a separate monitoring system. Checks run when a rollout needs an answer (was this host healthy before we touched it, did the change leave it working, are the hosts we already changed still fine before we go further) and once alongside each periodic drift check, so the server always holds a recent baseline for the whole fleet. There is no separate health loop; uptime monitoring stays with Grey.</p>
 <div class="grid3">
 <div class="card"><h4>1 · Baseline, before apply</h4><p>When a host's wave is due, the server sends <code>RunHealth { scope: baseline }</code> and the agent runs the checks of the modules it currently has applied. A failing baseline holds the host: the rollout does not touch an already-unhealthy host unless an operator forces it (<em>force apply</em> in the UI, audited). This separates "the change broke it" from "it was already broken".</p></div>
-<div class="card"><h4>2 · Bake, after apply</h4><p>Once <code>ApplyResult</code> arrives, checks for every applied module run at their <code>interval</code> (default 30 s) for the phase's <code>bake</code> duration, then stop. A <code>required</code> check that stays failing for longer than <code>settle</code> (default 2 m, flap tolerance for services restarting mid-rollout) marks the host <em>unhealthy</em>, counts against <code>max_failures</code>, and pauses the rollout on breach; a check that recovers inside the settle window is recorded as a flap, not a failure. <code>min_uptime</code> on the <code>systemd</code> check catches crash loops inside the window.</p></div>
+<div class="card"><h4>2 · Bake, after apply</h4><p>Once <code>ApplyResult</code> arrives, checks for every applied module run at their <code>interval</code> (default 30 s) for the phase's <code>bake</code> duration, then stop (a required check that is still failing keeps being sampled past the window until it recovers or fails past <code>settle</code>). A <code>required</code> check that stays failing for longer than <code>settle</code> (default 2 m, flap tolerance for services restarting mid-rollout) marks the host <em>unhealthy</em>, counts against <code>max_failures</code>, and pauses the rollout on breach; a check that recovers inside the settle window is recorded as a flap, not a failure. The agent does not wait for the server: the same failure rolls that module back to the cached stable revision on the host (section <a href="#engine">04</a>) and is reported as a durable module rollback. <code>min_uptime</code> on the <code>systemd</code> check catches crash loops inside the window.</p></div>
 <div class="card"><h4>3 · Pre-phase, before advancing</h4><p>Before the next phase starts, the server sends <code>RunHealth { scope: rollout }</code> to every host this rollout has already updated and waits for all results. A regression anywhere pauses the rollout instead of advancing, so a slow-burning failure in the canary is caught before the fleet follows.</p></div>
-<div class="card"><h4>4 · With each drift check</h4><p>Every <code>drift.interval</code> (default 15 m) the agent already re-plans its assigned revision; it now also runs the checks of its applied modules once and sends <code>HealthReport { scope: drift }</code> with the <code>Drift</code> message. This is the fleet's baseline health between rollouts: it drives the Overview roll-up, lets the UI show a host as unhealthy before anyone starts a rollout, and lets the controller pre-flag hosts that will be held at baseline. The pre-apply baseline check still runs fresh when the wave is due; the drift report is a recent reading, not a substitute.</p></div>
+<div class="card"><h4>4 · With each drift check</h4><p>Every <code>drift.interval</code> (default 15 m) the agent already re-plans the revision it has applied; it now also runs the checks of its applied modules once and sends <code>HealthReport { scope: drift }</code> with the <code>Drift</code> message. This is the fleet's baseline health between rollouts: it drives the Overview roll-up, lets the UI show a host as unhealthy before anyone starts a rollout, and lets the controller pre-flag hosts that will be held at baseline. The pre-apply baseline check still runs fresh when the wave is due; the drift report is a recent reading, not a substitute.</p></div>
 </div>
 <h3>Check kinds</h3>
+<p>A declaration is one kind key beside <code>name</code>, <code>interval</code> (30 s, the repeat cadence inside the bake window), <code>timeout</code> (10 s; a check that exceeds it fails) and <code>required</code> (true). Every spec rejects unknown fields, and a check returns <code>pass</code>, <code>fail</code> or <code>unknown</code>; <em>unknown</em> means the check itself could not run (a missing tool, an unsupported platform, an expression that does not parse) and never fails a run.</p>
 <div class="scroll"><table>
-<thead><tr><th>Kind</th><th>Spec</th><th>Use</th></tr></thead>
+<thead><tr><th>Kind</th><th>Spec (defaults)</th><th>Platforms</th><th>Use</th></tr></thead>
 <tbody>
-<tr><td><code>http</code></td><td>url, method, headers, expect.status, expect.body_contains, tls.insecure</td><td>Nomad agent health, Caddy admin, otelcol health extension</td></tr>
-<tr><td><code>tcp</code></td><td>address</td><td>a port is listening</td></tr>
-<tr><td><code>systemd</code></td><td>unit, state (active/inactive), min_uptime</td><td>unit came up and stayed up; <code>min_uptime: 30s</code> catches crash loops</td></tr>
-<tr><td><code>command</code></td><td>run, expect.exit, expect.stdout_matches</td><td><code>tailscale status</code>, <code>rustic snapshots</code></td></tr>
-<tr><td><code>filter</code></td><td>a filt-rs expression over refreshed facts</td><td><code>host.facts.disk["/"].free_percent > 10</code> is not expressible (no indexing), so facts expose flat keys: <code>host.facts.disk.root.free_percent &gt; 10</code></td></tr>
-<tr><td><code>file</code></td><td>path, exists, max_age</td><td>a backup marker was written recently</td></tr>
+<tr><td><code>http</code></td><td><code>url</code>, <code>method</code> (<code>GET</code>), <code>headers</code> (values may reference secrets), <code>expect.status</code> (any 2xx), <code>expect.body_contains</code>, <code>tls.insecure</code> (false), <code>timeout</code> (10s)</td><td>all</td><td>Nomad agent health, Caddy admin, otelcol health extension; a connection error or timeout fails</td></tr>
+<tr><td><code>tcp</code></td><td><code>address</code> (<code>host:port</code>), <code>timeout</code> (5s)</td><td>all</td><td>a port is listening</td></tr>
+<tr><td><code>systemd</code></td><td><code>unit</code>, <code>state</code> (<code>active</code> or <code>inactive</code>; default active), <code>min_uptime</code></td><td>linux</td><td>unit came up and stayed up; <code>min_uptime: 30s</code> catches crash loops ("restarted 4s ago"); unknown without <code>systemctl</code></td></tr>
+<tr><td><code>command</code></td><td><code>run</code> (argv list, or a string run with <code>sh -c</code>), <code>expect.exit</code> (0), <code>expect.stdout_matches</code> (regex), <code>timeout</code> (30s)</td><td>all</td><td><code>tailscale status</code>, <code>rustic snapshots</code>; a program that cannot start is unknown, not failed</td></tr>
+<tr><td><code>filter</code></td><td><code>expr</code>: a filt-rs expression over the host's facts, labels, groups and vars</td><td>all</td><td>indexing is not expressible, so facts expose flat keys: <code>host.facts.hardware.disk.root.free_percent &gt; 10</code>. It reads the facts already in the context (refreshed by the module's <code>facts.provides</code> after an apply, collected by TTL otherwise); a missing fact makes a comparison false, so the check fails</td></tr>
+<tr><td><code>file</code></td><td><code>path</code>, <code>exists</code> (true), <code>max_age</code>, <code>contains</code></td><td>all</td><td>a backup marker was written recently; <code>contains</code> reads the whole file, so keep it for small files</td></tr>
 </tbody></table></div>
-<p>Checks have <code>required: true</code> by default; an <code>informational</code> check reports but never fails a run. Results carry a reason string and are exported as the <code>buckle.health.status</code> metric with <code>module</code>, <code>check</code> and <code>scope</code> (baseline, bake, rollout, drift) attributes whenever they run, so Honeycomb and Grafana get the same signal the server does. Locally, <code>buckle apply</code> runs the bake-scope checks once after applying and <code>buckle health</code> runs them on demand.</p>
+<p><code>required: false</code> makes a check informational: it reports but never fails a run. A waived check (an operator's <em>continue</em>) still runs and reports but no longer counts. Results carry a reason string, scrubbed of known secret values before it leaves the check, reach the server as <code>HealthReport</code> messages and are kept as health events with their scope (baseline, bake, rollout, drift); exporting them as an OTLP gauge is not implemented yet (section <a href="#observability">13</a>). Locally, <code>buckle apply</code> runs the checks after applying (with settle, for modules that changed) and <code>buckle health</code> runs them on demand, exiting 1 when a required check fails.</p>
 <div class="card note"><p>Health checks are intentionally shallow. Grey already does deep uptime monitoring across the estate; Buckle's checks answer "did my change break the thing I changed" and feed that answer into rollout control. The <code>http</code> check could later point at Grey's API to use a richer signal as a rollout gate.</p></div>
 </section>
 
@@ -861,7 +970,7 @@ pub mod sinks {
 <tr><td>Schema</td><td>protobuf, generated types both sides, forward-compatible field numbering</td><td>hand-rolled framing plus serde; versioning is on us</td></tr>
 <tr><td>Streams</td><td>bidirectional streaming built in; blob fetches run as separate streams on the same connection without blocking the session</td><td>one message channel; multiplexing and backpressure are hand-written</td></tr>
 <tr><td>Flow control</td><td>HTTP/2 per-stream windows; a slow agent pulling a 40 MB bundle does not stall its heartbeat</td><td>none beyond TCP; large frames block</td></tr>
-<tr><td>Tracing</td><td>metadata carries <code>traceparent</code>; tonic interceptors do it once</td><td>custom</td></tr>
+<tr><td>Tracing</td><td>metadata carries <code>traceparent</code>, and <code>Apply</code>, <code>Rollback</code> and <code>RunHealth</code> repeat it as a field so the context survives a re-send</td><td>custom</td></tr>
 <tr><td>Cost</td><td>tonic + prost, roughly 1.5 MB of binary, h2 already pulled in by reqwest</td><td>smaller, but every feature above is reimplemented</td></tr>
 <tr><td>Browser</td><td>not needed; the UI talks to the REST API</td><td>native in browsers (irrelevant here)</td></tr>
 </tbody></table></div>
@@ -870,40 +979,48 @@ pub mod sinks {
 <pre><code class="language-protobuf"><span class="fname">buckle-proto/proto/buckle/v1/fleet.proto  (excerpt)</span>service Fleet {
   // The long-lived session. Agent speaks first with Hello.
   rpc Session(stream AgentMessage) returns (stream ServerMessage);
-  // Content-addressed fetches, cached by digest on the agent.
-  rpc FetchRevision(FetchRevisionRequest) returns (stream Chunk);   // tar of modules/ + vars/ for one revision
+  // Content-addressed fetches, cached by digest on the agent. All three answer only for an active host,
+  // and only for the stable revision or a revision one of its rollouts assigns it.
+  rpc FetchRevision(FetchRevisionRequest) returns (stream Chunk);   // gzip tar of buckle.yaml, modules/ and vars/ for one revision
   rpc FetchBlob(FetchBlobRequest) returns (stream Chunk);           // one large file by digest
   rpc FetchSecrets(FetchSecretsRequest) returns (SecretBundle);     // top-up for modules selected after facts changed
 }
 
 message AgentMessage {
   oneof msg {
-    Hello        hello = 1;      // host_id, labels, agent version, applied revision, state summary
-    Facts        facts = 2;      // full facts tree, sent on connect and on change
-    Heartbeat    heartbeat = 3;  // every 30s, liveness only
-    PlanResult   plan = 4;       // Plan (redacted), digest, deferred modules
-    ApplyEvent   apply = 5;      // step started/finished, change count, errors; streamed as it happens
-    ApplyResult  result = 6;     // final status, duration, health results, new applied revision; on failure: failed module, failed checks/task, modules rolled back, modules not started
+    Hello        hello = 1;      // host_id, version, seed labels, applied revision, token, platform/arch, bootstrap flag,
+                                 // unreported_apply_revisions (an apply running, or finished but not yet acknowledged)
+    Facts        facts = 2;      // full facts tree (JSON), sent on connect and on change
+    Heartbeat    heartbeat = 3;  // every 30s: liveness, applied revision, busy
+    PlanResult   plan = 4;       // redacted Plan (JSON), digest, counts, deferred_modules, error, module_errors ("module: reason"; the plan stays valid)
+    ApplyEvent   apply = 5;      // step started/finished, handler, health, facts refreshed; streamed as it happens
+    ApplyResult  result = 6;     // final status, ApplyOutcome (JSON), failed module and checks, modules rolled back / not started;
+                                 // report_id (durable), needs_attention (steps stayed blocked; nothing rolled back)
     HealthReport health = 7;     // results of a RunHealth request (baseline, bake, rollout) or of the drift pass (drift)
-    Drift        drift = 8;      // periodic drift pass: plan summary (empty or not) + the accompanying HealthReport
-    LocalRollback rollback = 9;  // agent rolled itself back while disconnected: from, to, reason, health evidence
+    Drift        drift = 8;      // periodic drift pass: plan summary (empty or not), whether it was corrected
+    LocalRollback rollback = 9;  // agent rolled itself, or only some modules, back: from, to, reason, modules, health evidence;
+                                 // report_id (durable), succeeded, rollback_error, rollback_outcome_json
   }
 }
 
 message ServerMessage {
   oneof msg {
-    Welcome      welcome = 1;    // server version, session id, assigned stable revision, secrets scoped to the host
-    Assign       assign = 2;     // "this is your desired revision" (does not imply apply)
-    RequestPlan  plan = 3;       // plan the assigned revision, reply with PlanResult
-    Apply        apply = 4;      // apply the plan with this digest (approval token binds digest + revision); may carry waived checks for a `continue`
+    Welcome      welcome = 1;    // server version, session id, stable revision + stable_tree_digest, issued token, effective labels, host status, secrets scoped to the host
+    Assign       assign = 2;     // "this is your desired revision" (does not imply apply); tree_digest, secrets
+    RequestPlan  plan = 3;       // plan the revision, optionally restricted by a task selector, reply with PlanResult
+    Apply        apply = 4;      // apply the plan with this digest (approval token binds digest + revision); waived checks for a `continue`, rollout/phase,
+                                 // force, traceparent, and `select`: the selector of the approved plan, so the agent's re-plan can match the digest
     Rollback     rollback = 5;   // apply this older revision now
-    RunHealth    health = 6;     // run checks now: scope baseline (before apply), bake (repeat for a window) or rollout (pre-phase)
+    RunHealth    health = 6;     // run checks now: scope baseline (before apply), bake (repeat until a time) or rollout (pre-phase); traceparent
     Ping         ping = 7;
-    Upgrade      upgrade = 8;    // install this agent version with update-rs when idle, then restart under the service manager
+    Upgrade      upgrade = 8;    // install this agent version when idle, then restart under the service manager
+    Rejected     rejected = 9;   // the session is closed: unknown host, bad token, version too old; `retry` says whether trying again can help
+    Ack          ack = 10;       // report_ids the server has durably stored; the agent may forget them
+    HostUpdate   host_update = 11; // the host's record changed while connected (approved, paused, resumed, labels edited): status, labels, stable revision, secrets, stable_tree_digest
   }
 }
 
-message SecretBundle { repeated SecretValue secrets = 1; }   // only ever sent inside Welcome/Assign or FetchSecrets
+message SecretBundle { repeated SecretValue secrets = 1; }   // name, value, the server's fingerprint; only ever sent inside Welcome/Assign/HostUpdate or FetchSecrets
 </code></pre>
 
 <div class="proto-wrap">
@@ -926,14 +1043,18 @@ message SecretBundle { repeated SecretValue secrets = 1; }   // only ever sent i
 <h3>Session rules</h3>
 <ul>
 <li><b>Identity.</b> On connect the server authenticates the peer by Tailscale whois when it can and by per-host token otherwise (both modes are always on; the decision card in <a href="#topology">02</a> has the enrolment flow). Under whois the agent's claimed <code>host_id</code> must match the node name; under token auth the identity is the one bound to the token at enrolment. Labels come from two places: the agent reports its seed labels on connect, and operators manage server-side labels per host in the UI (stored in the database, never in server config). Server labels win on conflict, so an agent cannot promote itself out of the canary phase; the UI shows both sets and which one is effective.</li>
-<li><b>Registration.</b> A host the server has never seen is created on first Hello. With <code>agents.registration: auto</code> (the default under Tailscale auth) it is active immediately; with <code>approve</code> (recommended for token auth) it sits as <em>pending</em>, visible in the UI, excluded from rollouts until an admin approves it. Admins can also pause a host (kept in the fleet, excluded from rollouts and drift correction), resume it, or forget it (removes its record; a reconnecting agent registers afresh).</li>
+<li><b>Registration.</b> A host the server has never seen is created on first Hello. With <code>agents.registration: auto</code> (the default) it is active immediately, except that a tailnet node no <code>agents.tailscale</code> list admits registers as <em>pending</em>; with <code>approve</code> (recommended for token auth) every new host sits as <em>pending</em>, visible in the UI, excluded from rollouts until an admin approves it. A pending host still connects, but receives no secrets and cannot fetch content. Admins can also pause a host (kept in the fleet, excluded from rollouts and drift correction), resume it, or forget it (removes its record and closes its live session; a reconnecting agent registers afresh). Approving, pausing, resuming and editing labels reach a connected agent at once as a <code>HostUpdate</code>, without a reconnect. The enrolment rules are in section <a href="#server">09</a>.</li>
 <li><b>Stable revision cached locally.</b> <code>Welcome</code> and <code>Assign</code> name the fleet's current stable revision; the agent keeps that revision's tree and its scoped secrets in the state directory (secrets at mode 0600, the same trust level as the files they render) so it can apply it with no server at all. See the local rollback rules in section <a href="#rollout">10</a>.</li>
-<li><b>Reconnect.</b> Exponential backoff 1 s to 5 min with jitter (mail-backup's <code>reconnect_min/max</code>). On reconnect the agent sends Hello with its applied revision and the digest of its last plan, and the server resumes the host's rollout state from there rather than restarting it.</li>
+<li><b>Transport.</b> An <code>https://</code> server URL uses TLS, pinned to <code>tls.ca_fingerprint</code>, verified against <code>tls.ca_file</code>, or checked against the system roots; an <code>http://</code> URL is refused unless <code>tls.insecure_plaintext</code> is set, and an <code>https://</code> URL combined with <code>insecure_plaintext</code> is refused rather than downgraded. Every call carries the per-host (or bootstrap) token in <code>x-buckle-token</code> and, when traced, <code>traceparent</code>; revision downloads are verified against the digest the server sends.</li>
+<li><b>Reconnect.</b> Exponential backoff 1 s to 5 min with jitter (mail-backup's <code>reconnect_min/max</code>). A new stream must send Hello within 30 s, and the agent gives up on a session that has not been answered with a Welcome within 30 s and reconnects with backoff. On reconnect the agent sends Hello with its applied revision, the digest of its last plan and <code>unreported_apply_revisions</code>, and the server resumes the host's rollout state from there rather than restarting it. A server that refuses the host outright (<code>Rejected { retry: false }</code>) does not stop the agent, which a service manager would only restart every few seconds: it keeps retrying with its own backoff from 1 s doubling to 1 h, and when the stored per-host token was refused and a bootstrap token is configured the next attempt presents the bootstrap token, so a forgotten host registers afresh (and goes back to the stored token if that is refused too). <code>Rejected { retry: true }</code> retries on the normal schedule.</li>
 <li><b>Assignment is not apply.</b> <code>Assign</code> tells the agent what to fetch and plan. Only <code>Apply</code> with a matching plan digest mutates. If the agent's fresh plan digest differs from the approved one (the host changed in between), it refuses and reports <em>stale plan</em>; the server re-requests a plan and, if the phase requires approval, the UI shows the host as needing re-approval.</li>
+<li><b>Requests are bound to their session.</b> Plan, health, apply and rollback requests belong to the session that sent them. If that session ends before the agent starts one, the agent drops it without a report and the server re-sends it after the reconnect: an <code>Apply</code> goes out again with the same plan digest and approval token, at most three times before the host is failed, unless Hello shows the target revision already applied or lists it in <code>unreported_apply_revisions</code> (the apply is running, or its result has not been acknowledged), in which case the server waits for the result instead. An apply that has started runs to completion whatever happens to the session, and its result is durable. A host that stays in <em>applying</em> for longer than <code>agents.apply_timeout</code> (default 30 min, counted from the Apply being sent or re-sent) without an <code>ApplyResult</code> counts as failed for the rollout, and so does one that stays disconnected mid-wave for longer than <code>agents.disconnect_timeout</code> (default 10 min).</li>
+<li><b>Durable reports.</b> <code>ApplyResult</code> and <code>LocalRollback</code> carry a <code>report_id</code>, monotonic per agent. The agent writes each one to <code>agent.json</code> before sending it, keeps it until an <code>Ack</code> names the id, and re-sends every unacknowledged report after each <code>Welcome</code>. The server records each (host, report_id) once, in the same transaction as the report's effects, and acknowledges duplicates too, so a dropped connection or a server restart can neither lose a result nor apply it twice. Reports from older agents carry id 0 and are not deduplicated.</li>
+<li><b>Bake failures roll the module back.</b> While it answers a <code>bake</code> request the agent tracks the failure streak of every required check; one that fails continuously for <code>settle</code> (default 2 m) rolls that module back on the host to the cached stable revision (planned with a module selector, applied through the engine), after which the agent makes no further changes and the server decides. The rollback is reported as a durable <code>LocalRollback</code> that names the modules and the failing checks, and says whether the rollback itself succeeded; if it did not, the rollout host is marked as needing attention with both results recorded. A failing check keeps being sampled past the bake window until it recovers or fails past <code>settle</code>, because the server judges it on the same clock.</li>
 <li><b>Backpressure.</b> ApplyEvents are coalesced to at most 10 per second per host; the server stores the last event per step and the full stream goes to tracing.</li>
-<li><b>Versioning.</b> Hello carries the agent version; the server refuses agents older than its minimum and the UI shows version skew. protobuf field numbering keeps older servers working with newer agents within a major version.</li>
-<li><b>Self-update.</b> Buckle uses <code>update-rs</code> (git-tool's self-update crate, with its <code>opentelemetry</code> feature so the update is traced across the relaunch) for both <code>buckle update</code> on the command line and server-driven agent upgrades. When <code>agents.desired_version</code> is set, the server sends <code>Upgrade</code> to each host only while it is idle (no apply, bake or health run in progress), paced in the fleet's phase order with the phase's <code>parallel</code> limit but without plan approval; the agent downloads the GitHub release asset for its platform, verifies it, swaps the binary and exits so systemd (or launchd / SCM) restarts it, then reconnects with the new version in Hello. The server also upgrades itself the same way when an operator triggers it from the UI.</li>
-<li><b>Local mode</b> implements the same <code>Transport</code> trait with a filesystem watcher (<code>notify</code>): a directory change is an <code>Assign</code> of a synthetic revision, and apply is automatic.</li>
+<li><b>Versioning.</b> Hello carries the agent version; the server refuses agents older than <code>agents.minimum_agent_version</code> (checked before anything is written, so a refused old agent can enrol once it is upgraded) and the UI shows version skew. Protobuf field numbering keeps older servers working with newer agents within a major version: the messages and fields added since the first draft (<code>Ack</code>, <code>HostUpdate</code>, <code>report_id</code>, <code>needs_attention</code>, <code>module_errors</code>, <code>Apply.select</code>, <code>Welcome.stable_tree_digest</code>, <code>unreported_apply_revisions</code>, the <code>traceparent</code> fields) are all additive, and an older agent simply never acknowledges or reports what it does not know.</li>
+<li><b>Self-update.</b> Buckle uses <code>update-rs</code>'s GitHub release source and asset naming for both <code>buckle update [--to VERSION]</code> on the command line and the agent's handling of <code>Upgrade</code>: it downloads the release asset for its platform, refuses it unless GitHub reports a SHA-256 digest and the download matches, renames the new binary into place beside the running one (on Windows the running image is moved aside first) and exits, so systemd, launchd or the Service Control Manager restarts it, and it reconnects with the new version in Hello. An <code>Upgrade</code> sent <code>when_idle</code> waits until the agent has nothing queued. The relaunch machinery of <code>update-rs</code> is not used, because its detached processes would be killed with the service's cgroup. The server side is not built: <code>agents.desired_version</code> is accepted in server.yaml, but nothing yet sends <code>Upgrade</code> (no phase-ordered pacing, no UI trigger), so fleet upgrades are driven by running <code>buckle update</code> on the hosts.</li>
+<li><b>Local mode</b> implements the same <code>Transport</code> trait with a filesystem watcher (<code>notify</code>): a change that has settled for 2 s is an <code>Assign</code> of a synthetic revision (its id is the digest of the tree) followed by a plan and an automatic apply, and reports are logged. The agent resolves the fleet's secrets itself in this mode (section <a href="#secrets">06</a>).</li>
 </ul>
 </section>
 
@@ -945,8 +1066,9 @@ message SecretBundle { repeated SecretValue secrets = 1; }   // only ever sent i
 <h3>Source watcher</h3>
 <ul>
 <li>A bare clone under <code>data_dir/source.git</code> managed with <code>gix</code>, fetched every <code>poll</code> (default 30 s) and immediately on <code>POST /api/v1/webhooks/source</code> (HMAC-verified, for a GitHub webhook over Tailscale Funnel or a Nomad-local forwarder).</li>
-<li>Change detection compares the remote-tracking ref for the configured branch before and after the fetch (the audit of github-backup found that comparing <code>HEAD</code> misses remote-only updates).</li>
-<li>Each new commit is loaded in memory, validated (schema, selectors parse, templates parse, module graph acyclic, every referenced secret declared) and stored as a <code>Revision</code>: commit id, author, message, timestamp, a content-addressed tarball of <code>modules/</code> and <code>vars/</code>, and the validation report. Invalid commits are stored as rejected revisions so the UI can show the author what broke, and the fleet stays on the last valid one.</li>
+<li>Change detection compares the remote-tracking ref for the configured branch before and after the fetch (the audit of github-backup found that comparing <code>HEAD</code> misses remote-only updates), and then with the last commit it processed.</li>
+<li>Every new commit on the branch becomes a revision, oldest first, so each one is validated and visible in the UI and the rollout controller supersedes the older ones (up to 50 commits per fetch: a longer gap, or a tip that does not descend from the last processed commit through first parents, builds the tip only). A branch that moves back to a commit already built (a force-push, or a reverted ref) is announced again, so the fleet converges on the branch tip rather than staying on a revision the branch no longer points at. A fetch is interrupted after <code>source.git.fetch_timeout</code> (default 2 m) and retried at the next poll.</li>
+<li>Each commit is exported to <code>data_dir/revisions/&lt;id&gt;/</code>, loaded and validated (schema with unknown fields rejected, selectors parse, templates parse, unique module names, <code>needs</code> resolve and form a DAG, rollout phase names unique and not <code>stragglers</code>, every referenced secret declared) and stored as a <code>Revision</code>: commit id, author, message, timestamp, a content-addressed gzip tarball of <code>buckle.yaml</code>, <code>modules/</code> and <code>vars/</code> (with a digest the agent verifies, and an index of its files by digest for <code>FetchBlob</code>), and the validation report. Invalid commits are stored as rejected revisions so the UI can show the author what broke, and the fleet stays on the last valid one. This check is narrower than <code>buckle validate</code>, which also resolves task and health kinds, handler references, <code>after:</code> and the <code>command.run</code> <code>id</code> rule and, given <code>--facts</code>, dry-plans each fixture host: run it in CI, because a revision with an unknown task kind is accepted by the server and fails as a plan error for that module on the hosts that select it.</li>
 <li>A <code>path:</code> source (local directory with a filesystem watcher) is supported for development and for a server fed by a CI job that already checked out the repo.</li>
 </ul>
 
@@ -955,15 +1077,20 @@ message SecretBundle { repeated SecretValue secrets = 1; }   // only ever sent i
 <div class="scroll"><table>
 <thead><tr><th>Table</th><th>Holds</th></tr></thead>
 <tbody>
-<tr><td><code>hosts</code></td><td>host_id, agent_labels (reported, JSON), labels (server-managed via UI/API, JSON), status (pending / active / paused), notes, first_seen, last_seen, agent_version, applied_revision, connection state</td></tr>
+<tr><td><code>hosts</code></td><td>host_id, agent_labels (reported, JSON), labels (server-managed via UI/API, JSON), status (pending / active / paused), notes, token hash and auth method, platform and arch, first_seen, last_seen, agent_version, applied_revision, last plan digest, connection state, health summary, drifted</td></tr>
 <tr><td><code>host_facts</code></td><td>latest facts tree per host (JSON), collected_at; history kept for 7 days for the UI's "what changed" view</td></tr>
 <tr><td><code>revisions</code></td><td>id, commit, author, message, created_at, tarball digest, validation status and report</td></tr>
 <tr><td><code>rollouts</code></td><td>id, revision, state, policy snapshot (phases as evaluated at start), started_at, finished_at, triggered_by</td></tr>
 <tr><td><code>rollout_hosts</code></td><td>rollout, host, phase, wave, state, plan digest, plan (redacted JSON), result, health, timestamps</td></tr>
 <tr><td><code>approvals</code></td><td>rollout, phase, approver (OIDC subject), plan digests approved, note, at</td></tr>
-<tr><td><code>health_events</code></td><td>host, module, check, status, reason, at (rolling 30 days)</td></tr>
+<tr><td><code>health_events</code></td><td>host, rollout, scope, module, check, kind, required, status, reason, at (rolling 30 days)</td></tr>
 <tr><td><code>audit_log</code></td><td>who did what: approvals, pauses, rollbacks, label pins, with trace id</td></tr>
-<tr><td><code>kv</code></td><td>small state: last fetched commit, server install key for fingerprints</td></tr>
+<tr><td><code>revision_blobs</code></td><td>digest, revision, path: an index of each valid revision's files by content digest, which <code>FetchBlob</code> serves</td></tr>
+<tr><td><code>runs</code></td><td>apply results per host (revision, plan digest, outcome, changes, removals, error, trace id), kept for the host's history</td></tr>
+<tr><td><code>apply_events</code></td><td>the last event per (host, plan digest, step); the full stream goes to tracing</td></tr>
+<tr><td><code>host_drift</code></td><td>what the latest drift pass found different, one row per drifted resource (module, kind, key, summary, redacted diff, first detected); replaced by every drift report and cleared when a successful apply brings the host back in line</td></tr>
+<tr><td><code>agent_reports</code></td><td>(host, report_id) of every durable report already stored, so a report an agent re-sends is applied once (section <a href="#protocol">08</a>)</td></tr>
+<tr><td><code>kv</code></td><td>small state: last fetched commit, stable revision, server install key for fingerprints</td></tr>
 </tbody></table></div>
 
 <h3>Server configuration</h3>
@@ -982,19 +1109,29 @@ source:
     url: https://github.com/example/fleet-config.git
     branch: main
     poll: 30s
+    fetch_timeout: 2m               # one fetch is interrupted after this long (default 2m)
     credentials: { token: "${{ env.GIT_TOKEN }}" }
     webhook_secret: "${{ env.GIT_WEBHOOK_SECRET }}"
+  # path: /srv/buckle-config        # instead of git: a local directory (development, or a CI job that already checked out the repo)
 
 agents:
   auth: [tailscale, token]          # both always available; chosen per connection
   bootstrap_token: "${{ env.BUCKLE_BOOTSTRAP_TOKEN }}"
   registration: auto                # auto | approve (new hosts wait for an admin in the UI)
-  minimum_agent_version: "2.0.0"
-  desired_version: "2.0.0"         # agents self-update to this release (update-rs) when idle, in phase order
+  tailscale:                        # which tailnet nodes are trusted as agents (section 02)
+    allowed_tags: ["tag:buckle"]    # a node carrying one of these tags (the `tag:` prefix is optional) ...
+    allowed_users: ["ops@example.com"]   # ... or owned by one of these users is admitted; any other node is refused
+  # tailscale_socket: /var/run/tailscale/tailscaled.sock   # tailscaled LocalAPI, for whois
+  minimum_agent_version: "2.0.0"    # older agents are refused (before anything is written)
+  desired_version: "2.0.0"          # accepted, but nothing sends Upgrade yet (section 08)
+  disconnect_timeout: 10m           # a host disconnected this long in the middle of its wave counts as failed
+  apply_timeout: 30m                # a host applying this long without an ApplyResult counts as failed
   # per-host labels, pauses and notes live in the database and are managed in the UI, not here
 
 web:
   base_url: https://buckle.example.ts.net
+  trust_proxy: true                 # take the client address (for ACLs and sign-in rate limits) from X-Forwarded-For
+  trusted_proxy_hops: 1             # how many reverse proxies append to it; the address is the entry that many places from the right
   user_acl:  'claims.email endswith "@example.com"'
   admin_acl: '"buckle-admins" in claims.groups'
   oidc:
@@ -1005,14 +1142,26 @@ web:
 
 secrets:
   providers:
-    file: { root: /secrets }        # Nomad `template` stanzas render Nomad Variables here, one file per secret
-    env: {}
+    file: { root: /secrets }        # Nomad `template` stanzas render Nomad Variables here, one file per secret; paths may not leave the root
+    env:                            # `{ env: NAME }` references; the server's own credentials are never readable
+      allow: ["FLEET_*"]            # optional: when set, only these variables (exact names, or a prefix ending in *)
+      deny: [AWS_SECRET_ACCESS_KEY] # always wins over allow
     # exec: { allow: ["op"] }       # local development only; off unless listed
 
 telemetry:
   otlp_endpoint: http://otel-collector.example.internal:4317
+  otlp_headers: { x-honeycomb-team: "${{ env.HONEYCOMB_KEY }}" }   # values are redacted in logs
+  trace_url_template: https://ui.honeycomb.io/example/environments/prod/trace?trace_id={trace_id}   # fills trace_url beside every trace_id the API serves
 </code></pre>
-<p>Server config is YAML with <code>${{ env.NAME }}</code> interpolated on string values after parsing, the analytics approach; an unset variable is a start-up error. The fleet config (buckle.yaml in Git) uses the same interpolation syntax for secret references so authors see one convention.</p>
+<p>Server config is YAML with <code>${{ env.NAME }}</code> interpolated on string values after parsing, the analytics approach; an unset variable is a start-up error, and every variable the file interpolates is withheld from the <code>env</code> secret provider. Unknown keys are rejected. <code>--otel-endpoint</code> and the standard <code>OTEL_EXPORTER_OTLP_*</code> variables take precedence over the <code>telemetry</code> section. <code>telemetry.trace_url_template</code> must contain <code>{trace_id}</code>. <code>buckle server --print-fingerprint</code> prints the SHA-256 fingerprint of the gRPC certificate (generating it in <code>auto</code> mode) for <code>buckle install agent --ca-fingerprint</code>. The fleet config (buckle.yaml in Git) references secrets with provider maps (<code>{ file: … }</code>, <code>{ env: … }</code>) rather than this interpolation syntax.</p>
+<h3>Enrolment and trust</h3>
+<ul>
+<li><b>No takeover.</b> A bootstrap token only creates hosts. If the claimed <code>host_id</code> is already registered, whether it enrolled with a token or registered over the tailnet, enrolment is refused ("present its per-host token, or forget the host in the UI to enrol it again"); a forgotten host has no row and enrols afresh. Symmetrically, a host that enrolled with a token keeps authenticating by its token even when a tailnet node bears its name, so a node name cannot stand in for the token.</li>
+<li><b>Throttled.</b> Anything that is not a recognised per-host token counts as a bootstrap attempt, limited to 10 per peer address per minute, compared in constant time; the claimed <code>host_id</code> must be 1 to 128 characters of letters, digits, <code>.</code>, <code>_</code> and <code>-</code>. Per-host tokens are random 32 bytes, stored only as a SHA-256 hash.</li>
+<li><b>Version first.</b> <code>agents.minimum_agent_version</code> is checked before anything is written, so a refused old agent leaves no half-enrolled record and can enrol once it is upgraded.</li>
+<li><b>Tailnet trust.</b> Whois proves who a peer is, not that it belongs to the fleet. With <code>agents.tailscale.allowed_tags</code> or <code>allowed_users</code> set, a node matching neither is refused outright, registered or not; a matching new node registers according to <code>registration</code>. With both lists empty nothing is trusted to activate itself: a new tailnet node registers <em>pending</em> and waits for an admin, exactly as under <code>approve</code>, and the server warns at start-up when that is the case.</li>
+</ul>
+
 
 <div class="card decision"><div class="tag">Decision · agreed</div><p><b>HTTP on actix-web, gRPC on tonic, in one process.</b> actix-web is what automate and analytics use, so the OIDC middleware, the <code>TracingLogger</code> transform, the embedded-UI serving and the test harness port over directly. tonic runs on the same tokio runtime on its own port. Both shut down on SIGTERM; the rollout controller checkpoints host state on every transition so a restart mid-rollout resumes rather than restarts.</p></div>
 </section>
@@ -1078,11 +1227,11 @@ telemetry:
     bake: 5m                    # default per phase: how long post-apply checks repeat before the host counts as done
     baseline: hold              # hold: an unhealthy host waits for an operator to force it · skip: exclude it · ignore: apply anyway
 
-  phases:
+  phases:                       # omit them and one implicit phase `fleet` (select: true, parallel: 1) covers every host
     - name: canary
       select: 'host.groups contains "canary"'
       parallel: 1
-      approval: required        # required | auto | if_destructive (any removal or file.absent in the plan)
+      approval: required        # required | auto | if_destructive (a plan with any cleanup removal or deleting step)
       bake: 15m
       max_failures: 0
     - name: home
@@ -1187,7 +1336,8 @@ grey/systemd.unit[grey]                      <span class="red">disable + stop (r
 <li><b>Dedupe by digest.</b> Four hosts with the same plan are one review, not four. The digest covers the redacted plan, so a secret rotation produces one digest for every host that uses the secret.</li>
 <li><b>Approval binds digests.</b> The <code>Apply</code> message carries an approval token over (rollout, phase, plan digest). The agent refuses to apply a plan with a different digest.</li>
 <li><b>Destructive highlighting.</b> Removals, <code>file.absent</code>, <code>apt.package absent</code> and <code>user.account absent</code> are flagged; <code>approval: if_destructive</code> gates only when such steps exist.</li>
-<li><b>Deferred modules</b> show with their reason. If a deferred module's eventual plan turns out destructive, the agent stops before it and reports <em>needs approval</em> for the deferred portion rather than guessing.</li>
+<li><b>Deferred modules</b> show with their reason, and the digest covers that they are deferred, not what they will do. The intent was that a deferred module whose eventual plan turns out destructive stops the agent for <em>needs approval</em>. As built, the agent plans a deferred module once the facts it waits for are refreshed and applies it, together with the removals of its orphans, without a second review; the only destructive step held back is a <em>blocked</em> step that turns into a deletion (section <a href="#engine">04</a>). See the known gaps in section <a href="#implementation">16</a>.</li>
+<li><b>Locally</b> <code>buckle plan</code> exits 0 when nothing would change and 2 when something would, so CI can detect drift, and <code>--output json</code> prints the same plan as data; <code>buckle apply</code> prints the plan, applies it and exits 1 unless the run succeeded.</li>
 <li><b>Everything in the plan is already redacted</b>, so the server stores it, the UI shows it and the audit log keeps it without a second filtering step.</li>
 </ul>
 </section>
@@ -1198,13 +1348,13 @@ grey/systemd.unit[grey]                      <span class="red">disable + stop (r
 <p class="lede">The UI follows automate and analytics exactly: a Yew application compiled to WebAssembly with Trunk, hand-written SCSS, a framework-free <code>buckle-api</code> DTO crate shared with the server, embedded with <code>include_dir!</code> and served with an SPA fallback.</p>
 
 <div class="card decision"><div class="tag">Decision · agreed</div>
-<p><b>OIDC uses the analytics variant: server-driven Authorization Code + PKCE, HttpOnly session and refresh cookies, double-submit CSRF.</b> Tokens never reach the browser's JavaScript. Routes: <code>/api/v1/auth/login</code>, <code>/callback</code>, <code>/refresh</code>, <code>/logout</code>, <code>/csrf</code>; <code>/api/v1/me</code> returns 200 with the user or 204 when OIDC is not configured. Authorisation is two filt-rs ACLs over <code>claims.*</code>, <code>client_ip</code>, <code>method</code> and <code>path</code>: <code>user_acl</code> (may read) and <code>admin_acl</code> (may approve, pause, rollback, and manage hosts: labels, registration, pause, forget). Omitting <code>oidc</code> disables authentication for local development, with the ACLs still evaluated against request metadata.</p>
+<p><b>OIDC uses the analytics variant: server-driven Authorization Code + PKCE, HttpOnly session and refresh cookies, double-submit CSRF.</b> Tokens never reach the browser's JavaScript. Routes: <code>/api/v1/auth/login</code> (takes <code>return_to</code>, honoured only when it is a local path starting with a single <code>/</code>; anything else lands on <code>/</code>), <code>/callback</code>, <code>/refresh</code>, <code>/logout</code>, <code>/csrf</code>; <code>/api/v1/me</code> always answers 200: the signed-in user, or, when OIDC is not configured, an <code>anonymous: true</code> placeholder whose <code>is_admin</code> says what <code>admin_acl</code> made of the request (older servers answered 204). Authorisation is two filt-rs ACLs over <code>claims.*</code>, <code>client_ip</code>, <code>method</code> and <code>path</code>: <code>user_acl</code> (may read; absent means every signed-in user) and <code>admin_acl</code> (may approve, reject, pause, rollback, and manage hosts: labels, registration, pause, forget; absent means nobody when OIDC is configured and everybody when it is not). <code>client_ip</code> is the peer address, or with <code>web.trust_proxy</code> the <code>X-Forwarded-For</code> entry <code>web.trusted_proxy_hops</code> places from the right, so entries a client wrote itself are never trusted. Omitting <code>oidc</code> disables authentication for local development, with the ACLs still evaluated against request metadata; the server warns at start-up about whichever combination leaves the UI open or shut. The sign-in endpoints are rate limited per client (IPv6 clients per /64, since one host can pick a fresh address for every request).</p>
 <p class="q">The automate variant (popup + bearer token in sessionStorage) avoids CSRF handling but keeps an ID token in the page. For a tool whose buttons mutate production hosts, cookies with CSRF is the safer default.</p></div>
 
 <h3>Pages</h3>
 <div class="grid2">
 <div class="card"><h4>Overview</h4><p>Fleet roll-up from each host's latest health report (the drift-check reading between rollouts, refreshed every <code>drift.interval</code>) and agent liveness (healthy / failing / held / offline / drifted, each with the age of the reading), the active rollout as a phase pipeline, the last five revisions with their rollout outcome, agents needing attention (version skew, stale plan, offline &gt; 10 min).</p></div>
-<div class="card"><h4>Rollouts</h4><p>List with state and revision. Detail: phase columns with host chips (the animation above is the sketch), approval pane with deduplicated plans and diffs, per-host timeline of apply events, health during bake, action buttons scoped by <code>admin_acl</code>, link to the Honeycomb trace.</p></div>
+<div class="card"><h4>Rollouts</h4><p>List with state and revision. Detail: phase columns with host chips (the animation above is the sketch) and, per phase, the required checks that form its health gate; an approval pane with the deduplicated plans rendered from a typed plan view (modules, steps with outcome and diff kind, handlers, removals with their caution, re-homed records, notes) and a reject action that takes a reason; a timeline of controller transitions, oldest first, that appends as events arrive; health during bake; hosts that <em>need approval</em> (their plan changed after approval) or <em>need attention</em> (a rollback they ran themselves failed); action buttons scoped by <code>admin_acl</code>; and the trace id, linked when <code>telemetry.trace_url_template</code> is configured.</p></div>
 <div class="card"><h4>Hosts</h4><p>Table with effective labels, groups, facts summary, status (pending / active / paused), applied revision, drift, health, last seen. Detail: full facts tree, module and resource state (what Buckle owns on this host), health results per rollout and scope with reasons, drift diffs, recent runs with spans. Admin controls on the same page: edit server labels (with a live preview of which groups and rollout phase the host would land in), approve a pending registration, pause or resume, forget, and free-text notes. Every change is audited and applied to the next rollout's selection; a label change during an active rollout does not move a host between phases mid-flight.</p></div>
 <div class="card"><h4>Revisions</h4><p>Git log view: commit, author, validation status with errors for rejected commits, which rollout used it, and a "start rollout" / "roll back fleet to this" action.</p></div>
 <div class="card"><h4>Audit</h4><p>Every operator action and controller transition with actor, time, trace id. Filterable with a filt-rs expression, the same way automate's activity page works.</p></div>
@@ -1218,14 +1368,15 @@ grey/systemd.unit[grey]                      <span class="red">disable + stop (r
 <div class="scroll"><table>
 <thead><tr><th>Route</th><th>Purpose</th></tr></thead>
 <tbody>
-<tr><td><code>GET /api/v1/fleet</code>, <code>GET /api/v1/hosts/{id}</code>, <code>GET /api/v1/hosts/{id}/facts|state|health|runs</code></td><td>Fleet and host views</td></tr>
+<tr><td><code>GET /api/v1/me</code>, <code>GET /api/v1/csrf</code>, <code>GET /api/v1/auth/login?return_to=</code>, <code>/auth/callback</code>, <code>POST /api/v1/auth/refresh|logout</code></td><td>Sign-in, session and CSRF token</td></tr>
+<tr><td><code>GET /api/v1/fleet</code>, <code>GET /api/v1/hosts/{id}</code>, <code>GET /api/v1/hosts/{id}/facts|state|health|runs</code></td><td>Fleet and host views; a host's detail carries the drift items its last drift check reported, with redacted diffs</td></tr>
 <tr><td><code>PATCH /api/v1/hosts/{id}</code> (labels, notes), <code>POST /api/v1/hosts/{id}/approve|pause|resume</code>, <code>DELETE /api/v1/hosts/{id}</code>, <code>POST /api/v1/hosts/{id}/preview</code></td><td>Agent management: server labels, registration approval, pause, forget; preview returns the groups and phase a label set would produce</td></tr>
 <tr><td><code>GET /api/v1/revisions</code>, <code>GET /api/v1/revisions/{id}</code>, <code>POST /api/v1/revisions/{id}/rollout</code></td><td>Revisions and manual rollout start</td></tr>
-<tr><td><code>GET /api/v1/rollouts</code>, <code>GET /api/v1/rollouts/{id}</code>, <code>GET /api/v1/rollouts/{id}/plans</code></td><td>Rollout state and deduplicated plans</td></tr>
-<tr><td><code>POST /api/v1/rollouts/{id}/approve|pause|resume|rollback|abort</code>, <code>POST …/hosts/{host}/retry|skip</code></td><td>Admin actions, CSRF-protected, audited</td></tr>
-<tr><td><code>GET /api/v1/events</code> (SSE)</td><td>Live updates for the UI: host state, rollout transitions, health changes</td></tr>
+<tr><td><code>GET /api/v1/rollouts</code>, <code>GET /api/v1/rollouts/{id}</code>, <code>GET /api/v1/rollouts/{id}/plans</code></td><td>Rollout state (phases with their hosts and health gate, the timeline oldest first) and deduplicated plans; each host reports <code>needs_approval</code> and <code>needs_attention</code></td></tr>
+<tr><td><code>POST /api/v1/rollouts/{id}/approve|pause|resume|rollback|abort</code>, <code>POST /api/v1/rollouts/{id}/reject</code> (<code>{ reason }</code>; 409 unless awaiting approval), <code>POST …/hosts/{host}/retry|skip|force</code>, <code>POST …/hosts/{host}/continue</code> (<code>{ waive_checks, note }</code>)</td><td>Admin actions, CSRF-protected, audited</td></tr>
+<tr><td><code>GET /api/v1/events</code> (SSE)</td><td>Live updates for the UI: <code>host_changed</code>, <code>rollout_changed</code>, <code>rollout_host_changed</code>, <code>rollout_timeline</code>, <code>revision_added</code>, <code>audit</code>, plus <code>lagged</code> when the client fell behind. The stream re-checks its session every 30 s (expiry, sign-out, the ACLs as they are now) and, when it no longer passes, sends <code>session_ended</code> and closes, so the browser's reconnect meets the usual 401 or 403</td></tr>
 <tr><td><code>GET /api/v1/catalog</code></td><td>Registered task, fact and health kinds with JSON schemas</td></tr>
-<tr><td><code>GET /api/v1/audit</code></td><td>Audit log with filt-rs filter parameter</td></tr>
+<tr><td><code>GET /api/v1/audit</code></td><td>Audit log, paged (<code>before</code>, <code>limit</code>, default 100, at most 1000) with a filt-rs <code>filter</code>; <code>progress=false</code> hides the controller's ordinary progress transitions (plan pending, planned, baseline, applying, baking, rolling back) and keeps outcomes and operator actions</td></tr>
 <tr><td><code>POST /api/v1/webhooks/source</code></td><td>Git push notification (HMAC)</td></tr>
 </tbody></table></div>
 <p>Live updates use Server-Sent Events rather than a WebSocket: one-directional, trivially proxied, reconnects for free in the browser, and actix serves it from the same event bus the controller already publishes to.</p>
@@ -1238,20 +1389,17 @@ grey/systemd.unit[grey]                      <span class="red">disable + stop (r
 <div class="grid2">
 <div class="card"><h4>Traces</h4>
 <ul>
-<li><code>rollout.run</code> (server, root) → <code>rollout.phase</code> → <code>rollout.host</code> (one per host per wave) → the agent's <code>agent.apply</code> span, parented via <code>traceparent</code> in gRPC metadata → <code>module.apply</code> → <code>task.plan</code> / <code>task.apply</code> → <code>handler.run</code> → <code>health.check</code>.</li>
-<li>Agent-initiated work (drift re-plans, continuous health) starts a fresh root per pass with <code>parent: None</code> and <code>follows_from</code> the session span, the mail-backup pattern, so traces export promptly.</li>
-<li>Span fields: <code>buckle.revision</code>, <code>buckle.host</code>, <code>buckle.module</code>, <code>buckle.task.kind</code>, <code>buckle.task.key</code>, <code>buckle.changed</code> (bool), <code>buckle.plan.digest</code>, <code>buckle.phase</code>, <code>buckle.wave</code>. Command stdout/stderr are recorded on <code>command.run</code> spans as v1 does, truncated at 16 KB, and never when the command's environment carried a secret unless the task sets <code>capture: always</code>.</li>
+<li><code>rollout.run</code> (server, root) → <code>rollout.phase</code> → <code>rollout.host</code> (one per host per wave) → the agent's <code>agent.apply</code> span, parented via <code>traceparent</code> (gRPC metadata, and a field on <code>Apply</code>, <code>Rollback</code> and <code>RunHealth</code> so a re-sent request keeps its parent) → <code>engine.apply</code> → <code>module.apply</code> (or <code>module.rollback</code>) → <code>task.plan</code> / <code>task.apply</code> → <code>handler.run</code> → <code>removal.run</code> → <code>health.check</code>.</li>
+<li>Agent-initiated work (<code>agent.drift</code>, <code>agent.watchdog</code>) starts a fresh root per pass with <code>parent: None</code> and <code>follows_from</code> the <code>agent.session</code> span, the mail-backup pattern, so traces export promptly.</li>
+<li>Span fields: <code>buckle.revision</code>, <code>buckle.host</code>, <code>buckle.module</code>, <code>buckle.task.kind</code>, <code>buckle.task.key</code>, <code>buckle.changed</code> (bool), <code>buckle.plan.digest</code>, <code>buckle.phase</code>, <code>buckle.wave</code>. Command stdout/stderr are recorded on <code>command.run</code> spans as v1 does, truncated at 4 KiB each and scrubbed of known secret values, and never when the command's environment carried a secret unless the task sets <code>capture: always</code>.</li>
 </ul></div>
 <div class="card"><h4>Metrics (OTLP)</h4>
 <ul>
-<li><code>buckle.apply.duration</code> histogram by module and outcome</li>
-<li><code>buckle.task.changes</code> counter by kind</li>
-<li><code>buckle.health.status</code> gauge (1 pass, 0 fail) by module and check</li>
-<li><code>buckle.drift.resources</code> gauge per host</li>
-<li><code>buckle.rollout.hosts</code> gauge by rollout, phase, state</li>
-<li><code>buckle.agent.connected</code> gauge on the server</li>
+<li><code>buckle.rollout.hosts</code> gauge by rollout, phase and state: the hosts of every live rollout, sampled by the server every 15 s; a series that disappears is recorded once as 0 so dashboards do not keep the last value</li>
+<li><code>buckle.agent.connected</code> gauge on the server: agents with an open session</li>
+<li><em>Not implemented yet:</em> <code>buckle.apply.duration</code> (histogram by module and outcome), <code>buckle.task.changes</code> (counter by kind), <code>buckle.health.status</code> (gauge by module and check) and <code>buckle.drift.resources</code> (gauge per host). The same facts reach the server today as <code>ApplyResult</code>, <code>HealthReport</code> and <code>Drift</code> messages and as spans.</li>
 </ul>
-<p>Metrics go through the OpenTelemetry battery's meter provider; tracing-batteries gains a small <code>metrics</code> helper if it lacks one today.</p></div>
+<p>Metrics go through the OpenTelemetry battery's meter provider (instruments are no-ops until an OTLP endpoint is configured). The endpoint comes from <code>--otel-endpoint</code>, the standard <code>OTEL_EXPORTER_OTLP_*</code> variables, or the <code>telemetry.otlp_endpoint</code> and <code>otlp_headers</code> keys of server.yaml and agent.yaml, in that order of precedence.</p></div>
 </div>
 <h3>Logs and errors</h3>
 <p>human-errors throughout, with the user/system split deciding what counts as a bug: a template referencing an undefined var is a user error shown in the plan; a panic in a task kind or a corrupted state file is a system error sent to Sentry (optional battery) and surfaced in the UI as "needs attention". The agent writes structured logs to journald via tracing's stdout layer with OTLP as the primary path. The HTTP <code>TracingLogger</code> comes from automate with its query and header redaction lists.</p>
@@ -1264,11 +1412,14 @@ grey/systemd.unit[grey]                      <span class="red">disable + stop (r
 <div class="scroll"><table>
 <thead><tr><th>Target</th><th>v2.0</th><th>Later</th></tr></thead>
 <tbody>
-<tr><td>Debian / Ubuntu, arm64 + amd64</td><td>Full: apt, systemd, ufw, sysctl, users, swap, hostname. CI runs the task suite in containers for both architectures, plus a nightly on a real aarch64 runner.</td><td></td></tr>
+<tr><td>Debian / Ubuntu, arm64 + amd64</td><td>Full: apt, systemd, ufw, sysctl, users, swap, hostname. CI runs the unit and integration suites natively on Linux amd64 and arm64 runners, and a containers job plans the example and applies a small fixture fleet (it needs no systemd) in Debian 12 and Ubuntu 24.04 images with the static musl binary on x86_64. There is no nightly aarch64 container run.</td><td></td></tr>
 <tr><td>Other Linux (RHEL family, Alpine)</td><td>Everything but package repositories; <code>dnf.*</code>/<code>apk.*</code> are not in scope.</td><td><code>dnf.package</code>, <code>apk.package</code></td></tr>
-<tr><td>macOS (arm64)</td><td>Agent, file, command, download, archive, github.release build and are smoke-tested.</td><td><code>brew.package</code>, <code>launchd.service</code>, <code>defaults.write</code></td></tr>
-<tr><td>Windows (amd64)</td><td>Same as macOS; service install via <code>buckle install agent</code> uses the Service Control Manager.</td><td><code>winget.package</code>, <code>windows.service</code>, <code>registry.value</code></td></tr>
+<tr><td>macOS (arm64)</td><td>Agent, file, command, download, archive, github.release build and their tests run in CI. <code>buckle install agent</code> writes a LaunchDaemon (<code>com.sierrasoftworks.buckle-agent</code>: <code>RunAtLoad</code>, <code>KeepAlive</code>, output in <code>/var/log/buckle-agent.log</code>) and loads it with <code>launchctl bootstrap system</code>.</td><td><code>brew.package</code>, <code>launchd.service</code>, <code>defaults.write</code></td></tr>
+<tr><td>Windows (amd64)</td><td>Same as macOS. <code>buckle install agent</code> creates (or, when it exists, reconfigures and restarts) the <code>buckle-agent</code> service through <code>sc.exe</code> with automatic start and restart-on-failure actions; the service runs <code>buckle agent --windows-service</code> under the Service Control Manager, and a Stop or Shutdown request is a graceful shutdown that lets a running apply finish first. <code>icacls</code> restricts agent.yaml and the state directory (token, install key, cached secrets) to Administrators and SYSTEM, by SID so it works on localised Windows, the counterpart of modes 0600 and 0700.</td><td><code>winget.package</code>, <code>windows.service</code>, <code>registry.value</code></td></tr>
 </tbody></table></div>
+<p>Which parts exist where follows the kinds' <code>PLATFORMS</code>. The <code>os</code>, <code>tailscale</code>, <code>cloud</code>, <code>users</code>, <code>nomad</code> and <code>docker</code> fact providers run on every platform; <code>hardware</code>, <code>net</code> and <code>systemd</code> are Linux-only and <code>script</code> is Unix-only, so <code>host.facts.hardware.*</code> does not exist on macOS or Windows and a module that reads it should be guarded by an <code>os</code> test. Among tasks, <code>apt.*</code>, <code>systemd.*</code>, <code>sysctl.param</code>, <code>ufw.*</code>, <code>user.*</code>, <code>hostname.set</code> and <code>swap.file</code> are Linux-only; <code>cron.job</code>, <code>file.symlink</code> and <code>ssh.authorized_key</code> are Unix-only; the rest are everywhere.</p>
+<p><b>Service installation.</b> On Linux the installer writes <code>/etc/systemd/system/buckle-agent.service</code> and enables it. Where there is no systemd (no <code>systemctl</code> on the PATH: a container, an Alpine host), or with <code>--no-service</code>, it writes agent.yaml and the state directory, installs nothing, and prints the exact command that starts the agent (<code>buckle agent --config …</code>) for the init system of your choice, exiting successfully.</p>
+<p><b>Minimal containers.</b> A host without the tools a kind drives is a normal place to plan, not an error. <code>apt.*</code> without <code>apt-get</code>, <code>systemd.*</code> without <code>systemctl</code> or without systemd as PID 1, <code>docker.image</code> without <code>docker</code>, <code>hostname.set</code> without <code>hostnamectl</code> or <code>hostname</code>, <code>swap.file</code>, <code>user.*</code> without the <code>passwd</code> tools, and an explicit <code>validate</code> program that is not installed all plan as <em>Blocked</em> with the reason and run nothing; <code>sysctl.param</code> (read from <code>/proc/sys</code>), <code>cron.job</code>, <code>ufw.rule</code> and <code>command.run</code> still plan. Blocked steps are planned again at apply once an earlier step has changed something (section <a href="#engine">04</a>).</p>
 <p>The release matrix mirrors mail-backup: linux musl x86_64 and aarch64, darwin x86_64 and arm64, windows x86_64; per-platform Docker images merged into one manifest; Homebrew tap. The server image is the same binary.</p>
 </section>
 
@@ -1279,7 +1430,7 @@ grey/systemd.unit[grey]                      <span class="red">disable + stop (r
 <div class="scroll"><table>
 <thead><tr><th>Role</th><th>Module</th><th>Notes from the audit, and what the port does</th></tr></thead>
 <tbody>
-<tr><td>common</td><td><code>packages</code>, <code>users</code>, <code>ssh</code>, <code>firewall</code>, <code>sysctl</code>, <code>swap</code></td><td>The catch-all role becomes six small modules with one concern each, so a host can take <code>users</code> without <code>swap</code> and a failure in one does not block the others. <code>packages</code>: baseline apt set, unattended-upgrades, CA certificates. <code>users</code>: admin group, accounts with hashed passwords (a <code>Secret</code>), authorized keys, sudoers via <code>file.line</code> with <code>validate: visudo -cf {path}</code>. <code>ssh</code>: sshd hardening and the user-CA trust files, notifying a reload. <code>firewall</code> (<code>needs: [tailscale]</code>): ufw defaults, service and multicast rules, then <code>ufw.state enabled</code> last; because <code>tailscale</code> contributes its own <code>ufw.rule</code> for the interface before this module enables default-deny, a fresh host never locks itself out, which fixes the ordering bug in the Ansible role. <code>sysctl</code>: the kernel parameters as one <code>sysctl.param</code> list. <code>swap</code>: the dead <code>Format swap → Enable swap</code> handler chain becomes a single <code>swap.file</code> resource. The orphan fail2ban handler is dropped.</td></tr>
+<tr><td>common</td><td><code>packages</code>, <code>users</code>, <code>ssh</code>, <code>firewall</code>, <code>sysctl</code>, <code>swap</code></td><td>The catch-all role becomes six small modules with one concern each, so a host can take <code>users</code> without <code>swap</code> and a failure in one does not block the others. <code>packages</code>: baseline apt set, unattended-upgrades, CA certificates. <code>users</code>: admin group, accounts with hashed passwords (a <code>Secret</code>), authorized keys, sudoers as a validated <code>file.template</code> in <code>/etc/sudoers.d</code> (<code>validate: ["visudo", "-cf", "{path}"]</code>, which is also the automatic check for any file there). <code>ssh</code>: sshd hardening and the user-CA trust files, notifying a reload. <code>firewall</code> (<code>needs: [tailscale]</code>): ufw defaults, service and multicast rules, then <code>ufw.state enabled</code> last; because a rule for the tailnet interface precedes it, a fresh host never locks itself out, which fixes the ordering bug in the Ansible role, and the order is enforced as well as conventional: <code>ufw.state</code> and <code>ufw.default</code> refuse (blocked) to enable the firewall or deny incoming traffic unless a rule keeps SSH or a management interface such as <code>tailscale0</code> reachable (<code>allow_lockout: true</code> overrides). <code>sysctl</code>: the kernel parameters as one <code>sysctl.param</code> list. <code>swap</code>: the dead <code>Format swap → Enable swap</code> handler chain becomes a single <code>swap.file</code> resource. The orphan fail2ban handler is dropped.</td></tr>
 <tr><td>terminal</td><td><code>terminal</code></td><td>atuin's eight-task install dance becomes one <code>github.release</code> task with an arch table that skips armv7l. The <code>getent</code> loop becomes a template loop over <code>host.facts.users.accounts</code> filtered to admin users.</td></tr>
 <tr><td>tailscale</td><td><code>tailscale</code></td><td>Provides facts (<code>facts.provides: [tailscale]</code>) so hostname and downstream templates see the tailnet name. The never-working <code>Authenticate tailscale</code> handler (placeholder key, missing <code>tag:</code> prefix) is replaced by a <code>command.run</code> with <code>unless: tailscale status</code> and a real <code>Secret</code> auth key, correctly tagged.</td></tr>
 <tr><td>backup</td><td><code>rustic</code></td><td>rustic installed via <code>github.release</code> with a proper arch mapping (armv7l was broken). <code>rustic init</code> gated on a probe that distinguishes "repo missing" from "mount down". The oneshot <code>backup.service</code> is no longer started on every apply (only enabled plus the timer). A secret the backup hooks used but the secrets list omitted is declared.</td></tr>
@@ -1288,62 +1439,69 @@ grey/systemd.unit[grey]                      <span class="red">disable + stop (r
 <tr><td>opentelemetry, grey, loadbalancer</td><td>not ported</td><td>Not applied by any playbook today, so neither deliverable carries them; they can be written fresh as modules if and when they are wanted. The minijinja stress test moves to a synthetic template in the engine's test suite instead. The group_vars file that never loaded is noted in the private port's README.</td></tr>
 <tr><td>automate</td><td>not ported</td><td>Described in the README but absent from the repo. Left out of both deliverables.</td></tr>
 </tbody></table></div>
-<p>The public example carries three health checks per Nomad host (API, unit, eligibility), a canary phase selected by label, and a <code>vars/</code> layering that demonstrates overlay precedence explicitly (the audit found an overlay conflict in the Ansible repo that was resolved by alphabetical accident; the example shows the deliberate form). Its templates are generic Nomad, Docker, Tailscale and otelcol configurations written for the example, not copies of the private ones. <code>buckle validate</code> runs against it in CI, and an integration test applies it inside Debian and Ubuntu containers for both architectures.</p>
+<p>The public example carries three health checks per Nomad host (API, unit, eligibility), a canary phase selected by label, and a <code>vars/</code> layering that demonstrates overlay precedence explicitly (the audit found an overlay conflict in the Ansible repo that was resolved by alphabetical accident; the example shows the deliberate form). Its templates are generic Nomad, Docker, Tailscale and otelcol configurations written for the example, not copies of the private ones. <code>buckle validate</code> runs against it with each facts fixture in CI, a behavioural test in <code>crates/buckle/tests/example.rs</code> checks its groups, overlay precedence and phase membership and dry-plans each of its seven fictional hosts, and the containers job plans it as a Nomad worker inside Debian 12 and Ubuntu 24.04 images; applying the whole example needs systemd, so the container job applies a smaller fixture fleet instead.</p>
 </section>
 
 <!-- ============ 16. IMPLEMENTATION ============ -->
 <section class="sec" id="implementation" data-comment-target data-title="Implementation plan">
 <div class="sec-head"><div><span class="num">16</span><h2>Implementation plan</h2></div><button class="cmt" data-for="implementation">Comment</button></div>
-<p class="lede">Workspace first, then parallel lanes behind stable traits, then integration. Server and agent land before the task library is complete so the control plane is proven early; the UI comes last, against a frozen API. Each lane is a sub-agent with a model and effort chosen for the work; the orchestrator (Fable 5.1) owns the skeleton, the interfaces, every review, and integration.</p>
+<p class="lede">The plan was workspace first, then parallel lanes behind stable traits, then integration, with the control plane proven before the task library was complete and the UI last, against a frozen API. This section records what that produced and what is still open, so the rest of the document can be read as a description of the code.</p>
 
 <h3>Workspace</h3>
-<pre><code class="language-text"><span class="fname">Cargo workspace (edition 2024, resolver 3)</span>crates/
-  buckle          THE ONLY BINARY · clap derive · subcommands: plan, apply, agent, server, health, facts, validate, install, update, migrate
-  buckle-core     lib · model, selectors, templater, secrets, planner, executor, state, registries (traits only)
-  buckle-std      lib · standard tasks, fact providers, health checks (register_* macros)
-  buckle-proto    lib · fleet.proto + tonic/prost build
-  buckle-agent    lib · transport (grpc, local), session loop, bundle cache, reporting  (linked into `buckle agent`)
-  buckle-server   lib · source watcher (gix), revisions, rollout controller, SQLite, actix API, OIDC, UI embedding  (linked into `buckle server`)
-  buckle-api      lib · framework-free DTOs shared by server and UI
+<pre><code class="language-text"><span class="fname">Cargo workspace (edition 2024, resolver 3, version 2.0.0-dev)</span>crates/
+  buckle              THE ONLY BINARY · clap derive · subcommands: plan, apply, health, facts, validate, agent, server, install, catalog, update, migrate
+  buckle-core         lib · model, selectors, templater, secrets, planner, executor, state, the System trait and plan-mode guard, registries (traits only)
+  buckle-std          lib · standard tasks, fact providers, health checks (register_* macros)
+  buckle-proto        lib · fleet.proto + tonic/prost build
+  buckle-agent        lib · transport (grpc, local), session loop, bundle cache, durable reports, watchdog, install, self-update  (linked into `buckle agent`)
+  buckle-server       lib · source watcher (gix), revisions, rollout controller, SQLite, actix API, OIDC, UI embedding  (linked into `buckle server`)
+  buckle-api          lib · framework-free DTOs shared by server and UI
+  buckle-integration  lib + tests · an in-process server and N agents on fake hosts, driven through the real gRPC and REST surfaces
 
   The split into library crates exists so lanes can build and test in parallel; deployment sees one executable.
   `buckle server` and `buckle agent` can even run in the same process on the server host (the server's own host is
   managed by an agent like any other).
-ui/               Yew + Trunk (excluded from the workspace, like automate)
+ui/               Yew + Trunk (excluded from the workspace, like automate), with Playwright specs under ui/e2e
 examples/nomad-cluster
-docs/             VuePress: guide / reference / advanced (reference pages generated from the catalog)
+fixtures/         facts files (debian-arm64, ubuntu-amd64, ubuntu-arm64), a minimal config, v1 packages for `buckle migrate`
+scripts/          container-test.sh (plan the example in an image), container-apply.sh (apply a fixture fleet in an image)
+docs/design/      this page and its README (there is no VuePress site)
 </code></pre>
 
-<h3>Lanes</h3>
-<div class="lanes">
-  <div class="lane"><div class="who">Lane 0 · Fable 5.1 (orchestrator)</div><div class="t">Skeleton and contracts</div><ul><li>workspace, CI matrix, release workflow</li><li><code>buckle-core</code> traits: Task, FactProvider, HealthCheck, System, Cx, Plan, ResourceRecord, Secret</li><li><code>fleet.proto</code> and <code>buckle-api</code> DTOs</li><li>fixtures: sample facts, sample module tree</li></ul></div>
-  <div class="lane"><div class="who">Lane 1 · Fable 5.1 · xhigh</div><div class="t">Core engine</div><ul><li>config loader, vars layering, filt-rs context, minijinja integration</li><li>planner (DAG, locks, handlers, fact refresh, deferral)</li><li>executor, state file, removal, drift</li><li>plan rendering (text, JSON)</li></ul></div>
-  <div class="lane"><div class="who">Lane 2 · Opus 5.5 · high</div><div class="t">Secrets</div><ul><li><code>Secret</code>, <code>Sensitive</code>, <code>Redacted</code>, witness sinks</li><li>providers: env, file, exec, server</li><li>two-mode renderer, shadow diffs</li><li>leak tests: Debug/Display/serde/tracing never contain a value</li></ul></div>
-  <div class="lane"><div class="who">Lane 3 · Opus 5.5 · high</div><div class="t">Protocol and agent</div><ul><li>tonic service + client, interceptors (whois, token, traceparent)</li><li>session loop, reconnect, bundle cache by digest</li><li>apply/health/drift reporting, stale-plan refusal</li><li><code>buckle install agent</code> (systemd, launchd, SCM)</li><li>self-update with <code>update-rs</code>: <code>buckle update</code>, server-driven <code>Upgrade</code> when idle, traced relaunch</li></ul></div>
-  <div class="lane"><div class="who">Lane 4 · Opus 5.5 · high</div><div class="t">Server</div><ul><li>gix source watcher + webhook, revision validation and store</li><li>SQLite schema and migrations</li><li>rollout controller state machine, persisted</li><li>actix API, SSE bus, OIDC (analytics port), ACLs, audit</li></ul></div>
-  <div class="lane"><div class="who">Lane 5 · Sonnet 5.5 · high</div><div class="t">Tasks: files and system</div><ul><li>file.* (copy, template, directory, absent, symlink, line, block, download)</li><li>archive.extract, github.release, command.run, docker.image</li><li>user.*, ssh.authorized_key, hostname.set, swap.file, cron.job</li></ul></div>
-  <div class="lane"><div class="who">Lane 6 · Sonnet 5.5 · high</div><div class="t">Tasks: apt, systemd, network; facts; health</div><ul><li>apt.*, systemd.*, sysctl.param, ufw.*</li><li>fact providers: os, hardware, net, tailscale, cloud.oci, cloud.azure, users, systemd, nomad, docker, script</li><li>health: http, tcp, systemd, command, filter, file</li></ul></div>
-  <div class="lane"><div class="who">Lane 7 · Sonnet 5.5 · medium</div><div class="t">Example and docs</div><ul><li><code>examples/nomad-cluster</code> (fictional public example) and the private infra-ansible port</li><li>VuePress docs skeleton, guide pages</li><li><code>buckle migrate</code> for v1 package directories</li></ul></div>
-  <div class="lane"><div class="who">Lane 8 · Opus 5.5 · high</div><div class="t">Integration tests</div><ul><li>in-process server + N agents with the local transport</li><li>container matrix: debian/ubuntu × amd64/arm64 applying the example</li><li>rollout scenarios: approval, failure budget, pause, rollback, straggler, server restart mid-rollout</li></ul></div>
-  <div class="lane"><div class="who">Lane 9 · Opus 5.5 · high</div><div class="t">UI</div><ul><li>Yew app shell, auth state machine, API client with CSRF</li><li>Overview, Rollouts (pipeline + approval), Hosts, Revisions, Audit, Reference</li><li>SSE live updates; Playwright e2e against the real binary</li></ul></div>
+<h3>What landed</h3>
+<div class="grid2">
+<div class="card"><h4>Engine and library</h4><ul>
+<li>The plan/apply/remove pipeline of section <a href="#engine">04</a>: DAG scheduling, locks, handlers, fact refresh and deferral, selection safety, re-homing, drift mode, module-scoped rollback, blocked-step re-planning, the plan-mode write guard and per-step state saves.</li>
+<li>Thirty task kinds, ten fact providers and six health checks (section <a href="#registry">05</a>), each with a JSON schema served by <code>buckle catalog</code> and <code>GET /api/v1/catalog</code>.</li>
+<li>The secrets model of section <a href="#secrets">06</a>, with its leak tests, server-side providers and scoped delivery.</li>
+<li>Every subcommand: <code>plan</code> (exit 2 when something would change), <code>apply</code>, <code>health</code>, <code>facts</code>, <code>validate</code>, <code>agent</code>, <code>server</code>, <code>install agent</code>, <code>catalog</code>, <code>update</code> and <code>migrate</code> (a v1 package directory in, a v2 repository out, with <code>TODO(migrate)</code> comments wherever a person must decide).</li>
+</ul></div>
+<div class="card"><h4>Fleet</h4><ul>
+<li>The agent: gRPC session with reconnect and backoff, durable acknowledged reports, session-bound requests, drift passes, the local-rollback watchdog and bake rollback, local-directory mode, installers for systemd, launchd and the Windows Service Control Manager, and self-update from GitHub releases.</li>
+<li>The server: Git watcher building every commit as a revision, SQLite persistence, the persisted rollout controller (phases, waves, approval, baseline, bake, pre-phase checks, pause, retry, continue, skip, rollback, stragglers), enrolment and tailnet trust, the REST API with SSE and OIDC (section <a href="#ui">12</a>), audit, and two OTLP gauges.</li>
+<li>The UI (<code>ui/</code>): the Overview, Rollouts, Hosts, Revisions, Audit and Reference pages, built with Trunk and embedded in the server.</li>
+<li><code>buckle-integration</code>: end-to-end scenarios against a real server and agents for approval, phased rollout, failure budgets, health gating, local rollback, drift, enrolment, staleness, secrets, restarts and automatic triggering.</li>
+<li><code>examples/nomad-cluster</code> and the CI that validates and plans it, plus the release workflow for the five binaries and the Docker manifest.</li>
+</ul></div>
 </div>
 
-<h3>Sequence</h3>
-<div class="timeline">
-  <div class="w">Step 1</div><div>Lane 0. The orchestrator writes the skeleton and contracts and lands them on the branch. Every later lane compiles against these; interface changes go through the orchestrator.</div>
-  <div class="w">Step 2</div><div>Lanes 1, 2, 3, 4 in parallel (engine, secrets, protocol+agent, server). Lanes 5 and 6 start at the same time against the Task trait with an in-memory <code>System</code>, so they do not wait for the engine.</div>
-  <div class="w">Step 3</div><div>Integration: orchestrator wires engine + std + agent + server into the binary, runs <code>buckle apply</code> on the example in a container, runs the in-process rollout scenarios. Lane 8 starts here. Lane 7 writes the example as soon as the task kinds it needs exist.</div>
-  <div class="w">Step 4</div><div>Lane 9 (UI) against the frozen REST API; OIDC end-to-end with the wiremock identity provider ported from automate's test harness.</div>
-  <div class="w">Review</div><div>After each lane: the orchestrator reviews the diff against this document (a checklist per section), runs <code>cargo clippy --all-targets --all-features -- -D warnings</code>, <code>cargo fmt --check</code>, <code>cargo test</code>, and the leak tests. Findings go back to the lane's agent; nothing is merged on the agent's say-so.</div>
-  <div class="w">Ship</div><div>One PR on <code>feat/keen-pasteur-hfo67z</code> with the full v2 tree, CI green on the matrix, release workflow producing the five binaries and the Docker manifest. Version 2.0.0.</div>
-</div>
-
+<h3>Known gaps</h3>
+<p>Each of these is checkable in the repository; none is a design change. The first three are the tests recorded as ignored in <code>crates/buckle-integration/tests/fleet</code> (run them with <code>cargo test -p buckle-integration -- --ignored</code>); the rest follow from the code.</p>
+<ul>
+<li><b>A phase over its failure budget can still promote.</b> Section <a href="#rollout">10</a> says that when failures exceed <code>max_failures</code> the phase pauses and nothing else starts. Today, once the operator acts on a different host the controller resumes, and when that host finishes the phase counts the still-failed host as finished, passes its gate and promotes the revision with the breach unresolved (<code>drive_phases</code> in <code>rollout/controller.rs</code> treats <code>Failed</code> as finished). Test: <code>a_phase_over_its_failure_budget_does_not_complete_while_the_failure_stands</code> in <code>gaps.rs</code>.</li>
+<li><b>A restart while a rollout awaits approval can promote it unapproved.</b> The controller drives its phases as soon as it loads, before agents have reconnected, so every planned host counts as offline and the phase finishes with its hosts missed; the revision is then promoted without the canary's approval and the stragglers stage applies it. Test: <code>a_rollout_restarted_while_awaiting_approval_still_awaits_it</code> in <code>durability.rs</code>.</li>
+<li><b>A rotated secret in a template.</b> Section <a href="#secrets">06</a> promises a fingerprint change on exactly the lines that use the secret. <code>a_rotated_secret_is_a_fingerprint_change_on_the_line_that_uses_it</code> in <code>gaps.rs</code> is ignored on the grounds that <code>file.template</code> ignores the recorded shadow, but <code>file.template</code> now plans against the recorded shadow whenever the file is unchanged since Buckle wrote it. The ignore may be stale; re-run the test before counting this as open.</li>
+<li><b>Deferred modules are applied unreviewed.</b> Section <a href="#plan">11</a> says that if a deferred module's eventual plan is destructive the agent stops and asks for approval. The executor plans a deferred module after the facts it waits for are refreshed and runs it, with the removals of its orphans, whatever it turns out to do; the approved digest covers the deferral, not the module's steps. Only a previously blocked step that now plans a deletion is held back.</li>
+<li><b>Server-driven agent upgrades.</b> <code>agents.desired_version</code> is parsed and shown in the configuration, but nothing constructs an <code>Upgrade</code> message, so the phase-ordered, idle-only upgrade of section <a href="#protocol">08</a> does not happen; the agent's handling of <code>Upgrade</code> and <code>buckle update</code> work.</li>
+<li><b>Metrics.</b> Only <code>buckle.rollout.hosts</code> and <code>buckle.agent.connected</code> exist; the apply-duration, task-change, health-status and drift-resource instruments of section <a href="#observability">13</a> do not.</li>
+<li><b>User documentation.</b> The VuePress guide and reference pages planned for <code>docs/</code> were not written; the documentation is this page, its README, the project README, the example's README and the generated <code>buckle catalog</code>.</li>
+</ul>
 <h3>Testing conventions</h3>
 <ul>
 <li>Unit tests inline (<code>#[cfg(test)] mod tests</code>), <code>rstest</code> cases, descriptive sentence names, as in the reference repos. A <code>System</code> fake makes task tests hermetic; a container suite exercises the real thing.</li>
 <li>Secret leak tests are property-style: for every type that can hold a secret, format with Debug and Display, serialise with serde_json and serde_yaml, record on a tracing span with the Testing battery, and assert the plaintext never appears.</li>
-<li>Protocol tests run server and agent in one process over a tonic channel; time is controlled with <code>tokio::time::pause</code> for bake and backoff.</li>
-<li>Playwright e2e for the UI starts the real binary with OIDC disabled and with the wiremock IdP, following automate's <code>e2e/</code> layout.</li>
+<li>Protocol tests run server and agent in one process over a real tonic channel (<code>buckle-agent</code> against a fake server, and <code>buckle-integration</code> against the real one); time is controlled with <code>tokio::time::pause</code> where bake, settle and backoff are under test.</li>
+<li>Sign-in is tested in the server's web tests against an in-process wiremock identity provider. The UI's Playwright specs (<code>ui/e2e</code>) run the built UI against a small static server in demo mode, with fixtures and no server behind it.</li>
 </ul>
 </section>
 
