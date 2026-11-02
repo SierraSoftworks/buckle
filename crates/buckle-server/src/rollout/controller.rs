@@ -700,10 +700,12 @@ impl Controller {
                 HostPhase::PlanPending => self.request_plan(ri, hi),
                 HostPhase::Baseline => self.send_baseline(ri, hi),
                 HostPhase::Applying => {
+                    // An approved Apply keeps running on the agent after its
+                    // session drops and its result is delivered on
+                    // reconnect, so it is never re-sent; a host already on
+                    // the target revision has evidently finished.
                     if c.applied_revision.as_deref() == Some(target.as_str()) {
                         self.start_bake(ri, hi);
-                    } else {
-                        self.send_apply(ri, hi);
                     }
                 }
                 HostPhase::Baking => {
@@ -779,10 +781,18 @@ impl Controller {
             if h.runtime.revision != plan.revision {
                 continue;
             }
-            if !matches!(h.state, HostPhase::PlanPending | HostPhase::Planned) {
+            // The agent refused an Apply because its fresh plan differs from
+            // the approved digest: the fresh plan comes back as a PlanResult
+            // whose error starts with "stale plan". The host returns to
+            // planned with the new digest (re-approval where required).
+            let stale = plan.error.starts_with("stale plan") && !plan.digest.is_empty();
+            if stale && matches!(h.state, HostPhase::Applying | HostPhase::Baseline) {
+                self.live[ri].hosts[hi].runtime.applied = false;
+                self.live[ri].hosts[hi].state = HostPhase::PlanPending;
+            } else if !matches!(h.state, HostPhase::PlanPending | HostPhase::Planned) {
                 continue;
             }
-            if !plan.error.is_empty() {
+            if !plan.error.is_empty() && !stale {
                 let error = format!("planning failed: {}", plan.error);
                 self.live[ri].hosts[hi].runtime.error = Some(error.clone());
                 self.fail_host(ri, hi, &error);

@@ -6,8 +6,9 @@ use buckle_core::{Digest, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Every regular file under `root` (relative paths, `/`-separated, sorted),
-/// skipping `.git`.
+/// Every regular file under `root` (relative paths, sorted), skipping
+/// entries whose name starts with `.` (`.git`, editor swap files), as the
+/// agent's bundle packer does.
 pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![PathBuf::new()];
@@ -16,7 +17,7 @@ pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
         for entry in std::fs::read_dir(&dir).to_human_error()? {
             let entry = entry.to_human_error()?;
             let name = entry.file_name();
-            if name == ".git" {
+            if name.to_string_lossy().starts_with('.') {
                 continue;
             }
             let path = rel.join(&name);

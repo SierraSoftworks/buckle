@@ -29,6 +29,9 @@ struct Script {
     gate_fail: bool,
     silent_apply: bool,
     stale_once: bool,
+    /// On the next Apply, answer as the agent does: a PlanResult whose error
+    /// starts with "stale plan" carrying this fresh digest.
+    stale_plan_result: Option<String>,
     local_rollback_on_bake: bool,
 }
 
@@ -238,6 +241,24 @@ impl Harness {
                     }
                     SMsg::Apply(a) => {
                         if s.silent_apply {
+                            continue;
+                        }
+                        if let Some(fresh) = s.stale_plan_result.clone() {
+                            {
+                                let mut sc = script.lock().unwrap();
+                                sc.stale_plan_result = None;
+                                sc.digest = fresh.clone();
+                            }
+                            reply(AMsg::Plan(PlanResult {
+                                revision: a.revision,
+                                digest: fresh.clone(),
+                                changes: 3,
+                                error: format!(
+                                    "stale plan: the approved plan was {} but the host now plans {fresh}",
+                                    a.plan_digest
+                                ),
+                                ..Default::default()
+                            }));
                             continue;
                         }
                         if s.stale_once {
@@ -1051,4 +1072,56 @@ async fn every_transition_is_audited() {
             "missing {expected} in {actions:?}"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_agent_reported_stale_plan_needs_reapproval_for_that_host() {
+    let mut h = Harness::new().await;
+    h.revision("r1", "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n").await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.stale_plan_result = Some("plan-fresh".into()));
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "planned", |r, _| {
+        r.state == RolloutState::AwaitingApproval
+    })
+    .await;
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "web".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (r, hosts) = h
+        .wait(&id, "re-approval", |r, hs| {
+            r.state == RolloutState::AwaitingApproval
+                && host(hs, "a").plan_digest.as_deref() == Some("plan-fresh")
+        })
+        .await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Planned, "a stale plan is not a failure");
+    assert!(
+        super::view::detail(&r, &hosts, &[], &[])
+            .plans
+            .iter()
+            .any(|g| g.digest == "plan-fresh")
+    );
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "web".into(),
+        digests: vec!["plan-fresh".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait_state(&id, RolloutState::Completed).await;
+    let applies = h.applies();
+    assert_eq!(applies.len(), 2);
+    assert_eq!(applies[1].2.plan_digest, "plan-fresh");
+    assert!(
+        applies.iter().all(|a| !a.2.plan_digest.is_empty()),
+        "Apply always carries a digest"
+    );
 }

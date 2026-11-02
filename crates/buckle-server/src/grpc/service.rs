@@ -560,13 +560,15 @@ impl FleetService {
         if let Err(e) = stored {
             tracing::warn!(buckle.host = %host, error = %e, "an agent report could not be stored");
         }
-        let notify_ui = matches!(
-            msg,
+        // A drift pass with an empty digest found nothing; only a real
+        // drift is worth telling the UI about.
+        let notify_ui = match &msg {
+            agent_message::Msg::Drift(d) => !d.plan_digest.is_empty(),
             agent_message::Msg::Health(_)
-                | agent_message::Msg::Drift(_)
-                | agent_message::Msg::Result(_)
-                | agent_message::Msg::Rollback(_)
-        );
+            | agent_message::Msg::Result(_)
+            | agent_message::Msg::Rollback(_) => true,
+            _ => false,
+        };
         if matches!(
             msg,
             agent_message::Msg::Plan(_)
