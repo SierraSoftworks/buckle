@@ -36,10 +36,16 @@ impl State {
         let empty = flag("empty").is_some();
         let hosts = if empty { vec![] } else { data::hosts(now) };
         let details = hosts.iter().map(|h| data::host_detail(h, now)).collect();
+        let mut rollouts = if empty { vec![] } else { data::rollouts(now) };
+        if flag("awaiting").is_some()
+            && let Some(active) = rollouts.iter_mut().find(|r| r.summary.id == "42")
+        {
+            data::hold_at_cloud_gate(active, now);
+        }
         Self {
             hosts,
             details,
-            rollouts: if empty { vec![] } else { data::rollouts(now) },
+            rollouts,
             revisions: if empty { vec![] } else { data::revisions(now) },
             audit: if empty { vec![] } else { data::audit(now) },
             outbox: Vec::new(),
@@ -118,17 +124,21 @@ fn admin() -> Result<(), ApiError> {
 }
 
 pub fn me() -> Result<Option<Me>, ApiError> {
+    let viewer = flag("role").as_deref() == Some("viewer");
     match flag("auth").as_deref() {
         Some("expired") => Err(ApiError::Unauthorized),
-        Some("off") => Ok(None),
+        // A server without OIDC; with `role=viewer`, one whose admin_acl does
+        // not match the request.
+        Some("off") => Ok(Some(Me::anonymous(!viewer))),
         _ => {
             let mut me = data::me();
-            if flag("role").as_deref() == Some("viewer") {
+            if viewer {
                 me = Me {
                     name: "Victor Viewer".into(),
                     email: Some("victor@example.com".into()),
                     subject: "victor".into(),
                     is_admin: false,
+                    anonymous: false,
                 };
             }
             Ok(Some(me))
@@ -137,6 +147,9 @@ pub fn me() -> Result<Option<Me>, ApiError> {
 }
 
 pub fn refresh() -> Result<(), ApiError> {
+    if flag("session").as_deref() == Some("ended") {
+        return Err(ApiError::Unauthorized);
+    }
     match flag("auth").as_deref() {
         Some("expired") => Err(ApiError::Unauthorized),
         _ => Ok(()),
@@ -372,10 +385,23 @@ fn event(kind: &str, message: String, host: Option<&str>, phase: Option<&str>) -
     }
 }
 
+/// The timeline entries a demo action added (from index `before`), as the
+/// server's stream would deliver them.
+pub(super) fn timeline(detail: &RolloutDetail, before: usize) -> Vec<LiveEvent> {
+    detail.events[before.min(detail.events.len())..]
+        .iter()
+        .map(|event| LiveEvent::RolloutTimeline {
+            rollout_id: detail.summary.id.clone(),
+            event: event.clone(),
+        })
+        .collect()
+}
+
 pub fn approve(id: &str, request: &ApproveRequest) -> Result<RolloutDetail, ApiError> {
     admin()?;
     with(|s| {
         let detail = s.rollout_mut(id)?;
+        let before = detail.events.len();
         let phase = detail
             .phases
             .iter_mut()
@@ -413,6 +439,7 @@ pub fn approve(id: &str, request: &ApproveRequest) -> Result<RolloutDetail, ApiE
             .push(event("phase.approved", message.clone(), None, Some(&name)));
         let summary = detail.summary.clone();
         let snapshot = detail.clone();
+        s.outbox.extend(timeline(&snapshot, before));
         for h in changed {
             s.outbox.push(LiveEvent::RolloutHostChanged {
                 rollout_id: id.into(),
@@ -439,6 +466,7 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
     admin()?;
     with(|s| {
         let detail = s.rollout_mut(id)?;
+        let before = detail.events.len();
         let state = detail.summary.state;
         let next = match (action, state) {
             (
@@ -492,6 +520,7 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
             None,
         ));
         let snapshot = detail.clone();
+        s.outbox.extend(timeline(&snapshot, before));
         s.outbox.push(LiveEvent::RolloutChanged {
             rollout: snapshot.summary.clone(),
         });
@@ -505,6 +534,52 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
     })
 }
 
+pub fn reject(id: &str, reason: &str) -> Result<RolloutDetail, ApiError> {
+    admin()?;
+    if reason.trim().is_empty() {
+        return Err(ApiError::Server(
+            "Say why the rollout is rejected: the reason is recorded in the audit log.".into(),
+        ));
+    }
+    with(|s| {
+        let detail = s.rollout_mut(id)?;
+        let before = detail.events.len();
+        if detail.summary.state != RolloutState::AwaitingApproval {
+            return Err(ApiError::Conflict(format!(
+                "Rollout {id} is not awaiting approval, so there is nothing to reject; abort it instead."
+            )));
+        }
+        let phase = detail.summary.current_phase.clone();
+        detail.summary.state = RolloutState::Aborted;
+        detail.summary.finished_at = Some(Utc::now());
+        detail.summary.current_phase = None;
+        detail.events.push(event(
+            "rollout.abort",
+            format!("{} aborted the rollout. Rejected: {reason}", actor()),
+            None,
+            None,
+        ));
+        detail.events.push(event(
+            "rollout.reject",
+            format!("{} rejected the rollout: {reason}", actor()),
+            None,
+            phase.as_deref(),
+        ));
+        let snapshot = detail.clone();
+        s.outbox.extend(timeline(&snapshot, before));
+        s.outbox.push(LiveEvent::RolloutChanged {
+            rollout: snapshot.summary.clone(),
+        });
+        s.record(
+            &actor(),
+            "rollout.reject",
+            id,
+            format!("{} rejected the rollout: {reason}", actor()),
+        );
+        Ok(snapshot)
+    })
+}
+
 fn host_entry(
     s: &mut State,
     id: &str,
@@ -512,6 +587,7 @@ fn host_entry(
     f: impl FnOnce(&mut buckle_api::RolloutHost) -> Result<String, ApiError>,
 ) -> Result<RolloutDetail, ApiError> {
     let detail = s.rollout_mut(id)?;
+    let before = detail.events.len();
     let entry = detail
         .phases
         .iter_mut()
@@ -532,6 +608,7 @@ fn host_entry(
         rollout_id: id.into(),
         host: changed,
     });
+    s.outbox.extend(timeline(&snapshot, before));
     s.record(&actor(), "rollout.host", host, message);
     Ok(snapshot)
 }
@@ -602,7 +679,11 @@ pub fn catalog() -> Result<Catalog, ApiError> {
     Ok(data::catalog())
 }
 
-pub fn audit(filter: &str, before: Option<u64>) -> Result<Page<AuditEntry>, ApiError> {
+pub fn audit(
+    filter: &str,
+    before: Option<u64>,
+    progress: bool,
+) -> Result<Page<AuditEntry>, ApiError> {
     if let crate::logic::filter::Check::Invalid { message, .. } =
         crate::logic::filter::check(filter)
     {
@@ -614,6 +695,7 @@ pub fn audit(filter: &str, before: Option<u64>) -> Result<Page<AuditEntry>, ApiE
         let matched: Vec<AuditEntry> = crate::logic::filter::filter_entries(&s.audit, filter)
             .into_iter()
             .filter(|e| before.is_none_or(|b| e.id < b))
+            .filter(|e| progress || !e.is_progress())
             .cloned()
             .collect();
         let total = matched.len() as u64;

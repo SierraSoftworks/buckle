@@ -378,6 +378,7 @@ mod tests {
             updated_at: now,
             bake_until: None,
             needs_approval: stale,
+            needs_attention: false,
         };
         let rollout = RolloutDetail {
             summary: RolloutSummary {
@@ -412,6 +413,7 @@ mod tests {
                 approved_by: Some("alice".into()),
                 approved_at: None,
                 bake_until: None,
+                health_checks: vec![],
             }],
             plans: vec![],
             events: vec![],

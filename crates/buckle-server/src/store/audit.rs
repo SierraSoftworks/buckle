@@ -23,20 +23,8 @@ pub struct NewAudit {
 pub const SCAN_LIMIT: usize = 5000;
 
 /// Controller transitions that only show a host moving through a rollout's
-/// ordinary steps (`progress` in filters); outcomes such as healthy, failed,
-/// held, skipped or rolled back are not progress.
-pub const PROGRESS_ACTIONS: &[&str] = &[
-    "rollout.host.plan_pending",
-    "rollout.host.planned",
-    "rollout.host.baseline",
-    "rollout.host.applying",
-    "rollout.host.baking",
-    "rollout.host.rolling_back",
-];
-
-fn is_progress(actor: &str, action: &str) -> bool {
-    actor == "controller" && PROGRESS_ACTIONS.contains(&action)
-}
+/// ordinary steps (`progress` in filters). Shared with the UI.
+pub use buckle_api::PROGRESS_ACTIONS;
 
 fn progress_sql() -> String {
     let actions = PROGRESS_ACTIONS
@@ -92,7 +80,7 @@ impl Filterable for AuditView<'_> {
             "subject" => e.subject.as_deref().into(),
             "message" => e.message.as_str().into(),
             "trace_id" => e.trace_id.as_deref().into(),
-            "progress" => FilterValue::Bool(is_progress(&e.actor, &e.action)),
+            "progress" => FilterValue::Bool(e.is_progress()),
             other => match (other.strip_prefix("detail."), &e.detail) {
                 (Some(path), Some(detail)) => buckle_core::selectors::lookup_path(detail, path)
                     .map(buckle_core::selectors::json_to_filter_value)
@@ -249,6 +237,15 @@ impl<'c> Audit<'c> {
 }
 
 impl Audit<'_> {
+    /// Entry `id` when it belongs to a rollout's timeline: its subject is a
+    /// rollout and it is not about a host's registration (`host.*`).
+    pub fn rollout_entry(&self, id: u64) -> Result<Option<AuditEntry>> {
+        let only = format!(
+            " AND id = {id} AND subject IN (SELECT id FROM rollouts) AND action NOT LIKE 'host.%'"
+        );
+        Ok(self.rows(&only, id as i64 + 1, 1)?.pop())
+    }
+
     /// Entries about one subject (e.g. a rollout id), newest first.
     pub fn for_subject(&self, subject: &str, limit: u32) -> Result<Vec<AuditEntry>> {
         let mut stmt = self

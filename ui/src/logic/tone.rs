@@ -126,6 +126,12 @@ pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook 
         label.push_str(", needs approval");
     }
 
+    // Its own rollback failed: an operator must look, whatever the state.
+    if entry.needs_attention {
+        classes.push("block--attention");
+        label.push_str(", needs attention");
+    }
+
     if let Some(host) = host {
         let settled = matches!(
             entry.state,
@@ -301,6 +307,7 @@ mod tests {
             updated_at: Utc::now(),
             bake_until: None,
             needs_approval: false,
+            needs_attention: false,
         }
     }
 
@@ -405,6 +412,20 @@ mod tests {
         let mut waived = entry(HostRolloutState::Baking);
         waived.waived_checks = vec!["nomad/api".into()];
         assert_eq!(block_look(&waived, None).label, "baking, checks waived");
+    }
+
+    #[test]
+    fn a_host_whose_own_rollback_failed_needs_attention() {
+        let mut stuck = entry(HostRolloutState::Failed);
+        stuck.needs_attention = true;
+        let look = block_look(&stuck, None);
+        assert!(look.classes.contains(&"block--attention"));
+        assert_eq!(look.label, "failed, needs attention");
+        assert!(
+            !block_look(&entry(HostRolloutState::Failed), None)
+                .classes
+                .contains(&"block--attention")
+        );
     }
 
     #[test]

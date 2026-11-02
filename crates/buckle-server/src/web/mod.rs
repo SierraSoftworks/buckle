@@ -7,6 +7,7 @@ mod error;
 pub mod logger;
 pub mod oidc;
 mod routes;
+pub mod timeline;
 mod ui;
 
 pub use error::ApiError;
@@ -46,6 +47,8 @@ pub struct AppState {
     pub agent_sessions: Arc<crate::grpc::LiveSessions>,
     /// How often an event stream re-checks the session it was opened with.
     pub sse_recheck: std::time::Duration,
+    /// `telemetry.trace_url_template`: turns a trace id into a link.
+    pub trace_url_template: Option<String>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -88,7 +91,25 @@ impl AppState {
             server_version,
             agent_sessions: Default::default(),
             sse_recheck: std::time::Duration::from_secs(30),
+            trace_url_template: None,
         }
+    }
+
+    /// The link to `trace_id` in the tracing UI, when a template is set.
+    pub fn trace_url(&self, trace_id: Option<&str>) -> Option<String> {
+        let (template, id) = (self.trace_url_template.as_deref()?, trace_id?);
+        (!id.is_empty()).then(|| crate::config::trace_url(template, id))
+    }
+
+    /// Fills `trace_url` on a rollout summary from its `trace_id`.
+    pub fn link_rollout(
+        &self,
+        mut summary: buckle_api::RolloutSummary,
+    ) -> buckle_api::RolloutSummary {
+        if summary.trace_url.is_none() {
+            summary.trace_url = self.trace_url(summary.trace_id.as_deref());
+        }
+        summary
     }
 
     /// The OIDC redirect URI.
@@ -140,6 +161,10 @@ pub async fn serve(
     listener: std::net::TcpListener,
     cancel: CancellationToken,
 ) -> buckle_core::Result<()> {
+    for warning in state.web.startup_warnings() {
+        tracing::warn!("{warning}");
+    }
+    let relay = timeline::spawn(state.store.clone(), state.events.clone(), cancel.clone());
     let state = web::Data::new(state);
     let server = actix_web::HttpServer::new(move || app(state.clone()))
         .disable_signals()
@@ -158,7 +183,9 @@ pub async fn serve(
         cancel.cancelled().await;
         handle.stop(true).await;
     });
-    server.await.map_err(|e| {
+    let served = server.await;
+    relay.abort();
+    served.map_err(|e| {
         buckle_core::error::wrap_system(
             e,
             "The HTTP server stopped unexpectedly.",

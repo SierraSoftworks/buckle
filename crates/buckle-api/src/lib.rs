@@ -6,6 +6,7 @@ pub mod audit;
 pub mod auth;
 pub mod catalog;
 pub mod fleet;
+pub mod plan;
 pub mod revision;
 pub mod rollout;
 
@@ -13,6 +14,7 @@ pub use audit::*;
 pub use auth::*;
 pub use catalog::*;
 pub use fleet::*;
+pub use plan::*;
 pub use revision::*;
 pub use rollout::*;
 

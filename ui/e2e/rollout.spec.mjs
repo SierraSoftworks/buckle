@@ -41,10 +41,30 @@ describe("the rollout pipeline", () => {
     const tip = block.locator(".block__tip");
     await tip.waitFor({ state: "visible" });
     assert.match(await tip.textContent(), /pi-5.*failed.*nomad\/api/s);
-    assert.equal(await block.getAttribute("aria-label"), "pi-5: failed");
+    assert.equal(await block.getAttribute("aria-label"), "pi-5: failed, needs attention");
     await block.focus();
     await block.press("Enter");
     assert.equal(await heading(page), "pi-5");
+    await close();
+  });
+
+  test("a host whose own rollback failed is flagged for attention", async () => {
+    const { page, close } = await open("/rollouts/42");
+    await page.locator('a.block.block--attention[data-host="pi-5"]').waitFor();
+    const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });
+    await row.getByText("needs attention").waitFor();
+    await close();
+  });
+
+  test("each stage shows its health gate, red where a host fails a check", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const home = page.locator('[data-stage="home"] .gate-checks');
+    await home.getByText("backup/marker").waitFor();
+    const api = home.locator(".pill", { hasText: "nomad/api" });
+    assert.match(await api.getAttribute("class"), /tone-danger/, "pi-5 failed nomad/api");
+    const gate = page.getByTestId("health-gate");
+    await gate.getByText("nomad/unit").waitFor();
+    assert.equal(await gate.locator(".pill").count(), 4, "the cloud stage's four required checks");
     await close();
   });
 
@@ -125,6 +145,29 @@ describe("approving a phase", () => {
     await close();
   });
 
+  test("rejecting a rollout held at a gate needs a reason and ends it", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
+    await page.locator(".page-head .pill", { hasText: "awaiting approval" }).waitFor();
+    await page.getByRole("button", { name: "Reject…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Reject rollout #42" });
+    const confirm = dialog.getByRole("button", { name: "Reject rollout" });
+    await dialog.getByRole("textbox", { name: /Type/ }).fill("#42");
+    assert.ok(await confirm.isDisabled(), "a reason is required");
+    await dialog.getByRole("textbox", { name: /Reason/ }).fill("grey's removal takes the agent token too early");
+    await confirm.click();
+    await page.locator(".page-head .pill", { hasText: "aborted" }).waitFor();
+    await page.locator(".timeline__kind", { hasText: "rollout.reject" }).first().waitFor();
+    await close();
+  });
+
+  test("a running rollout offers no reject, only abort", async () => {
+    const { page, close } = await open("/rollouts/42");
+    await page.getByRole("button", { name: "Review and approve…" }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "Reject…" }).count(), 0);
+    await page.getByRole("button", { name: "Abort…" }).waitFor();
+    await close();
+  });
+
   test("a failed host can continue with its failing checks waived", async () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });
@@ -148,6 +191,17 @@ describe("live updates", () => {
     await block.waitFor();
     assert.equal(await block.getAttribute("data-state"), "applying");
     await eventually(async () => assert.equal(await block.getAttribute("data-state"), "baking"), 15_000);
+    await close();
+  });
+
+  test("timeline entries are appended as they arrive", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "live" });
+    await page.getByRole("button", { name: "Details for pi-4" }).click();
+    const timeline = page.locator(".host-row .timeline");
+    await timeline.waitFor();
+    const before = await timeline.locator(".timeline__item").count();
+    await timeline.locator(".timeline__kind", { hasText: "host.bake_started" }).waitFor({ timeout: 15_000 });
+    assert.equal(await timeline.locator(".timeline__item").count(), before + 1, "appended once");
     await close();
   });
 });

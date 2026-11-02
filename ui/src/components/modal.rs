@@ -166,6 +166,10 @@ pub struct ConfirmProps {
     pub note: bool,
     #[prop_or_default]
     pub note_placeholder: Option<AttrValue>,
+    /// The note is a required reason: the action stays disabled until one
+    /// is written (implies `note`).
+    #[prop_or_default]
+    pub note_required: bool,
     #[prop_or_default]
     pub error: Option<String>,
     pub on_confirm: Callback<String>,
@@ -182,7 +186,8 @@ pub fn confirm(props: &ConfirmProps) -> Html {
         && props
             .type_to_confirm
             .as_ref()
-            .is_none_or(|w| typed.trim() == w.as_str());
+            .is_none_or(|w| typed.trim() == w.as_str())
+        && (!props.note_required || !note.trim().is_empty());
 
     let on_ack = {
         let acked = acked.clone();
@@ -240,9 +245,9 @@ pub fn confirm(props: &ConfirmProps) -> Html {
                             autocomplete="off" spellcheck="false" data-autofocus="" />
                     </label>
                 }
-                if props.note {
+                if props.note || props.note_required {
                     <label class="field">
-                        <span class="field__label">{ "Note for the audit log (optional)" }</span>
+                        <span class="field__label">{ if props.note_required { "Reason for the audit log (required)" } else { "Note for the audit log (optional)" } }</span>
                         <textarea class="input" rows="2" value={(*note).clone()} oninput={on_note}
                             placeholder={props.note_placeholder.clone().unwrap_or_default()} />
                     </label>

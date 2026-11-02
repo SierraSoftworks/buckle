@@ -81,7 +81,10 @@ pub fn live_provider(props: &LiveProviderProps) -> Html {
                         dispatcher.dispatch(Action::Resync);
                     }
                     Signal::Frame(Frame::Event(e)) => dispatcher.dispatch(Action::Event(e)),
-                    Signal::Frame(Frame::Lagged) => dispatcher.dispatch(Action::Resync),
+                    // `sse::run` handles the end of a session itself.
+                    Signal::Frame(Frame::Lagged | Frame::SessionEnded) => {
+                        dispatcher.dispatch(Action::Resync)
+                    }
                     Signal::Retrying(secs) => {
                         dispatcher.dispatch(Action::Link(Link::Retrying(secs)))
                     }
@@ -104,9 +107,16 @@ pub fn live_provider(props: &LiveProviderProps) -> Html {
 fn demo_feed(dispatcher: UseReducerDispatcher<Live>) {
     use gloo_timers::callback::Interval;
     let ticking = crate::fixtures::flag("live").is_some();
+    // `?demo&session=ended`: the server ends the stream as a session lapses.
+    let ends = crate::fixtures::flag("session").as_deref() == Some("ended");
     let mut beat = 0u32;
     Interval::new(400, move || {
         beat += 1;
+        if ends && beat == 3 {
+            spawn_local(async {
+                crate::auth::session_ended().await;
+            });
+        }
         let mut events = crate::fixtures::store::drain();
         if ticking && beat.is_multiple_of(10) {
             events.extend(crate::fixtures::live::tick());

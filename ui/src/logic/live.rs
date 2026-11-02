@@ -71,11 +71,23 @@ pub fn apply_host_detail(detail: &mut HostDetail, event: &LiveEvent) {
     }
 }
 
-/// Applies a rollout or rollout-host change to a rollout's detail. A host
-/// whose entry now names another phase moves there, so it is still drawn in
-/// exactly one stage.
+/// Applies a rollout or rollout-host change, or a new timeline entry, to a
+/// rollout's detail. A host whose entry now names another phase moves
+/// there, so it is still drawn in exactly one stage. A timeline entry the
+/// detail already has (the fetch saw it) is not added twice; the timeline
+/// stays oldest first.
 pub fn apply_rollout(detail: &mut RolloutDetail, event: &LiveEvent) {
     match event {
+        LiveEvent::RolloutTimeline { rollout_id, event } if *rollout_id == detail.summary.id => {
+            if !detail.events.contains(event) {
+                let at = detail
+                    .events
+                    .iter()
+                    .rposition(|e| e.at <= event.at)
+                    .map_or(0, |i| i + 1);
+                detail.events.insert(at, event.clone());
+            }
+        }
         LiveEvent::RolloutChanged { rollout } if rollout.id == detail.summary.id => {
             detail.summary = rollout.clone();
         }
@@ -135,13 +147,20 @@ pub enum Frame {
     Event(Box<LiveEvent>),
     /// The server dropped events for this client: everything must be refetched.
     Lagged,
+    /// The session the stream was opened with no longer passes (expired,
+    /// signed out, or refused by the ACLs as they are now); the server has
+    /// closed the stream.
+    SessionEnded,
 }
 
 /// Decodes one SSE frame. The payload's own `type` tag decides the variant;
-/// the event name only distinguishes the out-of-band `lagged` signal.
+/// the event name only distinguishes the out-of-band `lagged` and
+/// `session_ended` signals.
 pub fn decode(name: &str, data: &str) -> Result<Frame, String> {
-    if name == "lagged" {
-        return Ok(Frame::Lagged);
+    match name {
+        "lagged" => return Ok(Frame::Lagged),
+        "session_ended" => return Ok(Frame::SessionEnded),
+        _ => {}
     }
     serde_json::from_str::<LiveEvent>(data)
         .map(|e| Frame::Event(Box::new(e)))
@@ -154,9 +173,11 @@ pub const EVENT_NAMES: &[&str] = &[
     "host_changed",
     "rollout_changed",
     "rollout_host_changed",
+    "rollout_timeline",
     "revision_added",
     "audit",
     "lagged",
+    "session_ended",
     "message",
 ];
 
@@ -308,6 +329,7 @@ mod tests {
             updated_at: Utc::now(),
             bake_until: None,
             needs_approval: false,
+            needs_attention: false,
         }
     }
 
@@ -324,6 +346,7 @@ mod tests {
             approved_by: None,
             approved_at: None,
             bake_until: None,
+            health_checks: vec![],
         }
     }
 
@@ -439,6 +462,43 @@ mod tests {
     }
 
     #[test]
+    fn timeline_entries_are_appended_once_in_time_order() {
+        let at = |secs: i64| Utc::now() - chrono::Duration::seconds(secs);
+        let ev = |kind: &str, when| buckle_api::RolloutEvent {
+            at: when,
+            kind: kind.into(),
+            message: kind.into(),
+            host: None,
+            phase: None,
+            actor: Some("controller".into()),
+        };
+        let started = ev("rollout.started", at(60));
+        let mut detail = RolloutDetail {
+            summary: summary("42", RolloutState::Rolling),
+            phases: vec![],
+            plans: vec![],
+            events: vec![started.clone()],
+        };
+        let live = |rollout: &str, event: &buckle_api::RolloutEvent| LiveEvent::RolloutTimeline {
+            rollout_id: rollout.into(),
+            event: event.clone(),
+        };
+        let done = ev("rollout.phase.done", at(10));
+        apply_rollout(&mut detail, &live("42", &done));
+        apply_rollout(&mut detail, &live("42", &done)); // twice is once
+        apply_rollout(&mut detail, &live("42", &started)); // the fetch had it
+        apply_rollout(&mut detail, &live("41", &ev("rollout.aborted", at(5))));
+        // A late arrival lands where its time puts it.
+        let approved = ev("rollout.approve", at(30));
+        apply_rollout(&mut detail, &live("42", &approved));
+        let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["rollout.started", "rollout.approve", "rollout.phase.done"]
+        );
+    }
+
+    #[test]
     fn lists_gain_new_items_at_the_top() {
         let mut rollouts = vec![summary("41", RolloutState::Completed)];
         apply_rollouts(
@@ -499,6 +559,8 @@ mod tests {
             other => panic!("expected a host change, got {other:?}"),
         }
         assert_eq!(decode("lagged", "{}"), Ok(Frame::Lagged));
+        assert_eq!(decode("session_ended", "{}"), Ok(Frame::SessionEnded));
+        assert!(EVENT_NAMES.contains(&"session_ended"));
         assert!(decode("host_changed", "{not json").is_err());
     }
 

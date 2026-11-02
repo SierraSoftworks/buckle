@@ -37,8 +37,17 @@ describe("session", () => {
     await page.waitForURL(/\/api\/v1\/auth\/login\?/);
     const target = new URL(page.url());
     assert.equal(target.pathname, "/api/v1/auth/login");
-    assert.equal(target.searchParams.get("next"), "/hosts/pi-1?demo&auth=expired");
-    assert.equal(target.searchParams.get("return_to"), target.searchParams.get("next"));
+    assert.equal(target.searchParams.get("return_to"), "/hosts/pi-1?demo&auth=expired");
+    assert.equal(target.searchParams.get("next"), null, "one spelling: return_to");
+    await close();
+  });
+
+  test("an event stream the server ends for the session goes to sign in", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "session=ended", allowErrors: true });
+    await page.locator("main h1").waitFor();
+    await page.waitForURL(/\/api\/v1\/auth\/login\?/);
+    const target = new URL(page.url());
+    assert.equal(target.searchParams.get("return_to"), "/rollouts/42?demo&session=ended");
     await close();
   });
 
@@ -46,6 +55,15 @@ describe("session", () => {
     const { page, close } = await open("/rollouts/42", { flags: "auth=off" });
     await page.getByText("no sign-in", { exact: true }).waitFor();
     await page.getByRole("button", { name: "Review and approve…" }).waitFor();
+    await close();
+  });
+
+  test("without sign-in, admin_acl still decides who may act", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "auth=off&role=viewer" });
+    await page.getByText("no sign-in", { exact: true }).waitFor();
+    await page.getByText("read only", { exact: true }).waitFor();
+    await page.getByText("Approving needs an administrator (admin_acl).").waitFor();
+    assert.equal(await page.getByRole("button", { name: "Review and approve…" }).count(), 0);
     await close();
   });
 

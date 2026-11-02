@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use buckle_api::{
     ActionRequest, ApproveRequest, AuditEntry, Catalog, ContinueRequest, CsrfToken, ErrorBody,
     Fleet, HealthResultDto, HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup,
-    RevisionSummary, RolloutDetail, RolloutSummary, StartRollout,
+    RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, StartRollout,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -216,8 +216,9 @@ async fn write<B: Serialize, T: DeserializeOwned>(
 
 // ------------------------------------------------------------------ session
 
-/// `GET /me`: `Some` for a signed-in user, `None` when the server has no
-/// sign-in configured (everything is then permitted).
+/// `GET /me`: who is asking and whether they may act. A server without
+/// sign-in answers with [`Me::anonymous`] set; one from before that field
+/// answered 204, read here as `None` (everything permitted).
 pub async fn me() -> Result<Option<Me>, ApiError> {
     demo!(demo_store::me());
     let response = send::<()>(Method::Get, "/me", None).await?;
@@ -349,6 +350,21 @@ pub async fn approve(id: &str, request: &ApproveRequest) -> Result<RolloutDetail
     .await
 }
 
+/// Turns down a rollout that is awaiting approval; it ends aborted, with
+/// `reason` in the audit log.
+pub async fn reject(id: &str, reason: &str) -> Result<RolloutDetail, ApiError> {
+    demo!(demo_store::reject(id, reason));
+    let body = RejectRequest {
+        reason: reason.into(),
+    };
+    write(
+        Method::Post,
+        &format!("/rollouts/{}/reject", enc(id)),
+        Some(&body),
+    )
+    .await
+}
+
 /// `pause`, `resume`, `rollback` or `abort`.
 pub async fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetail, ApiError> {
     demo!(demo_store::rollout_action(id, action, note));
@@ -401,12 +417,21 @@ pub async fn catalog() -> Result<Catalog, ApiError> {
 }
 
 /// A page of the audit log, newest first, optionally filtered with a filt-rs
-/// expression and continued from before an entry id.
-pub async fn audit(filter: &str, before: Option<u64>) -> Result<Page<AuditEntry>, ApiError> {
-    demo!(demo_store::audit(filter, before));
+/// expression and continued from before an entry id. Without `progress`
+/// the controller's progress transitions (`buckle_api::PROGRESS_ACTIONS`)
+/// are left out (`progress=false`).
+pub async fn audit(
+    filter: &str,
+    before: Option<u64>,
+    progress: bool,
+) -> Result<Page<AuditEntry>, ApiError> {
+    demo!(demo_store::audit(filter, before, progress));
     let mut path = format!("/audit?limit=100&filter={}", enc(filter.trim()));
     if let Some(before) = before {
         path.push_str(&format!("&before={before}"));
+    }
+    if !progress {
+        path.push_str("&progress=false");
     }
     get(&path).await
 }
