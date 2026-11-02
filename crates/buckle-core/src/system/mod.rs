@@ -7,7 +7,7 @@
 
 mod real;
 
-pub use real::RealSystem;
+pub use real::{HttpClient, RealSystem};
 
 use crate::Platform;
 use async_trait::async_trait;

@@ -505,15 +505,21 @@ dependencies = [
 name = "buckle"
 version = "2.0.0-dev"
 dependencies = [
+ "async-trait",
  "buckle-agent",
  "buckle-api",
  "buckle-core",
  "buckle-server",
  "buckle-std",
+ "chrono",
  "clap",
  "human-errors",
+ "reqwest 0.13.5",
  "rstest",
+ "schemars",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tokio-util",
