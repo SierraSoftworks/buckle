@@ -1254,6 +1254,68 @@ async fn without_a_template_trace_ids_stay_text() {
     assert_eq!(detail.summary.trace_url, None);
 }
 
+// ------------------------------------------------------------ rollout names
+
+#[actix_web::test]
+async fn rollouts_are_named_and_found_by_name() {
+    // `twin` shares `clash`'s first 33 bits, so the two share a name.
+    let (solo, clash, twin) = (
+        "0b5e7d21-4c3a-4e8f-9a1b-2c3d4e5f6a7b",
+        "3f2a9c1e-8b4d-4f6a-9c2e-1d7b5a3e9f01",
+        "3f2a9c1e-9000-4000-8000-000000000000",
+    );
+    let e = env(WebConfig::default()).await;
+    e.store
+        .call(move |db| {
+            for id in [solo, clash, twin] {
+                db.rollouts().save(&finished_rollout(id, None))?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let get = |uri: String| test::TestRequest::get().uri(&uri).to_request();
+    let name = |id: &str| buckle_api::rollout_name(id).unwrap();
+
+    let list: buckle_api::Page<buckle_api::RolloutSummary> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/rollouts".into())).await).await;
+    assert!(
+        list.items
+            .iter()
+            .all(|r| r.name.as_deref() == Some(name(&r.id).as_str()))
+    );
+
+    let typed = name(solo).replace('.', "-").to_uppercase();
+    for key in [solo.to_owned(), name(solo), typed] {
+        let resp = test::call_service(&app, get(format!("/api/v1/rollouts/{key}"))).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{key}");
+        let detail: buckle_api::RolloutDetail = test::read_body_json(resp).await;
+        assert_eq!(detail.summary.id, solo, "{key}");
+    }
+    for (uri, status) in [
+        (
+            format!("/api/v1/rollouts/{}/plans", name(solo)),
+            StatusCode::OK,
+        ),
+        (
+            format!("/api/v1/rollouts/{}", name(clash)),
+            StatusCode::CONFLICT,
+        ),
+        (format!("/api/v1/rollouts/{clash}"), StatusCode::OK),
+        (
+            "/api/v1/rollouts/abandon.ability.able".into(),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        assert_eq!(
+            test::call_service(&app, get(uri.clone())).await.status(),
+            status,
+            "{uri}"
+        );
+    }
+}
+
 // ------------------------------------------------------------ drift
 
 #[actix_web::test]

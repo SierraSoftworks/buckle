@@ -95,6 +95,7 @@ pub fn summary(record: &RolloutRecord, hosts: &[RolloutHostRecord]) -> RolloutSu
         .count() as u32;
     RolloutSummary {
         id: record.id.clone(),
+        name: buckle_api::rollout_name(&record.id),
         revision: record.revision.clone(),
         revision_message: record.runtime.revision_message.clone(),
         state: record.state,

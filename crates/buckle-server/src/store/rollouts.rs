@@ -176,6 +176,26 @@ impl<'c> Rollouts<'c> {
             .transpose()
     }
 
+    /// The ids of rollouts named `name`, newest first: the candidates sharing
+    /// its id prefix, narrowed to those whose full name matches.
+    pub fn ids_named(&self, name: &buckle_api::RolloutName) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id FROM rollouts WHERE id >= ?1 AND id < ?1 || '~' ORDER BY started_at DESC, rowid DESC",
+            )
+            .map_err(db_error)?;
+        let ids = stmt
+            .query_map(params![name.id_prefix()], |r| r.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        Ok(ids
+            .into_iter()
+            .filter(|id| buckle_api::RolloutName::of(id).as_ref() == Some(name))
+            .collect())
+    }
+
     /// Newest first.
     pub fn list(&self, limit: u32, offset: u32) -> Result<Vec<RolloutRecord>> {
         let mut stmt = self
