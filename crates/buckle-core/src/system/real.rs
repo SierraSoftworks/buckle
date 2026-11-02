@@ -12,6 +12,8 @@ pub struct RealSystem {
     http: Option<std::sync::Arc<dyn HttpClient>>,
     /// Reported instead of the running binary's platform (dry runs over facts).
     platform: Option<Platform>,
+    /// Buckle's own directory on this host, when the caller knows it.
+    state_dir: Option<PathBuf>,
 }
 
 /// HTTP is injected so that the core crate does not depend on an HTTP client;
@@ -35,6 +37,14 @@ impl RealSystem {
     /// so a dry run over another host's facts checks kinds against that host.
     pub fn with_platform(mut self, platform: Platform) -> Self {
         self.platform = Some(platform);
+        self
+    }
+
+    /// Reports `dir` from [`System::state_dir`] instead of the environment's
+    /// default, so tasks keep their ledgers and scratch files where the
+    /// agent or command was told to (`state_dir` in agent.yaml, `--state-dir`).
+    pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = Some(dir.into());
         self
     }
 
@@ -254,6 +264,17 @@ impl System for RealSystem {
 
     fn env_var(&self, name: &str) -> Option<String> {
         std::env::var(name).ok()
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        match &self.state_dir {
+            Some(dir) => dir.clone(),
+            None => self
+                .env_var("BUCKLE_STATE_DIR")
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/var/lib/buckle")),
+        }
     }
 
     async fn read(&self, path: &Path) -> crate::Result<Option<Vec<u8>>> {
