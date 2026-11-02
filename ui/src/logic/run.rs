@@ -10,6 +10,7 @@ use buckle_api::{
 };
 use chrono::{DateTime, Utc};
 
+use super::live::EventLog;
 use super::tone::Tone;
 
 pub fn run_label(state: RunState) -> &'static str {
@@ -669,46 +670,161 @@ pub fn track(current: Option<Activity>, p: &RunProgress) -> Option<Activity> {
     }
 }
 
-/// What each host of a rollout is doing, described for its block: from the
-/// reports held, kept current by the updates since, and from the updates
-/// alone for hosts without one. (A plain list while it is built: a rollout
-/// applies a handful of hosts at once, and the bundle is smaller for it.)
-pub fn activities<'a>(
-    mut reports: Vec<RunReport>,
-    rollout: &str,
-    events: impl IntoIterator<Item = &'a LiveEvent>,
-) -> BTreeMap<String, String> {
-    let mut tracked: Vec<(String, Option<Activity>)> = reports
-        .iter()
-        .map(|r| (r.host.clone(), activity(r)))
-        .collect();
-    for event in events {
-        let LiveEvent::RunProgress { progress: p } = event else {
-            continue;
-        };
-        if p.rollout_id.as_deref() != Some(rollout) {
-            continue;
+/// One applying host's report, held by a rollout page and kept current in
+/// place by the updates that follow it.
+#[derive(Debug, Clone, PartialEq)]
+struct Held {
+    host: String,
+    /// The live store's sequence number the report reflects updates up to.
+    seq: u64,
+    report: RunReport,
+    /// What the host is doing: from the report while it can take the
+    /// updates, from the updates alone when one names something it lacks.
+    now: Option<Activity>,
+}
+
+/// What the hosts of a rollout are doing, for their blocks: the report of
+/// each applying host, fetched once and then kept current by the updates
+/// (applied in place, never copied), and the updates alone for a host whose
+/// report is not held. A report that cannot take an update (a module it
+/// lacks) is not fetched again: the updates carry on from there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RolloutActivity {
+    rollout: String,
+    epoch: u64,
+    /// The last update looked at for the hosts not held.
+    seq: u64,
+    held: Vec<Held>,
+    /// Hosts known only from their updates.
+    loose: Vec<(String, Option<Activity>)>,
+    /// Hosts whose report is being fetched.
+    asking: Vec<String>,
+    /// Hosts the server had no report for: not asked again while they apply.
+    unanswered: Vec<String>,
+}
+
+impl RolloutActivity {
+    /// Brings everything up to the log's newest update. A rollout or an
+    /// epoch (a reconnection, a lag) of its own starts over; hosts that are
+    /// no longer applying are let go; a report whose updates were dropped
+    /// from the log is let go too, to be fetched again.
+    pub fn sync(&mut self, rollout: &str, epoch: u64, applying: &[String], log: &EventLog) {
+        if self.rollout != rollout || self.epoch != epoch {
+            *self = Self {
+                rollout: rollout.to_string(),
+                epoch,
+                seq: log.seq,
+                ..Self::default()
+            };
         }
-        let slot = match tracked.iter().position(|(h, _)| *h == p.host) {
-            Some(i) => i,
-            None => {
-                tracked.push((p.host.clone(), None));
-                tracked.len() - 1
+        self.held.retain(|h| applying.contains(&h.host));
+        self.loose.retain(|(h, _)| applying.contains(h));
+        self.unanswered.retain(|h| applying.contains(h));
+        let rollout = &self.rollout;
+        self.held.retain_mut(|h| {
+            let Some(events) = log.since(h.seq) else {
+                return false;
+            };
+            for event in events {
+                if let LiveEvent::RunProgress { progress: p } = &*event
+                    && p.host == h.host
+                    && p.rollout_id.as_deref() == Some(rollout.as_str())
+                {
+                    h.now = match apply_progress(&mut h.report, p) {
+                        Applied::Changed => activity(&h.report),
+                        _ => track(h.now.take(), p),
+                    };
+                }
             }
-        };
-        let held = reports
-            .iter_mut()
-            .find(|r| r.host == p.host && r.id == p.run_id);
-        let now = match held.map(|report| (apply_progress(report, p), report)) {
-            Some((Applied::Changed, report)) => activity(report),
-            _ => track(tracked[slot].1.take(), p),
-        };
-        tracked[slot].1 = now;
+            h.seq = log.seq;
+            true
+        });
+        match log.since(self.seq) {
+            None => self.loose.clear(),
+            Some(events) => {
+                for event in events {
+                    let LiveEvent::RunProgress { progress: p } = &*event else {
+                        continue;
+                    };
+                    if p.rollout_id.as_deref() != Some(rollout.as_str())
+                        || !applying.contains(&p.host)
+                        || self.held.iter().any(|h| h.host == p.host)
+                    {
+                        continue;
+                    }
+                    match self.loose.iter_mut().find(|(h, _)| *h == p.host) {
+                        Some((_, now)) => *now = track(now.take(), p),
+                        None => self.loose.push((p.host.clone(), track(None, p))),
+                    }
+                }
+            }
+        }
+        self.seq = log.seq;
     }
-    tracked
-        .into_iter()
-        .filter_map(|(host, a)| a.map(|a| (host, a.describe())))
-        .collect()
+
+    /// The applying hosts to fetch a report for, at most `max` in all held
+    /// or being fetched: neither held, nor being fetched, nor known to have
+    /// none.
+    pub fn to_ask(&self, applying: &[String], max: usize) -> Vec<String> {
+        let room = max.saturating_sub(self.held.len() + self.asking.len());
+        applying
+            .iter()
+            .filter(|h| {
+                !self.held.iter().any(|x| x.host == **h)
+                    && !self.asking.contains(h)
+                    && !self.unanswered.contains(h)
+            })
+            .take(room)
+            .cloned()
+            .collect()
+    }
+
+    /// Notes that these hosts' reports are being fetched.
+    pub fn asking(&mut self, hosts: &[String]) {
+        self.asking.extend(hosts.iter().cloned());
+    }
+
+    /// Takes the answers to a fetch made at `seq` in `epoch`: the reports,
+    /// to be brought up to date by the next [`RolloutActivity::sync`], and
+    /// the hosts without one. Answers from an earlier epoch are dropped.
+    pub fn answered(
+        &mut self,
+        epoch: u64,
+        seq: u64,
+        answers: impl IntoIterator<Item = (String, Option<RunReport>)>,
+    ) {
+        for (host, report) in answers {
+            self.asking.retain(|h| *h != host);
+            if epoch != self.epoch {
+                continue;
+            }
+            match report {
+                Some(report) => {
+                    self.loose.retain(|(h, _)| *h != host);
+                    self.held.retain(|h| h.host != host);
+                    self.held.push(Held {
+                        now: activity(&report),
+                        host,
+                        seq,
+                        report,
+                    });
+                }
+                None if !self.unanswered.contains(&host) => self.unanswered.push(host),
+                None => {}
+            }
+        }
+    }
+
+    /// What each host is doing, described for its block
+    /// (`nomad › file.template[…]`).
+    pub fn describe(&self) -> BTreeMap<String, String> {
+        self.held
+            .iter()
+            .map(|h| (h.host.as_str(), h.now.as_ref()))
+            .chain(self.loose.iter().map(|(h, a)| (h.as_str(), a.as_ref())))
+            .filter_map(|(host, a)| a.map(|a| (host.to_string(), a.describe())))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1297,35 +1413,159 @@ pub(crate) mod tests {
         assert_eq!(track(a, &end), None);
     }
 
-    #[test]
-    fn a_rollouts_hosts_report_what_they_are_doing() {
-        let held = live_report();
-        let event = |host: &str, run: &str, rollout: &str, step: &str| LiveEvent::RunProgress {
+    fn update(
+        host: &str,
+        run: &str,
+        rollout: Option<&str>,
+        step: &str,
+        state: StepState,
+    ) -> LiveEvent {
+        LiveEvent::RunProgress {
             progress: RunProgress {
                 host: host.into(),
                 run_id: run.into(),
-                rollout_id: Some(rollout.into()),
-                step_state: Some(StepState::Running),
+                rollout_id: rollout.map(Into::into),
+                step_state: Some(state),
                 ..progress(Some("nomad"), Some(step))
             },
-        };
-        let mut local = event("pi-4", "run-9", "", "apt.package[nomad]");
-        if let LiveEvent::RunProgress { progress } = &mut local {
-            progress.rollout_id = None;
         }
-        let events = [
-            event("pi-1", "run-1", "42", "file.copy[c]"),
-            event("pi-2", "run-7", "42", "apt.package[nomad]"),
-            event("pi-3", "run-8", "41", "apt.package[nomad]"),
-            local,
-        ];
-        let map = activities(vec![held], "42", &events);
-        // pi-1's held report was moved on by the update: two steps running,
-        // the first is named.
+    }
+
+    fn hosts(list: &[&str]) -> Vec<String> {
+        list.iter().map(|h| h.to_string()).collect()
+    }
+
+    #[test]
+    fn a_rollouts_hosts_report_what_they_are_doing() {
+        let mut log = EventLog::default();
+        let applying = hosts(&["pi-1", "pi-2", "pi-3", "pi-4"]);
+        let mut a = RolloutActivity::default();
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.to_ask(&applying, 24), applying, "nothing held yet");
+        a.asking(&applying);
+        assert!(a.to_ask(&applying, 24).is_empty(), "being fetched");
+
+        // The fetch was made at sequence 0; updates arrive meanwhile.
+        log.push(update(
+            "pi-1",
+            "run-1",
+            Some("42"),
+            "file.copy[c]",
+            StepState::Running,
+        ));
+        log.push(update(
+            "pi-2",
+            "run-7",
+            Some("42"),
+            "apt.package[nomad]",
+            StepState::Running,
+        ));
+        log.push(update(
+            "pi-3",
+            "run-8",
+            Some("41"),
+            "apt.package[nomad]",
+            StepState::Running,
+        ));
+        log.push(update(
+            "pi-4",
+            "run-9",
+            None,
+            "apt.package[nomad]",
+            StepState::Running,
+        ));
+        a.sync("42", 0, &applying, &log);
+        a.answered(
+            0,
+            0,
+            [
+                ("pi-1".to_string(), Some(live_report())),
+                ("pi-2".to_string(), None),
+                ("pi-3".to_string(), None),
+                ("pi-4".to_string(), None),
+            ],
+        );
+        a.sync("42", 0, &applying, &log);
+        let map = a.describe();
+        // pi-1's report took the update made while it was fetched: two
+        // steps running, the first is named.
         assert_eq!(map["pi-1"], "nomad › file.copy[b]");
+        // pi-2 has no report: its updates alone say what it does.
         assert_eq!(map["pi-2"], "nomad › apt.package[nomad]");
-        assert!(!map.contains_key("pi-3"), "another rollout's host");
+        assert!(!map.contains_key("pi-3"), "another rollout's run");
         assert!(!map.contains_key("pi-4"), "a run outside any rollout");
+        // Nobody is asked about twice: held, or known to have no report.
+        assert!(a.to_ask(&applying, 24).is_empty());
+
+        // The held report is kept current in place.
+        log.push(update(
+            "pi-1",
+            "run-1",
+            Some("42"),
+            "file.copy[b]",
+            StepState::Changed,
+        ));
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.describe()["pi-1"], "nomad › file.copy[c]");
+        // An update it cannot take (a step it lacks) is followed alone,
+        // without fetching it again.
+        log.push(update(
+            "pi-1",
+            "run-1",
+            Some("42"),
+            "file.copy[new]",
+            StepState::Running,
+        ));
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.describe()["pi-1"], "nomad › file.copy[new]");
+        assert!(a.to_ask(&applying, 24).is_empty());
+    }
+
+    #[test]
+    fn rollout_activity_lets_go_of_what_it_can_no_longer_vouch_for() {
+        let mut log = EventLog::default();
+        let applying = hosts(&["pi-1", "pi-2"]);
+        let mut a = RolloutActivity::default();
+        a.sync("42", 0, &applying, &log);
+        a.asking(&applying);
+        a.answered(
+            0,
+            0,
+            [
+                ("pi-1".to_string(), Some(live_report())),
+                ("pi-2".to_string(), None),
+            ],
+        );
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.to_ask(&applying, 24), Vec::<String>::new());
+        assert_eq!(
+            a.to_ask(&hosts(&["pi-1", "pi-2", "pi-5"]), 1),
+            Vec::<String>::new(),
+            "one report held, at most one"
+        );
+        assert_eq!(
+            a.to_ask(&hosts(&["pi-1", "pi-2", "pi-5"]), 24),
+            hosts(&["pi-5"])
+        );
+
+        // A host that stopped applying is let go, and asked about afresh if
+        // it applies again.
+        a.sync("42", 0, &hosts(&["pi-1"]), &log);
+        assert_eq!(a.to_ask(&applying, 24), hosts(&["pi-2"]));
+
+        // Updates dropped from the log: the report is fetched again.
+        for _ in 0..EventLog::CAPACITY + 1 {
+            log.push(update("pi-9", "run-0", Some("42"), "x", StepState::Running));
+        }
+        a.sync("42", 0, &applying, &log);
+        assert_eq!(a.to_ask(&applying, 24), applying);
+
+        // A new epoch starts over, and an answer from the old one is dropped.
+        a.asking(&applying);
+        a.sync("42", 1, &applying, &log);
+        a.answered(0, 0, [("pi-1".to_string(), Some(live_report()))]);
+        assert!(a.describe().is_empty());
+        assert_eq!(a.to_ask(&applying, 24), applying);
     }
 
     #[test]

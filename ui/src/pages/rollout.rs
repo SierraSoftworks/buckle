@@ -24,7 +24,7 @@ use crate::logic::format::{count, first_line, relative, short, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{GateKind, GateState, layout};
 use crate::logic::plan::{ApprovalScope, approval_scope};
-use crate::logic::run::activities;
+use crate::logic::run::RolloutActivity;
 use crate::logic::tone::{
     Tone, check_status_tone, host_error_headline, host_error_tone, host_state_label,
     host_state_tone, rollout_finished, rollout_state_label, rollout_state_tone,
@@ -36,7 +36,7 @@ pub struct Props {
     pub id: String,
 }
 
-/// The most reports fetched at once for the blocks' "in progress" detail: a
+/// The most reports held at once for the blocks' "in progress" detail: a
 /// phase applies a few hosts at a time, and the updates cover the rest.
 const MAX_ACTIVITY_REPORTS: usize = 24;
 
@@ -93,8 +93,9 @@ pub fn rollout_page(props: &Props) -> Html {
     });
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
-    // The reports of the hosts applying now, so their blocks can say which
-    // module and step they are on; run updates keep that current.
+    // What the applying hosts are doing, for their blocks: each one's
+    // report fetched once (all at the same time) and kept current by the
+    // run updates, or the updates alone while there is none.
     let applying: Vec<String> = live
         .as_ref()
         .map(|d| {
@@ -106,27 +107,39 @@ pub fn rollout_page(props: &Props) -> Html {
                 .map(|h| h.host.clone())
                 .collect();
             v.sort();
-            v.truncate(MAX_ACTIVITY_REPORTS);
             v
         })
         .unwrap_or_default();
-    let reports = use_fetch((props.id.clone(), applying), |(id, hosts)| async move {
-        let mut reports = Vec::new();
-        for host in &hosts {
-            if let Ok(report) = api::rollout_host_report(&id, host).await {
-                reports.push(report);
+    let tracker = use_mut_ref(RolloutActivity::default);
+    let redraw = use_force_update();
+    let (activity, to_ask) = {
+        let mut t = tracker.borrow_mut();
+        t.sync(&props.id, store.epoch, &applying, &store.log);
+        (t.describe(), t.to_ask(&applying, MAX_ACTIVITY_REPORTS))
+    };
+    {
+        let (tracker, id) = (tracker.clone(), props.id.clone());
+        let (epoch, seq) = (store.epoch, store.log.seq);
+        use_effect_with(to_ask, move |hosts| {
+            if !hosts.is_empty() {
+                tracker.borrow_mut().asking(hosts);
+                let hosts = hosts.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let reports = futures::future::join_all(
+                        hosts.iter().map(|h| api::rollout_host_report(&id, h)),
+                    )
+                    .await;
+                    tracker.borrow_mut().answered(
+                        epoch,
+                        seq,
+                        hosts.into_iter().zip(reports.into_iter().map(Result::ok)),
+                    );
+                    redraw.force_update();
+                });
             }
-        }
-        Ok::<_, ApiError>(reports)
-    });
-    let activity: BTreeMap<String, String> = reports
-        .data
-        .as_ref()
-        .map(|data| {
-            let events = store.log.since(data.0).unwrap_or_default();
-            activities(data.1.clone(), &props.id, events.iter().map(|e| &**e))
-        })
-        .unwrap_or_default();
+            || ()
+        });
+    }
     let ask = use_state(|| None::<Ask>);
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
