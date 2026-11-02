@@ -56,6 +56,10 @@ pub struct AgentOptions {
     pub backoff_max: Duration,
     /// Whether the backoff is jittered.
     pub backoff_jitter: bool,
+    /// Cap of the backoff after the server refuses the host outright
+    /// (`Rejected { retry: false }`): the agent keeps running and retries,
+    /// from `backoff_min` doubling to this (1 h).
+    pub rejected_backoff_max: Duration,
     /// Minimum spacing between ApplyEvent messages (100 ms, i.e. 10/s).
     pub event_spacing: Duration,
     /// How long shutdown waits for a running operation.
@@ -71,6 +75,7 @@ impl Default for AgentOptions {
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(300),
             backoff_jitter: true,
+            rejected_backoff_max: Duration::from_secs(3600),
             event_spacing: coalesce::EVENT_SPACING,
             shutdown_grace: Duration::from_secs(60),
         }
@@ -177,6 +182,9 @@ struct Shared {
     watchdog_queued: AtomicBool,
     /// The revision an Apply is running for, for Hello.
     applying: Mutex<Option<RevisionId>>,
+    /// The server refused the stored per-host token: present the bootstrap
+    /// token instead (a forgotten host registers afresh, design §08).
+    use_bootstrap: AtomicBool,
 }
 
 enum SessionEnd {
@@ -368,12 +376,16 @@ impl Agent {
                 watchdog_wake: Notify::new(),
                 watchdog_queued: AtomicBool::new(false),
                 applying: Mutex::new(None),
+                use_bootstrap: AtomicBool::new(false),
             }),
         })
     }
 
-    /// Runs until `shutdown` trips, an upgrade asks for a restart (exit code
-    /// 0), or the server rejects the host without retry (an error).
+    /// Runs until `shutdown` trips or an upgrade asks for a restart (exit
+    /// code 0). A server that refuses the host outright does not stop the
+    /// agent (a service manager would only restart it every few seconds):
+    /// it backs off up to an hour, falling back to the bootstrap token when
+    /// the per-host token was refused.
     pub async fn run(self, shutdown: CancellationToken) -> buckle_core::Result<i32> {
         let shared = self.shared;
         shared.load().await?;
@@ -398,8 +410,13 @@ impl Agent {
         );
 
         let mut backoff = Backoff::new(shared.options.backoff_min, shared.options.backoff_max);
+        let mut rejected_backoff = Backoff::new(
+            shared.options.backoff_min,
+            shared.options.rejected_backoff_max,
+        );
         if !shared.options.backoff_jitter {
             backoff = backoff.without_jitter();
+            rejected_backoff = rejected_backoff.without_jitter();
         }
         let result = loop {
             if shutdown.is_cancelled() || shared.stop.is_cancelled() {
@@ -407,15 +424,17 @@ impl Agent {
             }
             let hello = shared.hello().await;
             tracing::debug!(?hello, "connecting");
+            let used_bootstrap = hello.bootstrap;
             let connected = tokio::select! {
                 result = shared.transport.connect(hello) => Some(result),
                 _ = shutdown.cancelled() => None,
                 _ = shared.stop.cancelled() => None,
             };
+            let mut refused = false;
             match connected {
                 None => break Ok(0),
                 Some(Ok(session)) => {
-                    let span = tracing::info_span!("agent.session", host = %shared.host_id);
+                    let span = tracing::info_span!("agent.session", buckle.host = %shared.host_id);
                     match shared
                         .clone()
                         .drive(session, &queue, &shutdown)
@@ -427,13 +446,8 @@ impl Agent {
                             reason,
                             retry: false,
                         } => {
-                            tracing::error!(%reason, "the server rejected this host; not retrying");
-                            break Err(buckle_core::error::user(
-                                format!("The server rejected this host: {reason}"),
-                                &[
-                                    "Ask a Buckle admin to approve or re-enrol the host, then restart the agent.",
-                                ],
-                            ));
+                            refused = true;
+                            shared.refused(&reason, used_bootstrap);
                         }
                         SessionEnd::Rejected {
                             reason,
@@ -444,6 +458,7 @@ impl Agent {
                         SessionEnd::Closed { welcomed } => {
                             if welcomed {
                                 backoff.reset();
+                                rejected_backoff.reset();
                             }
                         }
                     }
@@ -452,7 +467,13 @@ impl Agent {
                     tracing::warn!(error = %err.description(), "could not connect to the server");
                 }
             }
-            let delay = backoff.next_delay();
+            // A refusal that the bootstrap token may get past is retried on
+            // the normal schedule; any other is retried slowly.
+            let delay = if refused && !shared.use_bootstrap.load(Ordering::SeqCst) {
+                rejected_backoff.next_delay()
+            } else {
+                backoff.next_delay()
+            };
             tracing::info!(delay = ?delay, "reconnecting after a delay");
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
@@ -501,6 +522,23 @@ impl Shared {
         Ok(())
     }
 
+    /// The server refused the host outright. When it refused the stored
+    /// per-host token (the host may have been forgotten) and a bootstrap
+    /// token is configured, the next attempt presents the bootstrap token so
+    /// the host registers afresh; when the bootstrap token was refused too,
+    /// the next attempt goes back to the stored token.
+    fn refused(&self, reason: &str, used_bootstrap: bool) {
+        let can_fall_back =
+            self.config.bootstrap_token.is_some() && matches!(self.store.read_token(), Ok(Some(_)));
+        if !used_bootstrap && can_fall_back {
+            tracing::warn!(%reason, "the server refused this host's token; registering again with the bootstrap token");
+            self.use_bootstrap.store(true, Ordering::SeqCst);
+        } else {
+            self.use_bootstrap.store(false, Ordering::SeqCst);
+            tracing::error!(%reason, "the server refused this host; retrying with backoff (ask a Buckle admin to approve or re-enrol it)");
+        }
+    }
+
     fn save_agent(&self, data: &Data) {
         if let Err(err) = self.store.save_agent_state(&data.agent) {
             tracing::error!(error = %err.description(), "could not persist the agent's session state");
@@ -512,6 +550,9 @@ impl Shared {
         let issued = self.store.read_token().unwrap_or_else(|err| {
             tracing::warn!(error = %err.description(), "could not read the per-host token");
             None
+        });
+        let issued = issued.filter(|_| {
+            !(self.use_bootstrap.load(Ordering::SeqCst) && self.config.bootstrap_token.is_some())
         });
         let (token, bootstrap) = match issued {
             Some(t) => (Some(t), false),
@@ -643,7 +684,10 @@ impl Shared {
         );
         if let Some(token) = &welcome.issued_token {
             match self.store.write_token(token) {
-                Ok(()) => tracing::info!("stored the per-host token issued by the server"),
+                Ok(()) => {
+                    self.use_bootstrap.store(false, Ordering::SeqCst);
+                    tracing::info!("stored the per-host token issued by the server")
+                }
                 Err(err) => {
                     tracing::error!(error = %err.description(), "could not store the per-host token")
                 }

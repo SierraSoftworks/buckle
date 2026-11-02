@@ -478,3 +478,78 @@ async fn bake_checks_run_at_their_own_intervals_until_the_deadline() {
     );
     h.stop().await.expect("clean exit");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_final_rejection_keeps_the_agent_running_with_a_slow_backoff() {
+    let mut h = Harness::start(Setup::default()).await;
+    let reject = || {
+        pb::server_message::Msg::Rejected(pb::Rejected {
+            reason: "unknown host".into(),
+            retry: false,
+        })
+    };
+    for _ in 0..8 {
+        let session = h.sessions.accept().await;
+        session.send(reject()).await;
+    }
+    let attempts = h.fleet.attempts();
+    let gaps: Vec<u64> = attempts
+        .windows(2)
+        .map(|w| (w[1] - w[0]).as_secs())
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![1, 2, 4, 8, 16, 32, 64],
+        "doubling, not a fixed restart loop"
+    );
+    assert!(
+        h.handle.as_ref().is_some_and(|j| !j.is_finished()),
+        "still running"
+    );
+    // Capped at an hour (128 s … 2048 s, then 3600 s rather than 4096 s).
+    for _ in 0..5 {
+        let session = h.sessions.accept().await;
+        session.send(reject()).await;
+    }
+    tokio::time::sleep(Duration::from_secs(3700)).await;
+    let attempts = h.fleet.attempts();
+    assert_eq!(attempts.len(), 14);
+    let last = attempts[attempts.len() - 1] - attempts[attempts.len() - 2];
+    assert_eq!(last, Duration::from_secs(3600));
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_host_token_falls_back_to_the_bootstrap_token() {
+    let mut h = Harness::start(Setup {
+        yaml: "bootstrap_token: boot-strap\n".into(),
+        prepare: Some(Box::new(|dir: &Path| {
+            let store = Store::new(dir);
+            store.ensure().expect("ensure");
+            store.write_token("forgotten-token").expect("token");
+        })),
+        ..Default::default()
+    })
+    .await;
+    let first = h.sessions.accept().await;
+    assert_eq!(first.hello.token, "forgotten-token");
+    assert!(!first.hello.bootstrap);
+    // The admin forgot the host: its token is no longer known.
+    first
+        .send(pb::server_message::Msg::Rejected(pb::Rejected {
+            reason: "The token is not recognised.".into(),
+            retry: false,
+        }))
+        .await;
+    let second = h.sessions.accept().await;
+    assert_eq!(second.hello.token, "boot-strap");
+    assert!(second.hello.bootstrap, "it registers afresh");
+    second.send(welcome(None, Some("fresh-token"))).await;
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.read_token().ok().flatten().as_deref() == Some("fresh-token")).await;
+    drop(second);
+    let third = h.sessions.accept().await;
+    assert_eq!(third.hello.token, "fresh-token");
+    assert!(!third.hello.bootstrap);
+    h.stop().await.expect("clean exit");
+}

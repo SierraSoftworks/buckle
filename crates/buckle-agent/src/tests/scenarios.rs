@@ -718,29 +718,19 @@ async fn reconnect_backoff_grows_and_resets_after_a_session() {
     h.stop().await.expect("clean exit");
 }
 
-#[rstest]
-#[case::final_rejection(false)]
-#[case::retryable(true)]
 #[tokio::test(start_paused = true)]
-async fn rejection_stops_the_agent_unless_retry_is_allowed(#[case] retry: bool) {
+async fn a_retryable_rejection_reconnects() {
     let mut h = Harness::start(Setup::default()).await;
     let session = h.sessions.accept().await;
     session
         .send(pb::server_message::Msg::Rejected(pb::Rejected {
-            reason: "unknown host".into(),
-            retry,
+            reason: "server busy".into(),
+            retry: true,
         }))
         .await;
-    if retry {
-        let again = h.sessions.accept().await;
-        assert_eq!(again.hello.host_id, "test-host");
-        h.stop().await.expect("clean exit");
-    } else {
-        let err = h.join().await.expect_err("the agent gives up");
-        assert!(err.description().contains("unknown host"));
-        tokio::time::sleep(Duration::from_secs(600)).await;
-        assert_eq!(h.fleet.attempts().len(), 1, "no further attempts");
-    }
+    let again = h.sessions.accept().await;
+    assert_eq!(again.hello.host_id, "test-host");
+    h.stop().await.expect("clean exit");
 }
 
 #[tokio::test(start_paused = true)]
