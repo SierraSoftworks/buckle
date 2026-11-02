@@ -218,10 +218,29 @@ pub fn destructive_in(hosts: &[&RolloutHost], plans: &[PlanGroup]) -> bool {
     })
 }
 
+/// Whether any distinct plan used by these hosts has a deferred module, whose
+/// plan is only known at apply time: `if_destructive` reviews it as if it
+/// were destructive, as the server does.
+fn deferred_in(hosts: &[&RolloutHost], plans: &[PlanGroup]) -> bool {
+    hosts.iter().any(|h| {
+        plans.iter().any(|g| {
+            g.plan.as_ref().is_some_and(|p| !p.deferred.is_empty())
+                && (h.plan_digest.as_deref() == Some(g.digest.as_str())
+                    || g.hosts.contains(&h.host))
+        })
+    })
+}
+
 fn gate(phase: &RolloutPhase, hosts: &[&RolloutHost], plans: &[PlanGroup]) -> Gate {
     let policy = phase.approval.to_ascii_lowercase();
-    let because_destructive = policy == "if_destructive" && destructive_in(hosts, plans);
-    let kind = if policy == "required" || because_destructive {
+    // The server is the authority on whether the stage waits for an
+    // approval: a phase it holds, or a host it says needs one, is gated
+    // whatever the plans here suggest.
+    let server_asks =
+        phase.state == PhaseState::AwaitingApproval || hosts.iter().any(|h| h.needs_approval);
+    let because_destructive = policy == "if_destructive"
+        && (server_asks || destructive_in(hosts, plans) || deferred_in(hosts, plans));
+    let kind = if policy == "required" || because_destructive || server_asks {
         GateKind::Approval
     } else {
         GateKind::Auto
@@ -545,6 +564,76 @@ mod tests {
         assert!(p.stages[1].gate.closed());
         assert_eq!(p.stages[1].gate.label(), "needs approval");
         assert!(!p.stages[0].gate.closed());
+    }
+
+    /// A lone host in an `if_destructive` phase whose plan the server holds
+    /// for approval, though no plan group here is marked destructive: the
+    /// stage is still gated, so the page offers its approval.
+    #[test]
+    fn a_stage_the_server_holds_for_approval_is_gated() {
+        use buckle_api::{ModuleNote, PlanView};
+        let group = |deferred: bool| PlanGroup {
+            digest: "aaaa".into(),
+            hosts: vec!["prophet".into()],
+            changes: 1,
+            removals: 0,
+            destructive: false,
+            plan: Some(PlanView {
+                deferred: if deferred {
+                    vec![ModuleNote {
+                        module: "otel".into(),
+                        ..ModuleNote::default()
+                    }]
+                } else {
+                    vec![]
+                },
+                ..PlanView::default()
+            }),
+        };
+        let lone = |needs_approval: bool| {
+            let mut h = host("prophet", "rest", HostRolloutState::Planned, 1);
+            h.needs_approval = needs_approval;
+            h
+        };
+        let cases = [
+            (
+                "held",
+                PhaseState::AwaitingApproval,
+                true,
+                false,
+                GateState::AwaitingApproval,
+            ),
+            (
+                "host asks",
+                PhaseState::Running,
+                true,
+                false,
+                GateState::Open,
+            ),
+            (
+                "deferred, not reached",
+                PhaseState::Pending,
+                false,
+                true,
+                GateState::Waiting,
+            ),
+        ];
+        for (name, state, needs, deferred, want) in cases {
+            let d = detail(
+                vec![
+                    phase("canary", PhaseState::Done, "auto", vec![]),
+                    phase("rest", state, "if_destructive", vec![lone(needs)]),
+                ],
+                vec![group(deferred)],
+            );
+            let gate = &layout(&d).stages[1].gate;
+            assert_eq!(
+                (gate.kind, gate.state),
+                (GateKind::Approval, want),
+                "{name}"
+            );
+            assert!(gate.because_destructive, "{name}");
+        }
     }
 
     #[test]

@@ -638,3 +638,34 @@
     margin-left: 0.4rem;
   }
 }
+
+// A host's blueprint reuses the run's module and step rows; these are the
+// states only a blueprint has.
+.blueprint {
+  .run-module--drifted {
+    border-left-color: var(--warn);
+  }
+
+  .run-module--removing,
+  .run-module--applying {
+    border-left-color: var(--active);
+  }
+
+  .run-step--drifted .run-step__state {
+    color: var(--warn);
+    font-weight: 600;
+  }
+
+  .run-step--applying,
+  .run-step--removing {
+    .run-step__state {
+      color: var(--active);
+      font-weight: 600;
+    }
+  }
+
+  .run-step--removing .run-step__key {
+    text-decoration: line-through;
+    text-decoration-color: color-mix(in srgb, var(--fg-3) 60%, transparent);
+  }
+}

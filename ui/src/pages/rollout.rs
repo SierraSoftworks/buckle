@@ -97,18 +97,22 @@ pub fn rollout_page(props: &Props) -> Html {
         })
         .unwrap_or(0);
     let settled = use_debounced(touched, 1_500);
+    // The plans are fetched again with the detail: a host that plans (or
+    // re-plans) after the page opened is otherwise missing from the
+    // approval pane's scope, leaving nothing to approve.
+    let plans = use_fetch(props.id.clone(), |id| async move {
+        api::rollout_plans(&id).await
+    });
     {
-        let reload = detail.reload.clone();
+        let (reload, reload_plans) = (detail.reload.clone(), plans.reload.clone());
         use_effect_with(settled, move |n| {
             if *n > 0 {
                 reload.emit(());
+                reload_plans.emit(());
             }
             || ()
         });
     }
-    let plans = use_fetch(props.id.clone(), |id| async move {
-        api::rollout_plans(&id).await
-    });
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
     // What the applying hosts are doing, for their blocks: each one's
