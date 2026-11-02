@@ -1,7 +1,7 @@
 //! `ufw.state`: enable or disable the firewall and set its logging level.
 
 use super::sys_exec::{legacy_ledger, run_checked};
-use super::ufw_common::{installed, read_status, ufw};
+use super::ufw_common::{installed, lockout_reason, read_status, ufw};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::state::ResourceRecord;
@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 /// Enables or disables ufw and optionally sets its logging level.
 ///
 /// `enabled: true` runs `ufw --force enable` (no confirmation prompt), so
-/// order it after the `ufw.rule` that keeps SSH reachable. `logging` is one
+/// order it after the `ufw.rule` that keeps SSH reachable. Enabling is
+/// refused (blocked, with advice) unless a rule on the host, or a `ufw.rule`
+/// earlier in the same plan, allows or limits incoming SSH (the `Port`s in
+/// sshd_config, default 22/tcp) or all traffic on a management interface
+/// such as `tailscale0`; set `allow_lockout: true` to enable anyway. `logging` is one
 /// of `off`, `on`, `low`, `medium`, `high` or `full`; `on` accepts whatever
 /// level is already active. When ufw is inactive its status command says
 /// nothing about logging, so the level is read from `/etc/ufw/ufw.conf`.
@@ -30,6 +34,9 @@ pub struct Spec {
     /// Logging level: `off`, `on`, `low`, `medium`, `high` or `full`.
     #[serde(default)]
     pub logging: Option<String>,
+    /// Enable even when no rule keeps SSH or a management interface reachable.
+    #[serde(default)]
+    pub allow_lockout: bool,
 }
 
 const LEVELS: &[&str] = &["off", "on", "low", "medium", "high", "full"];
@@ -80,11 +87,24 @@ impl Task for UfwState {
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         validate(spec)?;
         if !installed(cx).await? {
+            if spec.enabled
+                && !spec.allow_lockout
+                && let Some(reason) = lockout_reason(cx, "Enabling ufw", true).await?
+            {
+                return Ok(Planned::blocked(reason));
+            }
             return Ok(Planned::change(Diff::Opaque {
                 summary: format!("{} (ufw is not installed yet)", Self::describe(spec)),
             }));
         }
         let status = read_status(cx, false).await?;
+        if spec.enabled
+            && !status.active
+            && !spec.allow_lockout
+            && let Some(reason) = lockout_reason(cx, "Enabling ufw", true).await?
+        {
+            return Ok(Planned::blocked(reason));
+        }
         let mut changes = Vec::new();
         if status.active != spec.enabled {
             changes.push(
@@ -149,6 +169,15 @@ impl Task for UfwState {
                 was_enabled = Some(status.active);
             }
             if spec.enabled {
+                // The rules that keep the host reachable must be in place by now.
+                if !spec.allow_lockout
+                    && let Some(reason) = lockout_reason(cx, "Enabling ufw", false).await?
+                {
+                    return Err(buckle_core::error::user(
+                        format!("ufw was not enabled. {reason}."),
+                        &["Order the SSH or management-interface ufw.rule before ufw.state."],
+                    ));
+                }
                 run_checked(cx, ufw(&["--force", "enable"])).await?;
                 done.push("enabled ufw".into());
             } else {
@@ -300,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_enables_with_force_and_sets_logging_first() {
-        let ufw = Ufw::new();
+        let ufw = Ufw::new().rule("limit 22/tcp");
         let sys = ufw.attach(FakeSystem::new()).with_file(
             "/etc/ufw/ufw.conf",
             "ENABLED=no\nLOGLEVEL=low\n",
@@ -312,7 +341,7 @@ mod tests {
         let ufw_lines: Vec<String> = sys
             .command_lines()
             .into_iter()
-            .filter(|l| !l.starts_with("ufw status"))
+            .filter(|l| !l.starts_with("ufw status") && !l.starts_with("ufw show"))
             .collect();
         assert_eq!(ufw_lines, vec!["ufw logging medium", "ufw --force enable"]);
         let world = ufw.snapshot();
@@ -337,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn removal_reverts_only_what_buckle_changed() {
-        let ufw = Ufw::new();
+        let ufw = Ufw::new().rule("limit 22/tcp");
         let sys = ufw.attach(FakeSystem::new()).with_file(
             "/etc/ufw/ufw.conf",
             "ENABLED=no\nLOGLEVEL=low\n",
@@ -369,6 +398,98 @@ mod tests {
         let removed = UfwState.remove(&cx, &record).await.unwrap();
         assert!(!removed.changed);
         assert_eq!(sys.commands_run().len(), before);
+        assert!(ufw.snapshot().active);
+    }
+
+    #[rstest]
+    #[case::no_rules(Ufw::new(), json!({"enabled": true}), false)]
+    #[case::only_http(Ufw::new().rule("allow 80/tcp"), json!({"enabled": true}), false)]
+    #[case::udp_22_does_not_count(Ufw::new().rule("allow 22/udp"), json!({"enabled": true}), false)]
+    #[case::deny_22_does_not_count(Ufw::new().rule("deny 22/tcp"), json!({"enabled": true}), false)]
+    #[case::ssh_allowed(Ufw::new().rule("allow 22/tcp"), json!({"enabled": true}), true)]
+    #[case::ssh_limited(Ufw::new().rule("limit 22/tcp"), json!({"enabled": true}), true)]
+    #[case::ssh_in_a_range(Ufw::new().rule("allow 20:30/tcp"), json!({"enabled": true}), true)]
+    #[case::openssh_profile(Ufw::new().rule("allow OpenSSH"), json!({"enabled": true}), true)]
+    #[case::tailscale(Ufw::new().rule("allow in on tailscale0"), json!({"enabled": true}), true)]
+    #[case::lan_everything(Ufw::new().rule("allow from 10.0.0.0/8"), json!({"enabled": true}), true)]
+    #[case::opted_out(Ufw::new(), json!({"enabled": true, "allow_lockout": true}), true)]
+    #[tokio::test]
+    async fn enabling_is_blocked_without_a_rule_that_keeps_ssh_reachable(
+        #[case] ufw: Ufw,
+        #[case] spec_json: serde_json::Value,
+        #[case] allowed: bool,
+    ) {
+        let (_sys, cx) = host(&ufw);
+        let s: Spec = spec(spec_json);
+        let planned = UfwState.plan(&cx, &s).await.unwrap();
+        match (&planned, allowed) {
+            (Planned::Blocked { reason }, false) => {
+                assert!(
+                    reason.contains("allow_lockout") && reason.contains("22/tcp"),
+                    "{reason}"
+                );
+                let err = UfwState.apply(&cx, &s, &Planned::NoOp).await.unwrap_err();
+                assert!(err.description().contains("not enabled"));
+                assert!(!ufw.snapshot().active);
+            }
+            (Planned::Change { .. }, true) => {
+                UfwState.apply(&cx, &s, &Planned::NoOp).await.unwrap();
+                assert!(ufw.snapshot().active);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ssh_port_comes_from_sshd_config() {
+        let ufw = Ufw::new().rule("allow 22/tcp");
+        let sys = ufw
+            .attach(FakeSystem::new())
+            .with_file(
+                "/etc/ssh/sshd_config",
+                "Include /etc/ssh/sshd_config.d/*.conf\n",
+                FilePerms::default(),
+            )
+            .with_file(
+                "/etc/ssh/sshd_config.d/10-port.conf",
+                "Port 2222\n",
+                FilePerms::default(),
+            );
+        let planned = UfwState
+            .plan(&cx(&sys), &spec(json!({"enabled": true})))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&planned, Planned::Blocked { reason } if reason.contains("2222/tcp")),
+            "{planned:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_planned_earlier_in_the_same_plan_counts() {
+        use crate::tasks::ufw_rule::UfwRule;
+        let ufw = Ufw::new();
+        let (sys, cx) = host(&ufw);
+        let enable: Spec = spec(json!({"enabled": true}));
+        assert!(matches!(
+            UfwState.plan(&cx, &enable).await.unwrap(),
+            Planned::Blocked { .. }
+        ));
+        // The same plan (same context) first plans the SSH rule...
+        let rule: crate::tasks::ufw_rule::Spec =
+            spec(json!({"rule": "limit", "to_port": 22, "proto": "tcp"}));
+        assert!(UfwRule.plan(&cx, &rule).await.unwrap().is_change());
+        assert!(UfwState.plan(&cx, &enable).await.unwrap().is_change());
+        // ...but another plan does not see it.
+        let other = super::super::sys_exec::testkit::cx(&sys);
+        assert!(matches!(
+            UfwState.plan(&other, &enable).await.unwrap(),
+            Planned::Blocked { .. }
+        ));
+        // Applying still checks the host: the rule must really be there.
+        assert!(UfwState.apply(&cx, &enable, &Planned::NoOp).await.is_err());
+        UfwRule.apply(&cx, &rule, &Planned::NoOp).await.unwrap();
+        UfwState.apply(&cx, &enable, &Planned::NoOp).await.unwrap();
         assert!(ufw.snapshot().active);
     }
 }

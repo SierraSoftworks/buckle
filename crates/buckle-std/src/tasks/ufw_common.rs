@@ -468,6 +468,147 @@ pub(crate) async fn installed(cx: &Cx) -> Result<bool> {
     Ok(cx.system.which("ufw").await?.is_some())
 }
 
+// ---------------------------------------------------------------------------
+// Lockout protection
+// ---------------------------------------------------------------------------
+
+/// Interfaces that count as a management path when a rule allows them wholesale.
+const MANAGEMENT_INTERFACE_PREFIXES: &[&str] = &["tailscale"];
+
+/// The ports sshd listens on: `Port` lines of `/etc/ssh/sshd_config` and
+/// `/etc/ssh/sshd_config.d/*.conf`, or 22.
+pub(crate) async fn ssh_ports(cx: &Cx) -> Result<Vec<u16>> {
+    let mut files = vec![std::path::PathBuf::from("/etc/ssh/sshd_config")];
+    if let Some(mut entries) = cx
+        .system
+        .list_dir(std::path::Path::new("/etc/ssh/sshd_config.d"))
+        .await?
+    {
+        entries.sort();
+        files.extend(
+            entries
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "conf")),
+        );
+    }
+    let mut ports = Vec::new();
+    for file in files {
+        let Some(bytes) = cx.system.read(&file).await? else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            let mut words = line.split_whitespace();
+            if words.next().is_some_and(|w| w.eq_ignore_ascii_case("port"))
+                && let Some(port) = words.next().and_then(|p| p.parse().ok())
+                && !ports.contains(&port)
+            {
+                ports.push(port);
+            }
+        }
+    }
+    if ports.is_empty() {
+        ports.push(22);
+    }
+    Ok(ports)
+}
+
+fn port_spec_covers(spec: &str, port: u16) -> bool {
+    spec.split(',').any(|part| match part.split_once(':') {
+        Some((lo, hi)) => matches!((lo.parse::<u16>(), hi.parse::<u16>()), (Ok(lo), Ok(hi)) if lo <= port && port <= hi),
+        None => part.parse::<u16>() == Ok(port),
+    })
+}
+
+/// Whether `rule` keeps a management path open: an incoming `allow` or
+/// `limit` for one of the SSH ports (TCP or any protocol), for the `OpenSSH`
+/// application profile, or for every port, either on any interface (from
+/// some or all sources) or on a management interface such as `tailscale0`.
+pub(crate) fn keeps_access(rule: &Rule, ssh_ports: &[u16]) -> bool {
+    if !matches!(rule.action.as_str(), "allow" | "limit") || rule.direction != "in" {
+        return false;
+    }
+    if rule.proto.as_deref().is_some_and(|p| p != "tcp") {
+        return false;
+    }
+    if let Some(app) = &rule.app {
+        return app.eq_ignore_ascii_case("OpenSSH");
+    }
+    match &rule.port {
+        Some(port) => ssh_ports.iter().any(|p| port_spec_covers(port, *p)),
+        // Every port: on any interface, or on a management interface.
+        None => rule.interface.as_deref().is_none_or(|i| {
+            MANAGEMENT_INTERFACE_PREFIXES
+                .iter()
+                .any(|p| i.starts_with(p))
+        }),
+    }
+}
+
+/// Rules that `ufw.rule` tasks earlier in the same plan will add. Keyed by
+/// the plan's templater (one per planner, shared by the plan's tasks and its
+/// apply), held weakly so entries vanish with the plan. This lets
+/// `ufw.state`/`ufw.default` see an SSH rule planned before them although it
+/// is not on the host yet. (A core facility for "what earlier steps of this
+/// plan will do" would replace this.)
+type PlannedRules = Vec<(std::sync::Weak<buckle_core::template::Templater>, Rule)>;
+static PLANNED: LazyLock<std::sync::Mutex<PlannedRules>> =
+    LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Notes that this plan will add `rule`.
+pub(crate) fn note_planned_rule(cx: &Cx, rule: &Rule) {
+    let mut planned = PLANNED.lock().unwrap_or_else(|p| p.into_inner());
+    planned.retain(|(w, _)| w.strong_count() > 0);
+    let me = std::sync::Arc::downgrade(&cx.templater);
+    if !planned
+        .iter()
+        .any(|(w, r)| w.ptr_eq(&me) && r.same_selector(rule) && r.action == rule.action)
+    {
+        planned.push((me, rule.clone()));
+    }
+}
+
+fn planned_rules(cx: &Cx) -> Vec<Rule> {
+    let mut planned = PLANNED.lock().unwrap_or_else(|p| p.into_inner());
+    planned.retain(|(w, _)| w.strong_count() > 0);
+    let me = std::sync::Arc::downgrade(&cx.templater);
+    planned
+        .iter()
+        .filter(|(w, _)| w.ptr_eq(&me))
+        .map(|(_, r)| r.clone())
+        .collect()
+}
+
+/// `None` when a rule on the host (or one planned earlier in this plan, when
+/// `include_planned`) keeps SSH or a management interface reachable;
+/// otherwise the reason the change would lock the operator out.
+pub(crate) async fn lockout_reason(
+    cx: &Cx,
+    what: &str,
+    include_planned: bool,
+) -> Result<Option<String>> {
+    let ports = ssh_ports(cx).await?;
+    let mut rules = if installed(cx).await? {
+        read_status(cx, true).await?.rules
+    } else {
+        Vec::new()
+    };
+    if include_planned {
+        rules.extend(planned_rules(cx));
+    }
+    if rules.iter().any(|r| keeps_access(r, &ports)) {
+        return Ok(None);
+    }
+    let ports = ports
+        .iter()
+        .map(|p| format!("{p}/tcp"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Some(format!(
+        "{what} would cut off remote access: no ufw rule allows (or limits) SSH ({ports}) or a management interface such as tailscale0, on the host or earlier in this plan. \
+         Add a ufw.rule such as `{{rule: limit, to_port: 22, proto: tcp}}` or `{{rule: allow, interface: tailscale0}}` before this task, or set `allow_lockout: true` if this host is reached another way"
+    )))
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     pub const VERBOSE_ACTIVE: &str = "\
@@ -620,6 +761,9 @@ pub(crate) mod testkit {
                     let mut from = render_side(&r.from_ip, &None, &None, &None, &None, v6);
                     if r.direction == "out" {
                         from.push_str(" (out)");
+                    }
+                    if let Some(c) = &r.comment {
+                        from.push_str(&format!(" # {c}"));
                     }
                     let action =
                         format!("{} {}", r.action.to_uppercase(), r.direction.to_uppercase());

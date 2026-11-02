@@ -1,7 +1,7 @@
 //! `ufw.default`: a default firewall policy.
 
 use super::sys_exec::{legacy_ledger, run_checked};
-use super::ufw_common::{installed, read_status, ufw};
+use super::ufw_common::{installed, lockout_reason, read_status, ufw};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::state::ResourceRecord;
@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 /// `deny` or `reject`. The current policy is read from `ufw status verbose`
 /// (or from `/etc/default/ufw` while the firewall is inactive).
 ///
+/// Setting `incoming` to `deny` or `reject` on an active firewall is refused
+/// (blocked, with advice) unless a rule on the host, or a `ufw.rule` earlier
+/// in the same plan, allows or limits incoming SSH or all traffic on a
+/// management interface such as `tailscale0`; set `allow_lockout: true` to
+/// change it anyway. (On an inactive firewall the check happens when
+/// `ufw.state` enables it.)
+///
 /// Removal restores the policy that was in place before Buckle first changed
 /// it, and does nothing if Buckle never changed it.
 pub struct UfwDefault;
@@ -27,6 +34,13 @@ pub struct Spec {
     pub direction: Direction,
     /// `allow`, `deny` or `reject`.
     pub policy: Policy,
+    /// Change an incoming policy even when no rule keeps SSH or a management interface reachable.
+    #[serde(default)]
+    pub allow_lockout: bool,
+}
+
+fn closes_incoming(spec: &Spec) -> bool {
+    spec.direction == Direction::Incoming && spec.policy != Policy::Allow && !spec.allow_lockout
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -100,6 +114,13 @@ impl Task for UfwDefault {
             }));
         }
         let status = read_status(cx, false).await?;
+        if status.active
+            && closes_incoming(spec)
+            && status.defaults.get("incoming").map(String::as_str) != Some(spec.policy.as_str())
+            && let Some(reason) = lockout_reason(cx, &summary, true).await?
+        {
+            return Ok(Planned::blocked(reason));
+        }
         match status.defaults.get(spec.direction.as_str()) {
             Some(current) if current == spec.policy.as_str() => Ok(Planned::NoOp),
             current => Ok(Planned::change(Diff::Opaque {
@@ -126,6 +147,20 @@ impl Task for UfwDefault {
                 .or_else(|| status.defaults.get(dir).cloned()),
             None => status.defaults.get(dir).cloned(),
         };
+        if status.active
+            && closes_incoming(spec)
+            && let Some(reason) = lockout_reason(
+                cx,
+                &format!("ufw default {} incoming", spec.policy.as_str()),
+                false,
+            )
+            .await?
+        {
+            return Err(buckle_core::error::user(
+                format!("The incoming policy was not changed. {reason}."),
+                &["Order the SSH or management-interface ufw.rule before ufw.default."],
+            ));
+        }
         run_checked(cx, ufw(&["default", spec.policy.as_str(), dir])).await?;
         let mut applied = Applied::changed(format!("ufw default {} {}", spec.policy.as_str(), dir));
         if let Some(previous) = before {
@@ -227,7 +262,10 @@ mod tests {
 
     #[tokio::test]
     async fn apply_sets_the_policy_and_remembers_the_old_one() {
-        let ufw = Ufw::new().active().default_policy("incoming", "allow");
+        let ufw = Ufw::new()
+            .active()
+            .default_policy("incoming", "allow")
+            .rule("allow in on tailscale0");
         let (sys, cx) = host(&ufw);
         let s: Spec = spec(json!({"direction": "incoming", "policy": "deny"}));
         let applied = UfwDefault.apply(&cx, &s, &Planned::NoOp).await.unwrap();
@@ -247,7 +285,10 @@ mod tests {
 
     #[tokio::test]
     async fn removal_restores_the_original_policy_even_after_a_second_change() {
-        let ufw = Ufw::new().active().default_policy("incoming", "allow");
+        let ufw = Ufw::new()
+            .active()
+            .default_policy("incoming", "allow")
+            .rule("allow in on tailscale0");
         let (sys, cx) = host(&ufw);
         let first = UfwDefault
             .apply(
@@ -277,7 +318,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_record_from_before_the_ledger_was_retired_is_migrated_once() {
-        let ufw = Ufw::new().active().default_policy("incoming", "deny");
+        let ufw = Ufw::new()
+            .active()
+            .default_policy("incoming", "deny")
+            .rule("allow in on tailscale0");
         let (sys, _cx) = host(&ufw);
         // The old code kept "allow" (the policy before Buckle) only in the ledger.
         put(
@@ -326,5 +370,32 @@ mod tests {
         let removed = UfwDefault.remove(&cx, &record).await.unwrap();
         assert!(!removed.changed);
         assert!(sys.command_lines().is_empty());
+    }
+
+    #[rstest]
+    #[case::deny_without_ssh(Ufw::new().active().default_policy("incoming", "allow"), json!({"direction": "incoming", "policy": "deny"}), true)]
+    #[case::reject_without_ssh(Ufw::new().active().default_policy("incoming", "allow"), json!({"direction": "incoming", "policy": "reject"}), true)]
+    #[case::deny_with_ssh(Ufw::new().active().default_policy("incoming", "allow").rule("limit 22/tcp"), json!({"direction": "incoming", "policy": "deny"}), false)]
+    #[case::opted_out(Ufw::new().active().default_policy("incoming", "allow"), json!({"direction": "incoming", "policy": "deny", "allow_lockout": true}), false)]
+    #[case::inactive_firewall_is_checked_on_enable(Ufw::new().default_policy("incoming", "allow"), json!({"direction": "incoming", "policy": "deny"}), false)]
+    #[case::outgoing_is_never_a_lockout(Ufw::new().active(), json!({"direction": "outgoing", "policy": "deny"}), false)]
+    #[tokio::test]
+    async fn closing_incoming_traffic_needs_a_rule_that_keeps_ssh_reachable(
+        #[case] ufw: Ufw,
+        #[case] spec_json: serde_json::Value,
+        #[case] blocked: bool,
+    ) {
+        let (_sys, cx) = host(&ufw);
+        let s: Spec = spec(spec_json);
+        let planned = UfwDefault.plan(&cx, &s).await.unwrap();
+        assert_eq!(
+            matches!(planned, Planned::Blocked { .. }),
+            blocked,
+            "{planned:?}"
+        );
+        assert_eq!(
+            UfwDefault.apply(&cx, &s, &Planned::NoOp).await.is_err(),
+            blocked
+        );
     }
 }
