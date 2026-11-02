@@ -163,6 +163,19 @@ mod tests {
     }
 
     #[test]
+    fn converted_text_renders_back_to_what_v1_would_have_printed() {
+        use buckle_core::selectors::{HostContext, HostIdentity, Vars};
+        let go = "${#x} and {% y %} and {# z #}: {{ .A }}\n";
+        let converted = convert(go, &set(&[]), &set(&["A"]));
+        let vars: Vars = serde_json::from_value(serde_json::json!({"A": "1"})).unwrap();
+        let ctx = HostContext::new(HostIdentity::default()).with_vars(vars);
+        let rendered = buckle_core::template::Templater::new()
+            .render_plain(&converted.text, &ctx)
+            .expect("the converted template renders");
+        assert_eq!(rendered, "${#x} and {% y %} and {# z #}: 1\n");
+    }
+
+    #[test]
     fn unknown_keys_become_vars_with_a_note() {
         let converted = convert("{{ .FROM_SCRIPT }}", &set(&[]), &set(&[]));
         assert_eq!(converted.text, "{{ vars.FROM_SCRIPT }}");

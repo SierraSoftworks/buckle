@@ -1,0 +1,3 @@
+description: Has a template Go can do more with than Jinja can be told to.
+files:
+  etc: /etc/tpl

@@ -30,7 +30,7 @@ impl Migration {
             .values()
             .map(|bytes| {
                 String::from_utf8_lossy(bytes)
-                    .matches("TODO(migrate)")
+                    .matches("TODO(migrate):")
                     .count()
             })
             .sum()

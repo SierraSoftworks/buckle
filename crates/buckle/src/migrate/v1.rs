@@ -6,7 +6,7 @@
 //! files (`.tpl` ones are Go templates) and `scripts/` holds the scripts that
 //! run after the files are placed.
 
-use buckle_core::error::{self, HumanizableResult};
+use buckle_core::error;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -181,7 +181,13 @@ fn read_package(dir: &Path, ignored: &mut Vec<PathBuf>) -> error::Result<Package
             &["A v1 package is a directory containing package.yml; remove the directory if it is not one."],
         )
     })?;
-    let doc: serde_yaml::Value = serde_yaml::from_str(&text).to_human_error()?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| {
+        error::wrap_user(
+            e,
+            format!("The package.yml of '{id}' is not valid YAML."),
+            &["Fix the syntax error the inner message points at, then migrate again."],
+        )
+    })?;
     let doc = match doc {
         serde_yaml::Value::Mapping(map) => map,
         serde_yaml::Value::Null => Default::default(),
@@ -420,6 +426,8 @@ pub fn read(dir: &Path) -> error::Result<V1> {
             v1.ignored.push(entry.path());
         }
     }
+
+    v1.ignored.sort();
 
     let known: Vec<&str> = v1.packages.iter().map(|p| p.id.as_str()).collect();
     for package in &v1.packages {
