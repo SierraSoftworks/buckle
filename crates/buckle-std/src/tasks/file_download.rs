@@ -3,6 +3,7 @@
 use super::hostkit::{self, describe_perms, digest_change};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
+use buckle_core::secrets::SecretField;
 use buckle_core::state::ResourceRecord;
 use buckle_core::system::{FileKind, FilePerms};
 use buckle_core::task::{Applied, Cx, Task};
@@ -22,7 +23,7 @@ use tracing::instrument;
 ///     mode: "0755"
 ///     checksum: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 ///     # or: checksum: https://releases.example.com/tool-1.2.3.sha256
-///     headers: { Authorization: "Bearer ..." }
+///     headers: { Authorization: "Bearer {{ secrets.release_token }}" }   # values may use secrets
 ///     force: false
 /// ```
 ///
@@ -37,6 +38,7 @@ use tracing::instrument;
 /// The download is held in memory and written atomically. Removal deletes
 /// `dest` only if its content still matches what Buckle wrote.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// The URL to GET.
     pub url: String,
@@ -47,9 +49,10 @@ pub struct Spec {
     /// `sha256:<hex>`, a bare hex digest, or the URL of a file containing one.
     #[serde(default)]
     pub checksum: Option<String>,
-    /// Extra request headers (also sent when fetching a checksum URL).
+    /// Extra request headers (also sent when fetching a checksum URL). Values
+    /// may reference secrets: `Authorization: "Bearer {{ secrets.token }}"`.
     #[serde(default)]
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, SecretField>,
     /// Download again even if `dest` exists (when no checksum is given).
     #[serde(default)]
     pub force: bool,
@@ -58,11 +61,8 @@ pub struct Spec {
 pub struct FileDownload;
 buckle_core::register_task!(FileDownload);
 
-fn header_list(spec: &Spec) -> Vec<(String, String)> {
-    spec.headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+fn header_list(cx: &Cx, spec: &Spec) -> Result<Vec<(String, String)>> {
+    hostkit::resolve_headers(cx, &spec.headers)
 }
 
 /// Resolves the expected SHA-256 (lowercase hex) from the `checksum` field.
@@ -120,7 +120,7 @@ impl FileDownload {
     async fn inspect(&self, cx: &Cx, spec: &Spec) -> Result<Inspection> {
         hostkit::require_absolute(&spec.dest, "dest")?;
         let dest = spec.dest.display();
-        let headers = header_list(spec);
+        let headers = header_list(cx, spec)?;
         let expected = match &spec.checksum {
             Some(c) => Some(resolve_checksum(cx, c, &spec.url, &spec.dest, &headers).await?),
             None => None,
@@ -221,9 +221,11 @@ impl Task for FileDownload {
         let inspection = self.inspect(cx, spec).await?;
         if !inspection.planned.is_change() {
             let current = cx.system.read(&spec.dest).await?.unwrap_or_default();
-            return Ok(hostkit::written(
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("{} already up to date", spec.dest.display()),
                 &spec.dest,
+                false,
                 Digest::of(&current),
                 None,
                 false,
@@ -232,15 +234,18 @@ impl Task for FileDownload {
         if inspection.perms_only {
             cx.system.set_perms(&spec.dest, &spec.perms).await?;
             let current = cx.system.read(&spec.dest).await?.unwrap_or_default();
-            return Ok(hostkit::written(
+            // A file Buckle did not download is adopted, not claimed.
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("updated permissions of {}", spec.dest.display()),
                 &spec.dest,
+                false,
                 Digest::of(&current),
                 None,
                 true,
             ));
         }
-        let body = hostkit::http_get(cx, &spec.url, &header_list(spec)).await?;
+        let body = hostkit::http_get(cx, &spec.url, &header_list(cx, spec)?).await?;
         let digest = Digest::of(&body);
         if let Some(want) = &inspection.expected
             && digest.as_str() != want

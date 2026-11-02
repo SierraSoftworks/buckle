@@ -43,10 +43,25 @@ use tracing::instrument;
 /// The file must exist unless `create: true`. Mode and ownership are
 /// preserved. `backup: true` keeps a timestamped copy before each edit.
 ///
-/// Removal reverts the edit: a line Buckle added is deleted again, a line it
+/// `validate` is a command (argv) that checks the new content before it
+/// replaces the file (and while planning); `{path}` stands for a private
+/// temporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero
+/// exit fails the task and leaves the file untouched. Without `validate`,
+/// `/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with
+/// `visudo -cf {path}` and `sshd -t -f {path}` (when those tools are
+/// installed); `validate: []` turns that off.
+///
+/// Removal reverts the edit: a line Buckle added is deleted again (one
+/// occurrence only, so an identical line another task owns stays), a line it
 /// replaced is restored to its original text, and a file it created is deleted
 /// when it ends up empty. Edits made by `state: absent` are not restored.
+///
+/// The resource is identified by `path` and `regex` when a `regex` is given
+/// (else by `path` and `line`), so changing the `line` of a regex task updates
+/// the same line in place and removal still restores the text from before
+/// Buckle's first edit. Edits of one file are serialised across modules.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the file to edit.
     pub path: PathBuf,
@@ -70,6 +85,10 @@ pub struct Spec {
     /// Keep a timestamped `.bak` copy before editing.
     #[serde(default)]
     pub backup: bool,
+    /// A command that checks the new content; `{path}` stands for the file to check.
+    /// Default: automatic for sudoers and sshd_config; `[]` disables.
+    #[serde(default)]
+    pub validate: Option<Vec<String>>,
 }
 
 pub struct FileLine;
@@ -82,7 +101,18 @@ pub(crate) enum Marker {
     /// `line` was appended or inserted.
     Added { line: String, created: bool },
     /// `original` was replaced by `line`.
-    Replaced { line: String, original: String },
+    Replaced {
+        line: String,
+        /// The replaced text; empty when it was stashed instead (sensitive files).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        original: String,
+        /// For sensitive files (`/etc/ssh/*`, `/etc/environment`, ...): the
+        /// digest of the replaced text, which is kept in a 0600 file under
+        /// `<state_dir>/stash/file.line/` rather than in state (which is
+        /// reported to the server).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stashed: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -158,6 +188,7 @@ pub(crate) fn edit(spec: &Spec, current: &str) -> Result<Edit> {
                     marker: Some(Marker::Replaced {
                         line: line.to_owned(),
                         original,
+                        stashed: None,
                     }),
                     summary: format!("replace line {} in {}", index + 1, spec.path.display()),
                 });
@@ -234,7 +265,7 @@ impl FileLine {
             } => {
                 let new_text = hostkit::join_lines(&lines);
                 Outcome::Change {
-                    diff: hostkit::text_diff(summary, &file.text, &new_text),
+                    diff: hostkit::text_diff(cx, &spec.path, summary, &file.text, &new_text),
                     new_text,
                     marker,
                     existing: Some(file),
@@ -256,9 +287,9 @@ impl Task for FileLine {
         format!(
             "{}: {}",
             spec.path.display(),
-            spec.line
+            spec.regex
                 .as_deref()
-                .or(spec.regex.as_deref())
+                .or(spec.line.as_deref())
                 .unwrap_or_default()
         )
     }
@@ -275,17 +306,27 @@ impl Task for FileLine {
         Ok(match self.inspect(cx, spec).await? {
             Outcome::NoOp => Planned::NoOp,
             Outcome::Blocked(reason) => Planned::blocked(reason),
-            Outcome::Change { diff, .. } => Planned::change(diff),
+            Outcome::Change { diff, new_text, .. } => {
+                hostkit::validate::check(
+                    cx,
+                    &spec.path,
+                    spec.validate.as_deref(),
+                    hostkit::validate::Content::Bytes(new_text.as_bytes()),
+                )
+                .await?;
+                Planned::change(diff)
+            }
         })
     }
 
     #[instrument(name = "task.file.line.apply", skip_all, fields(path = %spec.path.display(), state = ?spec.state))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
+        let _guard = hostkit::lock_path(&spec.path).await;
         match self.inspect(cx, spec).await? {
-            Outcome::NoOp => Ok(Applied::unchanged(format!(
-                "{} already up to date",
-                spec.path.display()
-            ))),
+            Outcome::NoOp => Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("{} already up to date", spec.path.display())),
+            )),
             Outcome::Blocked(reason) => Err(error::user(
                 format!("Cannot edit {}: {reason}.", spec.path.display()),
                 &["Set `create: true` or create the file in an earlier task."],
@@ -296,6 +337,13 @@ impl Task for FileLine {
                 marker,
                 existing,
             } => {
+                hostkit::validate::check(
+                    cx,
+                    &spec.path,
+                    spec.validate.as_deref(),
+                    hostkit::validate::Content::Bytes(new_text.as_bytes()),
+                )
+                .await?;
                 hostkit::save_text(
                     cx,
                     &spec.path,
@@ -306,6 +354,12 @@ impl Task for FileLine {
                 )
                 .await?;
                 let mut applied = Applied::changed(diff.summary().to_owned());
+                let mut marker = marker.map(|m| merge_marker(previous_marker(cx, &spec.path), m));
+                if hostkit::is_sensitive_path(&spec.path)
+                    && let Some(m) = marker.take()
+                {
+                    marker = Some(stash_original(cx, m).await?);
+                }
                 if let Some(marker) = marker {
                     applied = applied.with_artefact(Artefact::Line {
                         path: spec.path.clone(),
@@ -328,6 +382,14 @@ impl Task for FileLine {
             Some((path, Marker::Added { line, .. })) => {
                 format!("delete the line `{line}` from {}", path.display())
             }
+            Some((
+                path,
+                Marker::Replaced {
+                    stashed: Some(_), ..
+                },
+            )) => {
+                format!("restore the original line in {}", path.display())
+            }
             Some((path, Marker::Replaced { original, .. })) => {
                 format!("restore the line `{original}` in {}", path.display())
             }
@@ -336,6 +398,16 @@ impl Task for FileLine {
     }
 
     async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
+        if let Some((path, _)) = line_artefact(record) {
+            let _guard = hostkit::lock_path(&path).await;
+            return self.revert(cx, record).await;
+        }
+        self.revert(cx, record).await
+    }
+}
+
+impl FileLine {
+    async fn revert(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
         let Some((path, marker)) = line_artefact(record) else {
             return Ok(Applied::skipped(
                 "no edit was recorded to revert (removed lines are not restored)",
@@ -350,14 +422,14 @@ impl Task for FileLine {
         let mut lines = hostkit::split_lines(&file.text);
         match &marker {
             Marker::Added { line, created } => {
-                let before = lines.len();
-                lines.retain(|l| l != line);
-                if lines.len() == before {
+                // One occurrence only: an identical line may belong to another task.
+                let Some(index) = lines.iter().rposition(|l| l == line) else {
                     return Ok(Applied::skipped(format!(
                         "the line is no longer in {}, nothing to revert",
                         path.display()
                     )));
-                }
+                };
+                lines.remove(index);
                 if *created && lines.iter().all(|l| l.trim().is_empty()) {
                     cx.system.remove(&path, false).await?;
                     return Ok(Applied::changed(format!(
@@ -366,14 +438,29 @@ impl Task for FileLine {
                     )));
                 }
             }
-            Marker::Replaced { line, original } => {
+            Marker::Replaced {
+                line,
+                original,
+                stashed,
+            } => {
                 let Some(index) = lines.iter().position(|l| l == line) else {
                     return Ok(Applied::skipped(format!(
                         "the line was changed outside Buckle in {}, left in place",
                         path.display()
                     )));
                 };
-                lines[index] = original.clone();
+                lines[index] = match stashed {
+                    None => original.clone(),
+                    Some(digest) => match unstash(cx, digest).await? {
+                        Some(text) => text,
+                        None => {
+                            return Ok(Applied::skipped(format!(
+                                "the original line of {} was not found in Buckle's stash, left as it is",
+                                path.display()
+                            )));
+                        }
+                    },
+                };
             }
         }
         hostkit::save_text(
@@ -385,11 +472,97 @@ impl Task for FileLine {
             &FilePerms::default(),
         )
         .await?;
+        if let Marker::Replaced {
+            stashed: Some(digest),
+            ..
+        } = &marker
+        {
+            let _ = cx.system.remove(&stash_path(cx, digest), false).await;
+        }
         Ok(Applied::changed(format!(
             "reverted the edit in {}",
             path.display()
         )))
     }
+}
+
+/// The edit an earlier apply of this resource recorded for `path`.
+fn previous_marker(cx: &Cx, path: &std::path::Path) -> Option<Marker> {
+    hostkit::ownership::previous_artefacts(cx)
+        .iter()
+        .find_map(|a| match a {
+            Artefact::Line { path: p, marker } if p == path => serde_json::from_str(marker).ok(),
+            _ => None,
+        })
+}
+
+/// Combines this apply's edit with the one recorded before, so that removal
+/// reverts to the state before Buckle's *first* edit: a line Buckle added and
+/// now rewrites is still an added line; a line it replaced and now rewrites
+/// again still restores the original text.
+fn merge_marker(previous: Option<Marker>, now: Marker) -> Marker {
+    match (previous, now) {
+        (Some(Marker::Added { line: old, created }), Marker::Replaced { line, original, .. })
+            if original == old =>
+        {
+            Marker::Added { line, created }
+        }
+        (
+            Some(Marker::Replaced {
+                line: old,
+                original: first,
+                stashed,
+            }),
+            Marker::Replaced { line, original, .. },
+        ) if original == old => Marker::Replaced {
+            line,
+            original: first,
+            stashed,
+        },
+        (_, now) => now,
+    }
+}
+
+fn stash_path(cx: &Cx, digest: &str) -> PathBuf {
+    crate::tasks::sys_exec::state_dir(cx)
+        .join("stash")
+        .join("file.line")
+        .join(digest)
+}
+
+/// Keeps the replaced text of a sensitive file out of state: it goes to a
+/// root-only file on the host, and the marker records only its digest.
+async fn stash_original(cx: &Cx, marker: Marker) -> Result<Marker> {
+    let Marker::Replaced {
+        line,
+        original,
+        stashed: None,
+    } = marker
+    else {
+        return Ok(marker);
+    };
+    let digest = buckle_core::Digest::of(original.as_bytes());
+    let path = stash_path(cx, digest.as_str());
+    if let Some(dir) = path.parent() {
+        cx.system.mkdir_all(dir, &FilePerms::mode(0o700)).await?;
+    }
+    cx.system
+        .write_atomic(&path, original.as_bytes(), &FilePerms::mode(0o600))
+        .await?;
+    Ok(Marker::Replaced {
+        line,
+        original: String::new(),
+        stashed: Some(digest.as_str().to_owned()),
+    })
+}
+
+async fn unstash(cx: &Cx, digest: &str) -> Result<Option<String>> {
+    Ok(cx
+        .system
+        .read(&stash_path(cx, digest))
+        .await?
+        .filter(|b| buckle_core::Digest::of(b).as_str() == digest)
+        .and_then(|b| String::from_utf8(b).ok()))
 }
 
 fn line_artefact(record: &ResourceRecord) -> Option<(PathBuf, Marker)> {
@@ -588,6 +761,155 @@ mod tests {
         assert_ne!(
             FileLine::key(&s(json!({"line": "a"}))),
             FileLine::key(&s(json!({"line": "b"})))
+        );
+    }
+
+    #[tokio::test]
+    async fn sshd_config_edits_are_validated_before_they_are_written() {
+        let sys = FakeSystem::new()
+            .with_file(
+                "/etc/ssh/sshd_config",
+                "PermitRootLogin yes\n",
+                FilePerms::mode(0o644),
+            )
+            .on_command_fail(
+                "sshd",
+                &["-t"],
+                255,
+                "Bad configuration option: PermitRootLogn",
+            );
+        let c = cx(&sys);
+        let s: Spec = spec(
+            json!({"path": "/etc/ssh/sshd_config", "line": "PermitRootLogn no", "regex": "^PermitRootLogin"}),
+        );
+        assert!(FileLine.plan(&c, &s).await.is_err());
+        assert!(FileLine.apply(&c, &s, &Planned::NoOp).await.is_err());
+        assert_eq!(
+            sys.file_string("/etc/ssh/sshd_config").unwrap(),
+            "PermitRootLogin yes\n"
+        );
+
+        let sys = sys.on_command_ok("sshd", &["-t"], "");
+        let c = cx(&sys);
+        apply(&FileLine, &c, &s).await;
+        assert_eq!(
+            sys.file_string("/etc/ssh/sshd_config").unwrap(),
+            "PermitRootLogn no\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_change_updates_in_place_and_removal_restores_the_first_original() {
+        let sys =
+            FakeSystem::new().with_file("/etc/conf", "#Port 22\nother\n", FilePerms::default());
+        let first: Spec = s(json!({"line": "Port 2222", "regex": "^#?Port "}));
+        let second: Spec = s(json!({"line": "Port 2200", "regex": "^#?Port "}));
+        assert_eq!(
+            FileLine::key(&first),
+            FileLine::key(&second),
+            "keyed on the regex"
+        );
+        let a = apply(&FileLine, &cx(&sys), &first).await;
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .previous(record("file.line", "k", &a))
+            .build();
+        let b = apply(&FileLine, &c, &second).await;
+        assert_eq!(sys.file_string("/etc/conf").unwrap(), "Port 2200\nother\n");
+        FileLine
+            .remove(&cx(&sys), &record("file.line", "k", &b))
+            .await
+            .unwrap();
+        assert_eq!(sys.file_string("/etc/conf").unwrap(), "#Port 22\nother\n");
+    }
+
+    #[tokio::test]
+    async fn removing_an_added_line_deletes_one_occurrence_only() {
+        let sys = FakeSystem::new().with_file("/etc/conf", "a\n", FilePerms::default());
+        let added = apply(&FileLine, &cx(&sys), &s(json!({"line": "x"}))).await;
+        // Another module's identical line appears later.
+        put(&sys, "/etc/conf", "a\nx\nb\nx\n").await;
+        FileLine
+            .remove(&cx(&sys), &record("file.line", "k", &added))
+            .await
+            .unwrap();
+        assert_eq!(sys.file_string("/etc/conf").unwrap(), "a\nx\nb\n");
+    }
+
+    #[tokio::test]
+    async fn concurrent_edits_of_one_file_do_not_lose_lines() {
+        let sys = FakeSystem::new().with_file("/etc/conf", "", FilePerms::default());
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let c = cx(&sys);
+            handles.push(tokio::spawn(async move {
+                let spec: Spec = spec(json!({"path": "/etc/conf", "line": format!("line{i}")}));
+                FileLine.apply(&c, &spec, &Planned::NoOp).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(sys.file_string("/etc/conf").unwrap().lines().count(), 8);
+    }
+
+    #[tokio::test]
+    async fn sensitive_files_get_context_free_diffs_and_no_replaced_text_in_state() {
+        let sys = FakeSystem::new().with_file(
+            "/etc/environment",
+            "PATH=/usr/bin\nAPI_TOKEN=hand-placed-token\nLANG=C\n",
+            FilePerms::mode(0o644),
+        );
+        let s: Spec =
+            spec(json!({"path": "/etc/environment", "line": "API_TOKEN=", "regex": "^API_TOKEN="}));
+        let planned = FileLine.plan(&cx(&sys), &s).await.unwrap();
+        let Diff::Update {
+            unified: Some(u), ..
+        } = diff(&planned)
+        else {
+            panic!("{planned:?}")
+        };
+        assert!(
+            !u.get().contains("PATH=") && !u.get().contains("LANG="),
+            "no context: {}",
+            u.get()
+        );
+        let applied = apply(&FileLine, &cx(&sys), &s).await;
+        let state = serde_json::to_string(&applied).unwrap();
+        assert!(!state.contains("hand-placed-token"), "{state}");
+        // Removal still restores it, from the 0600 stash outside state.
+        FileLine
+            .remove(&cx(&sys), &record("file.line", "k", &applied))
+            .await
+            .unwrap();
+        assert_eq!(
+            sys.file_string("/etc/environment").unwrap(),
+            "PATH=/usr/bin\nAPI_TOKEN=hand-placed-token\nLANG=C\n"
+        );
+        assert!(
+            sys.paths()
+                .iter()
+                .all(|p| !p.starts_with("/var/lib/buckle/stash/file.line/")
+                    || p.as_os_str() == "/var/lib/buckle/stash/file.line")
+        );
+    }
+
+    #[tokio::test]
+    async fn diffs_are_scrubbed_of_known_secret_values() {
+        let sys =
+            FakeSystem::new().with_file("/etc/conf", "pw=s3cr3t-value\n", FilePerms::default());
+        let c = cx_secrets(
+            &sys,
+            buckle_core::testing::MemorySource::new(),
+            secrets("pw", "s3cr3t-value"),
+        );
+        let planned = FileLine
+            .plan(&c, &s(json!({"line": "pw=other", "regex": "^pw="})))
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(
+            !json.contains("s3cr3t-value") && json.contains("secret:pw@"),
+            "{json}"
         );
     }
 }

@@ -78,6 +78,66 @@ impl UnitStatus {
     }
 }
 
+/// `Some(Blocked)` when systemd cannot be driven on this host: `systemctl`
+/// is missing, or systemd is not the running init system (no
+/// `/run/systemd/system`, the check `sd_booted()` makes), as in containers
+/// and chroots. Planning such a step is not an error; it is reported as
+/// blocked with the reason, and the executor plans it again once earlier
+/// steps have changed something.
+pub(crate) async fn unavailable(cx: &Cx) -> Result<Option<buckle_core::plan::Planned>> {
+    if cx.system.which("systemctl").await?.is_none() {
+        return Ok(Some(buckle_core::plan::Planned::blocked(
+            "`systemctl` is not installed on this host; systemd tasks need systemd as the init system",
+        )));
+    }
+    let booted = cx
+        .system
+        .stat(std::path::Path::new("/run/systemd/system"))
+        .await?
+        .is_some_and(|m| m.kind == buckle_core::system::FileKind::Directory);
+    if !booted {
+        return Ok(Some(buckle_core::plan::Planned::blocked(
+            "systemd is not the init system here (PID 1 is something else, as in a container); systemd tasks cannot run",
+        )));
+    }
+    Ok(None)
+}
+
+/// Whether `systemctl` failed because it could not reach systemd at all.
+pub(crate) fn cannot_connect(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("failed to connect to bus")
+        || s.contains("not been booted with systemd")
+        || s.contains("can't operate")
+        || s.contains("connection refused")
+}
+
+/// [`show`] for planning: a host where systemd cannot be reached yields `Err(Blocked)`.
+pub(crate) async fn show_for_plan(
+    cx: &Cx,
+    unit: &str,
+) -> Result<std::result::Result<UnitStatus, buckle_core::plan::Planned>> {
+    if let Some(blocked) = unavailable(cx).await? {
+        return Ok(Err(blocked));
+    }
+    let out = cx
+        .system
+        .run(systemctl(&[
+            "show",
+            unit,
+            "-p",
+            "UnitFileState,ActiveState,LoadState,SubState",
+        ]))
+        .await?;
+    if !out.success() && cannot_connect(&out.stderr_str()) {
+        return Ok(Err(buckle_core::plan::Planned::blocked(format!(
+            "systemctl cannot reach systemd: {}",
+            super::sys_exec::first_lines(&out.stderr_str(), &out.stdout_str(), 2)
+        ))));
+    }
+    show(cx, unit).await.map(Ok)
+}
+
 pub(crate) async fn show(cx: &Cx, unit: &str) -> Result<UnitStatus> {
     let out = cx
         .system
@@ -147,6 +207,11 @@ pub(crate) mod testkit {
 
         pub fn attach(&self, sys: FakeSystem) -> FakeSystem {
             let world = self.0.clone();
+            // systemd is PID 1 on this pretend host.
+            let sys = sys.with_dir(
+                "/run/systemd/system",
+                buckle_core::system::FilePerms::mode(0o755),
+            );
             sys.on_command("systemctl", &[], move |cmd| {
                 let mut units = world.lock().unwrap();
                 let sub = cmd.args.first().cloned().unwrap_or_default();

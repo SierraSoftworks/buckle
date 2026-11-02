@@ -90,6 +90,13 @@ impl HealthCheck for CommandCheck {
 
     #[tracing::instrument(name = "health.command", skip_all)]
     async fn check(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
+        // Reasons can quote command output or response bodies: scrub known secrets.
+        super::redacted(cx, self.probe(cx, spec).await)
+    }
+}
+
+impl CommandCheck {
+    async fn probe(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
         let matcher = match spec
             .expect
             .stdout_matches
@@ -240,5 +247,30 @@ mod tests {
             HealthStatus::Unknown { reason } => assert!(reason.contains(needle), "{reason}"),
             other => panic!("expected unknown, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn failure_reasons_are_scrubbed_of_secret_values() {
+        let sys = FakeSystem::new().on_command_fail(
+            "probe",
+            &[],
+            2,
+            "connect: password=pa55-word-x rejected",
+        );
+        let c = crate::tasks::hostkit::testkit::cx_secrets(
+            &sys,
+            buckle_core::testing::MemorySource::new(),
+            crate::tasks::hostkit::testkit::secrets("db", "pa55-word-x"),
+        );
+        let status = CommandCheck
+            .check(&c, &spec(json!({"run": ["probe"]})))
+            .await;
+        let HealthStatus::Fail { reason } = status else {
+            panic!("{status:?}")
+        };
+        assert!(
+            !reason.contains("pa55-word-x") && reason.contains("secret:db@"),
+            "{reason}"
+        );
     }
 }

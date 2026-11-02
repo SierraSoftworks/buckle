@@ -42,10 +42,17 @@ use tracing::instrument;
 /// Entries that would land outside `dest` (absolute paths, `..`) are rejected,
 /// as is writing beneath a symlink the archive itself created. The archive is
 /// held in memory and may not expand beyond 1 GiB. Files keep the archive's
-/// modes unless `mode` is set. Removal deletes the files Buckle extracted, and
-/// the directories it created if they are then empty, but only if every file is
-/// still exactly as extracted; otherwise it leaves everything in place.
+/// modes unless `mode` is set. A symlink entry never replaces an existing
+/// file or directory (or a symlink Buckle did not create) unless
+/// `force: true`; the plan is blocked instead.
+///
+/// Removal deletes the files Buckle extracted, and the directories it created
+/// if they are then empty, but only if every file is still exactly as
+/// extracted; otherwise it leaves everything in place. Files that were
+/// already in `dest` before Buckle first extracted over them are not Buckle's
+/// and are never deleted.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// URL, absolute host path, or path relative to the module's `files/` directory.
     pub src: String,
@@ -62,6 +69,22 @@ pub struct Spec {
     /// Skip the task when this path exists (relative paths are relative to `dest`).
     #[serde(default)]
     pub creates: Option<String>,
+    /// Let symlink entries replace existing files, directories or foreign symlinks.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Paths this resource extracted on earlier applies.
+fn owned_paths(cx: &Cx) -> BTreeSet<PathBuf> {
+    hostkit::ownership::previous_artefacts(cx)
+        .iter()
+        .filter_map(|a| match a {
+            Artefact::File { path } | Artefact::Symlink { path } | Artefact::Directory { path } => {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 pub struct ArchiveExtract;
@@ -445,6 +468,8 @@ impl ArchiveExtract {
         let entries = read_archive(&bytes, &hostkit::url_basename(&spec.src))?;
         let items = select(entries, spec.strip_components, &spec.include)?;
         let (mut new, mut changed) = (0usize, 0usize);
+        let owned = owned_paths(cx);
+        let mut clobbered = Vec::new();
         for (rel, entry) in &items {
             let target = spec.dest.join(rel);
             match (&entry.kind, cx.system.stat(&target).await?) {
@@ -470,14 +495,24 @@ impl ArchiveExtract {
                         changed += 1;
                     }
                 }
-                (EntryKind::Symlink(link), Some(_)) => {
-                    if cx.system.read_link(&target).await?.as_deref() != Some(link.as_path()) {
+                (EntryKind::Symlink(link), Some(meta)) => {
+                    let current = cx.system.read_link(&target).await?;
+                    if current.as_deref() != Some(link.as_path()) {
                         changed += 1;
+                        let ours = meta.kind == FileKind::Symlink && owned.contains(&target);
+                        if !ours && !spec.force {
+                            clobbered.push(target.display().to_string());
+                        }
                     }
                 }
             }
         }
-        let planned = if new + changed == 0 {
+        let planned = if !clobbered.is_empty() {
+            Planned::blocked(format!(
+                "the archive has symlinks that would replace existing paths Buckle did not create ({}); set `force: true` to replace them",
+                clobbered.join(", ")
+            ))
+        } else if new + changed == 0 {
             Planned::NoOp
         } else {
             let summary = format!(
@@ -533,12 +568,22 @@ impl Task for ArchiveExtract {
     #[instrument(name = "task.archive.extract.apply", skip_all, fields(src = %spec.src, dest = %spec.dest.display()))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         let mut inspection = self.inspect(cx, spec).await?;
-        if !inspection.planned.is_change() {
-            return Ok(Applied::unchanged(format!(
-                "{} already extracted",
-                spec.dest.display()
-            )));
+        if let Planned::Blocked { reason } = &inspection.planned {
+            return Err(error::user(
+                format!(
+                    "Nothing was extracted into {}: {reason}.",
+                    spec.dest.display()
+                ),
+                &["Remove the conflicting paths, or set `force: true`."],
+            ));
         }
+        if !inspection.planned.is_change() {
+            return Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("{} already extracted", spec.dest.display())),
+            ));
+        }
+        let owned = owned_paths(cx);
         if inspection.items.is_empty() {
             // `creates` was given, so planning did not read the archive.
             let bytes = fetch(cx, &spec.src).await?;
@@ -570,6 +615,10 @@ impl Task for ArchiveExtract {
             applied = applied.with_artefact(Artefact::Directory {
                 path: spec.dest.clone(),
             });
+        } else if owned.contains(&spec.dest) {
+            applied = applied.with_artefact(Artefact::Directory {
+                path: spec.dest.clone(),
+            });
         }
         let mut manifest_items = Vec::new();
         let mut created_dirs: BTreeSet<PathBuf> = BTreeSet::new();
@@ -584,14 +633,21 @@ impl Task for ArchiveExtract {
                 .collect();
             implicit.reverse();
             for dir in implicit {
-                if !created_dirs.contains(&dir) && cx.system.stat(&dir).await?.is_none() {
+                if !created_dirs.contains(&dir)
+                    && (owned.contains(&dir) || cx.system.stat(&dir).await?.is_none())
+                {
                     created_dirs.insert(dir.clone());
                     applied = applied.with_artefact(Artefact::Directory { path: dir });
                 }
             }
+            // Whether this resource may claim the entry: it creates it now, or
+            // created it on an earlier apply. A pre-existing file it overwrites
+            // is not Buckle's, so removal never deletes it.
+            let existed = cx.system.stat(&target).await?;
+            let claim = existed.is_none() || owned.contains(&target);
             match &entry.kind {
                 EntryKind::Dir => {
-                    let existed = cx.system.stat(&target).await?.is_some();
+                    let existed = existed.is_some() && !owned.contains(&target);
                     let perms = FilePerms {
                         mode: Some(if entry.mode == 0 { 0o755 } else { entry.mode }),
                         ..dir_perms.clone()
@@ -613,19 +669,33 @@ impl Task for ArchiveExtract {
                         ..dir_perms.clone()
                     };
                     cx.system.write_atomic(&target, &entry.data, &perms).await?;
-                    applied = applied.with_artefact(hostkit::file_artefact(&target));
+                    if claim {
+                        applied = applied.with_artefact(hostkit::file_artefact(&target));
+                    }
                 }
                 EntryKind::Symlink(link) => {
-                    if cx.system.stat(&target).await?.is_some() {
-                        cx.system.remove(&target, false).await?;
+                    let replace =
+                        cx.system.read_link(&target).await?.as_deref() != Some(link.as_path());
+                    if replace {
+                        if existed.is_some() {
+                            cx.system.remove(&target, false).await?;
+                        }
+                        cx.system.symlink(link, &target).await?;
                     }
-                    cx.system.symlink(link, &target).await?;
-                    applied = applied.with_artefact(Artefact::Symlink {
-                        path: target.clone(),
-                    });
+                    if claim || replace {
+                        // A link Buckle made (also over something else, with `force`) is Buckle's.
+                        applied = applied.with_artefact(Artefact::Symlink {
+                            path: target.clone(),
+                        });
+                    }
                 }
             }
-            if entry.kind != EntryKind::Dir {
+            // The manifest covers only what Buckle owns, which is what removal checks.
+            if entry.kind != EntryKind::Dir
+                && applied.artefacts.iter().any(|a| {
+                    matches!(a, Artefact::File { path } | Artefact::Symlink { path } if *path == target)
+                })
+            {
                 let (tag, value) = entry_value(entry);
                 manifest_items.push((format!("{tag} {}", target.display()), value));
             }
@@ -1005,5 +1075,79 @@ mod tests {
         assert!(glob_match("bin/*", "bin/tool"));
         assert!(!glob_match("*.txt", "a.md"));
         assert!(glob_match("*", ""));
+    }
+
+    #[tokio::test]
+    async fn files_that_existed_before_are_overwritten_but_never_claimed() {
+        let sys = host().with_file("/opt/tool/README", "the host's own", FilePerms::mode(0o644));
+        let applied = apply(
+            &ArchiveExtract,
+            &cx(&sys),
+            &s(json!({"strip_components": 1})),
+        )
+        .await;
+        assert!(!applied.artefacts.contains(&Artefact::File {
+            path: "/opt/tool/README".into()
+        }));
+        assert!(
+            applied
+                .artefacts
+                .iter()
+                .any(|a| matches!(a, Artefact::File { .. }))
+        );
+        let rec = record("archive.extract", "/opt/tool", &applied);
+        assert!(
+            ArchiveExtract
+                .remove(&cx(&sys), &rec)
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(
+            sys.exists("/opt/tool/README"),
+            "the pre-existing file stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_symlink_entry_never_replaces_an_existing_file_without_force() {
+        let bytes = {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            builder
+                .append_link(&mut header, "current", "releases/1.0")
+                .unwrap();
+            let tar = builder.into_inner().unwrap();
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut gz, &tar).unwrap();
+            gz.finish().unwrap()
+        };
+        let sys = FakeSystem::new()
+            .with_file("/srv/app/current", "precious", FilePerms::default())
+            .with_file("/srv/a.tgz", bytes, FilePerms::default());
+        let spec_of = |force: bool| -> Spec {
+            spec(json!({"src": "/srv/a.tgz", "dest": "/srv/app", "force": force}))
+        };
+        assert_eq!(
+            plan_class(&ArchiveExtract, &cx(&sys), &spec_of(false)).await,
+            Class::Blocked
+        );
+        assert!(
+            ArchiveExtract
+                .apply(&cx(&sys), &spec_of(false), &Planned::NoOp)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sys.file_string("/srv/app/current").as_deref(),
+            Some("precious")
+        );
+        apply(&ArchiveExtract, &cx(&sys), &spec_of(true)).await;
+        assert!(
+            sys.file("/srv/app/current").is_none(),
+            "replaced by the link"
+        );
     }
 }

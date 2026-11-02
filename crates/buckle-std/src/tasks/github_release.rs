@@ -53,6 +53,7 @@ use tracing::instrument;
 /// anything is written. Removal deletes `dest` only if it still matches what
 /// Buckle installed.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// `owner/name` of the repository.
     pub repo: String,
@@ -463,9 +464,11 @@ impl Task for GithubRelease {
         match &inspection.planned {
             Planned::NoOp => {
                 let current = cx.system.read(&spec.dest).await?.unwrap_or_default();
-                return Ok(hostkit::written(
+                return Ok(hostkit::ownership::file_written(
+                    cx,
                     format!("{} already up to date", spec.dest.display()),
                     &spec.dest,
+                    false,
                     Digest::of(&current),
                     None,
                     false,
@@ -485,9 +488,12 @@ impl Task for GithubRelease {
             // Only permissions differ.
             cx.system.set_perms(&spec.dest, &spec.perms).await?;
             let current = cx.system.read(&spec.dest).await?.unwrap_or_default();
-            return Ok(hostkit::written(
+            // A binary Buckle did not install is adopted, not claimed.
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("updated permissions of {}", spec.dest.display()),
                 &spec.dest,
+                false,
                 Digest::of(&current),
                 None,
                 true,

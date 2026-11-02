@@ -102,6 +102,9 @@ impl Task for SystemdDropin {
     #[tracing::instrument(name = "task.systemd.dropin.plan", skip_all, fields(unit = %spec.unit))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         spec.validate()?;
+        if let Some(blocked) = super::systemd_common::unavailable(cx).await? {
+            return Ok(blocked);
+        }
         let wanted = spec.render(cx)?;
         let path = spec.path();
         let summary = format!("drop-in {}", path.display());
@@ -207,7 +210,12 @@ mod tests {
     use serde_json::json;
 
     fn host() -> FakeSystem {
-        FakeSystem::new().on_command_ok("systemctl", &["daemon-reload"], "")
+        FakeSystem::new()
+            .with_dir(
+                "/run/systemd/system",
+                buckle_core::system::FilePerms::mode(0o755),
+            )
+            .on_command_ok("systemctl", &["daemon-reload"], "")
     }
 
     fn nomad() -> serde_json::Value {

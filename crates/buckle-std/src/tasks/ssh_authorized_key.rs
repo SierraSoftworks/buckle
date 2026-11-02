@@ -36,6 +36,7 @@ use tracing::instrument;
 /// `/home/<user>` (`/root` for root). Removal deletes the key lines Buckle
 /// added and leaves the rest of the file, including an emptied file, alone.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub user: String,
     /// One or more public key lines.
@@ -110,11 +111,21 @@ fn wanted_keys(spec: &Spec) -> Result<Vec<(String, (String, String))>> {
     Ok(keys)
 }
 
-/// Applies the spec to the current lines. Returns the new lines and the lines Buckle added or rewrote.
-fn edit(spec: &Spec, current: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+/// The result of applying a spec to the current lines.
+struct Edited {
+    lines: Vec<String>,
+    /// Lines Buckle added or rewrote (for the plan summary).
+    touched: Vec<String>,
+    /// Identities of keys that were not in the file and that Buckle appended.
+    appended: Vec<(String, String)>,
+}
+
+/// Applies the spec to the current lines.
+fn edit(spec: &Spec, current: &[String]) -> Result<Edited> {
     let wanted = wanted_keys(spec)?;
     let mut lines = current.to_vec();
     let mut touched = Vec::new();
+    let mut appended = Vec::new();
     match spec.state {
         Ensure::Absent => {
             lines.retain(|l| identity(l).is_none_or(|id| !wanted.iter().any(|(_, w)| *w == id)));
@@ -133,12 +144,28 @@ fn edit(spec: &Spec, current: &[String]) -> Result<(Vec<String>, Vec<String>)> {
                     None => {
                         lines.push(line.clone());
                         touched.push(line.clone());
+                        appended.push(id.clone());
                     }
                 }
             }
         }
     }
-    Ok((lines, touched))
+    Ok(Edited {
+        lines,
+        touched,
+        appended,
+    })
+}
+
+/// The key identities this resource added on earlier applies, by file.
+fn owned_ids(cx: &Cx, file: &std::path::Path) -> Vec<(String, String)> {
+    hostkit::ownership::previous_artefacts(cx)
+        .iter()
+        .filter_map(|a| match a {
+            Artefact::Line { path, marker } if path == file => identity(marker),
+            _ => None,
+        })
+        .collect()
 }
 
 struct Target {
@@ -191,7 +218,8 @@ struct Inspection {
     planned: Planned,
     target: Target,
     new_text: String,
-    touched: Vec<String>,
+    new_lines: Vec<String>,
+    appended: Vec<(String, String)>,
     file_exists: bool,
     dir_exists: bool,
     content_changed: bool,
@@ -206,7 +234,11 @@ impl SshAuthorizedKey {
             .as_ref()
             .map(|f| hostkit::split_lines(&f.text))
             .unwrap_or_default();
-        let (lines, touched) = edit(spec, &current_lines)?;
+        let Edited {
+            lines,
+            touched,
+            appended,
+        } = edit(spec, &current_lines)?;
         let new_text = hostkit::join_lines(&lines);
         let old_text = file.as_ref().map(|f| f.text.clone()).unwrap_or_default();
         let content_changed = lines != current_lines;
@@ -253,7 +285,13 @@ impl SshAuthorizedKey {
                 preview: Some(buckle_core::secrets::Redacted::plain(new_text.clone())),
             })
         } else if content_changed {
-            hostkit::text_diff_planned(format!("update {path}"), &old_text, &new_text)
+            hostkit::text_diff_planned(
+                cx,
+                &target.file,
+                format!("update {path}"),
+                &old_text,
+                &new_text,
+            )
         } else {
             Planned::change(Diff::Update {
                 summary: format!("{path}: {}", perm_notes.join(", ")),
@@ -264,7 +302,8 @@ impl SshAuthorizedKey {
             planned,
             target,
             new_text,
-            touched,
+            new_lines: lines,
+            appended,
             file_exists: file.is_some(),
             dir_exists,
             content_changed,
@@ -312,12 +351,14 @@ impl Task for SshAuthorizedKey {
 
     #[instrument(name = "task.ssh.authorized_key.apply", skip_all, fields(user = %spec.user, state = ?spec.state))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
+        let target = self.target(cx, spec).await?;
+        let _guard = hostkit::lock_path(&target.file).await;
         let i = self.inspect(cx, spec).await?;
         if !i.planned.is_change() {
-            return Ok(Applied::unchanged(format!(
-                "keys for {} already up to date",
-                spec.user
-            )));
+            return Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("keys for {} already up to date", spec.user)),
+            ));
         }
         let path = &i.target.file;
         if spec.state == Ensure::Present {
@@ -348,12 +389,25 @@ impl Task for SshAuthorizedKey {
         } else {
             cx.system.set_perms(path, &file_perms(&i.target)).await?;
         }
+        // Buckle owns only the keys it appended, on this apply or an earlier one.
+        // A key that was already in the file stays the user's even when Buckle
+        // rewrote its options, so removal never deletes it.
+        let mut owned = owned_ids(cx, path);
+        owned.extend(i.appended.iter().cloned());
         let mut applied = Applied::changed(format!("updated {}", path.display()));
-        for line in &i.touched {
-            applied = applied.with_artefact(Artefact::Line {
-                path: path.clone(),
-                marker: line.clone(),
-            });
+        for line in &i.new_lines {
+            if let Some(id) = identity(line)
+                && owned.contains(&id)
+                && !applied
+                    .artefacts
+                    .iter()
+                    .any(|a| matches!(a, Artefact::Line { marker, .. } if identity(marker).as_ref() == Some(&id)))
+            {
+                applied = applied.with_artefact(Artefact::Line {
+                    path: path.clone(),
+                    marker: line.clone(),
+                });
+            }
         }
         Ok(applied)
     }
@@ -387,6 +441,7 @@ impl Task for SshAuthorizedKey {
         }
         let mut removed = 0;
         for (path, markers) in by_file {
+            let _guard = hostkit::lock_path(&path).await;
             let Some(file) = hostkit::load_text(cx, &path).await? else {
                 continue;
             };
@@ -576,6 +631,51 @@ mod tests {
         assert!(SshAuthorizedKey.remove(&c, &rec).await.unwrap().changed);
         assert_eq!(sys.file_string(FILE).unwrap(), format!("{K2}\n"));
         assert!(!SshAuthorizedKey.remove(&c, &rec).await.unwrap().changed);
+    }
+
+    #[tokio::test]
+    async fn reoptioning_a_preexisting_key_never_claims_it_and_added_keys_stay_owned() {
+        // K1 was in the file before Buckle; K2 is added by Buckle.
+        let sys = with_keys(&format!("{K1}\n"));
+        let both = s(json!({"key": format!("from=\"10.0.0.1\" {K1}\n{K2}")}));
+        let first = apply(&SshAuthorizedKey, &cx(&sys), &both).await;
+        assert_eq!(
+            first.artefacts,
+            vec![Artefact::Line {
+                path: FILE.into(),
+                marker: K2.into()
+            }],
+            "only the appended key is Buckle's"
+        );
+        let rec = record("ssh.authorized_key", "k", &first);
+
+        // A later apply that only re-options K2 keeps it owned (with the new text).
+        let reoptioned = s(json!({"key": format!("from=\"10.0.0.1\" {K1}\nno-pty {K2}")}));
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .previous(rec)
+            .build();
+        let second = apply(&SshAuthorizedKey, &c, &reoptioned).await;
+        assert_eq!(
+            second.artefacts,
+            vec![Artefact::Line {
+                path: FILE.into(),
+                marker: format!("no-pty {K2}")
+            }]
+        );
+
+        // Removal deletes K2 only; the pre-existing K1 stays (with its options).
+        let rec = record("ssh.authorized_key", "k", &second);
+        assert!(
+            SshAuthorizedKey
+                .remove(&cx(&sys), &rec)
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            sys.file_string(FILE).unwrap(),
+            format!("from=\"10.0.0.1\" {K1}\n")
+        );
     }
 
     #[rstest]

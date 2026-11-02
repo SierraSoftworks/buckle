@@ -55,6 +55,7 @@ use tracing::instrument;
 /// the configuration (in the same `cwd`, with the non-secret `env`). Without it
 /// the removal is reported as "no cleanup defined".
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// The command: an argv list, or a string run with `sh -c`.
     pub run: StringOrArgv,
@@ -202,18 +203,47 @@ impl CommandRun {
             return Ok(Some(format!("{} exists", path.display())));
         }
         if let Some(unless) = &spec.unless {
-            let out = cx.system.run(self.build(cx, spec, unless)?).await?;
+            let out = self.probe(cx, self.build(cx, spec, unless)?).await?;
             if out.success() {
                 return Ok(Some(format!("`{}` succeeded", unless.display())));
             }
         }
         if let Some(only_if) = &spec.only_if {
-            let out = cx.system.run(self.build(cx, spec, only_if)?).await?;
+            let out = self.probe(cx, self.build(cx, spec, only_if)?).await?;
             if !out.success() {
                 return Ok(Some(format!("`{}` did not succeed", only_if.display())));
             }
         }
         Ok(None)
+    }
+
+    /// Runs an `unless` / `only_if` probe. A probe whose program is not
+    /// installed behaves as a shell would report it, exiting 127 ("command not
+    /// found"), rather than failing the plan: `unless: [nomad, version]`
+    /// before nomad is installed means "not installed yet, run".
+    async fn probe(&self, cx: &Cx, command: Command) -> Result<Output> {
+        let not_found = || Output {
+            code: Some(127),
+            stdout: Vec::new(),
+            stderr: format!("{}: command not found", command.program).into_bytes(),
+            timed_out: false,
+        };
+        let present = if command.program.contains('/') {
+            cx.system
+                .stat(std::path::Path::new(&command.program))
+                .await?
+                .is_some()
+        } else {
+            cx.system.which(&command.program).await?.is_some()
+        };
+        if !present {
+            return Ok(not_found());
+        }
+        match cx.system.run(command.clone()).await {
+            Ok(out) => Ok(out),
+            // The program vanished between the lookup and the start.
+            Err(_) => Ok(not_found()),
+        }
     }
 
     fn changed(spec: &Spec, out: &Output) -> bool {
@@ -227,7 +257,10 @@ impl CommandRun {
         }
     }
 
-    fn record_output(spec: &Spec, command: &Command, out: &Output) {
+    /// Records the exit code and, when `capture` allows, the output on the
+    /// span. Output always goes through the secret scrubber first: a command
+    /// may print a secret it read from a file, not only from its environment.
+    fn record_output(cx: &Cx, spec: &Spec, command: &Command, out: &Output) {
         let allowed = match spec.capture {
             Capture::Never => false,
             Capture::Redacted => !command.sensitive_env,
@@ -238,13 +271,20 @@ impl CommandRun {
             span.record("exit_code", code);
         }
         if allowed {
+            let redactor = buckle_core::secrets::redact::Redactor::new(&cx.secrets);
             span.record(
                 "stdout",
-                hostkit::clip(out.stdout_str().trim(), OUTPUT_CAPTURE_LIMIT),
+                hostkit::clip(
+                    redactor.redact_bytes(&out.stdout).get().trim(),
+                    OUTPUT_CAPTURE_LIMIT,
+                ),
             );
             span.record(
                 "stderr",
-                hostkit::clip(out.stderr_str().trim(), OUTPUT_CAPTURE_LIMIT),
+                hostkit::clip(
+                    redactor.redact_bytes(&out.stderr).get().trim(),
+                    OUTPUT_CAPTURE_LIMIT,
+                ),
             );
         }
     }
@@ -306,11 +346,12 @@ impl Task for CommandRun {
         let line = command.display_line();
         let sensitive = command.sensitive_env;
         let out = cx.system.run(command.clone()).await?;
-        Self::record_output(spec, &command, &out);
+        Self::record_output(cx, spec, &command, &out);
         let tolerated =
             matches!(spec.changed_when, Some(ChangedWhen::Exit(code)) if out.code == Some(code));
         if !out.success() && !tolerated {
             return Err(hostkit::command_failed(
+                cx,
                 "The command",
                 &hostkit::clip(&line, 300),
                 &out,
@@ -787,5 +828,50 @@ mod tests {
             "{fields:?}"
         );
         assert!(fields.iter().any(|(k, v)| k == "exit_code" && v == "0"));
+    }
+
+    #[tokio::test]
+    async fn failure_messages_never_quote_a_known_secret() {
+        // The command reads the secret itself (not via env) and prints it.
+        let sys = FakeSystem::new().on_command_fail(
+            "deploy",
+            &[],
+            1,
+            "auth failed for token tok-123-secret",
+        );
+        let c = crate::tasks::hostkit::testkit::cx_secrets(
+            &sys,
+            buckle_core::testing::MemorySource::new(),
+            crate::tasks::hostkit::testkit::secrets("api", "tok-123-secret"),
+        );
+        let s: Spec =
+            serde_json::from_value(json!({"run": ["deploy"], "capture": "always"})).unwrap();
+        let err = CommandRun.apply(&c, &s, &Planned::NoOp).await.unwrap_err();
+        let text = format!("{} {:?}", err.description(), err);
+        assert!(!text.contains("tok-123-secret"), "{text}");
+        assert!(text.contains("secret:api@"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_whose_program_is_missing_exits_127_instead_of_failing_the_plan() {
+        let sys = FakeSystem::new();
+        let c = cx(&sys);
+        let unless: Spec = serde_json::from_value(
+            json!({"run": ["install-nomad"], "unless": ["nomad", "version"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_class(&CommandRun, &c, &unless).await,
+            Class::Change,
+            "not installed yet: run"
+        );
+        let only_if: Spec =
+            serde_json::from_value(json!({"run": ["x"], "only_if": ["/usr/local/bin/missing"]}))
+                .unwrap();
+        assert_eq!(
+            plan_class(&CommandRun, &c, &only_if).await,
+            Class::NoOp,
+            "127 is not success"
+        );
     }
 }

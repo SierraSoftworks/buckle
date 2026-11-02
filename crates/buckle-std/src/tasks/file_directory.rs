@@ -26,17 +26,21 @@ use tracing::instrument;
 /// Missing parent directories are created too. With `recurse: true` the
 /// permissions are also applied to everything already inside the directory
 /// (the mode applies to files as well as directories, so prefer setting
-/// `owner` and `group` when recursing), and removal of a directory that
-/// Buckle created deletes its contents. Without `recurse`, removal deletes
-/// the directory only if it is empty. A directory that existed before Buckle
-/// managed it is never deleted.
+/// `owner` and `group` when recursing). `recurse` is about permissions only.
+///
+/// Removal deletes the directory only if Buckle created it and it is empty
+/// (files that other tasks wrote into it are removed by those tasks first,
+/// since removals run in reverse order). Contents Buckle did not create, such
+/// as the data a service keeps in `/var/lib/nomad`, are never deleted, and a
+/// directory that existed before Buckle managed it is never deleted.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the directory.
     pub path: PathBuf,
     #[serde(flatten)]
     pub perms: FilePerms,
-    /// Apply the permissions to existing contents as well, and remove contents with the directory.
+    /// Apply the permissions to existing contents as well (never affects removal).
     #[serde(default)]
     pub recurse: bool,
 }
@@ -44,8 +48,9 @@ pub struct Spec {
 pub struct FileDirectory;
 buckle_core::register_task!(FileDirectory);
 
-/// Marks, in the record, that removal may delete the directory's contents too.
-const RECURSIVE_MARKER: &str = "file.directory: remove recursively";
+/// Recorded by earlier versions to make removal recursive; now ignored, and
+/// dropped from the record on the next apply.
+const LEGACY_RECURSIVE_MARKER: &str = "file.directory: remove recursively";
 
 /// Everything beneath `root` whose permissions differ from `want`, as `(path, changes)`.
 async fn drifted_descendants(
@@ -77,6 +82,10 @@ async fn drifted_descendants(
     }
     drifted.sort();
     Ok(drifted)
+}
+
+fn is_legacy_marker(artefact: &Artefact) -> bool {
+    matches!(artefact, Artefact::Other { description } if description == LEGACY_RECURSIVE_MARKER)
 }
 
 struct Inspection {
@@ -161,26 +170,27 @@ impl Task for FileDirectory {
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         let inspection = self.inspect(cx, spec).await?;
         if !inspection.planned.is_change() {
-            return Ok(Applied::unchanged(format!(
-                "{} already up to date",
-                spec.path.display()
-            )));
+            return Ok(hostkit::ownership::carry_forward_if(
+                cx,
+                Applied::unchanged(format!("{} already up to date", spec.path.display())),
+                |a| !is_legacy_marker(a),
+            ));
         }
-        let mut applied;
+        let applied;
         if inspection.exists.is_none() {
             cx.system.mkdir_all(&spec.path, &spec.perms).await?;
             applied = Applied::changed(format!("created directory {}", spec.path.display()))
                 .with_artefact(Artefact::Directory {
                     path: spec.path.clone(),
                 });
-            if spec.recurse {
-                applied = applied.with_artefact(Artefact::Other {
-                    description: RECURSIVE_MARKER.to_owned(),
-                });
-            }
         } else {
             cx.system.set_perms(&spec.path, &spec.perms).await?;
-            applied = Applied::changed(format!("updated {}", spec.path.display()));
+            // A directory Buckle created earlier stays Buckle's after a permission change.
+            applied = hostkit::ownership::carry_forward_if(
+                cx,
+                Applied::changed(format!("updated {}", spec.path.display())),
+                |a| !is_legacy_marker(a),
+            );
         }
         for (path, _) in &inspection.drifted {
             cx.system.set_perms(path, &spec.perms).await?;
@@ -189,13 +199,20 @@ impl Task for FileDirectory {
     }
 
     fn describe_removal(&self, record: &ResourceRecord) -> String {
-        let recursive = record.artefacts.iter().any(
-            |a| matches!(a, Artefact::Other { description } if description == RECURSIVE_MARKER),
-        );
-        if recursive {
-            format!("delete directory {} and its contents", record.key.key)
+        if record
+            .artefacts
+            .iter()
+            .any(|a| matches!(a, Artefact::Directory { .. }))
+        {
+            format!(
+                "delete directory {} if Buckle created it and it is empty",
+                record.key.key
+            )
         } else {
-            format!("delete directory {} if it is empty", record.key.key)
+            format!(
+                "leave directory {} (it existed before Buckle managed it)",
+                record.key.key
+            )
         }
     }
 
@@ -208,9 +225,6 @@ impl Task for FileDirectory {
                 "the directory existed before Buckle managed it, left in place",
             ));
         };
-        let recursive = record.artefacts.iter().any(
-            |a| matches!(a, Artefact::Other { description } if description == RECURSIVE_MARKER),
-        );
         let Some(meta) = cx.system.stat(&path).await? else {
             return Ok(Applied::unchanged(format!(
                 "{} was already absent",
@@ -223,16 +237,17 @@ impl Task for FileDirectory {
                 path.display()
             )));
         }
-        if !recursive {
-            let entries = cx.system.list_dir(&path).await?.unwrap_or_default();
-            if !entries.is_empty() {
-                return Ok(Applied::skipped(format!(
-                    "{} is not empty, left in place",
-                    path.display()
-                )));
-            }
+        // Never recursive: whatever is still inside was not created by this
+        // task, and may be data that a service or an operator put there.
+        let entries = cx.system.list_dir(&path).await?.unwrap_or_default();
+        if !entries.is_empty() {
+            return Ok(Applied::skipped(format!(
+                "{} is not empty ({} entries Buckle did not create), left in place",
+                path.display(),
+                entries.len()
+            )));
         }
-        cx.system.remove(&path, recursive).await?;
+        cx.system.remove(&path, false).await?;
         Ok(Applied::changed(format!(
             "deleted directory {}",
             path.display()
@@ -325,7 +340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removal_deletes_only_empty_directories_unless_recursion_was_requested() {
+    async fn removal_deletes_only_empty_directories_buckle_created() {
         let sys = FakeSystem::new();
         let c = cx(&sys);
         let s: Spec = spec(json!({"path": "/srv/app"}));
@@ -344,17 +359,32 @@ mod tests {
         assert!(FileDirectory.remove(&c, &rec).await.unwrap().changed);
         assert!(!sys.exists("/srv/app"));
 
-        // Recursive: Buckle created it and recursion was requested.
-        let s: Spec = spec(json!({"path": "/srv/rec", "recurse": true}));
+        // `recurse` is about permissions: a service's data is never deleted.
+        let s: Spec = spec(json!({"path": "/var/lib/nomad", "owner": "nomad", "recurse": true}));
         let rec = record(
             "file.directory",
-            "/srv/rec",
+            "/var/lib/nomad",
             &apply(&FileDirectory, &c, &s).await,
         );
-        put(&sys, "/srv/rec/a/b", "x").await;
-        assert!(FileDirectory.describe_removal(&rec).contains("contents"));
-        assert!(FileDirectory.remove(&c, &rec).await.unwrap().changed);
-        assert!(!sys.exists("/srv/rec"));
+        put(&sys, "/var/lib/nomad/server/raft/raft.db", "raft").await;
+        put(&sys, "/var/lib/nomad/client/state.db", "state").await;
+        assert!(!FileDirectory.describe_removal(&rec).contains("contents"));
+        let out = FileDirectory.remove(&c, &rec).await.unwrap();
+        assert!(
+            !out.changed && out.summary.contains("not empty"),
+            "{}",
+            out.summary
+        );
+        assert!(sys.exists("/var/lib/nomad/server/raft/raft.db"));
+        assert!(sys.exists("/var/lib/nomad/client/state.db"));
+
+        // A record from an earlier version that asked for recursive removal is not obeyed.
+        let mut legacy = rec.clone();
+        legacy.artefacts.push(Artefact::Other {
+            description: LEGACY_RECURSIVE_MARKER.into(),
+        });
+        assert!(!FileDirectory.remove(&c, &legacy).await.unwrap().changed);
+        assert!(sys.exists("/var/lib/nomad/server/raft/raft.db"));
     }
 
     #[tokio::test]
@@ -370,5 +400,31 @@ mod tests {
         let out = FileDirectory.remove(&c, &rec).await.unwrap();
         assert!(!out.changed);
         assert!(sys.exists("/srv/app"));
+    }
+
+    #[tokio::test]
+    async fn a_permission_update_keeps_the_directory_buckle_created() {
+        let sys = FakeSystem::new();
+        let created = apply(
+            &FileDirectory,
+            &cx(&sys),
+            &spec(json!({"path": "/srv/app"})),
+        )
+        .await;
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .previous(record("file.directory", "/srv/app", &created))
+            .build();
+        let updated = apply(
+            &FileDirectory,
+            &c,
+            &spec(json!({"path": "/srv/app", "mode": "0700"})),
+        )
+        .await;
+        assert!(updated.artefacts.contains(&Artefact::Directory {
+            path: "/srv/app".into()
+        }));
+        let rec = record("file.directory", "/srv/app", &updated);
+        assert!(FileDirectory.remove(&cx(&sys), &rec).await.unwrap().changed);
+        assert!(!sys.exists("/srv/app"));
     }
 }

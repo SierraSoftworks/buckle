@@ -1,7 +1,7 @@
 //! `ufw.default`: a default firewall policy.
 
-use super::sys_exec::{Ledger, run_checked};
-use super::ufw_common::{installed, read_status, ufw};
+use super::sys_exec::{legacy_ledger, run_checked};
+use super::ufw_common::{installed, lockout_reason, read_status, ufw};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::state::ResourceRecord;
@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 /// `deny` or `reject`. The current policy is read from `ufw status verbose`
 /// (or from `/etc/default/ufw` while the firewall is inactive).
 ///
+/// Setting `incoming` to `deny` or `reject` on an active firewall is refused
+/// (blocked, with advice) unless a rule on the host, or a `ufw.rule` earlier
+/// in the same plan, allows or limits incoming SSH or all traffic on a
+/// management interface such as `tailscale0`; set `allow_lockout: true` to
+/// change it anyway. (On an inactive firewall the check happens when
+/// `ufw.state` enables it.)
+///
 /// Removal restores the policy that was in place before Buckle first changed
 /// it, and does nothing if Buckle never changed it.
 pub struct UfwDefault;
@@ -27,6 +34,13 @@ pub struct Spec {
     pub direction: Direction,
     /// `allow`, `deny` or `reject`.
     pub policy: Policy,
+    /// Change an incoming policy even when no rule keeps SSH or a management interface reachable.
+    #[serde(default)]
+    pub allow_lockout: bool,
+}
+
+fn closes_incoming(spec: &Spec) -> bool {
+    spec.direction == Direction::Incoming && spec.policy != Policy::Allow && !spec.allow_lockout
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -100,6 +114,13 @@ impl Task for UfwDefault {
             }));
         }
         let status = read_status(cx, false).await?;
+        if status.active
+            && closes_incoming(spec)
+            && status.defaults.get("incoming").map(String::as_str) != Some(spec.policy.as_str())
+            && let Some(reason) = lockout_reason(cx, &summary, true).await?
+        {
+            return Ok(Planned::blocked(reason));
+        }
         match status.defaults.get(spec.direction.as_str()) {
             Some(current) if current == spec.policy.as_str() => Ok(Planned::NoOp),
             current => Ok(Planned::change(Diff::Opaque {
@@ -115,18 +136,34 @@ impl Task for UfwDefault {
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         let dir = spec.direction.as_str();
         let status = read_status(cx, false).await?;
-        let mut ledger = Ledger::open(cx, "ufw").await?;
-        let ledger_key = format!("default.{dir}");
-        // Remember the policy from before Buckle ever changed it.
-        if !ledger.contains(&ledger_key)
-            && let Some(current) = status.defaults.get(dir)
+        // Remember the policy from before Buckle ever changed it: from this
+        // resource's record, else (records written before the ledger was
+        // retired) from the legacy ledger, else the policy in force now.
+        let before = match cx.previous.as_deref().and_then(previous) {
+            Some((_, policy)) => Some(policy),
+            None if cx.previous.is_some() => legacy_ledger(cx, "ufw")
+                .await?
+                .remove(&format!("default.{dir}"))
+                .or_else(|| status.defaults.get(dir).cloned()),
+            None => status.defaults.get(dir).cloned(),
+        };
+        if status.active
+            && closes_incoming(spec)
+            && let Some(reason) = lockout_reason(
+                cx,
+                &format!("ufw default {} incoming", spec.policy.as_str()),
+                false,
+            )
+            .await?
         {
-            ledger.insert(&ledger_key, current.clone());
+            return Err(buckle_core::error::user(
+                format!("The incoming policy was not changed. {reason}."),
+                &["Order the SSH or management-interface ufw.rule before ufw.default."],
+            ));
         }
         run_checked(cx, ufw(&["default", spec.policy.as_str(), dir])).await?;
-        ledger.save(cx).await?;
         let mut applied = Applied::changed(format!("ufw default {} {}", spec.policy.as_str(), dir));
-        if let Some(previous) = ledger.get(&ledger_key) {
+        if let Some(previous) = before {
             applied = applied.with_artefact(Artefact::Other {
                 description: format!("{PREVIOUS}{dir} previous={previous}"),
             });
@@ -148,9 +185,6 @@ impl Task for UfwDefault {
 
     #[tracing::instrument(name = "task.ufw.default.remove", skip_all, fields(resource = %record.key))]
     async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
-        let mut ledger = Ledger::open(cx, "ufw").await?;
-        ledger.remove(&format!("default.{}", record.key.key));
-        ledger.save(cx).await?;
         let Some((dir, policy)) = previous(record) else {
             return Ok(Applied::skipped(
                 "Buckle did not change this policy; left as it is",
@@ -180,7 +214,8 @@ buckle_core::register_task!(UfwDefault);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::sys_exec::testkit::{cx, record_of, spec};
+    use crate::tasks::hostkit::testkit::{FakeExt, put};
+    use crate::tasks::sys_exec::testkit::{cx, cx_after, record_of, spec};
     use crate::tasks::ufw_common::testkit::Ufw;
     use buckle_core::system::FilePerms;
     use buckle_core::testing::FakeSystem;
@@ -227,7 +262,10 @@ mod tests {
 
     #[tokio::test]
     async fn apply_sets_the_policy_and_remembers_the_old_one() {
-        let ufw = Ufw::new().active().default_policy("incoming", "allow");
+        let ufw = Ufw::new()
+            .active()
+            .default_policy("incoming", "allow")
+            .rule("allow in on tailscale0");
         let (sys, cx) = host(&ufw);
         let s: Spec = spec(json!({"direction": "incoming", "policy": "deny"}));
         let applied = UfwDefault.apply(&cx, &s, &Planned::NoOp).await.unwrap();
@@ -247,9 +285,12 @@ mod tests {
 
     #[tokio::test]
     async fn removal_restores_the_original_policy_even_after_a_second_change() {
-        let ufw = Ufw::new().active().default_policy("incoming", "allow");
-        let (_sys, cx) = host(&ufw);
-        UfwDefault
+        let ufw = Ufw::new()
+            .active()
+            .default_policy("incoming", "allow")
+            .rule("allow in on tailscale0");
+        let (sys, cx) = host(&ufw);
+        let first = UfwDefault
             .apply(
                 &cx,
                 &spec(json!({"direction": "incoming", "policy": "deny"})),
@@ -260,7 +301,7 @@ mod tests {
         // The author later switches to reject; the original (allow) is still what we restore.
         let applied = UfwDefault
             .apply(
-                &cx,
+                &cx_after(&sys, record_of("ufw.default", "incoming", &first)),
                 &spec(json!({"direction": "incoming", "policy": "reject"})),
                 &Planned::NoOp,
             )
@@ -276,6 +317,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_record_from_before_the_ledger_was_retired_is_migrated_once() {
+        let ufw = Ufw::new()
+            .active()
+            .default_policy("incoming", "deny")
+            .rule("allow in on tailscale0");
+        let (sys, _cx) = host(&ufw);
+        // The old code kept "allow" (the policy before Buckle) only in the ledger.
+        put(
+            &sys,
+            "/var/lib/buckle/ledger/ufw.json",
+            r#"{"default.incoming":"allow"}"#,
+        )
+        .await;
+        let old = record_of("ufw.default", "incoming", &Applied::changed("old"));
+        let applied = UfwDefault
+            .apply(
+                &cx_after(&sys, old),
+                &spec(json!({"direction": "incoming", "policy": "reject"})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        let record = record_of("ufw.default", "incoming", &applied);
+        assert_eq!(
+            UfwDefault.describe_removal(&record),
+            "ufw default allow incoming (restoring the previous policy)"
+        );
+        // From now on the record is authoritative; the ledger is not consulted or written.
+        sys.remove_for_test("/var/lib/buckle/ledger/ufw.json").await;
+        let next = UfwDefault
+            .apply(
+                &cx_after(&sys, record),
+                &spec(json!({"direction": "incoming", "policy": "deny"})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        assert!(
+            UfwDefault
+                .describe_removal(&record_of("ufw.default", "incoming", &next))
+                .contains("allow incoming")
+        );
+        assert!(!sys.exists("/var/lib/buckle/ledger/ufw.json"));
+    }
+
+    #[tokio::test]
     async fn removal_without_a_recorded_change_does_nothing() {
         let ufw = Ufw::new().active();
         let (sys, cx) = host(&ufw);
@@ -283,5 +370,32 @@ mod tests {
         let removed = UfwDefault.remove(&cx, &record).await.unwrap();
         assert!(!removed.changed);
         assert!(sys.command_lines().is_empty());
+    }
+
+    #[rstest]
+    #[case::deny_without_ssh(Ufw::new().active().default_policy("incoming", "allow"), json!({"direction": "incoming", "policy": "deny"}), true)]
+    #[case::reject_without_ssh(Ufw::new().active().default_policy("incoming", "allow"), json!({"direction": "incoming", "policy": "reject"}), true)]
+    #[case::deny_with_ssh(Ufw::new().active().default_policy("incoming", "allow").rule("limit 22/tcp"), json!({"direction": "incoming", "policy": "deny"}), false)]
+    #[case::opted_out(Ufw::new().active().default_policy("incoming", "allow"), json!({"direction": "incoming", "policy": "deny", "allow_lockout": true}), false)]
+    #[case::inactive_firewall_is_checked_on_enable(Ufw::new().default_policy("incoming", "allow"), json!({"direction": "incoming", "policy": "deny"}), false)]
+    #[case::outgoing_is_never_a_lockout(Ufw::new().active(), json!({"direction": "outgoing", "policy": "deny"}), false)]
+    #[tokio::test]
+    async fn closing_incoming_traffic_needs_a_rule_that_keeps_ssh_reachable(
+        #[case] ufw: Ufw,
+        #[case] spec_json: serde_json::Value,
+        #[case] blocked: bool,
+    ) {
+        let (_sys, cx) = host(&ufw);
+        let s: Spec = spec(spec_json);
+        let planned = UfwDefault.plan(&cx, &s).await.unwrap();
+        assert_eq!(
+            matches!(planned, Planned::Blocked { .. }),
+            blocked,
+            "{planned:?}"
+        );
+        assert_eq!(
+            UfwDefault.apply(&cx, &s, &Planned::NoOp).await.is_err(),
+            blocked
+        );
     }
 }

@@ -22,7 +22,8 @@ use std::path::PathBuf;
 /// also runs `sysctl -w name=value` so the change takes effect immediately.
 /// With `persist: false` only the live value is managed.
 ///
-/// A plan compares the live value (`sysctl -n`, whitespace-normalised) and the
+/// A plan compares the live value (read from `/proc/sys`, so planning needs
+/// no `sysctl` binary; whitespace-normalised) and the
 /// persisted line. Removal deletes the line, and the file when nothing but
 /// comments is left. It does not touch the live value: the kernel keeps what
 /// it was last given until the next reboot, because Buckle cannot know the
@@ -127,12 +128,44 @@ fn without_setting(content: &str, name: &str) -> (String, bool) {
     (kept.join("\n") + "\n", any_left)
 }
 
+/// `/proc/sys/net/ipv4/ip_forward` for `net.ipv4.ip_forward` (a name given
+/// with slashes is used as it is, as `sysctl` does).
+fn proc_path(name: &str) -> std::path::PathBuf {
+    let rel = if name.contains('/') {
+        name.trim_start_matches('/').to_owned()
+    } else {
+        name.replace('.', "/")
+    };
+    std::path::Path::new("/proc/sys").join(rel)
+}
+
+/// The live value, read from `/proc/sys` so that planning needs no `sysctl`
+/// binary (minimal images lack procps). `None` for an unknown key.
 async fn live_value(cx: &Cx, name: &str) -> Result<Option<String>> {
-    let out = cx
+    Ok(cx
         .system
-        .run(Command::new("sysctl").args(["-n", name]))
-        .await?;
-    Ok(out.success().then(|| squash_ws(&out.stdout_str())))
+        .read(&proc_path(name))
+        .await?
+        .map(|b| squash_ws(&String::from_utf8_lossy(&b))))
+}
+
+/// Sets the live value: `sysctl -w` when procps is installed, else a direct
+/// write to `/proc/sys` (through `sh`, with the value and path as arguments).
+async fn set_live(cx: &Cx, name: &str, value: &str) -> Result<()> {
+    let command = if cx.system.which("sysctl").await?.is_some() {
+        Command::new("sysctl")
+            .arg("-w")
+            .arg(format!("{name}={value}"))
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg(r#"printf '%s\n' "$1" > "$2""#)
+            .arg("sh")
+            .arg(value)
+            .arg(proc_path(name).to_string_lossy().into_owned())
+    };
+    run_checked(cx, command).await?;
+    Ok(())
 }
 
 #[async_trait]
@@ -236,13 +269,7 @@ impl Task for SysctlParam {
                     marker: spec.name.clone(),
                 });
         }
-        run_checked(
-            cx,
-            Command::new("sysctl")
-                .arg("-w")
-                .arg(format!("{}={}", spec.name, wanted)),
-        )
-        .await?;
+        set_live(cx, &spec.name, &wanted).await?;
         Ok(applied)
     }
 
@@ -320,7 +347,8 @@ mod tests {
 
     const FILE: &str = "/etc/sysctl.d/90-buckle-web.conf";
 
-    /// A pretend kernel: `sysctl -n` reads, `sysctl -w` writes.
+    /// A pretend kernel: values live in `/proc/sys`; `sysctl -n` reads and
+    /// `sysctl -w` writes (keeping the world map and the files in step).
     fn kernel(values: &[(&str, &str)]) -> (FakeSystem, Arc<Mutex<BTreeMap<String, String>>>) {
         let world: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(
             values
@@ -328,9 +356,27 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         ));
+        let mut sys = FakeSystem::new();
+        for (k, v) in values {
+            // The kernel separates multi-value settings with tabs.
+            sys = sys.with_file(
+                proc_path(k),
+                format!("{}\n", v.replace(' ', "\t")),
+                FilePerms::default(),
+            );
+        }
         let w = world.clone();
-        let sys = FakeSystem::new().on_command("sysctl", &[], move |cmd| {
+        let host = sys.clone();
+        let sys = sys.on_command("sysctl", &[], move |cmd| {
             let mut w = w.lock().unwrap();
+            if let [flag, assignment] = cmd.args.as_slice()
+                && flag == "-w"
+                && let Some((k, v)) = assignment.split_once('=')
+            {
+                let _ =
+                    host.clone()
+                        .with_file(proc_path(k), format!("{v}\n"), FilePerms::default());
+            }
             match cmd.args.as_slice() {
                 [flag, name] if flag == "-n" => match w.get(name) {
                     // The kernel separates multi-value settings with tabs.
@@ -566,5 +612,36 @@ mod tests {
             s.file(&cx),
             PathBuf::from("/etc/sysctl.d/90-buckle-web.conf")
         );
+    }
+
+    #[tokio::test]
+    async fn planning_needs_no_sysctl_binary_and_apply_falls_back_to_proc() {
+        // A minimal image: /proc/sys exists, procps does not.
+        let sys = FakeSystem::new()
+            .with_file("/proc/sys/net/ipv4/ip_forward", "0\n", FilePerms::default())
+            .on_command_ok("sh", &["-c"], "");
+        let c = cx(&sys);
+        let s: Spec = spec(json!({"name": "net.ipv4.ip_forward", "value": 1, "persist": false}));
+        assert!(SysctlParam.plan(&c, &s).await.unwrap().is_change());
+        SysctlParam.apply(&c, &s, &Planned::NoOp).await.unwrap();
+        let ran = sys.commands_run();
+        let sh = ran
+            .iter()
+            .find(|c| c.program == "sh")
+            .expect("wrote through sh");
+        assert_eq!(
+            &sh.args[3..],
+            &["1".to_owned(), "/proc/sys/net/ipv4/ip_forward".to_owned()]
+        );
+        assert!(!ran.iter().any(|c| c.program == "sysctl"));
+
+        let settled =
+            FakeSystem::new().with_file("/proc/sys/vm/swappiness", "10\n", FilePerms::default());
+        let s: Spec = spec(json!({"name": "vm/swappiness", "value": 10, "persist": false}));
+        assert_eq!(
+            SysctlParam.plan(&cx(&settled), &s).await.unwrap(),
+            Planned::NoOp
+        );
+        assert!(settled.commands_run().is_empty());
     }
 }

@@ -45,7 +45,10 @@ impl Task for SystemdReload {
     }
 
     #[tracing::instrument(name = "task.systemd.reload.plan", skip_all, fields(unit = %spec.name))]
-    async fn plan(&self, _cx: &Cx, spec: &Spec) -> Result<Planned> {
+    async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
+        if let Some(blocked) = super::systemd_common::unavailable(cx).await? {
+            return Ok(blocked);
+        }
         Ok(Planned::change(Diff::Opaque {
             summary: format!("reload {}", spec.name),
         }))
@@ -69,7 +72,12 @@ mod tests {
 
     #[tokio::test]
     async fn reloads_or_restarts_the_named_unit() {
-        let sys = FakeSystem::new().on_command_ok("systemctl", &["reload-or-restart"], "");
+        let sys = FakeSystem::new()
+            .with_dir(
+                "/run/systemd/system",
+                buckle_core::system::FilePerms::mode(0o755),
+            )
+            .on_command_ok("systemctl", &["reload-or-restart"], "");
         let cx = cx(&sys);
         let s: Spec = spec(json!({"name": "caddy"}));
         let planned = SystemdReload.plan(&cx, &s).await.unwrap();

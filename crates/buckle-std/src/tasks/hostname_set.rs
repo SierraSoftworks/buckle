@@ -19,13 +19,17 @@ use tracing::instrument;
 ///     name: "{{ host.id }}"
 /// ```
 ///
-/// The plan compares the running hostname (and `/etc/hostname` when it
-/// exists) with `name`. Applying runs `hostnamectl set-hostname` (falling back
-/// to `hostname` when `hostnamectl` is missing) and rewrites `/etc/hostname`.
+/// The plan compares the running (kernel) hostname and `/etc/hostname` (when
+/// it exists) with `name`; when they disagree with each other the change
+/// shows both. Applying runs `hostnamectl set-hostname` (falling back to
+/// `hostname` when `hostnamectl` is missing or cannot reach systemd, as in a
+/// container) and rewrites `/etc/hostname`. With neither tool installed the
+/// plan is blocked.
 /// `name` must be a valid hostname: letters, digits and `-`/`.`, at most 253
 /// characters. Removal does nothing: Buckle does not know what the previous
 /// hostname should be, so a hostname is released rather than reverted.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
 }
@@ -81,14 +85,26 @@ impl Task for HostnameSet {
         let stored_ok = stored
             .as_deref()
             .is_none_or(|s| s.eq_ignore_ascii_case(&spec.name));
-        Ok(if live_ok && stored_ok {
-            Planned::NoOp
-        } else {
-            Planned::change(Diff::Update {
-                summary: format!("hostname {live} → {}", spec.name),
-                unified: None,
-            })
-        })
+        if live_ok && stored_ok {
+            return Ok(Planned::NoOp);
+        }
+        if cx.system.which("hostnamectl").await?.is_none()
+            && cx.system.which("hostname").await?.is_none()
+        {
+            return Ok(Planned::blocked(
+                "neither `hostnamectl` nor `hostname` is installed; install systemd or the `hostname` package",
+            ));
+        }
+        let current = match stored.as_deref() {
+            Some(s) if !s.eq_ignore_ascii_case(&live) => {
+                format!("kernel {live}, /etc/hostname {s}")
+            }
+            _ => live.clone(),
+        };
+        Ok(Planned::change(Diff::Update {
+            summary: format!("hostname {current} → {}", spec.name),
+            unified: None,
+        }))
     }
 
     #[instrument(name = "task.hostname.set.apply", skip_all, fields(name = %spec.name))]
@@ -100,15 +116,39 @@ impl Task for HostnameSet {
                 spec.name
             )));
         }
-        let command = if cx.system.which("hostnamectl").await?.is_some() {
-            Command::new("hostnamectl")
-                .arg("set-hostname")
-                .arg(&spec.name)
-        } else {
+        let mut done = false;
+        if cx.system.which("hostnamectl").await?.is_some() {
+            let out = cx
+                .system
+                .run(
+                    Command::new("hostnamectl")
+                        .arg("set-hostname")
+                        .arg(&spec.name),
+                )
+                .await?;
+            if out.success() {
+                done = true;
+            } else if !super::systemd_common::cannot_connect(&out.stderr_str())
+                || cx.system.which("hostname").await?.is_none()
+            {
+                return Err(hostkit::command_failed(
+                    cx,
+                    "Setting the hostname",
+                    &format!("hostnamectl set-hostname {}", spec.name),
+                    &out,
+                    false,
+                ));
+            }
+        }
+        if !done {
             hostkit::require_tool(cx, "hostname", "install the `hostname` package").await?;
-            Command::new("hostname").arg(&spec.name)
-        };
-        hostkit::run_checked(cx, command, "Setting the hostname").await?;
+            hostkit::run_checked(
+                cx,
+                Command::new("hostname").arg(&spec.name),
+                "Setting the hostname",
+            )
+            .await?;
+        }
         cx.system
             .write_atomic(
                 Path::new(ETC_HOSTNAME),
@@ -148,8 +188,8 @@ mod tests {
     #[rstest]
     #[case::same(FakeSystem::new().with_hostname("web-1"), Class::NoOp)]
     #[case::same_case_insensitively(FakeSystem::new().with_hostname("WEB-1"), Class::NoOp)]
-    #[case::different(FakeSystem::new().with_hostname("old"), Class::Change)]
-    #[case::stale_etc_hostname(FakeSystem::new().with_hostname("web-1").with_file("/etc/hostname", "old\n", FilePerms::default()), Class::Change)]
+    #[case::different(FakeSystem::new().with_program("hostname").with_hostname("old"), Class::Change)]
+    #[case::stale_etc_hostname(FakeSystem::new().with_program("hostname").with_hostname("web-1").with_file("/etc/hostname", "old\n", FilePerms::default()), Class::Change)]
     #[case::etc_hostname_matches(FakeSystem::new().with_hostname("web-1").with_file("/etc/hostname", "web-1\n", FilePerms::default()), Class::NoOp)]
     #[tokio::test]
     async fn plan_outcomes(#[case] sys: FakeSystem, #[case] expected: Class) {
@@ -227,5 +267,39 @@ mod tests {
             .unwrap();
         assert!(!out.changed && out.summary.contains("not done"));
         assert!(sys.command_lines().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_kernel_and_file_that_disagree_are_both_shown() {
+        let sys = FakeSystem::new()
+            .with_hostname("old-kernel")
+            .with_file("/etc/hostname", "old-file\n", FilePerms::default())
+            .on_command_ok("hostname", &[], "");
+        let planned = HostnameSet
+            .plan(&cx(&sys), &spec(json!({"name": "web-1"})))
+            .await
+            .unwrap();
+        let summary = diff(&planned).summary().to_owned();
+        assert!(
+            summary.contains("kernel old-kernel") && summary.contains("/etc/hostname old-file"),
+            "{summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_tool_blocks_and_hostnamectl_without_systemd_falls_back() {
+        let sys = FakeSystem::new().with_hostname("old");
+        assert_eq!(
+            plan_class(&HostnameSet, &cx(&sys), &spec(json!({"name": "web-1"}))).await,
+            Class::Blocked
+        );
+
+        let sys = FakeSystem::new()
+            .with_hostname("old")
+            .on_command_fail("hostnamectl", &[], 1, "System has not been booted with systemd as init system (PID 1). Can't operate.\nFailed to connect to bus: Host is down")
+            .on_command_ok("hostname", &[], "");
+        apply(&HostnameSet, &cx(&sys), &spec(json!({"name": "web-1"}))).await;
+        assert!(sys.command_lines().contains(&"hostname web-1".to_owned()));
+        assert_eq!(sys.file_string("/etc/hostname").as_deref(), Some("web-1\n"));
     }
 }

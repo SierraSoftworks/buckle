@@ -3,7 +3,6 @@
 use super::hostkit::{self, describe_perms, diffable_text, digest_change, effective_perms};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
-use buckle_core::secrets::Redacted;
 use buckle_core::state::ResourceRecord;
 use buckle_core::system::{FileKind, FileMeta, FilePerms};
 use buckle_core::task::{Applied, Cx, Task};
@@ -28,7 +27,16 @@ use tracing::instrument;
 /// The file is written atomically. Plans show a unified diff for text files
 /// and a digest change for binary ones. Removal deletes `dest` only if its
 /// content still matches what Buckle wrote; otherwise it is left in place.
+///
+/// `validate` is a command (argv) that checks the new content before it
+/// replaces the file (and while planning); `{path}` stands for a private
+/// temporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero
+/// exit fails the task and leaves the file untouched. Without `validate`,
+/// `/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with
+/// `visudo -cf {path}` and `sshd -t -f {path}` (when those tools are
+/// installed); `validate: []` turns that off.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Source path, relative to the module's `files/` directory.
     pub src: String,
@@ -39,6 +47,10 @@ pub struct Spec {
     /// Keep a timestamped `.bak` copy of the destination before replacing its content.
     #[serde(default)]
     pub backup: bool,
+    /// A command that checks the new content; `{path}` stands for the file to check.
+    /// Default: automatic for sudoers and sshd_config; `[]` disables.
+    #[serde(default)]
+    pub validate: Option<Vec<String>>,
 }
 
 pub struct FileCopy;
@@ -87,11 +99,12 @@ impl FileCopy {
                 summary.push_str(&format!(" (and {})", perms.join(", ")));
             }
             match (diffable_text(&current), diffable_text(&content)) {
-                (Some(old), Some(new)) => Planned::change(Diff::unified(
-                    summary,
-                    &Redacted::plain(old.to_owned()),
-                    &Redacted::plain(new.to_owned()),
-                )),
+                // The host's current content goes through the same rules as
+                // other editors: scrubbed, no context for sensitive files, and
+                // not shown at all when the file has held secrets.
+                (Some(old), Some(new)) => {
+                    Planned::change(hostkit::text_diff(cx, &spec.dest, summary, old, new))
+                }
                 _ => Planned::change(Diff::Update {
                     summary: format!(
                         "{summary}: content changed ({})",
@@ -132,7 +145,17 @@ impl Task for FileCopy {
 
     #[instrument(name = "task.file.copy.plan", skip_all, fields(src = %spec.src, dest = %spec.dest.display()))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
-        Ok(self.inspect(cx, spec).await?.planned)
+        let inspection = self.inspect(cx, spec).await?;
+        if inspection.planned.is_change() && content_differs(&inspection) {
+            hostkit::validate::check(
+                cx,
+                &spec.dest,
+                spec.validate.as_deref(),
+                hostkit::validate::Content::Bytes(&inspection.content),
+            )
+            .await?;
+        }
+        Ok(inspection.planned)
     }
 
     #[instrument(name = "task.file.copy.apply", skip_all, fields(src = %spec.src, dest = %spec.dest.display()))]
@@ -142,18 +165,26 @@ impl Task for FileCopy {
         let shadow = hostkit::shadow_of(&inspection.content);
         let dest = &spec.dest;
         if !inspection.planned.is_change() {
-            return Ok(hostkit::written(
+            return Ok(hostkit::ownership::file_written(
+                cx,
                 format!("{} already up to date", dest.display()),
                 dest,
+                false,
                 digest,
                 shadow,
                 false,
             ));
         }
-        let content_differs = inspection
-            .existing
-            .as_ref()
-            .is_none_or(|(_, current)| Digest::of(current) != digest);
+        let content_differs = content_differs(&inspection);
+        if content_differs {
+            hostkit::validate::check(
+                cx,
+                dest,
+                spec.validate.as_deref(),
+                hostkit::validate::Content::Bytes(&inspection.content),
+            )
+            .await?;
+        }
         match &inspection.existing {
             Some((meta, current)) if content_differs => {
                 if spec.backup {
@@ -171,9 +202,16 @@ impl Task for FileCopy {
                     .await?;
             }
         }
-        Ok(hostkit::written(
-            format!("wrote {}", dest.display()),
+        // A permission change on a file Buckle never wrote adopts it rather than claiming it.
+        Ok(hostkit::ownership::file_written(
+            cx,
+            if content_differs {
+                format!("wrote {}", dest.display())
+            } else {
+                format!("updated permissions of {}", dest.display())
+            },
             dest,
+            content_differs,
             digest,
             shadow,
             true,
@@ -190,6 +228,14 @@ impl Task for FileCopy {
     async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
         hostkit::remove_recorded_file(cx, record).await
     }
+}
+
+/// Whether applying rewrites the content (as opposed to only permissions).
+fn content_differs(inspection: &Inspection) -> bool {
+    inspection
+        .existing
+        .as_ref()
+        .is_none_or(|(_, current)| Digest::of(current) != Digest::of(&inspection.content))
 }
 
 #[cfg(test)]
@@ -426,5 +472,67 @@ mod tests {
         assert_eq!(s.perms.mode, Some(0o755));
         assert_eq!(s.perms.group.as_deref(), Some("wheel"));
         assert!(!s.backup);
+    }
+
+    fn sudoers_source() -> MemorySource {
+        MemorySource::new().with("sudoers/deploy", "deploy ALL=(ALL) NOPASSWD: ALL\n")
+    }
+
+    #[tokio::test]
+    async fn sudoers_files_are_checked_with_visudo_in_plan_and_apply() {
+        let sys = FakeSystem::new()
+            .with_dir("/etc/sudoers.d", FilePerms::mode(0o750))
+            .with_env("BUCKLE_STATE_DIR", "/srv/buckle-state")
+            .on_command_fail("visudo", &["-cf"], 1, ">>> parse error near line 1 <<<");
+        let c = cx_src(&sys, sudoers_source());
+        let s: Spec =
+            spec(json!({"src": "sudoers/deploy", "dest": "/etc/sudoers.d/deploy", "mode": "0440"}));
+        let err = FileCopy.plan(&c, &s).await.unwrap_err();
+        assert!(
+            err.description().contains("parse error"),
+            "{}",
+            err.description()
+        );
+        assert!(FileCopy.apply(&c, &s, &Planned::NoOp).await.is_err());
+        assert!(
+            !sys.exists("/etc/sudoers.d/deploy"),
+            "nothing was installed"
+        );
+        let ran = sys.commands_run();
+        let checked = ran.iter().find(|c| c.program == "visudo").unwrap();
+        assert!(
+            checked.args[1].starts_with("/srv/buckle-state/tmp/"),
+            "{:?}",
+            checked.args
+        );
+        assert!(
+            sys.paths()
+                .iter()
+                .all(|p| !p.starts_with("/srv/buckle-state/tmp/validate-"))
+        );
+        assert!(
+            sys.paths()
+                .iter()
+                .all(|p| !p.to_string_lossy().starts_with("/etc/sudoers.d/.")),
+            "no temp next to dest"
+        );
+
+        // `validate: []` turns the automatic check off.
+        let off: Spec =
+            spec(json!({"src": "sudoers/deploy", "dest": "/etc/sudoers.d/deploy", "validate": []}));
+        apply(&FileCopy, &c, &off).await;
+        assert!(sys.exists("/etc/sudoers.d/deploy"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_automatic_validator_is_skipped_but_an_explicit_one_is_required() {
+        let sys = FakeSystem::new().with_dir("/etc/sudoers.d", FilePerms::mode(0o750));
+        let c = cx_src(&sys, sudoers_source());
+        let auto: Spec = spec(json!({"src": "sudoers/deploy", "dest": "/etc/sudoers.d/deploy"}));
+        assert_eq!(plan_class(&FileCopy, &c, &auto).await, Class::Change);
+        let explicit: Spec = spec(
+            json!({"src": "sudoers/deploy", "dest": "/etc/sudoers.d/deploy", "validate": ["visudo", "-cf", "{path}"]}),
+        );
+        assert!(FileCopy.plan(&c, &explicit).await.is_err());
     }
 }

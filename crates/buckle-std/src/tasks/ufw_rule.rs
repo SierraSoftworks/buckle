@@ -1,7 +1,8 @@
 //! `ufw.rule`: one firewall rule.
 
+use super::hostkit;
 use super::sys_exec::{Scalar, run_checked};
-use super::ufw_common::{Rule, installed, read_status, ufw};
+use super::ufw_common::{Rule, installed, note_planned_rule, parse_rule_args, read_status, ufw};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::state::ResourceRecord;
@@ -26,7 +27,8 @@ use serde::{Deserialize, Serialize};
 /// ufw is enabled; enable the firewall with `ufw.state` after the rules that
 /// keep you connected (SSH first).
 ///
-/// Removal deletes exactly this rule (`ufw delete`), v4 and v6 together.
+/// Removal deletes exactly this rule (`ufw delete`), v4 and v6 together, and
+/// puts back any rule with the same selectors that applying replaced.
 pub struct UfwRule;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -165,6 +167,8 @@ impl Task for UfwRule {
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         let want = spec.rule()?;
         let summary = format!("ufw {}", want.args().join(" "));
+        // Lets a later ufw.state / ufw.default in this plan see the rule coming.
+        note_planned_rule(cx, &want);
         if !installed(cx).await? {
             return Ok(Planned::change(Diff::Create {
                 summary: format!("{summary} (ufw is not installed yet)"),
@@ -191,6 +195,17 @@ impl Task for UfwRule {
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         let want = spec.rule()?;
         let status = read_status(cx, true).await?;
+        // Rules this resource replaced before, and the rule it added before
+        // (which is Buckle's own and must not be "restored" on removal).
+        let previous = hostkit::ownership::previous_artefacts(cx);
+        let ours_before: Vec<String> = previous
+            .iter()
+            .filter_map(|a| match a {
+                Artefact::Rule { subsystem, id } if subsystem == "ufw" => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut replaced: Vec<Replaced> = previous.iter().filter_map(Replaced::parse).collect();
         for conflicting in matching_rules(&status.rules, &want)
             .into_iter()
             .filter(|r| r.action != want.action)
@@ -198,6 +213,13 @@ impl Task for UfwRule {
             let mut cmd = ufw(&["--force", "delete"]);
             cmd = cmd.args(conflicting.args());
             run_checked(cx, cmd).await?;
+            let entry = Replaced {
+                args: conflicting.args(),
+                comment: conflicting.comment.clone(),
+            };
+            if !ours_before.contains(&entry.args.join(" ")) && !replaced.contains(&entry) {
+                replaced.push(entry);
+            }
         }
         let mut cmd = ufw(&[]).args(want.args());
         if let Some(c) = &want.comment {
@@ -205,17 +227,26 @@ impl Task for UfwRule {
         }
         run_checked(cx, cmd).await?;
         let id = want.args().join(" ");
-        Ok(
+        let mut applied =
             Applied::changed(format!("added ufw rule: {id}")).with_artefact(Artefact::Rule {
                 subsystem: "ufw".into(),
                 id,
-            }),
-        )
+            });
+        for entry in replaced {
+            applied = applied.with_artefact(entry.artefact());
+        }
+        Ok(applied)
     }
 
     fn describe_removal(&self, record: &ResourceRecord) -> String {
+        let restore: Vec<String> = record
+            .artefacts
+            .iter()
+            .filter_map(Replaced::parse)
+            .map(|r| format!(", restore `ufw {}`", r.args.join(" ")))
+            .collect();
         match rule_id(record) {
-            Some(id) => format!("ufw delete {id}"),
+            Some(id) => format!("ufw delete {id}{}", restore.concat()),
             None => format!(
                 "nothing to delete for {} (Buckle did not add it)",
                 record.key.key
@@ -232,7 +263,50 @@ impl Task for UfwRule {
         };
         let cmd = ufw(&["--force", "delete"]).args(id.split_whitespace());
         run_checked(cx, cmd).await?;
-        Ok(Applied::changed(format!("deleted ufw rule: {id}")))
+        let mut summary = format!("deleted ufw rule: {id}");
+        for replaced in record.artefacts.iter().filter_map(Replaced::parse) {
+            let mut cmd = ufw(&[]).args(replaced.args.clone());
+            if let Some(c) = &replaced.comment {
+                cmd = cmd.arg("comment").arg(c.clone());
+            }
+            run_checked(cx, cmd).await?;
+            summary.push_str(&format!("; restored ufw {}", replaced.args.join(" ")));
+        }
+        Ok(Applied::changed(summary))
+    }
+}
+
+const REPLACED_PREFIX: &str = "ufw.rule replaced: ";
+
+/// A pre-existing rule with the same selectors that applying deleted, kept so
+/// that removal can put it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Replaced {
+    args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
+}
+
+impl Replaced {
+    fn artefact(&self) -> Artefact {
+        Artefact::Other {
+            description: format!(
+                "{REPLACED_PREFIX}{}",
+                serde_json::to_string(self).unwrap_or_default()
+            ),
+        }
+    }
+
+    fn parse(artefact: &Artefact) -> Option<Self> {
+        match artefact {
+            Artefact::Other { description } => {
+                let parsed: Replaced =
+                    serde_json::from_str(description.strip_prefix(REPLACED_PREFIX)?).ok()?;
+                // Only rule arguments are ever replayed.
+                parse_rule_args(&parsed.args).map(|_| parsed)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -257,7 +331,7 @@ buckle_core::register_task!(UfwRule);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::sys_exec::testkit::{cx, record_of, spec};
+    use crate::tasks::sys_exec::testkit::{cx, cx_after, record_of, spec};
     use crate::tasks::ufw_common::testkit::Ufw;
     use buckle_core::testing::FakeSystem;
     use rstest::rstest;
@@ -451,5 +525,40 @@ mod tests {
         let removed = UfwRule.remove(&cx, &record).await.unwrap();
         assert!(!removed.changed);
         assert!(sys.command_lines().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removal_restores_the_rule_that_applying_replaced() {
+        let ufw = Ufw::new()
+            .active()
+            .rule("allow in from 10.0.0.0/8 to any port 80 proto tcp comment 'http from lan'");
+        let (sys, cx) = host(&ufw);
+        let deny: Spec =
+            spec(json!({"rule": "deny", "to_port": 80, "proto": "tcp", "from_ip": "10.0.0.0/8"}));
+        let first = UfwRule.apply(&cx, &deny, &Planned::NoOp).await.unwrap();
+        assert!(ufw.snapshot().rules.iter().all(|r| r.action == "deny"));
+        // A later action change replaces Buckle's own rule; that is not "restored".
+        let reject: Spec =
+            spec(json!({"rule": "reject", "to_port": 80, "proto": "tcp", "from_ip": "10.0.0.0/8"}));
+        let second = UfwRule
+            .apply(
+                &cx_after(&sys, record_of("ufw.rule", "x", &first)),
+                &reject,
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        let record = record_of("ufw.rule", "x", &second);
+        let describe = UfwRule.describe_removal(&record);
+        assert!(
+            describe.contains("restore `ufw allow in from 10.0.0.0/8"),
+            "{describe}"
+        );
+        assert!(!describe.contains("restore `ufw deny"), "{describe}");
+        UfwRule.remove(&cx, &record).await.unwrap();
+        let rules = ufw.snapshot().rules;
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0].action, "allow");
+        assert_eq!(rules[0].comment.as_deref(), Some("http from lan"));
     }
 }

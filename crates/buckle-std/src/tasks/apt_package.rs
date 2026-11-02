@@ -1,7 +1,10 @@
 //! `apt.package`: install, upgrade or remove Debian packages.
 
-use super::apt_common::{PkgState, apt_get, query_package, query_policy, version_matches};
-use super::sys_exec::{Ledger, run_checked, state_dir};
+use super::apt_common::{
+    PkgState, apt_get, query_package, query_policy, removal_takes_along, version_matches,
+};
+use super::hostkit;
+use super::sys_exec::{run_checked, state_dir};
 use async_trait::async_trait;
 use buckle_core::Platforms;
 use buckle_core::Result;
@@ -33,6 +36,12 @@ use std::time::Duration;
 /// Removal removes only the packages this resource installed itself:
 /// packages that were already on the host when Buckle first managed them are
 /// left alone. Plans flag the removal with a caution.
+///
+/// Removing (with `state: absent`, or when the task leaves the config) is
+/// simulated first with `apt-get -s remove`. If apt would also remove other
+/// packages that depend on the ones named, the task is blocked with the list
+/// (and a removal is skipped, leaving the package installed) unless
+/// `remove_dependents: true`.
 pub struct AptPackage;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -59,6 +68,21 @@ pub struct Spec {
     /// Install recommended packages too (apt's default).
     #[serde(default = "default_true")]
     pub install_recommends: bool,
+    /// Allow removal to take along packages that depend on these.
+    #[serde(default)]
+    pub remove_dependents: bool,
+}
+
+/// Recorded when `remove_dependents` was set, so that removal may take dependents too.
+const REMOVE_DEPENDENTS: &str = "apt.package: removal may take dependent packages";
+
+fn dependents_blocked(pkgs: &[String], extra: &[String]) -> String {
+    format!(
+        "removing {} would also remove {} other package(s) that depend on it: {}; set `remove_dependents: true` if that is intended",
+        pkgs.join(", "),
+        extra.len(),
+        extra.join(", ")
+    )
 }
 
 fn default_true() -> bool {
@@ -131,6 +155,9 @@ impl Task for AptPackage {
     #[tracing::instrument(name = "task.apt.package.plan", skip_all, fields(packages = %Self::key(spec)))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         let pkgs = spec.packages()?;
+        if let Some(blocked) = super::apt_common::unavailable(cx, true).await? {
+            return Ok(blocked);
+        }
         let mut actions: Vec<String> = Vec::new();
         let mut blocked: Vec<String> = Vec::new();
         let mut upgrades = false;
@@ -186,6 +213,21 @@ impl Task for AptPackage {
         if actions.is_empty() {
             return Ok(Planned::NoOp);
         }
+        if spec.state == State::Absent && !spec.remove_dependents {
+            let mut targets = Vec::new();
+            for p in &pkgs {
+                if !matches!(
+                    query_package(cx, p).await?,
+                    PkgState::NotInstalled | PkgState::ConfigFiles { .. }
+                ) {
+                    targets.push(p.clone());
+                }
+            }
+            let extra = removal_takes_along(cx, &targets).await?;
+            if !extra.is_empty() {
+                return Ok(Planned::blocked(dependents_blocked(&targets, &extra)));
+            }
+        }
         let summary = actions.join(", ");
         Ok(Planned::change(match spec.state {
             State::Absent => Diff::Delete { summary },
@@ -200,7 +242,10 @@ impl Task for AptPackage {
     #[tracing::instrument(name = "task.apt.package.apply", skip_all, fields(packages = %Self::key(spec)))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         let pkgs = spec.packages()?;
-        let mut ledger = Ledger::open(cx, "apt.package").await?;
+        // Packages this resource installed on an earlier apply. Never another
+        // resource's: a module that finds a package already installed (by
+        // another module, or by hand) does not own it.
+        let owned = installed_by_buckle_list(hostkit::ownership::previous_artefacts(cx));
 
         if spec.state == State::Absent {
             let mut installed = Vec::new();
@@ -218,11 +263,21 @@ impl Task for AptPackage {
                     pkgs.join(", ")
                 )));
             }
-            run_checked(cx, apt_get("remove", true).args(installed.clone())).await?;
-            for p in &installed {
-                ledger.remove(p);
+            if !spec.remove_dependents {
+                let extra = removal_takes_along(cx, &installed).await?;
+                if !extra.is_empty() {
+                    return Err(buckle_core::error::user(
+                        format!(
+                            "Nothing was removed: {}.",
+                            dependents_blocked(&installed, &extra)
+                        ),
+                        &[
+                            "Remove the dependent packages first, or opt in with `remove_dependents: true`.",
+                        ],
+                    ));
+                }
             }
-            ledger.save(cx).await?;
+            run_checked(cx, apt_get("remove", true).args(installed.clone())).await?;
             return Ok(Applied::changed(format!(
                 "removed {}",
                 installed.join(", ")
@@ -266,15 +321,18 @@ impl Task for AptPackage {
 
         let mut applied = Applied::changed(format!("installed {}", pkgs.join(", ")));
         for (p, existed) in pkgs.iter().zip(was_installed) {
-            if !existed || ledger.contains(p) {
-                ledger.insert(p.clone(), "installed");
+            if !existed || owned.contains(p) {
                 applied = applied.with_artefact(Artefact::Package {
                     manager: "apt".into(),
                     name: p.clone(),
                 });
             }
         }
-        ledger.save(cx).await?;
+        if spec.remove_dependents {
+            applied = applied.with_artefact(Artefact::Other {
+                description: REMOVE_DEPENDENTS.into(),
+            });
+        }
         Ok(applied)
     }
 
@@ -293,7 +351,6 @@ impl Task for AptPackage {
     #[tracing::instrument(name = "task.apt.package.remove", skip_all, fields(resource = %record.key))]
     async fn remove(&self, cx: &Cx, record: &ResourceRecord) -> Result<Applied> {
         let names = installed_by_buckle(record);
-        let mut ledger = Ledger::open(cx, "apt.package").await?;
         if names.is_empty() {
             return Ok(Applied::skipped(
                 "Buckle did not install any package for this resource; nothing was removed",
@@ -305,15 +362,23 @@ impl Task for AptPackage {
                 present.push(n.clone());
             }
         }
-        for n in &names {
-            ledger.remove(n);
-        }
-        ledger.save(cx).await?;
         if present.is_empty() {
             return Ok(Applied::unchanged(format!(
                 "{} was already removed",
                 names.join(", ")
             )));
+        }
+        let may_take_dependents = record.artefacts.iter().any(
+            |a| matches!(a, Artefact::Other { description } if description == REMOVE_DEPENDENTS),
+        );
+        if !may_take_dependents {
+            let extra = removal_takes_along(cx, &present).await?;
+            if !extra.is_empty() {
+                return Ok(Applied::skipped(format!(
+                    "left installed: {}",
+                    dependents_blocked(&present, &extra)
+                )));
+            }
         }
         run_checked(cx, apt_get("remove", true).args(present.clone())).await?;
         Ok(Applied::changed(format!("removed {}", present.join(", "))))
@@ -321,8 +386,11 @@ impl Task for AptPackage {
 }
 
 fn installed_by_buckle(record: &ResourceRecord) -> Vec<String> {
-    record
-        .artefacts
+    installed_by_buckle_list(&record.artefacts)
+}
+
+fn installed_by_buckle_list(artefacts: &[Artefact]) -> Vec<String> {
+    artefacts
         .iter()
         .filter_map(|a| match a {
             Artefact::Package { manager, name } if manager == "apt" => Some(name.clone()),
@@ -378,7 +446,8 @@ buckle_core::register_task!(AptPackage);
 mod tests {
     use super::*;
     use crate::tasks::apt_common::testkit::Apt;
-    use crate::tasks::sys_exec::testkit::{cx, record_of, spec};
+    use crate::tasks::hostkit::testkit::put;
+    use crate::tasks::sys_exec::testkit::{cx, cx_after, record_of, spec};
     use buckle_core::system::HttpResponse;
     use buckle_core::testing::FakeSystem;
     use rstest::rstest;
@@ -603,16 +672,63 @@ mod tests {
     #[tokio::test]
     async fn ownership_survives_a_later_version_bump() {
         let apt = Apt::new().candidate("nomad", "1.7.5-1");
-        let (_sys, cx) = host(&apt);
+        let (sys, cx) = host(&apt);
         let v1: Spec = spec(json!({"name": "nomad"}));
         let first = AptPackage.apply(&cx, &v1, &Planned::NoOp).await.unwrap();
         assert_eq!(first.artefacts.len(), 1);
         // The author later pins a different version: the package is already
         // installed when the second apply runs, but Buckle still owns it.
         let v2: Spec = spec(json!({"name": "nomad", "version": "1.8.0-1"}));
-        let second = AptPackage.apply(&cx, &v2, &Planned::NoOp).await.unwrap();
+        let again = cx_after(&sys, record_of("apt.package", "nomad", &first));
+        let second = AptPackage.apply(&again, &v2, &Planned::NoOp).await.unwrap();
         assert_eq!(second.artefacts, first.artefacts);
         assert_eq!(apt.version_of("nomad").as_deref(), Some("1.8.0-1"));
+    }
+
+    #[tokio::test]
+    async fn another_module_cannot_claim_a_package_this_one_installed() {
+        let apt = Apt::new().candidate("nomad", "1.7.5-1");
+        let (sys, cx) = host(&apt);
+        let a = AptPackage
+            .apply(&cx, &spec(json!({"name": "nomad"})), &Planned::NoOp)
+            .await
+            .unwrap();
+        assert_eq!(a.artefacts.len(), 1, "module A installed it");
+        // Module B (a new resource, no previous record) finds it installed.
+        let b = AptPackage
+            .apply(
+                &cx_of_module(&sys, "other"),
+                &spec(json!({"name": "nomad", "version": "1.8.0-1"})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        assert!(b.artefacts.is_empty(), "module B does not own it");
+        let b_record = record_of("apt.package", "nomad", &b);
+        assert!(!AptPackage.remove(&cx, &b_record).await.unwrap().changed);
+        assert!(apt.is_installed("nomad"));
+        // A leftover legacy ledger naming the package is ignored too.
+        put(
+            &sys,
+            "/var/lib/buckle/ledger/apt.package.json",
+            r#"{"nomad":"installed"}"#,
+        )
+        .await;
+        let b = AptPackage
+            .apply(
+                &cx_of_module(&sys, "other"),
+                &spec(json!({"name": "nomad", "version": "1.7.5-1"})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        assert!(b.artefacts.is_empty());
+    }
+
+    fn cx_of_module(sys: &FakeSystem, module: &str) -> Cx {
+        buckle_core::testing::CxBuilder::new(sys.clone())
+            .module(module)
+            .build()
     }
 
     #[tokio::test]
@@ -681,5 +797,84 @@ mod tests {
                 .removal_caution()
         );
         assert_eq!(AptPackage::key(&spec(json!({"names": ["a", "b"]}))), "a,b");
+    }
+
+    #[tokio::test]
+    async fn removing_a_package_others_depend_on_is_blocked_unless_opted_in() {
+        let apt = Apt::new()
+            .installed("containerd", "1.6")
+            .installed("docker-ce", "24.0")
+            .depends("docker-ce", "containerd");
+        let (_sys, cx) = host(&apt);
+        let absent: Spec = spec(json!({"name": "containerd", "state": "absent"}));
+        match AptPackage.plan(&cx, &absent).await.unwrap() {
+            Planned::Blocked { reason } => {
+                assert!(
+                    reason.contains("docker-ce") && reason.contains("remove_dependents"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected blocked, got {other:?}"),
+        }
+        assert!(
+            AptPackage
+                .apply(&cx, &absent, &Planned::NoOp)
+                .await
+                .is_err()
+        );
+        assert!(apt.is_installed("containerd") && apt.is_installed("docker-ce"));
+
+        let opted: Spec =
+            spec(json!({"name": "containerd", "state": "absent", "remove_dependents": true}));
+        assert!(AptPackage.plan(&cx, &opted).await.unwrap().is_change());
+        AptPackage.apply(&cx, &opted, &Planned::NoOp).await.unwrap();
+        assert!(!apt.is_installed("containerd"));
+    }
+
+    #[tokio::test]
+    async fn removal_of_a_record_leaves_a_package_others_depend_on() {
+        let apt = Apt::new()
+            .candidate("libfoo", "1.0")
+            .installed("app", "2.0")
+            .depends("app", "libfoo");
+        let (_sys, cx) = host(&apt);
+        let installed = AptPackage
+            .apply(&cx, &spec(json!({"name": "libfoo"})), &Planned::NoOp)
+            .await
+            .unwrap();
+        let record = record_of("apt.package", "libfoo", &installed);
+        let out = AptPackage.remove(&cx, &record).await.unwrap();
+        assert!(
+            !out.changed && out.summary.contains("app"),
+            "{}",
+            out.summary
+        );
+        assert!(apt.is_installed("libfoo") && apt.is_installed("app"));
+
+        // Opting in at install time is remembered for removal.
+        let installed = AptPackage
+            .apply(
+                &cx,
+                &spec(json!({"name": "libfoo", "remove_dependents": true})),
+                &Planned::NoOp,
+            )
+            .await
+            .unwrap();
+        let mut record = record_of("apt.package", "libfoo", &installed);
+        record.artefacts.push(Artefact::Package {
+            manager: "apt".into(),
+            name: "libfoo".into(),
+        });
+        assert!(AptPackage.remove(&cx, &record).await.unwrap().changed);
+        assert!(!apt.is_installed("libfoo") && !apt.is_installed("app"));
+    }
+
+    #[test]
+    fn simulated_removals_are_parsed() {
+        let text = "NOTE: This is only a simulation!\nRemv docker-ce [24.0]\nRemv containerd:amd64 [1.6]\nConf x\n";
+        assert_eq!(
+            crate::tasks::apt_common::parse_simulated_removals(text),
+            vec!["docker-ce".to_owned(), "containerd".to_owned()]
+        );
     }
 }

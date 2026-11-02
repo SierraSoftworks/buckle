@@ -103,6 +103,11 @@ impl Task for AptUpdate {
         let age = last_refresh(cx)
             .await?
             .map(|t| (now - t).to_std().unwrap_or_default());
+        if !age.is_some_and(|a| a < spec.max_age)
+            && let Some(blocked) = super::apt_common::unavailable(cx, false).await?
+        {
+            return Ok(blocked);
+        }
         match age {
             Some(age) if age < spec.max_age => Ok(Planned::NoOp),
             Some(age) => Ok(Planned::change(Diff::Opaque {

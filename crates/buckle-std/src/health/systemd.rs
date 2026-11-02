@@ -84,6 +84,13 @@ impl HealthCheck for SystemdCheck {
 
     #[tracing::instrument(name = "health.systemd", skip_all, fields(unit = %spec.unit))]
     async fn check(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
+        // Reasons can quote command output or response bodies: scrub known secrets.
+        super::redacted(cx, self.probe(cx, spec).await)
+    }
+}
+
+impl SystemdCheck {
+    async fn probe(&self, cx: &Cx, spec: &Spec) -> HealthStatus {
         match cx.system.which("systemctl").await {
             Ok(Some(_)) => {}
             Ok(None) => return HealthStatus::unknown("systemctl is not installed on this host"),

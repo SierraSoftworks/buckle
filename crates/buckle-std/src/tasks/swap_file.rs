@@ -31,9 +31,15 @@ use tracing::instrument;
 /// is applied with `sysctl -w vm.swappiness=N` and persisted in
 /// `/etc/sysctl.d/99-buckle-swap.conf`.
 ///
+/// An existing file at `path` that is not an active swap area is only
+/// recreated or formatted (`mkswap`) when Buckle created it or it already
+/// carries a swap signature; anything else (a data file at the wrong path) is
+/// reported as blocked and left untouched.
+///
 /// Removal runs `swapoff`, deletes the fstab line and the file, but only for a
 /// swap file that Buckle created. It holds the `fstab` lock.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the swap file.
     pub path: PathBuf,
@@ -134,6 +140,51 @@ async fn observe(cx: &Cx, spec: &Spec) -> Result<Observed> {
     })
 }
 
+/// Whether the file at `path` starts with a Linux swap header (`SWAPSPACE2`,
+/// or the old `SWAP-SPACE`, in the last 10 bytes of the first page, for page
+/// sizes up to 64 KiB). Read with `dd` so a multi-gigabyte file is not loaded.
+async fn has_swap_signature(cx: &Cx, path: &Path) -> Result<bool> {
+    if cx.system.which("dd").await?.is_none() {
+        return Ok(false);
+    }
+    let out = cx
+        .system
+        .run(
+            Command::new("dd")
+                .arg(format!("if={}", path.display()))
+                .arg("bs=65536")
+                .arg("count=1")
+                .arg("status=none"),
+        )
+        .await?;
+    if !out.success() {
+        return Ok(false);
+    }
+    Ok([4096usize, 8192, 16384, 65536].iter().any(|page| {
+        out.stdout
+            .get(page - 10..*page)
+            .is_some_and(|sig| sig == b"SWAPSPACE2" || sig == b"SWAP-SPACE")
+    }))
+}
+
+/// `Some(reason)` when applying would delete or format a file that is not a
+/// swap area and that Buckle did not create.
+async fn foreign_file(cx: &Cx, spec: &Spec, seen: &Observed) -> Result<Option<String>> {
+    let touches_file = seen.file_size.is_some()
+        && seen.active_kib.is_none()
+        && (seen.needs_create(spec) || seen.needs_activate(spec));
+    if !touches_file
+        || hostkit::ownership::owns_file(cx, &spec.path)
+        || has_swap_signature(cx, &spec.path).await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{} exists, has no swap signature and was not created by Buckle; refusing to delete or mkswap it. Move the file away or choose another `path`",
+        spec.path.display()
+    )))
+}
+
 fn artefact_line(spec: &Spec) -> Artefact {
     Artefact::Line {
         path: PathBuf::from(FSTAB),
@@ -177,6 +228,9 @@ impl Task for SwapFile {
         if seen.settled(spec) {
             return Ok(Planned::NoOp);
         }
+        if let Some(reason) = foreign_file(cx, spec, &seen).await? {
+            return Ok(Planned::blocked(reason));
+        }
         if seen.needs_activate(spec) {
             for tool in ["mkswap", "swapon"] {
                 if let Some(blocked) = hostkit::missing_tool(cx, tool, "install util-linux").await?
@@ -214,10 +268,16 @@ impl Task for SwapFile {
         hostkit::require_absolute(&spec.path, "path")?;
         let seen = observe(cx, spec).await?;
         if seen.settled(spec) {
-            return Ok(Applied::unchanged(format!(
-                "{} already active",
-                spec.path.display()
-            )));
+            return Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("{} already active", spec.path.display())),
+            ));
+        }
+        if let Some(reason) = foreign_file(cx, spec, &seen).await? {
+            return Err(error::user(
+                format!("The swap file was not configured: {reason}."),
+                &["A data file at the swap path is never overwritten."],
+            ));
         }
         let path = spec.path.display().to_string();
         let mut applied = Applied::changed(format!("configured swap file {path}"));
@@ -325,7 +385,8 @@ impl Task for SwapFile {
                 description: format!("{SYSCTL_MARKER}: {SYSCTL_FILE}"),
             });
         }
-        Ok(applied)
+        // The file, fstab line and sysctl file Buckle created on earlier applies stay its own.
+        Ok(hostkit::ownership::carry_forward(cx, applied))
     }
 
     fn describe_removal(&self, record: &ResourceRecord) -> String {
@@ -482,7 +543,26 @@ mod tests {
                     .with_file(PROC_SWAPPINESS, format!("{value}\n"), FilePerms::default());
             ok_output("")
         };
-        sys.on_command("fallocate", &[], fallocate)
+        let h = sys.clone();
+        let dd = move |cmd: &Command| {
+            let input = cmd.args[0].trim_start_matches("if=").to_owned();
+            if input == "/dev/zero" {
+                let out = cmd.args[1].trim_start_matches("of=").to_owned();
+                let mb: usize = cmd.args[3].trim_start_matches("count=").parse().unwrap();
+                let _ = h.clone().with_file(&out, zeros(mb), FilePerms::mode(0o644));
+                return ok_output("");
+            }
+            let mut bytes = h.file(&input).unwrap_or_default();
+            bytes.truncate(65536);
+            Output {
+                code: Some(0),
+                stdout: bytes,
+                stderr: vec![],
+                timed_out: false,
+            }
+        };
+        sys.on_command("dd", &[], dd)
+            .on_command("fallocate", &[], fallocate)
             .on_command_ok("mkswap", &[], "")
             .on_command("swapon", &[], swapon)
             .on_command("swapoff", &[], swapoff)
@@ -517,8 +597,8 @@ mod tests {
 
     #[rstest]
     #[case::nothing_exists(host(), Class::Change)]
-    #[case::file_but_not_active(host().with_file("/swapfile", zeros(1), FilePerms::mode(0o600)), Class::Change)]
-    #[case::wrong_size(host().with_file("/swapfile", zeros(2), FilePerms::mode(0o600)), Class::Change)]
+    #[case::file_but_not_active(host().with_file("/swapfile", swap_header(1), FilePerms::mode(0o600)), Class::Change)]
+    #[case::wrong_size(host().with_file("/swapfile", swap_header(2), FilePerms::mode(0o600)), Class::Change)]
     #[case::active_but_not_in_fstab(
         host().with_file("/swapfile", zeros(1), FilePerms::mode(0o600)).with_file(PROC_SWAPS, format!("{HEADER}/swapfile\tfile\t1024\t0\t-2\n"), FilePerms::default()),
         Class::Change
@@ -721,6 +801,95 @@ mod tests {
                 .plan(&cx(&sys), &s(json!({"path": "swapfile"})))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_swappiness_change_keeps_everything_buckle_created() {
+        let sys = host();
+        let first = apply(&SwapFile, &cx(&sys), &s(json!({}))).await;
+        assert!(
+            first
+                .artefacts
+                .iter()
+                .any(|a| matches!(a, Artefact::File { .. }))
+        );
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .previous(record("swap.file", "/swapfile", &first))
+            .build();
+        let second = apply(&SwapFile, &c, &s(json!({"swappiness": 10}))).await;
+        for artefact in &first.artefacts {
+            assert!(second.artefacts.contains(artefact), "{artefact:?} kept");
+        }
+        assert!(
+            SwapFile
+                .remove(&cx(&sys), &record("swap.file", "/swapfile", &second))
+                .await
+                .unwrap()
+                .summary
+                .contains("deleted the swap file")
+        );
+    }
+
+    /// A swap header in the last 10 bytes of a 4 KiB page.
+    fn swap_header(mb: usize) -> Vec<u8> {
+        let mut bytes = zeros(mb);
+        bytes[4096 - 10..4096].copy_from_slice(b"SWAPSPACE2");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn a_data_file_at_the_swap_path_is_never_deleted_or_formatted() {
+        for size in [1usize, 2] {
+            // Right size (would be mkswap'd) and wrong size (would be deleted).
+            let sys = host().with_file(
+                "/swapfile",
+                vec![7u8; size * 1024 * 1024],
+                FilePerms::mode(0o600),
+            );
+            let planned = SwapFile.plan(&cx(&sys), &s(json!({}))).await.unwrap();
+            assert!(
+                matches!(&planned, Planned::Blocked { reason } if reason.contains("no swap signature")),
+                "{planned:?}"
+            );
+            assert!(
+                SwapFile
+                    .apply(&cx(&sys), &s(json!({})), &Planned::NoOp)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(sys.file("/swapfile").unwrap()[0], 7);
+            assert!(
+                !sys.command_lines()
+                    .iter()
+                    .any(|l| l.starts_with("mkswap") || l.starts_with("fallocate"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inactive_swap_area_or_a_file_buckle_created_may_be_reformatted() {
+        let sys = host().with_file("/swapfile", swap_header(2), FilePerms::mode(0o600));
+        assert_eq!(
+            plan_class(&SwapFile, &cx(&sys), &s(json!({}))).await,
+            Class::Change
+        );
+        apply(&SwapFile, &cx(&sys), &s(json!({}))).await;
+        assert_eq!(sys.file("/swapfile").unwrap().len(), 1024 * 1024);
+
+        // No signature, but Buckle's own file from an earlier apply.
+        let sys = host().with_file("/swapfile", zeros(2), FilePerms::mode(0o600));
+        let prev = record(
+            "swap.file",
+            "/swapfile",
+            &Applied::changed("x").with_artefact(hostkit::file_artefact(Path::new("/swapfile"))),
+        );
+        let c = buckle_core::testing::CxBuilder::new(sys.clone())
+            .previous(prev)
+            .build();
+        assert_eq!(
+            plan_class(&SwapFile, &c, &s(json!({}))).await,
+            Class::Change
         );
     }
 }

@@ -46,6 +46,7 @@ use tracing::instrument;
 /// with `-r` only when `remove_home: true`) if Buckle created it, and is
 /// flagged as a cautionary removal.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
     #[serde(default)]
@@ -100,6 +101,33 @@ struct Changes {
     usermod: Vec<String>,
     add_groups: Vec<String>,
     password: bool,
+}
+
+/// Whether an earlier apply of this resource created the account.
+fn owned(cx: &Cx, name: &str) -> bool {
+    hostkit::ownership::previous_artefacts(cx)
+        .iter()
+        .any(|a| matches!(a, Artefact::User { name: n } if n == name))
+}
+
+fn remove_home_recorded(artefacts: &[Artefact]) -> bool {
+    artefacts
+        .iter()
+        .any(|a| matches!(a, Artefact::Other { description } if description == REMOVE_HOME))
+}
+
+/// The artefacts for an account Buckle owns: the user, and the home-removal
+/// flag as the spec currently says (so turning `remove_home` off is honoured).
+fn owned_artefacts(spec: &Spec) -> Vec<Artefact> {
+    let mut out = vec![Artefact::User {
+        name: spec.name.clone(),
+    }];
+    if spec.remove_home {
+        out.push(Artefact::Other {
+            description: REMOVE_HOME.into(),
+        });
+    }
+    out
 }
 
 impl UserAccount {
@@ -301,6 +329,17 @@ impl Task for UserAccount {
             (Ensure::Present, Some(user)) => {
                 let changes = self.changes(cx, spec, &user).await?;
                 if changes.summary.is_empty() {
+                    if owned(cx, &spec.name)
+                        && remove_home_recorded(hostkit::ownership::previous_artefacts(cx))
+                            != spec.remove_home
+                    {
+                        return Ok(Planned::change(Diff::Opaque {
+                            summary: format!(
+                                "record remove_home: {} for user {}",
+                                spec.remove_home, spec.name
+                            ),
+                        }));
+                    }
                     return Ok(Planned::NoOp);
                 }
                 for (needed, tool) in [
@@ -349,24 +388,23 @@ impl Task for UserAccount {
                 if let Some(password) = &spec.password {
                     self.set_password(cx, spec, password).await?;
                 }
-                let mut applied = Applied::changed(format!("created user {}", spec.name))
-                    .with_artefact(Artefact::User {
-                        name: spec.name.clone(),
-                    });
-                if spec.remove_home {
-                    applied = applied.with_artefact(Artefact::Other {
-                        description: REMOVE_HOME.into(),
-                    });
-                }
+                let mut applied = Applied::changed(format!("created user {}", spec.name));
+                applied.artefacts = owned_artefacts(spec);
                 Ok(applied)
             }
             (Ensure::Present, Some(user)) => {
+                // An account Buckle created stays Buckle's across later changes.
+                let ownership = if owned(cx, &spec.name) {
+                    owned_artefacts(spec)
+                } else {
+                    Vec::new()
+                };
                 let changes = self.changes(cx, spec, &user).await?;
                 if changes.summary.is_empty() {
-                    return Ok(Applied::unchanged(format!(
-                        "user {} already up to date",
-                        spec.name
-                    )));
+                    let mut applied =
+                        Applied::unchanged(format!("user {} already up to date", spec.name));
+                    applied.artefacts = ownership;
+                    return Ok(applied);
                 }
                 if !changes.usermod.is_empty() || !changes.add_groups.is_empty() {
                     hostkit::require_tool(cx, "usermod", "install the `passwd` package").await?;
@@ -381,11 +419,13 @@ impl Task for UserAccount {
                 {
                     self.set_password(cx, spec, password).await?;
                 }
-                Ok(Applied::changed(format!(
+                let mut applied = Applied::changed(format!(
                     "updated user {}: {}",
                     spec.name,
                     changes.summary.join(", ")
-                )))
+                ));
+                applied.artefacts = ownership;
+                Ok(applied)
             }
         }
     }
@@ -443,7 +483,7 @@ mod tests {
     use super::*;
     use crate::tasks::hostkit::testkit::*;
     use buckle_core::system::{FilePerms, GroupInfo};
-    use buckle_core::testing::{FakeSystem, MemorySource};
+    use buckle_core::testing::{CxBuilder, FakeSystem, MemorySource};
     use rstest::rstest;
     use serde_json::json;
 
@@ -701,6 +741,64 @@ mod tests {
             }),
         );
         assert!(!UserAccount.remove(&cx(&sys), &rec).await.unwrap().changed);
+    }
+
+    #[tokio::test]
+    async fn ownership_survives_later_changes_and_follows_remove_home() {
+        let sys = host();
+        let created = apply(&UserAccount, &cx(&sys), &s(json!({"remove_home": true}))).await;
+        let first = record("user.account", "alice", &created);
+
+        // A later group change keeps the account Buckle's, with remove_home.
+        let c = CxBuilder::new(sys.clone()).previous(first.clone()).build();
+        let updated = apply(
+            &UserAccount,
+            &c,
+            &s(json!({"remove_home": true, "groups": ["docker"]})),
+        )
+        .await;
+        assert!(updated.artefacts.contains(&Artefact::User {
+            name: "alice".into()
+        }));
+        assert!(remove_home_recorded(&updated.artefacts));
+        let second = record("user.account", "alice", &updated);
+        assert!(
+            UserAccount
+                .describe_removal(&second)
+                .contains("home directory")
+        );
+
+        // Turning remove_home off is a change that only updates the record.
+        let c = CxBuilder::new(sys.clone()).previous(second).build();
+        let spec = s(json!({"groups": ["docker"]}));
+        assert_eq!(plan_class(&UserAccount, &c, &spec).await, Class::Change);
+        let ran = sys.command_lines().len();
+        let off = apply(&UserAccount, &c, &spec).await;
+        assert_eq!(sys.command_lines().len(), ran, "no command needed");
+        assert_eq!(
+            off.artefacts,
+            vec![Artefact::User {
+                name: "alice".into()
+            }]
+        );
+
+        // An account Buckle did not create is never claimed by an update.
+        let sys = host().with_user(user("bob", 1002));
+        let adopted = apply(
+            &UserAccount,
+            &cx(&sys),
+            &spec_named("bob", json!({"shell": "/bin/zsh"})),
+        )
+        .await;
+        assert!(adopted.artefacts.is_empty());
+    }
+
+    fn spec_named(name: &str, extra: serde_json::Value) -> Spec {
+        let mut raw = json!({"name": name});
+        raw.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        spec(raw)
     }
 
     #[test]

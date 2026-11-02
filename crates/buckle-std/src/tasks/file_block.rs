@@ -34,8 +34,18 @@ use tracing::instrument;
 ///
 /// The marker lines delimit what Buckle owns, so removal deletes everything
 /// between them, and a file Buckle created is deleted if that leaves it empty.
-/// Two blocks in one file need different `marker`s.
+/// Two blocks in one file need different `marker`s. Edits of one file are
+/// serialised across modules.
+///
+/// `validate` is a command (argv) that checks the new content before it
+/// replaces the file (and while planning); `{path}` stands for a private
+/// temporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero
+/// exit fails the task and leaves the file untouched. Without `validate`,
+/// `/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with
+/// `visudo -cf {path}` and `sshd -t -f {path}` (when those tools are
+/// installed); `validate: []` turns that off.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Absolute path of the file to edit.
     pub path: PathBuf,
@@ -59,6 +69,10 @@ pub struct Spec {
     /// Keep a timestamped `.bak` copy before editing.
     #[serde(default)]
     pub backup: bool,
+    /// A command that checks the new content; `{path}` stands for the file to check.
+    /// Default: automatic for sudoers and sshd_config; `[]` disables.
+    #[serde(default)]
+    pub validate: Option<Vec<String>>,
 }
 
 fn default_marker() -> String {
@@ -187,7 +201,9 @@ impl FileBlock {
             Edit::Changed { lines, summary } => {
                 let new_text = hostkit::join_lines(&lines);
                 let diff = match &existing {
-                    Some(file) => hostkit::text_diff(summary, &file.text, &new_text),
+                    Some(file) => {
+                        hostkit::text_diff(cx, &spec.path, summary, &file.text, &new_text)
+                    }
                     None => Diff::Create {
                         summary: format!("create {} with the block", spec.path.display()),
                         preview: Some(buckle_core::secrets::Redacted::plain(new_text.clone())),
@@ -232,17 +248,27 @@ impl Task for FileBlock {
         Ok(match self.inspect(cx, spec).await? {
             Outcome::NoOp => Planned::NoOp,
             Outcome::Blocked(reason) => Planned::blocked(reason),
-            Outcome::Change { diff, .. } => Planned::change(diff),
+            Outcome::Change { diff, new_text, .. } => {
+                hostkit::validate::check(
+                    cx,
+                    &spec.path,
+                    spec.validate.as_deref(),
+                    hostkit::validate::Content::Bytes(new_text.as_bytes()),
+                )
+                .await?;
+                Planned::change(diff)
+            }
         })
     }
 
     #[instrument(name = "task.file.block.apply", skip_all, fields(path = %spec.path.display(), state = ?spec.state))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
+        let _guard = hostkit::lock_path(&spec.path).await;
         match self.inspect(cx, spec).await? {
-            Outcome::NoOp => Ok(Applied::unchanged(format!(
-                "{} already up to date",
-                spec.path.display()
-            ))),
+            Outcome::NoOp => Ok(hostkit::ownership::carry_forward(
+                cx,
+                Applied::unchanged(format!("{} already up to date", spec.path.display())),
+            )),
             Outcome::Blocked(reason) => Err(error::user(
                 format!("Cannot edit {}: {reason}.", spec.path.display()),
                 &["Set `create: true` or create the file in an earlier task."],
@@ -253,6 +279,13 @@ impl Task for FileBlock {
                 created,
                 existing,
             } => {
+                hostkit::validate::check(
+                    cx,
+                    &spec.path,
+                    spec.validate.as_deref(),
+                    hostkit::validate::Content::Bytes(new_text.as_bytes()),
+                )
+                .await?;
                 hostkit::save_text(
                     cx,
                     &spec.path,
@@ -264,9 +297,16 @@ impl Task for FileBlock {
                 .await?;
                 let mut applied = Applied::changed(diff.summary().to_owned());
                 if spec.state == Ensure::Present {
+                    // A file Buckle created on an earlier apply stays Buckle's.
+                    let created_before =
+                        hostkit::ownership::previous_artefacts(cx).iter().any(|a| {
+                            matches!(a, Artefact::Line { path, marker }
+                            if *path == spec.path
+                                && serde_json::from_str::<Marker>(marker).is_ok_and(|m| m.created))
+                        });
                     let marker = serde_json::to_string(&Marker {
                         marker: spec.marker.clone(),
-                        created,
+                        created: created || created_before,
                     })
                     .map_err(|e| {
                         error::wrap_system(
@@ -296,6 +336,7 @@ impl Task for FileBlock {
         let Some((path, marker)) = block_artefact(record) else {
             return Ok(Applied::skipped("no block was recorded to remove"));
         };
+        let _guard = hostkit::lock_path(&path).await;
         let Some(file) = hostkit::load_text(cx, &path).await? else {
             return Ok(Applied::unchanged(format!(
                 "{} no longer exists",
@@ -463,5 +504,25 @@ mod tests {
             FileBlock::key(&s(json!({"marker": "# {mark} one"}))),
             FileBlock::key(&s(json!({"marker": "# {mark} two"})))
         );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_validator_checks_the_edited_file() {
+        let sys = FakeSystem::new()
+            .with_file("/etc/app.conf", "a\n", FilePerms::default())
+            .on_command_fail("appcheck", &[], 1, "bad block");
+        let c = cx(&sys);
+        let s: Spec = spec(
+            json!({"path": "/etc/app.conf", "block": "b", "validate": ["appcheck", "{path}"]}),
+        );
+        assert!(
+            FileBlock
+                .plan(&c, &s)
+                .await
+                .unwrap_err()
+                .description()
+                .contains("bad block")
+        );
+        assert_eq!(sys.file_string("/etc/app.conf").unwrap(), "a\n");
     }
 }
