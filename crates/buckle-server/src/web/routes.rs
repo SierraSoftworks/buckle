@@ -141,12 +141,18 @@ fn peer_ip(state: &AppState, req: &HttpRequest) -> Option<std::net::IpAddr> {
     auth::client_ip(&state.web, req).and_then(|s| s.parse().ok())
 }
 
+/// `GET /auth/login?return_to=/rollouts/42`.
 #[derive(Deserialize)]
 struct LoginQuery {
+    /// Where the browser lands after signing in: a local path (with its
+    /// query and fragment), checked by [`auth::safe_return_to`]; anything
+    /// else, or nothing, lands on `/`. This is the only spelling read.
     #[serde(default)]
     return_to: Option<String>,
 }
 
+/// Starts a sign-in: remembers PKCE, nonce and `return_to` for ten minutes
+/// and redirects to the identity provider.
 async fn login(state: Data, req: HttpRequest, q: web::Query<LoginQuery>) -> ApiResult {
     let Some(oidc) = state.oidc.clone() else {
         return Err(ApiError::not_found(

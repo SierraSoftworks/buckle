@@ -85,14 +85,13 @@ pub fn here() -> String {
     format!("{path}{search}{hash}")
 }
 
-/// The sign-in URL that returns to `next`. Both spellings of the parameter
-/// are sent: the UI contract names it `next` and the server's handler reads
-/// `return_to`; whichever it reads, it finds the same value.
-pub fn login_url(next: &str) -> String {
-    let next = enc(next);
+/// The sign-in URL that comes back to `return_to` (the server's
+/// `GET /auth/login?return_to=` parameter, a local path).
+pub fn login_url(return_to: &str) -> String {
     format!(
-        "{}/auth/login?next={next}&return_to={next}",
-        crate::api::BASE
+        "{}/auth/login?return_to={}",
+        crate::api::BASE,
+        enc(return_to)
     )
 }
 

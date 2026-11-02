@@ -37,8 +37,8 @@ describe("session", () => {
     await page.waitForURL(/\/api\/v1\/auth\/login\?/);
     const target = new URL(page.url());
     assert.equal(target.pathname, "/api/v1/auth/login");
-    assert.equal(target.searchParams.get("next"), "/hosts/pi-1?demo&auth=expired");
-    assert.equal(target.searchParams.get("return_to"), target.searchParams.get("next"));
+    assert.equal(target.searchParams.get("return_to"), "/hosts/pi-1?demo&auth=expired");
+    assert.equal(target.searchParams.get("next"), null, "one spelling: return_to");
     await close();
   });
 
