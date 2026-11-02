@@ -1,6 +1,8 @@
 //! Rollout detail (design §10–§12): the pipeline, the approval pane with
-//! deduplicated plans and their diffs, each host's apply timeline and health
-//! during bake, and the operator decisions, offered to admins only.
+//! deduplicated plans and their diffs, each host's apply timeline, health
+//! during bake and run report (live while it applies, with the module and
+//! step in progress on its block), and the operator decisions, offered to
+//! admins only.
 
 use std::collections::BTreeMap;
 
@@ -14,17 +16,18 @@ use yew::prelude::*;
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, Countdown, Empty, ErrorState, Kind, Loading, PageHead, Panel, Pill, Pipeline,
-    PlanGroupView, Refresh, RouteLink, TraceLink, use_toast,
+    Button, Confirm, Countdown, Empty, ErrorBlock, ErrorState, Kind, Loading, PageHead, Panel,
+    Pill, Pipeline, PlanGroupView, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
 };
-use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
+use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::format::{count, first_line, relative, short, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{GateKind, GateState, layout};
 use crate::logic::plan::{ApprovalScope, approval_scope};
+use crate::logic::run::activities;
 use crate::logic::tone::{
-    Tone, check_status_tone, host_state_label, host_state_tone, rollout_finished,
-    rollout_state_label, rollout_state_tone,
+    Tone, check_status_tone, host_error_headline, host_error_tone, host_state_label,
+    host_state_tone, rollout_finished, rollout_state_label, rollout_state_tone,
 };
 use crate::store::use_live;
 
@@ -32,6 +35,10 @@ use crate::store::use_live;
 pub struct Props {
     pub id: String,
 }
+
+/// The most reports fetched at once for the blocks' "in progress" detail: a
+/// phase applies a few hosts at a time, and the updates cover the rest.
+const MAX_ACTIVITY_REPORTS: usize = 24;
 
 /// The decision an open dialog is asking about.
 #[derive(Clone, PartialEq)]
@@ -86,6 +93,40 @@ pub fn rollout_page(props: &Props) -> Html {
     });
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
+    // The reports of the hosts applying now, so their blocks can say which
+    // module and step they are on; run updates keep that current.
+    let applying: Vec<String> = live
+        .as_ref()
+        .map(|d| {
+            let mut v: Vec<String> = d
+                .phases
+                .iter()
+                .flat_map(|p| &p.hosts)
+                .filter(|h| h.state == HostRolloutState::Applying)
+                .map(|h| h.host.clone())
+                .collect();
+            v.sort();
+            v.truncate(MAX_ACTIVITY_REPORTS);
+            v
+        })
+        .unwrap_or_default();
+    let reports = use_fetch((props.id.clone(), applying), |(id, hosts)| async move {
+        let mut reports = Vec::new();
+        for host in &hosts {
+            if let Ok(report) = api::rollout_host_report(&id, host).await {
+                reports.push(report);
+            }
+        }
+        Ok::<_, ApiError>(reports)
+    });
+    let activity: BTreeMap<String, String> = reports
+        .data
+        .as_ref()
+        .map(|data| {
+            let events = store.log.since(data.0).unwrap_or_default();
+            activities(data.1.clone(), &props.id, events.iter().map(|e| &**e))
+        })
+        .unwrap_or_default();
     let ask = use_state(|| None::<Ask>);
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
@@ -301,11 +342,11 @@ pub fn rollout_page(props: &Props) -> Html {
                 </div>
             }
             <Panel title="Pipeline" subtitle={format!("{} hosts in {} stages · {}/{} done", s.hosts_total, d.phases.len(), s.hosts_done, s.hosts_total)}>
-                <Pipeline detail={d.clone()} hosts={hosts.clone()} {now} />
+                <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
             </Panel>
             { approval }
-            <Panel title="Hosts" subtitle="Each host's apply timeline and health during bake">
-                <HostTable detail={d.clone()} admin={admin && !finished} on_ask={open.clone()} {now} />
+            <Panel title="Hosts" subtitle="Each host's apply timeline, health during bake and run report">
+                <HostTable detail={d.clone()} admin={admin && !finished} on_ask={open.clone()} {activity} {now} />
             </Panel>
             <Panel title="Timeline" subtitle="Rollout and phase transitions">
                 { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), now) }
@@ -645,6 +686,8 @@ struct HostTableProps {
     detail: RolloutDetail,
     admin: bool,
     on_ask: Callback<Ask>,
+    /// The module and step each applying host is on.
+    activity: BTreeMap<String, String>,
     now: DateTime<Utc>,
 }
 
@@ -680,13 +723,16 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td><RouteLink to={Route::Host { id: h.host.clone() }} classes="mono strong">{ h.host.clone() }</RouteLink></td>
                                 <td>{ phase.name.clone() }{ h.wave.map(|w| html! { <span class="muted small">{ format!(" · wave {w}") }</span> }).unwrap_or_default() }</td>
                                 <td>
-                                    <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} title={h.error.clone()} />
+                                    <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} title={host_error_headline(h)} />
                                     if h.needs_approval { <span class="badge badge--info">{ "needs approval" }</span> }
                                     if h.needs_attention {
                                         <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>
                                     }
                                     if let Some(until) = h.bake_until.filter(|u| *u > props.now) {
                                         <span class="small muted">{ " " }<Countdown {until} /></span>
+                                    }
+                                    if let Some(now) = props.activity.get(&h.host).filter(|_| h.state == HostRolloutState::Applying) {
+                                        <span class="cell-sub mono" data-testid="host-activity">{ now.clone() }</span>
                                     }
                                 </td>
                                 <td>{ h.plan_digest.as_deref().map(|d| html! {
@@ -745,6 +791,24 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         .iter()
         .filter(|e| e.host.as_deref() == Some(h.host.as_str()))
         .collect();
+    // The host's run in this rollout, once it has one.
+    let has_run = h.run_id.is_some()
+        || matches!(
+            h.state,
+            HostRolloutState::Applying
+                | HostRolloutState::Baking
+                | HostRolloutState::Healthy
+                | HostRolloutState::Failed
+                | HostRolloutState::RolledBack
+        );
+    let run = use_run_report(
+        has_run.then(|| RunSource::Rollout {
+            rollout: rollout_id.clone(),
+            host: h.host.clone(),
+            run: h.run_id.clone(),
+        }),
+        None,
+    );
     let ask = |a: Ask| {
         let on_ask = props.on_ask.clone();
         Callback::from(move |_: MouseEvent| on_ask.emit(a.clone()))
@@ -779,7 +843,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         .unwrap_or_default();
     html! {
         <div class="host-row">
-            if let Some(e) = &h.error { <p class={classes!("note", (h.state == HostRolloutState::Failed).then_some("note--danger"))}>{ e.clone() }</p> }
+            <ErrorBlock error={h.error_detail.clone()} raw={h.error.clone().map(AttrValue::from)} tone={host_error_tone(h)} />
             { actions.unwrap_or_default() }
             <div class="host-row__cols">
                 <div>
@@ -809,6 +873,16 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
                         },
                     } }
                 </div>
+            </div>
+            <div class="host-row__run" data-testid="rollout-host-run">
+                <h4 class="subhead">{ "Run in this rollout" }</h4>
+                { match (&run.report, &run.error) {
+                    (Some(report), _) => html! { <RunReportView report={report.clone()} in_rollout=true /> },
+                    (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={run.reload.clone()} /> },
+                    (None, None) if !has_run => html! { <p class="muted">{ "No run yet: the host has not started applying in this rollout." }</p> },
+                    (None, None) if run.settled => html! { <p class="muted">{ "The server has no run report for this host in this rollout." }</p> },
+                    (None, None) => html! { <Loading label="Loading the run…" /> },
+                } }
             </div>
         </div>
     }

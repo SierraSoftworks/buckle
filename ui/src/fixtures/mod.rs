@@ -15,7 +15,7 @@
 //! | `auth=expired` | `/me` answers 401 and the refresh fails, so the UI sends you to sign in |
 //! | `session=ended` | a moment after loading, the event stream ends with `session_ended` and the refresh fails, so the UI sends you to sign in |
 //! | `slow` | every call takes 700 ms, to see the loading states |
-//! | `live` | the active rollout moves on by itself through the live event path |
+//! | `live` | the active rollout moves on by itself through the live event path, and pi-4's run advances step by step (`run_progress`) until it succeeds |
 //! | `awaiting` | the active rollout has finished its home phase and is held at the cloud gate, awaiting approval (so it can be rejected) |
 //! | `empty` | an empty fleet with no rollouts, to see the empty states |
 //!
@@ -29,6 +29,8 @@
 mod data;
 #[cfg(debug_assertions)]
 pub mod live;
+#[cfg(debug_assertions)]
+pub mod runs;
 #[cfg(debug_assertions)]
 pub mod store;
 

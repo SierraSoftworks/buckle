@@ -63,11 +63,19 @@ pub fn apply_fleet(fleet: &mut Fleet, event: &LiveEvent) {
     }
 }
 
+/// A host change replaces the summary; a run update is applied to the
+/// latest run the detail carries, when it is that run.
 pub fn apply_host_detail(detail: &mut HostDetail, event: &LiveEvent) {
-    if let LiveEvent::HostChanged { host } = event
-        && host.id == detail.summary.id
-    {
-        detail.summary = host.clone();
+    match event {
+        LiveEvent::HostChanged { host } if host.id == detail.summary.id => {
+            detail.summary = host.clone();
+        }
+        LiveEvent::RunProgress { progress } => {
+            if let Some(run) = &mut detail.latest_run {
+                super::run::apply_progress(run, progress);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -175,6 +183,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "rollout_host_changed",
     "rollout_timeline",
     "revision_added",
+    "run_progress",
     "audit",
     "lagged",
     "session_ended",
@@ -548,6 +557,53 @@ mod tests {
         );
         assert_eq!(revisions[0].id, "new");
         assert_eq!(revisions[1].rollout_id.as_deref(), Some("43"));
+    }
+
+    #[test]
+    fn a_run_update_reaches_the_hosts_latest_run() {
+        use buckle_api::{RunProgress, RunState, StepState};
+        let mut report = super::super::run::tests::report(vec![super::super::run::tests::module(
+            "nomad",
+            buckle_api::ModuleState::Running,
+            vec![super::super::run::tests::step("a", StepState::Running)],
+        )]);
+        report.host = "pi-1".into();
+        let mut detail = HostDetail {
+            summary: host("pi-1", HealthSummary::Healthy),
+            facts: serde_json::Value::Null,
+            facts_at: None,
+            resources: vec![],
+            recent_runs: vec![],
+            health_results: vec![],
+            drift: vec![],
+            latest_run: Some(report),
+        };
+        let event = LiveEvent::RunProgress {
+            progress: RunProgress {
+                host: "pi-1".into(),
+                run_id: "run-1".into(),
+                rollout_id: None,
+                at: Utc::now(),
+                run_state: RunState::Running,
+                module: Some("nomad".into()),
+                module_state: None,
+                step: Some("file.copy[a]".into()),
+                step_state: Some(StepState::Changed),
+                result: None,
+                error: None,
+            },
+        };
+        apply_host_detail(&mut detail, &event);
+        let run = detail.latest_run.as_ref().unwrap();
+        assert_eq!(run.modules[0].steps[0].state, StepState::Changed);
+        assert_eq!(run.counts.steps.changed, 1);
+
+        let data = serde_json::to_string(&event).unwrap();
+        assert!(EVENT_NAMES.contains(&"run_progress"));
+        match decode("run_progress", &data) {
+            Ok(Frame::Event(e)) => assert!(matches!(*e, LiveEvent::RunProgress { .. })),
+            other => panic!("expected run progress, got {other:?}"),
+        }
     }
 
     #[test]

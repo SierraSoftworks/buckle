@@ -22,7 +22,8 @@ use std::cell::RefCell;
 use buckle_api::{
     ActionRequest, ApproveRequest, AuditEntry, Catalog, ContinueRequest, CsrfToken, ErrorBody,
     Fleet, HealthResultDto, HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup,
-    RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, StartRollout,
+    RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, RunReport, RunSummary,
+    StartRollout,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -270,6 +271,35 @@ pub async fn host_health(id: &str) -> Result<Vec<HealthResultDto>, ApiError> {
     get(&format!("/hosts/{}/health", enc(id))).await
 }
 
+/// `GET /hosts/{id}/runs`: the host's runs, newest first. Read as a page,
+/// or as the bare list servers answered with before run reports.
+pub async fn host_runs(id: &str) -> Result<Vec<RunSummary>, ApiError> {
+    demo!(demo_store::host_runs(id));
+    let text = send::<()>(
+        Method::Get,
+        &format!("/hosts/{}/runs?limit=50", enc(id)),
+        None,
+    )
+    .await?
+    .text()
+    .await
+    .map_err(net)?;
+    // Told apart by their first character rather than an untagged enum,
+    // whose buffering costs the bundle more than this whole route.
+    let parsed = if text.trim_start().starts_with('[') {
+        serde_json::from_str(&text)
+    } else {
+        serde_json::from_str::<Page<RunSummary>>(&text).map(|page| page.items)
+    };
+    parsed.map_err(|e| ApiError::Server(format!("The server's answer was unreadable: {e}")))
+}
+
+/// `GET /hosts/{id}/runs/{run}`: one run, module by module and step by step.
+pub async fn host_run(id: &str, run: &str) -> Result<RunReport, ApiError> {
+    demo!(demo_store::host_run(id, run));
+    get(&format!("/hosts/{}/runs/{}", enc(id), enc(run))).await
+}
+
 pub async fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> {
     demo!(demo_store::patch_host(id, patch));
     write(Method::Patch, &format!("/hosts/{}", enc(id)), Some(patch)).await
@@ -392,6 +422,13 @@ pub async fn rollout_host_action(
         Some(&body),
     )
     .await
+}
+
+/// `GET /rollouts/{id}/hosts/{host}/report`: the host's run in this
+/// rollout, live while it applies.
+pub async fn rollout_host_report(id: &str, host: &str) -> Result<RunReport, ApiError> {
+    demo!(demo_store::rollout_host_report(id, host));
+    get(&format!("/rollouts/{}/hosts/{}/report", enc(id), enc(host))).await
 }
 
 /// Retries a host with the named failing checks waived for this rollout.

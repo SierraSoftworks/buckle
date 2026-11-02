@@ -327,8 +327,26 @@
     color: var(--fg-2);
   }
 
+  // A tooltip carries the headline only, and at most a few lines of it.
+  &__error,
+  &__note {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+  }
+
   &__error {
     color: var(--danger);
+  }
+
+  &__note {
+    color: var(--fg-2);
+  }
+
+  &__activity {
+    color: var(--active);
+    overflow-wrap: anywhere;
   }
 }
 
