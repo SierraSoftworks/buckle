@@ -4,8 +4,8 @@
 //! |---|---|
 //! | `token` | the per-host token issued at enrolment (0600) |
 //! | `install.key` | the key secret fingerprints are computed with (0600) |
-//! | `state.cbor` | the engine's resource state, applied and stable revision |
-//! | `agent.json` | session bookkeeping: last plan digest, labels, the local rollback watchdog, unreported local rollbacks (0600) |
+//! | `state.cbor` | the engine's resource state; written only by the engine (the agent reads it once, to migrate older state) |
+//! | `agent.json` | the agent's own bookkeeping: applied and stable revision, cached facts, last plan digest, labels, the local rollback watchdog, unacknowledged reports (0600) |
 //! | `revisions/<id>/` | extracted revision trees (the stable one is kept for local rollback) |
 //! | `secrets/<id>.cbor` | the secrets scoped to this host for a revision (0600) |
 
@@ -21,9 +21,25 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Session bookkeeping persisted in `agent.json`.
+/// The agent's own bookkeeping, persisted in `agent.json`.
+///
+/// `state.cbor` belongs to the engine, which loads it at the start of an
+/// apply and saves it as the run progresses; anything the agent records while
+/// an apply may be running (a Welcome naming a new stable revision, refreshed
+/// facts) lives here instead, so the engine is the only writer of
+/// `state.cbor`. Every write of this file happens under the session's data
+/// lock.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentState {
+    /// The revision this host has applied (last successful run).
+    #[serde(default)]
+    pub applied_revision: Option<RevisionId>,
+    /// The fleet's stable revision as last told by the server.
+    #[serde(default)]
+    pub stable_revision: Option<RevisionId>,
+    /// The facts collected so far, with their collection times.
+    #[serde(default)]
+    pub facts: buckle_core::facts::Facts,
     /// Digest of the last plan this agent produced.
     #[serde(default)]
     pub last_plan_digest: Option<String>,
@@ -198,17 +214,9 @@ impl Store {
         FileStateStore::new(self.root.join("state.cbor"))
     }
 
-    /// Loads the engine state.
+    /// Loads the engine state (read-only: only the engine writes it).
     pub fn load_state(&self) -> buckle_core::Result<State> {
         self.state_store().load()
-    }
-
-    /// Loads, modifies and saves the engine state.
-    pub fn update_state(&self, f: impl FnOnce(&mut State)) -> buckle_core::Result<()> {
-        let store = self.state_store();
-        let mut state = store.load()?;
-        f(&mut state);
-        store.save(&state)
     }
 
     /// The directory a revision's tree is extracted to.

@@ -174,7 +174,7 @@ async fn assign_plan_apply_reports_the_plan_coalesced_events_and_the_result() {
         serde_json::from_slice(&result.outcome_json).expect("outcome json");
     assert!(outcome.succeeded);
 
-    let state = Store::new(h.state_dir()).load_state().expect("state");
+    let state = Store::new(h.state_dir()).load_agent_state();
     assert_eq!(state.applied_revision, Some(rev("rev1")));
 
     // The next Hello carries the applied revision and the last plan digest.
@@ -574,12 +574,19 @@ async fn a_restart_mid_window_resumes_the_watchdog() {
                 )
                 .expect("extract");
             }
-            store
-                .update_state(|s| {
-                    s.applied_revision = Some(rev("rev1"));
-                    s.stable_revision = Some(rev("stable1"));
-                })
-                .expect("state");
+            // Bookkeeping as an older agent kept it, in the engine's state:
+            // adopted on start.
+            {
+                use buckle_core::state::StateStore;
+                store
+                    .state_store()
+                    .save(&buckle_core::state::State {
+                        applied_revision: Some(rev("rev1")),
+                        stable_revision: Some(rev("stable1")),
+                        ..Default::default()
+                    })
+                    .expect("state");
+            }
             store
                 .save_agent_state(&crate::store::AgentState {
                     watchdog: Some(crate::watchdog::WatchdogState {

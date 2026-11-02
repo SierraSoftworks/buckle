@@ -149,10 +149,8 @@ impl Queue {
 struct Data {
     revisions: HashMap<RevisionId, Arc<Revision>>,
     secrets: HashMap<RevisionId, Arc<SecretStore>>,
-    facts: Facts,
+    /// Persisted in agent.json: applied and stable revision, facts, …
     agent: AgentState,
-    applied: Option<RevisionId>,
-    stable: Option<RevisionId>,
     assigned: Option<RevisionId>,
 }
 
@@ -398,8 +396,19 @@ impl Agent {
 
 impl Shared {
     async fn load(&self) -> buckle_core::Result<()> {
+        // state.cbor belongs to the engine; it is only read here, to adopt
+        // the bookkeeping older agents kept in it.
         let state = self.store.load_state()?;
-        let agent = self.store.load_agent_state();
+        let mut agent = self.store.load_agent_state();
+        if agent.applied_revision.is_none() {
+            agent.applied_revision = state.applied_revision;
+        }
+        if agent.stable_revision.is_none() {
+            agent.stable_revision = state.stable_revision;
+        }
+        if agent.facts.tree.is_null() && !state.facts.tree.is_null() {
+            agent.facts = state.facts;
+        }
         if let Some(persisted) = agent.watchdog.clone() {
             tracing::info!(from = %persisted.from.short(), to = %persisted.to.short(), "resuming the local rollback watchdog");
             if let Ok(mut guard) = self.watchdog.lock() {
@@ -407,11 +416,6 @@ impl Shared {
             }
         }
         let mut data = self.data.lock().await;
-        data.applied = state.applied_revision;
-        data.stable = state.stable_revision;
-        if !state.facts.tree.is_null() {
-            data.facts = state.facts;
-        }
         data.agent = agent;
         Ok(())
     }
@@ -439,7 +443,7 @@ impl Shared {
             host_id: self.host_id.clone(),
             agent_version: self.options.agent_version.clone(),
             labels: self.config.labels.clone(),
-            applied_revision: data.applied.clone(),
+            applied_revision: data.agent.applied_revision.clone(),
             last_plan_digest: data.agent.last_plan_digest.clone(),
             token,
             platform: std::env::consts::OS.to_owned(),
@@ -500,7 +504,7 @@ impl Shared {
                     }
                 },
                 _ = heartbeat.tick() => if welcomed {
-                    let applied = self.data.lock().await.applied.clone();
+                    let applied = self.data.lock().await.agent.applied_revision.clone();
                     self.sink.send(Report::Heartbeat {
                         applied_revision: applied,
                         busy: self.busy.load(Ordering::SeqCst),
@@ -509,7 +513,7 @@ impl Shared {
                 _ = drift.tick() => if welcomed
                     && !self.busy.load(Ordering::SeqCst)
                     && queue.is_empty()
-                    && self.data.lock().await.applied.is_some()
+                    && self.data.lock().await.agent.applied_revision.is_some()
                 {
                     queue.push(Op::Drift, None);
                 },
@@ -543,13 +547,7 @@ impl Shared {
             data.agent.labels = welcome.labels.clone();
             data.agent.status = Some(welcome.status.clone()).filter(|s| !s.is_empty());
             if let Some(stable) = &welcome.stable_revision {
-                data.stable = Some(stable.clone());
-                if let Err(err) = self
-                    .store
-                    .update_state(|s| s.stable_revision = Some(stable.clone()))
-                {
-                    tracing::error!(error = %err.description(), "could not record the stable revision");
-                }
+                data.agent.stable_revision = Some(stable.clone());
                 if !welcome.secrets.is_empty() {
                     self.cache_secrets(&mut data, stable, &welcome.secrets);
                 }
@@ -787,8 +785,8 @@ impl Shared {
         )?);
         let mut data = self.data.lock().await;
         let keep: Vec<RevisionId> = [
-            data.applied.clone(),
-            data.stable.clone(),
+            data.agent.applied_revision.clone(),
+            data.agent.stable_revision.clone(),
             data.assigned.clone(),
         ]
         .into_iter()
@@ -816,7 +814,7 @@ impl Shared {
             },
             server_labels: labels_json(&data.agent.labels),
             secrets,
-            facts: data.facts.clone(),
+            facts: data.agent.facts.clone(),
             select,
             waived_checks,
             force,
@@ -832,7 +830,7 @@ impl Shared {
         data: &mut Data,
         revision: &RevisionId,
     ) -> Option<Arc<buckle_core::engine::Revision>> {
-        let stable = data.stable.clone()?;
+        let stable = data.agent.stable_revision.clone()?;
         if &stable == revision {
             return None;
         }
@@ -864,7 +862,11 @@ impl Shared {
     }
 
     async fn remember_facts(&self, facts: Facts) {
-        self.data.lock().await.facts = facts;
+        let mut data = self.data.lock().await;
+        if data.agent.facts != facts {
+            data.agent.facts = facts;
+            self.save_agent(&data);
+        }
     }
 
     async fn remember_plan(&self, plan: &Plan) {
@@ -890,18 +892,12 @@ impl Shared {
         {
             let mut data = self.data.lock().await;
             if stable {
-                data.stable = Some(revision.clone());
+                data.agent.stable_revision = Some(revision.clone());
+                self.save_agent(&data);
             }
             if desired {
                 data.assigned = Some(revision.clone());
             }
-        }
-        if stable
-            && let Err(err) = self
-                .store
-                .update_state(|s| s.stable_revision = Some(revision.clone()))
-        {
-            tracing::error!(error = %err.description(), "could not record the stable revision");
         }
         match self
             .ensure_revision(&revision, tree_digest.as_deref())
@@ -910,10 +906,14 @@ impl Shared {
             Ok(_) => {
                 tracing::info!(revision = %revision.short(), stable, "revision assigned");
                 let data = self.data.lock().await;
-                let keep: Vec<&RevisionId> = [&data.applied, &data.stable, &data.assigned]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let keep: Vec<&RevisionId> = [
+                    &data.agent.applied_revision,
+                    &data.agent.stable_revision,
+                    &data.assigned,
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
                 self.store.prune_revisions(&keep);
             }
             Err(err) => {
@@ -989,17 +989,11 @@ impl Shared {
         let applied = {
             let mut data = self.data.lock().await;
             if outcome.succeeded {
-                data.applied = Some(rev.id.clone());
-                if let Err(err) = self
-                    .store
-                    .update_state(|s| s.applied_revision = Some(rev.id.clone()))
-                {
-                    tracing::error!(error = %err.description(), "could not record the applied revision");
-                }
+                data.agent.applied_revision = Some(rev.id.clone());
             }
             data.agent.last_plan_digest = Some(plan.digest.to_string());
             self.save_agent(&data);
-            data.applied.clone()
+            data.agent.applied_revision.clone()
         };
         if report {
             self.sink
@@ -1086,7 +1080,7 @@ impl Shared {
             return;
         }
         let mut data = self.data.lock().await;
-        let Some(stable) = data.stable.clone() else {
+        let Some(stable) = data.agent.stable_revision.clone() else {
             tracing::debug!("not arming the local rollback watchdog: no stable revision is known");
             return;
         };
@@ -1148,7 +1142,7 @@ impl Shared {
         modules: Vec<String>,
         until: Option<chrono::DateTime<chrono::Utc>>,
     ) {
-        let applied = self.data.lock().await.applied.clone();
+        let applied = self.data.lock().await.agent.applied_revision.clone();
         let Some(revision) = applied else {
             self.sink
                 .send(Report::Health {
@@ -1220,7 +1214,7 @@ impl Shared {
         let (applied, paused) = {
             let data = self.data.lock().await;
             (
-                data.applied.clone(),
+                data.agent.applied_revision.clone(),
                 data.agent.status.as_deref() == Some("paused"),
             )
         };
@@ -1281,14 +1275,11 @@ impl Shared {
     }
 
     async fn facts(&self, force_report: bool) {
-        let previous = self.data.lock().await.facts.clone();
+        let previous = self.data.lock().await.agent.facts.clone();
         match self.runner.facts(&previous).await {
             Ok(facts) => {
                 let changed = facts.tree != previous.tree;
                 self.remember_facts(facts.clone()).await;
-                if let Err(err) = self.store.update_state(|s| s.facts = facts.clone()) {
-                    tracing::debug!(error = %err.description(), "could not cache facts");
-                }
                 if changed || force_report {
                     self.sink.send(Report::Facts(facts)).await;
                 }
@@ -1309,7 +1300,7 @@ impl Shared {
         }
         let candidates: Vec<(RevisionId, Arc<Revision>)> = {
             let data = self.data.lock().await;
-            [data.applied.clone(), data.assigned.clone()]
+            [data.agent.applied_revision.clone(), data.assigned.clone()]
                 .into_iter()
                 .flatten()
                 .filter_map(|id| data.revisions.get(&id).map(|r| (id, r.clone())))
