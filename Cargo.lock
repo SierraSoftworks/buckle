@@ -2221,7 +2221,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7518b930f6aeb75e871d32ce873c2ae46e35cef19b5a0b039d4337f651d897cd"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -6056,7 +6056,7 @@ dependencies = [
 [[package]]
 name = "tracing-batteries"
 version = "0.1.0"
-source = "git+https://github.com/sierrasoftworks/tracing-batteries-rs.git#00671757db55623b84eb49302731e70e3fdd21ab"
+source = "git+https://github.com/sierrasoftworks/tracing-batteries-rs.git#4aa19b634594c380bcb5fb7203bea6ae0ae91380"
 dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",
