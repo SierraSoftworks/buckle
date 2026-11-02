@@ -422,6 +422,24 @@ impl Harness {
             .await
     }
 
+    /// Waits until `host` is applying and its Apply has reached the host's
+    /// session, and returns that Apply. The controller saves the Applying
+    /// state before it sends the message, so the stored state alone can be
+    /// seen while the Apply is still on its way.
+    async fn wait_apply(&self, id: &str, host_id: &str) -> pb::Apply {
+        self.wait(id, "applying", |_, hs| {
+            host(hs, host_id).state == HostPhase::Applying
+        })
+        .await;
+        for _ in 0..600 {
+            if let Some((_, _, a)) = self.applies().into_iter().find(|a| a.1 == host_id) {
+                return a;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        panic!("no Apply reached {host_id}");
+    }
+
     /// Lets the controller settle for `secs` virtual seconds.
     async fn idle(&self, secs: u64) {
         tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -1366,10 +1384,7 @@ async fn an_applying_host_that_reconnects_off_target_gets_the_same_apply_again()
     h.script("a", |s| s.silent_apply = true);
     h.connect("a", None);
     let id = h.start("r1").await;
-    h.wait(&id, "applying", |_, hs| {
-        host(hs, "a").state == HostPhase::Applying
-    })
-    .await;
+    h.wait_apply(&id, "a").await;
 
     // The agent skipped the apply (its session died first) and reconnects
     // on the old revision with nothing in flight: the same Apply again.
@@ -2804,11 +2819,7 @@ async fn a_durable_report_stored_before_a_crash_is_replayed_on_start_up() {
     h.script("a", |s| s.silent_apply = true);
     h.connect("a", None);
     let id = h.start("r1").await;
-    h.wait(&id, "applying", |_, hs| {
-        host(hs, "a").state == HostPhase::Applying
-    })
-    .await;
-    let apply = h.applies()[0].2.clone();
+    let apply = h.wait_apply(&id, "a").await;
     let result = AMsg::Result(ApplyResult {
         revision: apply.revision.clone(),
         plan_digest: apply.plan_digest.clone(),
@@ -2855,11 +2866,7 @@ async fn a_durable_report_is_confirmed_only_after_its_reaction_is_saved() {
     h.script("a", |s| s.silent_apply = true);
     h.connect("a", None);
     let id = h.start("r1").await;
-    h.wait(&id, "applying", |_, hs| {
-        host(hs, "a").state == HostPhase::Applying
-    })
-    .await;
-    let apply = h.applies()[0].2.clone();
+    let apply = h.wait_apply(&id, "a").await;
     let result = AMsg::Result(ApplyResult {
         revision: apply.revision.clone(),
         plan_digest: apply.plan_digest.clone(),
