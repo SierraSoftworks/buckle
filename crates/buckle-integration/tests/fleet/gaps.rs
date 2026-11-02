@@ -148,11 +148,9 @@ async fn a_phase_over_its_failure_budget_does_not_complete_while_the_failure_sta
 
 /// Design §06 "What the operator sees": a rotated secret shows up as a
 /// fingerprint change on exactly the lines that use it (the plan diffs the
-/// recorded redacted shadow against the new redacted render). file.template
-/// never consults the recorded shadow for a sensitive render, so the plan
-/// says "content changed (digest a → b)" with only the new render.
+/// recorded redacted shadow against the new redacted render, when the file
+/// is unchanged since Buckle wrote it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "gap: a secret rotation is shown as an opaque digest change, not a shadow diff of the fingerprint (buckle-std tasks/file_template.rs inspect ignores cx.previous)"]
 async fn a_rotated_secret_is_a_fingerprint_change_on_the_line_that_uses_it() {
     let fleet = |template: &str| {
         let base = Fleet::with_phases("", ONE_PHASE);
