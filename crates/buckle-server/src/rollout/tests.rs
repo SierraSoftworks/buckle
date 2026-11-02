@@ -1809,3 +1809,103 @@ async fn a_restart_with_a_gate_pending_re_arms_it(#[case] reconnects: bool) {
         assert!(h.applies().iter().all(|a| a.1 == "c1"), "web never started");
     }
 }
+
+impl Harness {
+    /// Makes every checkpoint that writes an audit row fail (or stops it).
+    async fn fail_checkpoints(&self, fail: bool) {
+        self.store
+            .call(move |db| {
+                let sql = if fail {
+                    "CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+                } else {
+                    "DROP TRIGGER fail_audit"
+                };
+                db.conn()
+                    .execute_batch(sql)
+                    .map_err(|e| buckle_core::error::system(e.to_string(), &[]))
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn audit_actions(&self, id: &str) -> Vec<String> {
+        let id = id.to_owned();
+        self.store
+            .call(move |db| db.audit().for_subject(&id, 1000))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.action)
+            .collect()
+    }
+}
+
+/// A checkpoint that cannot be written loses nothing and sends nothing ahead
+/// of its state: the audit rows and the queued messages are kept, a finished
+/// rollout stays live until its final state is written, and the controller
+/// retries on its own.
+#[tokio::test(start_paused = true)]
+async fn a_failed_checkpoint_keeps_its_audit_outbox_and_finished_rollout() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 1m }\n  phases:\n    - { name: web, select: 'true', approval: required }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+
+    h.fail_checkpoints(true).await;
+    let refused = h
+        .command(Command::Approve {
+            rollout: id.clone(),
+            phase: "web".into(),
+            digests: vec!["plan-a".into()],
+            note: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind, CommandErrorKind::Internal, "{refused}");
+    h.idle(30).await;
+    assert!(
+        h.sent(|_, m| matches!(m, SMsg::Health(_) | SMsg::Apply(_)))
+            .is_empty(),
+        "nothing is sent before its state is saved"
+    );
+    h.fail_checkpoints(false).await;
+    h.wait(&id, "baking", |_, hs| {
+        host(hs, "a").state == HostPhase::Baking
+    })
+    .await;
+    assert!(
+        h.audit_actions(&id)
+            .await
+            .contains(&"rollout.approve".to_owned())
+    );
+
+    // The bake ends (and the rollout completes) while checkpoints fail.
+    h.fail_checkpoints(true).await;
+    h.idle(120).await;
+    let (r, _) = h.snapshot(&id).await;
+    assert_ne!(r.state, RolloutState::Completed, "not written yet");
+    h.fail_checkpoints(false).await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(r.finished_at.is_some());
+    assert_eq!(host(&hosts, "a").state, HostPhase::Healthy);
+    let actions = h.audit_actions(&id).await;
+    for a in [
+        "rollout.host.healthy",
+        "rollout.completed",
+        "revision.promoted",
+    ] {
+        assert!(actions.contains(&a.to_owned()), "{a} missing: {actions:?}");
+    }
+    let stable = h
+        .store
+        .call(|db| db.kv().get("stable_revision"))
+        .await
+        .unwrap();
+    assert_eq!(stable.as_deref(), Some("r1"));
+}

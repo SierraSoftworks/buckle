@@ -279,6 +279,15 @@ impl ControllerHandle {
     }
 }
 
+fn not_saved() -> buckle_core::Error {
+    buckle_core::error::system(
+        "The rollout controller accepted the change but could not save it yet.",
+        &[
+            "The controller keeps retrying and the change takes effect once it is saved; check the server logs for the database error.",
+        ],
+    )
+}
+
 fn stopped() -> buckle_core::Error {
     buckle_core::error::system(
         "The rollout controller is not running.",
@@ -367,6 +376,10 @@ struct Controller {
     stable: Option<String>,
     stable_dirty: bool,
     excluded: HashSet<String>,
+    /// The last checkpoint failed: retry it at this time.
+    flush_retry: Option<DateTime<Utc>>,
+    /// Consecutive failed checkpoints (for the retry backoff).
+    flush_failures: u32,
 }
 
 fn msg(m: server_message::Msg) -> ServerMessage {
@@ -514,6 +527,8 @@ impl Controller {
             stable,
             stable_dirty: false,
             excluded,
+            flush_retry: None,
+            flush_failures: 0,
         })
     }
 
@@ -764,7 +779,11 @@ impl Controller {
                 }
                 // Flush before replying so the caller observes the new state.
                 self.drive().await;
-                self.flush().await;
+                let saved = self.flush().await;
+                let result = match result {
+                    Ok(_) if !saved => Err(CommandError::internal(not_saved())),
+                    other => other,
+                };
                 let _ = reply.send(result);
             }
         }
@@ -2227,6 +2246,9 @@ impl Controller {
         let mut consider = |t: DateTime<Utc>| {
             next = Some(next.map_or(t, |n| n.min(t)));
         };
+        if let Some(t) = self.flush_retry {
+            consider(t);
+        }
         for l in &self.live {
             for h in &l.hosts {
                 if h.state == HostPhase::Baking {
@@ -3001,7 +3023,14 @@ impl Controller {
 
     // ------------------------------------------------------------ persistence
 
-    async fn flush(&mut self) {
+    /// Writes the checkpoint (dirty rollouts and hosts, the stable revision,
+    /// audit rows) in one transaction, then publishes live events and sends
+    /// the queued messages. Returns whether the checkpoint was written.
+    ///
+    /// When the transaction fails nothing is lost or sent ahead of its
+    /// state: the audit rows and the outbox are kept, finished rollouts stay
+    /// live, and a retry is armed with a backoff.
+    async fn flush(&mut self) -> bool {
         let mut rollouts = Vec::new();
         let mut hosts = Vec::new();
         for l in &self.live {
@@ -3017,7 +3046,7 @@ impl Controller {
         let audits = std::mem::take(&mut self.audits);
         let stable = self.stable_dirty.then(|| self.stable.clone()).flatten();
         if !(rollouts.is_empty() && hosts.is_empty() && audits.is_empty() && stable.is_none()) {
-            let (r2, h2) = (rollouts.clone(), hosts.clone());
+            let (r2, h2, a2) = (rollouts.clone(), hosts.clone(), audits.clone());
             let result = self
                 .store
                 .transaction(move |db| {
@@ -3031,7 +3060,7 @@ impl Controller {
                         db.kv().set(keys::STABLE_REVISION, s)?;
                     }
                     let mut entries = Vec::new();
-                    for a in &audits {
+                    for a in &a2 {
                         entries.push(db.audit().add(a)?);
                     }
                     Ok(entries)
@@ -3039,6 +3068,8 @@ impl Controller {
                 .await;
             match result {
                 Ok(entries) => {
+                    self.flush_retry = None;
+                    self.flush_failures = 0;
                     self.stable_dirty = false;
                     for l in &mut self.live {
                         l.dirty = false;
@@ -3071,7 +3102,16 @@ impl Controller {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "the rollout checkpoint could not be written; will retry");
+                    // Keep the audit rows (ahead of any recorded since) and
+                    // the outbox: nothing is sent before its state is saved.
+                    let mut kept = audits;
+                    kept.append(&mut self.audits);
+                    self.audits = kept;
+                    self.flush_failures = self.flush_failures.saturating_add(1);
+                    let backoff = 1i64 << self.flush_failures.min(5);
+                    self.flush_retry = Some(self.now() + chrono::Duration::seconds(backoff));
+                    tracing::error!(error = %e, failures = self.flush_failures, retry_in_s = backoff, "the rollout checkpoint could not be written; will retry");
+                    return false;
                 }
             }
         }
@@ -3102,9 +3142,15 @@ impl Controller {
             tracing::debug!(host = %host, "a message could not be delivered; treating the host as disconnected");
             self.on_disconnected(&host);
         }
-        // Forget finished rollouts (they stay in the store).
-        self.live
-            .retain(|l| !l.record.is_terminal() || l.record.runtime.stragglers_open);
+        // Forget finished rollouts once their final state is written (they
+        // stay in the store).
+        self.live.retain(|l| {
+            !l.record.is_terminal()
+                || l.record.runtime.stragglers_open
+                || l.dirty
+                || !l.dirty_hosts.is_empty()
+        });
+        true
     }
 
     /// Sends Assign and RequestPlan; `false` when the host has no session.
