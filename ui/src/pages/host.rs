@@ -1,4 +1,5 @@
-//! Host detail (design §12): the facts tree, what Buckle owns on the host,
+//! Host detail (design §12): the facts tree, the host's blueprint (what
+//! Buckle manages there, module by module),
 //! health per rollout and scope with reasons, drift diffs, the latest run
 //! module by module and step by step (live while it applies, with any older
 //! run a pick away), and, for admins, the controls: server labels with a live preview of the
@@ -19,8 +20,8 @@ use yew_router::prelude::*;
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind, Loading, PageHead,
-    Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
+    BlueprintView, Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind,
+    Loading, PageHead, Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::format::{
@@ -262,8 +263,8 @@ pub fn host_page(props: &Props) -> Html {
             }
             <RunsPanel host={h.id.clone()} latest={d.latest_run.clone()} newest={newest.clone()}
                 picked={(*picked).clone()} on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
-            <Panel title="Owned resources" subtitle="What Buckle manages on this host, and what removal would do">
-                { resources(&d, now) }
+            <Panel title="Blueprint" subtitle="What Buckle manages on this host, module by module: each resource's state and whether removal cleans it up">
+                <BlueprintView resources={d.resources.clone()} drift={d.drift.clone()} run={d.latest_run.clone()} />
             </Panel>
             <Panel title="Recent runs">{ runs(&d, now, (*picked).clone().or(newest.clone()), &{
                 let picked = picked.clone();
@@ -349,33 +350,6 @@ fn scope_label(scope: &str) -> &str {
         "bake" => "Bake, after apply",
         "rollout" => "Pre-phase re-check",
         other => other,
-    }
-}
-
-fn resources(d: &HostDetail, now: DateTime<Utc>) -> Html {
-    if d.resources.is_empty() {
-        return html! { <Empty title="Nothing owned yet" message="Resources appear once a revision has been applied." /> };
-    }
-    html! {
-        <div class="table-wrap">
-            <table class="table table--compact">
-                <thead><tr>
-                    <th scope="col">{ "Module" }</th><th scope="col">{ "Resource" }</th>
-                    <th scope="col">{ "Revision" }</th><th scope="col">{ "Applied" }</th><th scope="col">{ "On removal" }</th>
-                </tr></thead>
-                <tbody>
-                    { for d.resources.iter().map(|r| html! {
-                        <tr>
-                            <td class="mono">{ r.module.clone() }</td>
-                            <td class="mono">{ format!("{}[{}]", r.kind, r.key) }</td>
-                            <td class="mono" title={r.revision.clone()}>{ commit(&r.revision) }</td>
-                            <td title={timestamp(r.applied_at)}>{ relative(r.applied_at, now) }</td>
-                            <td>{ if r.removal == "leave" { html! { <span class="badge">{ "forget only" }</span> } } else { html! { <span class="badge badge--warn">{ r.removal.clone() }</span> } } }</td>
-                        </tr>
-                    }) }
-                </tbody>
-            </table>
-        </div>
     }
 }
 

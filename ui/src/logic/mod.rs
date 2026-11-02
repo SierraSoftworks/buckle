@@ -3,6 +3,7 @@
 //! shows, what a plan asks an approver to accept. None of it touches the DOM,
 //! so all of it is tested with a plain `cargo test` on the host target.
 
+pub mod blueprint;
 pub mod diff;
 pub mod filter;
 pub mod fleet;
