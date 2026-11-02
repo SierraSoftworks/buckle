@@ -452,6 +452,42 @@ impl crate::health::HealthCheck for SecretHeaderCheck {
 
 crate::register_health!(SecretHeaderCheck);
 
+/// A buggy kind whose `plan` writes `path` (a validator scratch file when it
+/// is under the temp dir, a real change otherwise).
+struct TestImpure;
+
+#[async_trait]
+impl Task for TestImpure {
+    type Spec = FileSpec;
+    const KIND: &'static str = "test.impure";
+
+    fn key(spec: &FileSpec) -> String {
+        spec.path.clone()
+    }
+
+    async fn plan(&self, cx: &Cx, spec: &FileSpec) -> crate::Result<Planned> {
+        cx.system
+            .write_atomic(
+                Path::new(&spec.path),
+                b"written while planning",
+                &FilePerms::default(),
+            )
+            .await?;
+        Ok(Planned::NoOp)
+    }
+
+    async fn apply(
+        &self,
+        _cx: &Cx,
+        _spec: &FileSpec,
+        _planned: &Planned,
+    ) -> crate::Result<Applied> {
+        Ok(Applied::unchanged("nothing"))
+    }
+}
+
+crate::register_task!(TestImpure);
+
 /// A systemd-shaped handler kind: `name` is the unit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 struct UnitSpec {
@@ -3152,6 +3188,38 @@ async fn health_check_fields_marked_secret_keep_their_template_for_the_check() {
         .await
         .unwrap();
     assert!(report.results[0].status.is_pass(), "{report:#?}");
+}
+
+#[tokio::test]
+async fn a_task_that_writes_while_planning_fails_loudly_and_changes_nothing() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module("name: bad\ntasks: [ { test.impure: { path: /etc/impure } } ]\n"),
+            module(
+                "name: scratch\ntasks: [ { test.impure: { path: /tmp/buckle-validate/conf } } ]\n",
+            ),
+            module("name: state\ntasks: [ { test.impure: { path: /var/lib/buckle/tmp/x } } ]\n"),
+        ],
+    );
+    let sys = FakeSystem::new();
+    let inputs = inputs(rev, &sys).with_scratch_dir("/var/lib/buckle/tmp");
+    let plan = plan(&inputs).await;
+    let bad = indeterminate(&plan, "bad");
+    assert!(bad.plan_error);
+    assert!(
+        bad.reason.contains("must not change the host"),
+        "{}",
+        bad.reason
+    );
+    assert!(!sys.exists("/etc/impure"));
+    assert_eq!(
+        module_names(&plan),
+        vec!["scratch", "state"],
+        "scratch writes are allowed"
+    );
+    assert!(sys.exists("/tmp/buckle-validate/conf"));
 }
 
 // ---------------------------------------------------------------------------

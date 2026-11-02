@@ -117,6 +117,10 @@ pub struct Inputs {
     /// [`Plan::held`] and left alone. Set it on the inputs of both the plan
     /// and the apply (the apply re-plans and compares digests).
     pub drift: bool,
+    /// Directories planning may write to besides the system's temp dir (the
+    /// agent passes `<state_dir>/tmp`). Any other mutation while planning is
+    /// refused (see [`crate::system::PlanGuard`]).
+    pub scratch_dirs: Vec<PathBuf>,
 }
 
 impl Inputs {
@@ -147,7 +151,14 @@ impl Inputs {
             facts_frozen: false,
             removals: true,
             drift: false,
+            scratch_dirs: Vec::new(),
         }
+    }
+
+    /// A directory planning may write to (e.g. `<state_dir>/tmp`).
+    pub fn with_scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch_dirs.push(dir.into());
+        self
     }
 
     /// Drift mode; see [`Inputs::drift`].

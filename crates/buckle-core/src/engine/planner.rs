@@ -214,6 +214,9 @@ pub(super) struct Planner<'a> {
     pub revision: &'a Revision,
     pub host: HostIdentity,
     pub system: Arc<dyn System>,
+    /// `system` behind a [`crate::system::PlanGuard`], for everything that
+    /// runs in plan mode.
+    pub plan_system: Arc<dyn System>,
     pub secrets: Arc<SecretStore>,
     pub select: Option<&'a crate::Filter>,
     pub waived: Arc<Vec<String>>,
@@ -239,6 +242,7 @@ impl<'a> Planner<'a> {
         Ok(Self {
             revision,
             host,
+            plan_system: Arc::new(crate::system::PlanGuard::new(system.clone(), [])),
             system,
             secrets,
             select,
@@ -264,6 +268,10 @@ impl<'a> Planner<'a> {
             &inputs.agent_vars,
         )?;
         planner.drift = inputs.drift;
+        planner.plan_system = Arc::new(crate::system::PlanGuard::new(
+            inputs.system.clone(),
+            inputs.scratch_dirs.clone(),
+        ));
         Ok(planner)
     }
 
@@ -321,7 +329,10 @@ impl<'a> Planner<'a> {
     pub fn cx(&self, module: &str, source: Arc<dyn Source>, host: HostContext, mode: Mode) -> Cx {
         Cx {
             mode,
-            system: self.system.clone(),
+            system: match mode {
+                Mode::Plan => self.plan_system.clone(),
+                Mode::Apply => self.system.clone(),
+            },
             host: Arc::new(host),
             templater: self.templater.clone(),
             source,

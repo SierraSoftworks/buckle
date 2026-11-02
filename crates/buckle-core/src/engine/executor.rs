@@ -291,6 +291,7 @@ impl<'a> Executor<'a> {
         .await;
         let mut cx = rs.cx.clone();
         cx.mode = Mode::Apply;
+        cx.system = self.inputs.system.clone();
         cx.previous = self
             .with_state(|s| s.get(&step.resource).cloned())
             .map(Arc::new);
@@ -397,6 +398,7 @@ impl<'a> Executor<'a> {
         if rh.planned.is_change() {
             let mut cx = rh.cx.clone();
             cx.mode = Mode::Apply;
+            cx.system = self.inputs.system.clone();
             let locks: Vec<String> = rh.task.locks_for(&rh.spec);
             let result = async {
                 let _guards = self.locks.acquire(&locks).await;

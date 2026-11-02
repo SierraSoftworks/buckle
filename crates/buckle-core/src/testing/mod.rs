@@ -582,6 +582,10 @@ impl System for FakeSystem {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         self.inner.lock().unwrap().now
     }
+
+    fn temp_dir(&self) -> PathBuf {
+        PathBuf::from("/tmp")
+    }
 }
 
 /// An in-memory module source: relative path → bytes.

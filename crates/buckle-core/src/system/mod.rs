@@ -5,8 +5,10 @@
 //! [`crate::testing::FakeSystem`], which is why the task library's unit tests
 //! are hermetic and fast.
 
+mod guard;
 mod real;
 
+pub use guard::PlanGuard;
 pub use real::{HttpClient, RealSystem};
 
 use crate::Platform;
@@ -396,6 +398,12 @@ pub trait System: Send + Sync {
     /// Wall-clock now, so tests can control time.
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
+    }
+
+    /// A directory for scratch files (validator inputs, downloads being
+    /// checked). Planning may write here; nowhere else.
+    fn temp_dir(&self) -> PathBuf {
+        std::env::temp_dir()
     }
 }
 
