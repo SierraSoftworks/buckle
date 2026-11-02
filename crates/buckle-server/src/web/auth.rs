@@ -429,15 +429,34 @@ fn unverified_expiry(token: &str) -> Option<i64> {
         .as_i64()
 }
 
-/// A fixed-window limiter per client address for the sign-in endpoints.
+/// A fixed-window limiter per client for the sign-in endpoints.
+///
+/// IPv4 clients are counted per address. IPv6 clients are counted per /64:
+/// a single host is routinely handed a whole /64 and can pick a fresh
+/// address for every request, so the address alone limits nothing. An
+/// IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counts as its IPv4 address.
 pub struct RateLimiter {
     limit: u32,
     window: Duration,
     inner: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
+/// The bucket a client address is counted in: the address itself for IPv4,
+/// its /64 prefix for IPv6.
+fn client_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(std::net::Ipv6Addr::from_bits(
+                v6.to_bits() & !((1u128 << 64) - 1),
+            )),
+        },
+    }
+}
+
 impl RateLimiter {
-    /// `limit` requests per `window` per address.
+    /// `limit` requests per `window` per client.
     pub fn new(limit: u32, window: Duration) -> Self {
         Self {
             limit,
@@ -446,17 +465,22 @@ impl RateLimiter {
         }
     }
 
-    /// Counts a request; `false` when over the limit.
+    /// Counts a request; `false` when over the limit. A poisoned lock (a
+    /// panic while counting) refuses rather than waving everyone through:
+    /// the sign-in endpoints are what this protects.
     pub fn allow(&self, ip: Option<IpAddr>) -> bool {
         let Some(ip) = ip else { return true };
         let Ok(mut m) = self.inner.lock() else {
-            return true;
+            tracing::error!(
+                "the sign-in rate limiter's lock is poisoned; refusing sign-in requests"
+            );
+            return false;
         };
         let now = Instant::now();
         if m.len() > 10_000 {
             m.retain(|_, (start, _)| now.duration_since(*start) < self.window);
         }
-        let entry = m.entry(ip).or_insert((now, 0));
+        let entry = m.entry(client_key(ip)).or_insert((now, 0));
         if now.duration_since(entry.0) >= self.window {
             *entry = (now, 0);
         }
@@ -619,6 +643,49 @@ mod tests {
         assert!(rl.allow(Some(a)) && rl.allow(Some(a)));
         assert!(!rl.allow(Some(a)));
         assert!(rl.allow(Some(b)));
+    }
+
+    #[rstest]
+    #[case("2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ffff", true)]
+    #[case("2001:db8:1:2::1", "2001:db8:1:2:abcd::9", true)]
+    #[case("2001:db8:1:2::1", "2001:db8:1:3::1", false)]
+    #[case("::ffff:10.0.0.1", "10.0.0.1", true)]
+    #[case("::ffff:10.0.0.1", "10.0.0.2", false)]
+    fn ipv6_clients_share_a_budget_per_64(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] shared: bool,
+    ) {
+        let rl = RateLimiter::new(2, Duration::from_secs(60));
+        let first: IpAddr = first.parse().unwrap();
+        let second: IpAddr = second.parse().unwrap();
+        assert!(rl.allow(Some(first)) && rl.allow(Some(first)));
+        assert!(!rl.allow(Some(first)));
+        assert_eq!(
+            rl.allow(Some(second)),
+            !shared,
+            "{second} shares {first}'s budget: {shared}"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_rate_limiter_fails_closed() {
+        let rl = RateLimiter::new(100, Duration::from_secs(60));
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(rl.allow(Some(a)));
+        std::thread::scope(|s| {
+            let poisoner = s.spawn(|| {
+                let _guard = rl.inner.lock().unwrap();
+                panic!("a bug while counting");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(rl.inner.is_poisoned());
+        assert!(!rl.allow(Some(a)), "refused rather than unlimited");
+        assert!(
+            !rl.allow(Some("10.0.0.2".parse().unwrap())),
+            "every client is refused"
+        );
     }
 
     #[test]
