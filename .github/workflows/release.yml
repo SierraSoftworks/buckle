@@ -210,7 +210,7 @@ jobs:
       # Pushed by digest only: tags are added by docker-publish once the
       # release is published.
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
