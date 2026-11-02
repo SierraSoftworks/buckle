@@ -31,14 +31,6 @@ pub fn error_view(report: &ErrorReport) -> ErrorView {
     }
 }
 
-/// The structured run error of a stored `ApplyResult` view (a rollout host
-/// row's `result`), else the first failed module's.
-pub fn result_error(result: Option<&serde_json::Value>) -> Option<ErrorView> {
-    let outcome = result?.get("outcome")?;
-    let outcome: ApplyOutcome = serde_json::from_value(outcome.clone()).ok()?;
-    outcome_error(&outcome)
-}
-
 /// The error a reader should see first for an outcome: the run-level one,
 /// else the first failing module's.
 pub fn outcome_error(outcome: &ApplyOutcome) -> Option<ErrorView> {

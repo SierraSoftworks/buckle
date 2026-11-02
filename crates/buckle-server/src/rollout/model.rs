@@ -263,6 +263,10 @@ pub struct HostRuntime {
     pub waived_checks: Vec<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The last failed apply's error, structured (from the agent's
+    /// ApplyResult), stored once when the result arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<buckle_api::ErrorView>,
     /// Apply was sent (the host may be on the new revision).
     #[serde(default)]
     pub applied: bool,

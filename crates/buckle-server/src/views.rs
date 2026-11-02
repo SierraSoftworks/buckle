@@ -3,8 +3,8 @@
 mod report;
 
 pub use report::{
-    error_view, event_key, finished_progress, outcome_error, pending_report, progress,
-    result_error, run_report, run_state,
+    error_view, event_key, finished_progress, outcome_error, pending_report, progress, run_report,
+    run_state,
 };
 
 use crate::source::cache::RevisionCache;
