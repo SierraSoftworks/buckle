@@ -1485,3 +1485,97 @@ async fn blocked_steps_fail_the_host_as_needing_attention_without_a_rollback() {
         "nothing rolled back"
     );
 }
+
+// ------------------------------------------------------------ review fixes
+
+/// After a restart nobody is connected yet: hosts still to plan or apply
+/// must not be taken for offline (missed) while their agents reconnect, or
+/// the phase completes and the revision is promoted unapproved.
+#[tokio::test(start_paused = true)]
+async fn a_restart_while_awaiting_approval_keeps_awaiting_it() {
+    let mut h = Harness::new().await;
+    h.revision("r1", TWO_PHASES).await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.connect("c1", None);
+    h.connect("w1", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "awaiting approval with plans", |r, hs| {
+        r.state == RolloutState::AwaitingApproval && hs.iter().all(|x| x.plan_digest.is_some())
+    })
+    .await;
+
+    h.restart().await;
+    // Inside the disconnect timeout nothing is missed or promoted.
+    h.idle(120).await;
+    let (r, hosts) = h.snapshot(&id).await;
+    assert_eq!(r.state, RolloutState::AwaitingApproval, "{:?}", r.runtime);
+    assert!(
+        hosts.iter().all(|x| x.state == HostPhase::Planned),
+        "{:?}",
+        hosts.iter().map(|x| (&x.host, x.state)).collect::<Vec<_>>()
+    );
+    assert!(h.applies().is_empty());
+    let stable = h
+        .store
+        .call(|db| db.kv().get("stable_revision"))
+        .await
+        .unwrap();
+    assert_eq!(stable, None, "nothing was promoted");
+
+    h.connect("c1", None);
+    h.connect("w1", None);
+    h.idle(5).await;
+    let (r, _) = h.snapshot(&id).await;
+    assert_eq!(r.state, RolloutState::AwaitingApproval);
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "canary".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+}
+
+/// A host that does not come back within the disconnect timeout after a
+/// restart misses its phase as an offline host would.
+#[tokio::test(start_paused = true)]
+async fn a_host_that_stays_away_after_a_restart_misses_its_phase() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.enrol("b", "web").await;
+    h.connect("a", None);
+    h.connect("b", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "plans in", |r, hs| {
+        r.state == RolloutState::AwaitingApproval && hs.iter().all(|x| x.plan_digest.is_some())
+    })
+    .await;
+    h.restart().await;
+    h.connect("a", None);
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "web".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "a healthy", |_, hs| {
+        host(hs, "a").state == HostPhase::Healthy
+    })
+    .await;
+    let (r, hosts) = h.snapshot(&id).await;
+    assert!(r.is_running(), "b's grace holds the phase open");
+    assert_eq!(host(&hosts, "b").state, HostPhase::Planned);
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "b").phase, STRAGGLERS, "b missed its phase");
+}

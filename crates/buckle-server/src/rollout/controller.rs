@@ -393,6 +393,16 @@ fn is_failure(r: &pb::HealthResult, waived: &[String]) -> bool {
     r.required && !r.passed && !r.unknown && !waived.contains(&check_name(r))
 }
 
+/// Host states that wait on the agent after a server restart: the
+/// disconnect clock starts for them on load.
+fn awaits_reconnect(state: HostPhase) -> bool {
+    state.in_flight()
+        || matches!(
+            state,
+            HostPhase::RollingBack | HostPhase::PlanPending | HostPhase::Planned
+        )
+}
+
 fn traceparent_of(span: &Span) -> Option<String> {
     use tracing_batteries::prelude::{OpenTelemetrySpanExt, get_text_map_propagator};
     let cx = span.context();
@@ -453,12 +463,12 @@ impl Controller {
                 }
             };
             // Every session is gone after a restart: start the disconnect clock
-            // for hosts that are waiting on an agent.
+            // for hosts that are waiting on an agent, and for hosts still to
+            // plan or apply, so they are not taken for offline (and missed)
+            // before their agents had a chance to reconnect.
             let mut dirty_hosts = BTreeSet::new();
             for (i, h) in hosts.iter_mut().enumerate() {
-                if (h.state.in_flight() || h.state == HostPhase::RollingBack)
-                    && h.runtime.disconnected_at.is_none()
-                {
+                if awaits_reconnect(h.state) && h.runtime.disconnected_at.is_none() {
                     h.runtime.disconnected_at = Some(now);
                     dirty_hosts.insert(i);
                 }
@@ -532,6 +542,15 @@ impl Controller {
 
     fn eligible(&self, host: &str) -> bool {
         self.connected(host) && !self.excluded.contains(host)
+    }
+
+    /// Whether a host still to plan or apply counts as missing its phase:
+    /// excluded, or disconnected and not inside a reconnect grace (after a
+    /// restart every host is disconnected until its agent comes back; the
+    /// disconnect clock started by [`Controller::load`] bounds the wait).
+    fn offline_for_phase(&self, h: &RolloutHostRecord) -> bool {
+        self.excluded.contains(&h.host)
+            || (!self.connected(&h.host) && h.runtime.disconnected_at.is_none())
     }
 
     /// Whether host `hi` may be sent an Apply (or a baseline check leading
@@ -2372,7 +2391,7 @@ impl Controller {
                 let h = &self.live[ri].hosts[i];
                 h.state.finished()
                     || (matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
-                        && !self.eligible(&h.host))
+                        && self.offline_for_phase(h))
             });
             if !done {
                 return changed;
