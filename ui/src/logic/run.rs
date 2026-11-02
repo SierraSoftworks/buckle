@@ -213,13 +213,31 @@ pub fn current_step(m: &ModuleReport) -> Option<&StepReport> {
 }
 
 /// The step's key without its kind, since the kind is shown beside it:
-/// `file.template[/etc/x]` → `/etc/x`. An id of another shape is kept whole.
+/// `file.template[/etc/x]` → `/etc/x`, and a removal's resource without
+/// its module too: `nomad/file.copy[/etc/x]` → `/etc/x`. An id of another
+/// shape is kept whole.
 pub fn step_key<'a>(kind: &str, id: &'a str) -> &'a str {
-    id.strip_prefix(kind)
-        .and_then(|rest| rest.strip_prefix('['))
-        .and_then(|rest| rest.strip_suffix(']'))
-        .filter(|key| !key.is_empty())
+    let bare = |id: &'a str| {
+        id.strip_prefix(kind)
+            .and_then(|rest| rest.strip_prefix('['))
+            .and_then(|rest| rest.strip_suffix(']'))
+            .filter(|key| !key.is_empty())
+    };
+    bare(id)
+        .or_else(|| {
+            id.split_once('/')
+                .filter(|(module, _)| !module.contains('['))
+                .and_then(|(_, rest)| bare(rest))
+        })
         .unwrap_or(id)
+}
+
+/// The module of a removal's resource (`nomad/file.copy[/etc/x]` → `nomad`).
+pub fn resource_module(resource: &str) -> Option<&str> {
+    resource
+        .split_once('/')
+        .map(|(module, _)| module)
+        .filter(|module| !module.is_empty() && !module.contains('['))
 }
 
 /// How long something took, or has been running so far: the reported
@@ -812,6 +830,22 @@ pub(crate) mod tests {
         assert_eq!(step_key("apt.package", "apt.package[ufw, jq]"), "ufw, jq");
         assert_eq!(step_key("file.copy", "restart"), "restart");
         assert_eq!(step_key("file.copy", "file.copy[]"), "file.copy[]");
+        // A removal's resource names its module first.
+        assert_eq!(
+            step_key("file.copy", "nomad/file.copy[/etc/nomad.d/client.hcl]"),
+            "/etc/nomad.d/client.hcl"
+        );
+        assert_eq!(
+            resource_module("nomad/file.copy[/etc/nomad.d/client.hcl]"),
+            Some("nomad")
+        );
+        // A key with slashes is not mistaken for a module.
+        assert_eq!(step_key("file.copy", "file.copy[/etc/a/b]"), "/etc/a/b");
+        assert_eq!(resource_module("file.copy[/etc/a/b]"), None);
+        assert_eq!(
+            step_key("file.copy", "other/apt.package[x]"),
+            "other/apt.package[x]"
+        );
     }
 
     #[test]
