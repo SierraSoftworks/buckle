@@ -210,6 +210,8 @@ mod tests {
         assert!(facts.tree["systemd"].is_null());
         assert_eq!(facts.tree["os"]["id"], "ubuntu");
         assert!(errors.iter().any(|e| e.provider == "systemd"), "{errors:?}");
-        assert!(facts.collected_at.contains_key("systemd"));
+        // A failed provider keeps its last value (none here), is marked
+        // stale and is retried on the next collection (buckle-core facts).
+        assert!(facts.stale.contains("systemd"));
     }
 }
