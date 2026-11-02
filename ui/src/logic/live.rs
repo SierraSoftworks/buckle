@@ -444,6 +444,7 @@ mod tests {
                 phase("stragglers", vec![]),
             ],
             plans: vec![],
+            fleet: None,
             events: vec![],
         };
         apply_rollout(
@@ -497,6 +498,7 @@ mod tests {
             summary: summary("42", RolloutState::Rolling),
             phases: vec![],
             plans: vec![],
+            fleet: None,
             events: vec![started.clone()],
         };
         let live = |rollout: &str, event: &buckle_api::RolloutEvent| LiveEvent::RolloutTimeline {

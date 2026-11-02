@@ -419,6 +419,7 @@ mod tests {
                 health_checks: vec![],
             }],
             plans: vec![],
+            fleet: None,
             events: vec![],
         };
 

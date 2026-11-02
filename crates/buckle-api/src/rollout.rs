@@ -1,4 +1,4 @@
-use crate::{HostSummary, PlanView, RevisionSummary};
+use crate::{FleetPlan, HostSummary, PlanView, RevisionSummary};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -146,6 +146,11 @@ pub struct RolloutDetail {
     pub phases: Vec<RolloutPhase>,
     /// Distinct plans across hosts, for review.
     pub plans: Vec<PlanGroup>,
+    /// Every host's plan of the rollout's revision as one union, each change
+    /// marked with the hosts it applies to (see [`FleetPlan`]). `None` from
+    /// servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<FleetPlan>,
     /// The timeline, oldest first (the newest 200 entries); later entries
     /// arrive as [`LiveEvent::RolloutTimeline`].
     pub events: Vec<RolloutEvent>,

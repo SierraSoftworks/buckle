@@ -979,8 +979,49 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
             .filter(|h| h.plan_digest.as_deref() == Some(g.digest.as_str()))
             .find_map(|h| crate::views::stored_plan_view(h.plan.as_ref()));
     }
+    detail.fleet = Some(fleet_plan(state, &r.revision, &hosts).await?);
     fill_health_checks(state, &r.revision, &hosts, &mut detail).await?;
     Ok(detail)
+}
+
+/// The union of the hosts' plans of `revision`, with each host's latest
+/// facts and labels for fact placeholders. Plans of another revision (the
+/// stragglers stage plans the stable one) count as unplanned.
+async fn fleet_plan(
+    state: &AppState,
+    revision: &str,
+    hosts: &[crate::store::RolloutHostRecord],
+) -> Result<buckle_api::FleetPlan, ApiError> {
+    let ids: Vec<String> = hosts.iter().map(|h| h.host.clone()).collect();
+    let contexts = state
+        .store
+        .call(move |db| {
+            let mut out = HashMap::new();
+            for id in ids {
+                let facts = db.hosts().latest_facts(&id)?.map(|(f, _)| f);
+                let labels = db.hosts().get(&id)?.map(|h| h.effective_labels());
+                out.insert(
+                    id.clone(),
+                    serde_json::json!({
+                        "id": id,
+                        "labels": labels.unwrap_or_default(),
+                        "facts": facts.unwrap_or(serde_json::Value::Null),
+                    }),
+                );
+            }
+            Ok(out)
+        })
+        .await?;
+    let input: Vec<buckle_api::FleetHost> = hosts
+        .iter()
+        .map(|h| buckle_api::FleetHost {
+            host: h.host.clone(),
+            plan: crate::views::stored_plan_view(h.plan.as_ref())
+                .filter(|p| p.revision.is_empty() || p.revision == revision),
+            context: contexts.get(&h.host).cloned().unwrap_or_default(),
+        })
+        .collect();
+    Ok(buckle_api::FleetPlan::build(&input))
 }
 
 /// Fills each phase's health gate: the required checks of the modules its

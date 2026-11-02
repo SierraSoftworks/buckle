@@ -598,6 +598,7 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
         },
         phases,
         plans: plans(),
+        fleet: None,
         events,
     }
 }
@@ -1313,6 +1314,7 @@ fn finished(
             trace_url: Some(trace_url(&fake_trace(id.parse().unwrap_or(0)))),
         },
         phases,
+        fleet: None,
         plans: vec![PlanGroup {
             digest: PLAN_NOMAD.into(),
             hosts: vec!["pi-1".into()],
