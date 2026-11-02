@@ -254,8 +254,8 @@ impl FleetPlan {
     }
 
     /// The plan as far as it concerns `keep` (a phase's hosts): other hosts
-    /// left out, and whatever only they had dropped. Tokens and exemplars
-    /// stay as built for the whole fleet.
+    /// left out, and whatever only they had dropped. Tokens stay as built
+    /// for the whole fleet; exemplars are drawn from the kept hosts.
     pub fn restrict(&self, keep: &[String]) -> FleetPlan {
         let hosts = |h: &[String]| -> Vec<String> {
             h.iter().filter(|h| keep.contains(h)).cloned().collect()
@@ -303,7 +303,17 @@ impl FleetPlan {
             indeterminate: shared(&self.indeterminate, &hosts),
             skipped: shared(&self.skipped, &hosts),
             warnings: shared(&self.warnings, &hosts),
-            facts: self.facts.clone(),
+            facts: self
+                .facts
+                .iter()
+                .map(|f| {
+                    let kept = self.hosts.iter().filter(|h| keep.contains(h));
+                    exemplars(
+                        &f.path,
+                        kept.filter_map(|h| f.values.get(h).map(|v| (h.as_str(), v.as_str()))),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -392,15 +402,22 @@ fn flatten(path: &str, value: &serde_json::Value, out: &mut Vec<(String, String)
 }
 
 fn samples(path: &str, hosts: &[FleetHost], leaves: &[Vec<(String, String)>]) -> FactSamples {
-    let mut all: Vec<FactSample> = Vec::new();
-    for (h, l) in hosts.iter().zip(leaves) {
-        if let Some((_, v)) = l.iter().find(|(p, _)| p == path) {
-            all.push(FactSample {
-                host: h.host.clone(),
-                value: v.clone(),
-            });
-        }
-    }
+    let all = hosts.iter().zip(leaves).filter_map(|(h, l)| {
+        l.iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, v)| (h.host.as_str(), v.as_str()))
+    });
+    exemplars(path, all)
+}
+
+/// Exemplars of `path` from `(host, value)` pairs, in host order.
+fn exemplars<'a>(path: &str, all: impl Iterator<Item = (&'a str, &'a str)>) -> FactSamples {
+    let all: Vec<FactSample> = all
+        .map(|(host, value)| FactSample {
+            host: host.to_owned(),
+            value: value.to_owned(),
+        })
+        .collect();
     let values = all
         .iter()
         .map(|s| (s.host.clone(), s.value.clone()))
@@ -633,6 +650,12 @@ mod tests {
             Some(conf("prophet", "10.0.0.2").as_str())
         );
         assert_eq!(plan.render("nobody", &step.key), step.key);
+
+        // A phase's exemplars come from its own hosts.
+        let phase = plan.restrict(&["prophet".to_owned()]);
+        let id = phase.fact("host.id").unwrap();
+        assert_eq!(id.samples.len(), 1);
+        assert_eq!(id.samples[0].host, "prophet");
     }
 
     #[test]
