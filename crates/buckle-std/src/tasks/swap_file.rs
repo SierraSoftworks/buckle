@@ -58,6 +58,8 @@ const PROC_SWAPPINESS: &str = "/proc/sys/vm/swappiness";
 const SYSCTL_FILE: &str = "/etc/sysctl.d/99-buckle-swap.conf";
 const SYSCTL_MARKER: &str = "swap.file sysctl";
 const MIB: u64 = 1024 * 1024;
+/// The largest page size Linux uses (arm64 with 64 KiB pages), in KiB.
+const MAX_PAGE_KIB: u64 = 64;
 
 fn fstab_line(spec: &Spec) -> String {
     format!("{} none swap sw 0 0", spec.path.display())
@@ -75,7 +77,11 @@ struct Observed {
 impl Observed {
     fn size_ok(&self, spec: &Spec) -> bool {
         match self.active_kib {
-            Some(kib) => kib == spec.size_mb * 1024,
+            // /proc/swaps leaves out the page mkswap keeps for its header, so
+            // a 1024 MiB file reads 1048572 KiB on 4 KiB pages.
+            Some(kib) => (spec.size_mb * 1024)
+                .checked_sub(kib)
+                .is_some_and(|header| header <= MAX_PAGE_KIB),
             None => self.file_size == Some(spec.size_mb * MIB),
         }
     }
@@ -513,7 +519,11 @@ mod tests {
         let h = sys.clone();
         let swapon = move |cmd: &Command| {
             let path = cmd.args.last().unwrap();
-            let size_kib = h.file(path).map(|b| b.len() / 1024).unwrap_or(0);
+            // Like the kernel, leave out the header page.
+            let size_kib = h
+                .file(path)
+                .map(|b| (b.len() / 1024).saturating_sub(4))
+                .unwrap_or(0);
             let current = h.file_string(PROC_SWAPS).unwrap_or_default();
             let _ = h.clone().with_file(
                 PROC_SWAPS,
@@ -592,6 +602,34 @@ mod tests {
         assert_eq!(
             plan_class(&SwapFile, &cx(&sys), &s(json!({}))).await,
             Class::NoOp
+        );
+    }
+
+    /// `s(json!({}))` asks for 1 MiB (1024 KiB); /proc/swaps reports the file
+    /// minus mkswap's header page.
+    #[rstest]
+    #[case::header_on_4k_pages(1020, Class::NoOp)]
+    #[case::header_on_64k_pages(960, Class::NoOp)]
+    #[case::exact(1024, Class::NoOp)]
+    #[case::smaller_than_a_header(956, Class::Change)]
+    #[case::larger(2044, Class::Change)]
+    #[tokio::test]
+    async fn active_size_allows_for_the_swap_header(#[case] kib: u64, #[case] expected: Class) {
+        let sys = host()
+            .with_file("/swapfile", swap_header(1), FilePerms::mode(0o600))
+            .with_file(
+                PROC_SWAPS,
+                format!("{HEADER}/swapfile\tfile\t{kib}\t0\t-2\n"),
+                FilePerms::default(),
+            )
+            .with_file(
+                "/etc/fstab",
+                "/swapfile none swap sw 0 0\n",
+                FilePerms::mode(0o644),
+            );
+        assert_eq!(
+            plan_class(&SwapFile, &cx(&sys), &s(json!({}))).await,
+            expected
         );
     }
 
