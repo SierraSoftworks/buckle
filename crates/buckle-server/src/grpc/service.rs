@@ -570,6 +570,7 @@ impl FleetService {
                         db.runs().add(&run)?;
                         if let Some(a) = applied {
                             db.hosts().set_applied_revision(&run.host, &a)?;
+                            db.drift().clear(&run.host)?;
                         }
                         Ok(())
                     })
@@ -623,8 +624,9 @@ impl FleetService {
             agent_message::Msg::Drift(d) => {
                 let drifted =
                     !d.plan_digest.is_empty() && (d.changes + d.removals) > 0 && !d.corrected;
+                let plan = d.plan_json.clone();
                 self.store
-                    .call(move |db| db.hosts().set_drifted(&h, drifted))
+                    .call(move |db| db.drift().record(&h, drifted, &plan, now))
                     .await
             }
             agent_message::Msg::Rollback(lr) => {

@@ -382,10 +382,13 @@ impl<'c> Hosts<'c> {
         Ok(())
     }
 
-    /// Forgets the host and its facts.
+    /// Forgets the host, its facts and its drift.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.conn
             .execute("DELETE FROM host_facts WHERE host_id = ?1", params![id])
+            .map_err(db_error)?;
+        self.conn
+            .execute("DELETE FROM host_drift WHERE host_id = ?1", params![id])
             .map_err(db_error)?;
         let n = self
             .conn

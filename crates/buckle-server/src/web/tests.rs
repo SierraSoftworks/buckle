@@ -1242,3 +1242,44 @@ async fn without_a_template_trace_ids_stay_text() {
     assert_eq!(detail.summary.trace_id.as_deref(), Some("00af7651"));
     assert_eq!(detail.summary.trace_url, None);
 }
+
+// ------------------------------------------------------------ drift
+
+#[actix_web::test]
+async fn a_host_serves_the_drift_its_last_report_found() {
+    let e = env(WebConfig::default()).await;
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    let plan = serde_json::to_vec(&crate::store::drift::tests::drift_plan(true)).unwrap();
+    e.store
+        .call(move |db| db.drift().record("pi-1", true, &plan, chrono::Utc::now()))
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let get = || {
+        test::TestRequest::get()
+            .uri("/api/v1/hosts/pi-1")
+            .to_request()
+    };
+    let host: buckle_api::HostDetail =
+        test::read_body_json(test::call_service(&app, get()).await).await;
+    assert!(host.summary.drifted);
+    let keys: Vec<&str> = host.drift.iter().map(|d| d.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["/etc/app.conf", "vm.swappiness", "/etc/grey"],
+        "by module (app, common, grey), kind and key"
+    );
+    assert!(host.drift.iter().all(|d| d.detected_at.is_some()));
+    assert!(
+        host.drift[0]
+            .unified
+            .as_deref()
+            .is_some_and(|u| u.contains("+managed"))
+    );
+
+    e.store.call(|db| db.drift().clear("pi-1")).await.unwrap();
+    let host: buckle_api::HostDetail =
+        test::read_body_json(test::call_service(&app, get()).await).await;
+    assert!(!host.summary.drifted);
+    assert!(host.drift.is_empty());
+}

@@ -524,7 +524,7 @@ fn health_dto(h: crate::store::HealthEventRecord) -> HealthResultDto {
 async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
     let id = path.into_inner();
     let summary = summary_or_404(&state, &id).await?;
-    let (facts, row, runs, health) = state
+    let (facts, row, runs, health, drift) = state
         .store
         .call(move |db| {
             Ok((
@@ -532,6 +532,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
                 db.rollouts().latest_healthy_for_host(&id)?,
                 db.runs().for_host(&id, 20)?,
                 db.health().for_host(&id, 100)?,
+                db.drift().for_host(&id)?,
             ))
         })
         .await?;
@@ -543,8 +544,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
             .unwrap_or(serde_json::Value::Null),
         facts_at: facts.map(|(_, at)| at),
         resources: resources(row),
-        // Drift diffs are not persisted per item yet; the UI tolerates an empty list.
-        drift: Vec::new(),
+        drift,
         recent_runs: runs.into_iter().map(|r| run_dto(&state, r)).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
     }))

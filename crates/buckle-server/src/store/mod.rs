@@ -8,6 +8,7 @@
 
 mod approvals;
 mod audit;
+pub mod drift;
 mod health;
 mod hosts;
 pub mod kv;
@@ -17,6 +18,7 @@ mod runs;
 
 pub use approvals::{ApprovalRecord, Approvals};
 pub use audit::{Audit, AuditFilter, NewAudit};
+pub use drift::Drift;
 pub use health::{HealthEventRecord, HealthEvents};
 pub use hosts::{HostRecord, Hosts, NewHost};
 pub use kv::Kv;
@@ -183,6 +185,19 @@ CREATE TABLE apply_events (
     PRIMARY KEY (host, plan_digest, step)
 );
 "#,
+    // 2: what the latest drift pass found, per resource.
+    r#"
+CREATE TABLE host_drift (
+    host_id TEXT NOT NULL,
+    module TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    unified TEXT,
+    detected_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, module, kind, key)
+);
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.
@@ -251,6 +266,11 @@ impl<'c> Db<'c> {
     /// Apply runs per host.
     pub fn runs(&self) -> Runs<'c> {
         Runs::new(self.conn)
+    }
+
+    /// What drift passes found per host.
+    pub fn drift(&self) -> Drift<'c> {
+        Drift::new(self.conn)
     }
 }
 
