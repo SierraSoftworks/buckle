@@ -4201,3 +4201,42 @@ async fn plan_errors_carry_structured_detail_outside_the_digest() {
     }
     assert_eq!(without.compute_digest(), plan.digest);
 }
+
+#[tokio::test]
+async fn a_handler_whose_owner_never_started_is_reported_as_run_under_its_owner() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: common\ntasks:\n  - test.file: { path: /lo/common, run: lo1 }\n    notify: [nomad:restart]\n",
+            ),
+            module(
+                "name: breaker\nneeds: [common]\ntasks: [ { test.file: { path: /lo/b, run: lo1, fail_times: 9 } } ]\n",
+            ),
+            module(
+                "name: nomad\nneeds: [common, breaker]\ntasks:\n  - test.file: { path: /lo/nomad, run: lo1 }\n    notify: [restart]\nhandlers:\n  restart: { systemd.restart: { name: nomad, run: lo1 } }\n",
+            ),
+        ],
+    );
+    let (outcome, _) = apply(&inputs(rev, &FakeSystem::new()).with_parallelism(1)).await;
+    assert_eq!(status_of(&outcome, "nomad"), ModuleStatus::NotStarted);
+    assert!(
+        handler_calls("lo1").contains(&"handler nomad:systemd.restart nomad".to_string()),
+        "the notified handler ran"
+    );
+    let nomad = module_outcome(&outcome, "nomad");
+    assert_eq!(
+        nomad
+            .handlers
+            .iter()
+            .map(|h| (h.id.as_str(), h.state))
+            .collect::<Vec<_>>(),
+        vec![("nomad:restart", StepState::Changed)],
+        "{nomad:#?}"
+    );
+    assert_eq!(
+        step_states(nomad),
+        vec![("test.file[/lo/nomad]", StepState::NotRun)]
+    );
+}

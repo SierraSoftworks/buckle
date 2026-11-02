@@ -764,6 +764,111 @@ async fn apply_events_open_a_run_that_the_result_completes() {
     assert_ne!(next_progress(&mut live).await.run_id, run_id);
 }
 
+fn module_started(digest: &str) -> AgentMessage {
+    apply_event(
+        digest,
+        buckle_core::engine::ApplyEvent::ModuleStarted { module: "m".into() },
+    )
+}
+
+fn result_for(digest: &str, report_id: u64) -> AgentMessage {
+    AgentMessage {
+        msg: Some(agent_message::Msg::Result(buckle_proto::v1::ApplyResult {
+            revision: "r1".into(),
+            plan_digest: digest.into(),
+            succeeded: true,
+            report_id,
+            ..Default::default()
+        })),
+    }
+}
+
+async fn run_of(s: &Server, id: &str) -> crate::store::RunRecord {
+    let id = id.to_owned();
+    s.store
+        .call(move |db| db.runs().get("pi-1", &id))
+        .await
+        .unwrap()
+        .expect("the run")
+}
+
+fn with_unreported(mut hello: AgentMessage, revisions: &[&str]) -> AgentMessage {
+    if let Some(agent_message::Msg::Hello(h)) = &mut hello.msg {
+        h.unreported_apply_revisions = revisions.iter().map(|r| r.to_string()).collect();
+    }
+    hello
+}
+
+#[tokio::test]
+async fn a_new_session_closes_a_run_it_does_not_report_and_a_reapply_gets_a_fresh_run() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let token = expect_welcome(reply).issued_token;
+    tx.send(module_started("d1")).await.unwrap();
+    let first = next_progress(&mut live).await.run_id;
+    drop((tx, stream));
+
+    // The agent restarted: its Hello names no unreported apply.
+    let (tx, _stream, reply) = open(s.addr, hello("pi-1", &token, "2.0.0")).await;
+    expect_welcome(reply);
+    let closed = next_progress(&mut live).await;
+    assert_eq!(closed.run_id, first);
+    assert_eq!(closed.run_state, buckle_api::RunState::Failed);
+    let abandoned = run_of(&s, &first).await;
+    assert_eq!(abandoned.outcome, "failed");
+    assert_eq!(abandoned.error.as_deref(), Some(crate::store::ABANDONED));
+
+    // Re-applying the same plan is a new run, not the first attempt's.
+    tx.send(module_started("d1")).await.unwrap();
+    let second = next_progress(&mut live).await.run_id;
+    assert_ne!(second, first);
+}
+
+#[tokio::test]
+async fn a_new_session_keeps_a_run_it_reports_as_still_running() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let token = expect_welcome(reply).issued_token;
+    tx.send(module_started("d1")).await.unwrap();
+    let first = next_progress(&mut live).await.run_id;
+    drop((tx, stream));
+    let (tx, _stream, reply) = open(
+        s.addr,
+        with_unreported(hello("pi-1", &token, "2.0.0"), &["r1"]),
+    )
+    .await;
+    expect_welcome(reply);
+    tx.send(module_started("d1")).await.unwrap();
+    assert_eq!(
+        next_progress(&mut live).await.run_id,
+        first,
+        "the same run goes on"
+    );
+    assert!(run_of(&s, &first).await.is_running());
+}
+
+#[tokio::test]
+async fn a_result_for_another_plan_closes_the_open_run_which_its_own_result_still_completes() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    tx.send(module_started("d1")).await.unwrap();
+    let open_run = next_progress(&mut live).await.run_id;
+    tx.send(result_for("d2", 1)).await.unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![1]);
+    let abandoned = run_of(&s, &open_run).await;
+    assert_eq!(abandoned.error.as_deref(), Some(crate::store::ABANDONED));
+    // Its own result, late, still completes it.
+    tx.send(result_for("d1", 2)).await.unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![2]);
+    let done = run_of(&s, &open_run).await;
+    assert_eq!(done.outcome, "succeeded");
+    assert_eq!(done.error, None);
+}
+
 #[tokio::test]
 async fn an_apply_result_larger_than_tonics_default_limit_is_accepted() {
     let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;

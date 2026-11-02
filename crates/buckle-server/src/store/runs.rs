@@ -14,8 +14,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 /// The outcome of a run that has not finished.
 pub const RUNNING: &str = "running";
 
-/// The error of a run another run superseded before its result arrived.
-pub const ABANDONED: &str = "the host started another apply before this run's result arrived";
+/// The error of a run whose result will not come: the host started another
+/// apply, reported another plan's result, or reconnected without it.
+pub const ABANDONED: &str = "the run stopped before its result arrived: the host moved on to another apply or reconnected without this one";
 
 /// One row of `runs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,8 +227,8 @@ impl<'c> Runs<'c> {
             .next())
     }
 
-    /// Closes an open run whose result never arrived because another run
-    /// started (its result may still arrive and complete it).
+    /// Closes an open run whose result will not come (it may still arrive
+    /// and complete it).
     pub fn abandon(&self, run_id: &str, at: DateTime<Utc>) -> Result<()> {
         self.conn
             .execute(
@@ -236,6 +237,26 @@ impl<'c> Runs<'c> {
             )
             .map_err(db_error)?;
         Ok(())
+    }
+
+    /// Abandons the host's open run unless its revision is one of
+    /// `unreported` (a new session's Hello lists the applies still running or
+    /// whose result is on its way; any other open run's result will not
+    /// come). Returns the run it closed.
+    pub fn abandon_unless_unreported(
+        &self,
+        host: &str,
+        unreported: &[String],
+        at: DateTime<Utc>,
+    ) -> Result<Option<RunRecord>> {
+        let Some(open) = self.open_for_host(host)? else {
+            return Ok(None);
+        };
+        if unreported.contains(&open.revision) {
+            return Ok(None);
+        }
+        self.abandon(&open.id, at)?;
+        self.get(host, &open.id)
     }
 
     /// One run of a host.
@@ -338,7 +359,9 @@ impl<'c> Runs<'c> {
     }
 
     /// Stores the latest event for one key (a step, module, handler,
-    /// removal or check) of a run.
+    /// removal or check) of a run. A step stored as `failed` or `blocked`
+    /// keeps that event: a module rollback runs the same step again, and the
+    /// live report must still show what failed.
     #[allow(clippy::too_many_arguments)]
     pub fn record_event(
         &self,
@@ -352,7 +375,7 @@ impl<'c> Runs<'c> {
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO run_events (run_id, key, seq, module, step_id, state, event, at) VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1), ?3, ?4, ?5, ?6, ?7) ON CONFLICT(run_id, key) DO UPDATE SET seq = excluded.seq, module = excluded.module, step_id = excluded.step_id, state = excluded.state, event = excluded.event, at = excluded.at",
+                "INSERT INTO run_events (run_id, key, seq, module, step_id, state, event, at) VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1), ?3, ?4, ?5, ?6, ?7) ON CONFLICT(run_id, key) DO UPDATE SET seq = excluded.seq, module = excluded.module, step_id = excluded.step_id, state = excluded.state, event = excluded.event, at = excluded.at WHERE run_events.state IS NULL OR run_events.state NOT IN ('failed', 'blocked')",
                 params![run_id, key, module, step_id, state, event, ts(at)],
             )
             .map_err(db_error)?;
@@ -516,6 +539,30 @@ mod tests {
         assert_eq!(
             events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
             vec!["a", "c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_blocked_step_is_never_replaced_by_a_later_event_of_it() {
+        let store = Store::in_memory().await.unwrap();
+        let t = Utc::now();
+        let events = store
+            .call(move |db| {
+                let runs = db.runs();
+                for (key, first) in [("step:m/x", "failed"), ("step:m/y", "blocked")] {
+                    runs.record_event("r", key, Some("m"), None, Some("running"), "started", t)?;
+                    runs.record_event("r", key, Some("m"), None, Some(first), first, t)?;
+                    // The rollback runs it again.
+                    runs.record_event("r", key, Some("m"), None, Some("running"), "again", t)?;
+                    runs.record_event("r", key, Some("m"), None, Some("changed"), "again", t)?;
+                }
+                runs.events("r")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
+            vec!["failed", "blocked"]
         );
     }
 }

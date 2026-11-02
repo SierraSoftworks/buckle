@@ -1276,6 +1276,7 @@ impl Controller {
                             h.runtime.failed_module = (!result.failed_module.is_empty())
                                 .then(|| result.failed_module.clone());
                             h.runtime.failed_checks = result.failed_checks.clone();
+                            h.runtime.error_detail = result_error_detail(&result);
                             let detail = if result.error.is_empty() {
                                 "apply failed".to_owned()
                             } else {
@@ -2323,6 +2324,7 @@ impl Controller {
             h.runtime.failed_checks.clear();
             h.runtime.failed_module = None;
             h.runtime.error = None;
+            h.runtime.error_detail = None;
             h.runtime.needs_attention = false;
             h.runtime.failing_since.clear();
             h.runtime.request_id = None;
@@ -3307,6 +3309,7 @@ impl Controller {
             h.wave = None;
             h.runtime.held_at_baseline = false;
             h.runtime.error = None;
+            h.runtime.error_detail = None;
             h.runtime.failed_checks.clear();
         }
         self.live[ri].hosts[hi].state = HostPhase::Missed;
@@ -3805,6 +3808,27 @@ struct ResultView {
     error: String,
     failed_checks: Vec<String>,
     outcome: Option<serde_json::Value>,
+}
+
+/// The structured error of a failed ApplyResult: the agent's run-level
+/// `error_detail`, else (an agent that sends none) the first failing
+/// module's from the outcome, parsed this once.
+fn result_error_detail(result: &ApplyResult) -> Option<buckle_api::ErrorView> {
+    if let Some(e) = &result.error_detail {
+        return Some(buckle_api::ErrorView {
+            kind: if e.kind == "system" {
+                buckle_api::ErrorKind::System
+            } else {
+                buckle_api::ErrorKind::User
+            },
+            message: e.message.clone(),
+            causes: e.causes.clone(),
+            advice: e.advice.clone(),
+        });
+    }
+    serde_json::from_slice::<buckle_core::engine::ApplyOutcome>(&result.outcome_json)
+        .ok()
+        .and_then(|o| crate::views::outcome_error(&o))
 }
 
 impl From<&ApplyResult> for ResultView {

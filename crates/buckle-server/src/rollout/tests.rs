@@ -338,6 +338,12 @@ impl Harness {
                             } else {
                                 String::new()
                             },
+                            error_detail: failed.as_ref().map(|_| buckle_proto::v1::ErrorDetail {
+                                kind: "user".into(),
+                                message: "health check failed".into(),
+                                causes: vec![],
+                                advice: vec!["Look at web's health checks.".into()],
+                            }),
                             ..Default::default()
                         }));
                     }
@@ -656,6 +662,30 @@ async fn max_failures_zero_pauses_on_the_first_failure() {
     assert_eq!(host(&hosts, "a").state, HostPhase::Failed);
     h.idle(600).await;
     assert_eq!(h.applies().len(), 1, "nothing else starts once paused");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_hosts_structured_error_is_stored_once_and_shown_on_its_row() {
+    let mut h = Harness::new().await;
+    h.revision("r1", "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', max_failures: 0 }\n").await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    h.script("a", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r1").await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    let a = host(&hosts, "a");
+    let stored = a
+        .runtime
+        .error_detail
+        .clone()
+        .expect("stored with the result");
+    assert_eq!(stored.advice, vec!["Look at web's health checks."]);
+    let row = super::view::host(&r, a, &[]);
+    assert_eq!(row.error_detail, Some(stored));
+    // The view reads the stored error, not the result document.
+    let mut without = a.clone();
+    without.runtime.error_detail = None;
+    assert_eq!(super::view::host(&r, &without, &[]).error_detail, None);
 }
 
 #[tokio::test(start_paused = true)]

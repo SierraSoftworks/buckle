@@ -31,14 +31,6 @@ pub fn error_view(report: &ErrorReport) -> ErrorView {
     }
 }
 
-/// The structured run error of a stored `ApplyResult` view (a rollout host
-/// row's `result`), else the first failed module's.
-pub fn result_error(result: Option<&serde_json::Value>) -> Option<ErrorView> {
-    let outcome = result?.get("outcome")?;
-    let outcome: ApplyOutcome = serde_json::from_value(outcome.clone()).ok()?;
-    outcome_error(&outcome)
-}
-
 /// The error a reader should see first for an outcome: the run-level one,
 /// else the first failing module's.
 pub fn outcome_error(outcome: &ApplyOutcome) -> Option<ErrorView> {
@@ -251,8 +243,9 @@ fn legacy_error(error: &str) -> ErrorView {
     ErrorView::system(error.to_owned())
 }
 
-/// Applies one live event to the report.
-fn apply_event(report: &mut RunReport, event: &ApplyEvent, at: DateTime<Utc>) {
+/// Applies one live event to the report. `step_ids` says the agent sends
+/// step ids (and so reports handlers with their own step events).
+fn apply_event(report: &mut RunReport, event: &ApplyEvent, at: DateTime<Utc>, step_ids: bool) {
     match event {
         ApplyEvent::ModuleStarted { module } => {
             let m = module_mut(report, module);
@@ -352,13 +345,23 @@ fn apply_event(report: &mut RunReport, event: &ApplyEvent, at: DateTime<Utc>) {
             finish_step(s, StepState::Skipped, at);
         }
         ApplyEvent::HandlerRun { module, handler } => {
-            // Older agents report a handler only once it ran.
+            // Older agents report a handler only once it ran (a change).
+            // Newer ones send StepStarted/StepFinished for a handler that
+            // changes something, so a HandlerRun on a handler still pending
+            // is one whose plan was a no-op.
             let id = engine::handler_id(module, handler);
             for m in &mut report.modules {
-                if let Some(h) = m.handlers.iter_mut().find(|h| h.id == id)
-                    && matches!(h.state, StepState::Pending | StepState::Running)
-                {
-                    finish_step(h, StepState::Changed, at);
+                if let Some(h) = m.handlers.iter_mut().find(|h| h.id == id) {
+                    match h.state {
+                        StepState::Pending if step_ids => {
+                            h.result = Some("no change".to_owned());
+                            finish_step(h, StepState::Unchanged, at);
+                        }
+                        StepState::Pending | StepState::Running => {
+                            finish_step(h, StepState::Changed, at)
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -564,14 +567,24 @@ pub fn run_report(
     if let Some(plan) = plan {
         from_plan(&mut report, plan);
     }
+    let parsed: Vec<(DateTime<Utc>, ApplyEvent)> = events
+        .iter()
+        .filter_map(|e| match serde_json::from_str::<ApplyEvent>(&e.event) {
+            Ok(event) => Some((e.at, event)),
+            Err(err) => {
+                tracing::debug!(run = %run.id, error = %err, "skipping an apply event this server cannot read");
+                None
+            }
+        })
+        .collect();
+    let step_ids = parsed
+        .iter()
+        .any(|(_, e)| e.step().is_some_and(|(_, id)| !id.is_empty()));
     for e in events {
         report.updated_at = report.updated_at.max(e.at);
-        match serde_json::from_str::<ApplyEvent>(&e.event) {
-            Ok(event) => apply_event(&mut report, &event, e.at),
-            Err(err) => {
-                tracing::debug!(run = %run.id, error = %err, "skipping an apply event this server cannot read")
-            }
-        }
+    }
+    for (at, event) in &parsed {
+        apply_event(&mut report, event, *at, step_ids);
     }
     if let Some(outcome) = outcome {
         apply_outcome(&mut report, outcome);
@@ -605,12 +618,21 @@ pub fn run_report(
     for m in &mut report.modules {
         m.health.sort_by_key(|h| h.at);
         // Tasks (not handlers) that changed something, as they stand now (a
-        // rolled-back step no longer counts).
-        m.changes = m
-            .steps
-            .iter()
-            .filter(|s| s.state == StepState::Changed)
-            .count() as u32;
+        // rolled-back step no longer counts); an outcome without per-step
+        // data (an older agent) has only its own count.
+        let stepless = outcome.and_then(|o| {
+            o.module_results
+                .iter()
+                .find(|mo| mo.module == m.name && mo.steps.is_empty())
+        });
+        m.changes = match stepless {
+            Some(mo) => mo.changes as u32,
+            None => m
+                .steps
+                .iter()
+                .filter(|s| s.state == StepState::Changed)
+                .count() as u32,
+        };
     }
     report.recount();
     report
@@ -1178,6 +1200,98 @@ mod tests {
             Some(ErrorView::system("base failed: boom"))
         );
         assert_eq!(report.removals[0].state, StepState::NotRun);
+    }
+
+    #[test]
+    fn an_outcome_without_steps_keeps_its_change_count() {
+        let mut outcome = outcome(ModuleStatus::Applied, vec![]);
+        outcome.module_results[0].changes = 2;
+        let report = run_report(&run("succeeded"), Some(&plan()), &[], Some(&outcome), &[]);
+        assert_eq!(module(&report, "base").changes, 2);
+        let with_steps = outcome_with_steps();
+        let report = run_report(
+            &run("succeeded"),
+            Some(&plan()),
+            &[],
+            Some(&with_steps),
+            &[],
+        );
+        assert_eq!(module(&report, "base").changes, 1, "counted from the steps");
+    }
+
+    fn outcome_with_steps() -> ApplyOutcome {
+        let mut o = outcome(
+            ModuleStatus::Applied,
+            vec![
+                ("file.copy[/a]", engine::StepState::Changed),
+                ("file.copy[/b]", engine::StepState::Unchanged),
+                ("file.copy[/c]", engine::StepState::Unchanged),
+            ],
+        );
+        o.module_results[0].changes = 7;
+        o
+    }
+
+    #[rstest]
+    #[case::newer_agent(true, StepState::Unchanged)]
+    #[case::older_agent(false, StepState::Changed)]
+    fn a_handler_run_on_a_pending_handler_depends_on_the_agent(
+        #[case] step_ids: bool,
+        #[case] expected: StepState,
+    ) {
+        let mut first = finished("base", "/a");
+        if !step_ids && let ApplyEvent::StepFinished { id, .. } = &mut first {
+            id.clear();
+        }
+        let events = vec![
+            ev(1, first),
+            ev(
+                2,
+                ApplyEvent::HandlerRun {
+                    module: "base".into(),
+                    handler: "restart".into(),
+                },
+            ),
+        ];
+        let report = run_report(
+            &run(crate::store::RUNNING),
+            Some(&plan()),
+            &events,
+            None,
+            &[],
+        );
+        assert_eq!(module(&report, "base").handlers[0].state, expected);
+    }
+
+    #[test]
+    fn a_handler_run_after_its_own_step_events_keeps_their_state() {
+        let started = ApplyEvent::StepStarted {
+            module: "base".into(),
+            task_id: "base:restart".into(),
+            id: "base:restart".into(),
+            kind: "systemd.restart".into(),
+        };
+        let events = vec![
+            ev(1, started),
+            ev(
+                2,
+                ApplyEvent::HandlerRun {
+                    module: "base".into(),
+                    handler: "restart".into(),
+                },
+            ),
+        ];
+        let report = run_report(
+            &run(crate::store::RUNNING),
+            Some(&plan()),
+            &events,
+            None,
+            &[],
+        );
+        assert_eq!(
+            module(&report, "base").handlers[0].state,
+            StepState::Changed
+        );
     }
 
     #[test]
