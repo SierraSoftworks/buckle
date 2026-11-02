@@ -266,6 +266,10 @@
     grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
     gap: 1.5rem;
   }
+
+  &__run {
+    margin-top: 0.5rem;
+  }
 }
 
 // Host labels editor

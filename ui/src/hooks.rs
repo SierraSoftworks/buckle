@@ -138,6 +138,13 @@ where
 pub enum RunSource {
     /// One run of a host: `GET /hosts/{host}/runs/{run}`.
     Host { host: String, run: String },
+    /// The host's run in a rollout: `GET /rollouts/{rollout}/hosts/{host}/report`.
+    /// `run` is the entry's `run_id`, so that a new run (a retry) is fetched.
+    Rollout {
+        rollout: String,
+        host: String,
+        run: Option<String>,
+    },
 }
 
 impl RunSource {
@@ -147,6 +154,11 @@ impl RunSource {
                 host: host.clone(),
                 rollout: None,
                 follow: false,
+            },
+            RunSource::Rollout { rollout, host, .. } => Watch {
+                host: host.clone(),
+                rollout: Some(rollout.clone()),
+                follow: true,
             },
         }
     }
@@ -191,6 +203,14 @@ pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> Run
                     None => Ok(None),
                     Some(RunSource::Host { host, run }) => {
                         api::host_run(&host, &run).await.map(Some)
+                    }
+                    Some(RunSource::Rollout { rollout, host, .. }) => {
+                        match api::rollout_host_report(&rollout, &host).await {
+                            Ok(report) => Ok(Some(report)),
+                            // No run in this rollout yet.
+                            Err(ApiError::NotFound(_)) => Ok(None),
+                            Err(e) => Err(e),
+                        }
                     }
                 }
             }

@@ -419,6 +419,13 @@ pub async fn rollout_host_action(
     .await
 }
 
+/// `GET /rollouts/{id}/hosts/{host}/report`: the host's run in this
+/// rollout, live while it applies.
+pub async fn rollout_host_report(id: &str, host: &str) -> Result<RunReport, ApiError> {
+    demo!(demo_store::rollout_host_report(id, host));
+    get(&format!("/rollouts/{}/hosts/{}/report", enc(id), enc(host))).await
+}
+
 /// Retries a host with the named failing checks waived for this rollout.
 pub async fn continue_host(
     id: &str,

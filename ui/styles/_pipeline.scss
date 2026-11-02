@@ -343,6 +343,11 @@
   &__note {
     color: var(--fg-2);
   }
+
+  &__activity {
+    color: var(--active);
+    overflow-wrap: anywhere;
+  }
 }
 
 @keyframes bake {

@@ -2,6 +2,8 @@
 //! run, module and step state, which modules open by default, how long
 //! things took, and what a host is doing right now.
 
+use std::collections::BTreeMap;
+
 use buckle_api::{
     LiveEvent, ModuleReport, ModuleState, RunProgress, RunReport, RunState, RunSummary, StepReport,
     StepState,
@@ -491,6 +493,110 @@ pub fn apply_run_list(list: &mut [RunSummary], host: &str, p: &RunProgress) -> b
     }
 }
 
+/// What a host is doing right now: the module it is in and, when known,
+/// the step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    pub module: String,
+    pub step: Option<String>,
+}
+
+impl Activity {
+    /// `nomad › file.template[/etc/nomad.d/nomad.hcl]`.
+    pub fn describe(&self) -> String {
+        match &self.step {
+            Some(step) => format!("{} › {}", self.module, step),
+            None => self.module.clone(),
+        }
+    }
+}
+
+/// The module a report is in and the step it is on, while it runs.
+pub fn activity(r: &RunReport) -> Option<Activity> {
+    if run_finished(r.state) {
+        return None;
+    }
+    let module = r
+        .modules
+        .iter()
+        .find(|m| m.state == ModuleState::Running)
+        .or_else(|| r.modules.iter().find(|m| current_step(m).is_some()))?;
+    Some(Activity {
+        module: module.name.clone(),
+        step: current_step(module).map(|s| s.id.clone()),
+    })
+}
+
+/// What a host is doing after an update, from the updates alone (for a host
+/// whose report is not held): a step or module starting is what it is on, and
+/// it finishing leaves the rest.
+pub fn track(current: Option<Activity>, p: &RunProgress) -> Option<Activity> {
+    if run_finished(p.run_state) {
+        return None;
+    }
+    let Some(module) = &p.module else {
+        return current;
+    };
+    match (&p.step, p.step_state, p.module_state) {
+        (Some(step), Some(StepState::Running), _) => Some(Activity {
+            module: module.clone(),
+            step: Some(step.clone()),
+        }),
+        (Some(step), Some(state), _) if state != StepState::Pending => current.map(|a| {
+            if a.module == *module && a.step.as_deref() == Some(step) {
+                Activity {
+                    module: a.module,
+                    step: None,
+                }
+            } else {
+                a
+            }
+        }),
+        (None, _, Some(ModuleState::Running)) => Some(Activity {
+            module: module.clone(),
+            step: None,
+        }),
+        (None, _, Some(_)) => current.filter(|a| a.module != *module),
+        _ => current,
+    }
+}
+
+/// What each host of a rollout is doing: from the reports held, kept current
+/// by the updates since, and from the updates alone for hosts without one.
+pub fn activities<'a>(
+    mut reports: Vec<RunReport>,
+    rollout: &str,
+    events: impl IntoIterator<Item = &'a LiveEvent>,
+) -> BTreeMap<String, Activity> {
+    let mut tracked: BTreeMap<String, Option<Activity>> = reports
+        .iter()
+        .map(|r| (r.host.clone(), activity(r)))
+        .collect();
+    for event in events {
+        let LiveEvent::RunProgress { progress: p } = event else {
+            continue;
+        };
+        if p.rollout_id.as_deref().is_some_and(|r| r != rollout) {
+            continue;
+        }
+        let held = reports
+            .iter_mut()
+            .find(|r| r.host == p.host && r.id == p.run_id);
+        let now = match held {
+            Some(report) => match apply_progress(report, p) {
+                Applied::Changed => activity(report),
+                _ => track(tracked.get(&p.host).cloned().flatten(), p),
+            },
+            None => track(tracked.get(&p.host).cloned().flatten(), p),
+        };
+        tracked.insert(p.host.clone(), now);
+    }
+    tracked
+        .into_iter()
+        .filter_map(|(host, a)| a.map(|a| (host, a)))
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -932,6 +1038,61 @@ pub(crate) mod tests {
         p.run_id = "run-2".into();
         assert!(!apply_run_list(&mut list, "pi-1", &p), "a new run");
         assert!(apply_run_list(&mut list, "pi-2", &p), "not this host's");
+    }
+
+    #[test]
+    fn a_running_report_says_where_it_is() {
+        let r = live_report();
+        let a = activity(&r).unwrap();
+        assert_eq!(a.describe(), "nomad › file.copy[b]");
+        let mut done = r.clone();
+        done.state = RunState::Succeeded;
+        assert_eq!(activity(&done), None);
+        let mut between = r;
+        between.modules[1].steps[0].state = StepState::Changed;
+        assert_eq!(activity(&between).unwrap().describe(), "nomad");
+    }
+
+    #[test]
+    fn updates_alone_track_the_step_in_progress() {
+        let mut p = progress(Some("nomad"), Some("apt.package[nomad]"));
+        p.step_state = Some(StepState::Running);
+        let a = track(None, &p);
+        assert_eq!(a.as_ref().unwrap().describe(), "nomad › apt.package[nomad]");
+        p.step_state = Some(StepState::Changed);
+        let a = track(a, &p);
+        assert_eq!(a.as_ref().unwrap().describe(), "nomad");
+        let mut m = progress(Some("nomad"), None);
+        m.module_state = Some(ModuleState::Applied);
+        assert_eq!(track(a.clone(), &m), None);
+        let mut end = progress(None, None);
+        end.run_state = RunState::Succeeded;
+        assert_eq!(track(a, &end), None);
+    }
+
+    #[test]
+    fn a_rollouts_hosts_report_what_they_are_doing() {
+        let held = live_report();
+        let event = |host: &str, run: &str, rollout: &str, step: &str| LiveEvent::RunProgress {
+            progress: RunProgress {
+                host: host.into(),
+                run_id: run.into(),
+                rollout_id: Some(rollout.into()),
+                step_state: Some(StepState::Running),
+                ..progress(Some("nomad"), Some(step))
+            },
+        };
+        let events = [
+            event("pi-1", "run-1", "42", "file.copy[c]"),
+            event("pi-2", "run-7", "42", "apt.package[nomad]"),
+            event("pi-3", "run-8", "41", "apt.package[nomad]"),
+        ];
+        let map = activities(vec![held], "42", &events);
+        // pi-1's held report was moved on by the update: two steps running,
+        // the first is named.
+        assert_eq!(map["pi-1"].describe(), "nomad › file.copy[b]");
+        assert_eq!(map["pi-2"].describe(), "nomad › apt.package[nomad]");
+        assert!(!map.contains_key("pi-3"), "another rollout's host");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{HostSummary, RolloutDetail, RolloutHost, RolloutPhase};
+use buckle_api::{HostRolloutState, HostSummary, RolloutDetail, RolloutHost, RolloutPhase};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
@@ -31,6 +31,10 @@ pub struct PipelineProps {
     /// Smaller blocks and no legend, for the Overview.
     #[prop_or_default]
     pub compact: bool,
+    /// What each applying host is doing (`nomad › file.template[…]`), for
+    /// its block's tooltip.
+    #[prop_or_default]
+    pub activity: BTreeMap<String, String>,
     pub now: DateTime<Utc>,
 }
 
@@ -41,7 +45,7 @@ pub fn pipeline(props: &PipelineProps) -> Html {
         html! {
             <div class="pipeline__step" role="listitem">
                 { gate(&stage.gate, i == 0, props.now) }
-                { column(stage, &props.hosts, props.compact, props.now) }
+                { column(stage, props) }
             </div>
         }
     });
@@ -133,12 +137,8 @@ pub fn health_gate(phase: &RolloutPhase) -> Html {
     }
 }
 
-fn column(
-    stage: &Stage,
-    hosts: &BTreeMap<String, HostSummary>,
-    compact: bool,
-    now: DateTime<Utc>,
-) -> Html {
+fn column(stage: &Stage, props: &PipelineProps) -> Html {
+    let (compact, now) = (props.compact, props.now);
     let phase = stage.phase;
     let c = &stage.counts;
     let mut tally = vec![format!("{}/{} healthy", c.healthy, c.total)];
@@ -193,16 +193,25 @@ fn column(
                 <p class="stage__empty muted">{ "No hosts" }</p>
             } else {
                 <div class="stage__blocks" {style} role="list">
-                    { for stage.hosts().map(|h| block(h, hosts.get(&h.host), now)) }
+                    { for stage.hosts().map(|h| block(h, props.hosts.get(&h.host), props.activity.get(&h.host), now)) }
                 </div>
             }
         </section>
     }
 }
 
-fn block(entry: &RolloutHost, host: Option<&HostSummary>, now: DateTime<Utc>) -> Html {
+fn block(
+    entry: &RolloutHost,
+    host: Option<&HostSummary>,
+    activity: Option<&String>,
+    now: DateTime<Utc>,
+) -> Html {
     let look = block_look(entry, host);
+    let activity = activity.filter(|_| entry.state == HostRolloutState::Applying);
     let mut detail: Vec<Html> = Vec::new();
+    if let Some(now) = activity {
+        detail.push(html! { <span class="block__activity">{ "running " }<span class="mono">{ now.clone() }</span></span> });
+    }
     if let Some(wave) = entry.wave {
         detail.push(html! { <span>{ format!("wave {wave}") }</span> });
     }
@@ -238,7 +247,10 @@ fn block(entry: &RolloutHost, host: Option<&HostSummary>, now: DateTime<Utc>) ->
     html! {
         <RouteLink to={Route::Host { id: entry.host.clone() }}
             classes={classes!(look.classes.clone())}
-            label={format!("{}: {}", entry.host, look.label)}
+            label={match activity {
+                Some(now) => format!("{}: {}, running {now}", entry.host, look.label),
+                None => format!("{}: {}", entry.host, look.label),
+            }}
             data_host={entry.host.clone()}
             data_state={host_state_label(entry.state).replace(' ', "-")}>
             <span class="block__tip" aria-hidden="true">

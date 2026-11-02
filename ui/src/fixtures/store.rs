@@ -199,6 +199,20 @@ pub fn host_run(id: &str, run: &str) -> Result<RunReport, ApiError> {
         .ok_or_else(|| ApiError::NotFound(format!("No run '{run}' on '{id}'.")))
 }
 
+pub fn rollout_host_report(id: &str, host: &str) -> Result<RunReport, ApiError> {
+    let run = with(|s| {
+        s.rollout_mut(id).map(|r| {
+            r.phases
+                .iter()
+                .flat_map(|p| &p.hosts)
+                .find(|h| h.host == host)
+                .and_then(|h| h.run_id.clone())
+        })
+    })?
+    .ok_or_else(|| ApiError::NotFound(format!("{host} has no run in rollout {id}.")))?;
+    host_run(host, &run)
+}
+
 pub fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> {
     admin()?;
     with(|s| {
