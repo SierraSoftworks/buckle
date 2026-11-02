@@ -537,7 +537,7 @@ fn runs_panel(props: &RunsProps) -> Html {
         (Some(_), None, None) => html! { <Loading label="Loading the run…" /> },
     };
     html! {
-        <Panel title={if older { "Run report" } else { "Latest run" }} id="run-report"
+        <Panel title={if older { "Run report" } else { "Latest run" }} id="run-report" class="run-panel"
             subtitle={if older { "An older run of this host, module by module" } else { "The host's newest run, module by module and step by step" }}
             actions={html! { <>{ back.unwrap_or_default() }{ picker.unwrap_or_default() }</> }}>
             { body }

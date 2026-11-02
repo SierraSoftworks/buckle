@@ -1,6 +1,10 @@
 @use 'tokens' as *;
 
 .table-wrap {
+  // A containing block, so that an absolutely positioned descendant (a
+  // visually hidden column header) scrolls with the table instead of
+  // widening the page.
+  position: relative;
   overflow-x: auto;
 }
 

@@ -491,15 +491,26 @@
   }
 }
 
-// A host page's run section: the picker beside the title.
+// A host page's run section: the picker beside the title, or under it when
+// there is no room.
+.run-panel > .panel__head {
+  flex-wrap: wrap;
+
+  .panel__actions {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+}
+
 .run-picker {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  min-width: 0;
 
   .input {
     width: auto;
-    max-width: 22rem;
+    max-width: min(22rem, 100%);
     min-height: 28px;
     padding: 0.15rem 0.4rem;
     font-size: 0.82rem;
@@ -507,17 +518,22 @@
 }
 
 @media (max-width: $small) {
+  // The name takes the line; the count and time follow it, together.
   .run-module__row {
-    grid-template-columns: 1rem auto minmax(0, 1fr);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 0.6rem;
+  }
 
-    .run-module__changes,
-    .run-module__duration {
-      grid-column: 3;
-      text-align: left;
-    }
+  .run-module__title {
+    flex: 1 1 8rem;
   }
 
   .run-module__body {
     padding-left: 0.8rem;
+  }
+
+  .error-block__section {
+    margin-left: 0.4rem;
   }
 }
