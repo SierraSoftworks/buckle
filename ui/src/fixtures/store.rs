@@ -13,6 +13,7 @@ use buckle_api::{
     ApproveRequest, AuditEntry, Catalog, ContinueRequest, Fleet, HostDetail, HostPatch,
     HostPreview, HostRolloutState, HostStatus, HostSummary, LiveEvent, Me, Page, PhaseState,
     RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutState, RolloutSummary,
+    RunReport, RunSummary,
 };
 use chrono::Utc;
 
@@ -185,6 +186,17 @@ pub fn host(id: &str) -> Result<HostDetail, ApiError> {
             .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("No host '{id}'.")))
     })
+}
+
+pub fn host_runs(id: &str) -> Result<Vec<RunSummary>, ApiError> {
+    host(id).map(|d| d.recent_runs)
+}
+
+pub fn host_run(id: &str, run: &str) -> Result<RunReport, ApiError> {
+    host(id)?
+        .latest_run
+        .filter(|r| r.id == run)
+        .ok_or_else(|| ApiError::NotFound(format!("No run '{run}' on '{id}'.")))
 }
 
 pub fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> {

@@ -8,13 +8,14 @@
 use std::future::Future;
 use std::rc::Rc;
 
-use buckle_api::LiveEvent;
+use buckle_api::{LiveEvent, RunReport};
 use chrono::{DateTime, Utc};
 use gloo_timers::callback::{Interval, Timeout};
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
-use crate::api::ApiError;
+use crate::api::{self, ApiError};
+use crate::logic::run::{Applied, Watch, follow};
 use crate::store::use_live;
 
 /// The state of one fetched resource.
@@ -130,6 +131,108 @@ where
         }
     }
     Some(value)
+}
+
+/// Where a run report comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunSource {
+    /// One run of a host: `GET /hosts/{host}/runs/{run}`.
+    Host { host: String, run: String },
+}
+
+impl RunSource {
+    fn watch(&self) -> Watch {
+        match self {
+            RunSource::Host { host, .. } => Watch {
+                host: host.clone(),
+                rollout: None,
+                follow: false,
+            },
+        }
+    }
+}
+
+/// A run report, kept current.
+pub struct RunFeed {
+    /// The report with every update since it was fetched applied; `None`
+    /// while loading, or when there is no run (yet).
+    pub report: Option<RunReport>,
+    /// The source has answered, with a report or with "no run yet".
+    pub settled: bool,
+    pub error: Option<ApiError>,
+    pub reload: Callback<()>,
+}
+
+/// Fetches a run report and applies the `run_progress` updates that follow.
+/// It fetches again when an update names something the report does not hold
+/// (or, for a rollout's host, a run other than the one held), and, like
+/// every fetch, when the stream lagged or reconnected.
+///
+/// `seed` is the report the page already holds for this run (a host's
+/// detail carries its latest run, kept current by the same updates): it
+/// answers the first fetch, so the report is not asked for twice on load.
+#[hook]
+pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> RunFeed {
+    let live = use_live();
+    let seed =
+        seed.filter(|s| matches!(&source, Some(RunSource::Host { run, .. }) if *run == s.id));
+    let first = use_mut_ref(|| true);
+    let fetch = {
+        let (first, seed) = (first.clone(), seed.clone());
+        use_fetch(source.clone(), move |source| {
+            let seeded = std::mem::replace(&mut *first.borrow_mut(), false)
+                .then_some(seed)
+                .flatten();
+            async move {
+                if let Some(report) = seeded {
+                    return Ok(Some(report));
+                }
+                match source {
+                    None => Ok(None),
+                    Some(RunSource::Host { host, run }) => {
+                        api::host_run(&host, &run).await.map(Some)
+                    }
+                }
+            }
+        })
+    };
+
+    let mut report = match &fetch.data {
+        Some(data) => data.1.clone(),
+        None => seed,
+    };
+    let mut stale = false;
+    if let (Some(data), Some(watch)) = (&fetch.data, source.as_ref().map(RunSource::watch))
+        && let Some(events) = live.log.since(data.0)
+    {
+        for event in events {
+            if let LiveEvent::RunProgress { progress } = &*event {
+                stale |= follow(report.as_mut(), progress, &watch) == Applied::Refetch;
+            }
+        }
+    }
+    if let Some(r) = report.as_mut() {
+        r.recount();
+    }
+
+    // Once per fetched answer: the next answer has a newer sequence number.
+    let stale_at = stale.then(|| fetch.data.as_ref().map(|d| d.0)).flatten();
+    {
+        let reload = fetch.reload.clone();
+        use_effect_with(stale_at, move |at| {
+            if at.is_some() {
+                reload.emit(());
+            }
+            || ()
+        });
+    }
+
+    RunFeed {
+        report,
+        settled: fetch.data.is_some(),
+        error: fetch.error.clone(),
+        reload: fetch.reload.clone(),
+    }
 }
 
 /// The current time, ticking every `secs` seconds.

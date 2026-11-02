@@ -22,7 +22,8 @@ use std::cell::RefCell;
 use buckle_api::{
     ActionRequest, ApproveRequest, AuditEntry, Catalog, ContinueRequest, CsrfToken, ErrorBody,
     Fleet, HealthResultDto, HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup,
-    RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, StartRollout,
+    RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, RunReport, RunSummary,
+    StartRollout,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -268,6 +269,30 @@ pub async fn host(id: &str) -> Result<HostDetail, ApiError> {
 pub async fn host_health(id: &str) -> Result<Vec<HealthResultDto>, ApiError> {
     demo!(demo_store::host(id).map(|h| h.health_results));
     get(&format!("/hosts/{}/health", enc(id))).await
+}
+
+/// `GET /hosts/{id}/runs`: the host's runs, newest first. Read as a page,
+/// or as the bare list servers answered with before run reports.
+pub async fn host_runs(id: &str) -> Result<Vec<RunSummary>, ApiError> {
+    demo!(demo_store::host_runs(id));
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Runs {
+        Page(Page<RunSummary>),
+        List(Vec<RunSummary>),
+    }
+    Ok(
+        match get::<Runs>(&format!("/hosts/{}/runs?limit=50", enc(id))).await? {
+            Runs::Page(page) => page.items,
+            Runs::List(list) => list,
+        },
+    )
+}
+
+/// `GET /hosts/{id}/runs/{run}`: one run, module by module and step by step.
+pub async fn host_run(id: &str, run: &str) -> Result<RunReport, ApiError> {
+    demo!(demo_store::host_run(id, run));
+    get(&format!("/hosts/{}/runs/{}", enc(id), enc(run))).await
 }
 
 pub async fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> {
