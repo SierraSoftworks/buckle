@@ -196,6 +196,7 @@ pub fn detail(
         summary: summary(record, hosts),
         phases,
         plans: plan_groups(hosts),
+        fleet: None,
         events,
     }
 }

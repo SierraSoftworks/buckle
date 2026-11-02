@@ -360,6 +360,7 @@ mod tests {
             },
             phases,
             plans,
+            fleet: None,
             events: vec![],
         }
     }

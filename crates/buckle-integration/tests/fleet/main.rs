@@ -8,6 +8,7 @@ mod drift;
 mod durability;
 mod enrolment;
 mod failures;
+mod fleet_plan;
 mod gaps;
 mod health_gating;
 mod local_rollback;
