@@ -59,26 +59,168 @@
   }
 }
 
+// A module (or removals, notes) as a collapsible block: its heading on one
+// line, its steps indented under a rule.
 .plan-module {
   margin-top: 0.6rem;
 
   &__head {
     display: flex;
     flex-wrap: wrap;
-    align-items: baseline;
-    gap: 0.75rem;
-    padding-bottom: 0.25rem;
+    align-items: center;
+    gap: 0.4rem 0.75rem;
+    padding: 0.2rem 0 0.25rem;
     border-bottom: 1px solid var(--line);
     font-size: 0.8rem;
+    cursor: pointer;
+    list-style: none;
+
+    &::-webkit-details-marker {
+      display: none;
+    }
+  }
+
+  &__chevron {
+    display: inline-flex;
+    color: var(--fg-3);
+    transition: transform var(--transition);
+
+    .icon {
+      width: 14px;
+      height: 14px;
+    }
+  }
+
+  &[open] > &__head &__chevron {
+    transform: rotate(90deg);
   }
 
   &__name {
     font-size: 0.85rem;
   }
 
-  &--removals .plan-module__head {
+  &__count {
+    color: var(--fg-2);
+  }
+
+  &__body {
+    margin-left: 0.45rem;
+    padding-left: 0.9rem;
+    border-left: 2px solid var(--line);
+  }
+
+  &--removals > .plan-module__head {
     border-bottom-color: color-mix(in srgb, var(--danger) 50%, var(--line));
   }
+
+  &--removals > .plan-module__body {
+    border-left-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  }
+}
+
+// The coloured icon a plan line leads with.
+.mark {
+  display: inline-flex;
+  align-self: center;
+  color: var(--fg-3);
+
+  .icon {
+    width: 15px;
+    height: 15px;
+  }
+
+  &--create {
+    color: var(--ok);
+  }
+
+  &--modify {
+    color: var(--warn);
+  }
+
+  &--remove,
+  &--blocked {
+    color: var(--danger);
+  }
+}
+
+// Which hosts a fleet-wide plan line applies to.
+.scope {
+  display: inline-flex;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  white-space: nowrap;
+
+  &--all {
+    background: var(--ok-soft);
+    color: var(--ok);
+  }
+
+  &--subset {
+    background: var(--warn-soft);
+    color: var(--warn);
+  }
+}
+
+// A host-specific value in a fleet-wide plan, with sample values on hover.
+.fact {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 0.3rem;
+  border: 1px dashed color-mix(in srgb, var(--info) 55%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--info-soft);
+  color: var(--fg);
+  white-space: nowrap;
+  cursor: help;
+
+  .icon {
+    width: 11px;
+    height: 11px;
+    margin-right: 0.2rem;
+    color: var(--info);
+  }
+
+  &--legend {
+    cursor: default;
+  }
+
+  &__pop {
+    position: fixed;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    max-width: 360px;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    font-family: var(--font-sans);
+    font-size: 0.78rem;
+    line-height: 1.4;
+    white-space: normal;
+  }
+
+  &__pop-head {
+    font-weight: 600;
+  }
+
+  &__samples {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.1rem 0.75rem;
+  }
+
+  &__host {
+    color: var(--fg-2);
+  }
+}
+
+.fleet-plan__intro {
+  margin: 0 0 0.4rem;
 }
 
 .steps {
@@ -114,6 +256,26 @@
     color: var(--fg-2);
   }
 
+  // A step's diff or preview, indented under its line.
+  &__detail {
+    flex-basis: 100%;
+    padding-left: 1.4rem;
+  }
+
+  &__variants,
+  &__render {
+    flex-basis: 100%;
+    margin: 0.2rem 0 0 1.4rem;
+  }
+
+  &__variants {
+    margin-bottom: 0;
+  }
+
+  &__render select {
+    margin-left: 0.3rem;
+  }
+
   &__preview {
     flex-basis: 100%;
     margin: 0.3rem 0 0;
@@ -122,10 +284,6 @@
     background: var(--surface-2);
     white-space: pre-wrap;
     font-size: 0.78rem;
-  }
-
-  > .diff {
-    flex-basis: 100%;
   }
 
   &--destructive {

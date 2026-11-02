@@ -2,7 +2,10 @@
 //! share it, what changes module by module with unified diffs, destructive
 //! steps and removals called out, deferred modules with their reason.
 
-use buckle_api::{DiffKind, ModuleNote, PlanGroup, PlanView, StepOutcome, StepView};
+use buckle_api::{
+    DiffKind, HandlerView, ModuleNote, PlanGroup, PlanView, RehomeView, RemovalView, StepOutcome,
+    StepView,
+};
 use yew::prelude::*;
 
 use super::diff::{DiffView, secret_text};
@@ -64,6 +67,65 @@ pub fn plan_group(props: &PlanGroupProps) -> Html {
     }
 }
 
+/// What a plan line does, drawn as a coloured icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Create,
+    Modify,
+    Remove,
+    /// A removal that only forgets the record.
+    Forget,
+    Blocked,
+    Unchanged,
+}
+
+impl Mark {
+    pub fn of(s: &StepView) -> Mark {
+        match (s.outcome, s.diff) {
+            (StepOutcome::NoOp, _) => Mark::Unchanged,
+            (StepOutcome::Blocked, _) => Mark::Blocked,
+            (_, Some(DiffKind::Create)) => Mark::Create,
+            (_, Some(DiffKind::Delete)) => Mark::Remove,
+            _ => Mark::Modify,
+        }
+    }
+
+    fn parts(self) -> (&'static str, &'static str, Html) {
+        match self {
+            Mark::Create => ("create", "creates", icons::create()),
+            Mark::Modify => ("modify", "modifies", icons::modify()),
+            Mark::Remove => ("remove", "removes", icons::remove()),
+            Mark::Forget => ("forget", "forgets", icons::remove()),
+            Mark::Blocked => ("blocked", "blocked", icons::blocked()),
+            Mark::Unchanged => ("unchanged", "unchanged", icons::check()),
+        }
+    }
+}
+
+/// A line's coloured change icon.
+pub fn mark(m: Mark) -> Html {
+    let (class, label, icon) = m.parts();
+    html! {
+        <span class={classes!("mark", format!("mark--{class}"))} title={label}>
+            { icon }<span class="visually-hidden">{ format!("{label} ") }</span>
+        </span>
+    }
+}
+
+/// A collapsible block of a plan (a module, removals, notes): its heading
+/// on one line, its lines indented under it.
+pub fn block(class: &'static str, open: bool, head: Html, body: Html) -> Html {
+    html! {
+        <details class={classes!("plan-module", class)} open={open}>
+            <summary class="plan-module__head">
+                <span class="plan-module__chevron">{ icons::chevron() }</span>
+                { head }
+            </summary>
+            <div class="plan-module__body">{ body }</div>
+        </details>
+    }
+}
+
 /// A section of modules the plan only has a note about.
 fn notes(
     title: &str,
@@ -76,27 +138,35 @@ fn notes(
     if list.is_empty() {
         return html! {};
     }
-    html! {
-        <section class="plan-module">
-            <header class="plan-module__head">
-                <h4 class="plan-module__name">{ title.to_string() }</h4>
-                if !aside.is_empty() { <span class="muted">{ aside.to_string() }</span> }
-            </header>
+    block(
+        "",
+        true,
+        html! { <>
+            <h4 class="plan-module__name">{ title.to_string() }</h4>
+            if !aside.is_empty() { <span class="muted">{ aside.to_string() }</span> }
+        </> },
+        html! { <>
             <ul class="steps">
-                { for list.iter().map(|n| html! {
-                    <li class={classes!("step", class.to_string())}>
-                        <span class="step__glyph" aria-hidden="true">{ glyph.to_string() }</span>
-                        <span class="mono">{ n.module.clone() }</span>
-                        <span class="step__summary">{ secret_text(&n.reason) }</span>
-                        if !n.waiting_on.is_empty() {
-                            <span class="muted small">{ format!("waits for {}", n.waiting_on.join(", ")) }</span>
-                        }
-                        if n.plan_error { <span class="badge badge--danger">{ "plan error" }</span> }
-                    </li>
-                }) }
+                { for list.iter().map(|n| note(n, glyph, class, html! {})) }
             </ul>
             { footer }
-        </section>
+        </> },
+    )
+}
+
+/// One deferred, held or indeterminate module.
+pub fn note(n: &ModuleNote, glyph: &str, class: &str, scope: Html) -> Html {
+    html! {
+        <li class={classes!("step", class.to_string())}>
+            <span class="step__glyph" aria-hidden="true">{ glyph.to_string() }</span>
+            <span class="mono">{ n.module.clone() }</span>
+            <span class="step__summary">{ secret_text(&n.reason) }</span>
+            if !n.waiting_on.is_empty() {
+                <span class="muted small">{ format!("waits for {}", n.waiting_on.join(", ")) }</span>
+            }
+            if n.plan_error { <span class="badge badge--danger">{ "plan error" }</span> }
+            { scope }
+        </li>
     }
 }
 
@@ -107,115 +177,174 @@ fn body(plan: &PlanView) -> Html {
         </ul>
     });
     let modules = plan.modules.iter().map(|m| {
-        let changed: Vec<&StepView> = m.steps.iter().filter(|s| s.outcome != StepOutcome::NoOp).collect();
+        let changed: Vec<&StepView> = m
+            .steps
+            .iter()
+            .filter(|s| s.outcome != StepOutcome::NoOp)
+            .collect();
         let unchanged = m.steps.len() - changed.len();
-        html! {
-            <section class="plan-module">
-                <header class="plan-module__head">
-                    <h4 class="plan-module__name mono">{ m.module.clone() }</h4>
-                    if !m.needs.is_empty() {
-                        <span class="muted">{ format!("needs: {}", m.needs.join(", ")) }</span>
-                    }
-                    if unchanged > 0 {
-                        <span class="muted">{ format!("{unchanged} unchanged") }</span>
-                    }
-                </header>
+        block(
+            "",
+            !changed.is_empty(),
+            module_head(&m.module, &m.needs, changed.len(), unchanged, html! {}),
+            html! {
                 <ul class="steps">
-                    { for changed.into_iter().map(step) }
-                    { for m.handlers.iter().map(|h| html! {
-                        <li class="step step--handler">
-                            <span class="step__glyph" aria-hidden="true">{ "↻" }</span>
-                            <span class="mono">{ format!("handler {}:{}", m.module, h.handler) }</span>
-                            <span class="step__summary">{ h.summary.clone() }</span>
-                        </li>
-                    }) }
+                    { for changed.into_iter().map(|s| step(s, html! {})) }
+                    { for m.handlers.iter().map(|h| handler(&m.module, h, html! {})) }
                 </ul>
-            </section>
-        }
+            },
+        )
     });
-    let removals = (!plan.removals.is_empty()).then(|| html! {
-        <section class="plan-module plan-module--removals">
-            <header class="plan-module__head">
-                <h4 class="plan-module__name">{ "Removals" }</h4>
-                <span class="muted">{ "resources the revision no longer declares" }</span>
-            </header>
-            <ul class="steps">
-                { for plan.removals.iter().map(|r| html! {
-                    <li class={classes!("step", if r.cleanup { "step--destructive" } else { "step--forget" })}>
-                        <span class="step__glyph" aria-hidden="true">{ "−" }</span>
-                        <span class="mono step__resource">{ r.resource() }</span>
-                        <span class="step__summary">{ secret_text(&r.summary) }</span>
-                        if r.cleanup { <span class="badge badge--danger">{ "removal" }</span> }
-                        else { <span class="badge">{ "forget only" }</span> }
-                        if r.caution && r.cleanup {
-                            <span class="badge badge--warn" title="This kind's removal can take unrelated things down (dependent packages, files owned by a user).">{ icons::alert() }{ "caution" }</span>
-                        }
-                    </li>
-                }) }
-            </ul>
-        </section>
+    let removals = (!plan.removals.is_empty()).then(|| {
+        removals_block(html! { { for plan.removals.iter().map(|r| removal(r, html! {})) } })
     });
-    let rehomed = (!plan.rehomed.is_empty()).then(|| html! {
-        <section class="plan-module">
-            <header class="plan-module__head">
-                <h4 class="plan-module__name">{ "Taken over" }</h4>
-                <span class="muted">{ "records a declared resource now manages, kept instead of removed" }</span>
-            </header>
-            <ul class="steps">
-                { for plan.rehomed.iter().map(|r| html! {
-                    <li class="step step--forget">
-                        <span class="step__glyph" aria-hidden="true">{ "→" }</span>
-                        <span class="mono step__resource">{ format!("{} → {}", r.from, r.to) }</span>
-                        <span class="step__summary">{ secret_text(&r.summary) }</span>
-                        <span class="badge">{ r.how.clone() }</span>
-                    </li>
-                }) }
-            </ul>
-        </section>
-    });
+    let rehomed = (!plan.rehomed.is_empty())
+        .then(|| rehomed_block(html! { { for plan.rehomed.iter().map(|r| rehome(r, html! {})) } }));
     html! { <>
         { warnings.unwrap_or_default() }
         { for modules }
         { removals.unwrap_or_default() }
         { rehomed.unwrap_or_default() }
         { notes("Deferred", "", "…", "step--deferred", &plan.deferred,
-            html! { <p class="muted small">{ "If a deferred module's plan turns out destructive, the agent stops before it and asks for approval again." }</p> }) }
-        { notes("Indeterminate", "not applied; their resources are never removed", "?", "step--blocked", &plan.indeterminate, html! {}) }
-        { notes("Held", "not applied at this revision; left alone", "‖", "step--deferred", &plan.held, html! {}) }
+            html! { <p class="muted small">{ DEFERRED_NOTE }</p> }) }
+        { notes("Indeterminate", INDETERMINATE_NOTE, "?", "step--blocked", &plan.indeterminate, html! {}) }
+        { notes("Held", HELD_NOTE, "‖", "step--deferred", &plan.held, html! {}) }
         if !plan.skipped.is_empty() {
             <p class="muted small">{ format!("Not selected: {}", plan.skipped.join("; ")) }</p>
         }
     </> }
 }
 
-fn step(s: &StepView) -> Html {
-    let (glyph, summary, detail) = match s.outcome {
-        StepOutcome::Change => {
-            let glyph = match s.diff {
-                Some(DiffKind::Create) => "+",
-                Some(DiffKind::Delete) => "−",
-                _ => "~",
-            };
-            let detail = match (&s.unified, &s.preview) {
-                (Some(u), _) => html! { <DiffView unified={u.clone()} /> },
-                (None, Some(p)) => html! { <pre class="step__preview">{ secret_text(p) }</pre> },
-                _ => html! {},
-            };
-            (glyph, s.summary.clone(), detail)
-        }
-        StepOutcome::Blocked => ("!", format!("blocked: {}", s.summary), html! {}),
-        StepOutcome::NoOp => ("✓", "no change".into(), html! {}),
-    };
+pub const DEFERRED_NOTE: &str = "If a deferred module's plan turns out destructive, the agent stops before it and asks for approval again.";
+pub const INDETERMINATE_NOTE: &str = "not applied; their resources are never removed";
+pub const HELD_NOTE: &str = "not applied at this revision; left alone";
+
+/// A module's heading: its name, what it needs, and what it changes.
+pub fn module_head(
+    module: &str,
+    needs: &[String],
+    changed: usize,
+    unchanged: usize,
+    scope: Html,
+) -> Html {
+    html! { <>
+        <h4 class="plan-module__name mono">{ module.to_string() }</h4>
+        if changed > 0 { <span class="plan-module__count">{ count(changed, "change", "changes") }</span> }
+        if unchanged > 0 { <span class="muted">{ format!("{unchanged} unchanged") }</span> }
+        if !needs.is_empty() { <span class="muted">{ format!("needs: {}", needs.join(", ")) }</span> }
+        { scope }
+    </> }
+}
+
+pub fn removals_block(items: Html) -> Html {
+    block(
+        "plan-module--removals",
+        true,
+        html! { <>
+            <h4 class="plan-module__name">{ "Removals" }</h4>
+            <span class="muted">{ "resources the revision no longer declares" }</span>
+        </> },
+        html! { <ul class="steps">{ items }</ul> },
+    )
+}
+
+pub fn rehomed_block(items: Html) -> Html {
+    block(
+        "",
+        true,
+        html! { <>
+            <h4 class="plan-module__name">{ "Taken over" }</h4>
+            <span class="muted">{ "records a declared resource now manages, kept instead of removed" }</span>
+        </> },
+        html! { <ul class="steps">{ items }</ul> },
+    )
+}
+
+pub fn handler(module: &str, h: &HandlerView, scope: Html) -> Html {
     html! {
-        <li class={classes!("step", s.destructive.then_some("step--destructive"), (s.outcome == StepOutcome::Blocked).then_some("step--blocked"))}>
-            <span class="step__glyph" aria-hidden="true">{ glyph }</span>
-            <span class="mono step__resource">{ s.resource() }</span>
-            <span class="step__summary">{ secret_text(&summary) }</span>
-            if s.destructive { <span class="badge badge--danger">{ icons::alert() }{ "destructive" }</span> }
-            if !s.locks.is_empty() { <span class="badge" title="resource locks">{ format!("lock: {}", s.locks.join(", ")) }</span> }
-            if !s.notifies.is_empty() { <span class="muted small">{ format!("→ notify {}", s.notifies.join(", ")) }</span> }
-            if s.always_runs { <span class="badge badge--warn">{ "always runs" }</span> }
-            { detail }
+        <li class="step step--handler">
+            <span class="mark mark--handler" title="handler">{ icons::refresh() }</span>
+            <span class="mono">{ format!("handler {module}:{}", h.handler) }</span>
+            <span class="step__summary">{ secret_text(&h.summary) }</span>
+            { scope }
+        </li>
+    }
+}
+
+pub fn removal(r: &RemovalView, scope: Html) -> Html {
+    html! {
+        <li class={classes!("step", if r.cleanup { "step--destructive" } else { "step--forget" })}>
+            { mark(if r.cleanup { Mark::Remove } else { Mark::Forget }) }
+            <span class="mono step__resource">{ secret_text(&r.resource()) }</span>
+            <span class="step__summary">{ secret_text(&r.summary) }</span>
+            if r.cleanup { <span class="badge badge--danger">{ "removal" }</span> }
+            else { <span class="badge">{ "forget only" }</span> }
+            if r.caution && r.cleanup {
+                <span class="badge badge--warn" title="This kind's removal can take unrelated things down (dependent packages, files owned by a user).">{ icons::alert() }{ "caution" }</span>
+            }
+            { scope }
+        </li>
+    }
+}
+
+pub fn rehome(r: &RehomeView, scope: Html) -> Html {
+    html! {
+        <li class="step step--forget">
+            <span class="step__glyph" aria-hidden="true">{ "→" }</span>
+            <span class="mono step__resource">{ secret_text(&format!("{} → {}", r.from, r.to)) }</span>
+            <span class="step__summary">{ secret_text(&r.summary) }</span>
+            <span class="badge">{ r.how.clone() }</span>
+            { scope }
+        </li>
+    }
+}
+
+/// A step's diff or preview, indented under it.
+pub fn step_detail(s: &StepView) -> Html {
+    if s.outcome != StepOutcome::Change {
+        return html! {};
+    }
+    match (&s.unified, &s.preview) {
+        (Some(u), _) => html! { <div class="step__detail"><DiffView unified={u.clone()} /></div> },
+        (None, Some(p)) => {
+            html! { <div class="step__detail"><pre class="step__preview">{ secret_text(p) }</pre></div> }
+        }
+        _ => html! {},
+    }
+}
+
+/// A step's heading line, without its detail.
+pub fn step_line(s: &StepView, extra: Html) -> Html {
+    let summary = match s.outcome {
+        StepOutcome::Change => s.summary.clone(),
+        StepOutcome::Blocked => format!("blocked: {}", s.summary),
+        StepOutcome::NoOp => "no change".into(),
+    };
+    html! { <>
+        { mark(Mark::of(s)) }
+        <span class="mono step__resource">{ secret_text(&s.resource()) }</span>
+        <span class="step__summary">{ secret_text(&summary) }</span>
+        if s.destructive { <span class="badge badge--danger">{ icons::alert() }{ "destructive" }</span> }
+        if !s.locks.is_empty() { <span class="badge" title="resource locks">{ format!("lock: {}", s.locks.join(", ")) }</span> }
+        if !s.notifies.is_empty() { <span class="muted small">{ format!("→ notify {}", s.notifies.join(", ")) }</span> }
+        if s.always_runs { <span class="badge badge--warn">{ "always runs" }</span> }
+        { extra }
+    </> }
+}
+
+pub fn step_class(s: &StepView) -> Classes {
+    classes!(
+        "step",
+        s.destructive.then_some("step--destructive"),
+        (s.outcome == StepOutcome::Blocked).then_some("step--blocked")
+    )
+}
+
+fn step(s: &StepView, scope: Html) -> Html {
+    html! {
+        <li class={step_class(s)}>
+            { step_line(s, scope) }
+            { step_detail(s) }
         </li>
     }
 }
