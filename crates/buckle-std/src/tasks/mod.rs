@@ -4,6 +4,7 @@
 pub(crate) mod hostkit;
 
 pub mod archive_extract;
+pub mod command_run;
 pub mod file_absent;
 pub mod file_block;
 pub mod file_copy;
