@@ -52,7 +52,7 @@ jobs:
           VERSION="${TAG#v}"
           sed -i "0,/^version\s*=\s*\".*\"/s//version = \"$VERSION\"/" Cargo.toml
           sed -i "0,/^version\s*=\s*\".*\"/s//version = \"$VERSION\"/" ui/Cargo.toml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: versioned-manifests
           path: |
@@ -77,7 +77,7 @@ jobs:
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm trunk
       - run: cd ui && trunk build --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ui-dist
           path: ui/dist
@@ -141,7 +141,7 @@ jobs:
         run: |
           mkdir -p out
           cp target/${{ matrix.target }}/release/buckle${{ matrix.extension }} out/buckle-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.os }}-${{ matrix.arch }}
           path: out/buckle-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}
@@ -219,7 +219,7 @@ jobs:
         run: |
           mkdir -p /tmp/digests
           echo "${{ steps.build.outputs.digest }}" | sed 's/sha256://' | xargs -I{} touch /tmp/digests/{}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: digest-${{ matrix.arch }}
           path: /tmp/digests/*
