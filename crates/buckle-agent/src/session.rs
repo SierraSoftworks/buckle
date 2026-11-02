@@ -19,8 +19,8 @@ use crate::sink::ReportSink;
 use crate::store::{AgentState, Store};
 use crate::transport::grpc::set_parent_from_traceparent;
 use crate::transport::{
-    Hello, Instruction, LocalRollbackRecord, Report, RevisionSource, Session, Transport, Welcome,
-    WireSecret,
+    DurableReport, Hello, Instruction, LocalRollbackRecord, Report, RevisionSource, Session,
+    Transport, Welcome, WireSecret,
 };
 use crate::update::{UpdateOutcome, Updater};
 use crate::watchdog::{Verdict, Watchdog};
@@ -409,6 +409,7 @@ impl Shared {
         if agent.facts.tree.is_null() && !state.facts.tree.is_null() {
             agent.facts = state.facts;
         }
+        agent.migrate_legacy();
         if let Some(persisted) = agent.watchdog.clone() {
             tracing::info!(from = %persisted.from.short(), to = %persisted.to.short(), "resuming the local rollback watchdog");
             if let Ok(mut guard) = self.watchdog.lock() {
@@ -492,6 +493,7 @@ impl Shared {
                         break SessionEnd::Rejected { reason, retry };
                     }
                     Some(Instruction::Ping) => {}
+                    Some(Instruction::Ack { report_ids }) => self.on_ack(&report_ids).await,
                     Some(other) => {
                         if let Some(op) = op_for(other) {
                             // Plans and health answers are only useful to the
@@ -570,24 +572,50 @@ impl Shared {
                 tracing::info!(revision = %w.state.from.short(), "the session came back; the local rollback watchdog is disarmed");
                 data.agent.watchdog = None;
             }
-            let pending = std::mem::take(&mut data.agent.pending_rollbacks);
             self.save_agent(&data);
-            pending
+            data.agent
+                .unacked_reports
+                .iter()
+                .filter_map(DurableReport::to_report)
+                .collect::<Vec<_>>()
         };
         self.connected.store(true, Ordering::SeqCst);
 
-        let mut unsent = Vec::new();
-        for record in pending {
-            if !self.sink.send(Report::LocalRollback(record.clone())).await {
-                unsent.push(record);
-            }
+        // Durable reports stay in agent.json until the server acknowledges
+        // them; the server stores each report id once, so re-sending after
+        // every Welcome is safe.
+        if !pending.is_empty() {
+            tracing::info!(count = pending.len(), "re-sending unacknowledged reports");
         }
-        if !unsent.is_empty() {
-            let mut data = self.data.lock().await;
-            data.agent.pending_rollbacks.extend(unsent);
-            self.save_agent(&data);
+        for report in pending {
+            self.sink.send(report).await;
         }
         queue.push(Op::Facts { force_report: true }, None);
+    }
+
+    async fn on_ack(&self, ids: &[u64]) {
+        let mut data = self.data.lock().await;
+        if data.agent.acknowledge(ids) {
+            tracing::debug!(?ids, "the server acknowledged reports");
+            self.save_agent(&data);
+        }
+    }
+
+    /// Records `report` as durable (kept until acknowledged) and sends it.
+    async fn send_durable(&self, report: Report) {
+        if let Some(durable) = DurableReport::from_report(&report) {
+            let mut data = self.data.lock().await;
+            data.agent.keep_report(durable);
+            self.save_agent(&data);
+        }
+        self.sink.send(report).await;
+    }
+
+    async fn next_report_id(&self) -> u64 {
+        let mut data = self.data.lock().await;
+        let id = data.agent.next_report_id();
+        self.save_agent(&data);
+        id
     }
 
     async fn worker(
@@ -996,13 +1024,14 @@ impl Shared {
             data.agent.applied_revision.clone()
         };
         if report {
-            self.sink
-                .send(Report::ApplyResult {
-                    revision: rev.id.clone(),
-                    outcome: outcome.clone(),
-                    applied_revision: applied,
-                })
-                .await;
+            let report_id = self.next_report_id().await;
+            self.send_durable(Report::ApplyResult {
+                report_id,
+                revision: rev.id.clone(),
+                outcome: outcome.clone(),
+                applied_revision: applied,
+            })
+            .await;
         }
         outcome
     }
@@ -1451,27 +1480,29 @@ impl Shared {
             Ok::<_, buckle_core::Error>(self.run_apply(rev, &ctx, &plan, false).await)
         }
         .await;
-        let (succeeded, reason) = match result {
-            Ok(outcome) if outcome.succeeded => (true, reason),
+        let (succeeded, rollback_error, rollback_outcome) = match result {
             Ok(outcome) => (
-                false,
-                format!(
-                    "{reason}; the rollback itself failed: {}",
-                    outcome.error.unwrap_or_else(|| "a module failed".into())
-                ),
+                outcome.succeeded,
+                (!outcome.succeeded).then(|| {
+                    outcome
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "a module failed".into())
+                }),
+                serde_json::to_value(&outcome).ok(),
             ),
             Err(err) => (
                 false,
-                format!(
-                    "{reason}; the rollback could not run: {}",
-                    err.description()
-                ),
+                Some(format!("the rollback could not run: {}", err.description())),
+                None,
             ),
         };
         if !succeeded {
-            tracing::error!(%reason, "the local rollback failed; the host needs attention");
+            tracing::error!(%reason, error = ?rollback_error, "the local rollback failed; the host needs attention");
         }
+        let report_id = self.next_report_id().await;
         let record = LocalRollbackRecord {
+            report_id,
             from,
             to,
             reason,
@@ -1479,15 +1510,12 @@ impl Shared {
             evidence: watchdog.evidence().to_vec(),
             at: chrono::Utc::now(),
             succeeded,
+            rollback_error,
+            rollback_outcome,
         };
-        if self.connected.load(Ordering::SeqCst)
-            && self.sink.send(Report::LocalRollback(record.clone())).await
-        {
-            return;
-        }
-        let mut data = self.data.lock().await;
-        data.agent.pending_rollbacks.push(record);
-        self.save_agent(&data);
+        // Kept until the server acknowledges it; sent now if a session is up,
+        // otherwise after the next Welcome.
+        self.send_durable(Report::LocalRollback(record)).await;
     }
 }
 
@@ -1542,6 +1570,9 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             traceparent,
         },
         Instruction::Upgrade { version } => Op::Upgrade { version },
-        Instruction::Welcome(_) | Instruction::Ping | Instruction::Rejected { .. } => return None,
+        Instruction::Welcome(_)
+        | Instruction::Ping
+        | Instruction::Ack { .. }
+        | Instruction::Rejected { .. } => return None,
     })
 }

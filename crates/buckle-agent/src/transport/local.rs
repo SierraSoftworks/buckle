@@ -173,9 +173,19 @@ impl Transport for LocalTransport {
 
         let (instruction_tx, instruction_rx) = mpsc::channel::<Instruction>(64);
         let (report_tx, mut report_rx) = mpsc::channel::<Report>(256);
+        let acks = instruction_tx.clone();
         tokio::spawn(async move {
             while let Some(report) = report_rx.recv().await {
                 log_report(&report);
+                // Logging is all local mode does with a report, so durable
+                // ones are acknowledged as soon as they are logged.
+                if let Some(id) = report.report_id() {
+                    let _ = acks
+                        .send(Instruction::Ack {
+                            report_ids: vec![id],
+                        })
+                        .await;
+                }
             }
         });
 

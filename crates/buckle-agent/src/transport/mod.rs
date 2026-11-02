@@ -165,6 +165,11 @@ pub enum Instruction {
         /// The release to install.
         version: String,
     },
+    /// The server committed these durable reports; forget them.
+    Ack {
+        /// The acknowledged report ids.
+        report_ids: Vec<u64>,
+    },
     /// The session is being closed by the other side.
     Rejected {
         /// Why the session was refused.
@@ -254,8 +259,10 @@ pub enum Report {
         /// The event.
         event: buckle_core::engine::ApplyEvent,
     },
-    /// The result of an apply.
+    /// The result of an apply (durable: kept until acknowledged).
     ApplyResult {
+        /// The durable report id.
+        report_id: u64,
         /// The revision that was applied.
         revision: RevisionId,
         /// The outcome.
@@ -281,13 +288,108 @@ pub enum Report {
         /// Whether the drift was corrected.
         corrected: bool,
     },
-    /// The agent rolled itself back while disconnected.
+    /// The agent rolled itself (or a module) back on its own (durable).
     LocalRollback(LocalRollbackRecord),
 }
 
-/// A local rollback, persisted until it is reported.
+impl Report {
+    /// The durable report id, for reports the server acknowledges.
+    pub fn report_id(&self) -> Option<u64> {
+        match self {
+            Report::ApplyResult { report_id, .. } => Some(*report_id),
+            Report::LocalRollback(record) => Some(record.report_id),
+            _ => None,
+        }
+    }
+}
+
+/// A report kept in agent.json until the server acknowledges it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DurableReport {
+    /// An ApplyResult.
+    ApplyResult {
+        /// The durable report id.
+        report_id: u64,
+        /// The revision that was applied.
+        revision: RevisionId,
+        /// The outcome (`buckle_core::engine::ApplyOutcome` as JSON).
+        outcome: serde_json::Value,
+        /// The revision applied on the host after the run.
+        applied_revision: Option<RevisionId>,
+    },
+    /// A local or module rollback.
+    LocalRollback(LocalRollbackRecord),
+}
+
+impl DurableReport {
+    /// The report id.
+    pub fn report_id(&self) -> u64 {
+        match self {
+            DurableReport::ApplyResult { report_id, .. } => *report_id,
+            DurableReport::LocalRollback(record) => record.report_id,
+        }
+    }
+
+    /// The revision an ApplyResult reports on.
+    pub fn apply_revision(&self) -> Option<&RevisionId> {
+        match self {
+            DurableReport::ApplyResult { revision, .. } => Some(revision),
+            DurableReport::LocalRollback(_) => None,
+        }
+    }
+
+    /// The durable form of a report, if it is one.
+    pub fn from_report(report: &Report) -> Option<Self> {
+        match report {
+            Report::ApplyResult {
+                report_id,
+                revision,
+                outcome,
+                applied_revision,
+            } => Some(DurableReport::ApplyResult {
+                report_id: *report_id,
+                revision: revision.clone(),
+                outcome: serde_json::to_value(outcome).unwrap_or_default(),
+                applied_revision: applied_revision.clone(),
+            }),
+            Report::LocalRollback(record) => Some(DurableReport::LocalRollback(record.clone())),
+            _ => None,
+        }
+    }
+
+    /// The report to (re-)send, or `None` when a stored outcome no longer parses.
+    pub fn to_report(&self) -> Option<Report> {
+        match self {
+            DurableReport::ApplyResult {
+                report_id,
+                revision,
+                outcome,
+                applied_revision,
+            } => match serde_json::from_value(outcome.clone()) {
+                Ok(outcome) => Some(Report::ApplyResult {
+                    report_id: *report_id,
+                    revision: revision.clone(),
+                    outcome,
+                    applied_revision: applied_revision.clone(),
+                }),
+                Err(err) => {
+                    tracing::warn!(report = report_id, error = %err, "dropping a stored apply result that no longer parses");
+                    None
+                }
+            },
+            DurableReport::LocalRollback(record) => Some(Report::LocalRollback(record.clone())),
+        }
+    }
+}
+
+/// A local (or module) rollback, persisted until the server acknowledges it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalRollbackRecord {
+    /// The durable report id (0 in records written by older agents; a fresh
+    /// id is assigned when they are loaded).
+    #[serde(default)]
+    pub report_id: u64,
     /// The revision that was rolled back.
     pub from: RevisionId,
     /// The stable revision applied in its place.
@@ -302,4 +404,10 @@ pub struct LocalRollbackRecord {
     pub at: chrono::DateTime<chrono::Utc>,
     /// Whether the rollback apply itself succeeded.
     pub succeeded: bool,
+    /// The rollback apply's own error, when it failed.
+    #[serde(default)]
+    pub rollback_error: Option<String>,
+    /// The rollback apply's outcome (`ApplyOutcome` as JSON), when it ran.
+    #[serde(default)]
+    pub rollback_outcome: Option<serde_json::Value>,
 }

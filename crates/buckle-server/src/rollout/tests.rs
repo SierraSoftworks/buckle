@@ -32,6 +32,8 @@ struct Script {
     /// starts with "stale plan" carrying this fresh digest.
     stale_plan_result: Option<String>,
     local_rollback_on_bake: bool,
+    /// The local rollback itself fails.
+    local_rollback_fails: bool,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -219,6 +221,12 @@ impl Harness {
                                 from_revision: String::new(),
                                 to_revision: "stable".into(),
                                 reason: "server unreachable and health failing".into(),
+                                succeeded: !s.local_rollback_fails,
+                                rollback_error: if s.local_rollback_fails {
+                                    "apt is locked".into()
+                                } else {
+                                    String::new()
+                                },
                                 ..Default::default()
                             }));
                             continue;
@@ -875,6 +883,41 @@ async fn a_local_rollback_fails_the_host_and_pauses() {
     let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
     assert_eq!(r.runtime.pause.unwrap().kind, "local_rollback");
     assert_eq!(host(&hosts, "a").state, HostPhase::Failed);
+    assert!(!host(&hosts, "a").runtime.needs_attention);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_local_rollback_needs_attention_with_both_results() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 5m }\n  phases:\n    - { name: web, select: 'true', max_failures: 5 }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| {
+        s.local_rollback_on_bake = true;
+        s.local_rollback_fails = true;
+    });
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Failed);
+    assert!(a.runtime.needs_attention);
+    let error = a.runtime.error.as_deref().unwrap();
+    assert!(error.contains("needs attention"), "{error}");
+    assert!(error.contains("health failing"), "the failure: {error}");
+    assert!(
+        error.contains("apt is locked"),
+        "the rollback's own result: {error}"
+    );
+    let result = a.result.as_ref().expect("both results are stored");
+    assert_eq!(result["succeeded"], false);
+    assert_eq!(result["rollback_error"], "apt is locked");
+    let (r, hs) = h.snapshot(&id).await;
+    let approvals = vec![];
+    assert!(super::view::host(&r, host(&hs, "a"), &approvals).needs_attention);
 }
 
 #[tokio::test(start_paused = true)]

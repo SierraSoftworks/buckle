@@ -122,6 +122,9 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
         }
         Msg::Ping(_) => Instruction::Ping,
         Msg::Upgrade(u) => Instruction::Upgrade { version: u.version },
+        Msg::Ack(a) => Instruction::Ack {
+            report_ids: a.report_ids,
+        },
         Msg::Rejected(r) => Instruction::Rejected {
             reason: r.reason,
             retry: r.retry,
@@ -211,6 +214,14 @@ fn local_rollback_to_proto(record: &LocalRollbackRecord) -> pb::LocalRollback {
         at: Some(timestamp(record.at)),
         modules: record.modules.clone(),
         evidence: record.evidence.iter().map(health_result_to_proto).collect(),
+        succeeded: record.succeeded,
+        report_id: record.report_id,
+        rollback_error: record.rollback_error.clone().unwrap_or_default(),
+        rollback_outcome_json: record
+            .rollback_outcome
+            .as_ref()
+            .map(json_bytes)
+            .unwrap_or_default(),
     }
 }
 
@@ -262,10 +273,12 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             event_json: json_bytes(event),
         }),
         Report::ApplyResult {
+            report_id,
             revision,
             outcome,
             applied_revision,
         } => Msg::Result(pb::ApplyResult {
+            report_id: *report_id,
             revision: revision.0.clone(),
             plan_digest: outcome.plan_digest.to_string(),
             succeeded: outcome.succeeded,

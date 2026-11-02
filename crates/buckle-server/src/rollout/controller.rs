@@ -991,21 +991,48 @@ impl Controller {
             {
                 continue;
             }
-            let why = format!(
-                "rolled itself back from {} to {}: {}",
-                short(&lr.from_revision),
-                short(&lr.to_revision),
-                lr.reason
-            );
+            let what = if lr.modules.is_empty() {
+                format!(
+                    "rolled itself back from {} to {}",
+                    short(&lr.from_revision),
+                    short(&lr.to_revision)
+                )
+            } else {
+                format!(
+                    "rolled module(s) {} back to {}",
+                    lr.modules.join(", "),
+                    short(&lr.to_revision)
+                )
+            };
+            // Design §10: a rollback that itself fails leaves the host in
+            // needs attention with both results recorded.
+            let why = if lr.succeeded {
+                format!("{what}: {}", lr.reason)
+            } else {
+                format!(
+                    "needs attention: {what}: {}; the rollback itself failed: {}",
+                    lr.reason,
+                    if lr.rollback_error.is_empty() {
+                        "no detail"
+                    } else {
+                        lr.rollback_error.as_str()
+                    }
+                )
+            };
             {
                 let h = &mut self.live[ri].hosts[hi];
                 h.runtime.error = Some(why.clone());
+                h.runtime.needs_attention = !lr.succeeded;
+                if !lr.modules.is_empty() {
+                    h.runtime.failed_module = lr.modules.first().cloned();
+                }
                 h.runtime.failed_checks = lr
                     .evidence
                     .iter()
                     .filter(|r| !r.passed)
                     .map(check_name)
                     .collect();
+                h.result = serde_json::to_value(RollbackView::from(&lr)).ok();
             }
             self.set_host_state(ri, hi, HostPhase::Failed, &why);
             let is_virtual = self.is_virtual(ri, hi);
@@ -1659,6 +1686,7 @@ impl Controller {
             h.runtime.failed_checks.clear();
             h.runtime.failed_module = None;
             h.runtime.error = None;
+            h.runtime.needs_attention = false;
             h.runtime.failing_since.clear();
             h.runtime.request_id = None;
             h.runtime.bake_until = None;
@@ -2769,6 +2797,53 @@ impl From<&ApplyResult> for ResultView {
     }
 }
 
+/// What is stored as the host row's `result` after a rollback the host ran
+/// on its own: the failure that triggered it and the rollback's own result.
+#[derive(serde::Serialize)]
+struct RollbackView {
+    kind: &'static str,
+    from_revision: String,
+    to_revision: String,
+    modules: Vec<String>,
+    reason: String,
+    evidence: Vec<serde_json::Value>,
+    succeeded: bool,
+    rollback_error: String,
+    rollback_outcome: Option<serde_json::Value>,
+}
+
+impl From<&LocalRollback> for RollbackView {
+    fn from(r: &LocalRollback) -> Self {
+        Self {
+            kind: if r.modules.is_empty() {
+                "local_rollback"
+            } else {
+                "module_rollback"
+            },
+            from_revision: r.from_revision.clone(),
+            to_revision: r.to_revision.clone(),
+            modules: r.modules.clone(),
+            reason: r.reason.clone(),
+            evidence: r.evidence.iter().map(health_result_json).collect(),
+            succeeded: r.succeeded,
+            rollback_error: r.rollback_error.clone(),
+            rollback_outcome: serde_json::from_slice(&r.rollback_outcome_json).ok(),
+        }
+    }
+}
+
+fn health_result_json(x: &pb::HealthResult) -> serde_json::Value {
+    serde_json::json!({
+        "module": x.module,
+        "check": x.check,
+        "kind": x.kind,
+        "required": x.required,
+        "passed": x.passed,
+        "unknown": x.unknown,
+        "reason": x.reason,
+    })
+}
+
 /// What is stored as the host row's `health`.
 #[derive(serde::Serialize)]
 struct HealthView {
@@ -2780,21 +2855,7 @@ impl From<&HealthReport> for HealthView {
     fn from(r: &HealthReport) -> Self {
         Self {
             scope: r.scope,
-            results: r
-                .results
-                .iter()
-                .map(|x| {
-                    serde_json::json!({
-                        "module": x.module,
-                        "check": x.check,
-                        "kind": x.kind,
-                        "required": x.required,
-                        "passed": x.passed,
-                        "unknown": x.unknown,
-                        "reason": x.reason,
-                    })
-                })
-                .collect(),
+            results: r.results.iter().map(health_result_json).collect(),
         }
     }
 }

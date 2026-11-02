@@ -11,6 +11,7 @@ mod audit;
 mod health;
 mod hosts;
 pub mod kv;
+mod reports;
 mod revisions;
 pub mod rollouts;
 mod runs;
@@ -20,6 +21,7 @@ pub use audit::{Audit, AuditFilter, NewAudit};
 pub use health::{HealthEventRecord, HealthEvents};
 pub use hosts::{HostRecord, Hosts, NewHost};
 pub use kv::Kv;
+pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
 pub use runs::{RunRecord, Runs};
@@ -183,6 +185,17 @@ CREATE TABLE apply_events (
     PRIMARY KEY (host, plan_digest, step)
 );
 "#,
+    // 2: durable agent reports (ApplyResult, LocalRollback) seen per host, so
+    // a report the agent re-sends after a reconnect is stored once.
+    r#"
+CREATE TABLE agent_reports (
+    host TEXT NOT NULL,
+    report_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (host, report_id)
+);
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.
@@ -251,6 +264,11 @@ impl<'c> Db<'c> {
     /// Apply runs per host.
     pub fn runs(&self) -> Runs<'c> {
         Runs::new(self.conn)
+    }
+
+    /// Durable agent reports already stored.
+    pub fn reports(&self) -> AgentReports<'c> {
+        AgentReports::new(self.conn)
     }
 }
 

@@ -466,12 +466,26 @@ async fn local_rollback_triggers_when_cut_off_with_failing_health() {
     assert!(rollback.reason.contains("m/api"), "{}", rollback.reason);
     assert!(!rollback.evidence.is_empty());
     assert!(rollback.evidence.iter().all(|e| !e.passed && e.required));
-    assert!(
-        Store::new(h.state_dir())
+    assert!(rollback.succeeded);
+    assert!(rollback.report_id > 0);
+    // Kept until the server acknowledges it.
+    let store = Store::new(h.state_dir());
+    let kept = |store: &Store| {
+        store
             .load_agent_state()
-            .pending_rollbacks
-            .is_empty()
-    );
+            .unacked_reports
+            .iter()
+            .any(|r| r.report_id() == rollback.report_id)
+    };
+    assert!(kept(&store));
+    session
+        .send(pb::server_message::Msg::Ack(pb::Ack {
+            report_ids: vec![rollback.report_id],
+        }))
+        .await;
+    while kept(&store) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     h.stop().await.expect("clean exit");
 }
 
@@ -485,7 +499,13 @@ async fn local_rollback_does_not_trigger_when_health_is_fine() {
         state.watchdog, None,
         "the window passed and the watchdog disarmed"
     );
-    assert!(state.pending_rollbacks.is_empty());
+    assert!(
+        state
+            .unacked_reports
+            .iter()
+            .all(|r| matches!(r, crate::transport::DurableReport::ApplyResult { .. })),
+        "no local rollback was recorded"
+    );
     h.stop().await.expect("clean exit");
 }
 
@@ -622,12 +642,16 @@ async fn a_restart_mid_window_resumes_the_watchdog() {
         elapsed >= Duration::from_secs(179) && elapsed < Duration::from_secs(300),
         "{elapsed:?}"
     );
-    let pending = Store::new(h.state_dir())
-        .load_agent_state()
-        .pending_rollbacks;
+    let pending = Store::new(h.state_dir()).load_agent_state().unacked_reports;
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].to, rev("stable1"));
-    assert!(pending[0].succeeded);
+    match &pending[0] {
+        crate::transport::DurableReport::LocalRollback(record) => {
+            assert_eq!(record.to, rev("stable1"));
+            assert!(record.succeeded);
+            assert!(record.report_id > 0);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
     h.join_after_shutdown().await;
 }
 

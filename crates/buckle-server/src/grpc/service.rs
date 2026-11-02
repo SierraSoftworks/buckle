@@ -5,14 +5,14 @@ use super::tls::ServerIdentity;
 use crate::clock::Clock;
 use crate::config::{AgentAuth, AgentsConfig, Registration};
 use crate::events::EventBus;
-use crate::rollout::{Connected, ControllerHandle, Sessions};
+use crate::rollout::{Connected, ControllerHandle, HostLink, Sessions};
 use crate::secrets::ServerSecrets;
 use crate::source::cache::RevisionCache;
 use crate::store::{HealthEventRecord, NewAudit, NewHost, RunRecord, Store};
 use buckle_api::{Connection as LinkState, HealthSummary, HostStatus, LiveEvent};
 use buckle_proto::v1::fleet_server::{Fleet, FleetServer};
 use buckle_proto::v1::{
-    AgentMessage, Chunk, FetchBlobRequest, FetchRevisionRequest, FetchSecretsRequest, Hello,
+    Ack, AgentMessage, Chunk, FetchBlobRequest, FetchRevisionRequest, FetchSecretsRequest, Hello,
     Rejected, SecretBundle, ServerMessage, Welcome, agent_message, server_message,
 };
 use futures::{Stream, StreamExt};
@@ -386,16 +386,36 @@ impl FleetService {
         }
     }
 
+    /// Acknowledges durable reports the store has committed.
+    fn ack(&self, host: &str, report_ids: Vec<u64>) {
+        self.sessions.send(
+            host,
+            ServerMessage {
+                msg: Some(server_message::Msg::Ack(Ack { report_ids })),
+            },
+        );
+    }
+
     async fn route(&self, host: &str, msg: agent_message::Msg) {
         let now = self.now();
         let h = host.to_owned();
-        let stored = match &msg {
+        // Durable reports (ApplyResult, LocalRollback) carry a report id the
+        // agent keeps until acknowledged; it re-sends them after every
+        // Welcome, so only their first arrival has effects. `first` is
+        // `Ok(true)` for every first arrival (and every other message).
+        let durable_id = match &msg {
+            agent_message::Msg::Result(r) if r.report_id != 0 => Some(r.report_id),
+            agent_message::Msg::Rollback(lr) if lr.report_id != 0 => Some(lr.report_id),
+            _ => None,
+        };
+        let stored: buckle_core::Result<bool> = match &msg {
             agent_message::Msg::Facts(f) => {
                 let facts: serde_json::Value =
                     serde_json::from_slice(&f.json).unwrap_or(serde_json::Value::Null);
                 self.store
                     .call(move |db| db.hosts().record_facts(&h, &facts, now))
                     .await
+                    .map(|()| true)
             }
             agent_message::Msg::Heartbeat(hb) => {
                 let applied = hb.applied_revision.clone();
@@ -408,6 +428,7 @@ impl FleetService {
                         Ok(())
                     })
                     .await
+                    .map(|()| true)
             }
             agent_message::Msg::Plan(p) => {
                 let digest = p.digest.clone();
@@ -420,6 +441,7 @@ impl FleetService {
                         }
                     })
                     .await
+                    .map(|()| true)
             }
             agent_message::Msg::Apply(e) => {
                 let event = String::from_utf8_lossy(&e.event_json).into_owned();
@@ -437,6 +459,7 @@ impl FleetService {
                 self.store
                     .call(move |db| db.runs().record_event(&h, &digest, &step, &event, now))
                     .await
+                    .map(|()| true)
             }
             agent_message::Msg::Result(r) => {
                 let duration = r
@@ -463,12 +486,19 @@ impl FleetService {
                 let applied = (r.succeeded && !r.applied_revision.is_empty())
                     .then(|| r.applied_revision.clone());
                 self.store
-                    .call(move |db| {
+                    .transaction(move |db| {
+                        if let Some(id) = durable_id
+                            && !db
+                                .reports()
+                                .first_arrival(&run.host, id, "apply_result", now)?
+                        {
+                            return Ok(false);
+                        }
                         db.runs().add(&run)?;
                         if let Some(a) = applied {
                             db.hosts().set_applied_revision(&run.host, &a)?;
                         }
-                        Ok(())
+                        Ok(true)
                     })
                     .await
             }
@@ -516,6 +546,7 @@ impl FleetService {
                         db.hosts().set_health(&h, summary, now)
                     })
                     .await
+                    .map(|()| true)
             }
             agent_message::Msg::Drift(d) => {
                 let drifted =
@@ -523,35 +554,59 @@ impl FleetService {
                 self.store
                     .call(move |db| db.hosts().set_drifted(&h, drifted))
                     .await
+                    .map(|()| true)
             }
             agent_message::Msg::Rollback(lr) => {
                 let to = lr.to_revision.clone();
-                let r = self
+                let kind = if lr.modules.is_empty() {
+                    "local_rollback"
+                } else {
+                    "module_rollback"
+                };
+                let first = self
                     .store
-                    .call(move |db| {
-                        if to.is_empty() {
-                            Ok(())
-                        } else {
-                            db.hosts().set_applied_revision(&h, &to)
+                    .transaction(move |db| {
+                        if let Some(id) = durable_id
+                            && !db.reports().first_arrival(&h, id, kind, now)?
+                        {
+                            return Ok(false);
                         }
+                        // A module rollback leaves the host on the revision
+                        // it was applying (that module back on stable).
+                        if !to.is_empty() && kind == "local_rollback" {
+                            db.hosts().set_applied_revision(&h, &to)?;
+                        }
+                        Ok(true)
                     })
                     .await;
-                self.audit(
-                    host,
-                    "host.local_rollback",
-                    host,
-                    format!(
-                        "{host} rolled itself back from {} to {}: {}",
-                        lr.from_revision, lr.to_revision, lr.reason
-                    ),
-                )
-                .await;
-                r
+                if matches!(first, Ok(true)) {
+                    self.audit(
+                        host,
+                        &format!("host.{kind}"),
+                        host,
+                        rollback_message(host, lr),
+                    )
+                    .await;
+                }
+                first
             }
-            agent_message::Msg::Hello(_) => Ok(()),
+            agent_message::Msg::Hello(_) => Ok(true),
         };
-        if let Err(e) = stored {
-            tracing::warn!(buckle.host = %host, error = %e, "an agent report could not be stored");
+        match &stored {
+            Err(e) => {
+                tracing::warn!(buckle.host = %host, error = %e, "an agent report could not be stored");
+            }
+            Ok(first) => {
+                if let Some(id) = durable_id {
+                    // Committed (now or on an earlier arrival): the agent
+                    // may forget it.
+                    self.ack(host, vec![id]);
+                    if !first {
+                        tracing::debug!(buckle.host = %host, report = id, "ignoring a report already stored");
+                        return;
+                    }
+                }
+            }
         }
         // A drift pass with an empty digest found nothing; only a real
         // drift is worth telling the UI about.
@@ -574,6 +629,36 @@ impl FleetService {
         if notify_ui {
             self.publish_host(host).await;
         }
+    }
+}
+
+/// The audit message for a local or module rollback, with the rollback's own
+/// result when it failed (the host then needs attention).
+fn rollback_message(host: &str, lr: &buckle_proto::v1::LocalRollback) -> String {
+    let what = if lr.modules.is_empty() {
+        format!(
+            "{host} rolled itself back from {} to {}",
+            lr.from_revision, lr.to_revision
+        )
+    } else {
+        format!(
+            "{host} rolled module(s) {} back to {}",
+            lr.modules.join(", "),
+            lr.to_revision
+        )
+    };
+    if lr.succeeded {
+        format!("{what}: {}", lr.reason)
+    } else {
+        format!(
+            "{what}: {}; the rollback itself failed ({}); the host needs attention",
+            lr.reason,
+            if lr.rollback_error.is_empty() {
+                "no detail"
+            } else {
+                lr.rollback_error.as_str()
+            }
+        )
     }
 }
 

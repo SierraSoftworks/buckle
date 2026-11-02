@@ -107,6 +107,10 @@ message ApplyResult {
   bytes outcome_json = 12;
   // Checks that failed (module/check), for the operator's continue decision.
   repeated string failed_checks = 13;
+  // Monotonic per agent. The agent keeps the result until the server
+  // acknowledges this id (Ack) and re-sends it after every Welcome; the
+  // server stores it once per (host, report_id). 0 from older agents.
+  uint64 report_id = 14;
 }
 
 enum HealthScope {
@@ -156,7 +160,19 @@ message LocalRollback {
   google.protobuf.Timestamp at = 4;
   // Modules re-applied, or empty for a whole-revision rollback.
   repeated string modules = 5;
+  // The failing checks that justified the rollback.
   repeated HealthResult evidence = 6;
+  // Whether the rollback apply itself succeeded. When it did not, the host
+  // needs attention and both results (the failure and the rollback's) are
+  // recorded.
+  bool succeeded = 7;
+  // Durable like ApplyResult.report_id: kept until acknowledged.
+  uint64 report_id = 8;
+  // The rollback apply's own error, when it failed.
+  string rollback_error = 9;
+  // The rollback apply's buckle_core::engine::ApplyOutcome as JSON (its
+  // module results and health), when it ran.
+  bytes rollback_outcome_json = 10;
 }
 
 // ---------------------------------------------------------------- server → agent
@@ -172,7 +188,14 @@ message ServerMessage {
     Ping ping = 7;
     Upgrade upgrade = 8;
     Rejected rejected = 9;
+    Ack ack = 10;
   }
+}
+
+// The server stored these durable reports (ApplyResult, LocalRollback) in a
+// committed transaction; the agent may forget them.
+message Ack {
+  repeated uint64 report_ids = 1;
 }
 
 message Welcome {

@@ -9,7 +9,7 @@
 //! | `revisions/<id>/` | extracted revision trees (the stable one is kept for local rollback) |
 //! | `secrets/<id>.cbor` | the secrets scoped to this host for a revision (0600) |
 
-use crate::transport::LocalRollbackRecord;
+use crate::transport::{DurableReport, LocalRollbackRecord};
 use crate::watchdog::WatchdogState;
 use buckle_core::error::HumanizableResult;
 use buckle_core::plan::RevisionId;
@@ -52,9 +52,69 @@ pub struct AgentState {
     /// The armed local rollback watchdog, if any.
     #[serde(default)]
     pub watchdog: Option<WatchdogState>,
-    /// Local rollbacks not yet reported to a server.
+    /// The last durable report id handed out (0: none yet).
     #[serde(default)]
+    pub last_report_id: u64,
+    /// Durable reports (apply results, local and module rollbacks) the
+    /// server has not acknowledged yet, oldest first. Re-sent after every
+    /// Welcome.
+    #[serde(default)]
+    pub unacked_reports: Vec<DurableReport>,
+    /// Local rollbacks recorded by older agents; moved into
+    /// `unacked_reports` on load.
+    #[serde(default, skip_serializing)]
     pub pending_rollbacks: Vec<LocalRollbackRecord>,
+}
+
+/// How many unacknowledged reports are kept; the oldest go first.
+pub const MAX_UNACKED_REPORTS: usize = 64;
+
+impl AgentState {
+    /// A fresh durable report id. Ids increase monotonically; the first one is
+    /// seeded from the clock so a wiped agent.json does not reuse ids the
+    /// server has already stored for this host.
+    pub fn next_report_id(&mut self) -> u64 {
+        if self.last_report_id == 0 {
+            // Milliseconds × 1000 leaves room for a thousand reports per
+            // millisecond of uptime before a re-seeded id could collide.
+            self.last_report_id =
+                (chrono::Utc::now().timestamp_millis().max(1) as u64).saturating_mul(1000);
+        }
+        self.last_report_id += 1;
+        self.last_report_id
+    }
+
+    /// Records a durable report until it is acknowledged, dropping the oldest
+    /// beyond [`MAX_UNACKED_REPORTS`].
+    pub fn keep_report(&mut self, report: DurableReport) {
+        self.unacked_reports.push(report);
+        if self.unacked_reports.len() > MAX_UNACKED_REPORTS {
+            let drop = self.unacked_reports.len() - MAX_UNACKED_REPORTS;
+            tracing::warn!(
+                dropped = drop,
+                "too many unacknowledged reports; forgetting the oldest"
+            );
+            self.unacked_reports.drain(..drop);
+        }
+    }
+
+    /// Forgets acknowledged reports; `true` when any was removed.
+    pub fn acknowledge(&mut self, ids: &[u64]) -> bool {
+        let before = self.unacked_reports.len();
+        self.unacked_reports
+            .retain(|r| !ids.contains(&r.report_id()));
+        before != self.unacked_reports.len()
+    }
+
+    /// Moves local rollbacks recorded by older agents into the durable queue.
+    pub fn migrate_legacy(&mut self) {
+        for mut record in std::mem::take(&mut self.pending_rollbacks) {
+            if record.report_id == 0 {
+                record.report_id = self.next_report_id();
+            }
+            self.keep_report(DurableReport::LocalRollback(record));
+        }
+    }
 }
 
 /// Writes `bytes` to `path` atomically with mode 0600.

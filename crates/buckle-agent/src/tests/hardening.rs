@@ -148,3 +148,119 @@ async fn a_welcome_during_an_apply_keeps_the_stable_revision_and_the_engine_stat
     assert_eq!(fake.applies().len(), 1);
     h.stop().await.expect("clean exit");
 }
+
+/// A harness whose runner pauses every apply until released.
+async fn gated(fake: Arc<FakeRunner>) -> (Harness, Arc<StateWritingRunner>) {
+    let slot: Arc<std::sync::Mutex<Option<Arc<StateWritingRunner>>>> = Arc::default();
+    let (inner, built) = (fake.clone(), slot.clone());
+    let h = Harness::start(Setup {
+        runner: fake,
+        custom_runner: Some(Box::new(move |dir: &Path| {
+            let runner = Arc::new(StateWritingRunner {
+                inner,
+                state: FileStateStore::new(dir.join("state.cbor")),
+                started: Notify::new(),
+                release: Notify::new(),
+            });
+            *built.lock().expect("lock") = Some(runner.clone());
+            runner
+        })),
+        ..Default::default()
+    })
+    .await;
+    let runner = slot.lock().expect("lock").clone().expect("built");
+    (h, runner)
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_apply_result_without_a_session_is_delivered_on_the_next_one_until_acked() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    let (mut h, runner) = gated(fake.clone()).await;
+
+    let mut first = h.sessions.accept().await;
+    first.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    first.send(assign("rev1", &digest)).await;
+    first
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    runner.started.notified().await;
+    // The server goes away mid-apply; the result has nowhere to go.
+    h.fleet.set_unreachable(true);
+    first.close();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    runner.release.notify_one();
+    let store = Store::new(h.state_dir());
+    wait_until(|| !store.load_agent_state().unacked_reports.is_empty()).await;
+
+    // The next session gets it after Welcome.
+    h.fleet.set_unreachable(false);
+    let mut second = h.sessions.accept().await;
+    assert_eq!(second.hello.applied_revision, "rev1");
+    second.send(welcome(None, None)).await;
+    let result = second.expect(apply_result).await;
+    assert!(result.succeeded);
+    assert_eq!(result.revision, "rev1");
+    assert!(result.report_id > 0);
+
+    // Not acknowledged: the session after that gets the same report again.
+    second.close();
+    let mut third = h.sessions.accept().await;
+    third.send(welcome(None, None)).await;
+    let again = third.expect(apply_result).await;
+    assert_eq!(
+        again.report_id, result.report_id,
+        "same id, so the server can dedupe"
+    );
+    third
+        .send(pb::server_message::Msg::Ack(pb::Ack {
+            report_ids: vec![again.report_id],
+        }))
+        .await;
+    wait_until(|| store.load_agent_state().unacked_reports.is_empty()).await;
+
+    // Acknowledged: never sent again.
+    third.close();
+    let mut fourth = h.sessions.accept().await;
+    fourth.send(welcome(None, None)).await;
+    let until_heartbeat = fourth
+        .collect_until(|m| matches!(m, pb::agent_message::Msg::Heartbeat(_)))
+        .await;
+    assert!(
+        until_heartbeat
+            .iter()
+            .all(|(_, m)| apply_result(m).is_none()),
+        "an acknowledged result is not re-sent"
+    );
+    assert_eq!(fake.applies().len(), 1);
+    h.stop().await.expect("clean exit");
+}
+
+#[test]
+fn local_rollbacks_from_older_agents_become_durable_reports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("agent.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "pending_rollbacks": [{
+                "from": "rev1", "to": "stable1", "reason": "cut off",
+                "modules": [], "evidence": [], "at": "2026-01-01T00:00:00Z",
+                "succeeded": true
+            }]
+        }))
+        .expect("json"),
+    )
+    .expect("write");
+    let mut state = Store::new(dir.path()).load_agent_state();
+    state.migrate_legacy();
+    assert!(state.pending_rollbacks.is_empty());
+    assert_eq!(state.unacked_reports.len(), 1);
+    let id = state.unacked_reports[0].report_id();
+    assert!(id > 0);
+    assert!(state.next_report_id() > id, "ids keep increasing");
+}

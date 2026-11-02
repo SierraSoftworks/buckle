@@ -73,6 +73,11 @@ pub struct RolloutHost {
     /// (never approved, or the plan changed after approval).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_approval: bool,
+    /// A rollback the host ran on its own (local or module-scoped) failed:
+    /// the original failure and the rollback's own result are both in
+    /// `error` (and the stored result), and an operator must look.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_attention: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

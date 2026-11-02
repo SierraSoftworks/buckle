@@ -278,6 +278,9 @@ pub struct HostRuntime {
     /// The phase index the host belongs to (stragglers use `usize::MAX` → None).
     #[serde(default)]
     pub phase_index: Option<usize>,
+    /// A rollback the host ran on its own failed; both results are recorded.
+    #[serde(default)]
+    pub needs_attention: bool,
 }
 
 /// One `rollout_hosts` row.
