@@ -184,6 +184,19 @@ async fn a_hosts_run_report_follows_the_rollout_live_and_ends_with_a_structured_
             .all(|p| p.run_id == run_id && p.rollout_id.as_deref() == Some(id.as_str())),
         "every update of a rollout's run names the rollout: {progress:#?}"
     );
+    let failed_row = sse.events().into_iter().find_map(|e| match e {
+        buckle_api::LiveEvent::RolloutHostChanged { host, .. }
+            if host.host == "rep-1" && host.state == HostRolloutState::Failed =>
+        {
+            Some(host)
+        }
+        _ => None,
+    });
+    assert_eq!(
+        failed_row.and_then(|h| h.run_id),
+        Some(run_id.clone()),
+        "live rollout host rows name their run"
+    );
     assert!(
         progress.iter().any(
             |p| p.step.as_deref().is_some_and(|s| s.contains("slow-step"))
