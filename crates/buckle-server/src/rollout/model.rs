@@ -284,6 +284,11 @@ pub struct HostRuntime {
     /// How often the Apply was re-sent after reconnects without being run.
     #[serde(default)]
     pub apply_resends: u32,
+    /// How often the agent refused the approved Apply because its fresh plan
+    /// differed (a non-deterministic plan); reset once an Apply is accepted
+    /// or an operator re-plans.
+    #[serde(default)]
+    pub stale_refusals: u32,
     /// An operator retried or continued this host: it may proceed while the
     /// rollout is paused by a failure (never under an operator's pause).
     /// Cleared when the host finishes.

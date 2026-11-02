@@ -44,6 +44,10 @@ pub struct ControllerOptions {
 /// How often an Apply is re-sent to a host that reconnects without having
 /// run it before the host is failed instead.
 const MAX_APPLY_RESENDS: u32 = 3;
+/// How often an agent may refuse the approved Apply as stale (its fresh plan
+/// differs) before the host fails: a plan that changes on every attempt
+/// would otherwise cycle planned → applying → planned forever.
+pub(super) const MAX_STALE_REFUSALS: u32 = 3;
 
 /// The task selector of every RequestPlan (rollouts plan whole revisions),
 /// echoed in the Apply so the agent re-plans exactly what was approved.
@@ -1159,9 +1163,41 @@ impl Controller {
             // whose error starts with "stale plan". The host returns to
             // planned with the new digest (re-approval where required).
             let stale = plan.error.starts_with("stale plan") && !plan.digest.is_empty();
+            let mut stale_error = None;
             if stale && matches!(h.state, HostPhase::Applying | HostPhase::Baseline) {
-                self.live[ri].hosts[hi].runtime.applied = false;
-                self.live[ri].hosts[hi].state = HostPhase::PlanPending;
+                let approved = h.plan_digest.clone().unwrap_or_default();
+                let refusals = h.runtime.stale_refusals + 1;
+                let phase_index = h.runtime.phase_index;
+                // The host never applied: its slot in the wave is given back,
+                // as when it is deferred, so wave numbers count real waves.
+                if let Some(pi) = phase_index
+                    && let Some(p) = self.live[ri].record.runtime.phases.get_mut(pi)
+                {
+                    p.started = p.started.saturating_sub(1);
+                    self.live[ri].dirty = true;
+                }
+                let h = &mut self.live[ri].hosts[hi];
+                h.runtime.stale_refusals = refusals;
+                h.runtime.applied = false;
+                h.runtime.request_id = None;
+                h.runtime.apply_started_at = None;
+                let message = format!(
+                    "stale plan: the approved plan was {approved} but the host now plans {}",
+                    plan.digest
+                );
+                if refusals >= MAX_STALE_REFUSALS {
+                    let error = format!(
+                        "{message}; the plan changed on {refusals} apply attempts \
+                         and is not deterministic"
+                    );
+                    h.plan_digest = Some(plan.digest.clone());
+                    h.plan = serde_json::from_slice(&plan.plan_json).ok();
+                    h.runtime.error = Some(error.clone());
+                    self.fail_host(ri, hi, &error);
+                    continue;
+                }
+                h.state = HostPhase::PlanPending;
+                stale_error = Some(message);
             } else if !matches!(h.state, HostPhase::PlanPending | HostPhase::Planned) {
                 continue;
             }
@@ -1191,16 +1227,25 @@ impl Controller {
                 h.runtime.failed_checks.clear();
                 h.runtime.failed_module = None;
                 // A valid plan with modules that could not be planned: shown
-                // on the host; applying it fails those modules only.
-                h.runtime.error = (!plan.module_errors.is_empty()).then(|| {
-                    format!(
+                // on the host; applying it fails those modules only. A plan
+                // that replaced a stale one says so, so the host view shows
+                // why it went back to planned.
+                let mut notes: Vec<String> = stale_error.iter().cloned().collect();
+                if !plan.module_errors.is_empty() {
+                    notes.push(format!(
                         "modules that could not be planned: {}",
                         plan.module_errors.join("; ")
-                    )
-                });
+                    ));
+                }
+                h.runtime.error = (!notes.is_empty()).then(|| notes.join("; "));
             }
             self.touch_host(ri, hi);
-            self.set_host_state(ri, hi, HostPhase::Planned, "plan received");
+            let why = if stale_error.is_some() {
+                "plan received; the approved plan was stale"
+            } else {
+                "plan received"
+            };
+            self.set_host_state(ri, hi, HostPhase::Planned, why);
         }
     }
 
@@ -1221,6 +1266,8 @@ impl Controller {
                 {
                     self.live[ri].hosts[hi].result =
                         serde_json::to_value(ResultView::from(&result)).ok();
+                    // The agent accepted and ran the approved plan.
+                    self.live[ri].hosts[hi].runtime.stale_refusals = 0;
                     if result.succeeded {
                         self.start_bake(ri, hi);
                     } else {
@@ -2281,6 +2328,7 @@ impl Controller {
             h.runtime.request_id = None;
             h.runtime.bake_until = None;
             h.runtime.attempts += 1;
+            h.runtime.stale_refusals = 0;
             h.runtime.released = true;
             h.plan_digest = None;
         }
