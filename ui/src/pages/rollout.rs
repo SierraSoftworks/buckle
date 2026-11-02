@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    ApproveRequest, ContinueRequest, HealthResultDto, HostRolloutState, PlanGroup, RolloutDetail,
-    RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
+    ApproveRequest, ContinueRequest, HealthResultDto, HostRolloutState, LiveEvent, PlanGroup,
+    RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -17,7 +17,7 @@ use crate::components::{
     Button, Confirm, Countdown, Empty, ErrorState, Kind, Loading, PageHead, Panel, Pill, Pipeline,
     PlanGroupView, Refresh, RouteLink, TraceLink, use_toast,
 };
-use crate::hooks::{use_fetch, use_live_value, use_now};
+use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
 use crate::logic::format::{count, first_line, relative, short, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{GateKind, GateState, layout};
@@ -26,6 +26,7 @@ use crate::logic::tone::{
     Tone, check_status_tone, host_state_label, host_state_tone, rollout_finished,
     rollout_state_label, rollout_state_tone,
 };
+use crate::store::use_live;
 
 #[derive(Properties, PartialEq)]
 pub struct Props {
@@ -54,6 +55,35 @@ pub fn rollout_page(props: &Props) -> Html {
         |id| async move { api::rollout(&id).await },
     );
     let live = use_live_value(&detail, apply_rollout);
+    // The stream carries host and rollout state, not timeline entries: when
+    // this rollout changes, its detail (and timeline) is fetched again once
+    // the burst of events has settled.
+    let store = use_live();
+    let touched = detail
+        .data
+        .as_ref()
+        .and_then(|d| store.log.since(d.0))
+        .map(|events| {
+            events
+                .iter()
+                .filter(|e| match &***e {
+                    LiveEvent::RolloutChanged { rollout } => rollout.id == props.id,
+                    LiveEvent::RolloutHostChanged { rollout_id, .. } => *rollout_id == props.id,
+                    _ => false,
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let settled = use_debounced(touched, 1_500);
+    {
+        let reload = detail.reload.clone();
+        use_effect_with(settled, move |n| {
+            if *n > 0 {
+                reload.emit(());
+            }
+            || ()
+        });
+    }
     let plans = use_fetch(props.id.clone(), |id| async move {
         api::rollout_plans(&id).await
     });

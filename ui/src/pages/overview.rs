@@ -96,7 +96,7 @@ pub fn overview() -> Html {
 fn tiles(f: &Fleet, now: chrono::DateTime<chrono::Utc>) -> Html {
     let tiles = rollup(&f.hosts);
     html! {
-        <div class="tiles" role="list" aria-label="Fleet health">
+        <div class="tiles" role="group" aria-label="Fleet health">
             { for tiles.into_iter().map(|t| {
                 let tone = match t.bucket {
                     Bucket::Healthy => Tone::Ok,
@@ -123,7 +123,7 @@ fn tiles(f: &Fleet, now: chrono::DateTime<chrono::Utc>) -> Html {
                     </RouteLink>
                 }
             }) }
-            <div class="tile tile--plain" role="listitem">
+            <div class="tile tile--plain">
                 <span class="tile__label">{ "Fleet" }</span>
                 <span class="tile__value">{ f.counts.total }</span>
                 <span class="tile__age">{ format!("{} online · {} paused · {} pending", f.counts.online, f.counts.paused, f.counts.pending) }</span>
@@ -195,7 +195,7 @@ fn recent(
                     </li>
                 }
             }) }
-            if list.len() > 5 { <li class="muted">{ format!("and {} more", count(list.len() - 5, "older revision", "older revisions")) }</li> }
+            if list.len() > 5 { <li class="muted">{ format!("and {}", count(list.len() - 5, "older revision", "older revisions")) }</li> }
         </ul>
     }
 }

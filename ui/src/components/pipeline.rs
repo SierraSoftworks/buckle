@@ -129,7 +129,12 @@ fn column(stage: &Stage, hosts: &BTreeMap<String, HostSummary>, now: DateTime<Ut
     if c.plan_pending > 0 {
         tally.push(format!("{} plan pending", c.plan_pending));
     }
-    let bake = match phase.bake_until {
+    // The phase's own deadline, or while it has none, the latest of its
+    // baking hosts': the stage is baked when its last host is.
+    let until = phase
+        .bake_until
+        .or_else(|| stage.hosts().filter_map(|h| h.bake_until).max());
+    let bake = match until {
         Some(until) if until > now => html! { <Countdown {until} prefix="bake" /> },
         _ if phase.bake_seconds > 0 => {
             html! { <span>{ format!("bake {}", config_duration(phase.bake_seconds)) }</span> }

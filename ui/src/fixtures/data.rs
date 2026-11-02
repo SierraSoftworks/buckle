@@ -1542,6 +1542,11 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         at: now - Duration::minutes(mins),
         rollout_id: rollout.map(Into::into),
     };
+    // The drift readings are the ones the host's health summary was taken from.
+    let read = host
+        .health_at
+        .map(|at| (now - at).num_minutes())
+        .unwrap_or(3);
     let failing = host.health == HealthSummary::Failing;
     let held = host.health == HealthSummary::Held;
     let mut health_results = if pending {
@@ -1555,10 +1560,12 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
                 "http",
                 if failing { "fail" } else { "pass" },
                 failing.then_some("GET http://127.0.0.1:4646/v1/agent/health answered 500"),
-                3,
+                read,
                 None,
             ),
-            check("drift", "nomad", "unit", "systemd", "pass", None, 3, None),
+            check(
+                "drift", "nomad", "unit", "systemd", "pass", None, read, None,
+            ),
             check(
                 "drift",
                 "tailscale",
@@ -1566,7 +1573,7 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
                 "command",
                 "pass",
                 None,
-                3,
+                read,
                 None,
             ),
             check(
@@ -1576,10 +1583,12 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
                 "file",
                 if held { "fail" } else { "pass" },
                 held.then_some("/var/lib/rustic/last-snapshot is 26h old (max_age 25h)"),
-                3,
+                read,
                 None,
             ),
-            check("drift", "common", "metrics", "tcp", "pass", None, 3, None),
+            check(
+                "drift", "common", "metrics", "tcp", "pass", None, read, None,
+            ),
         ]
     };
     match host.id.as_str() {
