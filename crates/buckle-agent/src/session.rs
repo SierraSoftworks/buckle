@@ -196,6 +196,19 @@ fn labels_json(labels: &indexmap::IndexMap<String, String>) -> buckle_core::sele
         .collect()
 }
 
+/// `agent.yaml` vars as JSON values; a value JSON cannot represent is dropped with a warning.
+fn vars_json(vars: &indexmap::IndexMap<String, serde_yaml::Value>) -> buckle_core::selectors::Vars {
+    vars.iter()
+        .filter_map(|(k, v)| match serde_json::to_value(v) {
+            Ok(v) => Some((k.clone(), v)),
+            Err(err) => {
+                tracing::warn!(var = %k, error = %err, "ignoring an agent var that cannot be represented as JSON");
+                None
+            }
+        })
+        .collect()
+}
+
 fn failed_outcome(plan: &Plan, error: &buckle_core::Error, started: Instant) -> ApplyOutcome {
     ApplyOutcome {
         plan_digest: plan.digest.clone(),
@@ -794,7 +807,8 @@ impl Shared {
         force: bool,
     ) -> RunContext {
         let secrets = self.secrets_for(revision).await;
-        let data = self.data.lock().await;
+        let mut data = self.data.lock().await;
+        let stable_revision = self.stable_revision_for(&mut data, revision);
         RunContext {
             host: buckle_core::selectors::HostIdentity {
                 id: self.host_id.clone(),
@@ -806,6 +820,46 @@ impl Shared {
             select,
             waived_checks,
             force,
+            stable_revision,
+            vars: vars_json(&self.config.vars),
+        }
+    }
+
+    /// The cached stable revision to roll a failing module back to, when one is
+    /// known, cached and not the revision being applied. Loads it on first use.
+    fn stable_revision_for(
+        &self,
+        data: &mut Data,
+        revision: &RevisionId,
+    ) -> Option<Arc<buckle_core::engine::Revision>> {
+        let stable = data.stable.clone()?;
+        if &stable == revision {
+            return None;
+        }
+        if let Some(loaded) = data.revisions.get(&stable) {
+            return Some(loaded.clone());
+        }
+        if !self.store.has_revision(&stable) {
+            tracing::debug!(stable = %stable.short(), "stable revision not cached; module rollback disabled for this run");
+            return None;
+        }
+        let dir = match self.store.revision_dir(&stable) {
+            Ok(dir) => dir,
+            Err(err) => {
+                tracing::warn!(error = %err.description(), "could not locate the cached stable revision");
+                return None;
+            }
+        };
+        match buckle_core::engine::loader::load_dir(&dir, stable.clone()) {
+            Ok(loaded) => {
+                let loaded = Arc::new(loaded);
+                data.revisions.insert(stable, loaded.clone());
+                Some(loaded)
+            }
+            Err(err) => {
+                tracing::warn!(stable = %stable.short(), error = %err.description(), "the cached stable revision does not load; module rollback disabled for this run");
+                None
+            }
         }
     }
 

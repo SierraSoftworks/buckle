@@ -261,6 +261,10 @@ impl Task for CommandRun {
         hostkit::clip(&spec.run.display(), 120)
     }
 
+    fn always_runs(spec: &Spec) -> bool {
+        always_runs(spec)
+    }
+
     fn describe(spec: &Spec) -> String {
         if always_runs(spec) {
             format!("always runs: {}", hostkit::clip(&spec.run.display(), 120))

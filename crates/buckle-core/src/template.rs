@@ -70,6 +70,26 @@ impl Templater {
         s.contains("{{") || s.contains("{%")
     }
 
+    /// Compiles `source` without rendering it, reporting syntax errors.
+    pub fn check(&self, source: &str) -> crate::Result<()> {
+        use crate::error::HumanizableResult;
+        self.env
+            .template_from_str(source)
+            .to_human_error()
+            .map(|_| ())
+    }
+
+    /// The dotted variable paths a template reads from its context
+    /// (`vars.nomad_version`, `host.facts.arch`, `secrets.token`), so the
+    /// engine can resolve vars lazily and detect reference cycles.
+    pub fn referenced_paths(&self, source: &str) -> crate::Result<Vec<String>> {
+        use crate::error::HumanizableResult;
+        let template = self.env.template_from_str(source).to_human_error()?;
+        let mut paths: Vec<String> = template.undeclared_variables(true).into_iter().collect();
+        paths.sort();
+        Ok(paths)
+    }
+
     /// Renders with secrets forbidden. For task spec fields.
     pub fn render_plain(&self, source: &str, ctx: &HostContext) -> crate::Result<String> {
         self.render(source, ctx, RenderMode::Plain)
@@ -113,7 +133,8 @@ impl Templater {
         ctx: &HostContext,
         view: SecretsView,
     ) -> crate::Result<String> {
-        use crate::error::HumanizableResult;
+        let mode = view.mode;
+        let touched = view.touched.clone();
         // The JSON context (host, vars, module, task) plus the secrets object.
         let mut map: std::collections::BTreeMap<String, Value> = match ctx.template_json() {
             serde_json::Value::Object(obj) => obj
@@ -125,7 +146,23 @@ impl Templater {
         map.insert("secrets".into(), Value::from_object(view));
         self.env
             .render_str(source, Value::from(minijinja::value::Serde(map)))
-            .to_human_error()
+            .map_err(|e| {
+                // minijinja's error Debug dumps the referenced variables, which
+                // would include secret values: scrub through the secrets module.
+                let err = crate::secrets::redact::template_error(e, &ctx.secrets);
+                if mode == RenderMode::Plain && touched.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::error::wrap_user(
+                        err,
+                        "The template references a secret's value, but this field only accepts plain values.",
+                        &[
+                            "Use the secret in a file template, or in a task field that is declared as secret-capable.",
+                            "`secrets.NAME.present` and `secrets.NAME.fingerprint` are always allowed.",
+                        ],
+                    )
+                } else {
+                    err
+                }
+            })
     }
 }
 
@@ -404,6 +441,17 @@ mod tests {
         assert!(Templater::needs_render("a {{ b }}"));
         assert!(Templater::needs_render("{% if x %}y{% endif %}"));
         assert!(!Templater::needs_render("/etc/plain/path"));
+    }
+
+    #[test]
+    fn referenced_paths_lists_dotted_reads() {
+        let t = Templater::new();
+        let paths = t
+            .referenced_paths("{{ vars.a }}-{{ host.facts.arch }}{% if vars.b.c %}x{% endif %}")
+            .unwrap();
+        assert_eq!(paths, vec!["host.facts.arch", "vars.a", "vars.b.c"]);
+        assert!(t.check("{{ unclosed").is_err());
+        assert!(t.check("{{ fine }}").is_ok());
     }
 
     #[test]
