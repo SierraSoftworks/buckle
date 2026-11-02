@@ -62,4 +62,5 @@ tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 rsa.workspace = true
 actix-http.workspace = true
+buckle-agent.workspace = true
 schemars.workspace = true

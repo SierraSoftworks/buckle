@@ -128,7 +128,7 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
     let identity = grpc::tls::load(&config.listen.tls, &config.data_dir)?;
     match &identity {
         Some(id) => {
-            tracing::info!(fingerprint = %id.fingerprint, "gRPC TLS certificate fingerprint (agents pin this with --ca-fingerprint)")
+            tracing::info!(fingerprint = %format_args!("sha256:{}", id.fingerprint), "gRPC TLS certificate fingerprint (agents pin this with --ca-fingerprint)")
         }
         None => tracing::warn!("the gRPC listener is plaintext (listen.tls.mode: none)"),
     }

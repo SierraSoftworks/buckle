@@ -23,7 +23,7 @@ pub async fn run(args: ServerArgs) -> buckle_core::Result<i32> {
     if args.print_fingerprint {
         return match buckle_server::fingerprint(&config)? {
             Some(fp) => {
-                println!("{fp}");
+                println!("sha256:{fp}");
                 Ok(0)
             }
             None => Err(buckle_core::error::user(
