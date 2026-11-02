@@ -40,6 +40,8 @@ struct Script {
     rollback_modules: Vec<String>,
     /// The apply ends with blocked steps (needs attention).
     apply_blocked: bool,
+    /// Never answer pre-phase gate checks.
+    silent_gate: bool,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -222,7 +224,9 @@ impl Harness {
                     })),
                     SMsg::Health(h) => {
                         let scope = HealthScope::try_from(h.scope).unwrap();
-                        if scope == HealthScope::Baseline && s.silent_baseline {
+                        if scope == HealthScope::Baseline && s.silent_baseline
+                            || scope == HealthScope::Rollout && s.silent_gate
+                        {
                             continue;
                         }
                         let fail = match scope {
@@ -1694,4 +1698,114 @@ async fn host_decisions_do_not_override_an_operator_pause() {
     .unwrap();
     let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
     assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+}
+
+/// A failed pre-phase gate fails the host with the gate's checks, so the
+/// operator's host decisions apply to it; skipping it lets the gate pass on
+/// the remaining hosts instead of re-running on the failing one forever.
+#[rstest::rstest]
+#[case::skip("skip")]
+#[case::continue_waiving("continue")]
+#[case::resume("resume")]
+#[tokio::test(start_paused = true)]
+async fn a_failed_gate_fails_the_host_and_host_decisions_clear_it(#[case] decision: &str) {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        TWO_PHASES.replace(", approval: required", "").as_str(),
+    )
+    .await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.script("c1", |s| s.gate_fail = true);
+    h.connect("c1", None);
+    h.connect("w1", None);
+    let id = h.start("r1").await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    assert_eq!(r.runtime.pause.as_ref().unwrap().kind, "gate");
+    let c1 = host(&hosts, "c1");
+    assert_eq!(c1.state, HostPhase::Failed);
+    assert_eq!(c1.runtime.failed_checks, vec!["web/http"]);
+    assert!(
+        c1.runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("pre-phase gate")
+    );
+    let rollout = id.clone();
+    let note = String::new();
+    let command = match decision {
+        "skip" => Command::Skip {
+            rollout,
+            host: "c1".into(),
+            note,
+        },
+        "continue" => Command::Continue {
+            rollout,
+            host: "c1".into(),
+            waive: vec!["web/http".into()],
+            note,
+        },
+        _ => Command::Resume { rollout, note },
+    };
+    h.command(command).await.unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "w1").state, HostPhase::Healthy);
+    let expected = match decision {
+        "skip" => HostPhase::Skipped,
+        "continue" => HostPhase::Healthy,
+        _ => HostPhase::Failed,
+    };
+    assert_eq!(host(&hosts, "c1").state, expected);
+}
+
+/// A pre-phase gate pending across a restart is re-armed: the check is
+/// re-sent when the host reconnects, and a host that never comes back fails
+/// the gate after the disconnect timeout instead of stalling it for ever.
+#[rstest::rstest]
+#[case::reconnects(true)]
+#[case::stays_away(false)]
+#[tokio::test(start_paused = true)]
+async fn a_restart_with_a_gate_pending_re_arms_it(#[case] reconnects: bool) {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        TWO_PHASES.replace(", approval: required", "").as_str(),
+    )
+    .await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.script("c1", |s| s.silent_gate = true);
+    h.connect("c1", None);
+    h.connect("w1", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "gate pending", |r, _| {
+        r.runtime.phases[0]
+            .gate
+            .as_ref()
+            .is_some_and(|g| g.pending.contains_key("c1"))
+    })
+    .await;
+    h.restart().await;
+    h.script("c1", |s| s.silent_gate = false);
+    h.connect("w1", None);
+    if reconnects {
+        h.connect("c1", Some("r1"));
+        let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+        assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    } else {
+        let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+        assert_eq!(r.runtime.pause.as_ref().unwrap().kind, "gate");
+        let c1 = host(&hosts, "c1");
+        assert_eq!(c1.state, HostPhase::Failed);
+        assert!(
+            c1.runtime
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("disconnected")
+        );
+        assert!(h.applies().iter().all(|a| a.1 == "c1"), "web never started");
+    }
 }

@@ -467,8 +467,17 @@ impl Controller {
             // plan or apply, so they are not taken for offline (and missed)
             // before their agents had a chance to reconnect.
             let mut dirty_hosts = BTreeSet::new();
+            let gate_pending: HashSet<String> = record
+                .runtime
+                .phases
+                .iter()
+                .filter_map(|p| p.gate.as_ref())
+                .flat_map(|g| g.pending.keys().cloned())
+                .collect();
             for (i, h) in hosts.iter_mut().enumerate() {
-                if awaits_reconnect(h.state) && h.runtime.disconnected_at.is_none() {
+                if (awaits_reconnect(h.state) || gate_pending.contains(&h.host))
+                    && h.runtime.disconnected_at.is_none()
+                {
                     h.runtime.disconnected_at = Some(now);
                     dirty_hosts.insert(i);
                 }
@@ -1033,21 +1042,16 @@ impl Controller {
                     }
                     self.live[ri].dirty = true;
                 } else {
-                    self.live[ri].record.runtime.phases[pi].gate = None;
-                    self.live[ri].dirty = true;
-                    if let Some(hi) = self.live[ri].find(host) {
-                        self.live[ri].hosts[hi].runtime.failed_checks = failures.clone();
-                        self.touch_host(ri, hi);
-                    }
-                    self.pause(
-                        ri,
-                        "gate",
-                        format!(
-                            "pre-phase gate after '{phase_name}': {host} is failing {}",
-                            failures.join(", ")
-                        ),
-                        Some(host.to_owned()),
+                    let why = format!(
+                        "pre-phase gate after '{phase_name}': failing {}",
+                        failures.join(", ")
                     );
+                    if let Some(hi) = self.live[ri].find(host) {
+                        self.live[ri].hosts[hi].health =
+                            serde_json::to_value(HealthView::from(&report)).ok();
+                        self.live[ri].hosts[hi].runtime.failed_checks = failures.clone();
+                    }
+                    self.fail_gate(ri, pi, host, &why);
                 }
                 continue;
             }
@@ -2327,14 +2331,9 @@ impl Controller {
                     });
                     if let Some(pi) = gate {
                         let name = self.live[ri].record.runtime.phases[pi].name.clone();
-                        self.live[ri].record.runtime.phases[pi].gate = None;
-                        self.live[ri].dirty = true;
-                        self.pause(
-                            ri,
-                            "gate",
-                            format!("pre-phase gate after '{name}': {host} {why}"),
-                            Some(host.clone()),
-                        );
+                        self.live[ri].hosts[hi].runtime.failed_checks.clear();
+                        let why = format!("pre-phase gate after '{name}': {why}");
+                        self.fail_gate(ri, pi, &host, &why);
                     }
                 }
             }
@@ -2545,6 +2544,21 @@ impl Controller {
             }
         }
         changed
+    }
+
+    /// A host failed (or never answered) the pre-phase gate of phase `p`: it
+    /// is failed with the gate's checks, so retry, continue and skip apply to
+    /// it and a resume does not re-run the same gate on it, and the rollout
+    /// pauses naming it.
+    fn fail_gate(&mut self, ri: usize, p: usize, host: &str, why: &str) {
+        self.live[ri].record.runtime.phases[p].gate = None;
+        self.live[ri].dirty = true;
+        if let Some(hi) = self.live[ri].find(host) {
+            self.live[ri].hosts[hi].runtime.error = Some(why.to_owned());
+            self.live[ri].hosts[hi].runtime.disconnected_at = None;
+            self.set_host_state(ri, hi, HostPhase::Failed, why);
+        }
+        self.pause(ri, "gate", format!("{host}: {why}"), Some(host.to_owned()));
     }
 
     fn start_gate(&mut self, ri: usize, p: usize) {
