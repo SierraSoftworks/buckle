@@ -76,6 +76,17 @@ pub async fn refresh_session() -> Result<(), ()> {
         .await
 }
 
+/// The server ended the event stream because the session no longer passes:
+/// renew it from the refresh cookie if possible (`true`: carry on), and
+/// otherwise go to sign in, coming back here.
+pub async fn session_ended() -> bool {
+    if refresh_session().await.is_ok() {
+        return true;
+    }
+    begin_login();
+    false
+}
+
 /// Where the browser is now, to come back to after signing in.
 pub fn here() -> String {
     let location = window().location();

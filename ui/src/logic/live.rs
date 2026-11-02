@@ -147,13 +147,20 @@ pub enum Frame {
     Event(Box<LiveEvent>),
     /// The server dropped events for this client: everything must be refetched.
     Lagged,
+    /// The session the stream was opened with no longer passes (expired,
+    /// signed out, or refused by the ACLs as they are now); the server has
+    /// closed the stream.
+    SessionEnded,
 }
 
 /// Decodes one SSE frame. The payload's own `type` tag decides the variant;
-/// the event name only distinguishes the out-of-band `lagged` signal.
+/// the event name only distinguishes the out-of-band `lagged` and
+/// `session_ended` signals.
 pub fn decode(name: &str, data: &str) -> Result<Frame, String> {
-    if name == "lagged" {
-        return Ok(Frame::Lagged);
+    match name {
+        "lagged" => return Ok(Frame::Lagged),
+        "session_ended" => return Ok(Frame::SessionEnded),
+        _ => {}
     }
     serde_json::from_str::<LiveEvent>(data)
         .map(|e| Frame::Event(Box::new(e)))
@@ -170,6 +177,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "revision_added",
     "audit",
     "lagged",
+    "session_ended",
     "message",
 ];
 
@@ -551,6 +559,8 @@ mod tests {
             other => panic!("expected a host change, got {other:?}"),
         }
         assert_eq!(decode("lagged", "{}"), Ok(Frame::Lagged));
+        assert_eq!(decode("session_ended", "{}"), Ok(Frame::SessionEnded));
+        assert!(EVENT_NAMES.contains(&"session_ended"));
         assert!(decode("host_changed", "{not json").is_err());
     }
 

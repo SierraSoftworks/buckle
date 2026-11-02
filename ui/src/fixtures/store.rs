@@ -147,6 +147,9 @@ pub fn me() -> Result<Option<Me>, ApiError> {
 }
 
 pub fn refresh() -> Result<(), ApiError> {
+    if flag("session").as_deref() == Some("ended") {
+        return Err(ApiError::Unauthorized);
+    }
     match flag("auth").as_deref() {
         Some("expired") => Err(ApiError::Unauthorized),
         _ => Ok(()),

@@ -42,6 +42,15 @@ describe("session", () => {
     await close();
   });
 
+  test("an event stream the server ends for the session goes to sign in", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "session=ended", allowErrors: true });
+    await page.locator("main h1").waitFor();
+    await page.waitForURL(/\/api\/v1\/auth\/login\?/);
+    const target = new URL(page.url());
+    assert.equal(target.searchParams.get("return_to"), "/rollouts/42?demo&session=ended");
+    await close();
+  });
+
   test("a server without sign-in permits everything and says so", async () => {
     const { page, close } = await open("/rollouts/42", { flags: "auth=off" });
     await page.getByText("no sign-in", { exact: true }).waitFor();
