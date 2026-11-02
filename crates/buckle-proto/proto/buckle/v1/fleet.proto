@@ -97,6 +97,26 @@ message ApplyEvent {
   google.protobuf.Timestamp at = 3;
   // buckle_core::engine::ApplyEvent as JSON.
   bytes event_json = 4;
+  // The module the event is about, when it is about one.
+  string module = 5;
+  // The step's id within the module (`kind[key]`, or `owner:handler` for a
+  // handler), when the event is about a step. Empty from older agents.
+  string step_id = 6;
+  // The state the event leaves the step in: running, changed, unchanged,
+  // failed, blocked or skipped. Empty when the event is not about a step.
+  string step_state = 7;
+  // The step's error, structured, when it failed.
+  ErrorDetail error = 8;
+}
+
+// A structured error: what went wrong, the causes beneath it (outermost
+// first) and what to try, so that no reader has to parse a dumped string.
+message ErrorDetail {
+  // "user" or "system".
+  string kind = 1;
+  string message = 2;
+  repeated string causes = 3;
+  repeated string advice = 4;
 }
 
 message ApplyResult {
@@ -122,6 +142,9 @@ message ApplyResult {
   // Nothing failed outright but steps stayed blocked: the revision is not
   // fully applied and nothing was rolled back; an operator must look.
   bool needs_attention = 15;
+  // The run-level error (not a module's), structured. Module and step
+  // errors are in outcome_json.
+  ErrorDetail error_detail = 16;
 }
 
 enum HealthScope {

@@ -53,6 +53,10 @@ impl std::fmt::Debug for FleetService {
     }
 }
 
+/// The largest agent message the server decodes (tonic's default is 4 MiB):
+/// an ApplyResult of a host with thousands of steps must still arrive whole.
+pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Serves `service` on `listener` until `cancel` trips.
 pub async fn serve(
     service: FleetService,
@@ -76,7 +80,9 @@ pub async fn serve(
     }
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     builder
-        .add_service(FleetServer::new(service))
+        // An ApplyResult carries the whole outcome (every module and step) and
+        // is the authoritative record of a run: never refuse one for its size.
+        .add_service(FleetServer::new(service).max_decoding_message_size(MAX_AGENT_MESSAGE_BYTES))
         .serve_with_incoming_shutdown(incoming, cancel.cancelled_owned())
         .await
         .map_err(|e| {
@@ -603,21 +609,41 @@ impl FleetService {
             }
             agent_message::Msg::Apply(e) => {
                 let event = String::from_utf8_lossy(&e.event_json).into_owned();
-                let parsed: serde_json::Value = serde_json::from_str(&event).unwrap_or_default();
-                let step = format!(
-                    "{}/{}",
-                    parsed["module"].as_str().unwrap_or(""),
-                    parsed["task_id"]
-                        .as_str()
-                        .or(parsed["check"].as_str())
-                        .unwrap_or(parsed["event"].as_str().unwrap_or(""))
-                );
-                tracing::debug!(buckle.host = %host, step = %step, event = %event, "apply event");
-                let digest = e.plan_digest.clone();
-                self.store
-                    .call(move |db| db.runs().record_event(&h, &digest, &step, &event, now))
-                    .await
-                    .map(|()| true)
+                let parsed: Option<buckle_core::engine::ApplyEvent> =
+                    serde_json::from_str(&event).ok();
+                let key = match &parsed {
+                    Some(ev) => crate::views::event_key(ev),
+                    None => format!("raw:{}/{}", e.module, e.step_id),
+                };
+                let module = (!e.module.is_empty()).then(|| e.module.clone());
+                let step_id = (!e.step_id.is_empty()).then(|| e.step_id.clone());
+                let state = (!e.step_state.is_empty()).then(|| e.step_state.clone());
+                tracing::debug!(buckle.host = %host, key = %key, event = %event, "apply event");
+                let (digest, revision) = (e.plan_digest.clone(), e.revision.clone());
+                let run = self
+                    .store
+                    .transaction(move |db| {
+                        let run = open_run(db, &h, &revision, &digest, now)?;
+                        db.runs().record_event(
+                            &run.id,
+                            &key,
+                            module.as_deref(),
+                            step_id.as_deref(),
+                            state.as_deref(),
+                            &event,
+                            now,
+                        )?;
+                        Ok(run)
+                    })
+                    .await;
+                run.map(|run| {
+                    if let Some(event) = &parsed {
+                        self.events.publish(LiveEvent::RunProgress {
+                            progress: crate::views::progress(&run, event, now),
+                        });
+                    }
+                    true
+                })
             }
             agent_message::Msg::Result(r) => {
                 let duration = r
@@ -628,7 +654,10 @@ impl FleetService {
                             + chrono::Duration::nanoseconds(d.nanos as i64)
                     })
                     .unwrap_or_default();
+                let outcome: Option<buckle_core::engine::ApplyOutcome> =
+                    serde_json::from_slice(&r.outcome_json).ok();
                 let run = RunRecord {
+                    id: String::new(),
                     host: h.clone(),
                     rollout: None,
                     revision: r.revision.clone(),
@@ -647,6 +676,8 @@ impl FleetService {
                     removals: r.removals,
                     error: (!r.error.is_empty()).then(|| r.error.clone()),
                     trace_id: None,
+                    outcome_json: (!r.outcome_json.is_empty())
+                        .then(|| String::from_utf8_lossy(&r.outcome_json).into_owned()),
                 };
                 let applied = (r.succeeded && !r.applied_revision.is_empty())
                     .then(|| r.applied_revision.clone());
@@ -656,28 +687,38 @@ impl FleetService {
                         crate::rollout::encode_pending_report(host, id, &msg),
                     )
                 });
-                self.store
+                let stored = self
+                    .store
                     .transaction(move |db| {
                         if let Some(id) = durable_id
                             && !db
                                 .reports()
                                 .first_arrival(&run.host, id, "apply_result", now)?
                         {
-                            return Ok(false);
+                            return Ok(None);
                         }
                         // Kept until the controller has saved its reaction
                         // (replayed at start-up otherwise).
                         if let Some((key, value)) = &pending {
                             db.kv().set(key, value)?;
                         }
-                        db.runs().add(&run)?;
+                        let run = finish_run(db, run)?;
                         if let Some(a) = applied {
                             db.hosts().set_applied_revision(&run.host, &a)?;
                             db.drift().clear(&run.host)?;
                         }
-                        Ok(true)
+                        Ok(Some(run))
                     })
-                    .await
+                    .await;
+                stored.map(|run| match run {
+                    Some(run) => {
+                        self.events.publish(LiveEvent::RunProgress {
+                            progress: crate::views::finished_progress(&run, outcome.as_ref()),
+                        });
+                        true
+                    }
+                    None => false,
+                })
             }
             agent_message::Msg::Health(report) => {
                 let scope = buckle_proto::v1::HealthScope::try_from(report.scope)
@@ -815,6 +856,77 @@ impl FleetService {
             self.publish_host(host).await;
         }
     }
+}
+
+/// The host's open run for the plan `digest`, started now when there is none
+/// (a run of another plan still open is abandoned: its result never came).
+fn open_run(
+    db: &crate::store::Db<'_>,
+    host: &str,
+    revision: &str,
+    digest: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> buckle_core::Result<RunRecord> {
+    if let Some(mut open) = db.runs().open_for_host(host)? {
+        if open.plan_digest == digest {
+            // A run of a rollout always names it; look again in case the
+            // rollout's row was not there at the first event.
+            if open.rollout.is_none()
+                && let Some(rollout) = db.rollouts().applying_with_plan(host, digest)?
+            {
+                db.runs().set_rollout(&open.id, &rollout)?;
+                open.rollout = Some(rollout);
+            }
+            return Ok(open);
+        }
+        db.runs().abandon(&open.id, now)?;
+    }
+    let mut run = RunRecord {
+        id: RunRecord::new_id(),
+        host: host.to_owned(),
+        rollout: db.rollouts().applying_with_plan(host, digest)?,
+        revision: revision.to_owned(),
+        plan_digest: digest.to_owned(),
+        started_at: now,
+        finished_at: now,
+        outcome: crate::store::RUNNING.to_owned(),
+        changes: 0,
+        removals: 0,
+        error: None,
+        trace_id: None,
+        outcome_json: None,
+    };
+    run.id = db.runs().add(&run)?;
+    Ok(run)
+}
+
+/// Completes the run `result` reports on (the open one, or one abandoned
+/// before its result arrived), or records it when there is none. Returns
+/// the stored run.
+fn finish_run(db: &crate::store::Db<'_>, mut result: RunRecord) -> buckle_core::Result<RunRecord> {
+    match db.runs().unresolved(&result.host, &result.plan_digest)? {
+        Some(open) => {
+            result.id = open.id;
+            result.started_at = open.started_at;
+            result.rollout = match open.rollout {
+                Some(rollout) => Some(rollout),
+                None => db
+                    .rollouts()
+                    .applying_with_plan(&result.host, &result.plan_digest)?,
+            };
+            if let Some(rollout) = &result.rollout {
+                db.runs().set_rollout(&result.id, rollout)?;
+            }
+            db.runs().finish(&result)?;
+        }
+        None => {
+            result.rollout = db
+                .rollouts()
+                .applying_with_plan(&result.host, &result.plan_digest)?;
+            result.id = db.runs().add(&result)?;
+        }
+    }
+    Ok(result)
 }
 
 /// The audit message for a local or module rollback, with the rollback's own

@@ -280,6 +280,36 @@ pub struct Indeterminate {
     /// other modules still run.
     #[serde(default)]
     pub plan_error: bool,
+    /// The plan error, structured (message, causes, advice), when the module
+    /// could not be planned. Not part of the plan digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<crate::error::ErrorReport>,
+}
+
+impl Indeterminate {
+    /// An indeterminate module (not a plan error).
+    pub fn new(module: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            module: module.into(),
+            reason: reason.into(),
+            plan_error: false,
+            error_detail: None,
+        }
+    }
+
+    /// A module that is selected but could not be planned.
+    pub fn plan_error(
+        module: impl Into<String>,
+        reason: impl Into<String>,
+        detail: Option<crate::error::ErrorReport>,
+    ) -> Self {
+        Self {
+            module: module.into(),
+            reason: reason.into(),
+            plan_error: true,
+            error_detail: detail,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,13 +409,30 @@ impl Plan {
                 caution: r.caution,
             })
             .collect();
+        /// An indeterminate module without its structured error, so the
+        /// digest is what it was before that field existed.
+        #[derive(Serialize)]
+        struct IndeterminateContent<'a> {
+            module: &'a str,
+            reason: &'a str,
+            plan_error: bool,
+        }
+        let indeterminate: Vec<IndeterminateContent<'_>> = self
+            .indeterminate
+            .iter()
+            .map(|i| IndeterminateContent {
+                module: &i.module,
+                reason: &i.reason,
+                plan_error: i.plan_error,
+            })
+            .collect();
         #[derive(Serialize)]
         struct Content<'a> {
             modules: &'a [ModulePlan],
             removals: &'a [RemovalContent<'a>],
             deferred: &'a [Deferred],
-            #[serde(skip_serializing_if = "<[Indeterminate]>::is_empty")]
-            indeterminate: &'a [Indeterminate],
+            #[serde(skip_serializing_if = "<[IndeterminateContent]>::is_empty")]
+            indeterminate: &'a [IndeterminateContent<'a>],
             #[serde(skip_serializing_if = "<[Rehome]>::is_empty")]
             rehomed: &'a [Rehome],
             #[serde(skip_serializing_if = "<[Held]>::is_empty")]
@@ -395,7 +442,7 @@ impl Plan {
             modules: &self.modules,
             removals: &removals,
             deferred: &self.deferred,
-            indeterminate: &self.indeterminate,
+            indeterminate: &indeterminate,
             rehomed: &self.rehomed,
             held: &self.held,
         })

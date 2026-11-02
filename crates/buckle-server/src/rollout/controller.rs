@@ -3584,11 +3584,22 @@ impl Controller {
                     for a in &a2 {
                         entries.push(db.audit().add(a)?);
                     }
-                    Ok(entries)
+                    // The run each changed host is on, for its live row.
+                    let mut run_ids = std::collections::BTreeMap::new();
+                    for rollout in h2
+                        .iter()
+                        .map(|h| h.rollout.as_str())
+                        .collect::<BTreeSet<_>>()
+                    {
+                        for (host, id) in db.runs().ids_for_rollout(rollout)? {
+                            run_ids.insert((rollout.to_owned(), host), id);
+                        }
+                    }
+                    Ok((entries, run_ids))
                 })
                 .await;
             match result {
-                Ok(entries) => {
+                Ok((entries, run_ids)) => {
                     self.flush_retry = None;
                     self.flush_failures = 0;
                     self.pending_clear.clear();
@@ -3606,9 +3617,12 @@ impl Controller {
                     }
                     for h in &hosts {
                         if let Some(l) = self.live.iter().find(|l| l.record.id == h.rollout) {
+                            let mut host = view::host(&l.record, h, &l.approvals);
+                            host.run_id =
+                                run_ids.get(&(h.rollout.clone(), h.host.clone())).cloned();
                             self.events.publish(LiveEvent::RolloutHostChanged {
                                 rollout_id: h.rollout.clone(),
-                                host: view::host(&l.record, h, &l.approvals),
+                                host,
                             });
                         }
                     }

@@ -38,6 +38,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/hosts/{id}/state", web::get().to(host_state))
             .route("/hosts/{id}/health", web::get().to(host_health))
             .route("/hosts/{id}/runs", web::get().to(host_runs))
+            .route("/hosts/{id}/runs/{run}", web::get().to(host_run))
             .route("/hosts/{id}/preview", web::post().to(host_preview))
             .route("/hosts/{id}/{action}", web::post().to(host_action))
             .route("/revisions", web::get().to(revisions))
@@ -46,6 +47,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/rollouts", web::get().to(rollouts))
             .route("/rollouts/{id}", web::get().to(rollout))
             .route("/rollouts/{id}/plans", web::get().to(rollout_plans))
+            .route(
+                "/rollouts/{id}/hosts/{host}/report",
+                web::get().to(rollout_host_report),
+            )
             .route("/rollouts/{id}/approve", web::post().to(rollout_approve))
             .route("/rollouts/{id}/reject", web::post().to(rollout_reject))
             .route(
@@ -495,14 +500,17 @@ fn resources(row: Option<crate::store::RolloutHostRecord>) -> Vec<ResourceSummar
 }
 
 fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
+    let running = r.is_running();
     RunSummary {
-        id: String::new(),
-        state: None,
+        state: Some(crate::views::run_state(&r, true)),
+        id: r.id,
         trace_url: state.trace_url(r.trace_id.as_deref()),
         revision: r.revision,
         plan_digest: r.plan_digest,
         started_at: r.started_at,
-        finished_at: r.finished_at,
+        // A run in progress has no duration yet: the UI reads
+        // finished_at <= started_at as such.
+        finished_at: if running { r.started_at } else { r.finished_at },
         outcome: r.outcome,
         changes: r.changes,
         removals: r.removals,
@@ -525,21 +533,77 @@ fn health_dto(h: crate::store::HealthEventRecord) -> HealthResultDto {
     }
 }
 
+/// The report of a stored run: its rollout's plan (when the run follows
+/// one), its events, its outcome and the health results recorded from its
+/// start until the host's next run.
+async fn stored_report(
+    state: &AppState,
+    run: crate::store::RunRecord,
+) -> Result<buckle_api::RunReport, ApiError> {
+    let r = run.clone();
+    let (events, plan, next, health) = state
+        .store
+        .call(move |db| {
+            let plan = match &r.rollout {
+                Some(rollout) => db
+                    .rollouts()
+                    .host(rollout, &r.host)?
+                    .filter(|h| h.plan_digest.as_deref() == Some(r.plan_digest.as_str()))
+                    .and_then(|h| h.plan),
+                None => None,
+            };
+            Ok((
+                db.runs().events(&r.id)?,
+                plan,
+                db.runs().next_after(&r)?,
+                db.health().for_host(&r.host, 500)?,
+            ))
+        })
+        .await?;
+    use serde::Deserialize as _;
+    let plan = plan.and_then(|p| buckle_core::plan::Plan::deserialize(&p).ok());
+    let outcome: Option<buckle_core::engine::ApplyOutcome> = run
+        .outcome_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok());
+    let until = next.map(|n| n.started_at);
+    let health: Vec<HealthResultDto> = health
+        .into_iter()
+        .rev()
+        .filter(|h| {
+            matches!(h.scope.as_str(), "bake" | "rollout")
+                && h.at >= run.started_at
+                && until.is_none_or(|u| h.at < u)
+        })
+        .map(health_dto)
+        .collect();
+    let mut report =
+        crate::views::run_report(&run, plan.as_ref(), &events, outcome.as_ref(), &health);
+    report.trace_url = state.trace_url(report.trace_id.as_deref());
+    Ok(report)
+}
+
 async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
     let id = path.into_inner();
     let summary = summary_or_404(&state, &id).await?;
-    let (facts, row, runs, health, drift) = state
+    let (facts, row, runs, health, drift, latest) = state
         .store
         .call(move |db| {
             Ok((
                 db.hosts().latest_facts(&id)?,
                 db.rollouts().latest_healthy_for_host(&id)?,
-                db.runs().for_host(&id, 20)?,
+                // Newest first, the run in progress included.
+                db.runs().page(&id, None, 20)?.0,
                 db.health().for_host(&id, 100)?,
                 db.drift().for_host(&id)?,
+                db.runs().latest_for_host(&id)?,
             ))
         })
         .await?;
+    let latest_run = match latest {
+        Some(run) => Some(stored_report(&state, run).await?),
+        None => None,
+    };
     Ok(HttpResponse::Ok().json(HostDetail {
         summary,
         facts: facts
@@ -551,7 +615,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         drift,
         recent_runs: runs.into_iter().map(|r| run_dto(&state, r)).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
-        latest_run: None,
+        latest_run,
     }))
 }
 
@@ -585,18 +649,46 @@ async fn host_health(state: Data, _: Authenticated, path: web::Path<String>) -> 
     Ok(HttpResponse::Ok().json(rows.into_iter().map(health_dto).collect::<Vec<_>>()))
 }
 
-async fn host_runs(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
+#[derive(Deserialize)]
+struct RunsQuery {
+    /// A run id: the page starts after it (older runs).
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// A page of the host's runs, the running one included, newest first.
+async fn host_runs(
+    state: Data,
+    _: Authenticated,
+    path: web::Path<String>,
+    q: web::Query<RunsQuery>,
+) -> ApiResult {
     let id = path.into_inner();
     summary_or_404(&state, &id).await?;
-    let rows = state
+    let q = q.into_inner();
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let (rows, total) = state
         .store
-        .call(move |db| db.runs().for_host(&id, 50))
+        .call(move |db| db.runs().page(&id, q.before.as_deref(), limit))
         .await?;
-    Ok(HttpResponse::Ok().json(
-        rows.into_iter()
-            .map(|r| run_dto(&state, r))
-            .collect::<Vec<_>>(),
-    ))
+    let next = (rows.len() as u32 == limit)
+        .then(|| rows.last().map(|r| r.id.clone()))
+        .flatten();
+    let items: Vec<RunSummary> = rows.into_iter().map(|r| run_dto(&state, r)).collect();
+    Ok(HttpResponse::Ok().json(Page { items, next, total }))
+}
+
+/// One run of a host, module by module and step by step.
+async fn host_run(state: Data, _: Authenticated, path: web::Path<(String, String)>) -> ApiResult {
+    let (id, run) = path.into_inner();
+    summary_or_404(&state, &id).await?;
+    let (h, r) = (id.clone(), run.clone());
+    let found = state.store.call(move |db| db.runs().get(&h, &r)).await?;
+    let run =
+        found.ok_or_else(|| ApiError::not_found(format!("No run '{run}' on host '{id}'.")))?;
+    Ok(HttpResponse::Ok().json(stored_report(&state, run).await?))
 }
 
 async fn host_changed(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {
@@ -835,7 +927,17 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
         .await?;
     let (r, hosts, approvals, audit) =
         found.ok_or_else(|| ApiError::not_found(format!("No rollout '{id}'.")))?;
+    let i3 = id.to_owned();
+    let run_ids = state
+        .store
+        .call(move |db| db.runs().ids_for_rollout(&i3))
+        .await?;
     let mut detail = view::detail(&r, &hosts, &approvals, &audit);
+    for h in detail.phases.iter_mut().flat_map(|p| p.hosts.iter_mut()) {
+        if h.run_id.is_none() {
+            h.run_id = run_ids.get(&h.host).cloned();
+        }
+    }
     detail.summary = state.link_rollout(detail.summary);
     // The audit trail comes newest first; the timeline reads oldest first,
     // so live entries append.
@@ -953,6 +1055,55 @@ async fn rollouts(state: Data, _: Authenticated, q: web::Query<PageQuery>) -> Ap
 
 async fn rollout(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
     Ok(HttpResponse::Ok().json(rollout_detail(&state, &path.into_inner()).await?))
+}
+
+/// The host's run in a rollout: the plan as pending before it starts, live
+/// while it applies, final once its result arrived.
+async fn rollout_host_report(
+    state: Data,
+    _: Authenticated,
+    path: web::Path<(String, String)>,
+) -> ApiResult {
+    let (rollout, host) = path.into_inner();
+    let (r, h) = (rollout.clone(), host.clone());
+    let (row, run) = state
+        .store
+        .call(move |db| {
+            Ok((
+                db.rollouts().host(&r, &h)?,
+                db.runs().latest_for_rollout_host(&r, &h)?,
+            ))
+        })
+        .await?;
+    let row = row
+        .ok_or_else(|| ApiError::not_found(format!("No host '{host}' in rollout '{rollout}'.")))?;
+    use serde::Deserialize as _;
+    let plan = row
+        .plan
+        .as_ref()
+        .filter(|p| !p.is_null())
+        .and_then(|p| buckle_core::plan::Plan::deserialize(p).ok());
+    let report = match (run, plan) {
+        // The run of the host's current plan (live or finished).
+        (Some(run), Some(plan)) if run.plan_digest == plan.digest.to_string() => {
+            stored_report(&state, run).await?
+        }
+        // A plan the host has not started applying yet.
+        (_, Some(plan)) => crate::views::pending_report(
+            &host,
+            &row.runtime.revision,
+            Some(&rollout),
+            &plan,
+            row.updated_at,
+        ),
+        (Some(run), None) => stored_report(&state, run).await?,
+        (None, None) => {
+            return Err(ApiError::not_found(format!(
+                "Host '{host}' has no plan in rollout '{rollout}' yet."
+            )));
+        }
+    };
+    Ok(HttpResponse::Ok().json(report))
 }
 
 async fn rollout_plans(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {

@@ -65,11 +65,9 @@ pub fn succeeded(plan: &Plan) -> ApplyOutcome {
             .modules
             .iter()
             .map(|m| ModuleOutcome {
-                module: m.module.clone(),
-                status: ModuleStatus::Applied,
                 changes: m.changes(),
                 duration_ms: 12,
-                error: None,
+                ..ModuleOutcome::new(&m.module, ModuleStatus::Applied)
             })
             .collect(),
         failed_module: None,
@@ -77,6 +75,10 @@ pub fn succeeded(plan: &Plan) -> ApplyOutcome {
         not_started: vec![],
         health: None,
         error: None,
+        error_detail: None,
+        removals_run: vec![],
+        started_at: None,
+        finished_at: None,
     }
 }
 

@@ -12,5 +12,6 @@ mod gaps;
 mod health_gating;
 mod local_rollback;
 mod phased;
+mod reports;
 mod secrets;
 mod staleness;

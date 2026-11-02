@@ -168,6 +168,18 @@ impl State {
 pub trait StateStore: Send + Sync {
     fn load(&self) -> crate::Result<State>;
     fn save(&self, state: &State) -> crate::Result<()>;
+
+    /// Keeps the full outcome of the last apply (every module and step), for
+    /// `buckle status`. Kept apart from the state, which is saved after every
+    /// step. Stores that do not keep it ignore it.
+    fn save_last_run(&self, _outcome: &crate::engine::ApplyOutcome) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// The outcome [`StateStore::save_last_run`] kept, if any.
+    fn load_last_run(&self) -> crate::Result<Option<crate::engine::ApplyOutcome>> {
+        Ok(None)
+    }
 }
 
 /// A single CBOR file, written atomically: a `0600` temp file
@@ -200,6 +212,12 @@ impl FileStateStore {
     fn temp_path(&self) -> PathBuf {
         self.path
             .with_file_name(format!("{}{}", self.temp_prefix(), std::process::id()))
+    }
+
+    /// Where the last apply's outcome is kept: `last-run.json` beside the
+    /// state file.
+    pub fn last_run_path(&self) -> PathBuf {
+        self.path.with_file_name("last-run.json")
     }
 
     /// Removes temp files a crashed earlier write left next to the state file.
@@ -278,18 +296,41 @@ impl StateStore for FileStateStore {
         }
         written.to_human_error()
     }
+
+    fn save_last_run(&self, outcome: &crate::engine::ApplyOutcome) -> crate::Result<()> {
+        use crate::error::HumanizableResult;
+        let path = self.last_run_path();
+        let tmp = path.with_file_name(format!(".last-run.json.buckle-tmp-{}", std::process::id()));
+        let bytes = serde_json::to_vec(outcome).to_human_error()?;
+        let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written.to_human_error()
+    }
+
+    fn load_last_run(&self) -> crate::Result<Option<crate::engine::ApplyOutcome>> {
+        use crate::error::HumanizableResult;
+        match std::fs::read(self.last_run_path()) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).to_human_error()?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).to_human_error(),
+        }
+    }
 }
 
 /// An in-memory store for tests and plan-only runs.
 #[derive(Debug, Default)]
 pub struct MemoryStateStore {
     state: std::sync::Mutex<State>,
+    last_run: std::sync::Mutex<Option<crate::engine::ApplyOutcome>>,
 }
 
 impl MemoryStateStore {
     pub fn with(state: State) -> Self {
         Self {
             state: std::sync::Mutex::new(state),
+            last_run: std::sync::Mutex::new(None),
         }
     }
 }
@@ -302,6 +343,15 @@ impl StateStore for MemoryStateStore {
     fn save(&self, state: &State) -> crate::Result<()> {
         *self.state.lock().expect("state mutex") = state.clone();
         Ok(())
+    }
+
+    fn save_last_run(&self, outcome: &crate::engine::ApplyOutcome) -> crate::Result<()> {
+        *self.last_run.lock().expect("last run mutex") = Some(outcome.clone());
+        Ok(())
+    }
+
+    fn load_last_run(&self) -> crate::Result<Option<crate::engine::ApplyOutcome>> {
+        Ok(self.last_run.lock().expect("last run mutex").clone())
     }
 }
 
@@ -321,6 +371,23 @@ mod tests {
             applied_at: chrono::Utc::now(),
             introduced_in: RevisionId::new("r1"),
         }
+    }
+
+    #[test]
+    fn the_file_store_keeps_the_last_run_beside_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(dir.path().join("state.cbor"));
+        assert!(store.load_last_run().unwrap().is_none());
+        let outcome: crate::engine::ApplyOutcome = serde_json::from_value(serde_json::json!({
+            "plan_digest": Digest::of(b"p"), "succeeded": true, "changes": 0, "removals": 0,
+            "duration_ms": 1, "module_results": [], "failed_module": null,
+            "rolled_back_modules": [], "not_started": [], "health": null, "error": null
+        }))
+        .unwrap();
+        store.save_last_run(&outcome).unwrap();
+        assert!(dir.path().join("last-run.json").is_file());
+        let back = store.load_last_run().unwrap().unwrap();
+        assert_eq!(back.plan_digest, outcome.plan_digest);
     }
 
     #[test]

@@ -1157,6 +1157,8 @@ async fn trace_ids_come_with_links_when_a_template_is_configured() {
         finished_rollout("8", None),
     );
     let run = crate::store::RunRecord {
+        id: String::new(),
+        outcome_json: None,
         host: "pi-1".into(),
         rollout: None,
         revision: "r1".into(),
@@ -1205,9 +1207,14 @@ async fn trace_ids_come_with_links_when_a_template_is_configured() {
         host.recent_runs[0].trace_url.as_deref(),
         Some("https://ui.example/trace?trace_id=feed01")
     );
-    let runs: Vec<buckle_api::RunSummary> =
+    let runs: buckle_api::Page<buckle_api::RunSummary> =
         test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1/runs")).await).await;
-    assert_eq!(runs[0].trace_url, host.recent_runs[0].trace_url);
+    assert_eq!(runs.items[0].trace_url, host.recent_runs[0].trace_url);
+    assert_eq!(
+        host.latest_run.as_ref().and_then(|r| r.trace_url.clone()),
+        host.recent_runs[0].trace_url,
+        "the latest run's report links its trace too"
+    );
 
     // The controller publishes rollouts without links; the stream adds them.
     let resp = test::call_service(&app, get("/api/v1/events")).await;
@@ -1793,4 +1800,169 @@ async fn a_rollout_timeline_reads_oldest_first() {
         kinds,
         vec!["rollout.started", "rollout.phase.done", "rollout.completed"]
     );
+}
+
+// ------------------------------------------------------------ run reports
+
+#[actix_web::test]
+async fn run_reports_are_served_per_host_and_per_rollout_host() {
+    let e = env(WebConfig::default()).await;
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    let plan = crate::views::tests::review_plan();
+    let digest = plan.digest.to_string();
+    let row = |name: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
+        rollout: "7".into(),
+        host: name.into(),
+        phase: "canary".into(),
+        wave: Some(1),
+        state: crate::rollout::model::HostPhase::Planned,
+        plan_digest: plan.as_ref().map(|_| digest.clone()),
+        plan,
+        result: None,
+        health: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        runtime: crate::rollout::model::HostRuntime {
+            revision: "r1".into(),
+            phase_index: Some(0),
+            ..Default::default()
+        },
+    };
+    let (planned, unplanned) = (
+        row("pi-1", Some(serde_json::to_value(&plan).unwrap())),
+        row("pi-2", None),
+    );
+    e.store
+        .call(move |db| {
+            let mut rollout = finished_rollout("7", None);
+            rollout.runtime.phases = vec![crate::rollout::model::PhaseRuntime {
+                name: "canary".into(),
+                state: buckle_api::PhaseState::Running,
+                parallel: buckle_core::model::Parallelism::Count(1),
+                approval: buckle_core::model::ApprovalPolicy::Auto,
+                bake_seconds: 0,
+                max_failures: buckle_core::model::Parallelism::Count(0),
+                virtual_stage: false,
+                accepted_failures: 0,
+                started: 0,
+                gate: None,
+                bake_until: None,
+            }];
+            db.rollouts().save(&rollout)?;
+            db.rollouts().save_host(&planned)?;
+            db.rollouts().save_host(&unplanned)
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let get = |uri: String| test::TestRequest::get().uri(&uri).to_request();
+
+    // Before the host starts: the plan, everything pending.
+    let pending: buckle_api::RunReport = test::read_body_json(
+        test::call_service(&app, get("/api/v1/rollouts/7/hosts/pi-1/report".into())).await,
+    )
+    .await;
+    assert_eq!(pending.state, buckle_api::RunState::Pending);
+    assert!(!pending.modules.is_empty());
+    assert!(
+        pending
+            .modules
+            .iter()
+            .flat_map(|m| &m.steps)
+            .all(|s| s.state == buckle_api::StepState::Pending)
+    );
+    let resp = test::call_service(&app, get("/api/v1/rollouts/7/hosts/pi-2/report".into())).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no plan yet");
+    let resp = test::call_service(&app, get("/api/v1/rollouts/7/hosts/nope/report".into())).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A run of that plan, in progress.
+    let run = crate::store::RunRecord {
+        id: String::new(),
+        host: "pi-1".into(),
+        rollout: Some("7".into()),
+        revision: "r1".into(),
+        plan_digest: digest.clone(),
+        started_at: chrono::Utc::now(),
+        finished_at: chrono::Utc::now(),
+        outcome: crate::store::RUNNING.into(),
+        changes: 0,
+        removals: 0,
+        error: None,
+        trace_id: None,
+        outcome_json: None,
+    };
+    let module = plan.modules[0].module.clone();
+    let event = serde_json::to_string(&buckle_core::engine::ApplyEvent::ModuleStarted {
+        module: module.clone(),
+    })
+    .unwrap();
+    let run_id = e
+        .store
+        .call(move |db| {
+            let id = db.runs().add(&run)?;
+            db.runs().record_event(
+                &id,
+                "module:x",
+                None,
+                None,
+                None,
+                &event,
+                chrono::Utc::now(),
+            )?;
+            Ok(id)
+        })
+        .await
+        .unwrap();
+    let live: buckle_api::RunReport = test::read_body_json(
+        test::call_service(&app, get("/api/v1/rollouts/7/hosts/pi-1/report".into())).await,
+    )
+    .await;
+    assert_eq!(live.id, run_id);
+    assert_eq!(live.state, buckle_api::RunState::Running);
+    let m = live.modules.iter().find(|m| m.name == module).unwrap();
+    assert_eq!(m.state, buckle_api::ModuleState::Running);
+
+    let by_host: buckle_api::RunReport = test::read_body_json(
+        test::call_service(&app, get(format!("/api/v1/hosts/pi-1/runs/{run_id}"))).await,
+    )
+    .await;
+    assert_eq!(by_host, live);
+    let resp = test::call_service(&app, get("/api/v1/hosts/pi-1/runs/unknown".into())).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let detail: buckle_api::HostDetail =
+        test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1".into())).await)
+            .await;
+    assert_eq!(detail.latest_run.map(|r| r.id), Some(run_id.clone()));
+    assert_eq!(
+        detail.recent_runs[0].id, run_id,
+        "the run in progress is listed"
+    );
+    assert_eq!(
+        detail.recent_runs[0].state,
+        Some(buckle_api::RunState::Running)
+    );
+    assert_eq!(
+        detail.recent_runs[0].finished_at, detail.recent_runs[0].started_at,
+        "a run in progress has no duration yet"
+    );
+    let runs: buckle_api::Page<buckle_api::RunSummary> = test::read_body_json(
+        test::call_service(&app, get("/api/v1/hosts/pi-1/runs?limit=1".into())).await,
+    )
+    .await;
+    assert_eq!(runs.items[0].id, run_id);
+    assert_eq!(runs.items[0].state, Some(buckle_api::RunState::Running));
+    assert_eq!(runs.total, 1);
+
+    let rollout: buckle_api::RolloutDetail =
+        test::read_body_json(test::call_service(&app, get("/api/v1/rollouts/7".into())).await)
+            .await;
+    let host = rollout
+        .phases
+        .iter()
+        .flat_map(|p| &p.hosts)
+        .find(|h| h.host == "pi-1")
+        .unwrap();
+    assert_eq!(host.run_id.as_deref(), Some(run_id.as_str()));
 }

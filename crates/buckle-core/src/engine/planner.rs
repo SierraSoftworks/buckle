@@ -418,6 +418,18 @@ impl<'a> Planner<'a> {
     }
 
     /// A module-scoped failure for a plan: the scrubbed message and advice.
+    /// `err` as a structured, redacted report.
+    pub fn failure_report(&self, err: &crate::Error) -> crate::error::ErrorReport {
+        let redactor = crate::secrets::redact::Redactor::new(&self.secrets);
+        crate::error::ErrorReport::of(err).map_text(|t| {
+            if redactor.is_empty() {
+                t.to_owned()
+            } else {
+                redactor.redact(t).into_inner()
+            }
+        })
+    }
+
     pub fn failure(&self, err: &crate::Error) -> String {
         let advice = err.advice();
         if advice.is_empty() {
@@ -445,6 +457,7 @@ impl<'a> Planner<'a> {
                 module: name.clone(),
                 reason: format!("the directory modules/{name} has no module.yaml"),
                 plan_error: false,
+                error_detail: None,
             })
             .collect();
         for module in &self.revision.modules {
@@ -479,6 +492,7 @@ impl<'a> Planner<'a> {
                     module: cfg.name.clone(),
                     reason,
                     plan_error: false,
+                    error_detail: None,
                 }),
                 Decision::Broken(reason) => {
                     selected.insert(cfg.name.as_str(), module);
@@ -540,6 +554,7 @@ impl<'a> Planner<'a> {
                     module: name.to_owned(),
                     reason,
                     plan_error: false,
+                    error_detail: None,
                 });
             }
         }
@@ -1312,6 +1327,8 @@ pub(super) async fn plan_with(
     // Pass 1: render and parse every selected module. A failure is scoped to
     // its module (decided in pass 2: deferred or a plan error).
     let mut failures: HashMap<String, String> = selection.broken.clone();
+    // The same failures, structured, where an error was at hand.
+    let mut failure_reports: HashMap<String, crate::error::ErrorReport> = HashMap::new();
     let mut prepared: Vec<PreparedModule> = Vec::with_capacity(selection.order.len());
     for module in &selection.order {
         if failures.contains_key(&module.config.name) {
@@ -1324,6 +1341,7 @@ pub(super) async fn plan_with(
             Ok(p) => prepared.push(p),
             Err(err) => {
                 failures.insert(module.config.name.clone(), planner.failure(&err));
+                failure_reports.insert(module.config.name.clone(), planner.failure_report(&err));
             }
         }
     }
@@ -1381,6 +1399,7 @@ pub(super) async fn plan_with(
                 module: name,
                 reason: format!("it needs '{dep}', which could not be planned"),
                 plan_error: false,
+                error_detail: None,
             });
             continue;
         }
@@ -1410,6 +1429,12 @@ pub(super) async fn plan_with(
                 .collect();
             if providers.is_empty() && reasons.is_empty() {
                 problems.push(Indeterminate {
+                    error_detail: Some(
+                        failure_reports
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or_else(|| crate::error::ErrorReport::user(reason.clone())),
+                    ),
                     module: name,
                     reason: reason.clone(),
                     plan_error: true,
@@ -1453,6 +1478,7 @@ pub(super) async fn plan_with(
                 module: name,
                 reason: format!("planning failed: {}", planner.failure(&err)),
                 plan_error: true,
+                error_detail: Some(planner.failure_report(&err)),
             }),
         }
     }
