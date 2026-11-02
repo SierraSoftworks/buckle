@@ -460,7 +460,9 @@ pub fn apply_progress(report: &mut RunReport, p: &RunProgress) -> Applied {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Watch {
     pub host: String,
-    /// Only the run of this rollout (a rollout page's host drawer).
+    /// Only the run of this rollout (a rollout page's host drawer): an
+    /// update must name it, since a run outside any rollout (drift
+    /// correction, a local rollback) on the same host names none.
     pub rollout: Option<String>,
     /// An update about another run of the host means the one held is no
     /// longer the one to show (a retry started a new run), so fetch again.
@@ -474,9 +476,7 @@ pub fn follow(held: Option<&mut RunReport>, p: &RunProgress, watch: &Watch) -> A
     if p.host != watch.host {
         return Applied::Ignored;
     }
-    if let (Some(want), Some(got)) = (&watch.rollout, &p.rollout_id)
-        && want != got
-    {
+    if watch.rollout.is_some() && p.rollout_id != watch.rollout {
         return Applied::Ignored;
     }
     match held {
@@ -606,7 +606,7 @@ pub fn activities<'a>(
         let LiveEvent::RunProgress { progress: p } = event else {
             continue;
         };
-        if p.rollout_id.as_deref().is_some_and(|r| r != rollout) {
+        if p.rollout_id.as_deref() != Some(rollout) {
             continue;
         }
         let slot = match tracked.iter().position(|(h, _)| *h == p.host) {
@@ -1064,9 +1064,13 @@ pub(crate) mod tests {
         assert_eq!(follow(Some(&mut r), &p, &watch), Applied::Refetch);
         // The host had no run yet: now it has one.
         assert_eq!(follow(None, &p, &watch), Applied::Refetch);
-        // Another rollout's run, or another host's, is not this view's.
+        // Another rollout's run, or another host's, is not this view's, and
+        // nor is a run outside any rollout on the same host.
         p.rollout_id = Some("43".into());
         assert_eq!(follow(None, &p, &watch), Applied::Ignored);
+        p.rollout_id = None;
+        assert_eq!(follow(None, &p, &watch), Applied::Ignored);
+        assert_eq!(follow(Some(&mut r), &p, &watch), Applied::Ignored);
         p.rollout_id = Some("42".into());
         p.host = "pi-2".into();
         assert_eq!(follow(None, &p, &watch), Applied::Ignored);
@@ -1173,10 +1177,15 @@ pub(crate) mod tests {
                 ..progress(Some("nomad"), Some(step))
             },
         };
+        let mut local = event("pi-4", "run-9", "", "apt.package[nomad]");
+        if let LiveEvent::RunProgress { progress } = &mut local {
+            progress.rollout_id = None;
+        }
         let events = [
             event("pi-1", "run-1", "42", "file.copy[c]"),
             event("pi-2", "run-7", "42", "apt.package[nomad]"),
             event("pi-3", "run-8", "41", "apt.package[nomad]"),
+            local,
         ];
         let map = activities(vec![held], "42", &events);
         // pi-1's held report was moved on by the update: two steps running,
@@ -1184,6 +1193,7 @@ pub(crate) mod tests {
         assert_eq!(map["pi-1"], "nomad › file.copy[b]");
         assert_eq!(map["pi-2"], "nomad › apt.package[nomad]");
         assert!(!map.contains_key("pi-3"), "another rollout's host");
+        assert!(!map.contains_key("pi-4"), "a run outside any rollout");
     }
 
     #[test]
