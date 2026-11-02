@@ -586,19 +586,46 @@ fn clean(host: &str, start: DateTime<Utc>, now: DateTime<Utc>) -> RunReport {
             2_300,
         )],
     );
+    // A bake reading every 30s, the api blipping once while nomad settled,
+    // then the drift checks since.
     let at = start + Duration::seconds(160);
-    nomad.health = vec![
-        check("nomad", "api", "http", "pass", None, at, Some("42")),
-        check(
-            "nomad",
-            "unit",
-            "systemd",
-            "pass",
-            Some("active for 2m (min_uptime 30s)"),
-            at,
-            Some("42"),
-        ),
-    ];
+    nomad.health = (0..10)
+        .flat_map(|i| {
+            let at = at + Duration::seconds(30 * i);
+            let blip = i == 3;
+            [
+                check(
+                    "nomad",
+                    "api",
+                    "http",
+                    if blip { "fail" } else { "pass" },
+                    blip.then_some("GET http://127.0.0.1:4646/v1/agent/health answered 500"),
+                    at,
+                    Some("42"),
+                ),
+                check(
+                    "nomad",
+                    "unit",
+                    "systemd",
+                    "pass",
+                    Some("active for 2m (min_uptime 30s)"),
+                    at,
+                    Some("42"),
+                ),
+            ]
+        })
+        .collect();
+    for at in (1..=3)
+        .map(|i| at + Duration::minutes(10 * i))
+        .filter(|t| *t <= now)
+    {
+        for (c, kind) in [("api", "http"), ("unit", "systemd")] {
+            nomad.health.push(HealthResultDto {
+                scope: "drift".into(),
+                ..check("nomad", c, kind, "pass", None, at, Some("42"))
+            });
+        }
+    }
     let mut otel = module(
         "otel_ebpf_profiler",
         ModuleState::Applied,

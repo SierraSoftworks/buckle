@@ -456,27 +456,119 @@
   }
 }
 
-// A module's health results in this run.
+// Each module's health through the run: a bar of time slices, each as bad
+// as its worst check, with the checks' readings in a popover.
 .run-health {
-  list-style: none;
+  margin: 0.5rem 0;
 
-  &__item {
-    display: flex;
-    flex-wrap: wrap;
+  &__modules {
+    list-style: none;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg);
+  }
+
+  &__module {
+    display: grid;
+    grid-template-columns: minmax(6rem, 12rem) auto minmax(8rem, 1fr) auto;
     align-items: center;
-    gap: 0.25rem 0.6rem;
-    padding: 0.3rem 0.4rem;
+    gap: 0.25rem 0.75rem;
+    padding: 0.4rem 0.6rem;
     border-bottom: 1px solid var(--line);
-    font-size: 0.82rem;
+    font-size: 0.84rem;
 
     &:last-child {
       border-bottom: none;
     }
+
+    @media (max-width: 640px) {
+      grid-template-columns: 1fr auto;
+
+      .hbar {
+        grid-column: 1 / -1;
+      }
+    }
+  }
+
+  &__name {
+    overflow-wrap: anywhere;
+  }
+}
+
+.hbar {
+  display: flex;
+  gap: 1px;
+  height: 1.1rem;
+
+  &__bucket {
+    position: relative;
+    flex: 1;
+    min-width: 2px;
+    border-radius: 1px;
+    background: var(--tone, var(--fg-3));
+    outline-offset: 1px;
+
+    &--empty {
+      background: var(--surface-2);
+    }
+
+    &:hover,
+    &:focus-visible {
+      filter: brightness(1.2);
+    }
+
+    &:hover > .hbar__pop,
+    &:focus > .hbar__pop {
+      display: block;
+    }
+
+    // Keep the popover inside the bar at either end.
+    &:nth-child(-n + 10) > .hbar__pop {
+      left: 0;
+      transform: none;
+    }
+
+    &:nth-last-child(-n + 10) > .hbar__pop {
+      right: 0;
+      left: auto;
+      transform: none;
+    }
+  }
+
+  &__pop {
+    display: none;
+    position: absolute;
+    z-index: 20;
+    bottom: calc(100% + 0.4rem);
+    left: 50%;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: min(28rem, 85vw);
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    color: var(--fg);
+    font-size: 0.8rem;
+    pointer-events: none;
+  }
+
+  &__checks {
+    list-style: none;
+    margin-top: 0.3rem;
+  }
+
+  &__check {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.2rem 0.5rem;
+    padding: 0.15rem 0;
   }
 
   &__reason {
-    flex: 1;
-    min-width: 12rem;
+    flex-basis: 100%;
     color: var(--fg-2);
   }
 }

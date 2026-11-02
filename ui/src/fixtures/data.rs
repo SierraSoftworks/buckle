@@ -6,11 +6,11 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    AuditEntry, Catalog, Connection, DiffKind, DriftItem, HandlerView, HealthResultDto,
-    HealthSummary, HostDetail, HostRolloutState as S, HostStatus, HostSummary, KindDescriptor, Me,
-    ModuleNote, ModuleView, PhaseState, PlanGroup, PlanView, RemovalView, ResourceSummary,
-    RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase,
-    RolloutState, RolloutSummary, StepOutcome, StepView,
+    AuditEntry, Catalog, CheckEpoch, Connection, DiffKind, DriftItem, HandlerView, HealthResultDto,
+    HealthSummary, HostCheck, HostDetail, HostRolloutState as S, HostStatus, HostSummary,
+    KindDescriptor, Me, ModuleNote, ModuleView, PhaseState, PlanGroup, PlanView, RemovalView,
+    ResourceSummary, RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutHost,
+    RolloutPhase, RolloutState, RolloutSummary, StepOutcome, StepView,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
@@ -1923,11 +1923,85 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         facts_at: Some(now - Duration::minutes(4)),
         resources,
         recent_runs,
+        health_checks: host_checks(&health_results, &host.id),
         health_results,
-        health_checks: vec![],
         drift,
         latest_run,
     }
+}
+
+/// Each check's status per rollout, as the server aggregates it: the demo's
+/// readings make up rollout 42 (and the drift readings since), and two
+/// earlier rollouts passed, except on pi-5 whose api blipped in rollout 41.
+fn host_checks(results: &[HealthResultDto], host: &str) -> Vec<HostCheck> {
+    let mut checks: BTreeMap<(String, String), HostCheck> = BTreeMap::new();
+    let mut sorted: Vec<&HealthResultDto> = results.iter().collect();
+    sorted.sort_by_key(|r| r.at);
+    let rank = |s: &str| match s {
+        "fail" => 2,
+        "pass" => 0,
+        _ => 1,
+    };
+    for r in sorted {
+        let c = checks
+            .entry((r.module.clone(), r.check.clone()))
+            .or_insert_with(|| {
+                let earlier = |id: &str, days: i64, worst: &str| CheckEpoch {
+                    rollout_id: Some(id.into()),
+                    revision: format!("{id}e1d2c3b4a5f6"),
+                    status: "pass".into(),
+                    worst: worst.into(),
+                    reason: None,
+                    readings: 40,
+                    first_at: r.at - Duration::days(days),
+                    last_at: r.at - Duration::days(days - 1),
+                };
+                let blip = if host == "pi-5" && r.check == "api" {
+                    "fail"
+                } else {
+                    "pass"
+                };
+                HostCheck {
+                    module: r.module.clone(),
+                    check: r.check.clone(),
+                    kind: r.kind.clone(),
+                    required: r.required,
+                    status: r.status.clone(),
+                    reason: r.reason.clone(),
+                    scope: r.scope.clone(),
+                    at: r.at,
+                    history: vec![earlier("41", 3, blip), earlier("40", 6, "pass")],
+                }
+            });
+        c.status = r.status.clone();
+        c.reason = r.reason.clone();
+        c.scope = r.scope.clone();
+        c.at = r.at;
+        if c.history[0].rollout_id.as_deref() != Some("42") {
+            c.history.insert(
+                0,
+                CheckEpoch {
+                    rollout_id: Some("42".into()),
+                    revision: "42a1b2c3d4e5".into(),
+                    status: r.status.clone(),
+                    worst: r.status.clone(),
+                    reason: r.reason.clone(),
+                    readings: 0,
+                    first_at: r.at,
+                    last_at: r.at,
+                },
+            );
+        }
+        let e = &mut c.history[0];
+        e.status = r.status.clone();
+        e.reason = r.reason.clone();
+        e.readings += 1;
+        e.last_at = r.at;
+        if rank(&r.status) > rank(&e.worst) {
+            e.worst = r.status.clone();
+        }
+    }
+    checks.into_values().collect()
 }
 
 fn kind(
