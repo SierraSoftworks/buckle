@@ -102,7 +102,8 @@ pub fn live_provider(props: &LiveProviderProps) -> Html {
 }
 
 /// Delivers what the demo store produces (and, with `?demo&live`, a rollout
-/// that moves by itself) through the same reducer the stream feeds.
+/// that moves by itself and a run that advances step by step) through the
+/// same reducer the stream feeds.
 #[cfg(debug_assertions)]
 fn demo_feed(dispatcher: UseReducerDispatcher<Live>) {
     use gloo_timers::callback::Interval;
@@ -118,6 +119,9 @@ fn demo_feed(dispatcher: UseReducerDispatcher<Live>) {
             });
         }
         let mut events = crate::fixtures::store::drain();
+        if ticking && beat.is_multiple_of(2) {
+            events.extend(crate::fixtures::live::run_tick());
+        }
         if ticking && beat.is_multiple_of(10) {
             events.extend(crate::fixtures::live::tick());
         }

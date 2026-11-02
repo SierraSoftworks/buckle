@@ -1,16 +1,68 @@
-//! `?demo&live`: the active rollout moves on by itself, through the same
-//! event path a server's `GET /events` stream feeds, so the live updates can
-//! be watched without a server.
+//! `?demo&live`: the active rollout moves on by itself, and pi-4's run
+//! advances step by step, through the same event path a server's
+//! `GET /events` stream feeds, so the live updates can be watched without a
+//! server.
 
 use buckle_api::{HostRolloutState, LiveEvent, RolloutEvent};
 use chrono::{Duration, Utc};
 
+use super::runs::{LIVE_HOST, live_frame};
 use super::store::{timeline, with};
+use crate::logic::run::{apply_progress, run_finished};
 
-/// One step of the story: the applying host starts baking, a baking host
-/// whose window has passed turns healthy.
+/// One step of pi-4's run: the updates the agent would send, applied to the
+/// demo server's copy of the report first. When the run ends, its summary
+/// and the host's applied revision follow.
+pub fn run_tick() -> Vec<LiveEvent> {
+    with(|s| {
+        let frame = s.run_frame;
+        let Some(detail) = s.details.iter_mut().find(|d| d.summary.id == LIVE_HOST) else {
+            return Vec::new();
+        };
+        let Some(report) = detail.latest_run.as_mut() else {
+            return Vec::new();
+        };
+        if run_finished(report.state) {
+            return Vec::new();
+        }
+        s.run_frame += 1;
+        let updates = live_frame(frame, report);
+        for u in &updates {
+            apply_progress(report, u);
+        }
+        let mut events: Vec<LiveEvent> = updates
+            .into_iter()
+            .map(|progress| LiveEvent::RunProgress { progress })
+            .collect();
+        if run_finished(report.state) {
+            let summary = super::runs::summary_of(report, "success", None);
+            let revision = report.revision.clone();
+            detail.recent_runs[0] = summary;
+            if let Some(host) = s.hosts.iter_mut().find(|h| h.id == LIVE_HOST) {
+                host.applied_revision = Some(revision);
+                let host = host.clone();
+                detail.summary = host.clone();
+                events.push(LiveEvent::HostChanged { host });
+            }
+        }
+        events
+    })
+}
+
+/// One step of the story: an applying host whose run has finished starts
+/// baking, a baking host whose window has passed turns healthy.
 pub fn tick() -> Vec<LiveEvent> {
     with(|s| {
+        let running: Vec<String> = s
+            .details
+            .iter()
+            .filter(|d| {
+                d.latest_run
+                    .as_ref()
+                    .is_some_and(|r| !run_finished(r.state))
+            })
+            .map(|d| d.summary.id.clone())
+            .collect();
         let Ok(detail) = s.rollout_mut("42") else {
             return Vec::new();
         };
@@ -21,7 +73,7 @@ pub fn tick() -> Vec<LiveEvent> {
         for phase in &mut detail.phases {
             for h in &mut phase.hosts {
                 let next = match h.state {
-                    HostRolloutState::Applying => {
+                    HostRolloutState::Applying if !running.contains(&h.host) => {
                         let secs = phase.bake_seconds.min(30);
                         h.bake_until = Some(now + Duration::seconds(secs as i64));
                         Some((

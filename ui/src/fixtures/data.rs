@@ -10,7 +10,7 @@ use buckle_api::{
     HealthSummary, HostDetail, HostRolloutState as S, HostStatus, HostSummary, KindDescriptor, Me,
     ModuleNote, ModuleView, PhaseState, PlanGroup, PlanView, RemovalView, ResourceSummary,
     RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase,
-    RolloutState, RolloutSummary, RunSummary, StepOutcome, StepView,
+    RolloutState, RolloutSummary, StepOutcome, StepView,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
@@ -451,10 +451,12 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
     let mut pi5 = entry("pi-5", "home", 1, S::Failed, Some(PLAN_NOMAD), now, 4);
     pi5.failed_module = Some("nomad".into());
     pi5.failed_checks = vec!["nomad/api".into()];
-    pi5.error = Some("Required check nomad/api failed for longer than settle (2m): GET http://127.0.0.1:4646/v1/agent/health answered 500. Rolling nomad back failed too: apt.package[nomad] is blocked (1.9.2 is no longer in the repository), so the host is left on a mix of revisions.".into());
+    pi5.error = Some("nomad failed at file.template[/etc/nomad.d/nomad.hcl]: nomad config validate rejected the rendered file: client.servers: \"«secret:nomad_server@b21c»\" is not a valid address: missing port in address. Rolling nomad back failed too: apt.package[nomad] is blocked (1.9.2 is no longer in the repository), so the host is left on a mix of revisions; nomad/api has been failing since.".into());
+    pi5.error_detail = Some(super::runs::pi5_error());
     pi5.needs_attention = true;
     let mut pi6 = entry("pi-6", "home", 1, S::RolledBack, Some(PLAN_NOMAD), now, 6);
     pi6.error = Some("The agent applied the cached stable revision after 5m without a session while nomad/unit was failing (local rollback).".into());
+    pi6.error_detail = Some(super::runs::local_rollback_error());
     let mut pi7 = entry("pi-7", "home", 2, S::Skipped, Some(PLAN_NOMAD), now, 9);
     pi7.error = Some("Skipped by bob@example.com: board swap in progress.".into());
     let mut nas = entry("nas-1", "home", 2, S::Held, Some(PLAN_NOMAD), now, 3);
@@ -563,7 +565,16 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
         }],
     );
 
-    let phases = vec![canary, home, cloud, rest, stragglers];
+    let mut phases = vec![canary, home, cloud, rest, stragglers];
+    // The hosts that have run this rollout's revision.
+    for h in phases.iter_mut().flat_map(|p| p.hosts.iter_mut()) {
+        if matches!(
+            h.state,
+            S::Healthy | S::Baking | S::Applying | S::Failed | S::RolledBack
+        ) {
+            h.run_id = Some(super::runs::run_id(&h.host, NEW_REV));
+        }
+    }
     let total = phases.iter().map(|p| p.hosts.len() as u32).sum();
     let events = timeline(now);
 
@@ -1872,65 +1883,10 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         )),
         _ => {}
     }
-    let run = |rev: &str,
-               digest: &str,
-               hours: i64,
-               outcome: &str,
-               changes: u32,
-               removals: u32,
-               error: Option<&str>| {
-        let trace = fake_trace(hours as u64 + 1_000);
-        RunSummary {
-            id: String::new(),
-            state: None,
-            revision: rev.into(),
-            plan_digest: digest.into(),
-            started_at: now - Duration::hours(hours),
-            finished_at: now - Duration::hours(hours) + Duration::seconds(47),
-            outcome: outcome.into(),
-            changes,
-            removals,
-            error: error.map(Into::into),
-            trace_url: Some(trace_url(&trace)),
-            trace_id: Some(trace),
-        }
-    };
-    let recent_runs = if pending {
-        vec![]
-    } else {
-        let mut runs = vec![
-            run(STABLE_REV, "3c9d1e7a", 48, "success", 3, 0, None),
-            run(
-                ROLLED_BACK_REV,
-                "77ab0c2d",
-                120,
-                "rolled_back",
-                2,
-                0,
-                Some("docker/daemon failed; rolled back to 0aa1b2c"),
-            ),
-            run(OLD_REV, "d41f9b3e", 288, "success", 6, 2, None),
-        ];
-        if host.applied_revision.as_deref() == Some(NEW_REV) || host.id == "pi-5" {
-            runs.insert(
-                0,
-                run(
-                    NEW_REV,
-                    &PLAN_NOMAD[..8],
-                    0,
-                    if host.id == "pi-5" {
-                        "apply_ok_health_failed"
-                    } else {
-                        "success"
-                    },
-                    4,
-                    0,
-                    (host.id == "pi-5").then_some("nomad/api failing after apply"),
-                ),
-            );
-        }
-        runs
-    };
+    let recent_runs = super::runs::summaries(host, now);
+    let latest_run = recent_runs
+        .first()
+        .map(|r| super::runs::report_for(&host.id, r, now));
     let drift = if host.drifted {
         vec![
             DriftItem {
@@ -1965,7 +1921,7 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         recent_runs,
         health_results,
         drift,
-        latest_run: None,
+        latest_run,
     }
 }
 

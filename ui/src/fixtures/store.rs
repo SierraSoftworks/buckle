@@ -29,6 +29,8 @@ pub(super) struct State {
     pub audit: Vec<AuditEntry>,
     /// Events the demo produced, for the live provider to deliver.
     pub outbox: Vec<LiveEvent>,
+    /// How far `?demo&live` has moved pi-4's run on.
+    pub run_frame: usize,
 }
 
 impl State {
@@ -50,6 +52,7 @@ impl State {
             revisions: if empty { vec![] } else { data::revisions(now) },
             audit: if empty { vec![] } else { data::audit(now) },
             outbox: Vec::new(),
+            run_frame: 0,
         }
     }
 
@@ -192,10 +195,18 @@ pub fn host_runs(id: &str) -> Result<Vec<RunSummary>, ApiError> {
     host(id).map(|d| d.recent_runs)
 }
 
+/// The latest run as it stands (the live demo moves it on), or an older one
+/// built from its summary.
 pub fn host_run(id: &str, run: &str) -> Result<RunReport, ApiError> {
-    host(id)?
-        .latest_run
-        .filter(|r| r.id == run)
+    let detail = host(id)?;
+    if let Some(latest) = detail.latest_run.filter(|r| r.id == run) {
+        return Ok(latest);
+    }
+    detail
+        .recent_runs
+        .iter()
+        .find(|r| r.id == run)
+        .map(|r| super::runs::report_for(id, r, Utc::now()))
         .ok_or_else(|| ApiError::NotFound(format!("No run '{run}' on '{id}'.")))
 }
 
