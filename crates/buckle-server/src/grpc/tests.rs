@@ -700,4 +700,67 @@ async fn durable_reports_are_acknowledged_and_stored_once() {
     assert_eq!(rollbacks.len(), 1, "one audit row per report");
     assert!(rollbacks[0].message.contains("apt is locked"));
     assert!(rollbacks[0].message.contains("needs attention"));
+    // Acked only after the controller saved its reaction, which removes the
+    // pending copy kept for replay.
+    let pending = s
+        .store
+        .call(|db| {
+            db.kv()
+                .with_prefix(crate::store::kv::keys::PENDING_REPORT_PREFIX)
+        })
+        .await
+        .unwrap();
+    assert!(pending.is_empty(), "{pending:?}");
+}
+
+/// A re-sent durable report that is still pending (stored, but the
+/// controller never saved its reaction, e.g. the server stopped in between)
+/// is handed to the controller again rather than dropped as a duplicate,
+/// and acknowledged once its reaction is saved.
+#[tokio::test]
+async fn a_resent_report_still_pending_reaches_the_controller_again() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    let result = buckle_proto::v1::ApplyResult {
+        revision: "r1".into(),
+        plan_digest: "d1".into(),
+        succeeded: true,
+        applied_revision: "r1".into(),
+        report_id: 9,
+        ..Default::default()
+    };
+    // As if an earlier arrival was stored and the server stopped before the
+    // controller reacted: the arrival is recorded and the copy is pending.
+    let msg = agent_message::Msg::Result(result.clone());
+    let (key, value) = (
+        crate::rollout::pending_report_key("pi-1", 9),
+        crate::rollout::encode_pending_report("pi-1", 9, &msg),
+    );
+    let now = chrono::Utc::now();
+    s.store
+        .call(move |db| {
+            db.reports().first_arrival("pi-1", 9, "apply_result", now)?;
+            db.kv().set(&key, &value)
+        })
+        .await
+        .unwrap();
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::Result(result)),
+    })
+    .await
+    .unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![9]);
+    let pending = s
+        .store
+        .call(|db| {
+            db.kv()
+                .with_prefix(crate::store::kv::keys::PENDING_REPORT_PREFIX)
+        })
+        .await
+        .unwrap();
+    assert!(
+        pending.is_empty(),
+        "the controller consumed it: {pending:?}"
+    );
 }

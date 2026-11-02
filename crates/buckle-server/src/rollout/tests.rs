@@ -2787,3 +2787,120 @@ async fn reject_aborts_a_rollout_awaiting_approval() {
         .unwrap_err();
     assert_eq!(refused.kind, CommandErrorKind::Conflict);
 }
+
+/// A durable report the gRPC layer stored, whose reaction the controller had
+/// not saved when the server stopped, is replayed on start-up (the agent was
+/// never acked, and its re-send would be taken for a duplicate).
+#[tokio::test(start_paused = true)]
+async fn a_durable_report_stored_before_a_crash_is_replayed_on_start_up() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.silent_apply = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "applying", |_, hs| {
+        host(hs, "a").state == HostPhase::Applying
+    })
+    .await;
+    let apply = h.applies()[0].2.clone();
+    let result = AMsg::Result(ApplyResult {
+        revision: apply.revision.clone(),
+        plan_digest: apply.plan_digest.clone(),
+        succeeded: true,
+        applied_revision: apply.revision.clone(),
+        report_id: 42,
+        ..Default::default()
+    });
+    // What the gRPC layer commits before handing the report over.
+    let (key, value) = (
+        super::pending_report_key("a", 42),
+        super::encode_pending_report("a", 42, &result),
+    );
+    h.store
+        .call(move |db| db.kv().set(&key, &value))
+        .await
+        .unwrap();
+    h.restart().await;
+    h.wait(&id, "the replayed result reacted to", |_, hs| {
+        host(hs, "a").state == HostPhase::Baking
+    })
+    .await;
+    let left = h
+        .store
+        .call(|db| db.kv().with_prefix("controller.pending_report."))
+        .await
+        .unwrap();
+    assert!(left.is_empty(), "{left:?}");
+    h.connect("a", Some("r1"));
+    h.wait_state(&id, RolloutState::Completed).await;
+}
+
+/// The controller answers a durable report only once its reaction is
+/// saved: while checkpoints fail the report is not acknowledged.
+#[tokio::test(start_paused = true)]
+async fn a_durable_report_is_confirmed_only_after_its_reaction_is_saved() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', max_failures: 0 }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.silent_apply = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "applying", |_, hs| {
+        host(hs, "a").state == HostPhase::Applying
+    })
+    .await;
+    let apply = h.applies()[0].2.clone();
+    let result = AMsg::Result(ApplyResult {
+        revision: apply.revision.clone(),
+        plan_digest: apply.plan_digest.clone(),
+        succeeded: false,
+        error: "boom".into(),
+        report_id: 7,
+        ..Default::default()
+    });
+    let (key, value) = (
+        super::pending_report_key("a", 7),
+        super::encode_pending_report("a", 7, &result),
+    );
+    h.store
+        .call(move |db| db.kv().set(&key, &value))
+        .await
+        .unwrap();
+    h.fail_checkpoints(true).await;
+    let mut saved = h.handle.durable_report("a", 7, result.clone());
+    h.idle(10).await;
+    assert!(saved.try_recv().is_err(), "not confirmed while unsaved");
+    h.fail_checkpoints(false).await;
+    let confirmed = tokio::time::timeout(Duration::from_secs(120), saved)
+        .await
+        .expect("confirmed once saved");
+    assert_eq!(confirmed, Ok(true));
+    let (r, hosts) = h.snapshot(&id).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Failed);
+    assert_eq!(r.state, RolloutState::Paused);
+    let left = h
+        .store
+        .call(|db| db.kv().with_prefix("controller.pending_report."))
+        .await
+        .unwrap();
+    assert!(left.is_empty());
+    // A re-send of the same report is confirmed without a second reaction.
+    let again = h.handle.durable_report("a", 7, result);
+    assert_eq!(again.await, Ok(true));
+    let failed = h
+        .audit_actions(&id)
+        .await
+        .into_iter()
+        .filter(|a| a == "rollout.host.failed")
+        .count();
+    assert_eq!(failed, 1);
+}

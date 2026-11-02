@@ -106,6 +106,11 @@ fn rejected(reason: impl Into<String>, retry: bool) -> ServerStream {
     Box::pin(futures::stream::once(async move { Ok(m) }))
 }
 
+/// How long a session waits for the controller to save its reaction to a
+/// durable report before giving up on acknowledging it (the agent re-sends
+/// it after its next Welcome).
+const DURABLE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn internal(e: buckle_core::Error) -> Status {
     tracing::error!(error = %e, "a gRPC request failed");
     Status::internal("the server could not complete the request")
@@ -508,6 +513,37 @@ impl FleetService {
         }
     }
 
+    /// A durable report the store has committed (now, or on an earlier
+    /// arrival when `first` is false). It is acknowledged only once the
+    /// controller has saved its reaction (the pending copy is then gone): a
+    /// crash in between leaves the pending copy, replayed at start-up, and
+    /// the agent re-sends the unacknowledged report.
+    async fn durable(&self, host: &str, id: u64, first: bool, msg: agent_message::Msg) {
+        let forward = first || {
+            let key = crate::rollout::pending_report_key(host, id);
+            self.store
+                .call(move |db| db.kv().get(&key))
+                .await
+                .map(|v| v.is_some())
+                .unwrap_or(true)
+        };
+        if !forward {
+            tracing::debug!(buckle.host = %host, report = id, "a report already stored and reacted to; acknowledging it again");
+            self.ack(host, vec![id]);
+            return;
+        }
+        let saved = self.controller.durable_report(host, id, msg);
+        match tokio::time::timeout(DURABLE_ACK_TIMEOUT, saved).await {
+            Ok(Ok(true)) => self.ack(host, vec![id]),
+            Ok(_) => {
+                tracing::warn!(buckle.host = %host, report = id, "the controller stopped before saving its reaction to a report; not acknowledging it");
+            }
+            Err(_) => {
+                tracing::warn!(buckle.host = %host, report = id, "the controller has not saved its reaction to a report yet; not acknowledging it (the agent re-sends it)");
+            }
+        }
+    }
+
     /// Acknowledges durable reports the store has committed.
     fn ack(&self, host: &str, report_ids: Vec<u64>) {
         self.sessions.send(
@@ -614,6 +650,12 @@ impl FleetService {
                 };
                 let applied = (r.succeeded && !r.applied_revision.is_empty())
                     .then(|| r.applied_revision.clone());
+                let pending = durable_id.map(|id| {
+                    (
+                        crate::rollout::pending_report_key(host, id),
+                        crate::rollout::encode_pending_report(host, id, &msg),
+                    )
+                });
                 self.store
                     .transaction(move |db| {
                         if let Some(id) = durable_id
@@ -622,6 +664,11 @@ impl FleetService {
                                 .first_arrival(&run.host, id, "apply_result", now)?
                         {
                             return Ok(false);
+                        }
+                        // Kept until the controller has saved its reaction
+                        // (replayed at start-up otherwise).
+                        if let Some((key, value)) = &pending {
+                            db.kv().set(key, value)?;
                         }
                         db.runs().add(&run)?;
                         if let Some(a) = applied {
@@ -694,6 +741,12 @@ impl FleetService {
                 } else {
                     "module_rollback"
                 };
+                let pending = durable_id.map(|id| {
+                    (
+                        crate::rollout::pending_report_key(host, id),
+                        crate::rollout::encode_pending_report(host, id, &msg),
+                    )
+                });
                 let first = self
                     .store
                     .transaction(move |db| {
@@ -701,6 +754,9 @@ impl FleetService {
                             && !db.reports().first_arrival(&h, id, kind, now)?
                         {
                             return Ok(false);
+                        }
+                        if let Some((key, value)) = &pending {
+                            db.kv().set(key, value)?;
                         }
                         // A module rollback leaves the host on the revision
                         // it was applying (that module back on stable).
@@ -729,13 +785,11 @@ impl FleetService {
             }
             Ok(first) => {
                 if let Some(id) = durable_id {
-                    // Committed (now or on an earlier arrival): the agent
-                    // may forget it.
-                    self.ack(host, vec![id]);
-                    if !first {
-                        tracing::debug!(buckle.host = %host, report = id, "ignoring a report already stored");
-                        return;
+                    self.durable(host, id, *first, msg.clone()).await;
+                    if *first {
+                        self.publish_host(host).await;
                     }
+                    return;
                 }
             }
         }

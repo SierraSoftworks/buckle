@@ -736,6 +736,7 @@ dependencies = [
  "minijinja",
  "notify",
  "pretty_assertions",
+ "prost",
  "prost-types",
  "rand 0.10.3",
  "rcgen",

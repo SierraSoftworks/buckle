@@ -228,6 +228,15 @@ enum Input {
     RevisionAdded(String),
     HostChanged(String),
     HostRegistered(String),
+    /// A durable agent report (ApplyResult, LocalRollback) the gRPC layer
+    /// stored as pending; `done` is told once the controller's reaction is
+    /// persisted (and the pending copy removed), so the report can be acked.
+    Durable {
+        host: String,
+        report_id: u64,
+        msg: agent_message::Msg,
+        done: Option<oneshot::Sender<bool>>,
+    },
     Command {
         actor: String,
         command: Command,
@@ -273,6 +282,27 @@ impl ControllerHandle {
         let _ = self.tx.send(Input::HostChanged(host.to_owned()));
     }
 
+    /// A durable agent report the gRPC layer stored as pending (see
+    /// [`pending_report_key`]). The returned receiver resolves to `true` once
+    /// the controller has persisted its reaction and removed the pending
+    /// copy: only then may the report be acknowledged to the agent. It
+    /// resolves to `false` (or is dropped) when the controller stops first.
+    pub fn durable_report(
+        &self,
+        host: &str,
+        report_id: u64,
+        msg: agent_message::Msg,
+    ) -> oneshot::Receiver<bool> {
+        let (done, rx) = oneshot::channel();
+        let _ = self.tx.send(Input::Durable {
+            host: host.to_owned(),
+            report_id,
+            msg,
+            done: Some(done),
+        });
+        rx
+    }
+
     /// A host row was created by registration or enrolment (possibly a
     /// forgotten host coming back): refresh whether it is excluded. Its
     /// session's Welcome tells the agent its status, so nothing is pushed.
@@ -310,6 +340,33 @@ fn stopped() -> buckle_core::Error {
     )
 }
 
+/// The kv key under which the gRPC layer keeps a durable report until the
+/// controller has persisted its reaction to it.
+pub fn pending_report_key(host: &str, report_id: u64) -> String {
+    format!("{}{host}/{report_id}", keys::PENDING_REPORT_PREFIX)
+}
+
+/// The kv value of a pending durable report: the agent message, encoded.
+pub fn encode_pending_report(host: &str, report_id: u64, msg: &agent_message::Msg) -> String {
+    use prost::Message;
+    let bytes = pb::AgentMessage {
+        msg: Some(msg.clone()),
+    }
+    .encode_to_vec();
+    serde_json::json!({"host": host, "report_id": report_id, "message": hex::encode(bytes)})
+        .to_string()
+}
+
+fn decode_pending_report(value: &str) -> Option<(String, u64, agent_message::Msg)> {
+    use prost::Message;
+    let v: serde_json::Value = serde_json::from_str(value).ok()?;
+    let host = v.get("host")?.as_str()?.to_owned();
+    let report_id = v.get("report_id")?.as_u64()?;
+    let bytes = hex::decode(v.get("message")?.as_str()?).ok()?;
+    let msg = pb::AgentMessage::decode(bytes.as_slice()).ok()?.msg?;
+    Some((host, report_id, msg))
+}
+
 /// The HMAC approval token the Apply message carries.
 pub fn approval_token(key: &[u8; 32], rollout: &str, phase: &str, digest: &str) -> String {
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) else {
@@ -328,6 +385,20 @@ pub async fn spawn(
     let mut controller = Controller::load(deps).await?;
     let handle = ControllerHandle { tx };
     let task = tokio::spawn(async move {
+        // Durable reports the gRPC layer stored but whose reaction was not
+        // saved before the server stopped (they were never acked: the ack
+        // waits for that checkpoint). Replay them before any other input.
+        for (host, report_id, msg) in std::mem::take(&mut controller.replay) {
+            tracing::info!(buckle.host = %host, report = report_id, "replaying a durable report stored before a restart");
+            controller
+                .handle(Input::Durable {
+                    host,
+                    report_id,
+                    msg,
+                    done: None,
+                })
+                .await;
+        }
         controller.drive().await;
         controller.flush().await;
         controller.run(rx, cancel).await;
@@ -398,6 +469,14 @@ struct Controller {
     flush_retry: Option<DateTime<Utc>>,
     /// Consecutive failed checkpoints (for the retry backoff).
     flush_failures: u32,
+    /// Durable reports already reacted to by this process, by (host, id).
+    consumed: HashSet<(String, u64)>,
+    /// Pending-report keys to delete with the next checkpoint.
+    pending_clear: Vec<String>,
+    /// Waiting for the next successful checkpoint to ack their reports.
+    ack_waiters: Vec<oneshot::Sender<bool>>,
+    /// Pending durable reports found on load, replayed before any input.
+    replay: Vec<(String, u64, agent_message::Msg)>,
 }
 
 fn msg(m: server_message::Msg) -> ServerMessage {
@@ -489,10 +568,26 @@ impl Controller {
                     .iter()
                     .map(|h| (h.id.clone(), (h.status, h.effective_labels())))
                     .collect();
-                Ok((out, db.kv().get(keys::STABLE_REVISION)?, (excluded, seen)))
+                let pending = db.kv().with_prefix(keys::PENDING_REPORT_PREFIX)?;
+                Ok((
+                    out,
+                    db.kv().get(keys::STABLE_REVISION)?,
+                    (excluded, seen, pending),
+                ))
             })
             .await?;
-        let (excluded, host_seen) = excluded;
+        let (excluded, host_seen, pending) = excluded;
+        let mut replay = Vec::new();
+        for (key, value) in pending {
+            match decode_pending_report(&value) {
+                Some(r) => replay.push(r),
+                None => {
+                    tracing::warn!(key = %key, "a pending durable report could not be decoded; ignoring it")
+                }
+            }
+        }
+        // Oldest first (report ids are monotonic per agent).
+        replay.sort_by_key(|(_, id, _)| *id);
         let now = deps.clock.now();
         let mut live = Vec::new();
         let mut unloadable: Vec<(RolloutRecord, NewAudit)> = Vec::new();
@@ -593,6 +688,10 @@ impl Controller {
             host_seen,
             flush_retry: None,
             flush_failures: 0,
+            consumed: HashSet::new(),
+            pending_clear: Vec::new(),
+            ack_waiters: Vec::new(),
+            replay,
         })
     }
 
@@ -844,6 +943,28 @@ impl Controller {
             Input::RevisionAdded(id) => self.on_revision_added(&id).await,
             Input::HostChanged(host) => self.on_host_changed(&host).await,
             Input::HostRegistered(host) => self.on_host_registered(&host).await,
+            Input::Durable {
+                host,
+                report_id,
+                msg,
+                done,
+            } => {
+                let key = (host.clone(), report_id);
+                if self.consumed.insert(key) {
+                    match msg {
+                        agent_message::Msg::Result(r) => self.on_apply_result(&host, r),
+                        agent_message::Msg::Rollback(r) => self.on_local_rollback(&host, r),
+                        _ => {}
+                    }
+                }
+                // Removed with the checkpoint that holds the reaction (again,
+                // harmlessly, for a report already consumed).
+                self.pending_clear
+                    .push(pending_report_key(&host, report_id));
+                if let Some(done) = done {
+                    self.ack_waiters.push(done);
+                }
+            }
             Input::Command {
                 actor,
                 command,
@@ -3434,7 +3555,13 @@ impl Controller {
         }
         let audits = std::mem::take(&mut self.audits);
         let stable = self.stable_dirty.then(|| self.stable.clone()).flatten();
-        if !(rollouts.is_empty() && hosts.is_empty() && audits.is_empty() && stable.is_none()) {
+        let cleared = self.pending_clear.clone();
+        if !(rollouts.is_empty()
+            && hosts.is_empty()
+            && audits.is_empty()
+            && stable.is_none()
+            && cleared.is_empty())
+        {
             let (r2, h2, a2) = (rollouts.clone(), hosts.clone(), audits.clone());
             let result = self
                 .store
@@ -3448,6 +3575,9 @@ impl Controller {
                     if let Some(s) = &stable {
                         db.kv().set(keys::STABLE_REVISION, s)?;
                     }
+                    for key in &cleared {
+                        db.kv().delete(key)?;
+                    }
                     let mut entries = Vec::new();
                     for a in &a2 {
                         entries.push(db.audit().add(a)?);
@@ -3459,6 +3589,7 @@ impl Controller {
                 Ok(entries) => {
                     self.flush_retry = None;
                     self.flush_failures = 0;
+                    self.pending_clear.clear();
                     self.stable_dirty = false;
                     for l in &mut self.live {
                         l.dirty = false;
@@ -3530,6 +3661,10 @@ impl Controller {
         for host in undeliverable {
             tracing::debug!(host = %host, "a message could not be delivered; treating the host as disconnected");
             self.on_disconnected(&host);
+        }
+        // The reactions to these durable reports are saved: they may be acked.
+        for done in std::mem::take(&mut self.ack_waiters) {
+            let _ = done.send(true);
         }
         // Forget finished rollouts once their final state is written (they
         // stay in the store).
