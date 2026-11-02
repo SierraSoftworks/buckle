@@ -163,6 +163,16 @@ pub const STEP_STATES: &[StepState] = &[
     StepState::RolledBack,
 ];
 
+/// The tone of the error under a step or module of the given tone: a
+/// blocked step's reason is a warning and a rolled-back module's cause takes
+/// the rollback's colour; anything else is a failure.
+pub fn error_tone(tone: Tone) -> Tone {
+    match tone {
+        Tone::Warn | Tone::Mute => tone,
+        _ => Tone::Danger,
+    }
+}
+
 /// A module state an operator has to read: it failed, its health failed, it
 /// was rolled back, steps stayed blocked, or it could not be decided.
 pub fn module_problem(state: ModuleState) -> bool {
@@ -715,6 +725,14 @@ pub(crate) mod tests {
         assert!(!run_finished(RunState::Running));
         assert!(!run_finished(RunState::Pending));
         assert!(run_finished(RunState::RolledBack));
+    }
+
+    #[test]
+    fn an_error_takes_the_tone_of_what_it_explains() {
+        assert_eq!(error_tone(step_tone(StepState::Blocked)), Tone::Warn);
+        assert_eq!(error_tone(module_tone(ModuleState::RolledBack)), Tone::Mute);
+        assert_eq!(error_tone(step_tone(StepState::Failed)), Tone::Danger);
+        assert_eq!(error_tone(step_tone(StepState::NotRun)), Tone::Danger);
     }
 
     #[test]

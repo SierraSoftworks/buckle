@@ -20,8 +20,8 @@ use crate::app::Route;
 use crate::hooks::use_now;
 use crate::logic::format::{commit, count, millis, relative, short, timestamp};
 use crate::logic::run::{
-    current_step, elapsed_ms, expanded_by_default, module_has_problem, module_label, module_slug,
-    module_tone, run_finished, run_label, run_tone, step_glyph, step_key, step_label,
+    current_step, elapsed_ms, error_tone, expanded_by_default, module_has_problem, module_label,
+    module_slug, module_tone, run_finished, run_label, run_tone, step_glyph, step_key, step_label,
     step_progress, step_slug, step_tone,
 };
 use crate::logic::tone::{Tone, check_status_tone};
@@ -274,7 +274,8 @@ fn module_row(
             if open {
                 <div class="run-module__body" id={body_id}>
                     if let (Some(note), Some(_)) = (&m.note, current) { <p class="run-module__note">{ note.clone() }</p> }
-                    <ErrorBlock error={m.error.clone()} context={AttrValue::from(format!("{} {}", m.name, module_label(m.state)))} />
+                    <ErrorBlock error={m.error.clone()} tone={error_tone(module_tone(m.state))}
+                        context={AttrValue::from(format!("{} {}", m.name, module_label(m.state)))} />
                     if m.steps.is_empty() {
                         <p class="muted small">{ empty }</p>
                     } else {
@@ -324,7 +325,7 @@ fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool) -> Html {
                 if let Some(result) = s.result.as_deref().filter(|t| !t.is_empty()) {
                     <p class="run-step__result">{ secret_text(result) }</p>
                 }
-                <ErrorBlock error={s.error.clone()} />
+                <ErrorBlock error={s.error.clone()} tone={error_tone(step_tone(s.state))} />
             </div>
             <span class="run-step__duration">{ took.unwrap_or_default() }</span>
         </li>
@@ -346,7 +347,7 @@ fn removal_row(x: &RemovalReport) -> Html {
                     <span class="run-step__state">{ step_label(x.state) }</span>
                 </div>
                 if !x.summary.is_empty() { <p class="run-step__summary">{ secret_text(&x.summary) }</p> }
-                <ErrorBlock error={x.error.clone()} />
+                <ErrorBlock error={x.error.clone()} tone={error_tone(step_tone(x.state))} />
             </div>
             <span class="run-step__duration" />
         </li>
