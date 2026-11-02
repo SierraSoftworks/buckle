@@ -1,0 +1,17 @@
+# {{ buckle_managed }}
+data_dir   = "{{ vars.nomad_data_dir }}"
+name       = "{{ host.id }}"
+datacenter = "{{ vars.nomad_datacenter }}"
+region     = "{{ vars.nomad_region }}"
+log_level  = "{{ vars.nomad_log_level }}"
+
+# Listen everywhere; the firewall only lets the tailnet reach these ports.
+bind_addr = "0.0.0.0"
+
+# Advertise the tailnet address. Templates are rendered after the tailscale
+# module has applied (this module needs it), so the fact is populated by now.
+advertise {
+  http = "{{ host.facts.tailscale.ips | first }}"
+  rpc  = "{{ host.facts.tailscale.ips | first }}"
+  serf = "{{ host.facts.tailscale.ips | first }}"
+}

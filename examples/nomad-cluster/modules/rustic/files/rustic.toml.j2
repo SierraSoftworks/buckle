@@ -1,0 +1,12 @@
+# {{ buckle_managed }}
+[repository]
+repository = "{{ vars.rustic_repository }}"
+password = "{{ secrets.RUSTIC_PASSWORD }}"
+
+[forget]
+keep-daily = {{ vars.rustic_keep_daily }}
+keep-weekly = {{ vars.rustic_keep_weekly }}
+prune = true
+
+[[backup.snapshots]]
+sources = [{% for path in vars.rustic_sources %}"{{ path }}"{{ ", " if not loop.last }}{% endfor %}]

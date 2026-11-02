@@ -62,12 +62,15 @@ pub struct UpdateArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct MigrateArgs {
-    /// The Buckle 1.x configuration directory.
-    #[arg(long, value_name = "DIR")]
-    pub from: PathBuf,
-    /// Where to write the v2 configuration.
-    #[arg(long, value_name = "DIR")]
-    pub to: PathBuf,
+    /// The Buckle 1.x configuration directory (the one you gave `--config`).
+    #[arg(value_name = "V1_DIR")]
+    pub v1_dir: PathBuf,
+    /// Where to write the v2 repository. Must be new or empty, unless `--force` is given.
+    #[arg(value_name = "OUT_DIR")]
+    pub out_dir: PathBuf,
+    /// Replace buckle.yaml, vars/, modules/, facts.d/ and secrets.d/ in OUT_DIR.
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub async fn run(cli: Cli) -> buckle_core::Result<i32> {
@@ -82,15 +85,8 @@ pub async fn run(cli: Cli) -> buckle_core::Result<i32> {
         Command::Install(args) => install::run(args).await,
         Command::Catalog(args) => catalog::run(args),
         Command::Update(args) => update::run(args).await,
-        Command::Migrate(_) => Err(not_yet("buckle migrate")),
+        Command::Migrate(args) => crate::migrate::run(args),
     }
-}
-
-fn not_yet(what: &str) -> buckle_core::Error {
-    buckle_core::error::system(
-        format!("{what} is not implemented yet."),
-        &["This part of Buckle is still being built."],
-    )
 }
 
 /// A cancellation token that trips on SIGINT or SIGTERM.

@@ -1,0 +1,32 @@
+name: ssh
+description: sshd hardening and trust for the user certificate authority; reloaded, never restarted.
+when: 'host.facts.os.family == "debian"'
+needs: [packages]
+tags: [base, access]
+vars:
+  ssh_password_auth: false
+  ssh_permit_root_login: "no"
+  ssh_allow_users: [alice, bob, ops]     # a typed list: the template loops over it
+tasks:
+  - apt.package: { name: openssh-server }
+
+  - file.copy:
+      src: user-ca.pub
+      dest: /etc/ssh/user-ca.pub
+      mode: "0644"
+    notify: [reload-sshd]
+
+  - file.template:
+      src: 10-hardening.conf.j2
+      dest: /etc/ssh/sshd_config.d/10-hardening.conf
+      mode: "0644"
+      validate: ["sshd", "-t", "-f", "{path}"]
+    notify: [reload-sshd]
+
+  - systemd.unit: { name: ssh, enabled: true, active: true }
+
+# Handlers are module-scoped and run once, at the end of the module, however
+# many tasks notified them.
+handlers:
+  reload-sshd:
+    systemd.reload: { name: ssh }

@@ -1,0 +1,4 @@
+description: Web server files.
+files:
+  conf.d: /etc/web.d
+  bin: /usr/local/bin

@@ -65,9 +65,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p buckle
-      - name: Apply the example inside ${{ matrix.image }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # The images carry an older glibc than the runner (bookworm has 2.36, the
+      # runner 2.39), so a default release build would not start in them. The
+      # static musl binary, which is also what the release matrix ships, does.
+      - run: cargo build --release -p buckle --target x86_64-unknown-linux-musl
+      - name: Plan the example inside ${{ matrix.image }}
         run: |
           docker run --rm -v "$PWD:/src:ro" ${{ matrix.image }} bash -c '
             set -euo pipefail

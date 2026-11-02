@@ -1,0 +1,17 @@
+# {{ buckle_managed }}
+# The only place the docker plugin is configured; a second plugin "docker"
+# block elsewhere in /etc/nomad.d would make Nomad refuse to start.
+plugin "docker" {
+  config {
+    allow_privileged = {{ "true" if vars.nomad_docker_allow_privileged else "false" }}
+
+    volumes {
+      enabled = true
+    }
+
+    gc {
+      image       = true
+      image_delay = "3m"
+    }
+  }
+}

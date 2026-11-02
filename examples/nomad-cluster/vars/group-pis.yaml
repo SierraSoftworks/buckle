@@ -1,0 +1,5 @@
+# Group layer: the Raspberry Pis. SD cards wear out, so no swap file unless a
+# host overrides it, and quieter logs.
+swap_profile: none
+nomad_node_class: pi
+nomad_log_level: WARN

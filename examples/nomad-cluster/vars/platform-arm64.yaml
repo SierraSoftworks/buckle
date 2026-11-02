@@ -1,0 +1,3 @@
+# Platform layer: arm64 hosts (pi-1..pi-4, oci-1, oci-2).
+cni_arch: arm64
+nomad_node_class: arm         # replaced by the group layer for every arm64 host that is in a group

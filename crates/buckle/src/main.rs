@@ -2,6 +2,7 @@
 
 mod commands;
 mod http;
+mod migrate;
 mod render;
 mod telemetry;
 

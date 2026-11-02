@@ -1,0 +1,30 @@
+name: terminal
+description: Shell history tooling (atuin) installed from a GitHub release.
+needs: [packages]
+tags: [base]
+vars:
+  atuin_version: "18.4.0"
+  terminal_editor: vim
+tasks:
+  - github.release:
+      repo: atuinsh/atuin
+      version: '{{ vars.atuin_version }}'
+      asset: "atuin-{arch}-unknown-linux-gnu.tar.gz"
+      # Host architecture (as `uname -m` spells it) to the release's spelling.
+      # armv7l is deliberately absent: upstream publishes no 32-bit build, so
+      # such a host reports this task as blocked instead of failing the run.
+      arch_map:
+        x86_64: x86_64
+        aarch64: aarch64
+      extract: atuin
+      dest: /usr/local/bin/atuin
+      mode: "0755"
+      probe: ["atuin", "--version"]
+      probe_regex: 'atuin (\S+)'
+      checksum_asset: "atuin-{arch}-unknown-linux-gnu.tar.gz.sha256"
+    tags: [network]
+
+  - file.template:
+      src: terminal.sh.j2
+      dest: /etc/profile.d/10-terminal.sh
+      mode: "0644"

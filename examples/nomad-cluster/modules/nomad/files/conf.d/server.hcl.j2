@@ -1,0 +1,13 @@
+# {{ buckle_managed }}
+server {
+  enabled          = true
+  bootstrap_expect = {{ vars.nomad_server_bootstrap_expect }}
+
+  # A secret: rendered for real into the file (mode 0640), shown as a token
+  # carrying only a fingerprint in plans and in the recorded state.
+  encrypt = "{{ secrets.NOMAD_ENCRYPT_KEY }}"
+
+  server_join {
+    retry_join = [{% for peer in vars.nomad_server_peers %}"{{ peer }}"{{ ", " if not loop.last }}{% endfor %}]
+  }
+}

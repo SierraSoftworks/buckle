@@ -1,0 +1,8 @@
+# {{ buckle_managed }}
+PermitRootLogin {{ vars.ssh_permit_root_login }}
+PasswordAuthentication {{ "yes" if vars.ssh_password_auth else "no" }}
+KbdInteractiveAuthentication no
+X11Forwarding no
+MaxAuthTries 4
+TrustedUserCAKeys /etc/ssh/user-ca.pub
+AllowUsers{% for user in vars.ssh_allow_users %} {{ user }}{% endfor %}
