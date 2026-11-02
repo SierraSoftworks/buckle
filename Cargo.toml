@@ -108,6 +108,7 @@ wiremock = "0.6.5"
 tracing-subscriber = "0.3.23"
 pretty_assertions = "1.4"
 rsa = { version = "0.9", features = ["getrandom", "sha2"] }
+actix-http = "3.11"
 
 [profile.release]
 lto = "fat"

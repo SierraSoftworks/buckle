@@ -1,1 +1,855 @@
+//! The HTTP API end to end through actix's test harness, including OIDC
+//! sign-in against an in-process identity provider (wiremock) that serves
+//! discovery and a JWKS for an RSA key generated here.
 
+use super::*;
+use crate::clock::TokioClock;
+use crate::config::{OidcConfig, WebConfig};
+use crate::rollout::{ControllerDeps, ControllerOptions, Sessions};
+use crate::secrets::ServerSecrets;
+use crate::store::NewHost;
+use actix_web::body::MessageBody;
+use actix_web::cookie::Cookie;
+use actix_web::http::StatusCode;
+use actix_web::test;
+use base64::Engine as _;
+use buckle_api::HostStatus;
+use buckle_core::secrets::InstallKey;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock, Mutex};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+// ------------------------------------------------------------ a health kind for the catalog
+
+struct ProbeCheck;
+
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+struct ProbeSpec {
+    target: String,
+}
+
+#[async_trait::async_trait]
+impl buckle_core::health::HealthCheck for ProbeCheck {
+    type Spec = ProbeSpec;
+    const KIND: &'static str = "test.probe";
+    const DESCRIPTION: &'static str = "A probe registered by the server's tests.";
+    async fn check(
+        &self,
+        _cx: &buckle_core::task::Cx,
+        _spec: &ProbeSpec,
+    ) -> buckle_core::health::HealthStatus {
+        buckle_core::health::HealthStatus::Pass
+    }
+}
+buckle_core::register_health!(ProbeCheck);
+
+// ------------------------------------------------------------ harness
+
+struct Env {
+    _data: tempfile::TempDir,
+    store: Store,
+    state: web::Data<AppState>,
+}
+
+async fn env(web_config: WebConfig) -> Env {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::in_memory().await.unwrap();
+    let revisions = Arc::new(RevisionCache::new(data.path()));
+    let events = EventBus::default();
+    let (controller, _task) = crate::rollout::spawn(
+        ControllerDeps {
+            store: store.clone(),
+            link: Arc::new(Sessions::new()),
+            clock: Arc::new(TokioClock::new()),
+            events: events.clone(),
+            revisions: revisions.clone(),
+            secrets: ServerSecrets::new(&Default::default(), InstallKey::from_bytes([2; 32])),
+            approval_key: [2; 32],
+            options: ControllerOptions::default(),
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let state = web::Data::new(AppState::new(
+        store.clone(),
+        revisions,
+        controller,
+        events,
+        web_config,
+        Some("hook-secret".into()),
+        Some(Arc::new(Notify::new())),
+        "2.0.0-test".into(),
+    ));
+    Env {
+        _data: data,
+        store,
+        state,
+    }
+}
+
+fn acl(expr: &str) -> Option<buckle_core::Filter> {
+    Some(buckle_core::Filter::new(expr).unwrap())
+}
+
+async fn add_host(store: &Store, id: &str, status: HostStatus) {
+    let id = id.to_owned();
+    store
+        .call(move |db| {
+            db.hosts().create(&NewHost {
+                id,
+                status,
+                token_hash: None,
+                auth_method: "token".into(),
+                at: chrono::Utc::now(),
+            })?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+/// Fetches a CSRF token and returns (cookie, token).
+async fn csrf<S, B>(app: &S) -> (Cookie<'static>, String)
+where
+    S: actix_web::dev::Service<
+            actix_http::Request,
+            Response = actix_web::dev::ServiceResponse<B>,
+            Error = actix_web::Error,
+        >,
+    B: MessageBody,
+{
+    let resp = test::call_service(
+        app,
+        test::TestRequest::get().uri("/api/v1/csrf").to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = resp
+        .response()
+        .cookies()
+        .find(|c| c.name() == auth::CSRF_COOKIE)
+        .unwrap()
+        .into_owned();
+    let body: buckle_api::CsrfToken = test::read_body_json(resp).await;
+    (cookie, body.token)
+}
+
+// ------------------------------------------------------------ without OIDC
+
+#[actix_web::test]
+async fn me_is_204_without_oidc() {
+    let e = env(WebConfig::default()).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/me").to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[actix_web::test]
+async fn acls_apply_to_request_metadata_without_oidc() {
+    let e = env(WebConfig {
+        user_acl: acl(r#"headers.x-team == "ops""#),
+        ..Default::default()
+    })
+    .await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let denied = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body: buckle_api::ErrorBody = test::read_body_json(denied).await;
+    assert!(!body.error.is_empty());
+    let allowed = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/fleet")
+            .insert_header(("x-team", "ops"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let fleet: buckle_api::Fleet = test::read_body_json(allowed).await;
+    assert_eq!(fleet.counts.total, 0);
+}
+
+#[actix_web::test]
+async fn admin_routes_are_403_without_admin_acl() {
+    let e = env(WebConfig::default()).await;
+    add_host(&e.store, "pi-1", HostStatus::Pending).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/approve")
+            .cookie(cookie)
+            .insert_header((auth::CSRF_HEADER, token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "admin_acl absent means nobody"
+    );
+}
+
+#[actix_web::test]
+async fn mutations_need_the_csrf_token() {
+    let e = env(WebConfig {
+        admin_acl: acl("true"),
+        ..Default::default()
+    })
+    .await;
+    add_host(&e.store, "pi-1", HostStatus::Pending).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let missing = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/approve")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    let (cookie, token) = csrf(&app).await;
+    let wrong = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/approve")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, "not-the-token"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    let ok = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/approve")
+            .cookie(cookie)
+            .insert_header((auth::CSRF_HEADER, token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn hosts_can_be_relabelled_approved_and_previewed() {
+    let e = env(WebConfig {
+        admin_acl: acl("true"),
+        ..Default::default()
+    })
+    .await;
+    add_host(&e.store, "pi-1", HostStatus::Pending).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("tier".to_string(), "canary".to_string());
+    let patched = test::call_service(
+        &app,
+        test::TestRequest::patch()
+            .uri("/api/v1/hosts/pi-1")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(buckle_api::HostPatch {
+                labels: Some(labels.clone()),
+                notes: Some("in the cupboard".into()),
+            })
+            .to_request(),
+    )
+    .await;
+    assert_eq!(patched.status(), StatusCode::OK);
+    let summary: buckle_api::HostSummary = test::read_body_json(patched).await;
+    assert_eq!(summary.effective_labels["tier"], "canary");
+    assert_eq!(summary.notes, "in the cupboard");
+
+    let approved = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/approve")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .to_request(),
+    )
+    .await;
+    let summary: buckle_api::HostSummary = test::read_body_json(approved).await;
+    assert_eq!(summary.status, HostStatus::Active);
+    let again = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/approve")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+
+    let preview = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/preview")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(buckle_api::HostPatch::default())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK);
+
+    let audit = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/audit?filter=action%20%3D%3D%20%22host.approve%22")
+            .to_request(),
+    )
+    .await;
+    let page: buckle_api::Page<buckle_api::AuditEntry> = test::read_body_json(audit).await;
+    assert_eq!(page.total, 1);
+    let bad = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/audit?filter=%3D%3D")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    let missing = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/hosts/nope")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+async fn next_chunk(body: &mut actix_web::body::BoxBody) -> String {
+    let chunk = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        std::future::poll_fn(|cx| Pin::new(&mut *body).poll_next(cx)),
+    )
+    .await
+    .expect("a chunk arrives")
+    .expect("the stream is open")
+    .unwrap();
+    String::from_utf8_lossy(&chunk).into_owned()
+}
+
+#[actix_web::test]
+async fn sse_streams_controller_events() {
+    let e = env(WebConfig {
+        admin_acl: acl("true"),
+        ..Default::default()
+    })
+    .await;
+    // A valid revision with no hosts: starting it completes immediately.
+    let dir = e.state.revisions.dir("r1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("buckle.yaml"), "version: 2\n").unwrap();
+    let rec = crate::store::RevisionRecord {
+        id: "r1".into(),
+        commit: "r1".into(),
+        author: "a".into(),
+        message: "first".into(),
+        committed_at: chrono::Utc::now(),
+        created_at: chrono::Utc::now(),
+        tarball_digest: Some("t".into()),
+        status: buckle_api::RevisionStatus::Valid,
+        errors: vec![],
+        module_count: 0,
+        source: "path".into(),
+    };
+    e.store
+        .call(move |db| db.revisions().upsert(&rec))
+        .await
+        .unwrap();
+
+    let app = test::init_service(app(e.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/events").to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let mut body = resp.into_body().boxed();
+    assert!(next_chunk(&mut body).await.contains("connected"));
+
+    let (cookie, token) = csrf(&app).await;
+    let started = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/revisions/r1/rollout")
+            .cookie(cookie)
+            .insert_header((auth::CSRF_HEADER, token))
+            .set_json(buckle_api::StartRollout { note: "go".into() })
+            .to_request(),
+    )
+    .await;
+    assert_eq!(started.status(), StatusCode::CREATED);
+    let mut seen = String::new();
+    for _ in 0..20 {
+        seen.push_str(&next_chunk(&mut body).await);
+        if seen.contains("event: rollout_changed") {
+            break;
+        }
+    }
+    assert!(seen.contains("event: rollout_changed"), "{seen}");
+    assert!(seen.contains("data: {"));
+}
+
+#[actix_web::test]
+async fn the_catalog_lists_registered_kinds() {
+    let e = env(WebConfig::default()).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/catalog").to_request(),
+    )
+    .await;
+    let catalog: buckle_api::Catalog = test::read_body_json(resp).await;
+    let probe = catalog
+        .health
+        .iter()
+        .find(|k| k.kind == "test.probe")
+        .expect("registered kind listed");
+    assert_eq!(
+        probe.description,
+        "A probe registered by the server's tests."
+    );
+    assert!(probe.schema.is_object());
+    assert_eq!(catalog.server_version, "2.0.0-test");
+}
+
+#[actix_web::test]
+async fn webhooks_need_a_valid_signature() {
+    use hmac::{Hmac, KeyInit, Mac};
+    let e = env(WebConfig::default()).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let body = br#"{"ref":"refs/heads/main"}"#;
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"hook-secret").unwrap();
+    mac.update(body);
+    let good = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let ok = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/webhooks/source")
+            .insert_header(("x-hub-signature-256", good))
+            .set_payload(body.to_vec())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+    let bad = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/webhooks/source")
+            .insert_header(("x-hub-signature-256", "sha256=00"))
+            .set_payload(body.to_vec())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn the_ui_falls_back_to_index_and_robots_disallow() {
+    let e = env(WebConfig::default()).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let robots = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/robots.txt").to_request(),
+    )
+    .await;
+    assert_eq!(
+        test::read_body(robots).await,
+        "User-agent: *\nDisallow: /\n"
+    );
+    let page = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/rollouts/123").to_request(),
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(
+        page.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+}
+
+// ------------------------------------------------------------ OIDC
+
+const KID: &str = "buckle-test-key";
+const CLIENT_ID: &str = "buckle-under-test";
+
+struct ProviderKey {
+    der: Vec<u8>,
+    jwk: serde_json::Value,
+}
+
+fn rsa_key(kid: &str) -> ProviderKey {
+    use rsa::pkcs1::EncodeRsaPrivateKey as _;
+    use rsa::traits::PublicKeyParts as _;
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let der = key.to_pkcs1_der().unwrap().as_bytes().to_vec();
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    ProviderKey {
+        der,
+        jwk: serde_json::json!({
+            "kty": "RSA", "use": "sig", "alg": "RS256", "kid": kid,
+            "n": b64.encode(key.n().to_bytes_be()),
+            "e": b64.encode(key.e().to_bytes_be()),
+        }),
+    }
+}
+
+static PROVIDER: LazyLock<ProviderKey> = LazyLock::new(|| rsa_key(KID));
+static FORGER: LazyLock<ProviderKey> = LazyLock::new(|| rsa_key(KID));
+
+fn mint(key: &ProviderKey, issuer: &str, nonce: Option<&str>, groups: &[&str]) -> String {
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some(KID.into());
+    let now = chrono::Utc::now().timestamp();
+    let mut claims = serde_json::json!({
+        "iss": issuer,
+        "aud": CLIENT_ID,
+        "sub": "ada-123",
+        "email": "ada@example.com",
+        "name": "Ada Lovelace",
+        "groups": groups,
+        "iat": now,
+        "exp": now + 3600,
+    });
+    if let Some(n) = nonce {
+        claims["nonce"] = serde_json::Value::String(n.into());
+    }
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &jsonwebtoken::EncodingKey::from_rsa_der(&key.der),
+    )
+    .unwrap()
+}
+
+/// The token endpoint: checks PKCE against the challenge the authorization
+/// request carried and mints an id token with that request's nonce.
+#[derive(Clone)]
+struct TokenEndpoint {
+    issuer: String,
+    flows: Arc<Mutex<HashMap<String, (String, String)>>>,
+    forge: Arc<Mutex<bool>>,
+}
+
+impl Respond for TokenEndpoint {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .collect();
+        let Some((challenge, nonce)) = form
+            .get("code")
+            .and_then(|c| self.flows.lock().unwrap().get(c).cloned())
+        else {
+            return ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({"error": "invalid_grant"}));
+        };
+        let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+        if super::oidc::sha256_b64(&verifier) != challenge
+            || form.get("client_secret").map(String::as_str) != Some("shh")
+        {
+            return ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({"error": "invalid_grant"}));
+        }
+        let key: &ProviderKey = if *self.forge.lock().unwrap() {
+            &FORGER
+        } else {
+            &PROVIDER
+        };
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id_token": mint(key, &self.issuer, Some(&nonce), &["admins"]),
+            "refresh_token": "refresh-1",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }))
+    }
+}
+
+struct Idp {
+    server: MockServer,
+    flows: Arc<Mutex<HashMap<String, (String, String)>>>,
+    forge: Arc<Mutex<bool>>,
+}
+
+async fn idp() -> Idp {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"keys": [PROVIDER.jwk]})),
+        )
+        .mount(&server)
+        .await;
+    let flows = Arc::new(Mutex::new(HashMap::new()));
+    let forge = Arc::new(Mutex::new(false));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(TokenEndpoint {
+            issuer: issuer.clone(),
+            flows: flows.clone(),
+            forge: forge.clone(),
+        })
+        .mount(&server)
+        .await;
+    Idp {
+        server,
+        flows,
+        forge,
+    }
+}
+
+fn oidc_web(idp: &Idp) -> WebConfig {
+    WebConfig {
+        base_url: Some("http://buckle.test".into()),
+        user_acl: acl(r#"claims.email endswith "@example.com""#),
+        admin_acl: acl(r#"claims.groups contains "admins""#),
+        oidc: Some(OidcConfig {
+            endpoint: idp.server.uri(),
+            client_id: CLIENT_ID.into(),
+            client_secret: "shh".into(),
+            scopes: vec!["openid".into(), "email".into()],
+        }),
+        ..Default::default()
+    }
+}
+
+/// Runs login, plays the provider's authorize step, and returns the
+/// callback response.
+async fn sign_in<S, B>(app: &S, idp: &Idp, tamper_state: bool) -> actix_web::dev::ServiceResponse<B>
+where
+    S: actix_web::dev::Service<
+            actix_http::Request,
+            Response = actix_web::dev::ServiceResponse<B>,
+            Error = actix_web::Error,
+        >,
+    B: MessageBody,
+{
+    let login = test::call_service(
+        app,
+        test::TestRequest::get()
+            .uri("/api/v1/auth/login?return_to=/rollouts")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::FOUND);
+    let location =
+        url::Url::parse(login.headers().get("location").unwrap().to_str().unwrap()).unwrap();
+    let q: HashMap<String, String> = location.query_pairs().into_owned().collect();
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert_eq!(q["redirect_uri"], "http://buckle.test/api/v1/auth/callback");
+    let cookies: Vec<Cookie<'static>> =
+        login.response().cookies().map(|c| c.into_owned()).collect();
+    assert!(cookies.iter().all(|c| c.http_only() == Some(true)));
+    idp.flows.lock().unwrap().insert(
+        "the-code".into(),
+        (q["code_challenge"].clone(), q["nonce"].clone()),
+    );
+    let state = if tamper_state {
+        "tampered".to_string()
+    } else {
+        q["state"].clone()
+    };
+    let mut req = test::TestRequest::get().uri(&format!(
+        "/api/v1/auth/callback?code=the-code&state={state}"
+    ));
+    for c in cookies {
+        req = req.cookie(c);
+    }
+    test::call_service(app, req.to_request()).await
+}
+
+#[actix_web::test]
+async fn oidc_sign_in_sets_a_session_that_me_and_the_acls_read() {
+    let idp = idp().await;
+    let e = env(oidc_web(&idp)).await;
+    let app = test::init_service(app(e.state.clone())).await;
+
+    let anonymous = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+    )
+    .await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let me = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/me").to_request(),
+    )
+    .await;
+    assert_eq!(me.status(), StatusCode::UNAUTHORIZED);
+
+    let callback = sign_in(&app, &idp, false).await;
+    assert_eq!(callback.status(), StatusCode::FOUND);
+    assert_eq!(callback.headers().get("location").unwrap(), "/rollouts");
+    let session = callback
+        .response()
+        .cookies()
+        .find(|c| c.name() == auth::SESSION_COOKIE)
+        .expect("a session cookie")
+        .into_owned();
+    assert_eq!(session.http_only(), Some(true));
+
+    let me = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/me")
+            .cookie(session.clone())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(me.status(), StatusCode::OK);
+    let me: buckle_api::Me = test::read_body_json(me).await;
+    assert_eq!(me.email.as_deref(), Some("ada@example.com"));
+    assert_eq!(me.name, "Ada Lovelace");
+    assert!(me.is_admin);
+    let fleet = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/fleet")
+            .cookie(session)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(fleet.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn forged_tokens_and_tampered_state_are_refused() {
+    let idp = idp().await;
+    let e = env(oidc_web(&idp)).await;
+    let app = test::init_service(app(e.state.clone())).await;
+
+    let tampered = sign_in(&app, &idp, true).await;
+    assert_eq!(tampered.status(), StatusCode::BAD_REQUEST);
+
+    *idp.forge.lock().unwrap() = true;
+    let forged = sign_in(&app, &idp, false).await;
+    assert_eq!(
+        forged.status(),
+        StatusCode::BAD_REQUEST,
+        "an id token signed by another key is refused"
+    );
+
+    let cookie = Cookie::new(
+        auth::SESSION_COOKIE,
+        mint(&FORGER, &idp.server.uri(), None, &["admins"]),
+    );
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/me")
+            .cookie(cookie)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn a_valid_session_failing_user_acl_is_403_and_admin_routes_need_admin_acl() {
+    let idp = idp().await;
+    let mut web_config = oidc_web(&idp);
+    web_config.admin_acl = acl(r#"claims.groups contains "root""#);
+    let e = env(web_config.clone()).await;
+    add_host(&e.store, "pi-1", HostStatus::Pending).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let issuer = idp.server.uri();
+    let user = Cookie::new(
+        auth::SESSION_COOKIE,
+        mint(&PROVIDER, &issuer, None, &["ops"]),
+    );
+    let fleet = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/fleet")
+            .cookie(user.clone())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(fleet.status(), StatusCode::OK);
+    let (csrf_cookie, token) = csrf(&app).await;
+    let approve = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/hosts/pi-1/approve")
+            .cookie(user)
+            .cookie(csrf_cookie)
+            .insert_header((auth::CSRF_HEADER, token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(approve.status(), StatusCode::FORBIDDEN);
+
+    let mut strict = web_config;
+    strict.user_acl = acl(r#"claims.email endswith "@other.example""#);
+    let e2 = env(strict).await;
+    let app2 = test::init_service(super::app(e2.state.clone())).await;
+    let session = Cookie::new(auth::SESSION_COOKIE, mint(&PROVIDER, &issuer, None, &[]));
+    let denied = test::call_service(
+        &app2,
+        test::TestRequest::get()
+            .uri("/api/v1/fleet")
+            .cookie(session)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "authenticated but not allowed: 403, not 401"
+    );
+}
+
+#[actix_web::test]
+async fn every_protected_route_is_401_without_a_session() {
+    let idp = idp().await;
+    let e = env(oidc_web(&idp)).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    for (m, uri) in super::routes::PROTECTED {
+        let req = match *m {
+            "GET" => test::TestRequest::get(),
+            "POST" => test::TestRequest::post(),
+            "PATCH" => test::TestRequest::patch(),
+            "DELETE" => test::TestRequest::delete(),
+            other => panic!("unexpected method {other}"),
+        };
+        let resp = test::call_service(&app, req.uri(uri).to_request()).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{m} {uri}");
+    }
+}
