@@ -16,6 +16,7 @@ pub mod config;
 pub mod events;
 pub mod fleet;
 pub mod grpc;
+pub mod metrics;
 pub mod rollout;
 pub mod secrets;
 pub mod source;
@@ -124,6 +125,12 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
             &["Set source.git (a repository and branch) or source.path (a local directory)."],
         ));
     }
+
+    tasks.push(tokio::spawn(metrics::run(
+        store.clone(),
+        sessions.clone(),
+        cancel.clone(),
+    )));
 
     let identity = grpc::tls::load(&config.listen.tls, &config.data_dir)?;
     match &identity {

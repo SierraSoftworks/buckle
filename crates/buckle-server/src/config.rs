@@ -539,7 +539,16 @@ pub struct ExecProviderConfig {
     pub allow: Vec<String>,
 }
 
-/// `telemetry`: where traces and metrics go.
+/// `telemetry`: where traces and metrics go. The binary reads this section
+/// (through [`TelemetryConfig::peek`]) before the server starts, to set up
+/// OTLP export; `--otel-endpoint` and the standard `OTEL_EXPORTER_OTLP_*`
+/// variables take precedence over it.
+///
+/// ```yaml
+/// telemetry:
+///   otlp_endpoint: http://otel-collector.example.internal:4317
+///   otlp_headers: { x-honeycomb-team: "${{ env.HONEYCOMB_KEY }}" }
+/// ```
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
@@ -548,6 +557,19 @@ pub struct TelemetryConfig {
     /// Extra OTLP headers (often an API key); values are redacted in logs.
     #[serde(default)]
     pub otlp_headers: IndexMap<String, String>,
+}
+
+impl TelemetryConfig {
+    /// The `telemetry` section of the server.yaml at `path`, interpolated,
+    /// for setting up tracing before the server starts. `None` when the file
+    /// or the section cannot be read; the full load reports why.
+    pub fn peek(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let root: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+        let mut section = root.get("telemetry")?.clone();
+        interpolate_env(&mut section, &|name| std::env::var(name).ok()).ok()?;
+        serde_yaml::from_value(section).ok()
+    }
 }
 
 impl std::fmt::Debug for TelemetryConfig {
@@ -716,6 +738,24 @@ secrets:
         );
         let err = with_env(&yaml).unwrap_err();
         assert!(err.description().contains("webhook_secret"));
+    }
+
+    #[test]
+    fn the_telemetry_section_can_be_read_before_the_server_starts() {
+        // SAFETY: the variable is unique to this test.
+        unsafe { std::env::set_var("BUCKLE_CFG_TEST_OTLP_KEY", "k3y") };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(
+            &path,
+            "listen: { grpc: x, http: y }\nsource: { path: /x }\ntelemetry:\n  otlp_endpoint: http://collector:4317\n  otlp_headers: { x-api-key: \"${{ env.BUCKLE_CFG_TEST_OTLP_KEY }}\" }\n",
+        )
+        .unwrap();
+        let t = TelemetryConfig::peek(&path).unwrap();
+        assert_eq!(t.otlp_endpoint.as_deref(), Some("http://collector:4317"));
+        assert_eq!(t.otlp_headers["x-api-key"], "k3y");
+        assert!(!format!("{t:?}").contains("k3y"));
+        assert!(TelemetryConfig::peek(&dir.path().join("missing.yaml")).is_none());
     }
 
     #[test]
