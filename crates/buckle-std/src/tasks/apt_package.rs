@@ -635,7 +635,9 @@ mod tests {
             .find(|l| l.starts_with("apt-get install"))
             .unwrap();
         assert!(
-            install.ends_with("/var/lib/buckle/downloads/grafana-agent_1.0_amd64.deb"),
+            install
+                .replace('\\', "/")
+                .ends_with("/var/lib/buckle/downloads/grafana-agent_1.0_amd64.deb"),
             "{install}"
         );
         assert!(!sys.exists("/var/lib/buckle/downloads/grafana-agent_1.0_amd64.deb"));
