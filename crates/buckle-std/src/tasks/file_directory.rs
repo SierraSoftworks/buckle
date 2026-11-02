@@ -176,22 +176,22 @@ impl Task for FileDirectory {
                 |a| !is_legacy_marker(a),
             ));
         }
-        let applied;
-        if inspection.exists.is_none() {
+        let applied = if inspection.exists.is_none() {
             cx.system.mkdir_all(&spec.path, &spec.perms).await?;
-            applied = Applied::changed(format!("created directory {}", spec.path.display()))
-                .with_artefact(Artefact::Directory {
+            Applied::changed(format!("created directory {}", spec.path.display())).with_artefact(
+                Artefact::Directory {
                     path: spec.path.clone(),
-                });
+                },
+            )
         } else {
             cx.system.set_perms(&spec.path, &spec.perms).await?;
             // A directory Buckle created earlier stays Buckle's after a permission change.
-            applied = hostkit::ownership::carry_forward_if(
+            hostkit::ownership::carry_forward_if(
                 cx,
                 Applied::changed(format!("updated {}", spec.path.display())),
                 |a| !is_legacy_marker(a),
-            );
-        }
+            )
+        };
         for (path, _) in &inspection.drifted {
             cx.system.set_perms(path, &spec.perms).await?;
         }
