@@ -974,7 +974,17 @@ fn removal(
 }
 
 fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
-    let mut modules = vec![common_module()];
+    // Already in place everywhere: a module the plan review leaves out.
+    let tailscale = ModuleView {
+        module: "tailscale".into(),
+        needs: vec![],
+        steps: vec![
+            step("tailscale", "apt.package", "tailscale", None),
+            step("tailscale", "systemd.unit", "tailscaled", None),
+        ],
+        handlers: vec![],
+    };
+    let mut modules = vec![common_module(), tailscale];
     if nomad {
         modules.push(ModuleView {
             module: "nomad".into(),

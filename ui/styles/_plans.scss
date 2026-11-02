@@ -99,8 +99,12 @@
     font-size: 0.85rem;
   }
 
-  &__count {
-    color: var(--fg-2);
+  // What the block changes and on how many hosts, against the right edge.
+  &__aside {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-left: auto;
   }
 
   &__body {
@@ -115,6 +119,27 @@
 
   &--removals > .plan-module__body {
     border-left-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  }
+}
+
+// `+2 ~1 -1`: a block's changes by kind, in the change colours.
+.tally {
+  display: inline-flex;
+  gap: 0.45rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+
+  &__part--create {
+    color: var(--ok);
+  }
+
+  &__part--modify {
+    color: var(--warn);
+  }
+
+  &__part--remove,
+  &__part--blocked {
+    color: var(--danger);
   }
 }
 
