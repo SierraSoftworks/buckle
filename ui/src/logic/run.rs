@@ -324,12 +324,22 @@ fn fresh(step: StepState) -> bool {
 
 fn apply_step(s: &mut StepReport, p: &RunProgress) {
     if let Some(state) = p.step_state {
-        if state == StepState::Running && s.state != StepState::Running {
-            s.started_at = Some(p.at);
-            s.finished_at = None;
-            s.duration_ms = None;
-        } else if !fresh(state) && s.finished_at.is_none() {
-            s.finished_at = Some(p.at);
+        match state {
+            // Started (again): the last attempt's times are not this one's.
+            StepState::Running if s.state != StepState::Running => {
+                s.started_at = Some(p.at);
+                s.finished_at = None;
+                s.duration_ms = None;
+            }
+            StepState::Running => {}
+            // Planned again: it has not run yet.
+            StepState::Pending => {
+                s.started_at = None;
+                s.finished_at = None;
+                s.duration_ms = None;
+            }
+            _ if s.finished_at.is_none() => s.finished_at = Some(p.at),
+            _ => {}
         }
         s.state = state;
     }
@@ -347,15 +357,21 @@ fn apply_module(m: &mut ModuleReport, p: &RunProgress, own_error: bool) {
     let Some(state) = p.module_state else {
         return;
     };
-    if state == ModuleState::Running && m.state != ModuleState::Running {
-        m.started_at.get_or_insert(p.at);
-        m.finished_at = None;
-    } else if !matches!(
-        state,
-        ModuleState::Pending | ModuleState::Running | ModuleState::Deferred
-    ) && m.finished_at.is_none()
-    {
-        m.finished_at = Some(p.at);
+    match state {
+        // Started (again), as for a step: a retry's time is its own.
+        ModuleState::Running if m.state != ModuleState::Running => {
+            m.started_at = Some(p.at);
+            m.finished_at = None;
+            m.duration_ms = None;
+        }
+        ModuleState::Running => {}
+        ModuleState::Pending | ModuleState::Deferred => {
+            m.started_at = None;
+            m.finished_at = None;
+            m.duration_ms = None;
+        }
+        _ if m.finished_at.is_none() => m.finished_at = Some(p.at),
+        _ => {}
     }
     m.state = state;
     if own_error {
@@ -408,7 +424,9 @@ pub fn apply_progress(report: &mut RunReport, p: &RunProgress) -> Applied {
             {
                 // A step started before the module's own update arrived.
                 m.state = ModuleState::Running;
-                m.started_at.get_or_insert(p.at);
+                m.started_at = Some(p.at);
+                m.finished_at = None;
+                m.duration_ms = None;
             }
             m.changes = m
                 .steps
@@ -908,6 +926,55 @@ pub(crate) mod tests {
         apply_progress(&mut r, &p);
         assert!(r.modules[1].steps[1].error.is_none());
         assert_eq!(r.modules[1].steps[1].started_at, Some(p.at));
+    }
+
+    #[test]
+    fn a_retry_times_itself_afresh() {
+        let mut r = live_report();
+        let earlier = Utc::now() - chrono::Duration::minutes(5);
+        {
+            let m = &mut r.modules[1];
+            m.state = ModuleState::Failed;
+            m.started_at = Some(earlier);
+            m.finished_at = Some(earlier + chrono::Duration::seconds(40));
+            m.duration_ms = Some(40_000);
+            let s = &mut m.steps[0];
+            s.state = StepState::Failed;
+            s.started_at = Some(earlier);
+            s.finished_at = Some(earlier + chrono::Duration::seconds(30));
+            s.duration_ms = Some(30_000);
+        }
+        // The module is retried: its own times start again, so a duration
+        // computed while it runs is this attempt's, not the last one's.
+        let mut p = progress(Some("nomad"), None);
+        p.module_state = Some(ModuleState::Running);
+        apply_progress(&mut r, &p);
+        let m = &r.modules[1];
+        assert_eq!(m.started_at, Some(p.at));
+        assert_eq!((m.finished_at, m.duration_ms), (None, None));
+        assert_eq!(
+            elapsed_ms(m.duration_ms, m.started_at, m.finished_at, p.at, true),
+            Some(0)
+        );
+
+        // Its failed step is planned again, then runs again.
+        let mut q = progress(Some("nomad"), Some("file.copy[b]"));
+        q.step_state = Some(StepState::Pending);
+        apply_progress(&mut r, &q);
+        let s = &r.modules[1].steps[0];
+        assert_eq!(
+            (s.started_at, s.finished_at, s.duration_ms),
+            (None, None, None)
+        );
+        q.step_state = Some(StepState::Running);
+        apply_progress(&mut r, &q);
+        assert_eq!(r.modules[1].steps[0].started_at, Some(q.at));
+
+        // A module planned again has not started.
+        let mut d = progress(Some("nomad"), None);
+        d.module_state = Some(ModuleState::Pending);
+        apply_progress(&mut r, &d);
+        assert_eq!(r.modules[1].started_at, None);
     }
 
     #[test]
