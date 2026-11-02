@@ -122,6 +122,21 @@ fn h_record(raw: RawHost) -> Result<RolloutHostRecord> {
     })
 }
 
+/// Parses rollout rows, skipping (and logging by id) any that cannot be
+/// read, so one corrupt row cannot stop the controller from starting.
+fn readable_rollouts(rows: Vec<RawRollout>) -> Vec<RolloutRecord> {
+    rows.into_iter()
+        .filter_map(|raw| {
+            let id = raw.0.clone();
+            r_record(raw)
+                .map_err(|e| {
+                    tracing::error!(rollout = %id, error = %e, "skipping a rollout row that cannot be read");
+                })
+                .ok()
+        })
+        .collect()
+}
+
 impl<'c> Rollouts<'c> {
     pub(super) fn new(conn: &'c Connection) -> Self {
         Self { conn }
@@ -174,7 +189,7 @@ impl<'c> Rollouts<'c> {
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        rows.into_iter().map(r_record).collect()
+        Ok(readable_rollouts(rows))
     }
 
     /// Total number of rollouts.
@@ -199,8 +214,7 @@ impl<'c> Rollouts<'c> {
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        let records: Vec<RolloutRecord> = rows.into_iter().map(r_record).collect::<Result<_>>()?;
-        Ok(records
+        Ok(readable_rollouts(rows)
             .into_iter()
             .filter(|r| !r.is_terminal() || r.runtime.stragglers_open)
             .collect())
@@ -257,7 +271,17 @@ impl<'c> Rollouts<'c> {
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        rows.into_iter().map(h_record).collect()
+        Ok(rows
+            .into_iter()
+            .filter_map(|raw| {
+                let (rollout, host) = (raw.0.clone(), raw.1.clone());
+                h_record(raw)
+                    .map_err(|e| {
+                        tracing::error!(rollout = %rollout, host = %host, error = %e, "skipping a rollout host row that cannot be read");
+                    })
+                    .ok()
+            })
+            .collect())
     }
 
     /// Removes a host row (a forgotten host).
@@ -373,6 +397,42 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[tokio::test]
+    async fn corrupt_rows_are_skipped_rather_than_failing_the_load() {
+        let store = Store::in_memory().await.unwrap();
+        let (live, listed, hosts) = store
+            .call(|db| {
+                db.rollouts()
+                    .save(&rollout("good", "a", RolloutState::Rolling))?;
+                db.rollouts().save_host(&host_row("good", "pi-1", "a"))?;
+                db.rollouts().save_host(&host_row("good", "pi-2", "a"))?;
+                db.rollouts()
+                    .save(&rollout("bad", "b", RolloutState::Rolling))?;
+                db.conn()
+                    .execute_batch(
+                        "UPDATE rollouts SET state = 'exploded' WHERE id = 'bad'; \
+                         UPDATE rollout_hosts SET detail = '{not json' WHERE host = 'pi-2';",
+                    )
+                    .map_err(crate::store::db_error)?;
+                Ok((
+                    db.rollouts().live()?,
+                    db.rollouts().list(10, 0)?,
+                    db.rollouts().hosts("good")?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            live.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            hosts.iter().map(|h| h.host.as_str()).collect::<Vec<_>>(),
+            vec!["pi-1"]
+        );
     }
 
     #[tokio::test]

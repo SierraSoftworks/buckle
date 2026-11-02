@@ -1023,6 +1023,9 @@ struct AuditQuery {
     before: Option<u64>,
     #[serde(default)]
     limit: Option<u32>,
+    /// `false` leaves out controller progress transitions.
+    #[serde(default)]
+    progress: Option<bool>,
 }
 
 async fn audit(state: Data, _: Authenticated, q: web::Query<AuditQuery>) -> ApiResult {
@@ -1035,21 +1038,22 @@ async fn audit(state: Data, _: Authenticated, q: web::Query<AuditQuery>) -> ApiR
         None => None,
     };
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let (items, total) = state
+    let page = state
         .store
         .call(move |db| {
-            db.audit().list(&AuditFilter {
+            db.audit().page(&AuditFilter {
                 filter,
                 before: q.before,
                 limit,
+                hide_progress: q.progress == Some(false),
             })
         })
         .await?;
-    let next = (items.len() as u64) < total;
-    let next = next
-        .then(|| items.last().map(|e| e.id.to_string()))
-        .flatten();
-    Ok(HttpResponse::Ok().json(Page { items, next, total }))
+    Ok(HttpResponse::Ok().json(Page {
+        items: page.items,
+        next: page.next.map(|n| n.to_string()),
+        total: page.total,
+    }))
 }
 
 async fn webhook(state: Data, req: HttpRequest, body: web::Bytes) -> ApiResult {
