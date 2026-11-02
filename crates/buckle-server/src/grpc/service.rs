@@ -743,7 +743,7 @@ impl FleetService {
                     .and_then(|s| s.to_core())
                     .map(|s| format!("{s:?}").to_lowercase())
                     .unwrap_or_else(|| "unknown".into());
-                let events: Vec<HealthEventRecord> = report
+                let mut events: Vec<HealthEventRecord> = report
                     .results
                     .iter()
                     .map(|r| HealthEventRecord {
@@ -775,9 +775,25 @@ impl FleetService {
                 } else {
                     HealthSummary::Healthy
                 };
+                let revision = report.revision.clone();
                 self.store
                     .call(move |db| {
-                        db.health().record(&events)?;
+                        // The readings belong to the epoch of the revision
+                        // they ran against: its newest run's rollout.
+                        let run = if revision.is_empty() {
+                            db.runs().latest_for_host(&h)?
+                        } else {
+                            db.runs().latest_for_revision(&h, &revision)?
+                        };
+                        let rollout = run.as_ref().and_then(|r| r.rollout.clone());
+                        let revision = match (revision.is_empty(), run) {
+                            (true, Some(r)) => r.revision,
+                            _ => revision,
+                        };
+                        for e in &mut events {
+                            e.rollout = rollout.clone();
+                        }
+                        db.health().record(&revision, &events)?;
                         db.hosts().set_health(&h, summary, now)
                     })
                     .await

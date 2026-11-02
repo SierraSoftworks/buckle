@@ -20,7 +20,7 @@ mod runs;
 pub use approvals::{ApprovalRecord, Approvals};
 pub use audit::{Audit, AuditFilter, NewAudit};
 pub use drift::Drift;
-pub use health::{HealthEventRecord, HealthEvents};
+pub use health::{HEALTH_EPOCHS, HealthEventRecord, HealthEvents};
 pub(crate) use hosts::status_str as hosts_status_str;
 pub use hosts::{HostRecord, Hosts, NewHost};
 pub use kv::Kv;
@@ -237,6 +237,33 @@ CREATE TABLE run_events (
     PRIMARY KEY (run_id, key)
 );
 CREATE INDEX run_events_seq ON run_events(run_id, seq);
+"#,
+    // 5: each check's aggregated status per host and epoch (the rollout and
+    // revision applied when it ran), kept for the host's recent epochs.
+    // Seeded from the latest stored reading of each check.
+    r#"
+CREATE TABLE health_status (
+    host TEXT NOT NULL,
+    rollout TEXT NOT NULL DEFAULT '',
+    revision TEXT NOT NULL DEFAULT '',
+    module TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT '',
+    required INTEGER NOT NULL DEFAULT 1,
+    scope TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    worst TEXT NOT NULL,
+    readings INTEGER NOT NULL DEFAULT 1,
+    first_at TEXT NOT NULL,
+    last_at TEXT NOT NULL,
+    PRIMARY KEY (host, rollout, revision, module, check_name)
+);
+INSERT INTO health_status (host, rollout, revision, module, check_name, kind, required, scope, status, reason, worst, readings, first_at, last_at)
+SELECT e.host, COALESCE(e.rollout, ''), COALESCE(h.applied_revision, ''), e.module, e.check_name, e.kind, e.required, e.scope, e.status, e.reason, e.status, 1, e.at, e.at
+FROM health_events e
+LEFT JOIN hosts h ON h.host_id = e.host
+WHERE e.id IN (SELECT MAX(id) FROM health_events GROUP BY host, module, check_name);
 "#,
 ];
 

@@ -1922,6 +1922,7 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         resources,
         recent_runs,
         health_results,
+        health_checks: vec![],
         drift,
         latest_run,
     }

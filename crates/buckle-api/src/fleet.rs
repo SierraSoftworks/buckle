@@ -65,6 +65,10 @@ pub struct HostDetail {
     pub resources: Vec<ResourceSummary>,
     pub recent_runs: Vec<RunSummary>,
     pub health_results: Vec<HealthResultDto>,
+    /// Each check the host runs now: its latest reading and how it fared in
+    /// the host's recent rollouts. Empty from servers that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_checks: Vec<HostCheck>,
     /// What the latest drift check found different from the applied revision,
     /// one entry per drifted resource. Empty when the host has not drifted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -146,6 +150,44 @@ pub struct HealthResultDto {
     pub rollout_id: Option<String>,
 }
 
+/// One check on one host, aggregated: what it reads now and, per recent
+/// rollout, how it fared while that rollout's revision was applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCheck {
+    pub module: String,
+    pub check: String,
+    pub kind: String,
+    pub required: bool,
+    /// The latest reading: `pass`, `fail` or `unknown`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The scope of the latest reading (`drift`, `bake`, …).
+    pub scope: String,
+    pub at: DateTime<Utc>,
+    /// Newest first, one entry per recent rollout the check ran under.
+    #[serde(default)]
+    pub history: Vec<CheckEpoch>,
+}
+
+/// How one check fared while one rollout's revision was applied on a host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckEpoch {
+    /// Absent for applies outside a rollout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_id: Option<String>,
+    pub revision: String,
+    /// The last reading in the epoch.
+    pub status: String,
+    /// The worst reading in the epoch (`fail` over `unknown` over `pass`).
+    pub worst: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub readings: u32,
+    pub first_at: DateTime<Utc>,
+    pub last_at: DateTime<Utc>,
+}
+
 /// `PATCH /api/v1/hosts/{id}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostPatch {
@@ -224,6 +266,7 @@ mod tests {
         assert!(detail.drift.is_empty());
         assert_eq!(detail.recent_runs[0].trace_url, None);
         assert_eq!(detail.health_results[0].rollout_id, None);
+        assert!(detail.health_checks.is_empty());
 
         let fleet: Fleet = serde_json::from_value(json!({
             "hosts": [summary], "stable_revision": null, "active_rollout": null,
