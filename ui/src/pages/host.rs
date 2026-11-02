@@ -396,7 +396,8 @@ fn runs(
                 </tr></thead>
                 <tbody>
                     { for d.recent_runs.iter().map(|r| html! {
-                        <tr class={classes!((!r.id.is_empty() && shown.as_deref() == Some(r.id.as_str())).then_some("is-open"))}>
+                        <tr class={classes!((!r.id.is_empty() && shown.as_deref() == Some(r.id.as_str())).then_some("is-open"))}
+                            data-run={(!r.id.is_empty()).then(|| r.id.clone())}>
                             <td title={timestamp(r.started_at)}>{ relative(r.started_at, now) }</td>
                             <td class="mono" title={r.revision.clone()}>{ commit(&r.revision) }</td>
                             <td class="mono" title={r.plan_digest.clone()}>{ short(&r.plan_digest) }</td>
