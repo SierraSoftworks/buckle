@@ -26,7 +26,9 @@ pub mod validate;
 #[cfg(test)]
 mod tests;
 
-pub use validate::{ValidationIssue, ValidationReport, validate, validate_with_facts};
+pub use validate::{
+    HostSummary, ValidationIssue, ValidationReport, validate, validate_host, validate_with_facts,
+};
 
 use crate::facts::Facts;
 use crate::health::{HealthReport, HealthScope};

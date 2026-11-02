@@ -3788,6 +3788,41 @@ async fn validation_with_facts_catches_duplicate_keys_and_bad_var_references() {
     );
 }
 
+#[tokio::test]
+async fn validation_with_facts_warns_about_modules_a_host_would_defer() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module("name: p\nfacts: { provides: [test.counter] }\n"),
+            module("name: q\nneeds: [p]\nvars: { v: '{{ host.facts.test.counter.value }}' }\n"),
+            module("name: r\nvars: { v: '{{ vars.nope }}' }\n"),
+        ],
+    );
+    let host = HostIdentity {
+        id: "fixture".into(),
+        labels: Labels::new(),
+    };
+    let (report, summary) = crate::engine::validate_host(&rev, &host, &default_facts())
+        .await
+        .unwrap();
+    assert!(
+        report.warnings.iter().any(|w| w
+            .message
+            .contains("module 'q': would be deferred until 'p'")),
+        "{report}"
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.message.contains("module 'r'") && e.message.contains("vars.nope")),
+        "{report}"
+    );
+    assert_eq!(report.errors.len(), 1, "{report}");
+    assert_eq!(summary.unwrap().selected, vec!["p", "r", "q"]);
+}
+
 #[test]
 fn secret_reference_scanning_finds_names() {
     let refs = validate::secret_references(

@@ -1649,13 +1649,21 @@ pub(super) fn warnings(plan: &Plan) -> Vec<String> {
     out
 }
 
+/// What a dry run found for one host.
+pub(super) struct DryRun {
+    pub summary: super::validate::HostSummary,
+    /// `(module, message, is_error)`; warnings are modules that would be
+    /// deferred until a provider module applies.
+    pub problems: Vec<(String, String, bool)>,
+}
+
 /// Everything up to (not including) task `plan` for a host, with placeholder
-/// secrets, for `buckle validate --facts`.
+/// secrets, for `buckle validate --facts`. Problems are collected per module.
 pub(super) async fn dry_run(
     revision: &Revision,
     host: &HostIdentity,
     facts: &Facts,
-) -> crate::Result<()> {
+) -> crate::Result<DryRun> {
     let mut secrets = SecretStore::new();
     let key = crate::secrets::InstallKey::from_bytes([0u8; 32]);
     for name in revision.fleet.secrets.keys() {
@@ -1677,7 +1685,8 @@ pub(super) async fn dry_run(
     )?;
     let contexts = planner.contexts(facts);
     let selection = planner.select(&contexts)?;
-    for module in &selection.order {
+    let mut problems = Vec::new();
+    let check_module = |module: &LoadedModule| -> crate::Result<()> {
         let ctx = planner.module_context(&contexts, &module.config)?;
         planner.prepare(module, ctx.clone(), &contexts, false, &State::default())?;
         for (name, decl) in &module.config.handlers {
@@ -1703,6 +1712,53 @@ pub(super) async fn dry_run(
             })?;
             check.parse(json)?;
         }
+        Ok(())
+    };
+    let selected: Vec<String> = selection
+        .order
+        .iter()
+        .map(|m| m.config.name.clone())
+        .collect();
+    for module in &selection.order {
+        let name = &module.config.name;
+        let failure = match selection.broken.get(name) {
+            Some(reason) => Some(reason.clone()),
+            None => check_module(module).err().map(|e| planner.failure(&e)),
+        };
+        let Some(failure) = failure else { continue };
+        // On a real host a module whose templates read facts a provider it
+        // needs has not produced yet is deferred, not failed.
+        let refs = context::module_fact_references(revision, &module.config);
+        let provider = ancestors(revision, name).into_iter().find(|p| {
+            revision.module(p).is_some_and(|m| {
+                refs.iter()
+                    .any(|r| context::provided_by(r, &m.config.facts.provides))
+            })
+        });
+        match provider {
+            Some(p) => problems.push((
+                name.clone(),
+                format!(
+                    "would be deferred until '{p}' has applied and refreshed its facts ({failure})"
+                ),
+                false,
+            )),
+            None => problems.push((name.clone(), failure, true)),
+        }
     }
-    Ok(())
+    Ok(DryRun {
+        summary: super::validate::HostSummary {
+            host: host.id.clone(),
+            groups: contexts.base.groups.clone(),
+            selected,
+            skipped: selection.skipped,
+            conditional: selection
+                .conditional
+                .iter()
+                .map(|(m, _)| m.config.name.clone())
+                .collect(),
+            indeterminate: selection.indeterminate,
+        },
+        problems,
+    })
 }

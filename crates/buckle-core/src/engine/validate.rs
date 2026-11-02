@@ -395,6 +395,24 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
     Ok(report)
 }
 
+/// What a dry planning pass decided for one host (`buckle validate --facts`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSummary {
+    pub host: String,
+    /// Fleet groups the host is a member of.
+    pub groups: Vec<String>,
+    /// Modules selected, in dependency order.
+    pub selected: Vec<String>,
+    pub skipped: Vec<String>,
+    /// Modules whose `when` reads facts a selected module provides: decided
+    /// on the host after that module applies.
+    #[serde(default)]
+    pub conditional: Vec<String>,
+    /// Modules whose selection cannot be decided from these facts.
+    #[serde(default)]
+    pub indeterminate: Vec<crate::plan::Indeterminate>,
+}
+
 /// Static validation plus a dry planning pass for one host described by
 /// `host` and `facts`: groups, vars, module selection, spec rendering, spec
 /// parsing and resource keys (duplicates are errors). No task `plan` runs and
@@ -404,15 +422,53 @@ pub async fn validate_with_facts(
     host: &HostIdentity,
     facts: &Facts,
 ) -> crate::Result<ValidationReport> {
+    Ok(validate_host(revision, host, facts).await?.0)
+}
+
+/// [`validate_with_facts`], also returning what was decided for the host
+/// (`None` when static validation already failed). Module-scoped problems are
+/// reported per module; an indeterminate module is a warning.
+pub async fn validate_host(
+    revision: &Revision,
+    host: &HostIdentity,
+    facts: &Facts,
+) -> crate::Result<(ValidationReport, Option<HostSummary>)> {
     let mut report = validate(revision)?;
     if !report.is_ok() {
-        return Ok(report);
+        return Ok((report, None));
     }
+    let location = format!("host {}", host.id);
     match super::planner::dry_run(revision, host, facts).await {
-        Ok(()) => {}
-        Err(err) => report.error(None, format!("host {}", host.id), err.message()),
+        Ok(dry) => {
+            for (module, message, is_error) in &dry.problems {
+                if *is_error {
+                    report.error(
+                        Some(module),
+                        &location,
+                        format!("module '{module}': {message}"),
+                    );
+                } else {
+                    report.warning(
+                        Some(module),
+                        &location,
+                        format!("module '{module}': {message}"),
+                    );
+                }
+            }
+            for i in &dry.summary.indeterminate {
+                report.warning(
+                    Some(&i.module),
+                    &location,
+                    format!("module '{}' is indeterminate: {}", i.module, i.reason),
+                );
+            }
+            Ok((report, Some(dry.summary)))
+        }
+        Err(err) => {
+            report.error(None, location, err.message());
+            Ok((report, None))
+        }
     }
-    Ok(report)
 }
 
 /// `after:` is parsed but not implemented: tasks of a module run strictly in
