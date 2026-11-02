@@ -1,18 +1,39 @@
 //! The engine: load a revision, collect facts, select modules, resolve vars and
 //! secrets, plan, apply, remove, and run health checks.
 //!
-//! Lane 1 (core engine) owns this module. The skeleton fixes the public API so
-//! that the agent, the CLI and the server compile against it, and provides
-//! placeholder implementations that return a clear "not implemented" error.
+//! The pipeline has a pure half and a mutating half (design §04):
+//!
+//! * [`Engine::plan`] reads the host and produces a [`Plan`]. It never writes.
+//! * [`Engine::apply`] re-plans, refuses when the digest no longer matches the
+//!   plan it was handed (a stale plan), and then drives the host from the fresh
+//!   plan: modules concurrently along the `needs` DAG, tasks in order, resource
+//!   locks across modules, handlers, per-module health with settle, facts
+//!   refresh and deferred re-planning, module-scoped rollback and halt, and
+//!   finally removals of orphaned resources.
+//! * [`Engine::health`] runs module health checks once for a scope.
+//!
+//! Internals are split into [`context`] (labels, groups, vars), [`graph`]
+//! (module DAG), [`planner`], [`checks`] and [`executor`].
 
+mod checks;
+mod context;
+mod executor;
+mod graph;
 pub mod loader;
+mod planner;
+pub mod validate;
+
+#[cfg(test)]
+mod tests;
+
+pub use validate::{ValidationIssue, ValidationReport, validate, validate_with_facts};
 
 use crate::facts::Facts;
 use crate::health::{HealthReport, HealthScope};
 use crate::model::FleetConfig;
 use crate::plan::{Plan, RevisionId};
 use crate::secrets::SecretStore;
-use crate::selectors::{HostIdentity, Labels};
+use crate::selectors::{HostIdentity, Labels, Vars};
 use crate::state::StateStore;
 use crate::system::System;
 use crate::task::Source;
@@ -28,6 +49,13 @@ pub struct Revision {
     pub modules: Vec<LoadedModule>,
     /// Raw contents of every `vars` overlay file referenced by the fleet config.
     pub var_files: indexmap::IndexMap<PathBuf, serde_yaml::Value>,
+}
+
+impl Revision {
+    /// The module with this name, if the revision has one.
+    pub fn module(&self, name: &str) -> Option<&LoadedModule> {
+        self.modules.iter().find(|m| m.config.name == name)
+    }
 }
 
 impl std::fmt::Debug for LoadedModule {
@@ -62,6 +90,93 @@ pub struct Inputs {
     /// Checks waived for this run: `module/check`.
     pub waived_checks: Vec<String>,
     pub parallelism: usize,
+    /// The last known-good revision, used to re-apply a module that fails
+    /// (module-scoped rollback, design §04). `None` disables rollback.
+    pub stable_revision: Option<Arc<Revision>>,
+    /// Agent-local var overrides (`vars:` in agent.yaml); the last layer of the
+    /// vars precedence (design §03).
+    pub agent_vars: Vars,
+    /// When set, `facts` is used as-is and no provider runs: for tests and
+    /// `--facts` fixtures.
+    pub facts_frozen: bool,
+}
+
+impl Inputs {
+    /// Inputs with sensible defaults: no server labels, no cached facts, no
+    /// selector, no waivers, parallelism from the CPU count, no stable revision.
+    pub fn new(
+        revision: Arc<Revision>,
+        host: HostIdentity,
+        system: Arc<dyn System>,
+        secrets: Arc<SecretStore>,
+        state: Arc<dyn StateStore>,
+    ) -> Self {
+        Self {
+            revision,
+            host,
+            server_labels: Labels::new(),
+            system,
+            secrets,
+            state,
+            facts: Facts::new(),
+            select: None,
+            waived_checks: Vec::new(),
+            parallelism: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+            stable_revision: None,
+            agent_vars: Vars::new(),
+            facts_frozen: false,
+        }
+    }
+
+    pub fn with_server_labels(mut self, labels: Labels) -> Self {
+        self.server_labels = labels;
+        self
+    }
+
+    /// Seeds the facts cache; providers whose TTL expired still re-run.
+    pub fn with_facts(mut self, facts: Facts) -> Self {
+        self.facts = facts;
+        self
+    }
+
+    /// Uses `facts` verbatim and runs no provider.
+    pub fn with_frozen_facts(mut self, facts: Facts) -> Self {
+        self.facts = facts;
+        self.facts_frozen = true;
+        self
+    }
+
+    pub fn with_select(mut self, select: Option<crate::Filter>) -> Self {
+        self.select = select;
+        self
+    }
+
+    pub fn with_waived_checks(mut self, waived: Vec<String>) -> Self {
+        self.waived_checks = waived;
+        self
+    }
+
+    pub fn with_parallelism(mut self, parallelism: usize) -> Self {
+        self.parallelism = parallelism.max(1);
+        self
+    }
+
+    pub fn with_stable_revision(mut self, stable: Option<Arc<Revision>>) -> Self {
+        self.stable_revision = stable;
+        self
+    }
+
+    pub fn with_agent_vars(mut self, vars: Vars) -> Self {
+        self.agent_vars = vars;
+        self
+    }
+
+    /// The agent's labels with the server's overlaid (server wins).
+    pub fn labels(&self) -> Labels {
+        context::merged_labels(&self.host.labels, &self.server_labels)
+    }
 }
 
 /// Result of an apply.
@@ -152,15 +267,20 @@ pub enum ApplyEvent {
     },
 }
 
-/// The engine entry points. Lane 1 implements these.
+/// The engine entry points.
 pub struct Engine;
 
 impl Engine {
     /// Pure: collects facts (respecting TTLs), selects modules, resolves vars,
     /// plans every task and removal. Never mutates the host.
     pub async fn plan(inputs: &Inputs) -> crate::Result<(Plan, Facts)> {
-        let _ = inputs;
-        Err(not_implemented("Engine::plan"))
+        let span = tracing::info_span!("engine.plan", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id);
+        let (rich, facts) = tracing::Instrument::instrument(
+            planner::plan(inputs, &inputs.revision),
+            span,
+        )
+        .await?;
+        Ok((rich.plan, facts))
     }
 
     /// Applies a previously produced plan. Refuses when the host's fresh plan
@@ -170,24 +290,17 @@ impl Engine {
         plan: &Plan,
         events: tokio::sync::mpsc::Sender<ApplyEvent>,
     ) -> crate::Result<ApplyOutcome> {
-        let _ = (inputs, plan, events);
-        Err(not_implemented("Engine::apply"))
+        let span = tracing::info_span!("engine.apply", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id, buckle.plan.digest = %plan.digest.short());
+        tracing::Instrument::instrument(executor::apply(inputs, plan, events), span).await
     }
 
-    /// Runs the health checks of the given modules (or all applied modules when `None`).
+    /// Runs the health checks of the given modules (or all modules selected on
+    /// this host when `None`) once, with the given scope.
     pub async fn health(
         inputs: &Inputs,
         scope: HealthScope,
         modules: Option<&[String]>,
     ) -> crate::Result<HealthReport> {
-        let _ = (inputs, scope, modules);
-        Err(not_implemented("Engine::health"))
+        checks::run_scope(inputs, scope, modules).await
     }
-}
-
-fn not_implemented(what: &str) -> crate::Error {
-    crate::error::system(
-        format!("{what} is not implemented yet."),
-        &["This part of Buckle is still being built."],
-    )
 }

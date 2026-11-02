@@ -105,6 +105,22 @@ impl Source for DirSource {
     }
 }
 
+/// A [`Source`] with no files, for contexts that have no module behind them
+/// (fact collection, removals of resources whose module left the revision).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmptySource;
+
+#[async_trait]
+impl Source for EmptySource {
+    async fn read(&self, _path: &Path) -> crate::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    async fn list(&self, _path: &Path) -> crate::Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+}
+
 /// Everything a task needs while planning or applying.
 #[derive(Clone)]
 pub struct Cx {
@@ -169,6 +185,14 @@ pub trait Task: Send + Sync + 'static {
     /// A human summary of the desired state, for plans: "nomad present", "/etc/x (0644 root:root)".
     fn describe(spec: &Self::Spec) -> String {
         Self::key(spec)
+    }
+
+    /// Whether this task runs on every apply because it has no idempotency
+    /// guard (a `command.run` without `creates`, `unless` or `changed_when`).
+    /// Plans flag such steps so the author sees the smell.
+    fn always_runs(spec: &Self::Spec) -> bool {
+        let _ = spec;
+        false
     }
 
     /// Inspect the host. Pure: must not change anything.
@@ -320,6 +344,11 @@ pub trait DynTask: Send + Sync {
     fn parse(&self, raw: serde_json::Value) -> crate::Result<ErasedSpec>;
     fn key(&self, spec: &ErasedSpec) -> String;
     fn describe(&self, spec: &ErasedSpec) -> String;
+    /// See [`Task::always_runs`]. Defaults to `false`.
+    fn always_runs(&self, spec: &ErasedSpec) -> bool {
+        let _ = spec;
+        false
+    }
     async fn plan(&self, cx: &Cx, spec: &ErasedSpec) -> crate::Result<Planned>;
     async fn apply(&self, cx: &Cx, spec: &ErasedSpec, planned: &Planned) -> crate::Result<Applied>;
     fn describe_removal(&self, record: &ResourceRecord) -> String;
@@ -382,6 +411,11 @@ impl<T: Task> DynTask for T {
         spec.downcast::<T::Spec>()
             .map(T::describe)
             .unwrap_or_default()
+    }
+    fn always_runs(&self, spec: &ErasedSpec) -> bool {
+        spec.downcast::<T::Spec>()
+            .map(T::always_runs)
+            .unwrap_or(false)
     }
     async fn plan(&self, cx: &Cx, spec: &ErasedSpec) -> crate::Result<Planned> {
         let spec = spec
