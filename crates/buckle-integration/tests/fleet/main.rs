@@ -4,7 +4,13 @@
 
 mod auto_trigger;
 mod common;
+mod drift;
+mod durability;
 mod enrolment;
 mod failures;
+mod gaps;
 mod health_gating;
+mod local_rollback;
 mod phased;
+mod secrets;
+mod staleness;
