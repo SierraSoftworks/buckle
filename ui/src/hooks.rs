@@ -15,7 +15,7 @@ use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 use crate::api::{self, ApiError};
-use crate::logic::run::{Applied, Watch, follow};
+use crate::logic::run::{Applied, RefetchPolicy, Watch, follow, refetch_key};
 use crate::store::use_live;
 
 /// The state of one fetched resource.
@@ -257,13 +257,17 @@ pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> Run
         Some((_, (_, report))) => report.clone(),
         None => seed,
     };
-    let mut stale = false;
+    // The first thing an update asked about that the report could not take.
+    let mut question: Option<String> = None;
     if let (Some((seq, _)), Some(watch)) = (answer, source.as_ref().map(RunSource::watch))
         && let Some(events) = live.log.since(*seq)
     {
         for event in events {
-            if let LiveEvent::RunProgress { progress } = &*event {
-                stale |= follow(report.as_mut(), progress, &watch) == Applied::Refetch;
+            if let LiveEvent::RunProgress { progress } = &*event
+                && follow(report.as_mut(), progress, &watch) == Applied::Refetch
+                && question.is_none()
+            {
+                question = Some(refetch_key(report.as_ref(), progress));
             }
         }
     }
@@ -271,16 +275,22 @@ pub fn use_run_report(source: Option<RunSource>, seed: Option<RunReport>) -> Run
         r.recount();
     }
 
-    // Once per fetched answer: the next answer has a newer sequence number.
-    let stale_at = stale.then(|| answer.map(|d| d.0)).flatten();
+    // Fetch again for it: never while a fetch is in flight, and for the
+    // same question as the last fetch (whose answer did not have it yet)
+    // only after a growing wait, so a server slow to learn of a new step is
+    // not asked once per update.
+    let policy = use_mut_ref(RefetchPolicy::default);
     {
-        let reload = fetch.reload.clone();
-        use_effect_with(stale_at, move |at| {
-            if at.is_some() {
-                reload.emit(());
-            }
-            || ()
-        });
+        let (reload, policy) = (fetch.reload.clone(), policy.clone());
+        let at = answer.map(|d| d.0);
+        use_effect_with(
+            (at, question, fetch.loading),
+            move |(_, question, loading)| {
+                let wait = policy.borrow_mut().next(question.as_deref(), *loading);
+                let timer = wait.map(|ms| Timeout::new(ms, move || reload.emit(())));
+                move || drop(timer)
+            },
+        );
     }
 
     RunFeed {

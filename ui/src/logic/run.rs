@@ -504,6 +504,68 @@ pub fn follow(held: Option<&mut RunReport>, p: &RunProgress, watch: &Watch) -> A
     }
 }
 
+/// What an update the report cannot take is about, so that the same
+/// question is not asked again before the last answer is in: the run, when
+/// it is not the run held (or none is); the module, when the report does
+/// not have it (a deferred module just planned, all its steps new); the
+/// step otherwise.
+pub fn refetch_key(held: Option<&RunReport>, p: &RunProgress) -> String {
+    let step = p.step.as_deref().unwrap_or("");
+    match (held, &p.module) {
+        (Some(r), Some(m)) if r.id == p.run_id => {
+            if r.modules.iter().any(|x| x.name == *m) {
+                format!("{}|{m}|{step}", p.run_id)
+            } else {
+                format!("{}|{m}", p.run_id)
+            }
+        }
+        (Some(r), None) if r.id == p.run_id => format!("{}||{step}", p.run_id),
+        _ => p.run_id.clone(),
+    }
+}
+
+/// How long to wait before fetching a report again for the `attempt`th
+/// time about the same thing: at once the first time, then half a second,
+/// doubling up to fifteen seconds.
+pub fn refetch_delay(attempt: u32) -> u32 {
+    match attempt {
+        0 => 0,
+        n => (500u32 << (n - 1).min(5)).min(15_000),
+    }
+}
+
+/// Paces the refetches a report's updates ask for, so a server that is
+/// slow to learn of a new step is not asked once per update: nothing while
+/// a fetch is in flight, the first fetch for a question at once, and the
+/// same question again (the last answer did not have it yet) only after a
+/// growing wait.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefetchPolicy {
+    last: Option<String>,
+    attempts: u32,
+}
+
+impl RefetchPolicy {
+    /// Milliseconds to wait before fetching again for `question`, or `None`
+    /// to not fetch (nothing to ask, or a fetch is in flight).
+    pub fn next(&mut self, question: Option<&str>, in_flight: bool) -> Option<u32> {
+        if in_flight {
+            return None;
+        }
+        let Some(question) = question else {
+            *self = Self::default();
+            return None;
+        };
+        if self.last.as_deref() == Some(question) {
+            self.attempts += 1;
+        } else {
+            self.last = Some(question.to_string());
+            self.attempts = 0;
+        }
+        Some(refetch_delay(self.attempts))
+    }
+}
+
 /// The run a host page follows: the run of the newest update seen for the
 /// host since the page loaded, else the latest run its detail named.
 pub fn newest_run<'a>(
@@ -1117,6 +1179,42 @@ pub(crate) mod tests {
         let mut p = progress(None, None);
         p.run_id = "run-2".into();
         assert_eq!(follow(Some(&mut r), &p, &pinned), Applied::Ignored);
+    }
+
+    #[test]
+    fn a_refetch_question_names_the_run_module_or_step() {
+        let r = live_report();
+        let mut p = progress(Some("nomad"), Some("file.copy[zz]"));
+        assert_eq!(refetch_key(Some(&r), &p), "run-1|nomad|file.copy[zz]");
+        // Every step of a module the report lacks is one question.
+        p.module = Some("otel".into());
+        assert_eq!(refetch_key(Some(&r), &p), "run-1|otel");
+        p.step = Some("apt.package[otel]".into());
+        assert_eq!(refetch_key(Some(&r), &p), "run-1|otel");
+        // Another run, or none held: the run is the question.
+        p.run_id = "run-2".into();
+        assert_eq!(refetch_key(Some(&r), &p), "run-2");
+        assert_eq!(refetch_key(None, &p), "run-2");
+    }
+
+    #[test]
+    fn refetches_wait_for_the_last_answer_and_then_back_off() {
+        let mut policy = RefetchPolicy::default();
+        // The first time, at once; never while a fetch is in flight.
+        assert_eq!(policy.next(Some("run-1|otel"), false), Some(0));
+        assert_eq!(policy.next(Some("run-1|otel"), true), None);
+        assert_eq!(policy.next(Some("run-1|otel"), true), None);
+        // The answer still lacked it: wait, longer each time, up to a cap.
+        assert_eq!(policy.next(Some("run-1|otel"), false), Some(500));
+        assert_eq!(policy.next(Some("run-1|otel"), false), Some(1_000));
+        for _ in 0..10 {
+            policy.next(Some("run-1|otel"), false);
+        }
+        assert_eq!(policy.next(Some("run-1|otel"), false), Some(15_000));
+        // A new question is asked at once; an answered one starts over.
+        assert_eq!(policy.next(Some("run-2"), false), Some(0));
+        assert_eq!(policy.next(None, false), None);
+        assert_eq!(policy.next(Some("run-2"), false), Some(0));
     }
 
     #[test]
