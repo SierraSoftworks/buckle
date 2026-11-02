@@ -27,7 +27,7 @@ pub use kv::Kv;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
-pub use runs::{RunRecord, Runs};
+pub use runs::{ABANDONED, RUNNING, RunEvent, RunRecord, Runs};
 
 use buckle_core::Result;
 use chrono::{DateTime, Utc};
@@ -211,6 +211,32 @@ CREATE TABLE host_drift (
     detected_at TEXT NOT NULL,
     PRIMARY KEY (host_id, module, kind, key)
 );
+"#,
+    // 4: run reports. Runs get a stable id and keep the agent's full
+    // ApplyOutcome; a run is recorded as `running` from its first apply
+    // event, and its events are kept per run (the latest per step) in
+    // run_events, which replaces apply_events (runs from before the upgrade
+    // keep no events).
+    r#"
+DROP TABLE apply_events;
+ALTER TABLE runs ADD COLUMN run_id TEXT;
+ALTER TABLE runs ADD COLUMN outcome_json TEXT;
+UPDATE runs SET run_id = 'run-' || id WHERE run_id IS NULL;
+CREATE UNIQUE INDEX runs_run_id ON runs(run_id);
+CREATE INDEX runs_rollout ON runs(rollout, host);
+
+CREATE TABLE run_events (
+    run_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    module TEXT,
+    step_id TEXT,
+    state TEXT,
+    event TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (run_id, key)
+);
+CREATE INDEX run_events_seq ON run_events(run_id, seq);
 "#,
 ];
 
@@ -517,6 +543,28 @@ pub(crate) fn parse_ts_opt(s: Option<String>) -> Result<Option<DateTime<Utc>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_events_replace_apply_events() {
+        let store = Store::in_memory().await.unwrap();
+        let tables: Vec<String> = store
+            .call(|db| {
+                let mut stmt = db
+                    .conn()
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    .map_err(db_error)?;
+                let names = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(db_error)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(db_error)?;
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        assert!(tables.iter().any(|t| t == "run_events"), "{tables:?}");
+        assert!(!tables.iter().any(|t| t == "apply_events"), "{tables:?}");
+    }
 
     #[tokio::test]
     async fn migrations_are_idempotent_on_an_existing_database() {

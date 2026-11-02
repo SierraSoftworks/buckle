@@ -126,6 +126,17 @@ describe("a host's latest run", () => {
     await close();
   });
 
+  test("a run list that cannot be read says so, and the report still shows", async () => {
+    const { page, close } = await open("/hosts/pi-5", { flags: "runs=fail" });
+    const report = page.locator("#run-report");
+    await report.locator(".run").waitFor();
+    const error = report.getByRole("alert").filter({ hasText: "The host's runs could not be listed." });
+    await error.waitFor();
+    await error.getByRole("button", { name: "Try again" }).waitFor();
+    assert.equal(await page.getByLabel("Run to show").count(), 0);
+    await close();
+  });
+
   test("a host without runs says so", async () => {
     const { page, close } = await open("/hosts/rpi-new");
     await page.locator("#run-report").getByText("No runs yet").waitFor();
@@ -153,7 +164,12 @@ describe("a host's run in a rollout", () => {
     assert.equal(await nomad.locator(".run-module__row").getAttribute("aria-expanded"), "true");
     assert.equal(await step(nomad, TEMPLATE).getAttribute("data-state"), "running");
     assert.equal(await step(nomad, "systemd.unit[nomad]").getAttribute("data-state"), "pending");
-    assert.equal(await step(run, "nomad/file.copy[/etc/nomad.d/client.hcl]").getAttribute("data-state"), "pending");
+    const removal = step(run, "nomad/file.copy[/etc/nomad.d/client.hcl]");
+    assert.equal(await removal.getAttribute("data-state"), "pending");
+    // Its module, kind and key, each once.
+    assert.equal(await removal.locator(".run-step__name").textContent(), "nomad");
+    assert.equal(await removal.locator(".run-step__kind").textContent(), "file.copy");
+    assert.equal(await removal.locator(".run-step__key").textContent(), "/etc/nomad.d/client.hcl");
     // Within its own rollout's page, no link back to it.
     assert.equal(await run.getByRole("link", { name: "rollout #42" }).count(), 0);
     await close();

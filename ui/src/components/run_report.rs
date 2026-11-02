@@ -19,8 +19,8 @@ use crate::hooks::use_now;
 use crate::logic::format::{commit, count, millis, relative, short, timestamp};
 use crate::logic::run::{
     current_step, elapsed_ms, error_tone, expanded_by_default, module_has_problem, module_label,
-    module_slug, module_tone, run_finished, run_label, run_tone, step_glyph, step_key, step_label,
-    step_progress, step_slug, step_tone,
+    module_slug, module_tone, resource_module, run_finished, run_label, run_tone, step_glyph,
+    step_key, step_label, step_progress, step_slug, step_tone,
 };
 use crate::logic::tone::{Tone, check_status_tone};
 
@@ -339,13 +339,14 @@ fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool, caution: bool) -> Ht
     }
 }
 
-/// A removal, drawn as the step it is: its resource as the key, and a
-/// caution badge where its kind's removal can take more with it.
+/// A removal, drawn as the step it is: its module where the name goes, its
+/// kind and key (`data-step` keeps the whole resource), and a caution badge
+/// where its kind's removal can take more with it.
 fn removal_row(x: &RemovalReport, now: DateTime<Utc>, live: bool) -> Html {
     let step = StepReport {
         id: x.resource.clone(),
         kind: x.kind.clone(),
-        name: None,
+        name: resource_module(&x.resource).map(str::to_string),
         summary: x.summary.clone(),
         state: x.state,
         result: None,

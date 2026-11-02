@@ -3885,3 +3885,358 @@ fn secret_reference_scanning_respects_word_boundaries(
         expected
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-step outcomes and structured errors
+// ---------------------------------------------------------------------------
+
+fn module_outcome<'a>(outcome: &'a ApplyOutcome, module: &str) -> &'a ModuleOutcome {
+    outcome
+        .module_results
+        .iter()
+        .find(|m| m.module == module)
+        .unwrap_or_else(|| panic!("no result for {module}: {outcome:#?}"))
+}
+
+fn step_states(outcome: &ModuleOutcome) -> Vec<(&str, StepState)> {
+    outcome
+        .steps
+        .iter()
+        .map(|s| (s.id.as_str(), s.state))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_failing_step_is_failed_with_a_structured_error_and_later_steps_are_not_run() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: m\ntasks:\n  - test.file: { path: /so/a, content: a, run: so1 }\n  - test.file: { path: /so/b, run: so1, fail_times: 9 }\n    name: write b\n  - test.file: { path: /so/c, content: c, run: so1 }\n",
+            ),
+            module(
+                "name: later\nneeds: [m]\ntasks: [ { test.file: { path: /so/later, run: so1 } } ]\n",
+            ),
+        ],
+    );
+    let (outcome, events) = apply(&inputs(rev, &FakeSystem::new()).with_parallelism(1)).await;
+    let m = module_outcome(&outcome, "m");
+    assert_eq!(
+        step_states(m),
+        vec![
+            ("test.file[/so/a]", StepState::Changed),
+            ("test.file[/so/b]", StepState::Failed),
+            ("test.file[/so/c]", StepState::NotRun),
+        ]
+    );
+    let failed = &m.steps[1];
+    assert_eq!(failed.name.as_deref(), Some("write b"));
+    assert_eq!(failed.summary, "create /so/b", "the plan's summary");
+    assert!(failed.started_at.is_some() && failed.duration_ms.is_some());
+    let detail = failed.error_detail.as_ref().expect("a structured error");
+    assert_eq!(detail.kind, crate::error::ErrorKind::User);
+    assert_eq!(detail.message, "transient failure #1 writing /so/b");
+    assert_eq!(detail.advice, vec!["Try again."]);
+    assert_eq!(m.steps[0].result.as_deref(), Some("wrote /so/a"));
+    assert!(m.steps[2].started_at.is_none());
+
+    let module_error = m.error_detail.as_ref().expect("the module's error");
+    assert_eq!(
+        module_error.message,
+        "m/test.file[/so/b] failed: transient failure #1 writing /so/b"
+    );
+    assert_eq!(module_error.advice, vec!["Try again."]);
+    for line in [m.error.as_deref(), outcome.error.as_deref()] {
+        let line = line.expect("an error line");
+        assert!(!line.contains("To try and fix this"), "{line}");
+        assert!(!line.contains("Try again"), "no advice inline: {line}");
+    }
+    assert_eq!(
+        step_states(module_outcome(&outcome, "later")),
+        vec![("test.file[/so/later]", StepState::NotRun)],
+        "a module that never started lists its planned steps as not run"
+    );
+
+    let failed_event = events
+        .iter()
+        .find_map(|e| match e {
+            ApplyEvent::StepFailed {
+                id,
+                error,
+                error_detail,
+                ..
+            } => Some((id, error, error_detail)),
+            _ => None,
+        })
+        .expect("a StepFailed event");
+    assert_eq!(failed_event.0, "test.file[/so/b]");
+    assert_eq!(failed_event.1, "transient failure #1 writing /so/b");
+    assert_eq!(failed_event.2.as_ref(), Some(detail));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.step() == Some(("m", "test.file[/so/a]"))
+                && e.step_state() == Some(StepState::Running))
+    );
+}
+
+#[tokio::test]
+async fn blocked_steps_and_unnotified_handlers_are_reported_as_such() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /bk/tool, requires: /bk/missing, run: bk1 }\n  - test.file: { path: /bk/conf, content: c, run: bk1, unchanged: true }\n    notify: [restart]\nhandlers:\n  restart: { systemd.restart: { name: x, run: bk1 } }\n",
+        )],
+    );
+    let (outcome, events) = apply(&inputs(rev, &FakeSystem::new())).await;
+    let m = module_outcome(&outcome, "m");
+    assert_eq!(m.status, ModuleStatus::Blocked);
+    assert_eq!(
+        step_states(m),
+        vec![
+            ("test.file[/bk/tool]", StepState::Blocked),
+            ("test.file[/bk/conf]", StepState::Unchanged),
+        ]
+    );
+    assert_eq!(m.handlers.len(), 1, "{m:#?}");
+    assert_eq!(m.handlers[0].id, "m:restart");
+    assert_eq!(m.handlers[0].state, StepState::Skipped);
+    assert!(events.iter().any(|e| matches!(e, ApplyEvent::StepBlocked { id, reason, .. } if id == "test.file[/bk/tool]" && reason.contains("/bk/missing"))));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::StepSkipped { id, .. } if id == "m:restart"))
+    );
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, ApplyEvent::StepFinished { id, .. } if id == "test.file[/bk/tool]")
+        ),
+        "a blocked step is not reported as finished"
+    );
+}
+
+#[tokio::test]
+async fn handlers_that_ran_are_listed_under_the_module_with_their_result() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks:\n  - test.file: { path: /hr/a, content: a, run: hr1 }\n    notify: [restart]\nhandlers:\n  restart: { systemd.restart: { name: x, run: hr1 } }\n",
+        )],
+    );
+    let (outcome, events) = apply(&inputs(rev, &FakeSystem::new())).await;
+    let m = module_outcome(&outcome, "m");
+    assert_eq!(m.handlers.len(), 1, "{m:#?}");
+    assert_eq!(m.handlers[0].state, StepState::Changed);
+    assert!(m.handlers[0].result.is_some());
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::StepStarted { id, .. } if id == "m:restart"))
+    );
+}
+
+#[tokio::test]
+async fn steps_of_a_rolled_back_module_are_rolled_back() {
+    let sys = FakeSystem::new();
+    let r1 = revision("r1", FLEET, rollback_modules("rb-steps", "new", 99));
+    let stable = revision("r0", FLEET, rollback_modules("rb-steps", "stable", 0));
+    signal("rb-steps-release");
+    let inputs = inputs(r1, &sys)
+        .with_stable_revision(Some(stable))
+        .with_parallelism(1);
+    let (outcome, _) = apply(&inputs).await;
+    let b = module_outcome(&outcome, "b");
+    assert_eq!(b.status, ModuleStatus::RolledBack);
+    assert_eq!(
+        step_states(b),
+        vec![("test.file[/rb/rb-steps/b]", StepState::Failed)],
+        "the failing step stays failed so the reader sees what broke"
+    );
+    assert!(b.error_detail.is_some());
+    assert_eq!(
+        step_states(module_outcome(&outcome, "c")),
+        vec![("test.file[/rb/rb-steps/c]", StepState::NotRun)]
+    );
+}
+
+#[tokio::test]
+async fn removals_are_reported_run_or_not_run() {
+    let mut state = State::default();
+    state.record(record_for(
+        "gone",
+        "test.file",
+        "/rm/orphan",
+        RemovalPolicy::Cleanup,
+        "r0",
+    ));
+    let sys = FakeSystem::new().with_file("/rm/orphan", "x", FilePerms::mode(0o644));
+    let ok = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /rm/a, run: rm1 } } ]\n",
+        )],
+    );
+    let store = Arc::new(MemoryStateStore::with(state.clone()));
+    let (outcome, _) = apply(&inputs_with_store(ok, &sys, store)).await;
+    assert_eq!(outcome.removals_run.len(), 1, "{outcome:#?}");
+    let removal = &outcome.removals_run[0];
+    assert_eq!(removal.resource, "gone/test.file[/rm/orphan]");
+    assert_eq!(removal.state, StepState::Changed);
+
+    let failing = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /rm/b, run: rm2, fail_times: 9 } } ]\n",
+        )],
+    );
+    let store = Arc::new(MemoryStateStore::with(state));
+    let (outcome, _) = apply(&inputs_with_store(failing, &sys, store)).await;
+    assert_eq!(
+        outcome
+            .removals_run
+            .iter()
+            .map(|r| r.state)
+            .collect::<Vec<_>>(),
+        vec![StepState::NotRun],
+        "a halted run leaves its removals not run"
+    );
+}
+
+#[tokio::test]
+async fn errors_are_redacted_in_every_field() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /red/a, run: red1, fail_times: 9 } } ]\n",
+        )],
+    );
+    let mut inputs = inputs(rev, &FakeSystem::new());
+    let mut secrets = SecretStore::new();
+    // Values that appear in the failure's message and in its advice.
+    for (name, value) in [("pw", "transient failure"), ("tip", "Try again")] {
+        secrets.insert(Secret::new(
+            name,
+            value.into(),
+            &InstallKey::from_bytes([4; 32]),
+        ));
+    }
+    inputs.secrets = Arc::new(secrets);
+    let (outcome, events) = apply(&inputs).await;
+    assert!(
+        module_outcome(&outcome, "m").steps[0]
+            .error_detail
+            .is_some()
+    );
+    let json = serde_json::to_string(&outcome).unwrap();
+    let events = serde_json::to_string(&events).unwrap();
+    for text in [&json, &events] {
+        assert!(!text.contains("transient failure"), "{text}");
+        assert!(!text.contains("Try again"), "{text}");
+        assert!(text.contains("error_detail"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn an_outcome_survives_json_and_old_outcomes_still_parse() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(
+            "name: m\ntasks: [ { test.file: { path: /js/a, run: js1 } } ]\n",
+        )],
+    );
+    let (outcome, _) = apply(&inputs(rev, &FakeSystem::new())).await;
+    let back: ApplyOutcome =
+        serde_json::from_value(serde_json::to_value(&outcome).unwrap()).unwrap();
+    assert_eq!(
+        back.module_results[0].steps,
+        outcome.module_results[0].steps
+    );
+    assert!(back.started_at.is_some() && back.finished_at.is_some());
+    let old: ApplyOutcome = serde_json::from_value(serde_json::json!({
+        "plan_digest": outcome.plan_digest, "succeeded": true, "changes": 0, "removals": 0,
+        "duration_ms": 1, "failed_module": null, "rolled_back_modules": [], "not_started": [],
+        "health": null, "error": null,
+        "module_results": [{"module": "m", "status": "applied", "changes": 1, "duration_ms": 1, "error": null}]
+    }))
+    .unwrap();
+    assert!(old.module_results[0].steps.is_empty());
+    let old_event: ApplyEvent = serde_json::from_value(serde_json::json!({
+        "event": "step_failed", "module": "m", "task_id": "t", "kind": "k", "error": "boom"
+    }))
+    .unwrap();
+    assert!(
+        matches!(old_event, ApplyEvent::StepFailed { id, error_detail: None, .. } if id.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn plan_errors_carry_structured_detail_outside_the_digest() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module("name: bad\ntasks: [ { test.file: { path: '{{ vars.missing }}' } } ]\n"),
+            module("name: ok\ntasks: [ { test.file: { path: /pe/ok } } ]\n"),
+        ],
+    );
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    let bad = indeterminate(&plan, "bad");
+    assert!(bad.plan_error);
+    let detail = bad.error_detail.as_ref().expect("structured detail");
+    assert!(
+        !detail.message.contains("To try and fix this"),
+        "{detail:?}"
+    );
+    assert!(!detail.advice.is_empty(), "{detail:?}");
+    let mut without = plan.clone();
+    for i in &mut without.indeterminate {
+        i.error_detail = None;
+    }
+    assert_eq!(without.compute_digest(), plan.digest);
+}
+
+#[tokio::test]
+async fn a_handler_whose_owner_never_started_is_reported_as_run_under_its_owner() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: common\ntasks:\n  - test.file: { path: /lo/common, run: lo1 }\n    notify: [nomad:restart]\n",
+            ),
+            module(
+                "name: breaker\nneeds: [common]\ntasks: [ { test.file: { path: /lo/b, run: lo1, fail_times: 9 } } ]\n",
+            ),
+            module(
+                "name: nomad\nneeds: [common, breaker]\ntasks:\n  - test.file: { path: /lo/nomad, run: lo1 }\n    notify: [restart]\nhandlers:\n  restart: { systemd.restart: { name: nomad, run: lo1 } }\n",
+            ),
+        ],
+    );
+    let (outcome, _) = apply(&inputs(rev, &FakeSystem::new()).with_parallelism(1)).await;
+    assert_eq!(status_of(&outcome, "nomad"), ModuleStatus::NotStarted);
+    assert!(
+        handler_calls("lo1").contains(&"handler nomad:systemd.restart nomad".to_string()),
+        "the notified handler ran"
+    );
+    let nomad = module_outcome(&outcome, "nomad");
+    assert_eq!(
+        nomad
+            .handlers
+            .iter()
+            .map(|h| (h.id.as_str(), h.state))
+            .collect::<Vec<_>>(),
+        vec![("nomad:restart", StepState::Changed)],
+        "{nomad:#?}"
+    );
+    assert_eq!(
+        step_states(nomad),
+        vec![("test.file[/lo/nomad]", StepState::NotRun)]
+    );
+}

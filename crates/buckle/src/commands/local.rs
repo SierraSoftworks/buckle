@@ -100,6 +100,22 @@ pub struct ApplyArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct StatusArgs {
+    /// The configuration directory. Accepted so that `status` takes the same
+    /// flags as `plan` and `apply`; the report itself comes from the state
+    /// directory.
+    #[arg(short, long, env = "BUCKLE_CONFIG", value_name = "DIR")]
+    pub config: Option<PathBuf>,
+
+    /// Where the agent keeps its state (resources, shadows, facts cache).
+    #[arg(long, env = "BUCKLE_STATE_DIR", default_value = default_state_dir())]
+    pub state_dir: PathBuf,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub output: OutputFormat,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct HealthArgs {
     #[command(flatten)]
     pub local: LocalArgs,
@@ -326,10 +342,19 @@ pub async fn apply(args: ApplyArgs) -> buckle_core::Result<i32> {
 
     println!();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ApplyEvent>(256);
+    let interactive = {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
+    };
     let printer = tokio::spawn(async move {
+        let mut live = render::LiveRenderer::new(interactive);
         while let Some(event) = rx.recv().await {
-            println!("{}", render::render_event(&event));
+            print!("{}", live.event(&event));
+            let _ = std::io::stdout().flush();
         }
+        let mut rest = String::new();
+        live.close(&mut rest);
+        print!("{rest}");
     });
     let outcome = Engine::apply(&local.inputs, &plan, tx).await;
     let _ = printer.await;
@@ -346,6 +371,69 @@ pub async fn apply(args: ApplyArgs) -> buckle_core::Result<i32> {
         );
     }
     Ok(if outcome.succeeded { 0 } else { 1 })
+}
+
+pub async fn status(args: StatusArgs) -> buckle_core::Result<i32> {
+    status_to(args, &mut std::io::stdout())
+}
+
+/// Prints the report of the last apply on this host (by `buckle apply` or
+/// the agent) from the state directory. Exits 1 when that run did not
+/// succeed.
+pub(crate) fn status_to(args: StatusArgs, out: &mut dyn Write) -> buckle_core::Result<i32> {
+    let store = FileStateStore::new(args.state_dir.join("state.cbor"));
+    let state = store.load()?;
+    let last = store.load_last_run()?;
+    let run = state.runs.last();
+    if args.output == OutputFormat::Json {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "run": run, "outcome": last }))
+                .unwrap_or_default()
+        );
+    } else {
+        match run {
+            Some(run) => {
+                let _ = writeln!(
+                    out,
+                    "last run  revision {} · finished {} · {}",
+                    run.revision,
+                    run.finished_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                    serde_json::to_value(run.outcome)
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.replace('_', " ")))
+                        .unwrap_or_default()
+                );
+            }
+            None if last.is_none() => {
+                let _ = writeln!(out, "no run is recorded in {}", args.state_dir.display());
+                return Ok(0);
+            }
+            None => {}
+        }
+        match &last {
+            Some(outcome) => {
+                let _ = writeln!(out);
+                let _ = out.write_all(render::render_outcome(outcome).as_bytes());
+            }
+            None => {
+                if let Some(error) = run.and_then(|r| r.error.as_ref()) {
+                    let _ = writeln!(out, "error: {error}");
+                }
+                let _ = writeln!(
+                    out,
+                    "(no step detail was kept for this run; the next apply keeps it)"
+                );
+            }
+        }
+    }
+    let succeeded = match (&last, run) {
+        (Some(outcome), _) => outcome.succeeded,
+        (None, Some(run)) => run.outcome == buckle_core::state::RunOutcome::Succeeded,
+        (None, None) => true,
+    };
+    Ok(if succeeded { 0 } else { 1 })
 }
 
 pub async fn health(args: HealthArgs) -> buckle_core::Result<i32> {
@@ -808,5 +896,97 @@ mod tests {
         assert!(text.contains("\nmotd\n"), "{text}");
         assert!(text.contains("sysctl    needs: motd"), "{text}");
         assert!(text.contains("summary  "), "{text}");
+    }
+
+    fn status_args(dir: &Path) -> StatusArgs {
+        StatusArgs {
+            config: None,
+            state_dir: dir.to_path_buf(),
+            output: OutputFormat::Text,
+        }
+    }
+
+    #[test]
+    fn status_without_a_recorded_run_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        assert_eq!(status_to(status_args(dir.path()), &mut out).unwrap(), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("no run is recorded"), "{text}");
+    }
+
+    #[test]
+    fn status_prints_the_last_runs_report_from_the_state_store() {
+        use buckle_core::engine::{
+            ApplyOutcome, ModuleOutcome, ModuleStatus, StepOutcome, StepState,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(dir.path().join("state.cbor"));
+        let mut state = buckle_core::state::State::default();
+        state.push_run(
+            buckle_core::state::RunRecord {
+                revision: RevisionId::new("working-tree"),
+                plan_digest: buckle_core::Digest::of(b"p"),
+                started_at: chrono::Utc::now(),
+                finished_at: chrono::Utc::now(),
+                outcome: buckle_core::state::RunOutcome::Failed,
+                changes: 0,
+                removals: 0,
+                failed_module: Some("swap".into()),
+                rolled_back_modules: vec![],
+                error: Some("module 'swap': mkswap failed".into()),
+            },
+            50,
+        );
+        store.save(&state).unwrap();
+        let failed = StepOutcome {
+            id: "command.run[mkswap /swap]".into(),
+            kind: "command.run".into(),
+            name: None,
+            summary: "run `mkswap /swap`".into(),
+            state: StepState::Failed,
+            result: None,
+            started_at: None,
+            finished_at: None,
+            duration_ms: Some(30),
+            error_detail: Some(
+                buckle_core::error::ErrorReport::user("mkswap failed")
+                    .with_causes(["exit status 1"])
+                    .with_advice(["Check the size of /swap."]),
+            ),
+        };
+        store
+            .save_last_run(&ApplyOutcome {
+                plan_digest: buckle_core::Digest::of(b"p"),
+                succeeded: false,
+                changes: 0,
+                removals: 0,
+                duration_ms: 30,
+                module_results: vec![ModuleOutcome {
+                    steps: vec![failed],
+                    ..ModuleOutcome::new("swap", ModuleStatus::Failed)
+                }],
+                failed_module: Some("swap".into()),
+                rolled_back_modules: vec![],
+                not_started: vec![],
+                health: None,
+                error: Some("module 'swap': mkswap failed".into()),
+                error_detail: None,
+                removals_run: vec![],
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+        assert_eq!(status_to(status_args(dir.path()), &mut out).unwrap(), 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("last run  revision working-tree"),
+            "{text}"
+        );
+        assert!(text.contains("· failed"), "{text}");
+        assert!(text.contains("swap  FAILED"), "{text}");
+        assert!(text.contains("  ✗ command.run[mkswap /swap]"), "{text}");
+        assert!(text.contains("      caused by: exit status 1\n      to fix:\n        • Check the size of /swap.\n"), "{text}");
     }
 }

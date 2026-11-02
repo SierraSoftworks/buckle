@@ -234,6 +234,74 @@ pub fn needs_attention(outcome: &buckle_core::engine::ApplyOutcome) -> bool {
         })
 }
 
+/// A structured error on the wire.
+pub fn error_detail_to_proto(report: &buckle_core::error::ErrorReport) -> pb::ErrorDetail {
+    pb::ErrorDetail {
+        kind: match report.kind {
+            buckle_core::error::ErrorKind::User => "user",
+            buckle_core::error::ErrorKind::System => "system",
+        }
+        .to_owned(),
+        message: report.message.clone(),
+        causes: report.causes.clone(),
+        advice: report.advice.clone(),
+    }
+}
+
+/// An apply event on the wire: the event as JSON plus its module, step id,
+/// step state and (for a failure) structured error as plain fields.
+pub fn apply_event_to_proto(
+    revision: &buckle_core::plan::RevisionId,
+    plan_digest: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    event: &buckle_core::engine::ApplyEvent,
+) -> pb::ApplyEvent {
+    use buckle_core::engine::ApplyEvent as E;
+    let module = match event {
+        E::ModuleStarted { module }
+        | E::ModuleFinished { module, .. }
+        | E::StepStarted { module, .. }
+        | E::StepFinished { module, .. }
+        | E::StepFailed { module, .. }
+        | E::StepBlocked { module, .. }
+        | E::StepSkipped { module, .. }
+        | E::HandlerRun { module, .. }
+        | E::HealthChecked { module, .. } => module.clone(),
+        E::RemovalRun { .. } | E::FactsRefreshed { .. } => String::new(),
+    };
+    let step_state = event
+        .step_state()
+        .and_then(|s| match serde_json::to_value(s) {
+            Ok(serde_json::Value::String(s)) => Some(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    pb::ApplyEvent {
+        revision: revision.0.clone(),
+        plan_digest: plan_digest.to_owned(),
+        at: Some(timestamp(at)),
+        event_json: json_bytes(event),
+        module,
+        step_id: event
+            .step()
+            .map(|(_, id)| id.to_owned())
+            .unwrap_or_default(),
+        step_state,
+        error: match event {
+            E::StepFailed {
+                error_detail: Some(detail),
+                ..
+            } => Some(error_detail_to_proto(detail)),
+            E::StepFailed { error, .. } => Some(pb::ErrorDetail {
+                kind: "system".into(),
+                message: error.clone(),
+                ..Default::default()
+            }),
+            _ => None,
+        },
+    }
+}
+
 fn plan_result(plan: &buckle_core::plan::Plan, error: String) -> pb::PlanResult {
     pb::PlanResult {
         module_errors: plan
@@ -313,12 +381,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             plan_digest,
             at,
             event,
-        } => Msg::Apply(pb::ApplyEvent {
-            revision: revision.0.clone(),
-            plan_digest: plan_digest.clone(),
-            at: Some(timestamp(*at)),
-            event_json: json_bytes(event),
-        }),
+        } => Msg::Apply(apply_event_to_proto(revision, plan_digest, *at, event)),
         Report::ApplyResult {
             report_id,
             revision,
@@ -344,6 +407,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             rolled_back_modules: outcome.rolled_back_modules.clone(),
             not_started_modules: outcome.not_started.clone(),
             error: outcome.error.clone().unwrap_or_default(),
+            error_detail: outcome.error_detail.as_ref().map(error_detail_to_proto),
             outcome_json: json_bytes(outcome),
             failed_checks: outcome
                 .health
@@ -387,6 +451,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buckle_core::engine::{ApplyEvent, ApplyOutcome};
     use buckle_core::health::HealthScope;
     use rstest::rstest;
 
@@ -463,11 +528,9 @@ mod tests {
         assert!(!needs_attention(&outcome));
         outcome.succeeded = false;
         outcome.module_results = vec![ModuleOutcome {
-            module: "m".into(),
-            status: ModuleStatus::Blocked,
-            changes: 0,
             duration_ms: 1,
             error: Some("waiting on a lock".into()),
+            ..ModuleOutcome::new("m", ModuleStatus::Blocked)
         }];
         let report = Report::ApplyResult {
             report_id: 1,
@@ -487,6 +550,78 @@ mod tests {
         assert!(!needs_attention(&outcome), "a failure is a failure");
     }
 
+    #[rstest]
+    #[case::started(
+        ApplyEvent::StepStarted { module: "m".into(), task_id: "t".into(), id: "file.copy[/x]".into(), kind: "file.copy".into() },
+        "running",
+        false
+    )]
+    #[case::finished(
+        ApplyEvent::StepFinished { module: "m".into(), task_id: "t".into(), id: "file.copy[/x]".into(), kind: "file.copy".into(), changed: true, summary: "wrote".into() },
+        "changed",
+        false
+    )]
+    #[case::blocked(
+        ApplyEvent::StepBlocked { module: "m".into(), task_id: "t".into(), id: "file.copy[/x]".into(), kind: "file.copy".into(), reason: "no tool".into() },
+        "blocked",
+        false
+    )]
+    #[case::failed(
+        ApplyEvent::StepFailed {
+            module: "m".into(), task_id: "t".into(), id: "file.copy[/x]".into(), kind: "file.copy".into(),
+            error: "write failed".into(),
+            error_detail: Some(buckle_core::error::ErrorReport::user("write failed").with_causes(["disk full"]).with_advice(["free space"])),
+        },
+        "failed",
+        true
+    )]
+    fn step_events_carry_their_id_state_and_error_on_the_wire(
+        #[case] event: ApplyEvent,
+        #[case] state: &str,
+        #[case] has_error: bool,
+    ) {
+        let wire = apply_event_to_proto(&RevisionId::new("r"), "d", chrono::Utc::now(), &event);
+        assert_eq!(wire.module, "m");
+        assert_eq!(wire.step_id, "file.copy[/x]");
+        assert_eq!(wire.step_state, state);
+        assert_eq!(wire.error.is_some(), has_error);
+        if let Some(error) = wire.error {
+            assert_eq!(error.kind, "user");
+            assert_eq!(error.message, "write failed");
+            assert_eq!(error.causes, vec!["disk full"]);
+            assert_eq!(error.advice, vec!["free space"]);
+        }
+        let back: ApplyEvent = serde_json::from_slice(&wire.event_json).unwrap();
+        assert_eq!(back.step(), event.step());
+    }
+
+    #[test]
+    fn the_apply_result_carries_the_whole_outcome_and_its_run_error() {
+        let plan = crate::testing::plan_with_changes(&RevisionId::new("r"), 400);
+        let mut outcome = crate::testing::succeeded(&plan);
+        outcome.succeeded = false;
+        outcome.error_detail = Some(
+            buckle_core::error::ErrorReport::system("state could not be saved")
+                .with_advice(["check the disk"]),
+        );
+        let report = Report::ApplyResult {
+            report_id: 1,
+            revision: RevisionId::new("r"),
+            outcome: outcome.clone(),
+            applied_revision: None,
+        };
+        match report_to_proto(&report).msg {
+            Some(pb::agent_message::Msg::Result(r)) => {
+                let back: ApplyOutcome = serde_json::from_slice(&r.outcome_json).unwrap();
+                assert_eq!(back.module_results.len(), outcome.module_results.len());
+                let detail = r.error_detail.expect("the run error");
+                assert_eq!(detail.kind, "system");
+                assert_eq!(detail.advice, vec!["check the disk"]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     #[test]
     fn module_plan_errors_travel_with_the_plan() {
         let mut plan = crate::testing::plan_with_changes(&RevisionId::new("r"), 1);
@@ -495,11 +630,13 @@ mod tests {
                 module: "nomad".into(),
                 reason: "var 'dc' is undefined".into(),
                 plan_error: true,
+                error_detail: None,
             },
             buckle_core::plan::Indeterminate {
                 module: "docker".into(),
                 reason: "facts missing".into(),
                 plan_error: false,
+                error_detail: None,
             },
         ];
         match report_to_proto(&Report::Plan(plan)).msg {

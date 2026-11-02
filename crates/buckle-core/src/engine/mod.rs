@@ -32,6 +32,7 @@ pub use validate::{
     secret_names_for_host, validate, validate_host, validate_with_facts,
 };
 
+use crate::error::ErrorReport;
 use crate::facts::Facts;
 use crate::health::{HealthReport, HealthScope};
 use crate::model::FleetConfig;
@@ -41,6 +42,7 @@ use crate::selectors::{HostIdentity, Labels, Vars};
 use crate::state::StateStore;
 use crate::system::System;
 use crate::task::Source;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -272,6 +274,10 @@ impl StalePlan {
 }
 
 /// Result of an apply.
+///
+/// The agent ships it to the server as `ApplyResult.outcome_json`, so every
+/// field added after the first release is `#[serde(default)]`: a newer server
+/// reads an older agent's outcome and the other way round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyOutcome {
     pub plan_digest: crate::Digest,
@@ -287,7 +293,19 @@ pub struct ApplyOutcome {
     /// Modules not started because the run halted.
     pub not_started: Vec<String>,
     pub health: Option<HealthReport>,
+    /// Every problem of the run on one line each, joined (no advice).
     pub error: Option<String>,
+    /// The run-level error, structured: what failed, why, and what to try.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<ErrorReport>,
+    /// The removals of the plan (and of deferred modules), in order, with
+    /// what happened to each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removals_run: Vec<RemovalOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,7 +314,159 @@ pub struct ModuleOutcome {
     pub status: ModuleStatus,
     pub changes: usize,
     pub duration_ms: u64,
+    /// The module's problem on one line (no advice).
     pub error: Option<String>,
+    /// `error`, structured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<ErrorReport>,
+    /// The module's planned steps in plan order, with what happened to each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepOutcome>,
+    /// The handlers the module ran (or planned and did not run), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<StepOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl ModuleOutcome {
+    /// An outcome with no steps, timings or error.
+    pub fn new(module: impl Into<String>, status: ModuleStatus) -> Self {
+        Self {
+            module: module.into(),
+            status,
+            changes: 0,
+            duration_ms: 0,
+            error: None,
+            error_detail: None,
+            steps: Vec::new(),
+            handlers: Vec::new(),
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// Sets the error (both the line and the structured form).
+    pub fn with_error(mut self, error: ErrorReport) -> Self {
+        self.error = Some(error.one_line());
+        self.error_detail = Some(error);
+        self
+    }
+}
+
+/// The state of one step (task, handler or removal) of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepState {
+    /// Planned, not started yet.
+    Pending,
+    Running,
+    Changed,
+    Unchanged,
+    Failed,
+    /// Could not be applied here (tool missing, platform, precondition).
+    Blocked,
+    /// Not run on purpose (a handler nothing notified, removals disabled).
+    Skipped,
+    /// Never reached because the module or the run halted.
+    NotRun,
+    /// Applied, then undone by the module's rollback to the stable revision.
+    RolledBack,
+}
+
+/// What happened to one planned step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepOutcome {
+    /// The resource key within the module, `kind[key]` (for a handler,
+    /// `owner:handler`).
+    pub id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// What the plan said the step would do.
+    pub summary: String,
+    pub state: StepState,
+    /// What applying it reported, when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<ErrorReport>,
+}
+
+impl StepOutcome {
+    /// The not-yet-run outcome of a planned step.
+    pub fn planned(step: &crate::plan::Step, state: StepState) -> Self {
+        Self {
+            id: step_id(&step.resource),
+            kind: step.resource.kind.clone(),
+            name: step.task.name.clone(),
+            summary: planned_summary(&step.planned),
+            state,
+            result: None,
+            started_at: None,
+            finished_at: None,
+            duration_ms: None,
+            error_detail: None,
+        }
+    }
+
+    /// The not-yet-run outcome of a planned handler.
+    pub fn planned_handler(run: &crate::plan::HandlerRun, state: StepState) -> Self {
+        Self {
+            id: handler_id(&run.module, &run.handler),
+            kind: run.kind.clone(),
+            name: Some(run.handler.clone()),
+            summary: run.summary.clone(),
+            state,
+            result: None,
+            started_at: None,
+            finished_at: None,
+            duration_ms: None,
+            error_detail: None,
+        }
+    }
+}
+
+/// The id of a step within its module: `kind[key]`.
+pub fn step_id(resource: &crate::plan::ResourceKey) -> String {
+    format!("{}[{}]", resource.kind, resource.key)
+}
+
+/// The id of a handler: `owner:handler`.
+pub fn handler_id(owner: &str, handler: &str) -> String {
+    format!("{owner}:{handler}")
+}
+
+/// What a plan said a step would do, in one line.
+pub fn planned_summary(planned: &crate::plan::Planned) -> String {
+    match planned {
+        crate::plan::Planned::NoOp => "no change".to_owned(),
+        crate::plan::Planned::Change { diff } => diff.summary().to_owned(),
+        crate::plan::Planned::Blocked { reason } => format!("blocked: {reason}"),
+    }
+}
+
+/// What happened to one removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalOutcome {
+    /// `module/kind[key]`.
+    pub resource: String,
+    pub kind: String,
+    /// What the plan said the removal would do; once it ran, what it did.
+    pub summary: String,
+    pub state: StepState,
+    #[serde(default)]
+    pub caution: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<ErrorReport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +491,11 @@ pub enum ModuleStatus {
 }
 
 /// Progress events emitted during apply, for the agent to stream to the server.
+///
+/// Step events carry `id`, the step's resource key within the module
+/// (`kind[key]`, or `owner:handler` for a handler), so that they can be matched
+/// to the plan's steps. Fields added after the first release are
+/// `#[serde(default)]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ApplyEvent {
@@ -330,11 +505,15 @@ pub enum ApplyEvent {
     StepStarted {
         module: String,
         task_id: String,
+        #[serde(default)]
+        id: String,
         kind: String,
     },
     StepFinished {
         module: String,
         task_id: String,
+        #[serde(default)]
+        id: String,
         kind: String,
         changed: bool,
         summary: String,
@@ -342,8 +521,29 @@ pub enum ApplyEvent {
     StepFailed {
         module: String,
         task_id: String,
+        #[serde(default)]
+        id: String,
         kind: String,
+        /// The one-line message (no causes or advice).
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_detail: Option<ErrorReport>,
+    },
+    /// A step that could not be applied here (it stays planned).
+    StepBlocked {
+        module: String,
+        task_id: String,
+        id: String,
+        kind: String,
+        reason: String,
+    },
+    /// A step deliberately not run (a handler nothing notified).
+    StepSkipped {
+        module: String,
+        task_id: String,
+        id: String,
+        kind: String,
+        reason: String,
     },
     HandlerRun {
         module: String,
@@ -366,6 +566,47 @@ pub enum ApplyEvent {
     FactsRefreshed {
         providers: Vec<String>,
     },
+}
+
+impl ApplyEvent {
+    /// The module and step id the event is about, when it is about a step.
+    pub fn step(&self) -> Option<(&str, &str)> {
+        match self {
+            ApplyEvent::StepStarted { module, id, .. }
+            | ApplyEvent::StepFinished { module, id, .. }
+            | ApplyEvent::StepFailed { module, id, .. }
+            | ApplyEvent::StepBlocked { module, id, .. }
+            | ApplyEvent::StepSkipped { module, id, .. } => Some((module, id)),
+            _ => None,
+        }
+    }
+
+    /// The step state the event leaves its step in, when it is about a step.
+    pub fn step_state(&self) -> Option<StepState> {
+        Some(match self {
+            ApplyEvent::StepStarted { .. } => StepState::Running,
+            ApplyEvent::StepFinished { changed: true, .. } => StepState::Changed,
+            ApplyEvent::StepFinished { .. } => StepState::Unchanged,
+            ApplyEvent::StepFailed { .. } => StepState::Failed,
+            ApplyEvent::StepBlocked { .. } => StepState::Blocked,
+            ApplyEvent::StepSkipped { .. } => StepState::Skipped,
+            _ => return None,
+        })
+    }
+
+    /// Whether the event ends its step (or module): the event a coalescing
+    /// transport must never drop.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ApplyEvent::StepFinished { .. }
+                | ApplyEvent::StepFailed { .. }
+                | ApplyEvent::StepBlocked { .. }
+                | ApplyEvent::StepSkipped { .. }
+                | ApplyEvent::ModuleFinished { .. }
+                | ApplyEvent::RemovalRun { .. }
+        )
+    }
 }
 
 /// The engine entry points.
