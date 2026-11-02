@@ -201,7 +201,10 @@ impl FleetService {
                     let created = self
                         .store
                         .call(move |db| match db.hosts().get(&id)? {
-                            Some(h) => Ok((h.status, false)),
+                            // Enrolled with a token: the token is its identity,
+                            // not whichever tailnet node carries its name.
+                            Some(h) if h.token_hash.is_some() => Ok(None),
+                            Some(h) => Ok(Some((h.status, false))),
                             None => {
                                 db.hosts().create(&NewHost {
                                     id: id.clone(),
@@ -210,11 +213,17 @@ impl FleetService {
                                     auth_method: "tailscale".into(),
                                     at: now,
                                 })?;
-                                Ok((status, true))
+                                Ok(Some((status, true)))
                             }
                         })
                         .await
                         .map_err(|e| (e.description().to_string(), true))?;
+                    let Some(created) = created else {
+                        tracing::debug!(host = %identity.node, "a token-enrolled host on the tailnet; authenticating by token");
+                        return self
+                            .authenticate_by_token(Some(peer), hello, metadata_token)
+                            .await;
+                    };
                     if created.1 {
                         self.audit(
                             "controller",
@@ -239,6 +248,17 @@ impl FleetService {
                 }
             }
         }
+        self.authenticate_by_token(peer, hello, metadata_token)
+            .await
+    }
+
+    /// Token authentication and bootstrap enrolment.
+    async fn authenticate_by_token(
+        &self,
+        peer: Option<SocketAddr>,
+        hello: &Hello,
+        metadata_token: Option<String>,
+    ) -> Result<Authenticated, (String, bool)> {
         if !self.uses(AgentAuth::Token) {
             return Err((
                 "This server accepts agents over the tailnet only.".into(),
@@ -362,7 +382,20 @@ impl FleetService {
                     "this tailnet node is not trusted as an agent",
                 ));
             }
-            return Ok(identity.node);
+            let node = identity.node.clone();
+            let token_enrolled = self
+                .store
+                .call(move |db| {
+                    Ok(db
+                        .hosts()
+                        .get(&node)?
+                        .is_some_and(|h| h.token_hash.is_some()))
+                })
+                .await
+                .map_err(internal)?;
+            if !token_enrolled {
+                return Ok(identity.node);
+            }
         }
         let token = request
             .metadata()

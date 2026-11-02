@@ -488,6 +488,36 @@ async fn whois_authenticates_by_node_name() {
     assert!(expect_rejected(reply).reason.contains("tail-1"));
 }
 
+#[tokio::test]
+async fn a_tailnet_node_cannot_take_over_a_token_enrolled_host_by_name() {
+    let s = server(
+        Registration::Auto,
+        Some(FakeWhois::tagged("tag:buckle")),
+        vec![AgentAuth::Tailscale, AgentAuth::Token],
+    )
+    .await;
+    s.store
+        .call(|db| {
+            db.hosts().create(&NewHost {
+                id: "tail-1".into(),
+                status: HostStatus::Active,
+                token_hash: Some(auth::hash_token("the-host-token")),
+                auth_method: "token".into(),
+                at: chrono::Utc::now(),
+            })?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (_tx, _stream, reply) = open(s.addr, hello("tail-1", "", "2.0.0")).await;
+    assert!(
+        expect_rejected(reply).reason.contains("No token"),
+        "the node name alone is not enough"
+    );
+    let (_tx, _stream, reply) = open(s.addr, hello("tail-1", "the-host-token", "2.0.0")).await;
+    assert_eq!(expect_welcome(reply).status, "active");
+}
+
 #[rstest::rstest]
 #[case::tag_without_prefix(FakeWhois::tagged("tag:buckle"), trusting(&["buckle"], &[]), Some("active"))]
 #[case::listed_owner(FakeWhois::owned_by("ada@example.com"), trusting(&[], &["ada@example.com"]), Some("active"))]
