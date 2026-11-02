@@ -968,7 +968,7 @@ pub mod sinks {
 <tr><td>Schema</td><td>protobuf, generated types both sides, forward-compatible field numbering</td><td>hand-rolled framing plus serde; versioning is on us</td></tr>
 <tr><td>Streams</td><td>bidirectional streaming built in; blob fetches run as separate streams on the same connection without blocking the session</td><td>one message channel; multiplexing and backpressure are hand-written</td></tr>
 <tr><td>Flow control</td><td>HTTP/2 per-stream windows; a slow agent pulling a 40 MB bundle does not stall its heartbeat</td><td>none beyond TCP; large frames block</td></tr>
-<tr><td>Tracing</td><td>metadata carries <code>traceparent</code>; tonic interceptors do it once</td><td>custom</td></tr>
+<tr><td>Tracing</td><td>metadata carries <code>traceparent</code>, and <code>Apply</code>, <code>Rollback</code> and <code>RunHealth</code> repeat it as a field so the context survives a re-send</td><td>custom</td></tr>
 <tr><td>Cost</td><td>tonic + prost, roughly 1.5 MB of binary, h2 already pulled in by reqwest</td><td>smaller, but every feature above is reimplemented</td></tr>
 <tr><td>Browser</td><td>not needed; the UI talks to the REST API</td><td>native in browsers (irrelevant here)</td></tr>
 </tbody></table></div>
@@ -977,40 +977,48 @@ pub mod sinks {
 <pre><code class="language-protobuf"><span class="fname">buckle-proto/proto/buckle/v1/fleet.proto  (excerpt)</span>service Fleet {
   // The long-lived session. Agent speaks first with Hello.
   rpc Session(stream AgentMessage) returns (stream ServerMessage);
-  // Content-addressed fetches, cached by digest on the agent.
-  rpc FetchRevision(FetchRevisionRequest) returns (stream Chunk);   // tar of modules/ + vars/ for one revision
+  // Content-addressed fetches, cached by digest on the agent. All three answer only for an active host,
+  // and only for the stable revision or a revision one of its rollouts assigns it.
+  rpc FetchRevision(FetchRevisionRequest) returns (stream Chunk);   // gzip tar of buckle.yaml, modules/ and vars/ for one revision
   rpc FetchBlob(FetchBlobRequest) returns (stream Chunk);           // one large file by digest
   rpc FetchSecrets(FetchSecretsRequest) returns (SecretBundle);     // top-up for modules selected after facts changed
 }
 
 message AgentMessage {
   oneof msg {
-    Hello        hello = 1;      // host_id, labels, agent version, applied revision, state summary
-    Facts        facts = 2;      // full facts tree, sent on connect and on change
-    Heartbeat    heartbeat = 3;  // every 30s, liveness only
-    PlanResult   plan = 4;       // Plan (redacted), digest, deferred modules
-    ApplyEvent   apply = 5;      // step started/finished, change count, errors; streamed as it happens
-    ApplyResult  result = 6;     // final status, duration, health results, new applied revision; on failure: failed module, failed checks/task, modules rolled back, modules not started
+    Hello        hello = 1;      // host_id, version, seed labels, applied revision, token, platform/arch, bootstrap flag,
+                                 // unreported_apply_revisions (an apply running, or finished but not yet acknowledged)
+    Facts        facts = 2;      // full facts tree (JSON), sent on connect and on change
+    Heartbeat    heartbeat = 3;  // every 30s: liveness, applied revision, busy
+    PlanResult   plan = 4;       // redacted Plan (JSON), digest, counts, deferred_modules, error, module_errors ("module: reason"; the plan stays valid)
+    ApplyEvent   apply = 5;      // step started/finished, handler, health, facts refreshed; streamed as it happens
+    ApplyResult  result = 6;     // final status, ApplyOutcome (JSON), failed module and checks, modules rolled back / not started;
+                                 // report_id (durable), needs_attention (steps stayed blocked; nothing rolled back)
     HealthReport health = 7;     // results of a RunHealth request (baseline, bake, rollout) or of the drift pass (drift)
-    Drift        drift = 8;      // periodic drift pass: plan summary (empty or not) + the accompanying HealthReport
-    LocalRollback rollback = 9;  // agent rolled itself back while disconnected: from, to, reason, health evidence
+    Drift        drift = 8;      // periodic drift pass: plan summary (empty or not), whether it was corrected
+    LocalRollback rollback = 9;  // agent rolled itself, or only some modules, back: from, to, reason, modules, health evidence;
+                                 // report_id (durable), succeeded, rollback_error, rollback_outcome_json
   }
 }
 
 message ServerMessage {
   oneof msg {
-    Welcome      welcome = 1;    // server version, session id, assigned stable revision, secrets scoped to the host
-    Assign       assign = 2;     // "this is your desired revision" (does not imply apply)
-    RequestPlan  plan = 3;       // plan the assigned revision, reply with PlanResult
-    Apply        apply = 4;      // apply the plan with this digest (approval token binds digest + revision); may carry waived checks for a `continue`
+    Welcome      welcome = 1;    // server version, session id, stable revision + stable_tree_digest, issued token, effective labels, host status, secrets scoped to the host
+    Assign       assign = 2;     // "this is your desired revision" (does not imply apply); tree_digest, secrets
+    RequestPlan  plan = 3;       // plan the revision, optionally restricted by a task selector, reply with PlanResult
+    Apply        apply = 4;      // apply the plan with this digest (approval token binds digest + revision); waived checks for a `continue`, rollout/phase,
+                                 // force, traceparent, and `select`: the selector of the approved plan, so the agent's re-plan can match the digest
     Rollback     rollback = 5;   // apply this older revision now
-    RunHealth    health = 6;     // run checks now: scope baseline (before apply), bake (repeat for a window) or rollout (pre-phase)
+    RunHealth    health = 6;     // run checks now: scope baseline (before apply), bake (repeat until a time) or rollout (pre-phase); traceparent
     Ping         ping = 7;
-    Upgrade      upgrade = 8;    // install this agent version with update-rs when idle, then restart under the service manager
+    Upgrade      upgrade = 8;    // install this agent version when idle, then restart under the service manager
+    Rejected     rejected = 9;   // the session is closed: unknown host, bad token, version too old; `retry` says whether trying again can help
+    Ack          ack = 10;       // report_ids the server has durably stored; the agent may forget them
+    HostUpdate   host_update = 11; // the host's record changed while connected (approved, paused, resumed, labels edited): status, labels, stable revision, secrets, stable_tree_digest
   }
 }
 
-message SecretBundle { repeated SecretValue secrets = 1; }   // only ever sent inside Welcome/Assign or FetchSecrets
+message SecretBundle { repeated SecretValue secrets = 1; }   // name, value, the server's fingerprint; only ever sent inside Welcome/Assign/HostUpdate or FetchSecrets
 </code></pre>
 
 <div class="proto-wrap">
@@ -1033,14 +1041,17 @@ message SecretBundle { repeated SecretValue secrets = 1; }   // only ever sent i
 <h3>Session rules</h3>
 <ul>
 <li><b>Identity.</b> On connect the server authenticates the peer by Tailscale whois when it can and by per-host token otherwise (both modes are always on; the decision card in <a href="#topology">02</a> has the enrolment flow). Under whois the agent's claimed <code>host_id</code> must match the node name; under token auth the identity is the one bound to the token at enrolment. Labels come from two places: the agent reports its seed labels on connect, and operators manage server-side labels per host in the UI (stored in the database, never in server config). Server labels win on conflict, so an agent cannot promote itself out of the canary phase; the UI shows both sets and which one is effective.</li>
-<li><b>Registration.</b> A host the server has never seen is created on first Hello. With <code>agents.registration: auto</code> (the default under Tailscale auth) it is active immediately; with <code>approve</code> (recommended for token auth) it sits as <em>pending</em>, visible in the UI, excluded from rollouts until an admin approves it. Admins can also pause a host (kept in the fleet, excluded from rollouts and drift correction), resume it, or forget it (removes its record; a reconnecting agent registers afresh).</li>
+<li><b>Registration.</b> A host the server has never seen is created on first Hello. With <code>agents.registration: auto</code> (the default) it is active immediately, except that a tailnet node no <code>agents.tailscale</code> list admits registers as <em>pending</em>; with <code>approve</code> (recommended for token auth) every new host sits as <em>pending</em>, visible in the UI, excluded from rollouts until an admin approves it. A pending host still connects, but receives no secrets and cannot fetch content. Admins can also pause a host (kept in the fleet, excluded from rollouts and drift correction), resume it, or forget it (removes its record and closes its live session; a reconnecting agent registers afresh). Approving, pausing, resuming and editing labels reach a connected agent at once as a <code>HostUpdate</code>, without a reconnect. The enrolment rules are in section <a href="#server">09</a>.</li>
 <li><b>Stable revision cached locally.</b> <code>Welcome</code> and <code>Assign</code> name the fleet's current stable revision; the agent keeps that revision's tree and its scoped secrets in the state directory (secrets at mode 0600, the same trust level as the files they render) so it can apply it with no server at all. See the local rollback rules in section <a href="#rollout">10</a>.</li>
-<li><b>Reconnect.</b> Exponential backoff 1 s to 5 min with jitter (mail-backup's <code>reconnect_min/max</code>). On reconnect the agent sends Hello with its applied revision and the digest of its last plan, and the server resumes the host's rollout state from there rather than restarting it.</li>
+<li><b>Reconnect.</b> Exponential backoff 1 s to 5 min with jitter (mail-backup's <code>reconnect_min/max</code>). A new stream must send Hello within 30 s, and the agent gives up on a session that has not been answered with a Welcome within 30 s and reconnects with backoff. On reconnect the agent sends Hello with its applied revision, the digest of its last plan and <code>unreported_apply_revisions</code>, and the server resumes the host's rollout state from there rather than restarting it. A server that refuses the host outright (<code>Rejected { retry: false }</code>) does not stop the agent, which a service manager would only restart every few seconds: it keeps retrying with its own backoff from 1 s doubling to 1 h, and when the stored per-host token was refused and a bootstrap token is configured the next attempt presents the bootstrap token, so a forgotten host registers afresh (and goes back to the stored token if that is refused too). <code>Rejected { retry: true }</code> retries on the normal schedule.</li>
 <li><b>Assignment is not apply.</b> <code>Assign</code> tells the agent what to fetch and plan. Only <code>Apply</code> with a matching plan digest mutates. If the agent's fresh plan digest differs from the approved one (the host changed in between), it refuses and reports <em>stale plan</em>; the server re-requests a plan and, if the phase requires approval, the UI shows the host as needing re-approval.</li>
+<li><b>Requests are bound to their session.</b> Plan, health, apply and rollback requests belong to the session that sent them. If that session ends before the agent starts one, the agent drops it without a report and the server re-sends it after the reconnect: an <code>Apply</code> goes out again with the same plan digest and approval token, at most three times before the host is failed, unless Hello shows the target revision already applied or lists it in <code>unreported_apply_revisions</code> (the apply is running, or its result has not been acknowledged), in which case the server waits for the result instead. An apply that has started runs to completion whatever happens to the session, and its result is durable. A host that stays in <em>applying</em> for longer than <code>agents.apply_timeout</code> (default 30 min, counted from the Apply being sent or re-sent) without an <code>ApplyResult</code> counts as failed for the rollout, and so does one that stays disconnected mid-wave for longer than <code>agents.disconnect_timeout</code> (default 10 min).</li>
+<li><b>Durable reports.</b> <code>ApplyResult</code> and <code>LocalRollback</code> carry a <code>report_id</code>, monotonic per agent. The agent writes each one to <code>agent.json</code> before sending it, keeps it until an <code>Ack</code> names the id, and re-sends every unacknowledged report after each <code>Welcome</code>. The server records each (host, report_id) once, in the same transaction as the report's effects, and acknowledges duplicates too, so a dropped connection or a server restart can neither lose a result nor apply it twice. Reports from older agents carry id 0 and are not deduplicated.</li>
+<li><b>Bake failures roll the module back.</b> While it answers a <code>bake</code> request the agent tracks the failure streak of every required check; one that fails continuously for <code>settle</code> (default 2 m) rolls that module back on the host to the cached stable revision (planned with a module selector, applied through the engine), after which the agent makes no further changes and the server decides. The rollback is reported as a durable <code>LocalRollback</code> that names the modules and the failing checks, and says whether the rollback itself succeeded; if it did not, the rollout host is marked as needing attention with both results recorded. A failing check keeps being sampled past the bake window until it recovers or fails past <code>settle</code>, because the server judges it on the same clock.</li>
 <li><b>Backpressure.</b> ApplyEvents are coalesced to at most 10 per second per host; the server stores the last event per step and the full stream goes to tracing.</li>
-<li><b>Versioning.</b> Hello carries the agent version; the server refuses agents older than its minimum and the UI shows version skew. protobuf field numbering keeps older servers working with newer agents within a major version.</li>
-<li><b>Self-update.</b> Buckle uses <code>update-rs</code> (git-tool's self-update crate, with its <code>opentelemetry</code> feature so the update is traced across the relaunch) for both <code>buckle update</code> on the command line and server-driven agent upgrades. When <code>agents.desired_version</code> is set, the server sends <code>Upgrade</code> to each host only while it is idle (no apply, bake or health run in progress), paced in the fleet's phase order with the phase's <code>parallel</code> limit but without plan approval; the agent downloads the GitHub release asset for its platform, verifies it, swaps the binary and exits so systemd (or launchd / SCM) restarts it, then reconnects with the new version in Hello. The server also upgrades itself the same way when an operator triggers it from the UI.</li>
-<li><b>Local mode</b> implements the same <code>Transport</code> trait with a filesystem watcher (<code>notify</code>): a directory change is an <code>Assign</code> of a synthetic revision, and apply is automatic.</li>
+<li><b>Versioning.</b> Hello carries the agent version; the server refuses agents older than <code>agents.minimum_agent_version</code> (checked before anything is written, so a refused old agent can enrol once it is upgraded) and the UI shows version skew. Protobuf field numbering keeps older servers working with newer agents within a major version: the messages and fields added since the first draft (<code>Ack</code>, <code>HostUpdate</code>, <code>report_id</code>, <code>needs_attention</code>, <code>module_errors</code>, <code>Apply.select</code>, <code>Welcome.stable_tree_digest</code>, <code>unreported_apply_revisions</code>, the <code>traceparent</code> fields) are all additive, and an older agent simply never acknowledges or reports what it does not know.</li>
+<li><b>Self-update.</b> Buckle uses <code>update-rs</code>'s GitHub release source and asset naming for both <code>buckle update [--to VERSION]</code> on the command line and the agent's handling of <code>Upgrade</code>: it downloads the release asset for its platform, refuses it unless GitHub reports a SHA-256 digest and the download matches, renames the new binary into place beside the running one (on Windows the running image is moved aside first) and exits, so systemd, launchd or the Service Control Manager restarts it, and it reconnects with the new version in Hello. An <code>Upgrade</code> sent <code>when_idle</code> waits until the agent has nothing queued. The relaunch machinery of <code>update-rs</code> is not used, because its detached processes would be killed with the service's cgroup. The server side is not built: <code>agents.desired_version</code> is accepted in server.yaml, but nothing yet sends <code>Upgrade</code> (no phase-ordered pacing, no UI trigger), so fleet upgrades are driven by running <code>buckle update</code> on the hosts.</li>
+<li><b>Local mode</b> implements the same <code>Transport</code> trait with a filesystem watcher (<code>notify</code>): a change that has settled for 2 s is an <code>Assign</code> of a synthetic revision (its id is the digest of the tree) followed by a plan and an automatic apply, and reports are logged. The agent resolves the fleet's secrets itself in this mode (section <a href="#secrets">06</a>).</li>
 </ul>
 </section>
 
@@ -1052,8 +1063,9 @@ message SecretBundle { repeated SecretValue secrets = 1; }   // only ever sent i
 <h3>Source watcher</h3>
 <ul>
 <li>A bare clone under <code>data_dir/source.git</code> managed with <code>gix</code>, fetched every <code>poll</code> (default 30 s) and immediately on <code>POST /api/v1/webhooks/source</code> (HMAC-verified, for a GitHub webhook over Tailscale Funnel or a Nomad-local forwarder).</li>
-<li>Change detection compares the remote-tracking ref for the configured branch before and after the fetch (the audit of github-backup found that comparing <code>HEAD</code> misses remote-only updates).</li>
-<li>Each new commit is loaded in memory, validated (schema, selectors parse, templates parse, module graph acyclic, every referenced secret declared) and stored as a <code>Revision</code>: commit id, author, message, timestamp, a content-addressed tarball of <code>modules/</code> and <code>vars/</code>, and the validation report. Invalid commits are stored as rejected revisions so the UI can show the author what broke, and the fleet stays on the last valid one.</li>
+<li>Change detection compares the remote-tracking ref for the configured branch before and after the fetch (the audit of github-backup found that comparing <code>HEAD</code> misses remote-only updates), and then with the last commit it processed.</li>
+<li>Every new commit on the branch becomes a revision, oldest first, so each one is validated and visible in the UI and the rollout controller supersedes the older ones (up to 50 commits per fetch: a longer gap, or a tip that does not descend from the last processed commit through first parents, builds the tip only). A branch that moves back to a commit already built (a force-push, or a reverted ref) is announced again, so the fleet converges on the branch tip rather than staying on a revision the branch no longer points at. A fetch is interrupted after <code>source.git.fetch_timeout</code> (default 2 m) and retried at the next poll.</li>
+<li>Each commit is exported to <code>data_dir/revisions/&lt;id&gt;/</code>, loaded and validated (schema with unknown fields rejected, selectors parse, templates parse, unique module names, <code>needs</code> resolve and form a DAG, rollout phase names unique and not <code>stragglers</code>, every referenced secret declared) and stored as a <code>Revision</code>: commit id, author, message, timestamp, a content-addressed gzip tarball of <code>buckle.yaml</code>, <code>modules/</code> and <code>vars/</code> (with a digest the agent verifies, and an index of its files by digest for <code>FetchBlob</code>), and the validation report. Invalid commits are stored as rejected revisions so the UI can show the author what broke, and the fleet stays on the last valid one. This check is narrower than <code>buckle validate</code>, which also resolves task and health kinds, handler references, <code>after:</code> and the <code>command.run</code> <code>id</code> rule and, given <code>--facts</code>, dry-plans each fixture host: run it in CI, because a revision with an unknown task kind is accepted by the server and fails as a plan error for that module on the hosts that select it.</li>
 <li>A <code>path:</code> source (local directory with a filesystem watcher) is supported for development and for a server fed by a CI job that already checked out the repo.</li>
 </ul>
 
@@ -1062,15 +1074,19 @@ message SecretBundle { repeated SecretValue secrets = 1; }   // only ever sent i
 <div class="scroll"><table>
 <thead><tr><th>Table</th><th>Holds</th></tr></thead>
 <tbody>
-<tr><td><code>hosts</code></td><td>host_id, agent_labels (reported, JSON), labels (server-managed via UI/API, JSON), status (pending / active / paused), notes, first_seen, last_seen, agent_version, applied_revision, connection state</td></tr>
+<tr><td><code>hosts</code></td><td>host_id, agent_labels (reported, JSON), labels (server-managed via UI/API, JSON), status (pending / active / paused), notes, token hash and auth method, platform and arch, first_seen, last_seen, agent_version, applied_revision, last plan digest, connection state, health summary, drifted</td></tr>
 <tr><td><code>host_facts</code></td><td>latest facts tree per host (JSON), collected_at; history kept for 7 days for the UI's "what changed" view</td></tr>
 <tr><td><code>revisions</code></td><td>id, commit, author, message, created_at, tarball digest, validation status and report</td></tr>
 <tr><td><code>rollouts</code></td><td>id, revision, state, policy snapshot (phases as evaluated at start), started_at, finished_at, triggered_by</td></tr>
 <tr><td><code>rollout_hosts</code></td><td>rollout, host, phase, wave, state, plan digest, plan (redacted JSON), result, health, timestamps</td></tr>
 <tr><td><code>approvals</code></td><td>rollout, phase, approver (OIDC subject), plan digests approved, note, at</td></tr>
-<tr><td><code>health_events</code></td><td>host, module, check, status, reason, at (rolling 30 days)</td></tr>
+<tr><td><code>health_events</code></td><td>host, rollout, scope, module, check, kind, required, status, reason, at (rolling 30 days)</td></tr>
 <tr><td><code>audit_log</code></td><td>who did what: approvals, pauses, rollbacks, label pins, with trace id</td></tr>
-<tr><td><code>kv</code></td><td>small state: last fetched commit, server install key for fingerprints</td></tr>
+<tr><td><code>revision_blobs</code></td><td>digest, revision, path: an index of each valid revision's files by content digest, which <code>FetchBlob</code> serves</td></tr>
+<tr><td><code>runs</code></td><td>apply results per host (revision, plan digest, outcome, changes, removals, error, trace id), kept for the host's history</td></tr>
+<tr><td><code>apply_events</code></td><td>the last event per (host, plan digest, step); the full stream goes to tracing</td></tr>
+<tr><td><code>agent_reports</code></td><td>(host, report_id) of every durable report already stored, so a report an agent re-sends is applied once (section <a href="#protocol">08</a>)</td></tr>
+<tr><td><code>kv</code></td><td>small state: last fetched commit, stable revision, server install key for fingerprints</td></tr>
 </tbody></table></div>
 
 <h3>Server configuration</h3>
@@ -1089,19 +1105,29 @@ source:
     url: https://github.com/example/fleet-config.git
     branch: main
     poll: 30s
+    fetch_timeout: 2m               # one fetch is interrupted after this long (default 2m)
     credentials: { token: "${{ env.GIT_TOKEN }}" }
     webhook_secret: "${{ env.GIT_WEBHOOK_SECRET }}"
+  # path: /srv/buckle-config        # instead of git: a local directory (development, or a CI job that already checked out the repo)
 
 agents:
   auth: [tailscale, token]          # both always available; chosen per connection
   bootstrap_token: "${{ env.BUCKLE_BOOTSTRAP_TOKEN }}"
   registration: auto                # auto | approve (new hosts wait for an admin in the UI)
-  minimum_agent_version: "2.0.0"
-  desired_version: "2.0.0"         # agents self-update to this release (update-rs) when idle, in phase order
+  tailscale:                        # which tailnet nodes are trusted as agents (section 02)
+    allowed_tags: ["tag:buckle"]    # a node carrying one of these tags (the `tag:` prefix is optional) ...
+    allowed_users: ["ops@example.com"]   # ... or owned by one of these users is admitted; any other node is refused
+  # tailscale_socket: /var/run/tailscale/tailscaled.sock   # tailscaled LocalAPI, for whois
+  minimum_agent_version: "2.0.0"    # older agents are refused (before anything is written)
+  desired_version: "2.0.0"          # accepted, but nothing sends Upgrade yet (section 08)
+  disconnect_timeout: 10m           # a host disconnected this long in the middle of its wave counts as failed
+  apply_timeout: 30m                # a host applying this long without an ApplyResult counts as failed
   # per-host labels, pauses and notes live in the database and are managed in the UI, not here
 
 web:
   base_url: https://buckle.example.ts.net
+  trust_proxy: true                 # take the client address (for ACLs and sign-in rate limits) from X-Forwarded-For
+  trusted_proxy_hops: 1             # how many reverse proxies append to it; the address is the entry that many places from the right
   user_acl:  'claims.email endswith "@example.com"'
   admin_acl: '"buckle-admins" in claims.groups'
   oidc:
@@ -1112,14 +1138,25 @@ web:
 
 secrets:
   providers:
-    file: { root: /secrets }        # Nomad `template` stanzas render Nomad Variables here, one file per secret
-    env: {}
+    file: { root: /secrets }        # Nomad `template` stanzas render Nomad Variables here, one file per secret; paths may not leave the root
+    env:                            # `{ env: NAME }` references; the server's own credentials are never readable
+      allow: ["FLEET_*"]            # optional: when set, only these variables (exact names, or a prefix ending in *)
+      deny: [AWS_SECRET_ACCESS_KEY] # always wins over allow
     # exec: { allow: ["op"] }       # local development only; off unless listed
 
 telemetry:
   otlp_endpoint: http://otel-collector.example.internal:4317
+  otlp_headers: { x-honeycomb-team: "${{ env.HONEYCOMB_KEY }}" }   # values are redacted in logs
 </code></pre>
-<p>Server config is YAML with <code>${{ env.NAME }}</code> interpolated on string values after parsing, the analytics approach; an unset variable is a start-up error. The fleet config (buckle.yaml in Git) uses the same interpolation syntax for secret references so authors see one convention.</p>
+<p>Server config is YAML with <code>${{ env.NAME }}</code> interpolated on string values after parsing, the analytics approach; an unset variable is a start-up error, and every variable the file interpolates is withheld from the <code>env</code> secret provider. Unknown keys are rejected. <code>--otel-endpoint</code> and the standard <code>OTEL_EXPORTER_OTLP_*</code> variables take precedence over the <code>telemetry</code> section. <code>buckle server --print-fingerprint</code> prints the SHA-256 fingerprint of the gRPC certificate (generating it in <code>auto</code> mode) for <code>buckle install agent --ca-fingerprint</code>. The fleet config (buckle.yaml in Git) references secrets with provider maps (<code>{ file: … }</code>, <code>{ env: … }</code>) rather than this interpolation syntax.</p>
+<h3>Enrolment and trust</h3>
+<ul>
+<li><b>No takeover.</b> A bootstrap token only creates hosts. If the claimed <code>host_id</code> is already registered, whether it enrolled with a token or registered over the tailnet, enrolment is refused ("present its per-host token, or forget the host in the UI to enrol it again"); a forgotten host has no row and enrols afresh. Symmetrically, a host that enrolled with a token keeps authenticating by its token even when a tailnet node bears its name, so a node name cannot stand in for the token.</li>
+<li><b>Throttled.</b> Anything that is not a recognised per-host token counts as a bootstrap attempt, limited to 10 per peer address per minute, compared in constant time; the claimed <code>host_id</code> must be 1 to 128 characters of letters, digits, <code>.</code>, <code>_</code> and <code>-</code>. Per-host tokens are random 32 bytes, stored only as a SHA-256 hash.</li>
+<li><b>Version first.</b> <code>agents.minimum_agent_version</code> is checked before anything is written, so a refused old agent leaves no half-enrolled record and can enrol once it is upgraded.</li>
+<li><b>Tailnet trust.</b> Whois proves who a peer is, not that it belongs to the fleet. With <code>agents.tailscale.allowed_tags</code> or <code>allowed_users</code> set, a node matching neither is refused outright, registered or not; a matching new node registers according to <code>registration</code>. With both lists empty nothing is trusted to activate itself: a new tailnet node registers <em>pending</em> and waits for an admin, exactly as under <code>approve</code>, and the server warns at start-up when that is the case.</li>
+</ul>
+
 
 <div class="card decision"><div class="tag">Decision · agreed</div><p><b>HTTP on actix-web, gRPC on tonic, in one process.</b> actix-web is what automate and analytics use, so the OIDC middleware, the <code>TracingLogger</code> transform, the embedded-UI serving and the test harness port over directly. tonic runs on the same tokio runtime on its own port. Both shut down on SIGTERM; the rollout controller checkpoints host state on every transition so a restart mid-rollout resumes rather than restarts.</p></div>
 </section>
