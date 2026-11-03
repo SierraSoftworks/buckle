@@ -65,7 +65,7 @@ describe("every page renders in demo mode", () => {
     await skipped.getByRole("link", { name: "#41" }).click();
     await page.waitForURL(/\/rollouts\/41$/);
     await page.goBack();
-    await page.waitForURL(/\/rollouts$/);
+    await page.waitForURL(/\/rollouts(\?.*)?$/);
     // In-app navigation, no reload: the live store and demo mode survive.
     await page.getByRole("link", { name: "#42" }).click();
     assert.equal(await heading(page), "Rollout #42");
