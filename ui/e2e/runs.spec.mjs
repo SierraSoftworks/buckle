@@ -235,7 +235,8 @@ describe("live run updates", () => {
     // …the removal goes, and the run ends.
     await eventually(async () => assert.equal(await report.locator(".run").getAttribute("data-state"), "succeeded"), 15_000);
     assert.equal(await step(report, "nomad/file.copy[/etc/nomad.d/client.hcl]").getAttribute("data-state"), "changed");
-    assert.match(await report.locator('.run-count[data-count="pending"]').textContent(), /^0 pending$/);
+    // Nothing is left pending, and a finished run lists no zero counts.
+    assert.equal(await report.locator('.run-count[data-count="pending"]').count(), 0);
     assert.equal(await report.locator(".run__progress").count(), 0, "no progress bar once finished");
     await close();
   });

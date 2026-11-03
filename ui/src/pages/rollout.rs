@@ -7,8 +7,9 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    ApproveRequest, ContinueRequest, FleetPlan, HostRolloutState, LiveEvent, PlanGroup,
-    RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState, RolloutSummary,
+    ApproveRequest, ContinueRequest, FleetPlan, HostRolloutState, HostSummary, LiveEvent,
+    PlanGroup, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
+    RolloutSummary,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -16,10 +17,11 @@ use yew::prelude::*;
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::icons;
+use crate::components::meter::stage_segments;
 use crate::components::ui::Copyable;
 use crate::components::{
-    Button, Changes, Confirm, Countdown, Empty, ErrorBlock, ErrorState, HoverTip, Kind, Loading,
-    PageHead, Panel, Pill, Pipeline, PlanViews, Refresh, RouteLink, RunReportView, TraceLink,
+    Button, Changes, Confirm, Countdown, Empty, ErrorBlock, ErrorState, HostLink, HoverTip, Kind,
+    Loading, Meter, PageHead, Panel, Pill, Pipeline, PlanViews, Refresh, RunReportView, TraceLink,
     use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
@@ -32,7 +34,7 @@ use crate::logic::run::RolloutActivity;
 use crate::logic::ticker::{Source, Ticker, ticker};
 use crate::logic::tone::{
     Tone, host_error_headline, host_error_tone, host_state_label, host_state_tone,
-    rollout_finished, rollout_state_label, rollout_state_tone,
+    phase_state_label, phase_state_tone, rollout_finished, rollout_state_label, rollout_state_tone,
 };
 use crate::store::use_live;
 use yew_router::prelude::use_navigator;
@@ -259,8 +261,8 @@ pub fn rollout_page(props: &Props) -> Html {
                 <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
             </Panel>
             { approval }
-            <Panel title="Hosts" subtitle="Click a host for its way through the rollout and its run report">
-                <HostTable detail={d.clone()} plans={plan_groups.clone()} admin={admin && !finished} on_ask={open.clone()} {activity} {now} />
+            <Panel title="Hosts" subtitle="By stage. Click a row for the host's way through this rollout and its run report; hover a name for the host">
+                <HostTable detail={d.clone()} plans={plan_groups.clone()} admin={admin && !finished} on_ask={open.clone()} {activity} {hosts} {now} />
             </Panel>
             <Panel title="Timeline" subtitle="Rollout and phase transitions">
                 { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), s.started_at) }
@@ -881,6 +883,8 @@ struct HostTableProps {
     on_ask: Callback<Ask>,
     /// The module and step each applying host is on.
     activity: BTreeMap<String, String>,
+    /// The fleet's hosts, for each name's hover card.
+    hosts: BTreeMap<String, HostSummary>,
     now: DateTime<Utc>,
 }
 
@@ -888,16 +892,33 @@ struct HostTableProps {
 fn host_table(props: &HostTableProps) -> Html {
     let expanded = use_state(|| None::<String>);
     let p = layout(&props.detail);
-    let rows = p
-        .stages
-        .iter()
-        .flat_map(|st| st.hosts().map(move |h| (st.phase, h)));
+    let groups = p.stages.iter().filter(|st| st.counts.total > 0).map(|st| {
+        let phase = st.phase;
+        let c = &st.counts;
+        // Said once on the stage's heading instead of on each of its rows.
+        let all_need_approval = c.needs_approval == c.total;
+        let rows = st.hosts().map(move |h| (phase, h, all_need_approval));
+        let head = html! {
+            <tr class="table__group" key={format!("stage-{}", phase.name)} data-stage={phase.name.clone()}>
+                <th colspan="7" scope="colgroup">
+                    <span class="group-head">
+                        <span class="group-head__name">{ phase.name.clone() }</span>
+                        <Pill tone={phase_state_tone(phase.state)} label={phase_state_label(phase.state)} />
+                        <Meter segments={stage_segments(c)} total={c.total} />
+                        <span class="muted small">{ format!("{}/{} done", c.healthy, c.total) }</span>
+                        if all_need_approval { <span class="badge badge--info">{ "needs approval" }</span> }
+                    </span>
+                </th>
+            </tr>
+        };
+        (head, rows)
+    });
     html! {
         <div class="table-wrap">
             <table class="table table--hosts">
                 <thead><tr>
                     <th scope="col">{ "Host" }</th>
-                    <th scope="col">{ "Stage" }</th>
+                    <th scope="col">{ "Wave" }</th>
                     <th scope="col">{ "State" }</th>
                     <th scope="col">{ "Plan" }</th>
                     <th scope="col">{ "Checks" }</th>
@@ -905,7 +926,9 @@ fn host_table(props: &HostTableProps) -> Html {
                     <th scope="col"><span class="visually-hidden">{ "Details" }</span></th>
                 </tr></thead>
                 <tbody>
-                    { for rows.map(|(phase, h)| {
+                    { for groups.map(|(head, rows)| html! { <>
+                    { head }
+                    { for rows.map(|(phase, h, all_need_approval)| {
                         let open = expanded.as_deref() == Some(h.host.as_str());
                         let toggle = {
                             let (expanded, name) = (expanded.clone(), h.host.clone());
@@ -928,13 +951,13 @@ fn host_table(props: &HostTableProps) -> Html {
                         };
                         html! { <>
                             <tr key={h.host.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))} onclick={on_row}>
-                                <td><RouteLink to={Route::Host { id: h.host.clone() }} classes="mono strong">{ h.host.clone() }</RouteLink></td>
-                                <td>{ phase.name.clone() }{ h.wave.map(|w| html! { <span class="muted small">{ format!(" · wave {w}") }</span> }).unwrap_or_default() }</td>
+                                <td><HostLink id={h.host.clone()} host={props.hosts.get(&h.host).cloned()} now={props.now} /></td>
+                                <td class="muted">{ h.wave.map(|w| w.to_string()).unwrap_or_else(|| "—".into()) }</td>
                                 <td>
                                     <HoverTip tip={health_tip(phase, h)} label={format!("{}: {}", h.host, host_state_label(h.state))}>
                                         <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} />
                                     </HoverTip>
-                                    if h.needs_approval { <span class="badge badge--info">{ "needs approval" }</span> }
+                                    if h.needs_approval && !all_need_approval { <span class="badge badge--info">{ "needs approval" }</span> }
                                     if h.needs_attention {
                                         <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>
                                     }
@@ -945,10 +968,11 @@ fn host_table(props: &HostTableProps) -> Html {
                                         <span class="cell-sub mono" data-testid="host-activity">{ now.clone() }</span>
                                     }
                                 </td>
-                                <td>{ h.plan_digest.as_deref().map(|d| html! {
-                                    <span class="mono" title={d.to_string()}>{ short(d) }</span>
-                                }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
-                                    { host_tally(h, &props.plans).map(|tally| html! { <span class="cell-sub"><Changes {tally} /></span> }).unwrap_or_default() }
+                                <td class="nowrap">
+                                    { host_tally(h, &props.plans).map(|tally| html! { <Changes {tally} /> }).unwrap_or_default() }
+                                    { h.plan_digest.as_deref().map(|d| html! {
+                                        <span class="mono muted small plan-digest" title={format!("plan {d}")}>{ short(d) }</span>
+                                    }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
                                 </td>
                                 <td>
                                     { for h.failed_checks.iter().map(|c| html! { <span class="badge badge--danger mono">{ c.clone() }</span> }) }
@@ -972,6 +996,7 @@ fn host_table(props: &HostTableProps) -> Html {
                             }
                         </> }
                     }) }
+                    </> }) }
                 </tbody>
             </table>
         </div>

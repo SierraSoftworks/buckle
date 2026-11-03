@@ -107,3 +107,66 @@
 .cell-labels {
   max-width: 280px;
 }
+
+// A row that opens what it names on a click anywhere: its link stretches
+// over the row (still one tab stop, still a real link).
+.row-link {
+  position: relative;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--surface-2);
+  }
+
+  &__target::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+  }
+}
+
+// A row that opens on click through a handler (its cells hold links and
+// popovers of their own).
+.row-click {
+  cursor: pointer;
+
+  &:hover {
+    background: var(--surface-2);
+  }
+}
+
+// A group's heading row inside a table (a rollout's stage).
+.table__group {
+  th {
+    padding-top: 1rem;
+    border-bottom: 1px solid var(--line-strong);
+    background: transparent;
+    text-transform: none;
+    letter-spacing: normal;
+    font-size: 0.85rem;
+    color: var(--fg);
+  }
+
+  &:first-child th {
+    padding-top: 0.5rem;
+  }
+}
+
+.group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.75rem;
+
+  &__name {
+    font-weight: 650;
+  }
+
+  .meter {
+    width: 140px;
+  }
+}
+
+.table--hosts td:first-child {
+  padding-left: 1.25rem;
+}

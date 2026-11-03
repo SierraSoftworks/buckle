@@ -13,6 +13,7 @@ use yew::prelude::*;
 use super::countdown::Countdown;
 use super::icons;
 use super::link::RouteLink;
+use super::meter::{Meter, stage_segments};
 use super::ui::Pill;
 use crate::app::Route;
 use crate::logic::format::{config_duration, relative, short};
@@ -146,7 +147,9 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
         return outside_column(stage, props);
     }
     let c = &stage.counts;
-    let mut tally = vec![format!("{}/{} healthy", c.healthy, c.total)];
+    // "done", not "healthy": the fleet's health is a different reading, and
+    // a stage of healthy hosts that has not applied yet is 0 done.
+    let mut tally = vec![format!("{}/{} done", c.healthy, c.total)];
     if c.active > 0 {
         tally.push(format!("{} in flight", c.active));
     }
@@ -183,6 +186,7 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
                 <div class="stage__meta">
                     <span>{ tally.join(" · ") }</span>
                 </div>
+                <Meter segments={stage_segments(c)} total={c.total} class="stage__meter" />
                 <div class="stage__meta muted">
                     if phase.virtual_stage {
                         <span>{ "virtual · opens after promotion" }</span>

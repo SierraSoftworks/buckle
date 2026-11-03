@@ -88,6 +88,10 @@ pub struct HoverTipProps {
     pub tip: Html,
     #[prop_or_default]
     pub label: Option<AttrValue>,
+    /// The trigger is a link of its own: no extra tab stop or help cursor,
+    /// and the popover follows the link's focus.
+    #[prop_or_default]
+    pub link: bool,
 }
 
 /// A popover under its trigger while it is hovered or focused, positioned
@@ -129,10 +133,15 @@ pub fn hover_tip(props: &HoverTipProps) -> Html {
     if props.tip == Html::default() {
         return props.children.clone();
     }
+    let (class, tabindex, label) = if props.link {
+        ("tip-link", None, None)
+    } else {
+        ("tip", Some("0"), props.label.clone())
+    };
     html! {
-        <span class="tip" tabindex="0" ref={node} aria-label={props.label.clone()}
-            onmouseenter={enter} onfocus={focus}
-            onmouseleave={hide.reform(|e: MouseEvent| e.into())} onblur={hide.reform(|e: FocusEvent| e.into())}>
+        <span {class} {tabindex} ref={node} aria-label={label}
+            onmouseenter={enter} onfocusin={focus}
+            onmouseleave={hide.reform(|e: MouseEvent| e.into())} onfocusout={hide.reform(|e: FocusEvent| e.into())}>
             { props.children.clone() }
             if let Some((x, y)) = *at {
                 <span class="tip__pop" role="tooltip" style={format!("left: {x:.0}px; top: {:.0}px", y + 4.0)}>

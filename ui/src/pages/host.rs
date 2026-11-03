@@ -21,20 +21,19 @@ use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
     BlueprintView, Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind,
-    Loading, PageHead, Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
+    Loading, PageHead, Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink,
+    changes::{RunChanges, Took},
+    host_state_pills, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::format::{
-    commit, relative, relative_opt, rollout_label, short, short_duration, timestamp,
+    commit, count, relative, relative_opt, rollout_label, short, short_duration, timestamp,
 };
 use crate::logic::health::CheckState;
 use crate::logic::labels::{Change, Row, changes, collect, effective, rows};
 use crate::logic::live::{apply_fleet, apply_host_detail};
 use crate::logic::run::{follow_run_list, newest_run, run_label};
-use crate::logic::tone::{
-    Tone, check_status_tone, health_label, health_tone, host_status_label, host_status_tone,
-    outcome_tone,
-};
+use crate::logic::tone::{Tone, check_status_tone, outcome_tone};
 use crate::store::use_live;
 
 #[derive(Properties, PartialEq)]
@@ -222,11 +221,8 @@ pub fn host_page(props: &Props) -> Html {
     let offline = h.connection == Connection::Offline;
     let subtitle = html! {
         <div class="rollout-meta">
-            <Pill tone={host_status_tone(h.status)} label={host_status_label(h.status)} />
-            <Pill tone={if offline { Tone::Neutral } else { Tone::Ok }} label={if offline { "offline" } else { "online" }} />
-            <Pill tone={health_tone(h.health)} label={health_label(h.health)} title={h.health_at.map(timestamp)} />
-            if h.drifted { <Pill tone={Tone::Warn} label="drifted" /> }
-            <span class="muted">{ format!("last seen {}", relative_opt(h.last_seen, now)) }</span>
+            { host_state_pills(h) }
+            <span class="muted">{ format!("{} · last seen {}", if offline { "offline" } else { "online" }, relative_opt(h.last_seen, now)) }</span>
         </div>
     };
 
@@ -387,11 +383,13 @@ fn health_panel(checks: &[HostCheck], now: DateTime<Utc>) -> Html {
             }
             { for by_module.into_iter().map(|(module, list)| {
                 let worst = list.iter().map(|c| CheckState::of(&c.status, c.required)).max();
+                let n = list.len();
                 html! {
-                    <section class="health-module" data-module={module.to_string()}>
-                        <h3 class="subhead">
+                    <section class={classes!("health-module", worst.map(|w| w.tone().class()))} data-module={module.to_string()}>
+                        <h3 class="health-module__head">
                             <span class="mono">{ module.to_string() }</span>
-                            if let Some(w) = worst { { " " }<Pill tone={w.tone()} label={w.label()} /> }
+                            if let Some(w) = worst { <Pill tone={w.tone()} label={w.label()} /> }
+                            <span class="muted small">{ count(n, "check", "checks") }</span>
                         </h3>
                         <ul class="checks">{ for list.into_iter().map(|c| check_row(c, now)) }</ul>
                     </section>
@@ -472,8 +470,10 @@ fn runs(
                                 <Pill tone={outcome_tone(&r.outcome)} label={r.outcome.replace('_', " ")} />
                                 if let Some(e) = &r.error { <ErrorBlock raw={e.clone()} tone={outcome_tone(&r.outcome)} compact=true /> }
                             </td>
-                            <td>{ format!("{} · {} removals", r.changes, r.removals) }</td>
-                            <td>{ if r.finished_at > r.started_at { short_duration(r.finished_at.signed_duration_since(r.started_at).num_seconds()) } else { "—".into() } }</td>
+                            <td><RunChanges changes={r.changes} removals={r.removals} /></td>
+                            <td>{ if r.finished_at > r.started_at {
+                                html! { <Took label={short_duration(r.finished_at.signed_duration_since(r.started_at).num_seconds())} /> }
+                            } else { html! { <span class="muted">{ "—" }</span> } } }</td>
                             <td><TraceLink id={r.trace_id.clone()} url={r.trace_url.clone()} /></td>
                             <td>
                                 if !r.id.is_empty() {

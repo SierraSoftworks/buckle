@@ -1,6 +1,8 @@
-//! Hosts (design §12): every agent with its effective labels, groups, facts
-//! summary, status, applied revision, drift, health and last contact, with
-//! pending registrations first so they are approved rather than forgotten.
+//! Hosts (design §12): every agent on one line: its state (health, or
+//! offline, plus anything out of the ordinary), effective labels, platform,
+//! applied revision (quiet when stable) and last contact. Hover a name for
+//! the host's card, click a row to open it. Pending registrations come first
+//! so they are approved rather than forgotten.
 
 use buckle_api::{Connection, HostStatus, HostSummary};
 use serde::{Deserialize, Serialize};
@@ -11,14 +13,13 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, Empty, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh, RouteLink,
-    use_toast,
+    Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, PageHead, Panel, Refresh,
+    RouteLink, host_state_pills, icons, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
-use crate::logic::fleet::matches_filter;
+use crate::logic::fleet::{expected_version, matches_filter};
 use crate::logic::format::{age, commit, relative, timestamp};
 use crate::logic::live::apply_fleet;
-use crate::logic::tone::{Tone, health_label, health_tone, host_status_label, host_status_tone};
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Query {
@@ -121,6 +122,20 @@ pub fn hosts() -> Html {
         })
     };
 
+    // A click anywhere on a row opens the host, except on a control of its own.
+    let on_open = {
+        let navigator = navigator.clone();
+        Callback::from(move |(e, id): (MouseEvent, String)| {
+            let own = e
+                .target_dyn_into::<web_sys::Element>()
+                .and_then(|t| t.closest("a, button, input").ok().flatten())
+                .is_some();
+            if let (false, Some(n)) = (own, &navigator) {
+                n.push(&Route::Host { id });
+            }
+        })
+    };
+
     let body = match (&live, &fleet.error) {
         (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={fleet.reload.clone()} /> },
         (None, None) => html! { <Loading label="Loading hosts…" /> },
@@ -192,16 +207,16 @@ pub fn hosts() -> Html {
                         <table class="table" data-testid="hosts-table">
                             <thead><tr>
                                 <th scope="col">{ "Host" }</th>
-                                <th scope="col">{ "Status" }</th>
-                                <th scope="col">{ "Health" }</th>
+                                <th scope="col">{ "State" }</th>
                                 <th scope="col">{ "Labels" }</th>
-                                <th scope="col">{ "Groups" }</th>
-                                <th scope="col">{ "Facts" }</th>
+                                <th scope="col">{ "Platform" }</th>
                                 <th scope="col">{ "Revision" }</th>
-                                <th scope="col">{ "Drift" }</th>
                                 <th scope="col">{ "Last seen" }</th>
                             </tr></thead>
-                            <tbody>{ for rows.into_iter().map(|h| row(h, f.stable_revision.as_deref(), now)) }</tbody>
+                            <tbody>{ for rows.into_iter().map(|h| row(h, &Expect {
+                                stable: f.stable_revision.as_deref(),
+                                agent: expected_version(&f.hosts, f.desired_agent_version.as_deref().or(f.server_version.as_deref())),
+                            }, &on_open, now)) }</tbody>
                         </table>
                     </div>
                 }
@@ -226,20 +241,41 @@ pub fn hosts() -> Html {
     }
 }
 
-fn row(h: &HostSummary, stable: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> Html {
+/// What a row is compared against: anything else is called out.
+struct Expect<'a> {
+    stable: Option<&'a str>,
+    agent: Option<&'a str>,
+}
+
+fn row(
+    h: &HostSummary,
+    expect: &Expect<'_>,
+    on_open: &Callback<(MouseEvent, String)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Html {
     let offline = h.connection == Connection::Offline;
+    let platform = [h.platform.as_deref(), h.arch.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    // The agent's version only where it is not the one agents converge to.
+    let skew = h
+        .agent_version
+        .as_deref()
+        .filter(|v| expect.agent.is_some_and(|e| e != *v));
+    let onclick = {
+        let (on_open, id) = (on_open.clone(), h.id.clone());
+        Callback::from(move |e: MouseEvent| on_open.emit((e, id.clone())))
+    };
     html! {
-        <tr data-host={h.id.clone()}>
-            <td class="nowrap"><RouteLink to={Route::Host { id: h.id.clone() }} classes="mono strong">{ h.id.clone() }</RouteLink></td>
-            <td class="nowrap"><Pill tone={host_status_tone(h.status)} label={host_status_label(h.status)} /></td>
-            <td>
-                if offline {
-                    <Pill tone={Tone::Neutral} label="offline" title={format!("last reading: {}", health_label(h.health))} />
-                } else {
-                    <Pill tone={health_tone(h.health)} label={health_label(h.health)} />
-                }
-                if let Some(at) = h.health_at {
-                    <span class="cell-sub" title={timestamp(at)}>{ format!("{} old", age(Some(at), now)) }</span>
+        <tr data-host={h.id.clone()} class="row-click" {onclick}>
+            <td class="nowrap"><HostLink id={h.id.clone()} host={h.clone()} {now} /></td>
+            <td class="cell-state nowrap" title={h.health_at.map(|at| format!("health read {} ago ({})", age(Some(at), now), timestamp(at)))}>
+                { host_state_pills(h) }
+                // A reading is only worth a line of its own once it is old.
+                if let Some(at) = h.health_at.filter(|at| !offline && now - *at > chrono::Duration::hours(1)) {
+                    <span class="cell-sub text-warn" title={timestamp(at)}>{ format!("read {} ago", age(Some(at), now)) }</span>
                 }
             </td>
             <td class="cell-labels">
@@ -250,11 +286,11 @@ fn row(h: &HostSummary, stable: Option<&str>, now: chrono::DateTime<chrono::Utc>
                     </span>
                 }) }
             </td>
-            <td>{ for h.groups.iter().map(|g| html! { <span class="badge">{ g.clone() }</span> }) }</td>
             <td class="nowrap">
-                <span>{ h.platform.clone().unwrap_or_default() }</span>
-                <span class="cell-sub">{ h.arch.clone().unwrap_or_default() }</span>
-                <span class="cell-sub" title="agent version">{ h.agent_version.clone().map(|v| format!("agent {v}")).unwrap_or_default() }</span>
+                <span title={h.agent_version.as_ref().map(|v| format!("agent {v}"))}>{ platform }</span>
+                if let Some(v) = skew {
+                    <span class="cell-sub text-warn" title={format!("expected {}", expect.agent.unwrap_or_default())}>{ format!("agent {v}") }</span>
+                }
                 if let Some(u) = &h.upgrade {
                     <span class="cell-sub" title={u.error.clone()}>{ match u.state {
                         buckle_api::UpgradeState::Requested => format!("upgrading to {}", u.version),
@@ -262,16 +298,17 @@ fn row(h: &HostSummary, stable: Option<&str>, now: chrono::DateTime<chrono::Utc>
                     } }</span>
                 }
             </td>
-            <td>
+            <td class="nowrap">
                 { match &h.applied_revision {
-                    Some(r) => html! { <>
-                        <span class="mono" title={r.clone()}>{ commit(r) }</span>
-                        if Some(r.as_str()) == stable { <span class="badge badge--ok">{ "stable" }</span> }
-                    </> },
+                    // The stable revision is the norm: shown quietly, so a
+                    // host on anything else stands out.
+                    Some(r) if Some(r.as_str()) == expect.stable => html! {
+                        <span class="mono muted" title={format!("{r} (stable)")}>{ commit(r) }{ " " }<span class="stable-mark">{ icons::check() }</span></span>
+                    },
+                    Some(r) => html! { <span class="mono revision-other" title={format!("{r} (not the stable revision)")}>{ commit(r) }</span> },
                     None => html! { <span class="muted">{ "—" }</span> },
                 } }
             </td>
-            <td>{ if h.drifted { html! { <Pill tone={Tone::Warn} label="drifted" /> } } else { html! { <span class="muted">{ "—" }</span> } } }</td>
             <td class="nowrap" title={h.last_seen.map(timestamp)}>
                 if offline { <span class="text-warn">{ relative_opt(h.last_seen, now) }</span> } else { { relative_opt(h.last_seen, now) } }
             </td>

@@ -43,6 +43,34 @@ pub fn changes(props: &ChangesProps) -> Html {
 }
 
 #[derive(Properties, PartialEq)]
+pub struct RunChangesProps {
+    /// Steps that changed something (created or modified).
+    pub changes: u32,
+    pub removals: u32,
+}
+
+/// A run's coarse counts in the same pill: a run summary says how many steps
+/// changed something and how many removals ran, not which kind of change.
+#[function_component(RunChanges)]
+pub fn run_changes(props: &RunChangesProps) -> Html {
+    let (c, r) = (props.changes, props.removals);
+    let part = |n: u32, class: &str, sign: &str| {
+        html! {
+            <span class={classes!("change-pill__part", format!("change-pill__part--{class}"), (n == 0).then_some("change-pill__part--zero"))}
+                data-part={class.to_string()}>
+                { format!("{sign}{n}") }
+            </span>
+        }
+    };
+    html! {
+        <span class="change-pill" data-testid="tally" title={format!("{c} changed (created or modified), {r} removed")}>
+            { part(c, "modify", "~") }
+            { part(r, "remove", "-") }
+        </span>
+    }
+}
+
+#[derive(Properties, PartialEq)]
 pub struct TookProps {
     /// The formatted duration (`2m 05s`).
     pub label: AttrValue,
