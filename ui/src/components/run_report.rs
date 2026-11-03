@@ -158,13 +158,22 @@ fn removal_problem(x: &RemovalReport) -> bool {
 /// The strip at the top: state, step counts, timing, what was applied.
 fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
     let s = &r.counts.steps;
+    let live = !run_finished(r.state);
     let mut counts = vec![
         ("changed", s.changed, Tone::Ok),
         ("unchanged", s.unchanged, Tone::Neutral),
+    ];
+    // While it runs these can still move; once it has finished a zero is
+    // noise and only what happened is listed.
+    for (label, n, tone) in [
         ("failed", s.failed, Tone::Danger),
         ("blocked", s.blocked, Tone::Warn),
         ("pending", s.pending, Tone::Neutral),
-    ];
+    ] {
+        if live || n > 0 {
+            counts.push((label, n, tone));
+        }
+    }
     for (label, n, tone) in [
         ("running", s.running, Tone::Active),
         ("rolled back", s.rolled_back, Tone::Mute),
@@ -175,7 +184,6 @@ fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
             counts.push((label, n, tone));
         }
     }
-    let live = !run_finished(r.state);
     let took = elapsed_ms(None, r.started_at, r.finished_at, now, live).map(millis);
     let tally = run_tally(r);
     let (done, total) = step_progress(r);

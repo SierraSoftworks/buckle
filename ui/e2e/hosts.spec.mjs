@@ -37,6 +37,20 @@ describe("host labels", () => {
   });
 });
 
+describe("hosts table", () => {
+  test("a host's name summarises it on hover, and its row opens it", async () => {
+    const { page, close } = await open("/hosts");
+    const row = page.locator('tr[data-host="hz-3"]');
+    await row.getByRole("link", { name: "hz-3", exact: true }).hover();
+    const card = page.getByTestId("host-card");
+    await card.waitFor();
+    for (const want of [/healthy/, /drifted/, /debian\/bookworm/]) assert.match(await card.textContent(), want);
+    await row.locator("td").nth(3).click();
+    assert.equal(await heading(page), "hz-3");
+    await close();
+  });
+});
+
 describe("registration and forgetting", () => {
   test("a pending registration is approved from the hosts page", async () => {
     const { page, close } = await open("/hosts");

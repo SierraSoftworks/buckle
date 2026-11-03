@@ -6,15 +6,16 @@ use yew::prelude::*;
 
 use crate::api;
 use crate::app::Route;
+use crate::components::meter::rollout_segments;
 use crate::components::{
-    Button, Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink,
+    Button, Empty, ErrorState, Loading, Meter, PageHead, Panel, Pill, Refresh, RouteLink,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::format::{
     commit, first_line, relative, rollout_label, short_duration, timestamp,
 };
 use crate::logic::live::apply_rollouts;
-use crate::logic::tone::{rollout_state_label, rollout_state_tone};
+use crate::logic::tone::{rollout_finished, rollout_state_label, rollout_state_tone};
 
 #[function_component(Rollouts)]
 pub fn rollouts() -> Html {
@@ -104,27 +105,25 @@ fn use_fetch_items(
 }
 
 fn row(r: &RolloutSummary, now: chrono::DateTime<chrono::Utc>) -> Html {
-    let pct = (r.hosts_done * 100).checked_div(r.hosts_total).unwrap_or(0);
     let took = r
         .finished_at
         .map(|f| short_duration(f.signed_duration_since(r.started_at).num_seconds()))
         .unwrap_or_else(|| "—".into());
     html! {
-        <tr>
-            <td><RouteLink to={Route::rollout(&r.id)} classes="strong">{ rollout_label(&r.id) }</RouteLink></td>
+        <tr class="row-link">
+            <td><RouteLink to={Route::rollout(&r.id)} classes="strong row-link__target">{ rollout_label(&r.id) }</RouteLink></td>
             <td>
                 <Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} title={r.pause_reason.clone()} />
-                if let Some(p) = &r.current_phase { <span class="muted small">{ format!(" {p}") }</span> }
+                if let Some(p) = r.current_phase.as_ref().filter(|_| !rollout_finished(r.state)) {
+                    <span class="cell-sub">{ format!("in {p}") }</span>
+                }
             </td>
             <td>
                 <span class="mono">{ commit(&r.revision) }</span>
                 <span class="cell-sub">{ first_line(&r.revision_message).to_string() }</span>
             </td>
             <td>
-                <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax={r.hosts_total.to_string()}
-                    aria-valuenow={r.hosts_done.to_string()} aria-label={format!("{} of {} hosts done", r.hosts_done, r.hosts_total)}>
-                    <span class="progress__bar" style={format!("width: {pct}%")} />
-                </div>
+                <Meter segments={rollout_segments(r)} total={r.hosts_total as usize} />
                 <span class="cell-sub">
                     { format!("{}/{} done", r.hosts_done, r.hosts_total) }
                     if r.hosts_failed > 0 { <span class="text-danger">{ format!(" · {} failed", r.hosts_failed) }</span> }

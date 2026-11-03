@@ -139,7 +139,7 @@ pub fn revisions() -> Html {
                             if auth.is_admin() && !rejected && !r.is_stable {
                                 <div class="gitlog__actions">
                                     if older {
-                                        <Button small=true kind={Kind::Danger} onclick={open(Ask::RollBack(r.clone()))}>{ "Roll back fleet to this…" }</Button>
+                                        <Button small=true kind={Kind::Subtle} onclick={open(Ask::RollBack(r.clone()))}>{ "Roll back fleet to this…" }</Button>
                                     } else if rollout.is_none() || rollout.is_some_and(|o| rollout_finished(o.state)) {
                                         <Button small=true onclick={open(Ask::Start(r.clone()))}>{ "Start rollout…" }</Button>
                                     }

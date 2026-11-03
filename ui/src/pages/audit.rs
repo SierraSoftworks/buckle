@@ -49,6 +49,17 @@ fn rollout_subject(e: &AuditEntry) -> Option<String> {
     e.subject.as_deref().and_then(subject_rollout_name)
 }
 
+/// Where a host's, rollout's or revision's entry links to, by its action's kind.
+fn subject_route(e: &AuditEntry) -> Option<Route> {
+    let subject = e.subject.clone()?;
+    match e.action.split('.').next()? {
+        "host" | "agent" => Some(Route::Host { id: subject }),
+        "rollout" | "phase" => Some(Route::rollout(&subject)),
+        "revision" => Some(Route::Revisions),
+        _ => None,
+    }
+}
+
 /// An entry's message, with its rollout's id written as the rollout's name.
 fn message(e: &AuditEntry) -> String {
     match (&e.subject, rollout_subject(e)) {
@@ -251,7 +262,16 @@ pub fn audit() -> Html {
                                             <button type="button" class="link-btn link-btn--aside small" title={format!("Filter by this rollout ({s})")}
                                                 aria-label={format!("Filter by rollout {s}")} onclick={narrow("subject", s.clone())}>{ "filter" }</button>
                                         </span> },
-                                        (Some(s), None) => html! { <button type="button" class="link-btn mono" title="Filter by this subject" onclick={narrow("subject", s.clone())}>{ s.clone() }</button> },
+                                        // A host or revision opens where it lives; the
+                                        // filter stays beside it.
+                                        (Some(s), None) => match subject_route(e) {
+                                            Some(to) => html! { <span class="audit__rollout">
+                                                <RouteLink {to} classes="mono">{ s.clone() }</RouteLink>
+                                                <button type="button" class="link-btn link-btn--aside small" title="Filter by this subject"
+                                                    aria-label={format!("Filter by {s}")} onclick={narrow("subject", s.clone())}>{ "filter" }</button>
+                                            </span> },
+                                            None => html! { <button type="button" class="link-btn mono" title="Filter by this subject" onclick={narrow("subject", s.clone())}>{ s.clone() }</button> },
+                                        },
                                         (None, _) => html! { <span class="muted">{ "—" }</span> },
                                     } }</td>
                                     <td>

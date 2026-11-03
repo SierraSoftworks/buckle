@@ -57,6 +57,25 @@
   &--plain {
     border-top-color: var(--line-strong);
   }
+
+  &--fleet .meter {
+    margin: 0.3rem 0 0.15rem;
+  }
+
+  // Not a health bucket of its own: drawn apart from the ones that add up.
+  &--aside {
+    border-style: dashed;
+    border-top-style: solid;
+    background: transparent;
+  }
+
+  &--zero {
+    border-top-color: var(--line-strong);
+
+    .tile__value {
+      color: var(--fg-3);
+    }
+  }
 }
 
 .attention {
@@ -74,13 +93,39 @@
     }
   }
 
+  &__item {
+    align-items: center;
+  }
+
+  &__mark {
+    flex: none;
+    width: 4px;
+    align-self: stretch;
+    border-radius: 2px;
+    background: var(--tone, var(--line-strong));
+  }
+
   &__host {
     min-width: 6rem;
     font-weight: 600;
   }
 
   &__why {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.2rem 0.9rem;
     color: var(--fg-2);
+  }
+
+  &__concern::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-right: 0.4rem;
+    border-radius: 50%;
+    background: var(--tone, var(--neutral));
+    vertical-align: middle;
   }
 }
 
@@ -266,8 +311,31 @@
   }
 }
 
-.health-module + .health-module {
-  margin-top: 0.5rem;
+.health-module {
+  padding: 0.5rem 0.75rem 0.35rem;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--tone, var(--line-strong));
+  border-radius: var(--radius);
+
+  & + & {
+    margin-top: 0.6rem;
+  }
+
+  &__head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0 0 0.25rem;
+    font-size: 0.88rem;
+    font-weight: 650;
+  }
+
+  // The module's checks hang under it.
+  .checks {
+    margin-left: 0.35rem;
+    padding-left: 0.85rem;
+    border-left: 1px solid var(--line);
+  }
 }
 
 // One mark per recent rollout, oldest first, coloured by its worst reading.
@@ -656,4 +724,48 @@
   &__name {
     overflow-wrap: anywhere;
   }
+}
+
+// Destructive, rare and repeated on every older revision: quiet until the
+// row is the one being looked at.
+.gitlog__actions {
+  opacity: 0.6;
+  transition: opacity 120ms ease;
+}
+
+.gitlog__item:hover .gitlog__actions,
+.gitlog__actions:focus-within {
+  opacity: 1;
+}
+
+// Hosts table
+.stable-mark svg {
+  width: 12px;
+  height: 12px;
+  color: var(--ok);
+  vertical-align: -2px;
+}
+
+.revision-other {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.cell-state .pill + .pill {
+  margin-left: 0.25rem;
+}
+
+// One line per host where the page is wide enough: labels are what a row
+// is most often scanned for (groups, derived from them, are on the card).
+[data-testid="hosts-table"] .cell-labels {
+  max-width: none;
+  min-width: 21rem;
+}
+
+.plan-digest {
+  margin-left: 0.4rem;
+}
+
+.cell-sub.text-warn {
+  color: var(--warn);
 }

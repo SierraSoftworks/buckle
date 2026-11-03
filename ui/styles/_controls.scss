@@ -174,6 +174,61 @@ $tones: (
   }
 }
 
+// A link that summarises what it names on hover (a host's card).
+.tip-link {
+  display: inline-flex;
+}
+
+.host-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 220px;
+
+  &__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+
+    strong {
+      margin-right: 0.25rem;
+      font-size: 0.85rem;
+    }
+  }
+
+  &__facts {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    padding-top: 0.35rem;
+    border-top: 1px solid var(--line);
+    color: var(--fg-2);
+  }
+}
+
+// A segmented bar: how a whole splits into states.
+.meter {
+  display: flex;
+  gap: 1px;
+  width: 100%;
+  min-width: 60px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  overflow: hidden;
+
+  &__seg {
+    display: block;
+    min-width: 3px;
+    background: var(--tone, var(--neutral));
+
+    &--rest {
+      background: transparent;
+    }
+  }
+}
+
 .tip-checks {
   display: grid;
   grid-template-columns: auto 1fr;

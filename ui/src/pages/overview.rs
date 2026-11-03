@@ -12,7 +12,8 @@ use yew::prelude::*;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Changes, Empty, ErrorState, Loading, PageHead, Panel, Pill, Pipeline, Refresh, RouteLink,
+    Changes, Empty, ErrorState, HostLink, Loading, Meter, PageHead, Panel, Pill, Pipeline, Refresh,
+    RouteLink, Segment, meter::rollout_segments,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{Bucket, attention, rollup};
@@ -168,17 +169,48 @@ fn latest(
     </> }
 }
 
+fn bucket_tone(b: Bucket) -> Tone {
+    match b {
+        Bucket::Healthy => Tone::Ok,
+        Bucket::Failing => Tone::Danger,
+        Bucket::Held | Bucket::Drifted => Tone::Warn,
+        Bucket::Offline | Bucket::Unknown => Tone::Neutral,
+    }
+}
+
+/// The fleet at a glance: its size with how it splits by health, then one
+/// tile per health bucket. Drift is not a health state (a drifted host is
+/// also healthy, failing, …), so its tile stands apart and says so.
 fn tiles(f: &Fleet, now: chrono::DateTime<chrono::Utc>) -> Html {
-    let tiles = rollup(&f.hosts);
+    let mut tiles = rollup(&f.hosts);
+    // Health buckets that add up to the fleet first, drift after them.
+    tiles.sort_by_key(|t| t.bucket == Bucket::Drifted);
+    let mut segments: Vec<Segment> = tiles
+        .iter()
+        .filter(|t| t.bucket != Bucket::Drifted)
+        .map(|t| {
+            let label = match t.bucket {
+                Bucket::Unknown => "no reading",
+                b => b.filter(),
+            };
+            Segment::new(t.count, bucket_tone(t.bucket), label)
+        })
+        .collect();
+    segments.push(Segment::new(
+        f.counts.pending as usize,
+        Tone::Info,
+        "awaiting approval",
+    ));
     html! {
         <div class="tiles" role="group" aria-label="Fleet health">
+            <RouteLink to={Route::Hosts} classes="tile tile--plain tile--fleet" label={format!("{} hosts", f.counts.total)}>
+                <span class="tile__label">{ "Fleet" }</span>
+                <span class="tile__value">{ f.counts.total }</span>
+                <Meter {segments} total={f.counts.total as usize} rest="other" />
+                <span class="tile__age">{ format!("{} online · {} paused · {} pending", f.counts.online, f.counts.paused, f.counts.pending) }</span>
+            </RouteLink>
             { for tiles.into_iter().map(|t| {
-                let tone = match t.bucket {
-                    Bucket::Healthy => Tone::Ok,
-                    Bucket::Failing => Tone::Danger,
-                    Bucket::Held | Bucket::Drifted => Tone::Warn,
-                    Bucket::Offline | Bucket::Unknown => Tone::Neutral,
-                };
+                let tone = bucket_tone(t.bucket);
                 let ages = match (t.newest, t.oldest) {
                     (Some(n), Some(o)) if age(Some(n), now) != age(Some(o), now) => format!("readings {}–{} old", age(Some(n), now), age(Some(o), now)),
                     (Some(n), _) => format!("reading {} old", age(Some(n), now)),
@@ -187,22 +219,23 @@ fn tiles(f: &Fleet, now: chrono::DateTime<chrono::Utc>) -> Html {
                 let ages = if t.bucket == Bucket::Offline && t.count > 0 {
                     ages.replace("readings", "last seen").replace("reading", "last seen")
                 } else { ages };
+                let aside = t.bucket == Bucket::Drifted;
+                let ages = match (aside, t.count) {
+                    (_, 0) => "—".to_string(),
+                    (true, _) => format!("also counted above · {ages}"),
+                    (false, _) => ages,
+                };
                 html! {
                     <RouteLink to={Route::Hosts} query={vec![("show".to_string(), t.bucket.filter().to_string())]}
-                        classes={classes!("tile", tone.class())}
+                        classes={classes!("tile", tone.class(), aside.then_some("tile--aside"), (t.count == 0).then_some("tile--zero"))}
                         label={format!("{} {}: {}", t.count, t.bucket.label(), ages)}
                         data_state={t.bucket.filter()}>
                         <span class="tile__label">{ t.bucket.label() }</span>
                         <span class="tile__value">{ t.count }</span>
-                        <span class="tile__age">{ if t.count > 0 { ages } else { "—".into() } }</span>
+                        <span class="tile__age">{ ages }</span>
                     </RouteLink>
                 }
             }) }
-            <div class="tile tile--plain">
-                <span class="tile__label">{ "Fleet" }</span>
-                <span class="tile__value">{ f.counts.total }</span>
-                <span class="tile__age">{ format!("{} online · {} paused · {} pending", f.counts.online, f.counts.paused, f.counts.pending) }</span>
-            </div>
         </div>
     }
 }
@@ -233,7 +266,7 @@ fn module_changes(d: &RolloutDetail) -> Html {
             { for rows }
             if !removals.is_empty() {
                 <li class="module-changes__item" data-module="removals">
-                    <span class="module-changes__name">{ "Removals" }</span>
+                    <span class="module-changes__name muted">{ "removals" }</span>
                     <Changes tally={Tally { remove: removals.len(), ..Tally::default() }} />
                     <span class="muted small">{ hosts_changed(total, removed_on.len()) }</span>
                 </li>
@@ -256,8 +289,12 @@ fn rollout_head(
             <span class="rollout-head__message">{ format!("“{}”", first_line(&s.revision_message)) }</span>
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
             if let Some(tally) = tally { <Changes {tally} /> }
-            if let Some(p) = &s.current_phase { <span class="muted">{ format!("phase {p}") }</span> }
-            <span class="muted">{ format!("{}/{} done · started {}", s.hosts_done, s.hosts_total, relative(s.started_at, now)) }</span>
+            if let Some(p) = &s.current_phase { <span class="muted">{ format!("in {p}") }</span> }
+            <span class="rollout-head__progress">
+                <Meter segments={rollout_segments(s)} total={s.hosts_total as usize} />
+                <span class="muted small">{ format!("{}/{} done", s.hosts_done, s.hosts_total) }</span>
+            </span>
+            <span class="muted">{ format!("started {}", relative(s.started_at, now)) }</span>
         </div>
     }
 }
@@ -280,11 +317,23 @@ fn attention_list(
     }
     html! {
         <ul class="attention">
-            { for list.into_iter().map(|(host, concerns)| html! {
-                <li class="attention__item">
-                    <RouteLink to={Route::Host { id: host.clone() }} classes="attention__host mono">{ host.clone() }</RouteLink>
-                    <span class="attention__why">{ concerns.iter().map(|c| c.describe(now)).collect::<Vec<_>>().join(" · ") }</span>
-                </li>
+            { for list.into_iter().map(|(host, concerns)| {
+                let summary = f.hosts.iter().find(|h| h.id == host).cloned();
+                let worst = [Tone::Danger, Tone::Warn]
+                    .into_iter()
+                    .find(|t| concerns.iter().any(|c| c.tone() == *t))
+                    .unwrap_or(Tone::Info);
+                html! {
+                    <li class={classes!("attention__item", worst.class())} data-host={host.clone()}>
+                        <span class="attention__mark" aria-hidden="true" />
+                        <HostLink id={host.clone()} host={summary} {now} classes={classes!("attention__host", "mono")} />
+                        <span class="attention__why">
+                            { for concerns.iter().map(|c| html! {
+                                <span class={classes!("attention__concern", c.tone().class())}>{ c.describe(now) }</span>
+                            }) }
+                        </span>
+                    </li>
+                }
             }) }
         </ul>
     }

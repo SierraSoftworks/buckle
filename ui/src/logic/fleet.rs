@@ -158,6 +158,28 @@ pub enum Concern {
 }
 
 impl Concern {
+    /// How much it asks for: a failure first, a registration last.
+    pub fn tone(&self) -> super::tone::Tone {
+        use super::tone::Tone;
+        match self {
+            Concern::Failed { .. } => Tone::Danger,
+            Concern::Held { .. }
+            | Concern::StalePlan { .. }
+            | Concern::VersionSkew { .. }
+            | Concern::Offline { .. } => Tone::Warn,
+            Concern::Registration => Tone::Info,
+        }
+    }
+
+    fn severity(&self) -> u8 {
+        use super::tone::Tone;
+        match self.tone() {
+            Tone::Danger => 0,
+            Tone::Warn => 1,
+            _ => 2,
+        }
+    }
+
     pub fn describe(&self, now: DateTime<Utc>) -> String {
         match self {
             Concern::Registration => "awaiting registration approval".into(),
@@ -202,7 +224,8 @@ pub fn expected_version<'a>(
         .map(|(v, _)| v)
 }
 
-/// The agents needing attention, worst first (by number of concerns, then name).
+/// The agents needing attention, worst first: by their most severe concern,
+/// then by how many they have, then by name.
 pub fn attention(
     hosts: &[HostSummary],
     server_version: Option<&str>,
@@ -265,7 +288,13 @@ pub fn attention(
     }
 
     let mut list: Vec<_> = out.into_iter().collect();
-    list.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+    let worst = |c: &[Concern]| c.iter().map(Concern::severity).min().unwrap_or(u8::MAX);
+    list.sort_by(|a, b| {
+        worst(&a.1)
+            .cmp(&worst(&b.1))
+            .then(b.1.len().cmp(&a.1.len()))
+            .then(a.0.cmp(&b.0))
+    });
     list
 }
 
@@ -427,9 +456,9 @@ mod tests {
         let hosts = vec![host("pi-2"), host("pi-5"), pending, gone, blip, skewed];
         let list = attention(&hosts, Some("2.0.0"), Some(&rollout), now);
         let names: Vec<&str> = list.iter().map(|(h, _)| h.as_str()).collect();
-        assert_eq!(names, vec!["lab-3", "az-1", "new-1", "pi-5"]);
+        assert_eq!(names, vec!["pi-5", "lab-3", "az-1", "new-1"]);
         assert_eq!(
-            list[0].1,
+            list[1].1,
             vec![
                 Concern::VersionSkew {
                     running: "1.9.0".into(),
@@ -440,6 +469,6 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(list[1].1[0].describe(now), "offline for 25m");
+        assert_eq!(list[2].1[0].describe(now), "offline for 25m");
     }
 }
