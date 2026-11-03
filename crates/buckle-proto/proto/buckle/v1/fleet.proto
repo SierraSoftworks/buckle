@@ -37,6 +37,7 @@ message AgentMessage {
     HealthReport health = 7;
     Drift drift = 8;
     LocalRollback rollback = 9;
+    UpgradeResult upgrade = 10;
   }
 }
 
@@ -342,6 +343,25 @@ message Upgrade {
   string version = 1;
   // Only when the agent is idle.
   bool when_idle = 2;
+}
+
+// How an Upgrade went. Sent before the agent exits to restart into a new
+// binary (best effort: the reconnect's Hello is what confirms it).
+message UpgradeResult {
+  // The version the Upgrade asked for.
+  string version = 1;
+  UpgradeOutcome outcome = 2;
+  // Why it failed, for the operator.
+  string error = 3;
+}
+
+enum UpgradeOutcome {
+  UPGRADE_OUTCOME_UNSPECIFIED = 0;
+  // Installed; the agent is restarting into it.
+  UPGRADE_OUTCOME_UPDATED = 1;
+  // Already running the requested version.
+  UPGRADE_OUTCOME_UP_TO_DATE = 2;
+  UPGRADE_OUTCOME_FAILED = 3;
 }
 
 message Rejected {

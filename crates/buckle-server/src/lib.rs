@@ -21,6 +21,7 @@ pub mod rollout;
 pub mod secrets;
 pub mod source;
 pub mod store;
+pub mod upgrades;
 pub mod views;
 pub mod web;
 
@@ -158,6 +159,14 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
             )) as Arc<dyn grpc::Whois>
         });
     let guard = Arc::new(grpc::SessionGuard::default());
+    let upgrades = Arc::new(upgrades::AgentUpgrades::new(
+        sessions.clone(),
+        config
+            .agents
+            .desired_version
+            .clone()
+            .unwrap_or_else(|| VERSION.to_owned()),
+    ));
     let fleet = grpc::FleetService {
         store: store.clone(),
         sessions: sessions.clone(),
@@ -170,6 +179,7 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         clock,
         server_version: VERSION.to_owned(),
         guard: guard.clone(),
+        upgrades: upgrades.clone(),
     };
     let grpc_listener = tokio::net::TcpListener::bind(&config.listen.grpc)
         .await
@@ -202,6 +212,7 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         VERSION.to_owned(),
     );
     state.agent_sessions = guard.sessions.clone();
+    state.upgrades = upgrades;
     state.trace_url_template = config.telemetry.trace_url_template.clone();
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
 

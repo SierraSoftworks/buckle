@@ -4,12 +4,13 @@
 //! module by module and step by step (live while it applies, with any older
 //! run a pick away), and, for admins, the controls: server labels with a live preview of the
 //! groups and phase they produce, registration approval, pause and resume,
-//! notes, and forget.
+//! agent upgrades, notes, and forget.
 
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    Connection, HostCheck, HostDetail, HostPatch, HostPreview, HostStatus, RunReport, RunSummary,
+    AgentUpgrade, Connection, HostCheck, HostDetail, HostPatch, HostPreview, HostStatus, RunReport,
+    RunSummary, UpgradeState,
 };
 use chrono::{DateTime, Utc};
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
@@ -46,6 +47,7 @@ enum Ask {
     Approve,
     Pause,
     Resume,
+    Upgrade,
     Forget,
 }
 
@@ -58,8 +60,14 @@ pub fn host_page(props: &Props) -> Html {
     let detail = use_fetch(props.id.clone(), |id| async move { api::host(&id).await });
     let live = use_live_value(&detail, apply_host_detail);
     let fleet = use_fetch((), |_| api::fleet());
-    let active = use_live_value(&fleet, apply_fleet).and_then(|f| f.active_rollout);
+    let fleet = use_live_value(&fleet, apply_fleet);
+    let active = fleet.as_ref().and_then(|f| f.active_rollout.clone());
+    let desired = fleet
+        .as_ref()
+        .and_then(|f| f.desired_agent_version.clone().or(f.server_version.clone()));
     let ask = use_state(|| None::<Ask>);
+    // The version the upgrade dialog will ask for.
+    let upgrade_to = use_state(String::new);
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
     // The run the report shows: `None` follows the newest.
@@ -101,9 +109,13 @@ pub fn host_page(props: &Props) -> Html {
     let admin = auth.is_admin();
 
     let open = |a: Ask| {
-        let (ask, error) = (ask.clone(), error.clone());
+        let (ask, error, upgrade_to) = (ask.clone(), error.clone(), upgrade_to.clone());
+        let desired = desired.clone().unwrap_or_default();
         Callback::from(move |_: MouseEvent| {
             error.set(None);
+            if a == Ask::Upgrade {
+                upgrade_to.set(desired.clone());
+            }
             ask.set(Some(a.clone()));
         })
     };
@@ -121,8 +133,10 @@ pub fn host_page(props: &Props) -> Html {
             h.id.clone(),
         );
         let navigator = navigator.clone();
+        let upgrade_to = upgrade_to.clone();
         Callback::from(move |_note: String| {
             let Some(what) = (*ask).clone() else { return };
+            let version = (*upgrade_to).trim().to_owned();
             let (ask, busy, error, toast, reload, id, navigator) = (
                 ask.clone(),
                 busy.clone(),
@@ -145,6 +159,17 @@ pub fn host_page(props: &Props) -> Html {
                     Ask::Resume => api::host_action(&id, "resume")
                         .await
                         .map(|_| format!("{id} resumed.")),
+                    Ask::Upgrade => {
+                        api::upgrade_host(&id, (!version.is_empty()).then_some(version))
+                            .await
+                            .map(|h| match h.upgrade {
+                                Some(u) => format!(
+                                    "{id} will upgrade its agent to {} once idle.",
+                                    u.version
+                                ),
+                                None => format!("{id} was asked to upgrade its agent."),
+                            })
+                    }
                     Ask::Forget => api::forget_host(&id)
                         .await
                         .map(|_| format!("{id} forgotten.")),
@@ -184,6 +209,9 @@ pub fn host_page(props: &Props) -> Html {
             } else {
                 <Button onclick={open(Ask::Pause)}>{ "Pause…" }</Button>
             }
+            if h.connection == Connection::Online {
+                <Button onclick={open(Ask::Upgrade)}>{ "Upgrade agent…" }</Button>
+            }
             <Button kind={Kind::Danger} onclick={open(Ask::Forget)}>{ "Forget…" }</Button>
         </> }
     } else {
@@ -210,6 +238,23 @@ pub fn host_page(props: &Props) -> Html {
                 html! { <p>{ "A paused host stays in the fleet but is excluded from rollouts and drift correction until resumed." }</p> }, None),
             Ask::Resume => (format!("Resume {}", h.id), format!("Resume {}", h.id), false,
                 html! { <p>{ "The host rejoins rollouts and drift correction." }</p> }, None),
+            Ask::Upgrade => {
+                let oninput = {
+                    let upgrade_to = upgrade_to.clone();
+                    Callback::from(move |e: InputEvent| upgrade_to.set(e.target_unchecked_into::<HtmlInputElement>().value()))
+                };
+                (format!("Upgrade {}'s agent", h.id), "Upgrade agent".to_string(), false, html! { <>
+                    <p>{ format!(
+                        "The agent (now {}) downloads the release from GitHub, verifies its digest and swaps its binary once nothing else is queued, then restarts into it.",
+                        h.agent_version.as_deref().unwrap_or("an unknown version"),
+                    ) }</p>
+                    <label class="field">
+                        <span class="field__label">{ "Version" }</span>
+                        <input class="input mono" type="text" placeholder={desired.clone().unwrap_or_default()} aria-label="Version"
+                            value={(*upgrade_to).clone()} {oninput} spellcheck="false" />
+                    </label>
+                </> }, None)
+            }
             Ask::Forget => (format!("Forget {}", h.id), format!("Forget {}", h.id), true, html! { <>
                 <p>{ "Forgetting removes the host and its history from the server: facts, state, runs and health. Nothing on the host itself changes." }</p>
                 <p>{ "If the agent is still installed it can enrol again, and will need approving again." }</p>
@@ -230,7 +275,7 @@ pub fn host_page(props: &Props) -> Html {
                 <Panel title="Summary">
                     { crate::components::ui::facts_list(vec![
                         ("Platform", html! { { format!("{} · {}", h.platform.clone().unwrap_or_default(), h.arch.clone().unwrap_or_default()) } }),
-                        ("Agent", html! { { h.agent_version.clone().unwrap_or_else(|| "—".into()) } }),
+                        ("Agent", agent_version(h.agent_version.as_deref(), h.upgrade.as_ref(), desired.as_deref(), now)),
                         ("Applied", match &h.applied_revision {
                             Some(r) => html! { <span class="mono" title={r.clone()}>{ commit(r) }</span> },
                             None => html! { <span class="muted">{ "nothing yet" }</span> },
@@ -291,6 +336,40 @@ pub fn host_page(props: &Props) -> Html {
             { dialog.unwrap_or_default() }
         </div>
     }
+}
+
+/// The agent's version, with the upgrade it was asked for (or that one is
+/// available).
+fn agent_version(
+    running: Option<&str>,
+    upgrade: Option<&AgentUpgrade>,
+    desired: Option<&str>,
+    now: DateTime<Utc>,
+) -> Html {
+    let version = html! { <span class="mono">{ running.unwrap_or("—").to_string() }</span> };
+    let status = match upgrade {
+        Some(u) if u.state == UpgradeState::Failed => html! {
+            <Pill tone={Tone::Danger} label={format!("upgrade to {} failed", u.version)} title={u.error.clone()} />
+        },
+        Some(u) => html! {
+            <Pill tone={Tone::Active} label={format!("upgrading to {}", u.version)}
+                title={format!("Requested by {} {}; installs once the agent is idle.", u.requested_by, relative(u.requested_at, now))} />
+        },
+        None => match desired {
+            Some(d)
+                if running
+                    .is_some_and(|r| r.trim_start_matches('v') != d.trim_start_matches('v')) =>
+            {
+                html! { <span class="muted small">{ format!("{d} available") }</span> }
+            }
+            _ => html! {},
+        },
+    };
+    let error = upgrade
+        .filter(|u| u.state == UpgradeState::Failed)
+        .and_then(|u| u.error.clone())
+        .map(|e| html! { <span class="muted small">{ e }</span> });
+    html! { <>{ version }{ " " }{ status }{ for error }</> }
 }
 
 /// Each check as it reads now, module by module, with how it fared in the

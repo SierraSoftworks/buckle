@@ -23,7 +23,7 @@ use buckle_api::{
     ActionRequest, ApproveRequest, AuditEntry, Catalog, ContinueRequest, CsrfToken, ErrorBody,
     Fleet, HealthResultDto, HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup,
     RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, RunReport, RunSummary,
-    StartRollout,
+    StartRollout, UpgradeRequest,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -312,6 +312,18 @@ pub async fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError
         Method::Post,
         &format!("/hosts/{}/{}", enc(id), enc(action)),
         None,
+    )
+    .await
+}
+
+/// Asks the host's agent to install `version` (or the fleet's desired agent
+/// version) once idle, then restart into it.
+pub async fn upgrade_host(id: &str, version: Option<String>) -> Result<HostSummary, ApiError> {
+    demo!(demo_store::upgrade_host(id, version.as_deref()));
+    write(
+        Method::Post,
+        &format!("/hosts/{}/upgrade", enc(id)),
+        Some(&UpgradeRequest { version }),
     )
     .await
 }
