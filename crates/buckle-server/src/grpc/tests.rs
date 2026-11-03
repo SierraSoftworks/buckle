@@ -476,6 +476,39 @@ async fn only_active_hosts_fetch_and_only_revisions_meant_for_them() {
     );
 }
 
+/// A tailscaled that cannot be reached (restarted, stale socket).
+struct FailingWhois;
+
+#[async_trait]
+impl Whois for FailingWhois {
+    fn covers(&self, _peer: &SocketAddr) -> bool {
+        true
+    }
+    async fn whois(&self, _peer: &SocketAddr) -> buckle_core::Result<Option<WhoisIdentity>> {
+        Err(buckle_core::error::wrap_system(
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            "The local tailscaled could not be asked who a peer is.",
+            &[],
+        ))
+    }
+}
+
+#[rstest::rstest]
+#[case::tailnet_only(vec![AgentAuth::Tailscale])]
+#[case::token_fallback_without_token(vec![AgentAuth::Tailscale, AgentAuth::Token])]
+#[tokio::test]
+async fn a_failed_whois_is_retried_not_refused(#[case] auth: Vec<AgentAuth>) {
+    let s = server(Registration::Auto, Some(Arc::new(FailingWhois)), auth).await;
+    let (_tx, _stream, reply) = open(s.addr, hello("tail-1", "", "2.0.0")).await;
+    let rejected = expect_rejected(reply);
+    assert!(rejected.retry, "a server-side whois failure is retryable");
+    assert!(
+        rejected.reason.contains("tailscaled"),
+        "{}",
+        rejected.reason
+    );
+}
+
 #[tokio::test]
 async fn whois_authenticates_by_node_name() {
     let s = server(
