@@ -2,7 +2,7 @@
 // and its admin controls only for admins.
 
 import { describe, test } from "node:test";
-import { assert, eventually, heading, open } from "./helpers.mjs";
+import { assert, decide, decisions, eventually, heading, open } from "./helpers.mjs";
 
 describe("every page renders in demo mode", () => {
   test("overview rolls the fleet up with reading ages", async () => {
@@ -15,7 +15,8 @@ describe("every page renders in demo mode", () => {
     assert.match(await page.locator('.tile[data-state="healthy"] .tile__age').textContent(), /old/);
     // The latest rollout with its controls, the fleet on its stages (hosts
     // outside it last), the attention list, recent revisions.
-    await page.getByTestId("rollout-controls").getByRole("button", { name: "Pause" }).waitFor();
+    // The controls sit at the top right of the card they act on.
+    await page.locator(".overview__rollout .panel__actions").getByTestId("rollout-controls").getByRole("button", { name: "Approve cloud…" }).waitFor();
     // What each module of the latest rollout changes, in the shared pill.
     const nomad = page.locator('.overview__rollout .module-changes__item[data-module="nomad"]');
     await nomad.waitFor();
@@ -26,7 +27,7 @@ describe("every page renders in demo mode", () => {
     assert.equal(drawn, total, "every host in the fleet is on the map");
     assert.match(await page.locator(".attention").textContent(), /awaiting registration approval/);
     assert.match(await page.locator(".attention").textContent(), /expected 2\.0\.0-dev\.5/);
-    assert.equal(await page.locator(".revlist__item").count(), 5);
+    assert.equal(await page.locator(".grid--overview .gitlog__item").count(), 5);
     await close();
   });
 
@@ -39,9 +40,12 @@ describe("every page renders in demo mode", () => {
     await dialog.getByRole("checkbox", { name: /I have reviewed/ }).check();
     await dialog.getByRole("button", { name: "Approve 12 hosts" }).click();
     await page.getByRole("status").filter({ hasText: "Approved cloud: 2 plans bound." }).waitFor();
-    await controls.getByRole("button", { name: "Pause" }).click();
+    await decide(page, "Pause");
     await page.getByRole("dialog", { name: "Pause rollout #42" }).getByRole("button", { name: "Pause rollout" }).click();
-    await controls.getByRole("button", { name: "Resume" }).waitFor();
+    await eventually(async () => {
+      const { face, menu } = await decisions(page);
+      assert.ok([face, ...menu].includes("Resume"));
+    });
     await close();
   });
 
@@ -109,8 +113,28 @@ describe("every page renders in demo mode", () => {
     await rejected.waitFor();
     assert.match(await rejected.textContent(), /unknown field `tag`/);
     // A rejected commit offers nothing to do; an older valid one offers a rollback.
-    assert.equal(await rejected.getByRole("button").count(), 0);
+    assert.equal(await rejected.locator(".commit__actions").count(), 0);
     await page.getByRole("button", { name: "Roll back fleet to this…" }).first().waitFor();
+    // A valid commit carries a check; the commit card itself opens its rollout.
+    const rolled = page.locator(".gitlog__item", { has: page.locator(".commit--link") }).first();
+    await rolled.locator('.commit__status[aria-label="valid"]').waitFor();
+    const meta = await rolled.locator(".commit__meta").boundingBox();
+    await page.mouse.click(meta.x + 4, meta.y + meta.height / 2);
+    assert.match(await heading(page), /^Rollout /);
+    await close();
+  });
+
+  test("the overview keeps the running rollout while a newer one waits behind it", async () => {
+    const { page, close } = await open("/revisions");
+    await page.getByRole("button", { name: "Roll back fleet to this…" }).first().click();
+    const dialog = page.getByRole("dialog", { name: /Roll the fleet back/ });
+    const typed = (await dialog.getByRole("button", { name: /Roll back to/ }).textContent()).replace("Roll back to", "").trim();
+    await dialog.getByRole("textbox", { name: /Type/ }).fill(typed);
+    await dialog.getByRole("button", { name: /Roll back to/ }).click();
+    await page.locator(".page-head .pill", { hasText: "detected" }).waitFor();
+    await page.getByRole("link", { name: "Overview" }).first().click();
+    const card = page.locator(".overview__rollout");
+    await card.locator(".panel__subtitle", { hasText: "Rollout #42" }).waitFor();
     await close();
   });
 

@@ -20,13 +20,14 @@ use crate::components::icons;
 use crate::components::meter::stage_segments;
 use crate::components::ui::Copyable;
 use crate::components::{
-    Button, Changes, Confirm, Countdown, Empty, ErrorBlock, ErrorState, HostLink, HoverTip, Kind,
-    Loading, Meter, PageHead, Panel, Pill, Pipeline, PlanViews, Refresh, RunReportView, TraceLink,
-    use_toast,
+    Button, Changes, Commit, CommitCard, Confirm, Countdown, Empty, ErrorBlock, ErrorState,
+    HostLink, HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill, Pipeline, PlanViews,
+    Refresh, RunReportView, SplitButton, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
+use crate::logic::controls::{Decision, decisions};
 use crate::logic::fleet_plan::fleet_tally;
-use crate::logic::format::{count, first_line, relative, rollout_label, short, since, timestamp};
+use crate::logic::format::{count, relative, rollout_label, short, since, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{self, GateKind, GateState, host_checks, layout};
 use crate::logic::plan::{ApprovalScope, approval_scope, host_tally};
@@ -132,6 +133,8 @@ pub fn rollout_page(props: &Props) -> Html {
     }
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
+    // The rollout's commit as the revisions list has it (author, age).
+    let revisions = use_fetch((), |_| async { api::revisions(0).await.map(|p| p.items) });
     // What the applying hosts are doing, for their blocks: each one's
     // report fetched once (all at the same time) and kept current by the
     // run updates, or the updates alone while there is none.
@@ -206,18 +209,18 @@ pub fn rollout_page(props: &Props) -> Html {
     let admin = auth.is_admin();
     let finished = rollout_finished(s.state);
 
-    let subtitle = html! {
+    let subtitle = html! { <>
+        <CommitCard commit={Commit::of_rollout(s, revisions.value().map(|v| v.as_slice()).unwrap_or(&[]))}
+            link=false boxed=true {now} />
         <div class="rollout-meta">
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
-            <span class="mono" title={s.revision.clone()}>{ short(&s.revision) }</span>
-            <span>{ format!("“{}”", first_line(&s.revision_message)) }</span>
             if let Some(f) = &d.fleet { <Changes tally={fleet_tally(f)} /> }
             <span class="muted">{ format!("{} · started {}", s.triggered_by, relative(s.started_at, now)) }</span>
             if let Some(f) = s.finished_at { <span class="muted">{ format!("finished {}", relative(f, now)) }</span> }
             <TraceLink id={s.trace_id.clone()} url={s.trace_url.clone()} />
             if s.name.is_some() { <Copyable text={s.id.clone()} label={format!("{}…", short(&s.id))} /> }
         </div>
-    };
+    </> };
 
     let pipeline = layout(&d);
     let wanting = wanting_approval(&pipeline);
@@ -416,37 +419,47 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
     }
 }
 
-/// The rollout-wide decisions for its state: approve the phase waiting for
-/// it (`approve`, once it has plans to bind), reject a rollout held at a
-/// gate, pause or resume, roll back, abort. Nothing once it has finished.
+/// The rollout-wide decisions for its state as one split button: approve
+/// the phase waiting for it (`approve`, once it has plans to bind), else
+/// pause or resume, with reject, roll back and abort behind its menu.
+/// Nothing once it has finished.
 pub(crate) fn controls(s: &RolloutSummary, approve: Option<&str>, open: &Callback<Ask>) -> Html {
-    if rollout_finished(s.state) {
+    let Some(d) = decisions(s.state, approve) else {
         return html! {};
-    }
-    let ask = |a: Ask| {
-        let o = open.clone();
+    };
+    let ask = |d: &Decision| {
+        let (o, a) = (open.clone(), ask_for(d));
         Callback::from(move |_: MouseEvent| o.emit(a.clone()))
     };
-    let act = |a: &'static str| ask(Ask::Action(a));
-    html! { <>
-        if let Some(phase) = approve {
-            <Button kind={Kind::Primary} onclick={ask(Ask::Approve(phase.to_string()))}>
-                { format!("Approve {phase}…") }
-            </Button>
-        }
-        if s.state == RolloutState::AwaitingApproval {
-            <Button kind={Kind::Danger} onclick={ask(Ask::Reject)}>{ "Reject…" }</Button>
-        }
-        if s.state == RolloutState::Paused {
-            <Button kind={Kind::Primary} onclick={act("resume")}>{ "Resume" }</Button>
-        } else if s.state != RolloutState::RollingBack {
-            <Button onclick={act("pause")}>{ "Pause" }</Button>
-        }
-        if matches!(s.state, RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking) {
-            <Button kind={Kind::Danger} onclick={act("rollback")}>{ "Roll back…" }</Button>
-        }
-        <Button kind={Kind::Danger} onclick={act("abort")}>{ "Abort…" }</Button>
-    </> }
+    let kind = match &d.primary {
+        Decision::Approve(_) | Decision::Resume => Kind::Primary,
+        p if p.destructive() => Kind::Danger,
+        _ => Kind::Default,
+    };
+    let items = d
+        .menu
+        .iter()
+        .map(|m| MenuItem {
+            label: m.label().into(),
+            danger: m.destructive(),
+            onclick: ask(m),
+        })
+        .collect::<Vec<_>>();
+    html! {
+        <SplitButton label={d.primary.label()} onclick={ask(&d.primary)} {kind} {items}
+            menu_label="More rollout actions" testid="rollout-controls" />
+    }
+}
+
+fn ask_for(d: &Decision) -> Ask {
+    match d {
+        Decision::Approve(phase) => Ask::Approve(phase.clone()),
+        Decision::Reject => Ask::Reject,
+        Decision::Pause => Ask::Action("pause"),
+        Decision::Resume => Ask::Action("resume"),
+        Decision::Rollback => Ask::Action("rollback"),
+        Decision::Abort => Ask::Action("abort"),
+    }
 }
 
 /// Phases an approval is wanted for: reached and waiting, or gated and not

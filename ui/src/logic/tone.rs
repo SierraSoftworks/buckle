@@ -209,6 +209,13 @@ pub fn rollout_finished(state: RolloutState) -> bool {
     )
 }
 
+/// Whether a rollout is in progress, as the server's `is_active` has it: a
+/// rollout queued behind another (`detected`) is not, so it never takes the
+/// running one's place.
+pub fn rollout_active(state: RolloutState) -> bool {
+    !rollout_finished(state) && state != RolloutState::Detected
+}
+
 pub fn phase_state_label(state: PhaseState) -> &'static str {
     match state {
         PhaseState::Pending => "pending",

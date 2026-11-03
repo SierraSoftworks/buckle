@@ -97,6 +97,87 @@ $tones: (
   }
 }
 
+// A button with a menu: the expected action on its face, the rest behind
+// the chevron.
+.split {
+  position: relative;
+  display: inline-flex;
+
+  &__main {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+
+  &__toggle {
+    margin-left: -1px;
+    padding: 0.35rem 0.45rem;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+
+    svg {
+      transform: rotate(90deg);
+      transition: transform var(--transition);
+    }
+  }
+
+  &__main.btn--primary + &__toggle {
+    border-left-color: color-mix(in srgb, var(--on-brand) 30%, transparent);
+  }
+
+  &--open &__toggle svg {
+    transform: rotate(-90deg);
+  }
+
+  &__menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    min-width: 11rem;
+    padding: 0.3rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  &__item {
+    padding: 0.4rem 0.65rem;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--fg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+
+    &:hover,
+    &:focus-visible {
+      background: var(--surface-2);
+    }
+
+    &--danger {
+      color: var(--danger);
+
+      &:hover,
+      &:focus-visible {
+        background: var(--danger-soft);
+      }
+    }
+
+    // The gentle decisions first, a rule before the ones that end or undo.
+    &:not(.split__item--danger) + .split__item--danger {
+      margin-top: 0.3rem;
+      border-top: 1px solid var(--line);
+      border-top-left-radius: 0;
+      border-top-right-radius: 0;
+    }
+  }
+}
+
 .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -505,7 +586,8 @@ textarea.input {
 .page-head {
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-end;
+  // Actions are anchored at the top right, beside the title.
+  align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
   margin-bottom: 1.25rem;
