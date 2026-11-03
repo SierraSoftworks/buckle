@@ -72,6 +72,7 @@ struct Server {
     data: tempfile::TempDir,
     revisions: Arc<RevisionCache>,
     guard: Arc<SessionGuard>,
+    upgrades: Arc<crate::upgrades::AgentUpgrades>,
     cancel: CancellationToken,
 }
 
@@ -136,9 +137,13 @@ async fn server_full(
     )
     .await
     .unwrap();
+    let upgrades = Arc::new(crate::upgrades::AgentUpgrades::new(
+        sessions.clone(),
+        "2.3.0",
+    ));
     let service = FleetService {
         store: store.clone(),
-        sessions,
+        sessions: sessions.clone(),
         controller,
         revisions: revisions.clone(),
         secrets,
@@ -155,6 +160,7 @@ async fn server_full(
         clock,
         server_version: "2.0.0-test".into(),
         guard: guard.clone(),
+        upgrades: upgrades.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -166,6 +172,7 @@ async fn server_full(
         data,
         revisions,
         guard,
+        upgrades,
         cancel,
     }
 }
@@ -1065,4 +1072,91 @@ async fn a_resent_report_still_pending_reaches_the_controller_again() {
         pending.is_empty(),
         "the controller consumed it: {pending:?}"
     );
+}
+
+async fn wait_upgrade(
+    s: &Server,
+    what: &str,
+    pred: impl Fn(Option<buckle_api::AgentUpgrade>) -> bool,
+) {
+    for _ in 0..100 {
+        if pred(s.upgrades.get("pi-1")) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{what}: {:?}", s.upgrades.get("pi-1"));
+}
+
+async fn next_upgrade(stream: &mut tonic::Streaming<ServerMessage>) -> buckle_proto::v1::Upgrade {
+    loop {
+        match stream.message().await.unwrap().unwrap().msg {
+            Some(server_message::Msg::Upgrade(u)) => return u,
+            Some(_) => continue,
+            None => panic!("the stream ended"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_requested_upgrade_is_resent_until_the_agent_reconnects_on_it() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.2.0")).await;
+    let token = expect_welcome(reply).issued_token;
+    s.upgrades
+        .request("pi-1", Some("2.2.0"), None, "ben", chrono::Utc::now())
+        .unwrap();
+    let sent = next_upgrade(&mut stream).await;
+    assert_eq!((sent.version.as_str(), sent.when_idle), ("2.3.0", true));
+    drop((tx, stream));
+
+    // Restarted before upgrading: the new session is asked again.
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", &token, "2.2.0")).await;
+    expect_welcome(reply);
+    assert_eq!(next_upgrade(&mut stream).await.version, "2.3.0");
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::Upgrade(
+            buckle_proto::v1::UpgradeResult {
+                version: "2.3.0".into(),
+                outcome: buckle_proto::v1::UpgradeOutcome::Failed as i32,
+                error: "no binary for this platform".into(),
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    wait_upgrade(&s, "the failure is kept", |u| {
+        u.is_some_and(|u| {
+            u.state == buckle_api::UpgradeState::Failed
+                && u.error.as_deref() == Some("no binary for this platform")
+        })
+    })
+    .await;
+    drop((tx, stream));
+
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-1", &token, "2.3.0")).await;
+    expect_welcome(reply);
+    wait_upgrade(&s, "the reconnect settles it", |u| u.is_none()).await;
+    for action in ["host.upgrade_failed", "host.upgraded"] {
+        let mut found = false;
+        for _ in 0..100 {
+            let filter = crate::store::AuditFilter {
+                filter: Some(buckle_core::Filter::new(format!("action == \"{action}\"")).unwrap()),
+                limit: 10,
+                ..Default::default()
+            };
+            found = s
+                .store
+                .call(move |db| db.audit().list(&filter))
+                .await
+                .unwrap()
+                .1
+                > 0;
+            if found {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(found, "{action} is audited");
+    }
 }

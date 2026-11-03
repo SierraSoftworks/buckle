@@ -356,6 +356,24 @@ pub enum Report {
     },
     /// The agent rolled itself (or a module) back on its own (durable).
     LocalRollback(LocalRollbackRecord),
+    /// How an Upgrade went.
+    Upgrade {
+        /// The version the Upgrade asked for.
+        version: String,
+        /// What happened.
+        outcome: UpgradeReport,
+    },
+}
+
+/// The outcome of an Upgrade, as reported to the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeReport {
+    /// Installed; the agent is restarting into it.
+    Updated,
+    /// Already running the requested version.
+    UpToDate,
+    /// The upgrade failed.
+    Failed(String),
 }
 
 impl Report {

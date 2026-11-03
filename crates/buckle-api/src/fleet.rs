@@ -53,6 +53,40 @@ pub struct HostSummary {
     pub last_seen: Option<DateTime<Utc>>,
     #[serde(default)]
     pub notes: String,
+    /// An agent upgrade the server asked for and the agent has not yet
+    /// settled. Cleared when the agent reconnects running `version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<AgentUpgrade>,
+}
+
+/// An agent upgrade requested from the server (`POST /hosts/{id}/upgrade`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentUpgrade {
+    /// The release the agent was asked to install.
+    pub version: String,
+    pub state: UpgradeState,
+    pub requested_at: DateTime<Utc>,
+    pub requested_by: String,
+    /// Why it failed, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeState {
+    /// Sent; the agent installs it once idle, then restarts.
+    Requested,
+    Failed,
+}
+
+/// `POST /api/v1/hosts/{id}/upgrade`. Without a version the agent is moved to
+/// the fleet's desired agent version (`agents.desired_version`, or else the
+/// server's own).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,6 +251,10 @@ pub struct Fleet {
     /// UI flags agents reporting a different one as version skew.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_version: Option<String>,
+    /// The agent version the fleet should run: `agents.desired_version`, or
+    /// else the server's own. What an upgrade without a version installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_agent_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

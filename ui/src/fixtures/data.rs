@@ -344,6 +344,7 @@ pub fn hosts(now: DateTime<Utc>) -> Vec<HostSummary> {
                     "pi-1" => "Canary. Sits under the desk; reboot by hand if it wedges.".into(),
                     _ => String::new(),
                 },
+                upgrade: None,
             }
         })
         .collect()

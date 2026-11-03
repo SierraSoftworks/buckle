@@ -255,6 +255,12 @@ fn row(h: &HostSummary, stable: Option<&str>, now: chrono::DateTime<chrono::Utc>
                 <span>{ h.platform.clone().unwrap_or_default() }</span>
                 <span class="cell-sub">{ h.arch.clone().unwrap_or_default() }</span>
                 <span class="cell-sub" title="agent version">{ h.agent_version.clone().map(|v| format!("agent {v}")).unwrap_or_default() }</span>
+                if let Some(u) = &h.upgrade {
+                    <span class="cell-sub" title={u.error.clone()}>{ match u.state {
+                        buckle_api::UpgradeState::Requested => format!("upgrading to {}", u.version),
+                        buckle_api::UpgradeState::Failed => format!("upgrade to {} failed", u.version),
+                    } }</span>
+                }
             </td>
             <td>
                 { match &h.applied_revision {

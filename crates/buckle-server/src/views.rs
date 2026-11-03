@@ -68,6 +68,7 @@ pub fn host_summary(
         first_seen: host.first_seen,
         last_seen: host.last_seen,
         notes: host.notes.clone(),
+        upgrade: None,
     }
 }
 

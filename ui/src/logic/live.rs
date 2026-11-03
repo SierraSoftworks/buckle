@@ -308,6 +308,7 @@ mod tests {
             first_seen: Utc::now(),
             last_seen: None,
             notes: String::new(),
+            upgrade: None,
         }
     }
 
@@ -381,6 +382,7 @@ mod tests {
             active_rollout: None,
             counts: FleetCounts::default(),
             server_version: None,
+            desired_agent_version: None,
         };
         let event = LiveEvent::HostChanged {
             host: host("pi-2", HealthSummary::Failing),
@@ -407,6 +409,7 @@ mod tests {
             active_rollout: None,
             counts: FleetCounts::default(),
             server_version: None,
+            desired_agent_version: None,
         };
         apply_fleet(
             &mut fleet,

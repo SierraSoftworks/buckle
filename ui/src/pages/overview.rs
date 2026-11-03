@@ -267,7 +267,14 @@ fn attention_list(
     rollout: Option<&RolloutDetail>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Html {
-    let list = attention(&f.hosts, f.server_version.as_deref(), rollout, now);
+    let list = attention(
+        &f.hosts,
+        f.desired_agent_version
+            .as_deref()
+            .or(f.server_version.as_deref()),
+        rollout,
+        now,
+    );
     if list.is_empty() {
         return html! { <Empty title="Nothing needs attention" message="Every agent is registered, connected, current and on a plan its phase approved." /> };
     }

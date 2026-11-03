@@ -293,6 +293,7 @@ mod tests {
             first_seen: Utc::now(),
             last_seen: Some(Utc::now()),
             notes: String::new(),
+            upgrade: None,
         }
     }
 

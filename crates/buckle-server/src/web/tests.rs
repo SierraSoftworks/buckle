@@ -90,6 +90,10 @@ async fn env_with(web_config: WebConfig, adjust: impl FnOnce(&mut AppState)) -> 
         Some(Arc::new(Notify::new())),
         "2.0.0-test".into(),
     );
+    state.upgrades = Arc::new(crate::upgrades::AgentUpgrades::new(
+        sessions.clone(),
+        "2.3.0",
+    ));
     adjust(&mut state);
     let state = web::Data::new(state);
     Env {
@@ -411,6 +415,81 @@ async fn hosts_can_be_relabelled_approved_and_previewed() {
     )
     .await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[actix_web::test]
+async fn admins_can_ask_a_connected_agent_to_upgrade() {
+    let e = env(WebConfig {
+        admin_acl: acl("true"),
+        ..Default::default()
+    })
+    .await;
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    add_host(&e.store, "pi-2", HostStatus::Active).await;
+    let (_, mut rx) = e.sessions.attach("pi-1");
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    let upgrade = |host: &str, version: Option<&str>| {
+        test::TestRequest::post()
+            .uri(&format!("/api/v1/hosts/{host}/upgrade"))
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(buckle_api::UpgradeRequest {
+                version: version.map(str::to_owned),
+            })
+            .to_request()
+    };
+
+    for (host, version, status) in [
+        ("pi-2", None, StatusCode::CONFLICT),
+        ("pi-1", Some("latest"), StatusCode::BAD_REQUEST),
+        ("nope", None, StatusCode::NOT_FOUND),
+    ] {
+        let resp = test::call_service(&app, upgrade(host, version)).await;
+        assert_eq!(resp.status(), status, "{host} {version:?}");
+    }
+    assert!(rx.try_recv().is_err(), "refused requests send nothing");
+
+    let resp = test::call_service(&app, upgrade("pi-1", None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let summary: buckle_api::HostSummary = test::read_body_json(resp).await;
+    let requested = summary.upgrade.expect("the request is shown on the host");
+    assert_eq!(
+        requested.version, "2.3.0",
+        "defaults to the desired version"
+    );
+    assert_eq!(requested.state, buckle_api::UpgradeState::Requested);
+    match rx.try_recv().map(|m| m.msg) {
+        Ok(Some(buckle_proto::v1::server_message::Msg::Upgrade(u))) => {
+            assert_eq!(u.version, "2.3.0");
+            assert!(u.when_idle);
+        }
+        other => panic!("expected an Upgrade, got {other:?}"),
+    }
+
+    let fleet = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+    )
+    .await;
+    let fleet: buckle_api::Fleet = test::read_body_json(fleet).await;
+    assert_eq!(fleet.desired_agent_version.as_deref(), Some("2.3.0"));
+    assert!(
+        fleet
+            .hosts
+            .iter()
+            .any(|h| h.id == "pi-1" && h.upgrade.is_some())
+    );
+
+    let audit = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/audit?filter=action%20%3D%3D%20%22host.upgrade%22")
+            .to_request(),
+    )
+    .await;
+    let page: buckle_api::Page<buckle_api::AuditEntry> = test::read_body_json(audit).await;
+    assert_eq!(page.total, 1);
 }
 
 #[actix_web::test]

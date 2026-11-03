@@ -22,7 +22,7 @@ use crate::store::{AgentState, Store};
 use crate::transport::grpc::set_parent_from_traceparent;
 use crate::transport::{
     DurableReport, Hello, Instruction, LocalRollbackRecord, Report, RevisionSource, Session,
-    Transport, Welcome, WireSecret,
+    Transport, UpgradeReport, Welcome, WireSecret,
 };
 use crate::update::{UpdateOutcome, Updater};
 use crate::watchdog::{Verdict, Watchdog};
@@ -2131,15 +2131,23 @@ impl Shared {
 
     async fn upgrade(&self, version: String) {
         tracing::info!(%version, "upgrading the agent");
-        match self.updater.update(Some(&version)).await {
+        let (outcome, restart) = match self.updater.update(Some(&version)).await {
             Ok(UpdateOutcome::Updated { version }) => {
                 tracing::info!(%version, "upgraded; exiting so the service manager restarts the agent");
-                self.stop.cancel();
+                (UpgradeReport::Updated, true)
             }
             Ok(UpdateOutcome::UpToDate { version }) => {
-                tracing::info!(%version, "already running the requested version")
+                tracing::info!(%version, "already running the requested version");
+                (UpgradeReport::UpToDate, false)
             }
-            Err(err) => tracing::error!(error = %err.description(), "the upgrade failed"),
+            Err(err) => {
+                tracing::error!(error = %err.description(), "the upgrade failed");
+                (UpgradeReport::Failed(err.description()), false)
+            }
+        };
+        self.sink.send(Report::Upgrade { version, outcome }).await;
+        if restart {
+            self.stop.cancel();
         }
     }
 
