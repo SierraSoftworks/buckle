@@ -12,7 +12,7 @@ use crate::components::{
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::format::{
-    commit, first_line, relative, rollout_label, short_duration, timestamp,
+    commit, first_line, relative, rollout_label, rollout_note, short_duration, timestamp,
 };
 use crate::logic::live::apply_rollouts;
 use crate::logic::tone::{rollout_finished, rollout_state_label, rollout_state_tone};
@@ -113,9 +113,12 @@ fn row(r: &RolloutSummary, now: chrono::DateTime<chrono::Utc>) -> Html {
         <tr class="row-link">
             <td><RouteLink to={Route::rollout(&r.id)} classes="strong row-link__target">{ rollout_label(&r.id) }</RouteLink></td>
             <td>
-                <Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} title={r.pause_reason.clone()} />
+                <Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} title={rollout_note(r)} />
                 if let Some(p) = r.current_phase.as_ref().filter(|_| !rollout_finished(r.state)) {
                     <span class="cell-sub">{ format!("in {p}") }</span>
+                }
+                if let Some(by) = &r.superseded_by {
+                    <span class="cell-sub">{ "superseded by " }<RouteLink to={Route::rollout(by)} classes="row-link__also">{ rollout_label(by) }</RouteLink></span>
                 }
             </td>
             <td>

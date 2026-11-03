@@ -122,6 +122,19 @@ pub fn rollout_label(id: &str) -> String {
     buckle_api::rollout_name(id).unwrap_or_else(|| format!("#{id}"))
 }
 
+/// Why a rollout stands where it does, for its state pill's hover: why it
+/// paused, which rollout superseded it, or why it ended.
+pub fn rollout_note(r: &buckle_api::RolloutSummary) -> Option<String> {
+    r.pause_reason
+        .clone()
+        .or_else(|| {
+            r.superseded_by
+                .as_deref()
+                .map(|id| format!("superseded by rollout {}", rollout_label(id)))
+        })
+        .or_else(|| r.end_reason.clone())
+}
+
 /// The name of the rollout an audit subject is, when the subject is a
 /// rollout id (a UUID): hosts and commits are subjects too, and a commit's
 /// hex digits would otherwise name a rollout.
@@ -227,6 +240,43 @@ mod tests {
         assert_eq!(rollout_label("42"), "#42");
         let name = buckle_api::rollout_name(id).unwrap();
         assert_eq!(rollout_label(&name), name, "a name labels itself");
+    }
+
+    #[test]
+    fn a_rollout_note_says_why_it_stands_where_it_does() {
+        let summary = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "id": "40", "revision": "abc", "revision_message": "", "state": "skipped",
+                "started_at": "2026-01-01T00:00:00Z", "triggered_by": "controller",
+                "hosts_total": 0, "hosts_done": 0, "hosts_failed": 0,
+            });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<buckle_api::RolloutSummary>(v).unwrap()
+        };
+        let cases = [
+            (serde_json::json!({}), None),
+            (
+                serde_json::json!({"superseded_by": "41", "end_reason": "superseded by 41"}),
+                Some("superseded by rollout #41"),
+            ),
+            (
+                serde_json::json!({"end_reason": "aborted by bob"}),
+                Some("aborted by bob"),
+            ),
+            (
+                serde_json::json!({"pause_reason": "pi-1 failed", "end_reason": "x"}),
+                Some("pi-1 failed"),
+            ),
+        ];
+        for (extra, want) in cases {
+            assert_eq!(
+                rollout_note(&summary(extra.clone())).as_deref(),
+                want,
+                "{extra}"
+            );
+        }
     }
 
     #[test]

@@ -60,9 +60,16 @@ describe("every page renders in demo mode", () => {
     const { page, close } = await open("/rollouts");
     assert.equal(await heading(page), "Rollouts");
     await page.locator("tbody tr").first().waitFor();
-    assert.equal(await page.locator("tbody tr").count(), 4);
+    assert.equal(await page.locator("tbody tr").count(), 5);
     const text = await page.locator("tbody").textContent();
-    for (const s of ["rolling", "completed", "rolled back", "aborted"]) assert.ok(text.includes(s), s);
+    for (const s of ["rolling", "completed", "rolled back", "aborted", "skipped"]) assert.ok(text.includes(s), s);
+    // A skipped rollout links to the newer one that superseded it.
+    const skipped = page.locator("tbody tr", { hasText: "superseded by" });
+    assert.match(await skipped.textContent(), /skipped/);
+    await skipped.getByRole("link", { name: "#41" }).click();
+    await page.waitForURL(/\/rollouts\/41$/);
+    await page.goBack();
+    await page.waitForURL(/\/rollouts(\?.*)?$/);
     // In-app navigation, no reload: the live store and demo mode survive.
     await page.getByRole("link", { name: "#42" }).click();
     assert.equal(await heading(page), "Rollout #42");

@@ -123,6 +123,12 @@
     position: absolute;
     inset: 0;
   }
+
+  // Another link in the row, kept clickable above the stretched one.
+  &__also {
+    position: relative;
+    z-index: 1;
+  }
 }
 
 // A row that opens on click through a handler (its cells hold links and

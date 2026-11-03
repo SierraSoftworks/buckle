@@ -382,8 +382,8 @@ pub fn revisions(offset: u64) -> Result<Page<RevisionSummary>, ApiError> {
 pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiError> {
     admin()?;
     with(|s| {
-        // supersede: queue. A rollout started while another runs waits for
-        // it (`detected`), and replaces any rollout already waiting.
+        // supersede: latest. A rollout started while another runs waits for
+        // it (`detected`), and skips any rollout already waiting.
         let busy = s
             .rollouts
             .iter()
@@ -434,9 +434,10 @@ pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiEr
         }
         for r in &mut s.rollouts {
             if r.summary.state == RolloutState::Detected {
-                r.summary.state = RolloutState::Aborted;
+                r.summary.state = RolloutState::Skipped;
                 r.summary.finished_at = Some(Utc::now());
-                r.summary.pause_reason = Some(format!("superseded by {id}"));
+                r.summary.end_reason = Some(format!("superseded by {id}"));
+                r.summary.superseded_by = Some(id.clone());
                 s.outbox.push(LiveEvent::RolloutChanged {
                     rollout: r.summary.clone(),
                 });

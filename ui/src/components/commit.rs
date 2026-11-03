@@ -11,7 +11,9 @@ use super::icons;
 use super::link::RouteLink;
 use super::ui::Copyable;
 use crate::app::Route;
-use crate::logic::format::{commit, count, first_line, relative, rollout_label, timestamp};
+use crate::logic::format::{
+    commit, count, first_line, relative, rollout_label, rollout_note, timestamp,
+};
 use crate::logic::tone::{revision_status_tone, rollout_state_label, rollout_state_tone};
 
 /// What a card shows of a commit: a revision where one is known, else what a
@@ -131,7 +133,7 @@ pub fn commit_card(props: &CommitCardProps) -> Html {
                     // On its rollout's own page, the rollout goes without saying.
                     { match props.rollout.as_ref().filter(|_| props.link) {
                         Some(r) => html! {
-                            <span class={classes!("commit__rollout", rollout_state_tone(r.state).class())}>
+                            <span class={classes!("commit__rollout", rollout_state_tone(r.state).class())} title={rollout_note(r)}>
                                 { format!("rollout {} {}", rollout_label(&r.id), rollout_state_label(r.state)) }
                             </span>
                         },

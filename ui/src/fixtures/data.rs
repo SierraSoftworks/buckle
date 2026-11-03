@@ -20,6 +20,7 @@ pub const NEW_REV: &str = "7c2e1f0a9d3b5e7f1c2d4e6f8a0b1c3d5e7f9a1b";
 pub const STABLE_REV: &str = "5d4a9b2c7e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b";
 pub const REJECTED_REV: &str = "3b1f8e7c2a4d6f8b0c2e4a6c8e0a2c4e6a8c0e2a";
 pub const ROLLED_BACK_REV: &str = "9a0c6d1e3f5b7d9f1b3d5f7b9d1f3b5d7f9b1d3f";
+pub const SKIPPED_REV: &str = "4c6e8a0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c";
 pub const ABORTED_REV: &str = "e8f7a65b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f";
 pub const OLD_REV: &str = "1f2e3d4c5b6a7980a1b2c3d4e5f60718293a4b5c";
 pub const OLDEST_REV: &str = "0aa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9";
@@ -594,6 +595,8 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
             hosts_failed: 1,
             current_phase: Some("home".into()),
             pause_reason: None,
+            end_reason: None,
+            superseded_by: None,
             trace_id: Some(TRACE.into()),
             trace_url: Some(trace_url(TRACE)),
         },
@@ -1373,6 +1376,8 @@ fn finished(
                 RolloutState::Aborted => Some("pi-1 failed swap/zram in canary.".into()),
                 _ => None,
             },
+            end_reason: None,
+            superseded_by: None,
             trace_id: Some(fake_trace(id.parse().unwrap_or(0))),
             trace_url: Some(trace_url(&fake_trace(id.parse().unwrap_or(0)))),
         },
@@ -1390,6 +1395,53 @@ fn finished(
     }
 }
 
+/// A rollout a newer revision superseded while it was queued: it never froze
+/// a target set, so it has no phases.
+fn skipped(id: &str, rev: &str, message: &str, by: &str, at: DateTime<Utc>) -> RolloutDetail {
+    RolloutDetail {
+        summary: RolloutSummary {
+            id: id.into(),
+            name: None,
+            revision: rev.into(),
+            revision_message: message.into(),
+            state: RolloutState::Skipped,
+            started_at: at,
+            finished_at: Some(at + Duration::minutes(4)),
+            triggered_by: "controller (trigger: auto)".into(),
+            hosts_total: 0,
+            hosts_done: 0,
+            hosts_failed: 0,
+            current_phase: None,
+            pause_reason: None,
+            end_reason: Some(format!("superseded by {by}")),
+            superseded_by: Some(by.into()),
+            trace_id: None,
+            trace_url: None,
+        },
+        phases: vec![],
+        fleet: None,
+        plans: vec![],
+        events: vec![
+            RolloutEvent {
+                at,
+                kind: "rollout.detected".into(),
+                message: format!("Revision {} queued behind rollout 40.", &rev[..7]),
+                host: None,
+                phase: None,
+                actor: Some("controller".into()),
+            },
+            RolloutEvent {
+                at: at + Duration::minutes(4),
+                kind: "rollout.skipped".into(),
+                message: format!("rollout detected → skipped: superseded by {by}"),
+                host: None,
+                phase: None,
+                actor: Some("controller".into()),
+            },
+        ],
+    }
+}
+
 pub fn rollouts(now: DateTime<Utc>) -> Vec<RolloutDetail> {
     vec![
         active_rollout(now),
@@ -1400,6 +1452,13 @@ pub fn rollouts(now: DateTime<Utc>) -> Vec<RolloutDetail> {
             RolloutState::Completed,
             2,
             now,
+        ),
+        skipped(
+            "40a",
+            SKIPPED_REV,
+            "docker 28: bump containerd too",
+            "41",
+            now - Duration::days(5) + Duration::minutes(10),
         ),
         finished(
             "40",
@@ -1471,6 +1530,15 @@ pub fn revisions(now: DateTime<Utc>) -> Vec<RevisionSummary> {
             RevisionStatus::Valid,
             Some("41"),
             true,
+        ),
+        r(
+            SKIPPED_REV,
+            "Bob Builder <bob@example.com>",
+            "docker 28: bump containerd too",
+            Duration::days(5) - Duration::minutes(10),
+            RevisionStatus::Valid,
+            Some("40a"),
+            false,
         ),
         r(
             ROLLED_BACK_REV,

@@ -186,6 +186,7 @@ pub fn rollout_state_label(state: RolloutState) -> &'static str {
         RolloutState::RolledBack => "rolled back",
         RolloutState::Completed => "completed",
         RolloutState::Aborted => "aborted",
+        RolloutState::Skipped => "skipped",
     }
 }
 
@@ -195,7 +196,7 @@ pub fn rollout_state_tone(state: RolloutState) -> Tone {
         RolloutState::Planning | RolloutState::Rolling | RolloutState::Baking => Tone::Active,
         RolloutState::AwaitingApproval => Tone::Info,
         RolloutState::Paused => Tone::Warn,
-        RolloutState::RollingBack | RolloutState::RolledBack => Tone::Mute,
+        RolloutState::RollingBack | RolloutState::RolledBack | RolloutState::Skipped => Tone::Mute,
         RolloutState::Completed => Tone::Ok,
         RolloutState::Aborted => Tone::Danger,
     }
@@ -205,7 +206,10 @@ pub fn rollout_state_tone(state: RolloutState) -> Tone {
 pub fn rollout_finished(state: RolloutState) -> bool {
     matches!(
         state,
-        RolloutState::Completed | RolloutState::RolledBack | RolloutState::Aborted
+        RolloutState::Completed
+            | RolloutState::RolledBack
+            | RolloutState::Aborted
+            | RolloutState::Skipped
     )
 }
 
@@ -435,6 +439,11 @@ mod tests {
         assert_eq!(rollout_state_tone(RolloutState::Aborted), Tone::Danger);
         assert_eq!(rollout_state_tone(RolloutState::Completed), Tone::Ok);
         assert_eq!(rollout_state_tone(RolloutState::Paused), Tone::Warn);
+        assert_eq!(
+            rollout_state_tone(RolloutState::Skipped),
+            Tone::Mute,
+            "a superseded rollout did not fail"
+        );
         assert_eq!(health_tone(HealthSummary::Failing), Tone::Danger);
         assert_eq!(check_status_tone("FAIL"), Tone::Danger);
         assert_eq!(check_status_tone("pass"), Tone::Ok);
@@ -548,6 +557,7 @@ mod tests {
         assert!(rollout_finished(RolloutState::Completed));
         assert!(rollout_finished(RolloutState::Aborted));
         assert!(rollout_finished(RolloutState::RolledBack));
+        assert!(rollout_finished(RolloutState::Skipped));
         assert!(!rollout_finished(RolloutState::Paused));
         assert!(!rollout_finished(RolloutState::RollingBack));
     }
