@@ -120,6 +120,16 @@ pub fn clock() -> Html {
     </> })
 }
 
+pub fn stopwatch() -> Html {
+    icon(html! { <>
+        <circle cx="12" cy="14" r="7" />
+        <polyline points="12 10 12 14 14.5 15.5" />
+        <line x1="10" y1="3" x2="14" y2="3" />
+        <line x1="12" y1="3" x2="12" y2="7" />
+        <line x1="18" y1="7" x2="19.5" y2="5.5" />
+    </> })
+}
+
 pub fn pause() -> Html {
     icon(html! { <>
         <line x1="9" y1="5" x2="9" y2="19" />

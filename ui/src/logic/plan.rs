@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 
 use buckle_api::{PlanGroup, PlanView, RolloutHost, StepOutcome};
 
+use super::fleet_plan::Tally;
+
 /// What one distinct plan asks an approver to accept.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Review {
@@ -55,6 +57,38 @@ pub fn review(plan: &PlanView) -> Review {
     }
     r.deferred = plan.deferred.len();
     r
+}
+
+/// What a plan changes on its host: its steps by shape, and the removals
+/// that run (a removal that only forgets its record changes nothing).
+pub fn plan_tally(plan: &PlanView) -> Tally {
+    Tally {
+        remove: plan.removals.iter().filter(|r| r.cleanup).count(),
+        ..Tally::default()
+    }
+    .sum(Tally::of_steps(plan.steps()))
+}
+
+/// What a host's plan in a rollout changes: from its plan where the server
+/// holds a copy, else from the counts the host reported.
+pub fn host_tally(h: &RolloutHost, plans: &[PlanGroup]) -> Option<Tally> {
+    let digest = h.plan_digest.as_deref()?;
+    let held = plans
+        .iter()
+        .find(|g| g.digest == digest)
+        .and_then(|g| g.plan.as_ref());
+    match (held, h.plan_changes) {
+        (Some(plan), _) => Some(plan_tally(plan)),
+        (None, Some(changes)) => {
+            let removals = h.plan_removals.unwrap_or(0);
+            Some(Tally {
+                modify: changes.saturating_sub(removals) as usize,
+                remove: removals as usize,
+                ..Tally::default()
+            })
+        }
+        (None, None) => None,
+    }
 }
 
 /// What approving a phase binds: the distinct plans its hosts would apply.
@@ -189,6 +223,56 @@ mod tests {
                 plan_error: false,
             }],
             ..PlanView::default()
+        }
+    }
+
+    #[test]
+    fn a_plan_tallies_its_steps_and_the_removals_that_run() {
+        let t = plan_tally(&sample());
+        assert_eq!((t.create, t.modify, t.remove, t.blocked), (0, 2, 3, 1));
+    }
+
+    #[test]
+    fn a_hosts_tally_comes_from_its_plan_else_its_counts() {
+        let mut h = host_entry(Some("5b1c9e02"));
+        let group = PlanGroup {
+            digest: "5b1c9e02".into(),
+            hosts: vec!["pi-1".into()],
+            changes: 3,
+            removals: 2,
+            destructive: true,
+            plan: Some(sample()),
+        };
+        assert_eq!(
+            host_tally(&h, std::slice::from_ref(&group)),
+            Some(plan_tally(&sample()))
+        );
+        h.plan_changes = Some(4);
+        h.plan_removals = Some(1);
+        let t = host_tally(&h, &[]).unwrap();
+        assert_eq!((t.modify, t.remove), (3, 1));
+        assert_eq!(host_tally(&host_entry(None), &[group]), None);
+    }
+
+    fn host_entry(digest: Option<&str>) -> RolloutHost {
+        RolloutHost {
+            host: "pi-1".into(),
+            phase: "canary".into(),
+            wave: None,
+            state: HostRolloutState::Planned,
+            plan_digest: digest.map(Into::into),
+            plan_changes: None,
+            plan_removals: None,
+            failed_module: None,
+            failed_checks: vec![],
+            waived_checks: vec![],
+            error: None,
+            updated_at: Utc::now(),
+            bake_until: None,
+            needs_approval: false,
+            needs_attention: false,
+            error_detail: None,
+            run_id: None,
         }
     }
 

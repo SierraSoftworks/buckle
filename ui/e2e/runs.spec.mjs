@@ -145,9 +145,12 @@ describe("a host's latest run", () => {
 
   test("shows each module's health over the run, worst per slice, with the checks on hover", async () => {
     const { page, close } = await open("/hosts/pi-1");
-    const nomad = page.locator('#run-report .run-health__module[data-module="nomad"]');
+    // The bar sits in the module's heading, beside its changes and time.
+    const head = page.locator('#run-report .run-module[data-module="nomad"] .run-module__head');
+    const nomad = head.locator(".hbar");
     await nomad.waitFor();
     assert.equal(await nomad.getAttribute("data-state"), "pass", "it reads healthy now");
+    await head.getByTestId("tally").waitFor();
     // The api blipped once during bake: one slice shows it, the rest pass.
     const failing = nomad.locator('.hbar__bucket[data-state="fail"]');
     assert.equal(await failing.count(), 1);
@@ -158,6 +161,7 @@ describe("a host's latest run", () => {
     await pop.waitFor({ state: "visible" });
     assert.equal(await pop.locator('.hbar__check[data-check="api"]').getAttribute("data-state"), "fail");
     assert.match(await pop.textContent(), /answered 500/);
+    assert.match(await pop.locator(".hbar__when").textContent(), /^T\+/, "from the run's start");
     assert.equal(await pop.locator('.hbar__check[data-check="unit"]').getAttribute("data-state"), "pass");
     await close();
   });

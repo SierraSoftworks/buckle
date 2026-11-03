@@ -1,6 +1,8 @@
 //! A host's run, as the plan it follows (design §04, §12): a summary strip
 //! (state, counts, timing, revision, plan, trace), then every module in plan
-//! order with its steps and handlers, and the removals. Problems open by
+//! order with its steps and handlers, and the removals. Each module's
+//! heading carries what it changes, its health through the run and how long
+//! it took. Problems open by
 //! default, so a failed run reads from the top down to what went wrong; the
 //! rest is a click away, or all of it with "expand all". The same view shows
 //! a run in progress, so a live update only changes states.
@@ -9,6 +11,7 @@ use buckle_api::{ModuleReport, RemovalReport, RunReport, StepReport, StepState};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
+use super::changes::{Changes, Took};
 use super::diff::secret_text;
 use super::error_block::ErrorBlock;
 use super::icons;
@@ -16,12 +19,15 @@ use super::link::RouteLink;
 use super::ui::{Pill, TraceLink};
 use crate::app::Route;
 use crate::hooks::use_now;
-use crate::logic::format::{commit, count, millis, relative, rollout_label, short, timestamp};
+use crate::logic::fleet_plan::Tally;
+use crate::logic::format::{
+    commit, count, millis, relative, rollout_label, short, since, timestamp,
+};
 use crate::logic::health::{Bucket, CheckState, current_state, timeline};
 use crate::logic::run::{
     current_step, elapsed_ms, error_tone, expanded_by_default, module_has_problem, module_label,
-    module_slug, module_tone, resource_module, run_finished, run_label, run_tone, step_glyph,
-    step_key, step_label, step_progress, step_slug, step_tone,
+    module_slug, module_tally, module_tone, resource_module, run_finished, run_label, run_tally,
+    run_tone, step_glyph, step_key, step_label, step_progress, step_slug, step_tone,
 };
 use crate::logic::tone::{Tone, check_status_tone};
 
@@ -106,13 +112,16 @@ pub fn run_report(props: &RunReportProps) -> Html {
                                 overrides.set(next);
                             })
                         };
-                        module_row(&r.id, m, open, toggle, now, live)
+                        module_row(r, m, open, toggle, now, live)
                     }) }
                 </ol>
             }
             if !removals.is_empty() {
                 <section class="run-removals" aria-label="Removals">
-                    <h4 class="run__section-title">{ "Removals" }<span class="muted">{ " · resources the revision no longer declares" }</span></h4>
+                    <h4 class="run__section-title">
+                        { "Removals" }<span class="muted">{ " · resources the revision no longer declares" }</span>
+                        <Changes tally={Tally { remove: r.removals.len(), ..Tally::default() }} />
+                    </h4>
                     <ol class="run-steps run-steps--removals">{ for removals.iter().map(|x| removal_row(x, now, live)) }</ol>
                 </section>
             }
@@ -123,7 +132,6 @@ pub fn run_report(props: &RunReportProps) -> Html {
         <div class="run" data-run={r.id.clone()} data-state={run_label(r.state).replace(' ', "-")}>
             { summary(r, now, props.in_rollout) }
             <ErrorBlock error={r.error.clone()} context={AttrValue::from("The run")} />
-            { health_section(r, now) }
             if !r.modules.is_empty() {
                 <div class="run__toolbar">
                     <div class="chips" role="group" aria-label="Filter modules">
@@ -169,6 +177,7 @@ fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
     }
     let live = !run_finished(r.state);
     let took = elapsed_ms(None, r.started_at, r.finished_at, now, live).map(millis);
+    let tally = run_tally(r);
     let (done, total) = step_progress(r);
     let modules_done = r
         .modules
@@ -198,9 +207,8 @@ fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
                     Some(at) => html! { <span title={timestamp(at)}>{ format!("started {}", relative(at, now)) }</span> },
                     None => html! { <span>{ "not started" }</span> },
                 } }
-                if let Some(took) = took {
-                    <span>{ if live { format!("running for {took}") } else { format!("took {took}") } }</span>
-                }
+                <Changes {tally} />
+                if let Some(took) = took { <Took label={took} running={live} /> }
             </span>
             <span class="run__meta">
                 <span class="mono" title={r.revision.clone()}>{ format!("revision {}", commit(&r.revision)) }</span>
@@ -224,7 +232,7 @@ fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
 }
 
 fn module_row(
-    run: &str,
+    r: &RunReport,
     m: &ModuleReport,
     open: bool,
     toggle: Callback<MouseEvent>,
@@ -234,7 +242,7 @@ fn module_row(
     let slug = module_slug(m.state);
     let body_id = format!(
         "run-{}-{}",
-        run.replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+        r.id.replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
         m.name.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
     );
     let running = m.state == buckle_api::ModuleState::Running;
@@ -263,20 +271,29 @@ fn module_row(
         buckle_api::ModuleState::Skipped => "Not selected once its facts arrived.",
         _ => "No steps.",
     };
+    // The whole heading toggles the module; the button inside it is what
+    // the keyboard and assistive technology reach.
     html! {
         <li class={classes!("run-module", format!("run-module--{slug}"), open.then_some("is-open"))}
             data-module={m.name.clone()} data-state={slug}>
-            <button type="button" class="run-module__row" aria-expanded={open.to_string()}
-                aria-controls={body_id.clone()} onclick={toggle}>
-                <span class="run-module__chevron" aria-hidden="true">{ icons::chevron() }</span>
-                <Pill tone={module_tone(m.state)} label={module_label(m.state)} />
-                <span class="run-module__title">
-                    <span class="run-module__name mono">{ m.name.clone() }</span>
-                    { aside }
+            <div class="run-module__head" onclick={toggle}>
+                <button type="button" class="run-module__row" aria-expanded={open.to_string()}
+                    aria-controls={body_id.clone()}>
+                    <span class="run-module__chevron" aria-hidden="true">{ icons::chevron() }</span>
+                    <Pill tone={module_tone(m.state)} label={module_label(m.state)} />
+                    <span class="run-module__title">
+                        <span class="run-module__name mono">{ m.name.clone() }</span>
+                        { aside }
+                    </span>
+                </button>
+                <span class="run-module__aside">
+                    <Changes tally={module_tally(m)} />
+                    { health_bar(m, r.started_at) }
+                    <span class="run-module__duration">
+                        if let Some(took) = took { <Took label={took} running={running && live} /> }
+                    </span>
                 </span>
-                <span class="run-module__changes">{ count(m.changes as usize, "change", "changes") }</span>
-                <span class="run-module__duration">{ took.unwrap_or_default() }</span>
-            </button>
+            </div>
             if open {
                 <div class="run-module__body" id={body_id}>
                     if let (Some(note), Some(_)) = (&m.note, current) { <p class="run-module__note">{ note.clone() }</p> }
@@ -360,57 +377,40 @@ fn removal_row(x: &RemovalReport, now: DateTime<Utc>, live: bool) -> Html {
 }
 
 /// How many slices a module's health bar has.
-const HEALTH_BUCKETS: usize = 30;
+const HEALTH_BUCKETS: usize = 20;
 
-/// Each module's health through the run (bake, pre-phase and drift
-/// readings): its current state and a bar of equal time slices, each as bad
-/// as its worst check, with the checks' readings on hover or focus.
-fn health_section(r: &RunReport, now: DateTime<Utc>) -> Html {
-    let modules: Vec<&ModuleReport> = r.modules.iter().filter(|m| !m.health.is_empty()).collect();
-    if modules.is_empty() {
-        return html! {};
-    }
+/// A module's health through the run (bake, pre-phase and drift readings),
+/// in its heading: equal time slices, each as bad as its worst check, with
+/// the checks' readings on hover or focus. An empty slot keeps the bars of
+/// a run's modules in line when one has no readings.
+fn health_bar(m: &ModuleReport, started: Option<DateTime<Utc>>) -> Html {
+    let buckets = timeline(&m.health, started, HEALTH_BUCKETS);
+    let Some(t0) = buckets.first().map(|b| b.from) else {
+        return html! { <span class="hbar hbar--inline hbar--none" aria-hidden="true" /> };
+    };
+    let current = current_state(&m.health);
+    // A click on a slice is for its popover, not the module's toggle.
+    let keep = Callback::from(|e: MouseEvent| e.stop_propagation());
     html! {
-        <section class="run-health" aria-label="Health by module">
-            <h4 class="run__section-title">{ "Health" }<span class="muted">{ " · worst reading per slice of the run, hover for each check" }</span></h4>
-            <ul class="run-health__modules">
-                { for modules.into_iter().map(|m| {
-                    let current = current_state(&m.health);
-                    let buckets = timeline(&m.health, r.started_at, HEALTH_BUCKETS);
-                    let (from, until) = (buckets.first().map(|b| b.from), buckets.last().map(|b| b.until));
-                    html! {
-                        <li class="run-health__module" data-module={m.name.clone()}
-                            data-state={current.map(CheckState::slug)}>
-                            <span class="run-health__name mono">{ m.name.clone() }</span>
-                            if let Some(c) = current { <Pill tone={c.tone()} label={c.label()} /> }
-                            <div class="hbar" role="list" aria-label={format!("Health of {} over time", m.name)}>
-                                { for buckets.iter().map(health_bucket) }
-                            </div>
-                            <span class="run-health__span muted small">
-                                if let (Some(from), Some(until)) = (from, until) {
-                                    <span title={timestamp(from)}>{ relative(from, now) }</span>
-                                    { " → " }
-                                    <span title={timestamp(until)}>{ relative(until, now) }</span>
-                                }
-                            </span>
-                        </li>
-                    }
-                }) }
-            </ul>
-        </section>
+        <div class="hbar hbar--inline" role="list" onclick={keep}
+            data-state={current.map(CheckState::slug)}
+            aria-label={format!("Health of {} over the run{}", m.name, current.map(|c| format!(": {} now", c.label())).unwrap_or_default())}
+            title={current.map(|c| format!("health: {} now", c.label()))}>
+            { for buckets.iter().map(|b| health_bucket(b, t0)) }
+        </div>
     }
 }
 
-fn health_bucket(b: &Bucket<'_>) -> Html {
+fn health_bucket(b: &Bucket<'_>, t0: DateTime<Utc>) -> Html {
     let Some(state) = b.state else {
         return html! { <span class="hbar__bucket hbar__bucket--empty" role="listitem" aria-label="no readings yet" /> };
     };
-    let span = format!("{} to {}", timestamp(b.from), timestamp(b.until));
+    let span = format!("{} to {}", since(b.from, t0), since(b.until, t0));
     html! {
         <span class={classes!("hbar__bucket", state.tone().class())} role="listitem" tabindex="0"
             data-state={state.slug()} aria-label={format!("{}: {span}", state.label())}>
             <span class="hbar__pop" role="tooltip">
-                <span class="hbar__when small muted">{ span }</span>
+                <span class="hbar__when small muted" title={format!("{} to {}", timestamp(b.from), timestamp(b.until))}>{ span }</span>
                 <ul class="hbar__checks">
                     { for b.checks.iter().map(|c| html! {
                         <li class="hbar__check" data-check={c.reading.check.clone()} data-state={c.state.slug()}>
@@ -420,7 +420,7 @@ fn health_bucket(b: &Bucket<'_>) -> Html {
                             if !c.reading.required { <span class="muted small">{ "informational" }</span> }
                             if let Some(reason) = &c.reading.reason { <span class="hbar__reason">{ reason.clone() }</span> }
                             if c.carried {
-                                <span class="muted small">{ format!("last read {}", timestamp(c.reading.at)) }</span>
+                                <span class="muted small" title={timestamp(c.reading.at)}>{ format!("last read {}", since(c.reading.at, t0)) }</span>
                             }
                         </li>
                     }) }

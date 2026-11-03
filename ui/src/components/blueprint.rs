@@ -88,19 +88,20 @@ fn module_row(m: &Module, open: bool, toggle: Callback<MouseEvent>, now: DateTim
     html! {
         <li class={classes!("run-module", format!("run-module--{}", state.slug()), open.then_some("is-open"))}
             data-module={m.name.clone()} data-state={state.slug()}>
-            <button type="button" class="run-module__row" aria-expanded={open.to_string()}
-                aria-controls={body_id.clone()} onclick={toggle}>
-                <span class="run-module__chevron" aria-hidden="true">{ icons::chevron() }</span>
-                <Pill tone={state.tone()} label={state.label()} />
-                <span class="run-module__title">
-                    <span class="run-module__name mono">{ m.name.clone() }</span>
-                    <span class="run-module__note">{ count(m.resources.len(), "resource", "resources") }</span>
-                </span>
-                <span class="run-module__changes" title="Resources deleted from the host if the revision drops them">
+            <div class="run-module__head" onclick={toggle}>
+                <button type="button" class="run-module__row" aria-expanded={open.to_string()}
+                    aria-controls={body_id.clone()}>
+                    <span class="run-module__chevron" aria-hidden="true">{ icons::chevron() }</span>
+                    <Pill tone={state.tone()} label={state.label()} />
+                    <span class="run-module__title">
+                        <span class="run-module__name mono">{ m.name.clone() }</span>
+                        <span class="run-module__note">{ count(m.resources.len(), "resource", "resources") }</span>
+                    </span>
+                </button>
+                <span class="run-module__cleanup muted small" title="Resources deleted from the host if the revision drops them">
                     { format!("{cleanup} tagged for cleanup") }
                 </span>
-                <span class="run-module__duration" />
-            </button>
+            </div>
             if open {
                 <div class="run-module__body" id={body_id}>
                     <ol class="run-steps" aria-label={format!("Resources of {}", m.name)}>

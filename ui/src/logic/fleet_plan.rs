@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use buckle_api::{DiffKind, FleetModule, FleetStep, StepOutcome, StepView};
+use buckle_api::{DiffKind, FleetModule, FleetPlan, FleetStep, StepOutcome, StepView};
 
 use super::format::count;
 
@@ -97,6 +97,18 @@ pub fn summarise(m: &FleetModule) -> ModuleSummary {
         changed: changed.into_iter().cloned().collect(),
         handlers: m.handlers.len(),
     }
+}
+
+/// What a rollout changes across its fleet: each module's tally and the
+/// removals that run, each resource counted once however many hosts it is on.
+pub fn fleet_tally(f: &FleetPlan) -> Tally {
+    f.modules.iter().map(|m| summarise(m).tally).fold(
+        Tally {
+            remove: f.removals.iter().filter(|r| r.value.cleanup).count(),
+            ..Tally::default()
+        },
+        Tally::sum,
+    )
 }
 
 /// How many of the `total` hosts under review a block changes:

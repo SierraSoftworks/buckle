@@ -16,6 +16,10 @@ describe("every page renders in demo mode", () => {
     // The latest rollout with its controls, the fleet on its stages (hosts
     // outside it last), the attention list, recent revisions.
     await page.getByTestId("rollout-controls").getByRole("button", { name: "Pause" }).waitFor();
+    // What each module of the latest rollout changes, in the shared pill.
+    const nomad = page.locator('.overview__rollout .module-changes__item[data-module="nomad"]');
+    await nomad.waitFor();
+    assert.match(await nomad.getByTestId("tally").textContent(), /~\d+/);
     await page.locator('.overview__fleet .stage[data-stage="not in this rollout"] a.block').first().waitFor();
     const drawn = await page.locator(".overview__fleet a.block").count();
     const total = Number(await page.locator(".tile--plain .tile__value").textContent());

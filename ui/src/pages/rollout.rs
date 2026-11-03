@@ -1,35 +1,38 @@
 //! Rollout detail (design §10–§12): the pipeline, the approval pane with
-//! deduplicated plans and their diffs, each host's apply timeline, health
-//! during bake and run report (live while it applies, with the module and
-//! step in progress on its block), and the operator decisions, offered to
-//! admins only.
+//! deduplicated plans and their diffs, each host's lifecycle ticker and run
+//! report (live while it applies, with the module and step in progress on
+//! its block), and the operator decisions, offered to admins only. Every
+//! timeline counts from the rollout's start (`T+2m`).
 
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    ApproveRequest, ContinueRequest, FleetPlan, HealthResultDto, HostRolloutState, LiveEvent,
-    PlanGroup, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
-    RolloutSummary,
+    ApproveRequest, ContinueRequest, FleetPlan, HostRolloutState, LiveEvent, PlanGroup,
+    RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState, RolloutSummary,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
+use crate::components::icons;
 use crate::components::ui::Copyable;
 use crate::components::{
-    Button, Confirm, Countdown, Empty, ErrorBlock, ErrorState, HoverTip, Kind, Loading, PageHead,
-    Panel, Pill, Pipeline, PlanViews, Refresh, RouteLink, RunReportView, TraceLink, use_toast,
+    Button, Changes, Confirm, Countdown, Empty, ErrorBlock, ErrorState, HoverTip, Kind, Loading,
+    PageHead, Panel, Pill, Pipeline, PlanViews, Refresh, RouteLink, RunReportView, TraceLink,
+    use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
-use crate::logic::format::{count, first_line, relative, rollout_label, short, timestamp};
+use crate::logic::fleet_plan::fleet_tally;
+use crate::logic::format::{count, first_line, relative, rollout_label, short, since, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{self, GateKind, GateState, host_checks, layout};
-use crate::logic::plan::{ApprovalScope, approval_scope};
+use crate::logic::plan::{ApprovalScope, approval_scope, host_tally};
 use crate::logic::run::RolloutActivity;
+use crate::logic::ticker::{Source, Ticker, ticker};
 use crate::logic::tone::{
-    Tone, check_status_tone, host_error_headline, host_error_tone, host_state_label,
-    host_state_tone, rollout_finished, rollout_state_label, rollout_state_tone,
+    Tone, host_error_headline, host_error_tone, host_state_label, host_state_tone,
+    rollout_finished, rollout_state_label, rollout_state_tone,
 };
 use crate::store::use_live;
 use yew_router::prelude::use_navigator;
@@ -206,6 +209,7 @@ pub fn rollout_page(props: &Props) -> Html {
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
             <span class="mono" title={s.revision.clone()}>{ short(&s.revision) }</span>
             <span>{ format!("“{}”", first_line(&s.revision_message)) }</span>
+            if let Some(f) = &d.fleet { <Changes tally={fleet_tally(f)} /> }
             <span class="muted">{ format!("{} · started {}", s.triggered_by, relative(s.started_at, now)) }</span>
             if let Some(f) = s.finished_at { <span class="muted">{ format!("finished {}", relative(f, now)) }</span> }
             <TraceLink id={s.trace_id.clone()} url={s.trace_url.clone()} />
@@ -255,11 +259,11 @@ pub fn rollout_page(props: &Props) -> Html {
                 <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
             </Panel>
             { approval }
-            <Panel title="Hosts" subtitle="Each host's apply timeline, health during bake and run report">
-                <HostTable detail={d.clone()} admin={admin && !finished} on_ask={open.clone()} {activity} {now} />
+            <Panel title="Hosts" subtitle="Click a host for its way through the rollout and its run report">
+                <HostTable detail={d.clone()} plans={plan_groups.clone()} admin={admin && !finished} on_ask={open.clone()} {activity} {now} />
             </Panel>
             <Panel title="Timeline" subtitle="Rollout and phase transitions">
-                { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), now) }
+                { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), s.started_at) }
             </Panel>
             { dialog }
         </div>
@@ -739,7 +743,8 @@ fn updated(d: &RolloutDetail) -> usize {
         .count()
 }
 
-fn timeline(events: Vec<&RolloutEvent>, now: DateTime<Utc>) -> Html {
+/// The rollout's own events, newest first, each at its time from the start.
+fn timeline(events: Vec<&RolloutEvent>, t0: DateTime<Utc>) -> Html {
     if events.is_empty() {
         return html! { <p class="muted">{ "No events yet." }</p> };
     }
@@ -747,7 +752,7 @@ fn timeline(events: Vec<&RolloutEvent>, now: DateTime<Utc>) -> Html {
         <ol class="timeline">
             { for events.into_iter().rev().map(|e| html! {
                 <li class={classes!("timeline__item", tone_of_event(&e.kind).class())}>
-                    <time class="timeline__at" datetime={e.at.to_rfc3339()} title={timestamp(e.at)}>{ relative(e.at, now) }</time>
+                    <time class="timeline__at mono" datetime={e.at.to_rfc3339()} title={timestamp(e.at)}>{ since(e.at, t0) }</time>
                     <span class="timeline__kind mono">{ e.kind.clone() }</span>
                     <span class="timeline__message">{ e.message.clone() }</span>
                     if let Some(a) = &e.actor { <span class="timeline__actor muted">{ a.clone() }</span> }
@@ -780,6 +785,69 @@ fn tone_of_event(kind: &str) -> Tone {
     }
 }
 
+/// A host's lifecycle ticker: its states as segments of a bar, a dashed
+/// remainder for a bake still under way, and its events as markers above
+/// the bar, each with the whole event in a popover.
+fn ticker_view(t: &Ticker<'_>, t0: DateTime<Utc>, now: DateTime<Utc>) -> Html {
+    let segments = t.segments.iter().map(|seg| {
+        let (left, right) = (t.pct(seg.from), t.pct(seg.until));
+        let label = host_state_label(seg.state);
+        let span = format!("{label}: {} to {}", since(seg.from, t0), if seg.ongoing { "now".to_string() } else { since(seg.until, t0) });
+        html! {
+            <span class={classes!("ticker__seg", host_state_tone(seg.state).class(), seg.ongoing.then_some("ticker__seg--ongoing"))}
+                style={format!("left: {left:.2}%; width: {:.2}%", (right - left).max(0.4))}
+                data-state={label.replace(' ', "-")} title={span}>
+                <span class="ticker__label">{ label }</span>
+            </span>
+        }
+    });
+    let planned = t.bake_until.map(|until| {
+        let (left, right) = (t.pct(now), t.pct(until));
+        html! {
+            <span class="ticker__seg ticker__seg--planned tone-active"
+                style={format!("left: {left:.2}%; width: {:.2}%", right - left)}
+                title={format!("bake ends at {}", since(until, t0))} />
+        }
+    });
+    let markers = t.markers.iter().map(|m| {
+        let e = m.event;
+        let at = t.pct(e.at);
+        // The popover opens away from the nearer edge, so it stays in view.
+        let side = if at < 35.0 { "start" } else if at > 65.0 { "end" } else { "middle" };
+        html! {
+            <span class={classes!("ticker__marker", format!("ticker__marker--{side}"), m.transition.is_some().then_some("ticker__marker--transition"), tone_of_event(&e.kind).class())}
+                style={format!("left: {at:.2}%; --lane: {}", m.lane)} tabindex="0" role="listitem"
+                data-kind={e.kind.clone()} aria-label={format!("{} at {}: {}", e.kind, since(e.at, t0), e.message)}>
+                <span class="ticker__pop" role="tooltip">
+                    <span class="ticker__pop-head">
+                        <span class="mono ticker__kind">{ e.kind.clone() }</span>
+                        <time class="mono muted" datetime={e.at.to_rfc3339()}>{ since(e.at, t0) }</time>
+                    </span>
+                    <span class="ticker__message">{ e.message.clone() }</span>
+                    <span class="muted small">
+                        { timestamp(e.at) }
+                        if let Some(p) = &e.phase { { format!(" · phase {p}") } }
+                        if let Some(a) = &e.actor { { format!(" · {a}") } }
+                    </span>
+                </span>
+            </span>
+        }
+    });
+    html! {
+        <div class="ticker" data-testid="host-ticker" style={format!("--lanes: {}", t.lanes().max(1))}>
+            <div class="ticker__markers" role="list" aria-label="Events">{ for markers }</div>
+            <div class="ticker__bar" aria-hidden="true">
+                { for segments }
+                { planned.unwrap_or_default() }
+            </div>
+            <div class="ticker__axis muted small">
+                <time class="mono" datetime={t.from.to_rfc3339()} title={timestamp(t.from)}>{ since(t.from, t0) }</time>
+                <time class="mono" datetime={t.until.to_rfc3339()} title={timestamp(t.until)}>{ since(t.until, t0) }</time>
+            </div>
+        </div>
+    }
+}
+
 /// A host's state pill's popover: how it stands on each check of its
 /// phase's health gate, and the headline of its error.
 fn health_tip(phase: &RolloutPhase, h: &RolloutHost) -> Html {
@@ -807,6 +875,8 @@ fn health_tip(phase: &RolloutPhase, h: &RolloutHost) -> Html {
 #[derive(Properties, PartialEq)]
 struct HostTableProps {
     detail: RolloutDetail,
+    /// The rollout's distinct plans, for what each host's changes.
+    plans: Vec<PlanGroup>,
     admin: bool,
     on_ask: Callback<Ask>,
     /// The module and step each applying host is on.
@@ -841,8 +911,23 @@ fn host_table(props: &HostTableProps) -> Html {
                             let (expanded, name) = (expanded.clone(), h.host.clone());
                             Callback::from(move |_: MouseEvent| expanded.set(if open { None } else { Some(name.clone()) }))
                         };
+                        // A click anywhere on the row opens it, except on
+                        // what is a control of its own (the host's link, a
+                        // popover's trigger, the toggle itself).
+                        let on_row = {
+                            let toggle = toggle.clone();
+                            Callback::from(move |e: MouseEvent| {
+                                let own = e
+                                    .target_dyn_into::<web_sys::Element>()
+                                    .and_then(|t| t.closest("a, button, .tip, input, select, textarea").ok().flatten())
+                                    .is_some();
+                                if !own {
+                                    toggle.emit(e);
+                                }
+                            })
+                        };
                         html! { <>
-                            <tr key={h.host.clone()} class={classes!(open.then_some("is-open"))}>
+                            <tr key={h.host.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))} onclick={on_row}>
                                 <td><RouteLink to={Route::Host { id: h.host.clone() }} classes="mono strong">{ h.host.clone() }</RouteLink></td>
                                 <td>{ phase.name.clone() }{ h.wave.map(|w| html! { <span class="muted small">{ format!(" · wave {w}") }</span> }).unwrap_or_default() }</td>
                                 <td>
@@ -863,7 +948,7 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td>{ h.plan_digest.as_deref().map(|d| html! {
                                     <span class="mono" title={d.to_string()}>{ short(d) }</span>
                                 }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
-                                    { h.plan_changes.map(|c| html! { <span class="cell-sub">{ format!("{c} changes{}", h.plan_removals.filter(|r| *r > 0).map(|r| format!(" · {r} removals")).unwrap_or_default()) }</span> }).unwrap_or_default() }
+                                    { host_tally(h, &props.plans).map(|tally| html! { <span class="cell-sub"><Changes {tally} /></span> }).unwrap_or_default() }
                                 </td>
                                 <td>
                                     { for h.failed_checks.iter().map(|c| html! { <span class="badge badge--danger mono">{ c.clone() }</span> }) }
@@ -871,9 +956,10 @@ fn host_table(props: &HostTableProps) -> Html {
                                 </td>
                                 <td title={timestamp(h.updated_at)}>{ relative(h.updated_at, props.now) }</td>
                                 <td>
-                                    <button type="button" class="btn btn--subtle btn--small" onclick={toggle}
-                                        aria-expanded={open.to_string()} aria-label={format!("Details for {}", h.host)}>
-                                        { if open { "Hide" } else { "Details" } }
+                                    <button type="button" class="icon-btn row-toggle" onclick={toggle}
+                                        aria-expanded={open.to_string()} aria-label={format!("Details for {}", h.host)}
+                                        title={if open { "Hide details" } else { "Show details" }}>
+                                        { icons::chevron() }
                                     </button>
                                 </td>
                             </tr>
@@ -906,10 +992,6 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
     let h = &props.host;
     let rollout_id = props.detail.summary.id.clone();
     let started = props.detail.summary.started_at;
-    let health = use_fetch(
-        h.host.clone(),
-        |id| async move { api::host_health(&id).await },
-    );
     let events: Vec<&RolloutEvent> = props
         .detail
         .events
@@ -954,50 +1036,24 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
             }
         </div>
     });
-    let bake: Vec<HealthResultDto> = health
-        .value()
-        .map(|list| {
-            list.iter()
-                .filter(|r| match &r.rollout_id {
-                    Some(id) => *id == rollout_id,
-                    None => r.scope != "drift" && r.at >= started,
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let lifecycle = ticker(Source {
+        events,
+        state: h.state,
+        run_started: run.report.as_ref().and_then(|r| r.started_at),
+        run_finished: run.report.as_ref().and_then(|r| r.finished_at),
+        bake_until: h.bake_until,
+        now: props.now,
+    });
     html! {
         <div class="host-row">
             <ErrorBlock error={h.error_detail.clone()} raw={h.error.clone().map(AttrValue::from)} tone={host_error_tone(h)} />
             { actions.unwrap_or_default() }
-            <div class="host-row__cols">
-                <div>
-                    <h4 class="subhead">{ "Apply timeline" }</h4>
-                    { timeline(events, props.now) }
-                </div>
-                <div>
-                    <h4 class="subhead">{ "Health in this rollout" }</h4>
-                    { match (&health.error, health.value()) {
-                        (Some(e), None) => html! { <ErrorState error={e.clone()} retry={health.reload.clone()} /> },
-                        (_, None) => html! { <Loading /> },
-                        (_, Some(_)) if bake.is_empty() => html! { <p class="muted">{ "No checks have run for this rollout yet." }</p> },
-                        (_, Some(_)) => html! {
-                            <ul class="checks">
-                                { for bake.iter().rev().map(|r| html! {
-                                    <li class="checks__item">
-                                        <Pill tone={check_status_tone(&r.status)} label={r.status.clone()} />
-                                        <span class="mono">{ format!("{}/{}", r.module, r.check) }</span>
-                                        <span class="badge">{ r.scope.clone() }</span>
-                                        if !r.required { <span class="muted small">{ "informational" }</span> }
-                                        if h.waived_checks.contains(&format!("{}/{}", r.module, r.check)) { <span class="badge">{ "waived" }</span> }
-                                        <span class="checks__reason">{ r.reason.clone().unwrap_or_default() }</span>
-                                        <span class="muted small" title={timestamp(r.at)}>{ relative(r.at, props.now) }</span>
-                                    </li>
-                                }) }
-                            </ul>
-                        },
-                    } }
-                </div>
+            <div class="host-row__ticker">
+                <h4 class="subhead">{ "Through this rollout" }</h4>
+                { match &lifecycle {
+                    Some(t) => ticker_view(t, started, props.now),
+                    None => html! { <p class="muted">{ "Nothing has happened to this host in this rollout yet." }</p> },
+                } }
             </div>
             <div class="host-row__run" data-testid="rollout-host-run">
                 <h4 class="subhead">{ "Run in this rollout" }</h4>

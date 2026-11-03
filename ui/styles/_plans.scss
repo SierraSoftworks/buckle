@@ -130,23 +130,70 @@
 }
 
 // `+2 ~1 -1`: a block's changes by kind, in the change colours.
-.tally {
+// What an aggregate changes, as one pill in parts: `+2 | ~1 | -0`.
+.change-pill {
   display: inline-flex;
-  gap: 0.45rem;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
   font-family: var(--font-mono);
-  font-size: 0.75rem;
+  font-size: 0.72rem;
+  line-height: 1.55;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 
-  &__part--create {
-    color: var(--ok);
+  &__part {
+    padding: 0 0.42rem;
+
+    & + & {
+      border-left: 1px solid var(--line);
+    }
+
+    &--create {
+      color: var(--ok);
+      background: var(--ok-soft);
+    }
+
+    &--modify {
+      color: var(--warn);
+      background: var(--warn-soft);
+    }
+
+    &--remove,
+    &--blocked {
+      color: var(--danger);
+      background: var(--danger-soft);
+    }
+
+    &--zero {
+      color: var(--fg-3);
+      background: transparent;
+    }
+  }
+}
+
+// How long something took, behind a stopwatch.
+.took {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--fg-2);
+  font-size: 0.72rem;
+  line-height: 1.55;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+
+  .icon {
+    width: 12px;
+    height: 12px;
   }
 
-  &__part--modify {
-    color: var(--warn);
-  }
-
-  &__part--remove,
-  &__part--blocked {
-    color: var(--danger);
+  &--running {
+    color: var(--active);
   }
 }
 

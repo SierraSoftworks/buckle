@@ -20,10 +20,6 @@
   background: var(--surface);
   border-bottom: 1px solid var(--line);
 
-  &__menu {
-    display: none;
-  }
-
   &__brand {
     display: inline-flex;
     align-items: center;
@@ -48,6 +44,15 @@
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   align-items: start;
+
+  // A wide screen's sidebar, hidden from the menu button.
+  &--collapsed {
+    grid-template-columns: minmax(0, 1fr);
+
+    .sidebar {
+      display: none;
+    }
+  }
 }
 
 .sidebar {
@@ -143,15 +148,14 @@
 }
 
 @media (max-width: $narrow) {
-  .app-bar__menu {
-    display: inline-flex;
-  }
-
-  .app-body {
+  .app-body,
+  .app-body--collapsed {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .sidebar {
+  .sidebar,
+  .app-body--collapsed .sidebar {
+    display: block;
     position: fixed;
     left: 0;
     top: var(--bar-h);

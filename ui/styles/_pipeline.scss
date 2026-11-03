@@ -350,9 +350,11 @@
   }
 }
 
+// The block's own fill pulses, not its opacity: an opacity animation would
+// carry its popover (a child) along with it.
 @keyframes bake {
   50% {
-    opacity: 0.55;
+    background-color: color-mix(in srgb, var(--active) 55%, transparent);
   }
 }
 

@@ -229,13 +229,29 @@
     border-left-color: var(--active);
   }
 
-  &__row {
-    display: grid;
-    grid-template-columns: 1rem 7.5rem minmax(0, 1fr) auto 4.5rem;
+  // The heading: the toggle (chevron, state, name), then right-aligned
+  // what it changes, its health bar and its time, in columns that line up
+  // from one module to the next.
+  &__head {
+    display: flex;
     align-items: center;
     gap: 0.6rem;
-    width: 100%;
-    padding: 0.45rem 0.7rem 0.45rem 0.5rem;
+    padding-right: 0.7rem;
+    cursor: pointer;
+
+    &:hover {
+      background: var(--surface-2);
+    }
+  }
+
+  &__row {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1rem 7.5rem minmax(0, 1fr);
+    align-items: center;
+    gap: 0.6rem;
+    min-width: 0;
+    padding: 0.45rem 0 0.45rem 0.5rem;
     border: none;
     background: none;
     color: var(--fg);
@@ -243,13 +259,17 @@
     text-align: left;
     cursor: pointer;
 
-    &:hover {
-      background: var(--surface-2);
-    }
-
     .pill {
       justify-self: start;
     }
+  }
+
+  &__aside {
+    display: grid;
+    grid-template-columns: auto 7rem 5.5rem;
+    align-items: center;
+    justify-items: end;
+    gap: 0.6rem;
   }
 
   &__chevron {
@@ -298,16 +318,9 @@
     font-size: 0.8rem;
   }
 
-  &__changes,
   &__duration {
-    color: var(--fg-2);
-    font-size: 0.8rem;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-
-  &__duration {
-    text-align: right;
+    display: inline-flex;
+    justify-content: flex-end;
   }
 
   &__body {
@@ -458,43 +471,6 @@
 
 // Each module's health through the run: a bar of time slices, each as bad
 // as its worst check, with the checks' readings in a popover.
-.run-health {
-  margin: 0.5rem 0;
-
-  &__modules {
-    list-style: none;
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    background: var(--bg);
-  }
-
-  &__module {
-    display: grid;
-    grid-template-columns: minmax(6rem, 12rem) auto minmax(8rem, 1fr) auto;
-    align-items: center;
-    gap: 0.25rem 0.75rem;
-    padding: 0.4rem 0.6rem;
-    border-bottom: 1px solid var(--line);
-    font-size: 0.84rem;
-
-    &:last-child {
-      border-bottom: none;
-    }
-
-    @media (max-width: 640px) {
-      grid-template-columns: 1fr auto;
-
-      .hbar {
-        grid-column: 1 / -1;
-      }
-    }
-  }
-
-  &__name {
-    overflow-wrap: anywhere;
-  }
-}
-
 .hbar {
   display: flex;
   gap: 1px;
@@ -533,6 +509,24 @@
       left: auto;
       transform: none;
     }
+  }
+
+  // Small, in a module's heading at the right of the page: every popover
+  // opens leftwards from its slice.
+  &--inline {
+    width: 7rem;
+    height: 0.65rem;
+
+    .hbar__bucket > .hbar__pop {
+      right: 0;
+      left: auto;
+      transform: none;
+      cursor: default;
+    }
+  }
+
+  &--none {
+    visibility: hidden;
   }
 
   &__pop {
@@ -619,11 +613,22 @@
 }
 
 @media (max-width: $small) {
-  // The name takes the line; the count and time follow it, together.
+  // The name takes the line; the changes, health and time follow it.
+  .run-module__head {
+    flex-wrap: wrap;
+    gap: 0 0.6rem;
+    padding-bottom: 0.35rem;
+  }
+
   .run-module__row {
+    flex: 1 1 100%;
     display: flex;
     flex-wrap: wrap;
     gap: 0.3rem 0.6rem;
+  }
+
+  .run-module__aside {
+    margin-left: 1.6rem;
   }
 
   .run-module__title {

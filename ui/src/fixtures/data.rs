@@ -699,7 +699,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             29,
-            "host.apply_started",
+            "rollout.host.applying",
             "Applying plan 5b1c9e02 (4 changes).",
             Some("pi-1"),
             Some("canary"),
@@ -717,7 +717,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             28,
-            "host.bake_started",
+            "rollout.host.baking",
             "Baking for 15m.",
             Some("pi-1"),
             Some("canary"),
@@ -726,7 +726,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             14,
-            "host.healthy",
+            "rollout.host.healthy",
             "Bake window passed without a required check failing.",
             Some("pi-1"),
             Some("canary"),
@@ -744,7 +744,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             12,
-            "host.apply_started",
+            "rollout.host.applying",
             "Applying plan 5b1c9e02 (4 changes).",
             Some("pi-2"),
             Some("home"),
@@ -753,7 +753,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             12,
-            "host.apply_started",
+            "rollout.host.applying",
             "Applying plan 5b1c9e02 (4 changes).",
             Some("pi-5"),
             Some("home"),
@@ -762,7 +762,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             12,
-            "host.apply_started",
+            "rollout.host.applying",
             "Applying plan 5b1c9e02 (4 changes).",
             Some("pi-6"),
             Some("home"),
@@ -798,7 +798,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             9,
-            "host.skipped",
+            "rollout.host.skipped",
             "Skipped: board swap in progress.",
             Some("pi-7"),
             Some("home"),
@@ -816,7 +816,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             7,
-            "host.healthy",
+            "rollout.host.healthy",
             "Bake window passed without a required check failing.",
             Some("pi-2"),
             Some("home"),
@@ -834,7 +834,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             6,
-            "host.failed",
+            "rollout.host.failed",
             "nomad/api failed past settle; counts against max_failures (1 of 1).",
             Some("pi-5"),
             Some("home"),
@@ -843,7 +843,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             5,
-            "host.apply_started",
+            "rollout.host.applying",
             "Applying plan 5b1c9e02 (4 changes).",
             Some("pi-3"),
             Some("home"),
@@ -861,7 +861,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             3,
-            "host.held",
+            "rollout.host.held",
             "Baseline check backup/marker failing; held for an operator.",
             Some("nas-1"),
             Some("home"),
@@ -870,7 +870,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             2,
-            "host.bake_started",
+            "rollout.host.baking",
             "Baking for 5m.",
             Some("pi-3"),
             Some("home"),
@@ -879,7 +879,7 @@ fn timeline(now: DateTime<Utc>) -> Vec<RolloutEvent> {
         ev(
             now,
             1,
-            "host.apply_started",
+            "rollout.host.applying",
             "Applying plan 5b1c9e02 (4 changes).",
             Some("pi-4"),
             Some("home"),
