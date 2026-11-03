@@ -5,25 +5,55 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to a pull request supersedes the run in flight; main runs to
+# completion so that every merge is tested and refreshes the caches.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Line tables keep test backtraces useful while making target/ (and so every
+  # cache entry) far smaller and links faster than full debuginfo.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  lint:
-    name: Lint
+  # Decides which suites a change can affect. The Rust workspace never reads
+  # ui/ or docs/ (the server embeds a placeholder UI in tests), and the UI only
+  # depends on buckle-api and the workspace manifest.
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.rust.outputs.rust }}
+      ui: ${{ steps.ui.outputs.ui }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dorny/paths-filter@v3
+        id: rust
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+          predicate-quantifier: every
+          filters: |
+            rust:
+              - '**'
+              - '!ui/**'
+              - '!docs/**'
+              - '!**/*.md'
+      - uses: dorny/paths-filter@v3
+        id: ui
+        with:
+          filters: |
+            ui:
+              - 'ui/**'
+              - 'crates/buckle-api/**'
+              - 'Cargo.toml'
+              - '.github/workflows/test.yml'
 
   test:
     name: Test (${{ matrix.os }})
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,11 +62,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: ${{ matrix.os == 'ubuntu-latest' && 'rustfmt, clippy' || '' }}
+      # Only main saves caches: pull requests restore main's, so a PR (and
+      # every Dependabot bump) no longer adds a branch-scoped copy of each.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Lint shares the x64 Linux runner and cache: clippy and the tests reuse
+      # the same build scripts and proc-macros.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --no-fail-fast
 
   ui:
     name: UI
+    needs: [changes]
+    if: needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -48,6 +92,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm trunk
       # The UI is excluded from the workspace (it targets wasm32), so the
@@ -80,39 +125,51 @@ jobs:
           name: ui-dist
           path: ui/dist
 
+  # Runs alongside the test matrix rather than after it, and builds the binary
+  # once for both images.
   containers:
-    name: Apply example (${{ matrix.image }})
+    name: Apply example in containers
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    needs: [test]
-    strategy:
-      fail-fast: false
-      matrix:
-        image: ["debian:bookworm", "ubuntu:24.04"]
+    env:
+      # The release profile (optimised, panic = abort) without its fat LTO and
+      # single codegen unit, which only shrink the binary and take minutes.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       # The images carry an older glibc than the runner (bookworm has 2.36, the
       # runner 2.39), so a default release build would not start in them. The
       # static musl binary, which is also what the release matrix ships, does.
-      - run: cargo build --release -p buckle --target x86_64-unknown-linux-musl
-      - name: Plan the example inside ${{ matrix.image }}
+      - id: build
+        run: cargo build --release -p buckle --target x86_64-unknown-linux-musl
+      - name: Plan and apply the example inside debian:bookworm
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
-          docker run --rm -v "$PWD:/src:ro" ${{ matrix.image }} bash -c '
-            set -euo pipefail
-            if [ -x /src/scripts/container-test.sh ]; then /src/scripts/container-test.sh; else echo "container test script not present yet"; fi
-          '
-      - name: Apply tests/fixtures/container-fleet inside ${{ matrix.image }}
-        run: scripts/container-apply.sh "${{ matrix.image }}" target/x86_64-unknown-linux-musl/release/buckle
+          docker run --rm -v "$PWD:/src:ro" debian:bookworm /src/scripts/container-test.sh
+          scripts/container-apply.sh debian:bookworm target/x86_64-unknown-linux-musl/release/buckle
+      - name: Plan and apply the example inside ubuntu:24.04
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          docker run --rm -v "$PWD:/src:ro" ubuntu:24.04 /src/scripts/container-test.sh
+          scripts/container-apply.sh ubuntu:24.04 target/x86_64-unknown-linux-musl/release/buckle
 
-  # The required status check on main: one stable name that only goes green
-  # once every job above has passed.
+  # The required status check on main: one stable name that goes green once
+  # every job the change needs has passed (a skipped suite counts as passed).
   test-done:
     name: Tests Complete
-    needs: [lint, test, ui, containers]
+    needs: [changes, test, ui, containers]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
       - run: echo "Tests Complete for All Platforms"
