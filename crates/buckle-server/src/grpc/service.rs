@@ -45,6 +45,8 @@ pub struct FleetService {
     pub server_version: String,
     /// Live-session cancellation, enrolment throttling and the Hello timeout.
     pub guard: Arc<SessionGuard>,
+    /// Agent upgrades requested from the UI or API.
+    pub upgrades: Arc<crate::upgrades::AgentUpgrades>,
 }
 
 impl std::fmt::Debug for FleetService {
@@ -138,6 +140,32 @@ impl FleetService {
         }
     }
 
+    /// Audits how an agent settled an upgrade request.
+    async fn settled(&self, host: &str, settled: crate::upgrades::Settled) {
+        use crate::upgrades::Settled;
+        let (action, message) = match settled {
+            Settled::Upgraded { version } => {
+                tracing::info!(buckle.host = %host, %version, "the agent upgraded");
+                (
+                    "host.upgraded",
+                    format!("{host} upgraded its agent to {version}"),
+                )
+            }
+            Settled::UpToDate { version } => (
+                "host.upgraded",
+                format!("{host}'s agent already runs {version}"),
+            ),
+            Settled::Failed { version, error } => {
+                tracing::warn!(buckle.host = %host, %version, %error, "the agent upgrade failed");
+                (
+                    "host.upgrade_failed",
+                    format!("{host} could not upgrade its agent to {version}: {error}"),
+                )
+            }
+        };
+        self.audit(host, action, host, message).await;
+    }
+
     async fn audit(&self, actor: &str, action: &str, subject: &str, message: String) {
         let entry = NewAudit {
             at: self.now(),
@@ -162,7 +190,8 @@ impl FleetService {
     }
 
     async fn publish_host(&self, id: &str) {
-        if let Some(host) = crate::views::load_summary(&self.store, &self.revisions, id).await {
+        if let Some(mut host) = crate::views::load_summary(&self.store, &self.revisions, id).await {
+            host.upgrade = self.upgrades.get(id);
             self.events.publish(LiveEvent::HostChanged { host });
         }
     }
@@ -851,6 +880,14 @@ impl FleetService {
                 }
                 first
             }
+            agent_message::Msg::Upgrade(u) => {
+                let outcome =
+                    buckle_proto::v1::UpgradeOutcome::try_from(u.outcome).unwrap_or_default();
+                if let Some(settled) = self.upgrades.reported(host, &u.version, outcome, &u.error) {
+                    self.settled(host, settled).await;
+                }
+                Ok(true)
+            }
             agent_message::Msg::Hello(_) => Ok(true),
         };
         match &stored {
@@ -873,7 +910,8 @@ impl FleetService {
             agent_message::Msg::Drift(d) => !d.plan_digest.is_empty(),
             agent_message::Msg::Health(_)
             | agent_message::Msg::Result(_)
-            | agent_message::Msg::Rollback(_) => true,
+            | agent_message::Msg::Rollback(_)
+            | agent_message::Msg::Upgrade(_) => true,
             _ => false,
         };
         if matches!(
@@ -1121,6 +1159,10 @@ impl Fleet for FleetService {
         let (session_id, rx) = self.sessions.attach(&host);
         let closed = self.guard.sessions.register(&host, session_id);
         let welcome = self.welcome(&host, &authed, session_id).await;
+        // Queued behind the Welcome: a re-sent Upgrade reaches the new session.
+        if let Some(settled) = self.upgrades.connected(&host, &hello.agent_version) {
+            self.settled(&host, settled).await;
+        }
         tracing::info!(buckle.host = %host, session = session_id, status = %welcome.status, version = %hello.agent_version, "agent connected");
         self.controller.connected(Connected {
             host: host.clone(),

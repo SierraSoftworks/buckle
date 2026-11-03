@@ -10,7 +10,7 @@ use actix_web::{HttpMessage, HttpRequest, HttpResponse, web};
 use buckle_api::{
     ActionRequest, ApproveRequest, ContinueRequest, CsrfToken, Fleet, FleetCounts, HealthResultDto,
     HealthSummary, HostDetail, HostPatch, HostPreview, HostStatus, LiveEvent, Me, Page,
-    RejectRequest, ResourceSummary, RolloutState, RunSummary, StartRollout,
+    RejectRequest, ResourceSummary, RolloutState, RunSummary, StartRollout, UpgradeRequest,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -40,6 +40,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/hosts/{id}/runs", web::get().to(host_runs))
             .route("/hosts/{id}/runs/{run}", web::get().to(host_run))
             .route("/hosts/{id}/preview", web::post().to(host_preview))
+            .route("/hosts/{id}/upgrade", web::post().to(host_upgrade))
             .route("/hosts/{id}/{action}", web::post().to(host_action))
             .route("/revisions", web::get().to(revisions))
             .route("/revisions/{id}", web::get().to(revision))
@@ -428,7 +429,11 @@ async fn summaries(state: &AppState) -> Result<Vec<buckle_api::HostSummary>, Api
     let fleet = crate::views::reference_revision(&state.store, &state.revisions).await;
     Ok(rows
         .iter()
-        .map(|(h, f)| crate::views::host_summary(h, f, fleet.as_deref()))
+        .map(|(h, f)| {
+            let mut s = crate::views::host_summary(h, f, fleet.as_deref());
+            s.upgrade = state.upgrades.get(&h.id);
+            s
+        })
         .collect())
 }
 
@@ -465,6 +470,7 @@ async fn fleet(state: Data, _: Authenticated) -> ApiResult {
         active_rollout: active,
         counts,
         server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        desired_agent_version: Some(state.upgrades.desired().to_owned()),
     }))
 }
 
@@ -473,9 +479,11 @@ async fn hosts(state: Data, _: Authenticated) -> ApiResult {
 }
 
 async fn summary_or_404(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {
-    crate::views::load_summary(&state.store, &state.revisions, id)
+    let mut summary = crate::views::load_summary(&state.store, &state.revisions, id)
         .await
-        .ok_or_else(|| ApiError::not_found(format!("No host '{id}'.")))
+        .ok_or_else(|| ApiError::not_found(format!("No host '{id}'.")))?;
+    summary.upgrade = state.upgrades.get(id);
+    Ok(summary)
 }
 
 fn resources(row: Option<crate::store::RolloutHostRecord>) -> Vec<ResourceSummary> {
@@ -743,6 +751,7 @@ async fn host_forget(state: Data, admin: Administrative, path: web::Path<String>
     if !state.store.call(move |db| db.hosts().delete(&i2)).await? {
         return Err(ApiError::not_found(format!("No host '{id}'.")));
     }
+    state.upgrades.forget(&id);
     let actor = admin.0.actor();
     audit_action(
         &state,
@@ -796,6 +805,63 @@ async fn host_action(
     )
     .await;
     Ok(HttpResponse::Ok().json(host_changed(&state, &id).await?))
+}
+
+/// Asks the host's agent to install a release once idle and restart into it.
+async fn host_upgrade(
+    state: Data,
+    admin: Administrative,
+    path: web::Path<String>,
+    body: Option<web::Json<UpgradeRequest>>,
+) -> ApiResult {
+    use crate::upgrades::RequestError;
+    let id = path.into_inner();
+    let current = summary_or_404(&state, &id).await?;
+    let version = body.and_then(|b| b.into_inner().version);
+    let actor = admin.0.actor();
+    let upgrade = state
+        .upgrades
+        .request(
+            &id,
+            current.agent_version.as_deref(),
+            version.as_deref(),
+            &actor,
+            chrono::Utc::now(),
+        )
+        .map_err(|e| match e {
+            RequestError::InvalidVersion(v) => ApiError::bad_request(format!(
+                "'{v}' is not a release version; use MAJOR.MINOR.PATCH, such as 2.3.0."
+            )),
+            RequestError::Current(v) => {
+                ApiError::conflict(format!("{id}'s agent already runs {v}."))
+            }
+            RequestError::Offline => ApiError::conflict(format!(
+                "{id} is offline; its agent can be upgraded once it reconnects."
+            )),
+        })?;
+    tracing::info!(buckle.host = %id, version = %upgrade.version, "asked the agent to upgrade");
+    audit_action(
+        &state,
+        &actor,
+        "host.upgrade",
+        &id,
+        format!(
+            "{actor} asked {id} to upgrade its agent from {} to {}",
+            current
+                .agent_version
+                .as_deref()
+                .unwrap_or("an unknown version"),
+            upgrade.version
+        ),
+        None,
+    )
+    .await;
+    // Nothing about the host's record changed, so the controller is not told.
+    let summary = summary_or_404(&state, &id).await?;
+    state.events.publish(LiveEvent::HostChanged {
+        host: summary.clone(),
+    });
+    Ok(HttpResponse::Ok().json(summary))
 }
 
 async fn host_preview(

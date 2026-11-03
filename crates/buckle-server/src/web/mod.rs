@@ -45,6 +45,8 @@ pub struct AppState {
     pub server_version: String,
     /// Live agent sessions, so forgetting a host closes its stream.
     pub agent_sessions: Arc<crate::grpc::LiveSessions>,
+    /// Agent upgrades requested here, sent on the hosts' sessions.
+    pub upgrades: Arc<crate::upgrades::AgentUpgrades>,
     /// How often an event stream re-checks the session it was opened with.
     pub sse_recheck: std::time::Duration,
     /// `telemetry.trace_url_template`: turns a trace id into a link.
@@ -90,6 +92,7 @@ impl AppState {
             secure_cookies,
             server_version,
             agent_sessions: Default::default(),
+            upgrades: Default::default(),
             sse_recheck: std::time::Duration::from_secs(30),
             trace_url_template: None,
         }

@@ -10,10 +10,10 @@
 use std::cell::RefCell;
 
 use buckle_api::{
-    ApproveRequest, AuditEntry, Catalog, ContinueRequest, Fleet, HostDetail, HostPatch,
-    HostPreview, HostRolloutState, HostStatus, HostSummary, LiveEvent, Me, Page, PhaseState,
-    RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutState, RolloutSummary,
-    RunReport, RunSummary,
+    AgentUpgrade, ApproveRequest, AuditEntry, Catalog, Connection, ContinueRequest, Fleet,
+    HostDetail, HostPatch, HostPreview, HostRolloutState, HostStatus, HostSummary, LiveEvent, Me,
+    Page, PhaseState, RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutState,
+    RolloutSummary, RunReport, RunSummary, UpgradeState,
 };
 use chrono::Utc;
 
@@ -177,6 +177,7 @@ pub fn fleet() -> Result<Fleet, ApiError> {
                 .map(|r| r.id.clone()),
             active_rollout: active,
             server_version: Some(data::SERVER_VERSION.into()),
+            desired_agent_version: Some(data::SERVER_VERSION.into()),
         })
     })
 }
@@ -276,6 +277,51 @@ pub fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError> {
             &format!("host.{action}"),
             id,
             format!("{} {action}d {id}", actor()),
+        );
+        Ok(s.host_changed(id).expect("the host exists"))
+    })
+}
+
+pub fn upgrade_host(id: &str, version: Option<&str>) -> Result<HostSummary, ApiError> {
+    admin()?;
+    with(|s| {
+        let host = s
+            .hosts
+            .iter_mut()
+            .find(|h| h.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("No host '{id}'.")))?;
+        if host.connection == Connection::Offline {
+            return Err(ApiError::Conflict(format!(
+                "{id} is offline; its agent can be upgraded once it reconnects."
+            )));
+        }
+        let version = version
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(data::SERVER_VERSION)
+            .trim()
+            .trim_start_matches('v')
+            .to_owned();
+        if host.agent_version.as_deref() == Some(version.as_str()) {
+            return Err(ApiError::Conflict(format!(
+                "{id}'s agent already runs {version}."
+            )));
+        }
+        let from = host.agent_version.clone().unwrap_or_default();
+        host.upgrade = Some(AgentUpgrade {
+            version: version.clone(),
+            state: UpgradeState::Requested,
+            requested_at: Utc::now(),
+            requested_by: actor(),
+            error: None,
+        });
+        s.record(
+            &actor(),
+            "host.upgrade",
+            id,
+            format!(
+                "{} asked {id} to upgrade its agent from {from} to {version}",
+                actor()
+            ),
         );
         Ok(s.host_changed(id).expect("the host exists"))
     })

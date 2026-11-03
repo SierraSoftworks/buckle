@@ -401,6 +401,7 @@ mod tests {
             first_seen: Utc::now(),
             last_seen: None,
             notes: String::new(),
+            upgrade: None,
         }
     }
 

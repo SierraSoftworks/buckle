@@ -365,17 +365,22 @@ impl Runner for FakeRunner {
     }
 }
 
-/// An updater that records requests and reports success.
+/// An updater that records requests and reports success, or `fail`'s error.
 #[derive(Default)]
 pub struct FakeUpdater {
     /// The versions requested.
     pub requested: Mutex<Vec<Option<String>>>,
+    /// When set, every update fails with this message.
+    pub fail: Mutex<Option<String>>,
 }
 
 #[async_trait]
 impl Updater for FakeUpdater {
     async fn update(&self, version: Option<&str>) -> buckle_core::Result<UpdateOutcome> {
         lock(&self.requested).push(version.map(str::to_owned));
+        if let Some(message) = lock(&self.fail).clone() {
+            return Err(buckle_core::error::user(message, &["Try another release."]));
+        }
         Ok(UpdateOutcome::Updated {
             version: version.unwrap_or("latest").to_owned(),
         })

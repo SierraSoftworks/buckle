@@ -896,6 +896,30 @@ async fn upgrade_installs_the_version_and_exits_zero() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_failed_upgrade_is_reported_and_the_agent_keeps_running() {
+    let mut h = Harness::start(Setup::default()).await;
+    *h.updater.fail.lock().expect("lock") = Some("There is no Buckle release 9.9.9.".into());
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    session
+        .send(pb::server_message::Msg::Upgrade(pb::Upgrade {
+            version: "9.9.9".into(),
+            when_idle: true,
+        }))
+        .await;
+    let result = session
+        .expect(|m| match m {
+            pb::agent_message::Msg::Upgrade(u) => Some(u.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(result.version, "9.9.9");
+    assert_eq!(result.outcome, pb::UpgradeOutcome::Failed as i32);
+    assert!(result.error.contains("9.9.9"), "{}", result.error);
+    h.stop().await.expect("still running, so it stops cleanly");
+}
+
+#[tokio::test(start_paused = true)]
 async fn heartbeats_report_liveness() {
     let mut h = Harness::start(Setup::default()).await;
     let mut session = h.sessions.accept().await;

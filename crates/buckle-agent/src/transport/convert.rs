@@ -1,7 +1,9 @@
 //! Conversions between the transport-neutral agent types and the protobuf
 //! messages in [`buckle_proto::v1`].
 
-use super::{Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, Welcome, WireSecret};
+use super::{
+    Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, UpgradeReport, Welcome, WireSecret,
+};
 use buckle_core::health::{HealthReport, HealthResult, HealthStatus};
 use buckle_core::plan::RevisionId;
 use buckle_proto::v1 as pb;
@@ -461,6 +463,18 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             plan_json: plan.as_ref().map(json_bytes).unwrap_or_default(),
         }),
         Report::LocalRollback(record) => Msg::Rollback(local_rollback_to_proto(record)),
+        Report::Upgrade { version, outcome } => {
+            let (outcome, error) = match outcome {
+                UpgradeReport::Updated => (pb::UpgradeOutcome::Updated, String::new()),
+                UpgradeReport::UpToDate => (pb::UpgradeOutcome::UpToDate, String::new()),
+                UpgradeReport::Failed(e) => (pb::UpgradeOutcome::Failed, e.clone()),
+            };
+            Msg::Upgrade(pb::UpgradeResult {
+                version: version.clone(),
+                outcome: outcome as i32,
+                error,
+            })
+        }
     };
     pb::AgentMessage { msg: Some(msg) }
 }

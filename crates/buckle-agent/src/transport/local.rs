@@ -127,6 +127,9 @@ pub fn log_report(report: &Report) {
             ),
             None => tracing::info!(revision = %revision.short(), "no drift"),
         },
+        Report::Upgrade { version, outcome } => {
+            tracing::info!(%version, outcome = ?outcome, "upgrade")
+        }
         Report::LocalRollback(record) => tracing::warn!(
             from = %record.from.short(),
             to = %record.to.short(),
