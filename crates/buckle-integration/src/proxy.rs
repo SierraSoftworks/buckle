@@ -84,7 +84,24 @@ impl Proxy {
     /// Drops every proxied connection and refuses new ones until
     /// [`Proxy::point_at`] is called again.
     pub fn cut(&self) {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.cutter().cut();
+    }
+
+    /// A handle that cuts this proxy from anywhere (e.g. a scripted command
+    /// on a fake host, so a change itself can cut the agent off).
+    pub fn cutter(&self) -> Cutter {
+        Cutter(self.state.clone())
+    }
+}
+
+/// Cuts a [`Proxy`], as [`Proxy::cut`] does.
+#[derive(Clone)]
+pub struct Cutter(Arc<Mutex<State>>);
+
+impl Cutter {
+    /// See [`Proxy::cut`].
+    pub fn cut(&self) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
         s.upstream = None;
         s.generation.cancel();
         s.generation = CancellationToken::new();

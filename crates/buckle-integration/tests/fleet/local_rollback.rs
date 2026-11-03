@@ -5,12 +5,31 @@
 
 use crate::common::{self, APP_CONF, HEALTHY};
 use buckle_api::{HostRolloutState, Page, RolloutState};
+use buckle_core::system::Command;
+use buckle_core::testing::ok_output;
 use buckle_integration::server::ServerSettings;
-use buckle_integration::{Fleet, WAIT, World, eventually, rollout_host};
+use buckle_integration::{AgentSpec, Fleet, WAIT, World, eventually, rollout_host};
 
 const PHASE: &str =
     "    - { name: fleet, select: 'true', parallel: 1, approval: auto, bake: 60s }\n";
 const POLICY: &str = "  local_rollback: { enabled: true, after: 2s, on_health: true }\n";
+
+/// Revision 2: the checked `app` with its new file, which applies and passes
+/// its checks, then a `network` change after it that breaks the service (its
+/// health marker goes) and cuts the host off (the scripted `restart-network`
+/// cuts the proxy).
+///
+/// Both breakages happen during the apply, before the watchdog arms, so
+/// nothing the test does afterwards races the `local_rollback.after` window:
+/// it closes with no session and checks failing past settle, every time.
+fn breaking_v2() -> Fleet {
+    common::checked_app_module(Fleet::with_phases(POLICY, PHASE), 2).module(
+        "network",
+        format!(
+            "name: network\nneeds: [app]\ntasks:\n  - file.absent: {{ path: {HEALTHY} }}\n  - command.run: {{ run: [restart-network] }}\n"
+        ),
+    )
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cut_off_agent_with_failing_health_reapplies_the_stable_revision_and_reports_it_on_reconnect()
@@ -24,35 +43,18 @@ async fn a_cut_off_agent_with_failing_health_reapplies_the_stable_revision_and_r
     )
     .await;
     let v1 = world.source_revision();
-    let edge = world.spawn(common::host("edge-1"));
+    let cutter = world.cutter();
+    let edge = world.spawn(AgentSpec::new("edge-1").system(
+        common::healthy_system("edge-1").on_command("restart-network", &[], move |_: &Command| {
+            cutter.cut();
+            ok_output("")
+        }),
+    ));
     world.converge(&v1, &["edge-1"]).await;
 
-    // The new revision applies and passes its checks; the agent was
-    // connected before the apply, so it arms its watchdog.
-    let v2 = world
-        .publish(&common::checked_app_module(
-            Fleet::with_phases(POLICY, PHASE),
-            2,
-        ))
-        .await
-        .id;
-    let id = world.rollout_for(&v2).await.summary.id;
-    world
-        .wait_rollout_host(&id, "edge-1", HostRolloutState::Baking)
-        .await;
-    eventually("the watchdog to arm", WAIT, async || {
-        edge.agent_state()
-            .watchdog
-            .filter(|w| w.from.0 == v2 && w.to.0 == v1)
-            .map(|_| ())
-            .ok_or("not armed".to_owned())
-    })
-    .await;
-    assert_eq!(edge.file(APP_CONF), Some(common::app_conf(2)));
-
-    // The server goes away and the service the change touched breaks.
-    world.stop_server().await;
-    edge.remove_file(HEALTHY).await;
+    // The agent is connected when the apply starts, so it arms its watchdog
+    // after it; the apply itself cuts it off and breaks the service.
+    let v2 = world.publish(&breaking_v2()).await.id;
 
     // Past local_rollback.after with checks failing past settle and no
     // session, the agent applies the cached stable revision on its own.
@@ -76,6 +78,8 @@ async fn a_cut_off_agent_with_failing_health_reapplies_the_stable_revision_and_r
     );
     assert_eq!(edge.file(APP_CONF), Some(common::app_conf(1)));
     assert_eq!(edge.applied_revision().as_deref(), Some(v1.as_str()));
+    let id = world.rollout_for(&v2).await.summary.id;
+    world.stop_server().await;
 
     // A fresh server over the same data directory resumes the rollout; the
     // agent reconnects and reports the rollback, which fails its wave.
