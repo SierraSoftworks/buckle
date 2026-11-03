@@ -21,9 +21,8 @@ use std::cell::RefCell;
 
 use buckle_api::{
     ActionRequest, ApproveRequest, AuditEntry, Catalog, ContinueRequest, CsrfToken, ErrorBody,
-    Fleet, HealthResultDto, HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup,
-    RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, RunReport, RunSummary,
-    StartRollout,
+    Fleet, HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup, RejectRequest,
+    RevisionSummary, RolloutDetail, RolloutSummary, RunReport, RunSummary, StartRollout,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -264,11 +263,6 @@ pub async fn fleet() -> Result<Fleet, ApiError> {
 pub async fn host(id: &str) -> Result<HostDetail, ApiError> {
     demo!(demo_store::host(id));
     get(&format!("/hosts/{}", enc(id))).await
-}
-
-pub async fn host_health(id: &str) -> Result<Vec<HealthResultDto>, ApiError> {
-    demo!(demo_store::host(id).map(|h| h.health_results));
-    get(&format!("/hosts/{}/health", enc(id))).await
 }
 
 /// `GET /hosts/{id}/runs`: the host's runs, newest first. Read as a page,

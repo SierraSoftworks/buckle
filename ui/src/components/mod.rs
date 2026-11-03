@@ -1,6 +1,7 @@
 //! The shared, presentational components.
 
 pub mod blueprint;
+pub mod changes;
 pub mod countdown;
 pub mod diff;
 pub mod error_block;
@@ -18,6 +19,7 @@ pub mod toast;
 pub mod ui;
 
 pub use blueprint::BlueprintView;
+pub use changes::Changes;
 pub use countdown::Countdown;
 pub use diff::{DiffView, secret_text};
 pub use error_block::ErrorBlock;

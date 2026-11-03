@@ -85,4 +85,15 @@ describe("session", () => {
     await page.getByTestId("hosts-table").waitFor();
     await close();
   });
+
+  test("the menu button hides and shows the sidebar on a wide screen", async () => {
+    const { page, close } = await open("/");
+    const nav = page.getByRole("navigation", { name: "Sections" });
+    await nav.waitFor();
+    await page.getByRole("button", { name: "Hide navigation" }).click();
+    await eventually(async () => assert.equal(await nav.isVisible(), false));
+    await page.getByRole("button", { name: "Show navigation" }).click();
+    await nav.waitFor();
+    await close();
+  });
 });

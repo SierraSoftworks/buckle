@@ -78,7 +78,7 @@ pub fn tick() -> Vec<LiveEvent> {
                         h.bake_until = Some(now + Duration::seconds(secs as i64));
                         Some((
                             HostRolloutState::Baking,
-                            "host.bake_started",
+                            "rollout.host.baking",
                             format!("Applied; baking for {secs}s."),
                         ))
                     }
@@ -86,7 +86,7 @@ pub fn tick() -> Vec<LiveEvent> {
                         h.bake_until = None;
                         Some((
                             HostRolloutState::Healthy,
-                            "host.healthy",
+                            "rollout.host.healthy",
                             "Baked with every required check passing.".to_string(),
                         ))
                     }

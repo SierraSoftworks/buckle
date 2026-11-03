@@ -229,8 +229,7 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });
     await row.getByRole("button", { name: "Details for pi-5" }).click();
-    await page.getByRole("heading", { name: "Apply timeline" }).waitFor();
-    await page.locator(".checks__item", { hasText: "answered 500 for longer than settle" }).waitFor();
+    await page.getByTestId("host-ticker").waitFor();
     await page.getByRole("button", { name: "Continue with checks waived…" }).click();
     const dialog = page.getByRole("dialog", { name: "Continue pi-5 with checks waived" });
     await dialog.getByRole("checkbox").check();
@@ -251,14 +250,45 @@ describe("live updates", () => {
     await close();
   });
 
-  test("timeline entries are appended as they arrive", async () => {
+  test("a host's ticker gains a marker and a segment as it moves on", async () => {
     const { page, close } = await open("/rollouts/42", { flags: "live" });
     await page.getByRole("button", { name: "Details for pi-4" }).click();
-    const timeline = page.locator(".host-row .timeline");
-    await timeline.waitFor();
-    const before = await timeline.locator(".timeline__item").count();
-    await timeline.locator(".timeline__kind", { hasText: "host.bake_started" }).waitFor({ timeout: 15_000 });
-    assert.equal(await timeline.locator(".timeline__item").count(), before + 1, "appended once");
+    const ticker = page.getByTestId("host-ticker");
+    await ticker.waitFor();
+    const before = await ticker.locator(".ticker__marker").count();
+    await ticker.locator('.ticker__marker[data-kind="rollout.host.baking"]').waitFor({ timeout: 15_000 });
+    assert.equal(await ticker.locator(".ticker__marker").count(), before + 1, "appended once");
+    await ticker.locator('.ticker__seg[data-state="baking"]').waitFor();
+    await close();
+  });
+});
+
+describe("the hosts list", () => {
+  test("a click on a row opens and closes its details, with the event behind each marker", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-1", exact: true }) });
+    await row.locator("td").nth(1).click();
+    const ticker = page.getByTestId("host-ticker");
+    await ticker.waitFor();
+    // What a host went through, from the rollout's start; no separate health list.
+    assert.equal(await page.locator(".host-row .checks").count(), 0);
+    assert.match(await ticker.locator(".ticker__axis").textContent(), /T\+/);
+    const healthy = ticker.locator('.ticker__marker[data-kind="rollout.host.healthy"]');
+    await healthy.hover();
+    const pop = healthy.locator(".ticker__pop");
+    await pop.waitFor({ state: "visible" });
+    assert.match(await pop.textContent(), /Bake window passed/);
+    await row.locator("td").nth(1).click();
+    await eventually(async () => assert.equal(await ticker.count(), 0));
+    await close();
+  });
+
+  test("each host's plan shows what it changes in one pill", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-1", exact: true }) });
+    const pill = row.getByTestId("tally");
+    await pill.waitFor();
+    assert.match(await pill.textContent(), /^\+\d+~\d+-\d+/);
     await close();
   });
 });

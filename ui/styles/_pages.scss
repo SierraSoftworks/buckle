@@ -285,14 +285,148 @@
 }
 
 .host-row {
-  &__cols {
-    display: grid;
-    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
-    gap: 1.5rem;
+  &__ticker {
+    margin-top: 0.25rem;
   }
 
   &__run {
-    margin-top: 0.5rem;
+    margin-top: 0.75rem;
+  }
+}
+
+// A host's way through a rollout: state segments on a bar, its events as
+// markers in lanes above it, each with the whole event in a popover.
+.ticker {
+  --lane-h: 0.85rem;
+  position: relative;
+  padding-top: 0.2rem;
+
+  &__markers {
+    position: relative;
+    height: calc(var(--lanes) * var(--lane-h) + 0.2rem);
+    list-style: none;
+  }
+
+  &__marker {
+    position: absolute;
+    bottom: calc(var(--lane) * var(--lane-h));
+    width: 0.6rem;
+    height: 0.6rem;
+    margin-left: -0.3rem;
+    border: 2px solid var(--surface);
+    border-radius: 50%;
+    background: var(--tone, var(--fg-3));
+    cursor: default;
+    outline-offset: 2px;
+
+    // A state change: a diamond, so it reads apart from an annotation.
+    &--transition {
+      border-radius: 2px;
+      transform: rotate(45deg);
+
+      > .ticker__pop {
+        transform: rotate(-45deg);
+      }
+    }
+
+    &:hover,
+    &:focus-visible {
+      z-index: 10;
+      filter: brightness(1.25);
+    }
+
+    &:hover > .ticker__pop,
+    &:focus > .ticker__pop {
+      display: flex;
+    }
+  }
+
+  &__pop {
+    display: none;
+    position: absolute;
+    z-index: 20;
+    bottom: calc(100% + 0.45rem);
+    left: 50%;
+    flex-direction: column;
+    gap: 0.15rem;
+    width: max-content;
+    max-width: min(26rem, 80vw);
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    color: var(--fg);
+    font-size: 0.8rem;
+    line-height: 1.4;
+    translate: -50% 0;
+    pointer-events: none;
+  }
+
+  &__marker--start > &__pop {
+    left: -0.3rem;
+    translate: none;
+  }
+
+  &__marker--end > &__pop {
+    right: -0.3rem;
+    left: auto;
+    translate: none;
+  }
+
+  &__pop-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  &__kind {
+    color: var(--tone, var(--fg-2));
+    font-weight: 600;
+  }
+
+  &__bar {
+    position: relative;
+    height: 1.35rem;
+    overflow: hidden;
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+  }
+
+  &__seg {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+    padding: 0 0.35rem;
+    border-left: 2px solid var(--tone);
+    background: var(--tone-soft);
+    color: var(--tone);
+    font-size: 0.72rem;
+    font-weight: 550;
+    white-space: nowrap;
+
+    &--ongoing {
+      background: linear-gradient(90deg, var(--tone-soft), color-mix(in srgb, var(--tone) 30%, transparent));
+    }
+
+    &--planned {
+      border-left: none;
+      background: repeating-linear-gradient(135deg, var(--tone-soft) 0 4px, transparent 4px 8px);
+    }
+  }
+
+  &__label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  &__axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 0.2rem;
   }
 }
 
@@ -487,10 +621,6 @@
 
 @media (max-width: $narrow) {
   .labels,
-  .host-row__cols {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   .timeline__item {
     grid-template-columns: 4.5rem minmax(0, 1fr);
 
@@ -506,5 +636,24 @@
 
   .gitlog__actions {
     grid-column: 2;
+  }
+}
+
+// The latest rollout's changes on the Overview, one module a line.
+.module-changes {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) auto 1fr;
+  align-items: center;
+  gap: 0.3rem 0.8rem;
+  margin: 0.6rem 0 0.2rem;
+  list-style: none;
+  font-size: 0.84rem;
+
+  &__item {
+    display: contents;
+  }
+
+  &__name {
+    overflow-wrap: anywhere;
   }
 }

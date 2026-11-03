@@ -39,6 +39,19 @@
     background: var(--surface-2);
   }
 
+  // A row that opens its details from a click anywhere on it.
+  &__toggle-row {
+    cursor: pointer;
+  }
+
+  .row-toggle .icon {
+    transition: transform var(--transition);
+  }
+
+  tr.is-open .row-toggle .icon {
+    transform: rotate(90deg);
+  }
+
   &__detail > td {
     background: var(--surface-2);
     padding: 0.25rem 1rem 1rem;

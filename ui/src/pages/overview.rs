@@ -1,5 +1,6 @@
 //! Overview (design §12): the fleet's health roll-up with the age of each
-//! reading, the latest rollout with its decisions while it is live, the
+//! reading, the latest rollout with what each module changes and its
+//! decisions while it is live, the
 //! whole fleet laid out on that rollout's stages, the last five revisions
 //! with their rollout's outcome, and the agents needing attention.
 
@@ -11,10 +12,11 @@ use yew::prelude::*;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Empty, ErrorState, Loading, PageHead, Panel, Pill, Pipeline, Refresh, RouteLink,
+    Changes, Empty, ErrorState, Loading, PageHead, Panel, Pill, Pipeline, Refresh, RouteLink,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{Bucket, attention, rollup};
+use crate::logic::fleet_plan::{Tally, fleet_tally, hosts_changed, summarise};
 use crate::logic::format::{age, commit, count, first_line, relative, rollout_label};
 use crate::logic::live::{apply_fleet, apply_revisions, apply_rollout, apply_rollouts};
 use crate::logic::pipeline::{fleet_map, layout};
@@ -151,7 +153,8 @@ fn latest(
         .filter(|p| !scope_of(p, plans).digests.is_empty())
         .map(|p| p.name.clone());
     html! { <>
-        { rollout_head(s, now) }
+        { rollout_head(s, d.fleet.as_ref().map(fleet_tally), now) }
+        { module_changes(d) }
         if let Some(reason) = &s.pause_reason {
             <p class={classes!("note", (s.state == RolloutState::Paused).then_some("note--warn"))}>
                 <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
@@ -204,7 +207,46 @@ fn tiles(f: &Fleet, now: chrono::DateTime<chrono::Utc>) -> Html {
     }
 }
 
-fn rollout_head(s: &RolloutSummary, now: chrono::DateTime<chrono::Utc>) -> Html {
+/// What each module of the latest rollout changes, and on how many of its
+/// hosts; modules with nothing to apply are left out.
+fn module_changes(d: &RolloutDetail) -> Html {
+    let Some(f) = &d.fleet else {
+        return html! {};
+    };
+    let total = f.hosts.len();
+    let rows =
+        f.modules.iter().filter_map(|m| {
+            let summary = summarise(m);
+            summary.has_changes().then(|| html! {
+            <li class="module-changes__item" data-module={m.module.clone()}>
+                <span class="mono module-changes__name">{ m.module.clone() }</span>
+                <Changes tally={summary.tally} />
+                <span class="muted small">{ hosts_changed(total, summary.changed.len()) }</span>
+            </li>
+        })
+        });
+    let removals: Vec<_> = f.removals.iter().filter(|r| r.value.cleanup).collect();
+    let removed_on: std::collections::BTreeSet<&String> =
+        removals.iter().flat_map(|r| r.hosts.iter()).collect();
+    html! {
+        <ul class="module-changes" aria-label="Changes by module">
+            { for rows }
+            if !removals.is_empty() {
+                <li class="module-changes__item" data-module="removals">
+                    <span class="module-changes__name">{ "Removals" }</span>
+                    <Changes tally={Tally { remove: removals.len(), ..Tally::default() }} />
+                    <span class="muted small">{ hosts_changed(total, removed_on.len()) }</span>
+                </li>
+            }
+        </ul>
+    }
+}
+
+fn rollout_head(
+    s: &RolloutSummary,
+    tally: Option<Tally>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Html {
     html! {
         <div class="rollout-head">
             <RouteLink to={Route::rollout(&s.id)} classes="rollout-head__title">
@@ -213,6 +255,7 @@ fn rollout_head(s: &RolloutSummary, now: chrono::DateTime<chrono::Utc>) -> Html 
             <span class="mono">{ commit(&s.revision) }</span>
             <span class="rollout-head__message">{ format!("“{}”", first_line(&s.revision_message)) }</span>
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
+            if let Some(tally) = tally { <Changes {tally} /> }
             if let Some(p) = &s.current_phase { <span class="muted">{ format!("phase {p}") }</span> }
             <span class="muted">{ format!("{}/{} done · started {}", s.hosts_done, s.hosts_total, relative(s.started_at, now)) }</span>
         </div>

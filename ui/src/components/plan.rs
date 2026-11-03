@@ -8,6 +8,7 @@ use buckle_api::{
 };
 use yew::prelude::*;
 
+use super::changes::Changes;
 use super::diff::{DiffView, secret_text};
 use super::icons;
 use crate::logic::fleet_plan::Tally;
@@ -261,28 +262,8 @@ pub fn module_head(
         <h4 class="plan-module__name mono">{ module.to_string() }</h4>
         if deferred { <span class="badge" title={DEFERRED_BADGE}>{ "deferred" }</span> }
         if !needs.is_empty() { <span class="muted">{ format!("needs: {}", needs.join(", ")) }</span> }
-        <span class="plan-module__aside">{ tally(changes) }{ hosts }</span>
+        <span class="plan-module__aside"><Changes tally={changes} />{ hosts }</span>
     </> }
-}
-
-/// `+2 ~1 -1`: what a block creates, modifies and removes (and is blocked
-/// on), each in its change colour; kinds it has none of are left out.
-pub fn tally(t: Tally) -> Html {
-    let part = |n: usize, class: &'static str, sign: &'static str, what: &'static str| {
-        (n > 0).then(|| html! {
-            <span class={classes!("tally__part", format!("tally__part--{class}"))} title={format!("{n} {what}")}>
-                { format!("{sign}{n}") }
-            </span>
-        })
-    };
-    html! {
-        <span class="tally" data-testid="tally">
-            { part(t.create, "create", "+", "to create").unwrap_or_default() }
-            { part(t.modify, "modify", "~", "to modify").unwrap_or_default() }
-            { part(t.remove, "remove", "-", "to remove").unwrap_or_default() }
-            { part(t.blocked, "blocked", "!", "blocked").unwrap_or_default() }
-        </span>
-    }
 }
 
 /// The plan's warnings, as a block like a module's: counted in its heading,
@@ -316,7 +297,7 @@ pub fn removals_block(n: usize, hosts: Html, items: Html) -> Html {
         html! { <>
             <h4 class="plan-module__name">{ "Removals" }</h4>
             <span class="muted">{ "resources the revision no longer declares" }</span>
-            <span class="plan-module__aside">{ tally(Tally { remove: n, ..Tally::default() }) }{ hosts }</span>
+            <span class="plan-module__aside"><Changes tally={Tally { remove: n, ..Tally::default() }} />{ hosts }</span>
         </> },
         html! { <ul class="steps">{ items }</ul> },
     )

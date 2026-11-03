@@ -1,5 +1,7 @@
 //! The chrome around every page (design §12): a 48 px app bar, a 220 px
 //! sidebar that becomes a drawer on a narrow screen, and the page itself.
+//! The menu button opens the drawer on a narrow screen and hides or shows
+//! the sidebar (remembered) on a wide one.
 
 use yew::prelude::*;
 use yew_router::prelude::*;
@@ -40,6 +42,7 @@ fn section(route: &Route) -> Route {
 pub fn shell(props: &ShellProps) -> Html {
     let route = use_route::<Route>().unwrap_or(Route::Overview);
     let open = use_state(|| false);
+    let collapsed = use_state(|| crate::util::stored(NAV_COLLAPSED).is_some());
     let theme = use_state(theme::current);
 
     // Following a link closes the drawer, so the page it opened can be seen.
@@ -52,8 +55,16 @@ pub fn shell(props: &ShellProps) -> Html {
     }
 
     let toggle_nav = {
-        let open = open.clone();
-        Callback::from(move |_: MouseEvent| open.set(!*open))
+        let (open, collapsed) = (open.clone(), collapsed.clone());
+        Callback::from(move |_: MouseEvent| {
+            if narrow() {
+                open.set(!*open);
+            } else {
+                let next = !*collapsed;
+                crate::util::store(NAV_COLLAPSED, next.then_some("1"));
+                collapsed.set(next);
+            }
+        })
     };
     let close_nav = {
         let open = open.clone();
@@ -68,6 +79,13 @@ pub fn shell(props: &ShellProps) -> Html {
         })
     };
 
+    // Read at render: the button's next press acts on the layout of the moment.
+    let (shown, menu_label) = match (narrow(), *open, *collapsed) {
+        (true, true, _) => (true, "Close navigation"),
+        (true, false, _) => (false, "Open navigation"),
+        (false, _, false) => (true, "Hide navigation"),
+        (false, _, true) => (false, "Show navigation"),
+    };
     let current = section(&route);
     let nav = NAV.iter().map(|(label, icon, to)| {
         let active = *to == current;
@@ -85,8 +103,8 @@ pub fn shell(props: &ShellProps) -> Html {
             <a class="skip-link" href="#main">{ "Skip to content" }</a>
             <header class="app-bar">
                 <button type="button" class="icon-btn app-bar__menu" onclick={toggle_nav}
-                    aria-label={if *open { "Close navigation" } else { "Open navigation" }}
-                    aria-controls="sidebar" aria-expanded={(*open).to_string()}>
+                    aria-label={menu_label} title={menu_label}
+                    aria-controls="sidebar" aria-expanded={shown.to_string()}>
                     { if *open { icons::close() } else { icons::menu() } }
                 </button>
                 <RouteLink to={Route::Overview} classes="app-bar__brand" label="Buckle overview">
@@ -104,7 +122,7 @@ pub fn shell(props: &ShellProps) -> Html {
                 </button>
                 <UserChip />
             </header>
-            <div class="app-body">
+            <div class={classes!("app-body", collapsed.then_some("app-body--collapsed"))}>
                 if *open {
                     <div class="scrim" aria-hidden="true" onclick={close_nav} />
                 }
@@ -117,6 +135,18 @@ pub fn shell(props: &ShellProps) -> Html {
             </div>
         </div>
     }
+}
+
+/// Where a wide screen remembers that its sidebar was hidden.
+const NAV_COLLAPSED: &str = "buckle.nav.collapsed";
+
+/// Whether the sidebar is a drawer (`$narrow` in `_tokens.scss`).
+fn narrow() -> bool {
+    crate::util::window()
+        .match_media("(max-width: 860px)")
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.matches())
 }
 
 /// Whether live updates are flowing.

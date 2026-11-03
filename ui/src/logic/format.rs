@@ -83,6 +83,22 @@ pub fn age(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
+/// A moment on a timeline, from the timeline's start `t0`: `T+0s`, `T+45s`,
+/// `T+2m`, `T+2m 05s`, `T+1h 02m`, and `T-30s` for one before it.
+pub fn since(at: DateTime<Utc>, t0: DateTime<Utc>) -> String {
+    let secs = at.signed_duration_since(t0).num_seconds();
+    let (sign, abs) = (if secs < 0 { '-' } else { '+' }, secs.unsigned_abs());
+    let (h, m, s) = (abs / 3_600, (abs % 3_600) / 60, abs % 60);
+    let span = match (h, m, s) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m {s:02}s"),
+        (h, 0, _) => format!("{h}h"),
+        (h, m, _) => format!("{h}h {m:02}m"),
+    };
+    format!("T{sign}{span}")
+}
+
 /// An absolute time for a tooltip or an audit row.
 pub fn timestamp(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%d %H:%M:%S UTC").to_string()
@@ -185,6 +201,23 @@ mod tests {
         assert_eq!(age(Some(now - Duration::seconds(200)), now), "3m");
         // A reading stamped a moment in the future (clock skew) is not negative.
         assert_eq!(age(Some(now + Duration::seconds(3)), now), "0s");
+    }
+
+    #[test]
+    fn timeline_moments_count_from_its_start() {
+        let t0 = Utc::now();
+        let at = |secs| t0 + Duration::seconds(secs);
+        for (secs, want) in [
+            (0, "T+0s"),
+            (45, "T+45s"),
+            (120, "T+2m"),
+            (125, "T+2m 05s"),
+            (3_600, "T+1h"),
+            (3_720, "T+1h 02m"),
+            (-30, "T-30s"),
+        ] {
+            assert_eq!(since(at(secs), t0), want, "{secs}s");
+        }
     }
 
     #[test]

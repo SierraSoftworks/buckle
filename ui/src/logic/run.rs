@@ -10,6 +10,7 @@ use buckle_api::{
 };
 use chrono::{DateTime, Utc};
 
+use super::fleet_plan::Tally;
 use super::live::EventLog;
 use super::tone::Tone;
 
@@ -239,6 +240,33 @@ pub fn resource_module(resource: &str) -> Option<&str> {
         .split_once('/')
         .map(|(module, _)| module)
         .filter(|module| !module.is_empty() && !module.contains('['))
+}
+
+/// What a module's tasks change, by the shape of their planned change; a
+/// task the report gives no shape for counts as a modification once it has
+/// changed something. Handlers change nothing of their own.
+pub fn module_tally(m: &ModuleReport) -> Tally {
+    m.steps.iter().fold(Tally::default(), |t, s| {
+        let mut one = Tally::default();
+        match (s.diff, s.state) {
+            (Some(buckle_api::DiffKind::Create), _) => one.create = 1,
+            (Some(buckle_api::DiffKind::Delete), _) => one.remove = 1,
+            (Some(_), _) | (None, StepState::Changed) => one.modify = 1,
+            (None, _) => {}
+        }
+        t.sum(one)
+    })
+}
+
+/// A run's changes: its modules' and its removals'.
+pub fn run_tally(r: &RunReport) -> Tally {
+    r.modules.iter().map(module_tally).fold(
+        Tally {
+            remove: r.removals.len(),
+            ..Tally::default()
+        },
+        Tally::sum,
+    )
 }
 
 /// How long something took, or has been running so far: the reported
@@ -911,6 +939,39 @@ pub(crate) mod tests {
         };
         r.recount();
         r
+    }
+
+    #[test]
+    fn a_module_counts_its_changes_by_their_shape() {
+        use buckle_api::DiffKind;
+        let shaped = |id, diff, state| StepReport {
+            diff,
+            ..step(id, state)
+        };
+        let m = module(
+            "nomad",
+            ModuleState::Applied,
+            vec![
+                shaped("a", Some(DiffKind::Create), StepState::Changed),
+                shaped("b", Some(DiffKind::Update), StepState::Pending),
+                shaped("c", Some(DiffKind::Opaque), StepState::Changed),
+                shaped("d", Some(DiffKind::Delete), StepState::Failed),
+                shaped("e", None, StepState::Changed),
+                shaped("f", None, StepState::Unchanged),
+            ],
+        );
+        let t = module_tally(&m);
+        assert_eq!((t.create, t.modify, t.remove), (1, 3, 1));
+        let mut r = report(vec![m]);
+        r.removals.push(buckle_api::RemovalReport {
+            resource: "nomad/file.copy[/x]".into(),
+            kind: "file.copy".into(),
+            summary: "remove /x".into(),
+            state: StepState::Pending,
+            caution: false,
+            error: None,
+        });
+        assert_eq!(run_tally(&r).remove, 2, "removals count as removals");
     }
 
     #[test]
