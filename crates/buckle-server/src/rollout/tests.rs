@@ -994,30 +994,78 @@ async fn stragglers_stage_applies_late_hosts_and_carries_over() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn supersede_queue_waits_for_the_current_rollout() {
-    let mut h = Harness::new().await;
-    let gated = "  supersede: queue\n  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n";
-    h.revision("r1", gated).await;
-    h.revision("r2", &gated.replace(", approval: required", ""))
-        .await;
-    h.enrol("a", "web").await;
-    h.connect("a", None);
-    let first = h.start("r1").await;
-    h.wait_state(&first, RolloutState::AwaitingApproval).await;
-    let second = h.start("r2").await;
-    let (r2, _) = h.snapshot(&second).await;
-    assert_eq!(r2.state, RolloutState::Detected, "queued");
+/// One `web` phase under `supersede: {policy}`, held for approval when `gated`.
+fn superseding(policy: &str, gated: bool) -> String {
+    let approval = if gated { ", approval: required" } else { "" };
+    format!(
+        "  supersede: {policy}\n  health: {{ bake: 30s }}\n  phases:\n    - {{ name: web, select: 'true'{approval} }}\n"
+    )
+}
+
+async fn approve_web(h: &mut Harness, rollout: &str) {
     h.command(Command::Approve {
-        rollout: first.clone(),
+        rollout: rollout.to_owned(),
         phase: "web".into(),
         digests: vec!["plan-a".into()],
         note: String::new(),
     })
     .await
     .unwrap();
-    h.wait_state(&first, RolloutState::Completed).await;
-    h.wait_state(&second, RolloutState::Completed).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn supersede_latest_skips_queued_revisions_for_the_newest() {
+    // `queue` is the older name for `latest`.
+    for policy in ["latest", "queue"] {
+        let mut h = Harness::new().await;
+        h.revision("r1", &superseding(policy, true)).await;
+        h.revision("r2", &superseding(policy, false)).await;
+        h.revision("r3", &superseding(policy, false)).await;
+        h.enrol("a", "web").await;
+        h.connect("a", None);
+        let first = h.start("r1").await;
+        h.wait_state(&first, RolloutState::AwaitingApproval).await;
+        let second = h.start("r2").await;
+        let third = h.start("r3").await;
+        let (r2, _) = h.wait_state(&second, RolloutState::Skipped).await;
+        assert_eq!(
+            r2.runtime.superseded_by.as_ref(),
+            Some(&third),
+            "{policy}: names the rollout that superseded it"
+        );
+        assert_eq!(h.snapshot(&third).await.0.state, RolloutState::Detected);
+        approve_web(&mut h, &first).await;
+        h.wait_state(&first, RolloutState::Completed).await;
+        h.wait_state(&third, RolloutState::Completed).await;
+        assert_eq!(h.snapshot(&second).await.0.state, RolloutState::Skipped);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn supersede_sequential_rolls_out_every_queued_revision_in_order() {
+    let mut h = Harness::new().await;
+    for r in ["r1", "r2", "r3"] {
+        h.revision(r, &superseding("sequential", true)).await;
+    }
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let ids = [
+        h.start("r1").await,
+        h.start("r2").await,
+        h.start("r3").await,
+    ];
+    for (i, id) in ids.iter().enumerate() {
+        h.wait_state(id, RolloutState::AwaitingApproval).await;
+        for later in &ids[i + 1..] {
+            assert_eq!(
+                h.snapshot(later).await.0.state,
+                RolloutState::Detected,
+                "a later revision waits its turn"
+            );
+        }
+        approve_web(&mut h, id).await;
+        h.wait_state(id, RolloutState::Completed).await;
+    }
 }
 
 #[tokio::test(start_paused = true)]

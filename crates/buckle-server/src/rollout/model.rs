@@ -187,6 +187,9 @@ pub struct RolloutRuntime {
     /// Why the rollout ended, when it did not complete.
     #[serde(default)]
     pub end_reason: Option<String>,
+    /// The newer rollout that skipped (or replaced) this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     /// Hosts the target-set freeze matched to no phase.
     #[serde(default)]
     pub untargeted: Vec<String>,
@@ -223,11 +226,14 @@ impl RolloutRecord {
         self.is_running() || matches!(self.state, RolloutState::Paused | RolloutState::RollingBack)
     }
 
-    /// Ended (completed, rolled back, aborted).
+    /// Ended (completed, rolled back, aborted, skipped).
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.state,
-            RolloutState::Completed | RolloutState::RolledBack | RolloutState::Aborted
+            RolloutState::Completed
+                | RolloutState::RolledBack
+                | RolloutState::Aborted
+                | RolloutState::Skipped
         )
     }
 }

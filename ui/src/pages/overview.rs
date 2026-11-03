@@ -18,7 +18,7 @@ use crate::components::{
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{Bucket, attention, rollup};
 use crate::logic::fleet_plan::{Tally, fleet_tally, hosts_changed, summarise};
-use crate::logic::format::{age, commit, count, first_line, relative, rollout_label};
+use crate::logic::format::{age, commit, count, first_line, relative, rollout_label, rollout_note};
 use crate::logic::live::{apply_fleet, apply_revisions, apply_rollout, apply_rollouts};
 use crate::logic::pipeline::{fleet_map, layout};
 use crate::logic::tone::{
@@ -357,7 +357,7 @@ fn recent(
                             (buckle_api::RevisionStatus::Rejected, _) => html! { <Pill tone={revision_status_tone(r.status)} label="rejected" /> },
                             (_, Some(o)) => html! {
                                 <RouteLink to={Route::rollout(&o.id)} classes="revlist__rollout">
-                                    <Pill tone={rollout_state_tone(o.state)} label={format!("{} {}", rollout_label(&o.id), rollout_state_label(o.state))} />
+                                    <Pill tone={rollout_state_tone(o.state)} label={format!("{} {}", rollout_label(&o.id), rollout_state_label(o.state))} title={rollout_note(o)} />
                                 </RouteLink>
                             },
                             _ => html! { <span class="muted">{ "not rolled out" }</span> },

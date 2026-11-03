@@ -114,6 +114,8 @@ pub fn summary(record: &RolloutRecord, hosts: &[RolloutHostRecord]) -> RolloutSu
             .get(record.runtime.current_phase)
             .map(|p| p.name.clone()),
         pause_reason: record.runtime.pause.as_ref().map(|p| p.reason.clone()),
+        end_reason: record.runtime.end_reason.clone(),
+        superseded_by: record.runtime.superseded_by.clone(),
         trace_id: record.runtime.trace_id.clone(),
         trace_url: None,
     }

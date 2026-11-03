@@ -387,7 +387,7 @@ pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiEr
             .any(|r| !crate::logic::tone::rollout_finished(r.summary.state))
         {
             return Err(ApiError::Conflict(
-                "Rollout 42 is still running; with supersede: queue the new rollout starts when it finishes.".into(),
+                "Rollout 42 is still running; with supersede: latest the new rollout starts when it finishes.".into(),
             ));
         }
         let rev = s

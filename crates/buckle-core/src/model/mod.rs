@@ -140,11 +140,20 @@ pub enum RolloutTrigger {
     Manual,
 }
 
+/// What happens to a revision that arrives while a rollout is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SupersedePolicy {
+    /// Finish the current rollout, then roll out only the newest queued
+    /// revision; the queued ones in between are skipped. (`queue` is the
+    /// older name.)
     #[default]
-    Queue,
+    #[serde(alias = "queue")]
+    Latest,
+    /// Finish the current rollout, then roll out every queued revision in
+    /// the order it arrived.
+    Sequential,
+    /// Abort the current rollout and start the new one at once.
     Replace,
 }
 

@@ -385,7 +385,7 @@ rollout:                                  # see section 10
     - { name: home,   select: 'host.groups contains "home"',   parallel: 1, bake: 5m }
     - { name: cloud,  select: 'host.groups contains "cloud"',  parallel: 50%, bake: 5m, max_failures: 0 }
   on_failure: pause
-  supersede: queue
+  supersede: latest
 </code></pre>
 
 <h3>module.yaml</h3>
@@ -1067,7 +1067,7 @@ message SecretBundle { repeated SecretValue secrets = 1; }   // name, value, the
 <ul>
 <li>A bare clone under <code>data_dir/source.git</code> managed with <code>gix</code>, fetched every <code>poll</code> (default 30 s) and immediately on <code>POST /api/v1/webhooks/source</code> (HMAC-verified, for a GitHub webhook over Tailscale Funnel or a Nomad-local forwarder).</li>
 <li>Change detection compares the remote-tracking ref for the configured branch before and after the fetch (the audit of github-backup found that comparing <code>HEAD</code> misses remote-only updates), and then with the last commit it processed.</li>
-<li>Every new commit on the branch becomes a revision, oldest first, so each one is validated and visible in the UI and the rollout controller supersedes the older ones (up to 50 commits per fetch: a longer gap, or a tip that does not descend from the last processed commit through first parents, builds the tip only). A branch that moves back to a commit already built (a force-push, or a reverted ref) is announced again, so the fleet converges on the branch tip rather than staying on a revision the branch no longer points at. A fetch is interrupted after <code>source.git.fetch_timeout</code> (default 2 m) and retried at the next poll.</li>
+<li>Every new commit on the branch becomes a revision, oldest first, so each one is validated and visible in the UI and the rollout controller queues them by <code>rollout.supersede</code> (up to 50 commits per fetch: a longer gap, or a tip that does not descend from the last processed commit through first parents, builds the tip only). A branch that moves back to a commit already built (a force-push, or a reverted ref) is announced again, so the fleet converges on the branch tip rather than staying on a revision the branch no longer points at. A fetch is interrupted after <code>source.git.fetch_timeout</code> (default 2 m) and retried at the next poll.</li>
 <li>Each commit is exported to <code>data_dir/revisions/&lt;id&gt;/</code>, loaded and validated (schema with unknown fields rejected, selectors parse, templates parse, unique module names, <code>needs</code> resolve and form a DAG, rollout phase names unique and not <code>stragglers</code>, every referenced secret declared) and stored as a <code>Revision</code>: commit id, author, message, timestamp, a content-addressed gzip tarball of <code>buckle.yaml</code>, <code>modules/</code> and <code>vars/</code> (with a digest the agent verifies, and an index of its files by digest for <code>FetchBlob</code>), and the validation report. Invalid commits are stored as rejected revisions so the UI can show the author what broke, and the fleet stays on the last valid one. This check is narrower than <code>buckle validate</code>, which also resolves task and health kinds, handler references, <code>after:</code> and the <code>command.run</code> <code>id</code> rule and, given <code>--facts</code>, dry-plans each fixture host: run it in CI, because a revision with an unknown task kind is accepted by the server and fails as a plan error for that module on the hosts that select it.</li>
 <li>A <code>path:</code> source (local directory with a filesystem watcher) is supported for development and for a server fed by a CI job that already checked out the repo.</li>
 </ul>
@@ -1190,6 +1190,7 @@ telemetry:
     direction LR
     [*] --> Detected: new valid revision
     Detected --> Planning: trigger auto or operator starts
+    Detected --> Skipped: superseded while queued (latest, replace)
     Planning --> AwaitingApproval: phase requires sign-off
     Planning --> Rolling: auto-approved phase
     AwaitingApproval --> Rolling: approved (plan digests bound)
@@ -1206,12 +1207,13 @@ telemetry:
     RollingBack --> RolledBack: previous stable applied
     Completed --> [*]
     RolledBack --> [*]
-    Aborted --> [*]</pre>
+    Aborted --> [*]
+    Skipped --> [*]</pre>
 
 <h3>Policy</h3>
 <pre><code class="language-yaml"><span class="fname">buckle.yaml → rollout</span>rollout:
   trigger: auto                 # auto: every valid revision starts a rollout · manual: operator starts it in the UI
-  supersede: queue              # queue: finish current, then newest · replace: abort current when a newer revision arrives
+  supersede: latest             # latest: finish current, then newest (queued ones in between are skipped) · sequential: finish current, then each queued revision in order · replace: abort current when a newer revision arrives
   on_failure: pause             # pause | rollback | continue
   stragglers:                   # virtual final stage; opens once the revision is promoted to stable
     parallel: 2                 # hosts that missed their phase (offline, plan pending, enrolled after the freeze, held then released)

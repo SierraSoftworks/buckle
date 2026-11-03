@@ -15,6 +15,8 @@ pub enum RolloutState {
     RolledBack,
     Completed,
     Aborted,
+    /// Never started: a newer revision superseded it while it was queued.
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +133,12 @@ pub struct RolloutSummary {
     pub current_phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_reason: Option<String>,
+    /// Why a finished rollout ended (`superseded by …`, `aborted by …`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
+    /// The newer rollout that skipped (or replaced) this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     /// A link to `trace_id` in the configured tracing UI (Honeycomb), when the

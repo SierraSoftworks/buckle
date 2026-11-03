@@ -2374,24 +2374,16 @@ impl Controller {
         );
         if busy {
             match policy.supersede {
-                SupersedePolicy::Queue => {
-                    for rj in 0..ri {
-                        if self.live[rj].record.state == RolloutState::Detected {
-                            self.finish(
-                                rj,
-                                RolloutState::Aborted,
-                                "controller",
-                                &format!("superseded by {id}"),
-                            );
-                        }
-                    }
+                SupersedePolicy::Latest => {
+                    self.skip_queued(0..ri, &id);
                     return Ok(id);
                 }
+                SupersedePolicy::Sequential => return Ok(id),
                 SupersedePolicy::Replace => {
+                    self.skip_queued(0..ri, &id);
                     for rj in 0..ri {
-                        if self.live[rj].record.is_active()
-                            || self.live[rj].record.state == RolloutState::Detected
-                        {
+                        if self.live[rj].record.is_active() {
+                            self.live[rj].record.runtime.superseded_by = Some(id.clone());
                             self.finish(
                                 rj,
                                 RolloutState::Aborted,
@@ -3113,6 +3105,25 @@ impl Controller {
         }
     }
 
+    /// Marks the queued (detected) rollouts among `range` skipped: `newer`
+    /// superseded them before they started.
+    fn skip_queued(&mut self, range: std::ops::Range<usize>, newer: &str) {
+        for ri in range {
+            if self.live[ri].record.state == RolloutState::Detected {
+                self.live[ri].record.runtime.superseded_by = Some(newer.to_owned());
+                self.finish(
+                    ri,
+                    RolloutState::Skipped,
+                    "controller",
+                    &format!("superseded by {newer}"),
+                );
+            }
+        }
+    }
+
+    /// Starts a queued rollout once none is active. The newest queued
+    /// revision's `supersede` policy picks which: the oldest (`sequential`),
+    /// or the newest with the rest skipped (`latest`).
     async fn start_next_queued(&mut self) -> bool {
         if self.live.iter().any(|l| l.record.is_active()) {
             return false;
@@ -3120,22 +3131,22 @@ impl Controller {
         let queued: Vec<usize> = (0..self.live.len())
             .filter(|&i| self.live[i].record.state == RolloutState::Detected)
             .collect();
-        let Some(&newest) = queued.last() else {
+        let (Some(&oldest), Some(&newest)) = (queued.first(), queued.last()) else {
             return false;
         };
-        let newest_id = self.live[newest].record.id.clone();
-        for &i in &queued[..queued.len() - 1] {
+        let next = match self.live[newest].record.policy.supersede {
+            SupersedePolicy::Sequential => oldest,
+            SupersedePolicy::Latest | SupersedePolicy::Replace => {
+                let newest_id = self.live[newest].record.id.clone();
+                self.skip_queued(0..newest, &newest_id);
+                newest
+            }
+        };
+        let next_id = self.live[next].record.id.clone();
+        if let Err(e) = self.freeze(next).await {
+            tracing::error!(rollout = %next_id, error = %e, "a queued rollout could not start");
             self.finish(
-                i,
-                RolloutState::Aborted,
-                "controller",
-                &format!("superseded by {newest_id}"),
-            );
-        }
-        if let Err(e) = self.freeze(newest).await {
-            tracing::error!(rollout = %newest_id, error = %e, "a queued rollout could not start");
-            self.finish(
-                newest,
+                next,
                 RolloutState::Aborted,
                 "controller",
                 &format!("could not start: {e}"),

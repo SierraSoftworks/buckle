@@ -226,7 +226,7 @@ impl<'c> Rollouts<'c> {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {R_COLUMNS} FROM rollouts WHERE state NOT IN ('rolled_back', 'aborted') ORDER BY started_at, rowid"
+                "SELECT {R_COLUMNS} FROM rollouts WHERE state NOT IN ('rolled_back', 'aborted', 'skipped') ORDER BY started_at, rowid"
             ))
             .map_err(db_error)?;
         let rows = stmt
@@ -356,7 +356,7 @@ impl Rollouts<'_> {
             .prepare(
                 "SELECT r.id, r.revision, r.state, r.policy, r.started_at, r.finished_at, r.triggered_by, r.detail, h.detail \
                  FROM rollout_hosts h JOIN rollouts r ON r.id = h.rollout \
-                 WHERE h.host = ?1 AND r.state NOT IN ('rolled_back', 'aborted')",
+                 WHERE h.host = ?1 AND r.state NOT IN ('rolled_back', 'aborted', 'skipped')",
             )
             .map_err(db_error)?;
         let rows = stmt

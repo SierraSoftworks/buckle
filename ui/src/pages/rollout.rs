@@ -21,8 +21,8 @@ use crate::components::meter::stage_segments;
 use crate::components::ui::Copyable;
 use crate::components::{
     Button, Changes, Confirm, Countdown, Empty, ErrorBlock, ErrorState, HostLink, HoverTip, Kind,
-    Loading, Meter, PageHead, Panel, Pill, Pipeline, PlanViews, Refresh, RunReportView, TraceLink,
-    use_toast,
+    Loading, Meter, PageHead, Panel, Pill, Pipeline, PlanViews, Refresh, RouteLink, RunReportView,
+    TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::fleet_plan::fleet_tally;
@@ -255,6 +255,12 @@ pub fn rollout_page(props: &Props) -> Html {
                     if admin && s.state == RolloutState::Paused {
                         <span class="muted">{ " Retry, continue or skip the failed host below, or resume, roll back or abort the rollout." }</span>
                     }
+                </div>
+            }
+            if let Some(by) = s.superseded_by.as_ref().filter(|_| s.state == RolloutState::Skipped) {
+                <div class="banner banner--info" role="status">
+                    <strong>{ "Skipped: " }</strong>{ "rollout " }<RouteLink to={Route::rollout(by)}>{ rollout_label(by) }</RouteLink>
+                    { " of a newer revision superseded this one while it was queued, so it never started." }
                 </div>
             }
             <Panel title="Pipeline" subtitle={format!("{} hosts in {} stages · {}/{} done", s.hosts_total, d.phases.len(), s.hosts_done, s.hosts_total)}>

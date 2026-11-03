@@ -14,7 +14,7 @@ use crate::components::{
     use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
-use crate::logic::format::{commit, first_line, relative, rollout_label, timestamp};
+use crate::logic::format::{commit, first_line, relative, rollout_label, rollout_note, timestamp};
 use crate::logic::live::{apply_revisions, apply_rollouts};
 use crate::logic::tone::{Tone, rollout_finished, rollout_state_label, rollout_state_tone};
 
@@ -118,7 +118,7 @@ pub fn revisions() -> Html {
                                     <Pill tone={if rejected { Tone::Danger } else { Tone::Ok }} label={if rejected { "rejected" } else { "valid" }} />
                                     { match rollout {
                                         Some(o) => html! { <RouteLink to={Route::rollout(&o.id)}>
-                                            <Pill tone={rollout_state_tone(o.state)} label={format!("rollout {} {}", rollout_label(&o.id), rollout_state_label(o.state))} />
+                                            <Pill tone={rollout_state_tone(o.state)} label={format!("rollout {} {}", rollout_label(&o.id), rollout_state_label(o.state))} title={rollout_note(o)} />
                                         </RouteLink> },
                                         None => html! {},
                                     } }

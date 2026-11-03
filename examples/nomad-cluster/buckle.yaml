@@ -80,7 +80,7 @@ secrets:
 # whose selector matches, so pi-4 (which is also in `pis`) is only ever a canary.
 rollout:
   trigger: auto            # every valid revision starts a rollout
-  supersede: queue         # finish the current rollout, then roll the newest revision
+  supersede: latest        # finish the current rollout, then roll the newest revision (sequential: each in turn)
   on_failure: pause        # a human decides between retry, continue and rollback
   settle: 2m               # a required check must fail this long before it counts
   health:

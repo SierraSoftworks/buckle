@@ -427,6 +427,8 @@ mod tests {
                 hosts_failed: 1,
                 current_phase: None,
                 pause_reason: None,
+                end_reason: None,
+                superseded_by: None,
                 trace_id: None,
                 trace_url: None,
             },
