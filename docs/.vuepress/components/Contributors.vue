@@ -3,7 +3,7 @@
         <h2>Contributors</h2>
 
         <p>
-            Thank you to everyone who has contributed to turning Git-Tool into the awesome piece of software you find here. If your name is missing
+            Thank you to everyone who has contributed to turning Buckle into the awesome piece of software you find here. If your name is missing
             from the list, please open an issue and we'll try to get it resolved as soon as possible.
         </p>
 
