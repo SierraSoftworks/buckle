@@ -76,4 +76,32 @@ export async function heading(page) {
   return (await h1.first().textContent()).trim();
 }
 
+/** The rollout controls' split button (the first, where a page has two). */
+function controls(page) {
+  return page.getByTestId("rollout-controls").first();
+}
+
+/** Takes a rollout decision: from the split button's face, else its menu. */
+export async function decide(page, name) {
+  const c = controls(page);
+  await c.waitFor();
+  const face = c.locator(".split__main");
+  if ((await face.textContent()).trim() === name) return face.click();
+  await c.getByRole("button", { name: "More rollout actions" }).click();
+  await c.getByRole("menuitem", { name, exact: true }).click();
+}
+
+/** The decisions the split button offers: its face, then its menu. */
+export async function decisions(page) {
+  const c = controls(page);
+  await c.waitFor();
+  const face = (await c.locator(".split__main").textContent()).trim();
+  const toggle = c.getByRole("button", { name: "More rollout actions" });
+  if (!(await toggle.count())) return { face, menu: [] };
+  await toggle.click();
+  const menu = (await c.getByRole("menuitem").allTextContents()).map((t) => t.trim());
+  await page.keyboard.press("Escape");
+  return { face, menu };
+}
+
 export { assert };

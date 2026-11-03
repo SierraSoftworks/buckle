@@ -69,7 +69,7 @@ describe("session", () => {
 
   test("the session is shown and signing out leaves", async () => {
     const { page, close } = await open("/");
-    await page.getByText("Alice Operator").waitFor();
+    await page.getByRole("banner").getByText("Alice Operator").waitFor();
     await page.getByRole("button", { name: "Sign out" }).click();
     await page.waitForURL(url("/").replace(/\?.*/, "") + "?demo");
     await close();

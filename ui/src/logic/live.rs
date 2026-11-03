@@ -14,7 +14,7 @@ use buckle_api::{
     RevisionSummary, RolloutDetail, RolloutSummary,
 };
 
-use super::tone::rollout_finished;
+use super::tone::rollout_active;
 
 /// Recomputes the fleet's counts from its hosts.
 pub fn recount(hosts: &[HostSummary]) -> FleetCounts {
@@ -53,7 +53,7 @@ pub fn apply_fleet(fleet: &mut Fleet, event: &LiveEvent) {
             }
         }
         LiveEvent::RolloutChanged { rollout } => {
-            if !rollout_finished(rollout.state) {
+            if rollout_active(rollout.state) {
                 fleet.active_rollout = Some(rollout.id.clone());
             } else if fleet.active_rollout.as_deref() == Some(rollout.id.as_str()) {
                 fleet.active_rollout = None;
@@ -425,6 +425,14 @@ mod tests {
             &mut fleet,
             &LiveEvent::RolloutChanged {
                 rollout: summary("41", RolloutState::Completed),
+            },
+        );
+        assert_eq!(fleet.active_rollout.as_deref(), Some("42"));
+        // A newer commit's rollout queued behind it does not take its place.
+        apply_fleet(
+            &mut fleet,
+            &LiveEvent::RolloutChanged {
+                rollout: summary("43", RolloutState::Detected),
             },
         );
         assert_eq!(fleet.active_rollout.as_deref(), Some("42"));

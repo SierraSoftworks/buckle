@@ -165,7 +165,7 @@ pub fn fleet() -> Result<Fleet, ApiError> {
         let active = s
             .rollouts
             .iter()
-            .find(|r| !crate::logic::tone::rollout_finished(r.summary.state))
+            .find(|r| crate::logic::tone::rollout_active(r.summary.state))
             .map(|r| r.summary.id.clone());
         Ok(Fleet {
             counts: live::recount(&s.hosts),
@@ -382,14 +382,12 @@ pub fn revisions(offset: u64) -> Result<Page<RevisionSummary>, ApiError> {
 pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiError> {
     admin()?;
     with(|s| {
-        if s.rollouts
+        // supersede: latest. A rollout started while another runs waits for
+        // it (`detected`), and skips any rollout already waiting.
+        let busy = s
+            .rollouts
             .iter()
-            .any(|r| !crate::logic::tone::rollout_finished(r.summary.state))
-        {
-            return Err(ApiError::Conflict(
-                "Rollout 42 is still running; with supersede: latest the new rollout starts when it finishes.".into(),
-            ));
-        }
+            .any(|r| crate::logic::tone::rollout_active(r.summary.state));
         let rev = s
             .revisions
             .iter()
@@ -413,7 +411,11 @@ pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiEr
         detail.summary.id = id.clone();
         detail.summary.revision = rev.id.clone();
         detail.summary.revision_message = crate::logic::format::first_line(&rev.message).into();
-        detail.summary.state = RolloutState::Planning;
+        detail.summary.state = if busy {
+            RolloutState::Detected
+        } else {
+            RolloutState::Planning
+        };
         detail.summary.triggered_by = actor();
         detail.summary.started_at = Utc::now();
         detail.summary.current_phase = None;
@@ -429,6 +431,17 @@ pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiEr
         }
         if let Some(r) = s.revisions.iter_mut().find(|r| r.id == revision) {
             r.rollout_id = Some(id.clone());
+        }
+        for r in &mut s.rollouts {
+            if r.summary.state == RolloutState::Detected {
+                r.summary.state = RolloutState::Skipped;
+                r.summary.finished_at = Some(Utc::now());
+                r.summary.end_reason = Some(format!("superseded by {id}"));
+                r.summary.superseded_by = Some(id.clone());
+                s.outbox.push(LiveEvent::RolloutChanged {
+                    rollout: r.summary.clone(),
+                });
+            }
         }
         let summary = detail.summary.clone();
         s.rollouts.insert(0, detail);
