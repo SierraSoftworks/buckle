@@ -951,6 +951,7 @@ fn common_module() -> ModuleView {
             ),
         ],
         handlers: vec![],
+        deferred: false,
     }
 }
 
@@ -983,6 +984,7 @@ fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
             step("tailscale", "systemd.unit", "tailscaled", None),
         ],
         handlers: vec![],
+        deferred: false,
     };
     let mut modules = vec![common_module(), tailscale];
     if nomad {
@@ -1024,6 +1026,7 @@ fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
                 kind: "systemd.restart".into(),
                 summary: "restart nomad.service".into(),
             }],
+            deferred: false,
         });
     }
     if grey {
@@ -1040,6 +1043,7 @@ fn plan_doc(host: &str, digest: &str, grey: bool, nomad: bool) -> PlanView {
                 )),
             )],
             handlers: vec![],
+            deferred: false,
         });
     }
     let removals = if grey {

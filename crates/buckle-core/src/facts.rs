@@ -145,6 +145,44 @@ impl Facts {
         })
     }
 
+    /// A copy whose missing dotted `paths` hold `«fact:PATH»` placeholder
+    /// strings, for planning ahead of the provider that produces them.
+    /// Existing values are kept; longer paths are filled first, so a parent
+    /// path becomes an object rather than a placeholder.
+    pub fn with_placeholders<'p>(&self, paths: impl IntoIterator<Item = &'p str>) -> Facts {
+        let mut paths: Vec<&str> = paths.into_iter().collect();
+        paths.sort_by_key(|p| std::cmp::Reverse(p.split('.').count()));
+        let mut out = self.clone();
+        if !out.tree.is_object() {
+            out.tree = serde_json::Value::Object(Default::default());
+        }
+        'paths: for path in paths {
+            let parts: Vec<&str> = path.split('.').collect();
+            let mut current = &mut out.tree;
+            for (i, part) in parts.iter().enumerate() {
+                let Some(map) = current.as_object_mut() else {
+                    continue 'paths;
+                };
+                // A provider that has not produced its facts yet shows as
+                // null: as missing as an absent key.
+                let slot = map
+                    .entry(part.to_string())
+                    .or_insert(serde_json::Value::Null);
+                if i + 1 == parts.len() {
+                    if slot.is_null() {
+                        *slot = serde_json::Value::String(format!("«fact:{path}»"));
+                    }
+                    continue 'paths;
+                }
+                if slot.is_null() {
+                    *slot = serde_json::Value::Object(Default::default());
+                }
+                current = slot;
+            }
+        }
+        out
+    }
+
     /// Mounts `value` at the dotted `name`, creating intermediate objects.
     pub fn mount(
         &mut self,
@@ -244,6 +282,34 @@ pub struct FactError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn placeholders_fill_only_missing_paths() {
+        let mut facts = Facts::new();
+        facts.tree =
+            serde_json::json!({"tailscale": {"ip": "100.1.2.3"}, "os": "debian", "cloud": null});
+        let out = facts.with_placeholders([
+            "tailscale.hostname",
+            "tailscale",
+            "tailscale.ip",
+            "cloud.provider",
+            "os.id",
+        ]);
+        assert_eq!(
+            out.tree["tailscale"]["hostname"],
+            serde_json::json!("«fact:tailscale.hostname»")
+        );
+        assert_eq!(out.tree["tailscale"]["ip"], serde_json::json!("100.1.2.3"));
+        assert_eq!(
+            out.tree["cloud"]["provider"],
+            serde_json::json!("«fact:cloud.provider»")
+        );
+        assert_eq!(
+            out.tree["os"],
+            serde_json::json!("debian"),
+            "a scalar is never replaced"
+        );
+    }
+
     use super::*;
     use crate::system::{FilePerms, System};
     use crate::testing::{CxBuilder, FakeSystem};

@@ -199,6 +199,68 @@ impl ModulePlan {
     pub fn changes(&self) -> usize {
         self.steps.iter().filter(|s| s.planned.is_change()).count()
     }
+
+    /// The digest of what this module intends ([`Plan::intent_digest`]).
+    pub fn intent_digest(&self) -> Digest {
+        Digest::of_json(&ModuleIntent::of(self))
+    }
+}
+
+/// A module plan without its rendered text (see [`Plan::intent_digest`]).
+#[derive(Serialize)]
+struct ModuleIntent<'a> {
+    module: &'a str,
+    needs: &'a [String],
+    steps: Vec<StepIntent<'a>>,
+    handlers: Vec<(&'a str, &'a str, &'a str)>,
+}
+
+#[derive(Serialize)]
+struct StepIntent<'a> {
+    resource: &'a ResourceKey,
+    task: &'a str,
+    outcome: &'static str,
+    always_runs: bool,
+    removal: RemovalPolicy,
+    notifies: &'a [String],
+}
+
+impl<'a> ModuleIntent<'a> {
+    fn of(m: &'a ModulePlan) -> Self {
+        fn outcome(planned: &Planned) -> &'static str {
+            match planned {
+                Planned::NoOp => "noop",
+                Planned::Blocked { .. } => "blocked",
+                Planned::Change { diff } => match diff {
+                    Diff::Create { .. } => "create",
+                    Diff::Update { .. } => "update",
+                    Diff::Delete { .. } => "delete",
+                    Diff::Opaque { .. } => "run",
+                },
+            }
+        }
+        ModuleIntent {
+            module: &m.module,
+            needs: &m.needs,
+            steps: m
+                .steps
+                .iter()
+                .map(|s| StepIntent {
+                    resource: &s.resource,
+                    task: &s.task.id,
+                    outcome: outcome(&s.planned),
+                    always_runs: s.always_runs,
+                    removal: s.removal,
+                    notifies: &s.notifies,
+                })
+                .collect(),
+            handlers: m
+                .handlers
+                .iter()
+                .map(|h| (h.module.as_str(), h.handler.as_str(), h.kind.as_str()))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +325,13 @@ pub struct Deferred {
     pub module: String,
     pub waiting_on: Vec<String>,
     pub reason: String,
+    /// The module planned ahead of its providers: against the facts known
+    /// now, with each fact a provider has yet to produce rendered as a
+    /// `«fact:PATH»` placeholder. Shown for review and bound by the intent
+    /// digest; at apply time the module's real plan must keep its intent.
+    /// Absent when it could not be planned ahead (e.g. its `when` waits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<ModulePlan>,
 }
 
 /// A module whose selection or plan could not be determined on this host: its
@@ -457,69 +526,20 @@ impl Plan {
     /// fingerprint, a clock) keeps it, while a new resource, a new delete or
     /// a new removal changes it. Approvals bind this digest.
     pub fn intent_digest(&self) -> Digest {
-        #[derive(Serialize)]
-        struct StepIntent<'a> {
-            resource: &'a ResourceKey,
-            task: &'a str,
-            outcome: &'static str,
-            always_runs: bool,
-            removal: RemovalPolicy,
-            notifies: &'a [String],
-        }
-        #[derive(Serialize)]
-        struct ModuleIntent<'a> {
-            module: &'a str,
-            needs: &'a [String],
-            steps: Vec<StepIntent<'a>>,
-            handlers: Vec<(&'a str, &'a str, &'a str)>,
-        }
+        /// A deferred module previewed ahead of its providers is bound by
+        /// its preview's intent; without one, by its name alone.
+        type DeferredIntent<'a> = (&'a str, &'a [String], Option<ModuleIntent<'a>>);
         #[derive(Serialize)]
         struct Intent<'a> {
             modules: Vec<ModuleIntent<'a>>,
             removals: Vec<(&'a ResourceKey, RemovalPolicy, bool)>,
             rehomed: Vec<(&'a ResourceKey, &'a ResourceKey, RehomeKind)>,
-            deferred: Vec<(&'a str, &'a [String])>,
+            deferred: Vec<DeferredIntent<'a>>,
             indeterminate: Vec<(&'a str, bool)>,
             held: Vec<&'a str>,
         }
-        fn outcome(planned: &Planned) -> &'static str {
-            match planned {
-                Planned::NoOp => "noop",
-                Planned::Blocked { .. } => "blocked",
-                Planned::Change { diff } => match diff {
-                    Diff::Create { .. } => "create",
-                    Diff::Update { .. } => "update",
-                    Diff::Delete { .. } => "delete",
-                    Diff::Opaque { .. } => "run",
-                },
-            }
-        }
         Digest::of_json(&Intent {
-            modules: self
-                .modules
-                .iter()
-                .map(|m| ModuleIntent {
-                    module: &m.module,
-                    needs: &m.needs,
-                    steps: m
-                        .steps
-                        .iter()
-                        .map(|s| StepIntent {
-                            resource: &s.resource,
-                            task: &s.task.id,
-                            outcome: outcome(&s.planned),
-                            always_runs: s.always_runs,
-                            removal: s.removal,
-                            notifies: &s.notifies,
-                        })
-                        .collect(),
-                    handlers: m
-                        .handlers
-                        .iter()
-                        .map(|h| (h.module.as_str(), h.handler.as_str(), h.kind.as_str()))
-                        .collect(),
-                })
-                .collect(),
+            modules: self.modules.iter().map(ModuleIntent::of).collect(),
             removals: self
                 .removals
                 .iter()
@@ -533,7 +553,13 @@ impl Plan {
             deferred: self
                 .deferred
                 .iter()
-                .map(|d| (d.module.as_str(), d.waiting_on.as_slice()))
+                .map(|d| {
+                    (
+                        d.module.as_str(),
+                        d.waiting_on.as_slice(),
+                        d.preview.as_ref().map(ModuleIntent::of),
+                    )
+                })
                 .collect(),
             indeterminate: self
                 .indeterminate
@@ -552,14 +578,17 @@ impl Plan {
         self.changes() == 0 && self.removals.is_empty()
     }
 
-    /// Whether any step deletes something or any removal will run.
+    /// Whether any step (a deferred module's preview included) deletes
+    /// something or any removal will run.
     pub fn is_destructive(&self) -> bool {
+        let previews = self.deferred.iter().filter_map(|d| d.preview.as_ref());
         self.removals
             .iter()
             .any(|r| r.policy == RemovalPolicy::Cleanup)
             || self
                 .modules
                 .iter()
+                .chain(previews)
                 .flat_map(|m| &m.steps)
                 .any(|s| matches!(&s.planned, Planned::Change { diff } if diff.is_destructive()))
     }

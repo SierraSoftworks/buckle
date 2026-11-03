@@ -52,6 +52,12 @@ pub struct ModuleView {
     /// Handlers that run at the end of the module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handlers: Vec<HandlerView>,
+    /// A deferred module previewed ahead of the providers it waits on: facts
+    /// they have yet to produce show as `«fact:PATH»` placeholders, and the
+    /// agent applies it only if its real plan keeps these resources and
+    /// actions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
 }
 
 /// What a step's plan decided.
@@ -234,6 +240,7 @@ mod tests {
                     },
                 ],
                 handlers: vec![],
+                deferred: false,
             }],
             ..Default::default()
         };

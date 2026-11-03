@@ -58,6 +58,9 @@ struct Script {
     intent: String,
     /// The agent announces no capabilities (it predates force apply).
     legacy_agent: bool,
+    /// On the next Apply, leave these deferred modules alone: their real
+    /// plan diverged from the approved preview.
+    stale_deferred: Vec<String>,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -329,6 +332,18 @@ impl Harness {
                                     "stale plan: the approved plan was {} but the host now plans {fresh}",
                                     a.plan_digest
                                 ),
+                                ..Default::default()
+                            }));
+                            continue;
+                        }
+                        if !s.stale_deferred.is_empty() {
+                            script.lock().unwrap().stale_deferred.clear();
+                            reply(AMsg::Result(ApplyResult {
+                                revision: a.revision.clone(),
+                                plan_digest: a.plan_digest,
+                                succeeded: false,
+                                stale_modules: s.stale_deferred.clone(),
+                                error: "module 'web': not applied".into(),
                                 ..Default::default()
                             }));
                             continue;
@@ -3357,4 +3372,28 @@ async fn an_approval_covers_a_replan_that_only_changes_content() {
             .await
             .contains(&"rollout.host.plan_content_changed".to_owned())
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_deferred_module_that_diverged_from_its_preview_replans_the_host() {
+    let mut h = Harness::new().await;
+    let id = one_host(
+        &mut h,
+        ONE_PHASE,
+        |s| s.stale_deferred = vec!["nomad".into()],
+        |a| a.state != HostPhase::PlanPending,
+    )
+    .await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Healthy, "not failed");
+    assert_eq!(h.applies().len(), 2, "re-planned and applied again");
+    assert_eq!(r.runtime.phases[0].accepted_failures, 0);
+    let plans = h
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, m)| matches!(m, SMsg::Plan(_)))
+        .count();
+    assert_eq!(plans, 2, "the host was asked to plan again");
 }

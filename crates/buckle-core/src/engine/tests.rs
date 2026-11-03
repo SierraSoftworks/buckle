@@ -1872,6 +1872,18 @@ async fn modules_needing_fresh_facts_are_deferred_in_plan_and_resolved_in_apply(
         ]
     );
 
+    // Both are previewed for review, the fact they wait for as a placeholder.
+    let preview = |m: &str| {
+        let d = plan.deferred.iter().find(|d| d.module == m).unwrap();
+        format!("{:?}", d.preview.as_ref().expect("previewed"))
+    };
+    assert!(
+        preview("q").contains("«fact:test.counter.value»"),
+        "{}",
+        preview("q")
+    );
+    assert!(preview("r").contains("/defer/r"), "{}", preview("r"));
+
     let (outcome, events) = apply_plan(&inputs, &plan).await;
     assert!(outcome.succeeded, "{outcome:#?}");
     assert_eq!(status_of(&outcome, "p"), ModuleStatus::Applied);
@@ -1887,6 +1899,35 @@ async fn modules_needing_fresh_facts_are_deferred_in_plan_and_resolved_in_apply(
     assert!(plan2.deferred.is_empty(), "{:#?}", plan2.deferred);
     assert_eq!(module_names(&plan2), vec!["p", "q", "r"]);
     assert_eq!(step(&plan2, "q", "/defer/out").planned, Planned::NoOp);
+}
+
+#[tokio::test]
+async fn a_deferred_module_that_diverges_from_its_preview_is_not_applied() {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: p\nfacts: { provides: [test.counter] }\ntasks: [ { test.file: { path: /facts/counter, content: \"7\", run: diverge1 } } ]\n",
+            ),
+            // The resource itself is named by the provided fact.
+            module(
+                "name: q\nneeds: [p]\ntasks: [ { test.file: { path: '/diverge/{{ host.facts.test.counter.value }}', run: diverge1 } } ]\n",
+            ),
+        ],
+    );
+    let sys = FakeSystem::new();
+    let mut inputs = inputs(rev, &sys);
+    inputs.facts_frozen = false;
+    inputs.facts = Facts::new();
+    let plan = plan(&inputs).await;
+    assert!(plan.deferred[0].preview.is_some(), "{plan:#?}");
+    let (outcome, _) = apply_plan(&inputs, &plan).await;
+    assert!(!outcome.succeeded, "{outcome:#?}");
+    assert_eq!(status_of(&outcome, "p"), ModuleStatus::Applied);
+    let q = module_outcome(&outcome, "q");
+    assert!(q.stale, "{q:#?}");
+    assert!(!sys.exists("/diverge/7"), "nothing of it ran");
 }
 
 #[tokio::test]

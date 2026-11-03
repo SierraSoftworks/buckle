@@ -87,6 +87,10 @@ pub struct FleetModule {
     pub steps: Vec<FleetStep>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handlers: Vec<Shared<HandlerView>>,
+    /// Hosts on which the module is deferred and shown as its preview
+    /// ([`crate::plan::ModuleView::deferred`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<String>,
 }
 
 /// One task's resource across hosts.
@@ -208,6 +212,9 @@ impl FleetPlan {
                 }
             };
             fm.hosts.push(host.to_owned());
+            if m.deferred {
+                fm.deferred.push(host.to_owned());
+            }
             for s in &m.steps {
                 let fs = match fm
                     .steps
@@ -286,6 +293,7 @@ impl FleetPlan {
                 .map(|m| FleetModule {
                     module: m.module.clone(),
                     hosts: hosts(&m.hosts),
+                    deferred: hosts(&m.deferred),
                     needs: m.needs.clone(),
                     steps: m
                         .steps

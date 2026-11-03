@@ -200,6 +200,7 @@ fn body(plan: &PlanView) -> Html {
             module_head(
                 &m.module,
                 &m.needs,
+                m.deferred,
                 Tally::of_steps(changed.iter().copied()),
                 html! {},
             ),
@@ -240,15 +241,25 @@ fn body(plan: &PlanView) -> Html {
     </> }
 }
 
-pub const DEFERRED_NOTE: &str = "If a deferred module's plan turns out destructive, the agent stops before it and asks for approval again.";
+pub const DEFERRED_NOTE: &str = "Deferred modules marked above were planned ahead of the modules they wait on, with facts those have yet to produce shown as «fact:…». If a deferred module's real plan does anything else, the agent leaves it alone and the host asks for approval again.";
+
+/// The badge on a deferred module previewed ahead of its providers.
+const DEFERRED_BADGE: &str = "Planned ahead of the modules it waits on; applied only if its real plan keeps these resources and actions.";
 pub const INDETERMINATE_NOTE: &str = "not applied; their resources are never removed";
 pub const HELD_NOTE: &str = "not applied at this revision; left alone";
 
 /// A module's heading: its name and what it needs, then (right-aligned)
 /// what it changes and, in a fleet-wide plan, on how many hosts.
-pub fn module_head(module: &str, needs: &[String], changes: Tally, hosts: Html) -> Html {
+pub fn module_head(
+    module: &str,
+    needs: &[String],
+    deferred: bool,
+    changes: Tally,
+    hosts: Html,
+) -> Html {
     html! { <>
         <h4 class="plan-module__name mono">{ module.to_string() }</h4>
+        if deferred { <span class="badge" title={DEFERRED_BADGE}>{ "deferred" }</span> }
         if !needs.is_empty() { <span class="muted">{ format!("needs: {}", needs.join(", ")) }</span> }
         <span class="plan-module__aside">{ tally(changes) }{ hosts }</span>
     </> }
