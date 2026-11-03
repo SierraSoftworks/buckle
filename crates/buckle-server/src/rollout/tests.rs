@@ -2919,8 +2919,11 @@ async fn a_host_update_resends_in_flight_work_only_when_labels_or_status_change(
     h.enrol("a", "web").await;
     h.connect("a", None);
     let id = h.start("r1").await;
-    h.wait(&id, "baking", |_, hs| {
-        host(hs, "a").state == HostPhase::Baking
+    // The bake request leaves the outbox only after Baking is saved, so wait
+    // for its report: by then the request has reached the session's log.
+    h.wait(&id, "baking with a report", |_, hs| {
+        let a = host(hs, "a");
+        a.state == HostPhase::Baking && a.runtime.bake_reports > 0
     })
     .await;
     let count = |h: &Harness| {

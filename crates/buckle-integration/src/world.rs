@@ -237,6 +237,11 @@ impl World {
         self.proxy.cut();
     }
 
+    /// A handle that cuts every agent off the server, as [`World::cut`].
+    pub fn cutter(&self) -> crate::proxy::Cutter {
+        self.proxy.cutter()
+    }
+
     /// Lets agents reach the current server again.
     pub fn reconnect(&self) {
         if let Some(s) = &self.server {
