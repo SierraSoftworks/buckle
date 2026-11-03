@@ -1330,6 +1330,35 @@ impl Controller {
                         self.live[ri].hosts[hi].plan_digest = Some(result.plan_digest.clone());
                     }
                     self.live[ri].hosts[hi].runtime.force_plan = false;
+                    // A deferred module planned differently from the preview
+                    // that was approved, so the agent left it alone. The host
+                    // is re-planned for approval rather than failed.
+                    if !result.succeeded && !result.stale_modules.is_empty() {
+                        let why = format!(
+                            "deferred {} {} planned differently from the approved preview",
+                            if result.stale_modules.len() == 1 {
+                                "module"
+                            } else {
+                                "modules"
+                            },
+                            result.stale_modules.join(", ")
+                        );
+                        let h = &mut self.live[ri].hosts[hi];
+                        h.runtime.stale_refusals += 1;
+                        h.runtime.request_id = None;
+                        h.runtime.apply_started_at = None;
+                        if h.runtime.stale_refusals >= MAX_STALE_REFUSALS {
+                            h.runtime.error =
+                                Some(format!("{why}; force apply, retry or skip the host"));
+                            self.set_host_state(ri, hi, HostPhase::Held, &why);
+                        } else {
+                            h.runtime.error = Some(why.clone());
+                            h.plan_digest = None;
+                            self.set_host_state(ri, hi, HostPhase::PlanPending, &why);
+                            self.request_plan(ri, hi);
+                        }
+                        continue;
+                    }
                     // The agent accepted and ran the approved plan.
                     self.live[ri].hosts[hi].runtime.stale_refusals = 0;
                     if result.succeeded {

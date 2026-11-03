@@ -420,6 +420,12 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             error: outcome.error.clone().unwrap_or_default(),
             error_detail: outcome.error_detail.as_ref().map(error_detail_to_proto),
             outcome_json: json_bytes(outcome),
+            stale_modules: outcome
+                .module_results
+                .iter()
+                .filter(|m| m.stale)
+                .map(|m| m.module.clone())
+                .collect(),
             failed_checks: outcome
                 .health
                 .as_ref()

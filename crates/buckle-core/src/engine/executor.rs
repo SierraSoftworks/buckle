@@ -573,6 +573,7 @@ impl<'a> Executor<'a> {
                 handlers,
                 started_at: Some(started_at),
                 finished_at: Some(self.inputs.system.now()),
+                stale: false,
             },
             health,
         };
@@ -1117,6 +1118,13 @@ impl<'a> Executor<'a> {
             .iter()
             .map(|d| d.module.clone())
             .collect();
+        // What each previewed deferred module was approved to do.
+        let previews: HashMap<String, crate::Digest> = rich
+            .plan
+            .deferred
+            .iter()
+            .filter_map(|d| Some((d.module.clone(), d.preview.as_ref()?.intent_digest())))
+            .collect();
         let order = rich.order.clone();
         let needs = rich.needs.clone();
 
@@ -1177,10 +1185,36 @@ impl<'a> Executor<'a> {
                     }
                     if !module_plans.contains_key(name) && deferred.contains(name) {
                         let state = self.with_state(|s| s.clone());
-                        match planner
+                        let planned = planner
                             .plan_deferred(name, &self.facts(), &state, &rich.desired)
-                            .await
-                        {
+                            .await;
+                        // A previewed module must do what its preview showed:
+                        // otherwise nothing of it runs, and the host is
+                        // re-planned for approval.
+                        let diverged = previews.get(name).and_then(|approved| match &planned {
+                            Ok((DeferredPlan::Planned(p), _)) => {
+                                (p.plan.intent_digest() != *approved).then_some(
+                                    "its plan now does something other than its approved preview",
+                                )
+                            }
+                            Ok((DeferredPlan::Unselected, _)) => {
+                                Some("it is no longer selected, unlike its approved preview")
+                            }
+                            _ => None,
+                        });
+                        if let Some(why) = diverged {
+                            tracing::warn!(buckle.module = %name, why, "a deferred module diverged from its approved preview");
+                            started_modules.insert(name.clone());
+                            let mut outcome = ModuleOutcome::new(name, ModuleStatus::Failed)
+                                .with_error(ErrorReport::user(format!(
+                                    "not applied: {why}; re-plan the host and approve it again"
+                                )));
+                            outcome.stale = true;
+                            results.push(outcome);
+                            plan_errors.push(name.clone());
+                            continue;
+                        }
+                        match planned {
                             Ok((DeferredPlan::Planned(planned), orphans)) => {
                                 module_plans.insert(name.clone(), Arc::new(planned));
                                 late_removals.extend(orphans);

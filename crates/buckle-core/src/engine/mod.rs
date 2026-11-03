@@ -329,6 +329,10 @@ pub struct ModuleOutcome {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
+    /// A deferred module not applied because its real plan diverged from
+    /// the approved preview: the host needs re-planning, not repair.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 impl ModuleOutcome {
@@ -345,6 +349,7 @@ impl ModuleOutcome {
             handlers: Vec::new(),
             started_at: None,
             finished_at: None,
+            stale: false,
         }
     }
 

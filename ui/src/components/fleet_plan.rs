@@ -95,7 +95,7 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
         let within = summary.changed.clone();
         Some(block(
             "",
-            module_head(&m.module, &m.needs, summary.tally, changed_of(all, &summary.changed)),
+            module_head(&m.module, &m.needs, !m.deferred.is_empty(), summary.tally, changed_of(all, &summary.changed)),
             html! {
                 <ul class="steps">
                     { for changed.into_iter().map(|s| html! {

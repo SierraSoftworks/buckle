@@ -1113,6 +1113,42 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// Plans a deferred module ahead of its `providers`, for review: against
+    /// `facts` with every fact the providers have yet to produce (and the
+    /// module reads) as a `«fact:PATH»` placeholder. `None` when it cannot be
+    /// planned ahead (its `when` is not decided yet, or it does not render).
+    pub async fn preview_deferred(
+        &self,
+        name: &str,
+        facts: &Facts,
+        state: &State,
+        providers: &[String],
+    ) -> Option<ModulePlan> {
+        let module = self.revision.module(name)?;
+        let provided: Vec<String> = providers
+            .iter()
+            .filter_map(|p| self.revision.module(p))
+            .flat_map(|p| p.config.facts.provides.iter().cloned())
+            .collect();
+        let refs = context::module_fact_references(self.revision, &module.config);
+        let facts = facts.with_placeholders(
+            refs.iter()
+                .filter(|r| context::provided_by(r, &provided))
+                .map(String::as_str),
+        );
+        let contexts = self.contexts(&facts);
+        let ctx = self.module_context(&contexts, &module.config).ok()?;
+        if !matches!(
+            contexts.decide(module.config.when.as_ref(), &ctx),
+            Decision::Yes
+        ) {
+            return None;
+        }
+        let prepared = self.prepare(module, ctx, &contexts, true, state).ok()?;
+        let plan = self.plan_module(prepared, &contexts).await.ok()?;
+        Some(plan.plan)
+    }
+
     /// Orphans: resources in state that no selected module wants any more,
     /// skipping modules whose plan is deferred (their keys are unknown yet) or
     /// indeterminate, and records `skip` names (re-homed ones). Ordered for
@@ -1458,10 +1494,20 @@ pub(super) async fn plan_with(
             );
             needs.insert(name.clone(), waits);
             order.push(name.clone());
+            // Its providers: what it waits on and what those wait on.
+            let mut providers: BTreeSet<String> = waiting_on.iter().cloned().collect();
+            for w in &waiting_on {
+                providers.extend(ancestors(revision, w));
+            }
+            let providers: Vec<String> = providers.into_iter().collect();
+            let preview = planner
+                .preview_deferred(&name, facts, state, &providers)
+                .await;
             deferred.push(Deferred {
                 module: name,
                 waiting_on,
                 reason: reasons.join("; "),
+                preview,
             });
             continue;
         }
@@ -1534,6 +1580,7 @@ pub(super) async fn plan_with(
         order.push(name.clone());
         deferred.push(Deferred {
             module: name,
+            preview: None,
             reason: format!(
                 "its `when` reads facts from {}; decided once {} applied",
                 waiting_on.join(", "),

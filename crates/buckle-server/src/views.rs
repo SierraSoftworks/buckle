@@ -74,10 +74,19 @@ pub fn host_summary(
 /// The UI's typed view of an engine plan (design §11).
 pub fn plan_view(plan: &Plan) -> PlanView {
     use buckle_core::plan::{Diff, Planned, RehomeKind};
+    // Deferred modules previewed ahead of their providers follow the
+    // planned ones, marked deferred.
+    let previews = plan
+        .deferred
+        .iter()
+        .filter_map(|d| d.preview.as_ref().map(|p| (p, true)));
     let modules = plan
         .modules
         .iter()
-        .map(|m| ModuleView {
+        .map(|m| (m, false))
+        .chain(previews)
+        .map(|(m, deferred)| ModuleView {
+            deferred,
             module: m.module.clone(),
             needs: m.needs.clone(),
             steps: m
@@ -406,6 +415,7 @@ pub(crate) mod tests {
                 module: "otel".into(),
                 waiting_on: vec!["docker.version".into()],
                 reason: "waits for facts from docker".into(),
+                preview: None,
             }],
         )
         .with_held(vec![Held {
@@ -481,12 +491,28 @@ pub(crate) mod tests {
         assert!(!view.removals[1].cleanup, "removal: leave only forgets");
 
         assert_eq!(view.deferred[0].waiting_on, vec!["docker.version"]);
+        assert!(view.modules.iter().all(|m| !m.deferred));
         assert_eq!(view.held[0].module, "backup");
         assert!(view.indeterminate[0].plan_error);
         assert_eq!(view.rehomed[0].how, "moved");
         assert_eq!(view.rehomed[0].from, "old/file.copy[/etc/x]");
         assert_eq!(view.warnings.len(), 1);
         assert_eq!(view.skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_deferred_modules_preview_is_shown_after_the_planned_modules() {
+        let mut plan = review_plan();
+        let mut preview = plan.modules[0].clone();
+        preview.module = "otel".into();
+        plan.deferred[0].preview = Some(preview);
+        let view = plan_view(&plan);
+        let names: Vec<(&str, bool)> = view
+            .modules
+            .iter()
+            .map(|m| (m.module.as_str(), m.deferred))
+            .collect();
+        assert_eq!(names, vec![("nomad", false), ("otel", true)]);
     }
 
     #[test]

@@ -152,6 +152,9 @@ message ApplyResult {
   // The run-level error (not a module's), structured. Module and step
   // errors are in outcome_json.
   ErrorDetail error_detail = 16;
+  // Deferred modules not applied because their real plan diverged from the
+  // approved preview: the host needs re-planning and approval, not repair.
+  repeated string stale_modules = 17;
 }
 
 enum HealthScope {

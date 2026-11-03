@@ -77,6 +77,12 @@ pub fn render_plan(plan: &Plan, revision: &str, facts: Option<&serde_json::Value
             deferred.reason,
             width = RESOURCE_WIDTH + 4
         );
+        // Planned ahead of its providers; applied only if it keeps this intent.
+        if let Some(preview) = &deferred.preview {
+            for step in &preview.steps {
+                render_step(&mut out, step);
+            }
+        }
     }
 
     for i in &plan.indeterminate {
@@ -738,6 +744,7 @@ mod tests {
                 module: "profiler".into(),
                 waiting_on: vec!["docker".into()],
                 reason: "waits for facts from docker".into(),
+                preview: None,
             }],
         );
         let text = render_plan(
