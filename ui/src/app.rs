@@ -28,8 +28,6 @@ pub enum Route {
     Revisions,
     #[at("/audit")]
     Audit,
-    #[at("/reference")]
-    Reference,
     #[not_found]
     #[at("/404")]
     NotFound,
@@ -165,7 +163,6 @@ fn switch(route: Route) -> Html {
         Route::Host { id } => html! { <pages::host::HostPage {id} /> },
         Route::Revisions => html! { <pages::revisions::Revisions /> },
         Route::Audit => html! { <pages::audit::Audit /> },
-        Route::Reference => html! { <pages::reference::Reference /> },
         Route::NotFound => html! { <pages::NotFound /> },
     }
 }

@@ -8,7 +8,8 @@
     "dev": "trunk serve",
     "serve": "node e2e/serve.mjs dist 8082",
     "test": "cargo test",
-    "e2e": "node e2e/run.mjs"
+    "e2e": "node e2e/run.mjs",
+    "screenshots": "node e2e/screenshots.mjs"
   },
   "devDependencies": {
     "playwright": "1.63.0"

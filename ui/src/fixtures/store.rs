@@ -10,9 +10,9 @@
 use std::cell::RefCell;
 
 use buckle_api::{
-    AgentUpgrade, ApproveRequest, AuditEntry, Catalog, Connection, ContinueRequest, Fleet,
-    HostDetail, HostPatch, HostPreview, HostRolloutState, HostStatus, HostSummary, LiveEvent, Me,
-    Page, PhaseState, RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutState,
+    AgentUpgrade, ApproveRequest, AuditEntry, Connection, ContinueRequest, Fleet, HostDetail,
+    HostPatch, HostPreview, HostRolloutState, HostStatus, HostSummary, LiveEvent, Me, Page,
+    PhaseState, RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutState,
     RolloutSummary, RunReport, RunSummary, UpgradeState,
 };
 use chrono::Utc;
@@ -780,10 +780,6 @@ pub fn continue_host(
             ))
         })
     })
-}
-
-pub fn catalog() -> Result<Catalog, ApiError> {
-    Ok(data::catalog())
 }
 
 pub fn audit(

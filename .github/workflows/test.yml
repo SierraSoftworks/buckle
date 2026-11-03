@@ -20,7 +20,8 @@ env:
 
 jobs:
   # Decides which suites a change can affect. The Rust workspace never reads
-  # ui/ or docs/ (the server embeds a placeholder UI in tests), and the UI only
+  # ui/ (the server embeds a placeholder UI in tests) and reads docs/ only to
+  # check the documentation site's generated reference, and the UI only
   # depends on buckle-api and the workspace manifest.
   changes:
     name: Detect changes
@@ -28,6 +29,7 @@ jobs:
     outputs:
       rust: ${{ steps.rust.outputs.rust }}
       ui: ${{ steps.ui.outputs.ui }}
+      docs: ${{ steps.docs.outputs.docs }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
@@ -41,6 +43,13 @@ jobs:
               - '!docs/**'
               - '!**/*.md'
       - uses: dorny/paths-filter@v3
+        id: docs
+        with:
+          filters: |
+            docs:
+              - 'docs/**/*.md'
+              - 'docs/.vuepress/data/**'
+      - uses: dorny/paths-filter@v3
         id: ui
         with:
           filters: |
@@ -53,7 +62,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     needs: [changes]
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.docs == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

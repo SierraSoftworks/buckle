@@ -16,6 +16,5 @@ pub mod live;
 pub mod pipeline;
 pub mod plan;
 pub mod run;
-pub mod schema;
 pub mod ticker;
 pub mod tone;

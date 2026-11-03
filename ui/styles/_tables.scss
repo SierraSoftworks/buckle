@@ -60,38 +60,6 @@
   &--compact td {
     padding: 0.35rem 0.6rem;
   }
-
-  &--schema {
-    table-layout: fixed;
-
-    th:nth-child(1) {
-      width: 26%;
-    }
-
-    th:nth-child(2) {
-      width: 22%;
-    }
-
-    th:nth-child(3) {
-      width: 12%;
-    }
-
-    td {
-      overflow-wrap: anywhere;
-    }
-
-    .badge {
-      margin-left: 0.4rem;
-    }
-
-    tr.is-secret > td:first-child {
-      box-shadow: inset 3px 0 0 var(--brand);
-    }
-  }
-
-  .req {
-    color: var(--danger);
-  }
 }
 
 .nowrap {

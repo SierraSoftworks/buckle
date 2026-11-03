@@ -182,15 +182,11 @@ describe("every page renders in demo mode", () => {
     await close();
   });
 
-  test("reference renders kinds from their schemas with secret fields marked", async () => {
-    const { page, close } = await open("/reference");
-    assert.equal(await heading(page), "Reference");
-    const template = page.locator("#kind-file\\.template");
-    await template.waitFor();
-    assert.match(await template.textContent(), /dest \*/);
-    assert.equal(await template.locator("tr.is-secret").count(), 1);
-    await page.getByRole("tab", { name: /Health checks/ }).click();
-    await page.locator("#kind-http").waitFor();
+  test("the sidebar links to the documentation site", async () => {
+    const { page, close } = await open("/");
+    const docs = page.getByRole("navigation", { name: "Sections" }).getByRole("link", { name: "Documentation" });
+    assert.equal(await docs.getAttribute("href"), "https://buckle.sierrasoftworks.com");
+    assert.equal(await docs.getAttribute("target"), "_blank");
     await close();
   });
 

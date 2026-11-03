@@ -1,0 +1,3402 @@
+{
+  "cli": {
+    "about": "Lightweight fleet configuration with phased, health-gated rollouts. One binary: planner, agent and server.",
+    "commands": [
+      {
+        "about": "Show what applying a configuration directory would change on this host",
+        "args": [
+          {
+            "default": null,
+            "env": "BUCKLE_CONFIG",
+            "flag": "--config",
+            "help": "The configuration directory (containing buckle.yaml)",
+            "options": [],
+            "repeatable": false,
+            "required": true,
+            "short": "-c",
+            "value": "DIR"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--host-id",
+            "help": "Host identity to plan as; defaults to the hostname",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "HOST_ID"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--labels",
+            "help": "Labels for this host, as comma-separated key=value pairs. Values are typed like YAML scalars: `canary=true` is a boolean, `rack=3` a number, `rack=\"3\"` a string",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "LABELS"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--select",
+            "help": "Restrict to tasks matching this filt-rs selector, e.g. 'task.tags contains \"network\"'",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "SELECT"
+          },
+          {
+            "default": "/var/lib/buckle",
+            "env": "BUCKLE_STATE_DIR",
+            "flag": "--state-dir",
+            "help": "Where the agent keeps its state (resources, shadows, facts cache)",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "STATE_DIR"
+          },
+          {
+            "default": "text",
+            "env": null,
+            "flag": "--output",
+            "help": "",
+            "options": [
+              "text",
+              "json"
+            ],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "OUTPUT"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--facts",
+            "help": "Use these facts (a JSON file) instead of collecting them; for authoring and tests",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "FILE"
+          }
+        ],
+        "path": "plan",
+        "usage": "buckle plan [OPTIONS] --config <DIR>"
+      },
+      {
+        "about": "Apply a configuration directory to this host",
+        "args": [
+          {
+            "default": null,
+            "env": "BUCKLE_CONFIG",
+            "flag": "--config",
+            "help": "The configuration directory (containing buckle.yaml)",
+            "options": [],
+            "repeatable": false,
+            "required": true,
+            "short": "-c",
+            "value": "DIR"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--host-id",
+            "help": "Host identity to plan as; defaults to the hostname",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "HOST_ID"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--labels",
+            "help": "Labels for this host, as comma-separated key=value pairs. Values are typed like YAML scalars: `canary=true` is a boolean, `rack=3` a number, `rack=\"3\"` a string",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "LABELS"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--select",
+            "help": "Restrict to tasks matching this filt-rs selector, e.g. 'task.tags contains \"network\"'",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "SELECT"
+          },
+          {
+            "default": "/var/lib/buckle",
+            "env": "BUCKLE_STATE_DIR",
+            "flag": "--state-dir",
+            "help": "Where the agent keeps its state (resources, shadows, facts cache)",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "STATE_DIR"
+          },
+          {
+            "default": "text",
+            "env": null,
+            "flag": "--output",
+            "help": "",
+            "options": [
+              "text",
+              "json"
+            ],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "OUTPUT"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--facts",
+            "help": "Use these facts (a JSON file) instead of collecting them; for authoring and tests",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "FILE"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--yes",
+            "help": "Apply without confirming removals of packages, users or groups",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": "-y",
+            "value": null
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--waive",
+            "help": "Waive these checks (module/check) for this run",
+            "options": [],
+            "repeatable": true,
+            "required": false,
+            "short": null,
+            "value": "WAIVE_CHECKS"
+          }
+        ],
+        "path": "apply",
+        "usage": "buckle apply [OPTIONS] --config <DIR>"
+      },
+      {
+        "about": "Show the last apply on this host: every module and step with its state and any errors",
+        "args": [
+          {
+            "default": null,
+            "env": "BUCKLE_CONFIG",
+            "flag": "--config",
+            "help": "The configuration directory. Accepted so that `status` takes the same flags as `plan` and `apply`; the report itself comes from the state directory",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": "-c",
+            "value": "DIR"
+          },
+          {
+            "default": "/var/lib/buckle",
+            "env": "BUCKLE_STATE_DIR",
+            "flag": "--state-dir",
+            "help": "Where the agent keeps its state (resources, shadows, facts cache)",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "STATE_DIR"
+          },
+          {
+            "default": "text",
+            "env": null,
+            "flag": "--output",
+            "help": "",
+            "options": [
+              "text",
+              "json"
+            ],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "OUTPUT"
+          }
+        ],
+        "path": "status",
+        "usage": "buckle status [OPTIONS]"
+      },
+      {
+        "about": "Run the health checks of the modules applied to this host",
+        "args": [
+          {
+            "default": null,
+            "env": "BUCKLE_CONFIG",
+            "flag": "--config",
+            "help": "The configuration directory (containing buckle.yaml)",
+            "options": [],
+            "repeatable": false,
+            "required": true,
+            "short": "-c",
+            "value": "DIR"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--host-id",
+            "help": "Host identity to plan as; defaults to the hostname",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "HOST_ID"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--labels",
+            "help": "Labels for this host, as comma-separated key=value pairs. Values are typed like YAML scalars: `canary=true` is a boolean, `rack=3` a number, `rack=\"3\"` a string",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "LABELS"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--select",
+            "help": "Restrict to tasks matching this filt-rs selector, e.g. 'task.tags contains \"network\"'",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "SELECT"
+          },
+          {
+            "default": "/var/lib/buckle",
+            "env": "BUCKLE_STATE_DIR",
+            "flag": "--state-dir",
+            "help": "Where the agent keeps its state (resources, shadows, facts cache)",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "STATE_DIR"
+          },
+          {
+            "default": "text",
+            "env": null,
+            "flag": "--output",
+            "help": "",
+            "options": [
+              "text",
+              "json"
+            ],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "OUTPUT"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--facts",
+            "help": "Use these facts (a JSON file) instead of collecting them; for authoring and tests",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "FILE"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--module",
+            "help": "Only these modules",
+            "options": [],
+            "repeatable": true,
+            "required": false,
+            "short": null,
+            "value": "MODULES"
+          }
+        ],
+        "path": "health",
+        "usage": "buckle health [OPTIONS] --config <DIR>"
+      },
+      {
+        "about": "Print the facts collected about this host as JSON",
+        "args": [
+          {
+            "default": null,
+            "env": null,
+            "flag": "--provider",
+            "help": "Only these providers",
+            "options": [],
+            "repeatable": true,
+            "required": false,
+            "short": null,
+            "value": "PROVIDERS"
+          }
+        ],
+        "path": "facts",
+        "usage": "buckle facts [OPTIONS]"
+      },
+      {
+        "about": "Validate a configuration directory without touching the host",
+        "args": [
+          {
+            "default": null,
+            "env": "BUCKLE_CONFIG",
+            "flag": "--config",
+            "help": "The configuration directory (containing buckle.yaml)",
+            "options": [],
+            "repeatable": false,
+            "required": true,
+            "short": "-c",
+            "value": "DIR"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--facts",
+            "help": "Facts files to validate selectors and templates against",
+            "options": [],
+            "repeatable": true,
+            "required": false,
+            "short": null,
+            "value": "FILE"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--labels",
+            "help": "Labels applied to every --facts host, as comma-separated key=value pairs (typed like `plan --labels`)",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "LABELS"
+          }
+        ],
+        "path": "validate",
+        "usage": "buckle validate [OPTIONS] --config <DIR>"
+      },
+      {
+        "about": "Run the long-lived agent",
+        "args": [
+          {
+            "default": "/etc/buckle/agent.yaml",
+            "env": "BUCKLE_AGENT_CONFIG",
+            "flag": "--config",
+            "help": "Path to agent.yaml",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": "-c",
+            "value": "CONFIG"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--allow-secret-exec",
+            "help": "In local mode (`source` in agent.yaml), let the `exec` secret provider run PROGRAM (repeatable; e.g. `op`). Off unless given",
+            "options": [],
+            "repeatable": true,
+            "required": false,
+            "short": null,
+            "value": "PROGRAM"
+          }
+        ],
+        "path": "agent",
+        "usage": "buckle agent [OPTIONS]"
+      },
+      {
+        "about": "Run the fleet server",
+        "args": [
+          {
+            "default": "server.yaml",
+            "env": "BUCKLE_SERVER_CONFIG",
+            "flag": "--config",
+            "help": "Path to server.yaml",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": "-c",
+            "value": "CONFIG"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--print-fingerprint",
+            "help": "Print the SHA-256 fingerprint of the gRPC TLS certificate (generating it in `auto` mode) for `buckle install agent --ca-fingerprint`, then exit",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": null
+          }
+        ],
+        "path": "server",
+        "usage": "buckle server [OPTIONS]"
+      },
+      {
+        "about": "Install the agent: write agent.yaml and a service unit, then start it",
+        "args": [
+          {
+            "default": null,
+            "env": null,
+            "flag": "--server",
+            "help": "Server URL, e.g. https://buckle.example.ts.net:7700",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "SERVER"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--source",
+            "help": "Local configuration directory to watch instead of a server",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "SOURCE"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--token",
+            "help": "Bootstrap token for enrolment (not needed over Tailscale)",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "TOKEN"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--ca-fingerprint",
+            "help": "Pin the server certificate by fingerprint (sha256:…)",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "CA_FINGERPRINT"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--ca-file",
+            "help": "Trust this CA bundle (PEM) instead of the system roots",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "FILE"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--insecure-plaintext",
+            "help": "Allow a plaintext connection (only sensible over a tailnet)",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": null
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--state-dir",
+            "help": "Where the agent keeps its state",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "DIR"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--label",
+            "help": "Seed labels, repeatable: --label role=worker",
+            "options": [],
+            "repeatable": true,
+            "required": false,
+            "short": null,
+            "value": "LABELS"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--host-id",
+            "help": "Host identity override",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "HOST_ID"
+          },
+          {
+            "default": "/etc/buckle/agent.yaml",
+            "env": null,
+            "flag": "--config",
+            "help": "Where to write agent.yaml",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "CONFIG"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--no-service",
+            "help": "Write the files but do not install or start the service",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": null
+          }
+        ],
+        "path": "install agent",
+        "usage": "buckle install agent [OPTIONS]"
+      },
+      {
+        "about": "List the task kinds, fact providers and health checks built into this binary",
+        "args": [
+          {
+            "default": null,
+            "env": null,
+            "flag": "--json",
+            "help": "",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": null
+          }
+        ],
+        "path": "catalog",
+        "usage": "buckle catalog [OPTIONS]"
+      },
+      {
+        "about": "Update this binary to the latest release",
+        "args": [
+          {
+            "default": null,
+            "env": null,
+            "flag": "--to",
+            "help": "Install this release instead of the latest one",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "VERSION"
+          }
+        ],
+        "path": "update",
+        "usage": "buckle update [OPTIONS]"
+      },
+      {
+        "about": "Convert a Buckle 1.x package directory into a v2 module tree",
+        "args": [
+          {
+            "default": null,
+            "env": null,
+            "flag": "<V1_DIR>",
+            "help": "The Buckle 1.x configuration directory (the one you gave `--config`)",
+            "options": [],
+            "repeatable": false,
+            "required": true,
+            "short": null,
+            "value": null
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "<OUT_DIR>",
+            "help": "Where to write the v2 repository. Must be new or empty, unless `--force` is given",
+            "options": [],
+            "repeatable": false,
+            "required": true,
+            "short": null,
+            "value": null
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--force",
+            "help": "Replace buckle.yaml, vars/, modules/, facts.d/ and secrets.d/ in OUT_DIR",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": null
+          }
+        ],
+        "path": "migrate",
+        "usage": "buckle migrate [OPTIONS] <V1_DIR> <OUT_DIR>"
+      }
+    ],
+    "global": [
+      {
+        "default": null,
+        "env": "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "flag": "--otel-endpoint",
+        "help": "OpenTelemetry OTLP endpoint for traces and metrics",
+        "options": [],
+        "repeatable": false,
+        "required": false,
+        "short": null,
+        "value": "OTEL_ENDPOINT"
+      },
+      {
+        "default": null,
+        "env": null,
+        "flag": "--verbose",
+        "help": "Also write spans and logs to stdout",
+        "options": [],
+        "repeatable": false,
+        "required": false,
+        "short": "-v",
+        "value": null
+      }
+    ]
+  },
+  "facts": [
+    {
+      "description": "Cloud provider details (oci, azure) from the instance metadata service; null elsewhere.",
+      "details": null,
+      "fields": [],
+      "kind": "cloud",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Docker engine version and whether the daemon is running (null when not installed).",
+      "details": null,
+      "fields": [],
+      "kind": "docker",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Architecture, CPU count, memory, swap and disks (with flat disk.<name> keys for selectors).",
+      "details": null,
+      "fields": [],
+      "kind": "hardware",
+      "locks": [],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Hostname, FQDN, network interfaces and the default route.",
+      "details": null,
+      "fields": [],
+      "kind": "net",
+      "locks": [],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Nomad version and node eligibility (null when nomad is not installed).",
+      "details": null,
+      "fields": [],
+      "kind": "nomad",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Operating system: family, id, codename, version, pretty_name and kernel.",
+      "details": null,
+      "fields": [],
+      "kind": "os",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Custom facts from executables in the facts.d directory, mounted at script.<name>.",
+      "details": null,
+      "fields": [],
+      "kind": "script",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "systemd version and units (with flat active and failed name lists).",
+      "details": null,
+      "fields": [],
+      "kind": "systemd",
+      "locks": [],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Tailscale identity: hostname, ips, tags, online (null when not installed).",
+      "details": null,
+      "fields": [],
+      "kind": "tailscale",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Local user accounts (name, uid, gid, home, shell).",
+      "details": null,
+      "fields": [],
+      "kind": "users",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    }
+  ],
+  "health": [
+    {
+      "description": "Run a command and check its exit status and output.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The command: an argv list, or a shell string.",
+          "options": [],
+          "path": "run",
+          "required": true,
+          "secret": false,
+          "ty": "string | array of string"
+        },
+        {
+          "default": "{\"exit\":0,\"stdout_matches\":null}",
+          "depth": 0,
+          "description": "What the command must do.",
+          "options": [],
+          "path": "expect",
+          "required": false,
+          "secret": false,
+          "ty": "object"
+        },
+        {
+          "default": "0",
+          "depth": 1,
+          "description": "The required exit status; defaults to 0.",
+          "options": [],
+          "path": "expect.exit",
+          "required": false,
+          "secret": false,
+          "ty": "integer"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": "A regular expression that standard output must match.",
+          "options": [],
+          "path": "expect.stdout_matches",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "30s",
+          "depth": 0,
+          "description": "How long the command may run; defaults to 30s.",
+          "options": [],
+          "path": "timeout",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "command",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Check that a file exists, is recent (max_age) and contains a string.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The path to check.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A string the file must contain.",
+          "options": [],
+          "path": "contains",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "true",
+          "depth": 0,
+          "description": "Whether the file must exist; defaults to true.",
+          "options": [],
+          "path": "exists",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "The file must have been modified within this long.",
+          "options": [],
+          "path": "max_age",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        }
+      ],
+      "kind": "file",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Evaluate a filter expression over the host's facts (for example free disk space).",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The filt-rs expression, e.g. `host.facts.hardware.disk.root.free_percent > 10`.",
+          "options": [],
+          "path": "expr",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "filter",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Request a URL and check the status code and, optionally, the body.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The URL to request.",
+          "options": [],
+          "path": "url",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "{\"body_contains\":null,\"status\":null}",
+          "depth": 0,
+          "description": "What the response must look like.",
+          "options": [],
+          "path": "expect",
+          "required": false,
+          "secret": false,
+          "ty": "object"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": "A string the response body must contain.",
+          "options": [],
+          "path": "expect.body_contains",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": "The exact status code required; any 2xx when omitted.",
+          "options": [],
+          "path": "expect.status",
+          "required": false,
+          "secret": false,
+          "ty": "integer?"
+        },
+        {
+          "default": "{}",
+          "depth": 0,
+          "description": "Request headers. Values may reference secrets (`{{ secrets.token }}`).",
+          "options": [],
+          "path": "headers",
+          "required": false,
+          "secret": true,
+          "ty": "map of secret string"
+        },
+        {
+          "default": "GET",
+          "depth": 0,
+          "description": "The HTTP method; defaults to `GET`.",
+          "options": [],
+          "path": "method",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "10s",
+          "depth": 0,
+          "description": "How long to wait for the response; defaults to 10s.",
+          "options": [],
+          "path": "timeout",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "{\"insecure\":false}",
+          "depth": 0,
+          "description": "TLS options.",
+          "options": [],
+          "path": "tls",
+          "required": false,
+          "secret": false,
+          "ty": "object"
+        },
+        {
+          "default": "false",
+          "depth": 1,
+          "description": "Accept any TLS certificate.",
+          "options": [],
+          "path": "tls.insecure",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "http",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Check that a systemd unit is active (or inactive), and has been up for min_uptime.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The unit, e.g. `nomad.service`.",
+          "options": [],
+          "path": "unit",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "The unit must have been active at least this long.",
+          "options": [],
+          "path": "min_uptime",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "active",
+          "depth": 0,
+          "description": "The state the unit must be in: `active` (default) or `inactive`.",
+          "options": [
+            "active",
+            "inactive"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        }
+      ],
+      "kind": "systemd",
+      "locks": [],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    },
+    {
+      "description": "Check that a TCP port accepts connections.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The address to connect to, e.g. `127.0.0.1:4647`.",
+          "options": [],
+          "path": "address",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "5s",
+          "depth": 0,
+          "description": "How long to wait for the connection; defaults to 5s.",
+          "options": [],
+          "path": "timeout",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "tcp",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": null,
+      "shape": null
+    }
+  ],
+  "tasks": [
+    {
+      "description": "Install, upgrade or remove Debian packages (present, latest, absent; pinned versions; .deb URLs).",
+      "details": null,
+      "fields": [
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "URL of a `.deb` to download and install; requires `name`.",
+          "options": [],
+          "path": "deb",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "true",
+          "depth": 0,
+          "description": "Install recommended packages too (apt's default).",
+          "options": [],
+          "path": "install_recommends",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A single package name.",
+          "options": [],
+          "path": "name",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Several package names, managed as one resource.",
+          "options": [],
+          "path": "names",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Allow removal to take along packages that depend on these.",
+          "options": [],
+          "path": "remove_dependents",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "present",
+          "depth": 0,
+          "description": "`present` (default), `latest` or `absent`.",
+          "options": [
+            "present",
+            "absent",
+            "latest"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Run `apt-get update` before installing.",
+          "options": [],
+          "path": "update_cache",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Exact version to install (`1.22.1-9`), or a wildcard such as `1.22.*`.",
+          "options": [],
+          "path": "version",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        }
+      ],
+      "kind": "apt.package",
+      "locks": [
+        "apt"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": true,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Add an apt repository (deb822 .sources file) and download its signing key.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "File name stem: `/etc/apt/sources.list.d/<name>.sources`.",
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Suites (distributions), e.g. `bookworm`.",
+          "options": [],
+          "path": "suites",
+          "required": true,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Restrict to these architectures (`amd64`, `arm64`).",
+          "options": [],
+          "path": "architectures",
+          "required": false,
+          "secret": false,
+          "ty": "array of string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Credentials for a private repository, written to apt's auth.conf.d.",
+          "options": [],
+          "path": "auth",
+          "required": false,
+          "secret": false,
+          "ty": "object?"
+        },
+        {
+          "default": null,
+          "depth": 1,
+          "description": "The user name (or token name) apt sends.",
+          "options": [],
+          "path": "auth.login",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 1,
+          "description": "The password or token; may reference secrets (`{{ secrets.repo_token }}`).",
+          "options": [],
+          "path": "auth.password",
+          "required": true,
+          "secret": true,
+          "ty": "secret string"
+        },
+        {
+          "default": "[\"main\"]",
+          "depth": 0,
+          "description": "Components; defaults to `[main]`.",
+          "options": [],
+          "path": "components",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "true",
+          "depth": 0,
+          "description": "Write the source disabled (`Enabled: no`).",
+          "options": [],
+          "path": "enabled",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Where the signing key comes from.",
+          "options": [],
+          "path": "signed_by",
+          "required": false,
+          "secret": false,
+          "ty": "object?"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": "URL of a binary keyring, saved as `/usr/share/keyrings/<name>.gpg`.",
+          "options": [],
+          "path": "signed_by.keyring_url",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": "A keyring file that already exists on the host.",
+          "options": [],
+          "path": "signed_by.path",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": "URL of an ASCII-armoured public key, saved as `/usr/share/keyrings/<name>.asc`.",
+          "options": [],
+          "path": "signed_by.url",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "[\"deb\"]",
+          "depth": 0,
+          "description": "Archive types; defaults to `[deb]`.",
+          "options": [],
+          "path": "types",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A single repository URI.",
+          "options": [],
+          "path": "uri",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Several mirror URIs for the same repository.",
+          "options": [],
+          "path": "uris",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        }
+      ],
+      "kind": "apt.repository",
+      "locks": [
+        "apt"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Run apt-get update when the package index is older than max_age.",
+      "details": null,
+      "fields": [
+        {
+          "default": "1h",
+          "depth": 0,
+          "description": "Refresh when the index is older than this (`30m`, `1h`, `1d`).",
+          "options": [],
+          "path": "max_age",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "apt.update",
+      "locks": [
+        "apt"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "leave",
+      "shape": null
+    },
+    {
+      "description": "Extract a tar, tar.gz or zip archive from a URL, host path or module file into a directory.",
+      "details": "Extracts a `.tar.gz`, `.tgz`, `.tar` or `.zip` archive into `dest`.\n\n```yaml\n- archive.extract:\n    src: https://example.com/tool-1.2.3-linux-amd64.tar.gz   # URL, absolute host path, or module file\n    dest: /opt/tool\n    strip_components: 1              # drop the archive's top-level directory\n    include: [\"tool\", \"LICENSE\"]     # optional; exact names, `*` globs, or directory prefixes\n    creates: /opt/tool/tool          # skip the task when this exists\n    owner: root\n    group: root\n    mode: \"0755\"                     # applied to extracted files (not directories)\n```\n\n`src` is fetched over HTTP(S) when it starts with `http://` or `https://`,\nread from the host when it is an absolute path, and otherwise read from the\nmodule's `files/` directory. The archive format is detected from its\ncontent, so unusual file names are fine.\n\nWithout `creates`, the plan compares every file in the archive with `dest`\nand is a no-op only when they all match; for a URL that means downloading\nthe archive on every plan, so give remote archives a `creates:` path (which\nmay be relative to `dest`) to skip the work. `creates` must be produced by\nthe archive, or the task fails after extracting.\n\nEntries that would land outside `dest` (absolute paths, `..`) are rejected,\nas is writing beneath a symlink the archive itself created. The archive is\nheld in memory and may not expand beyond 1 GiB. Files keep the archive's\nmodes unless `mode` is set. A symlink entry never replaces an existing\nfile or directory (or a symlink Buckle did not create) unless\n`force: true`; the plan is blocked instead.\n\nRemoval deletes the files Buckle extracted, and the directories it created\nif they are then empty, but only if every file is still exactly as\nextracted; otherwise it leaves everything in place. Files that were\nalready in `dest` before Buckle first extracted over them are not Buckle's\nand are never deleted.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute directory to extract into (created if missing).",
+          "options": [],
+          "path": "dest",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "URL, absolute host path, or path relative to the module's `files/` directory.",
+          "options": [],
+          "path": "src",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Skip the task when this path exists (relative paths are relative to `dest`).",
+          "options": [],
+          "path": "creates",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Let symlink entries replace existing files, directories or foreign symlinks.",
+          "options": [],
+          "path": "force",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Only extract entries matching one of these names, `*` globs or directory prefixes.",
+          "options": [],
+          "path": "include",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "0",
+          "depth": 0,
+          "description": "Number of leading path components to drop from every entry.",
+          "options": [],
+          "path": "strip_components",
+          "required": false,
+          "secret": false,
+          "ty": "integer"
+        }
+      ],
+      "kind": "archive.extract",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Run a command, made idempotent with creates, unless, only_if and changed_when; secrets reach it through the environment.",
+      "details": "Runs a command, guarded so that it only runs when something needs doing.\n\n```yaml\n- command.run:\n    run: [\"nomad\", \"node\", \"eligibility\", \"-enable\", \"-self\"]   # argv, or a string run with `sh -c`\n    unless: \"nomad node status -self -json | grep -q '\\\"SchedulingEligibility\\\": \\\"eligible\\\"'\"\n    creates: /var/lib/app/initialised     # skip when this path exists\n    only_if: [\"test\", \"-d\", \"/srv/data\"]  # skip unless this exits 0\n    changed_when: \"output_contains:created\"   # always | never | output_contains:<text> | exit:<code>\n    env:\n      API_TOKEN: \"{{ secrets.api_token }}\"  # secrets go through the process-environment sink\n    cwd: /srv/app\n    timeout: 2m\n    remove: [\"rm\", \"-f\", \"/var/lib/app/initialised\"]   # cleanup when the task leaves the config\n    capture: redacted                      # redacted (default) | always | never\n```\n\n**Planning.** `creates` existing, `unless` exiting 0 or `only_if` exiting\nnon-zero all make the plan a no-op. The `unless` and `only_if` probes run in\nplan mode too, so they must be read-only. A command with none of `creates`,\n`unless` or `changed_when` is planned as `always runs: <command>` so the\nauthor sees the smell; the plan of such a task is never a no-op.\n\n**Applying.** The command runs and fails the task on a non-zero exit (except\nwhen `changed_when: exit:<code>` names that code). `changed_when` decides\nwhether the run counts as a change for handlers: `always` (the default),\n`never`, `output_contains:<text>` (stdout or stderr) or `exit:<code>`.\n\n**Secrets.** An `env` value that references `secrets.` is rendered with the\nreal value and handed to the process through the environment sink; it is\nnever rendered into the plan, the logs or the state. When any env value is\nsecret, the command's output is not captured (nor shown in errors) unless\n`capture: always` is set. By default (`capture: redacted`) stdout and stderr\nare recorded on the task's tracing span, truncated to 4 KiB each; `never`\nrecords nothing.\n\n**Removal.** With `remove`, the cleanup command runs when the task leaves\nthe configuration (in the same `cwd`, with the non-secret `env`). Without it\nthe removal is reported as \"no cleanup defined\".\n\n**Identity.** The resource is keyed by its rendered command, so editing the\ncommand or a var inside it re-keys it (a removal plus an addition). Give a\ntemplated command, or one with `remove`, a stable task `id`.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The command: an argv list, or a string run with `sh -c`.",
+          "options": [],
+          "path": "run",
+          "required": true,
+          "secret": false,
+          "ty": "string | array of string"
+        },
+        {
+          "default": "redacted",
+          "depth": 0,
+          "description": "Whether output is recorded on the task's span.",
+          "options": [
+            "redacted",
+            "always",
+            "never"
+          ],
+          "path": "capture",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "`always`, `never`, `output_contains:<text>` or `exit:<code>`.",
+          "options": [],
+          "path": "changed_when",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Skip when this path exists.",
+          "options": [],
+          "path": "creates",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "cwd",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "{}",
+          "depth": 0,
+          "description": "Environment variables; values may be templates and may reference secrets\n(they are rendered for real and handed over through the environment sink).",
+          "options": [],
+          "path": "env",
+          "required": false,
+          "secret": true,
+          "ty": "map of secret string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A probe that must exit 0 for the command to run.",
+          "options": [],
+          "path": "only_if",
+          "required": false,
+          "secret": false,
+          "ty": "string | array of string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A cleanup command run when the task is removed from the configuration.",
+          "options": [],
+          "path": "remove",
+          "required": false,
+          "secret": false,
+          "ty": "string | array of string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "How long the command may run, e.g. `30s` or `5m`.",
+          "options": [],
+          "path": "timeout",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A probe that exits 0 when nothing needs doing. Runs in plan mode too.",
+          "options": [],
+          "path": "unless",
+          "required": false,
+          "secret": false,
+          "ty": "string | array of string?"
+        }
+      ],
+      "kind": "command.run",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Manage a cron job as a Buckle-owned file in /etc/cron.d.",
+      "details": "Manages a cron job as its own file in `/etc/cron.d`.\n\n```yaml\n- cron.job:\n    name: backup-nightly            # file name: letters, digits, '-' and '_' only\n    user: root                      # default: root\n    schedule: \"30 2 * * *\"          # five fields, or @hourly @daily @weekly @monthly @yearly @reboot\n    command: /usr/local/bin/backup --quiet\n    state: present                  # or absent\n```\n\nThe file `/etc/cron.d/<name>` (mode 0644, root) is owned entirely by\nBuckle. Unescaped `%` characters in `command` are escaped for you, because\ncron would otherwise treat them as newlines. `command` must be one line.\nRemoval deletes the file if it still has the content Buckle wrote.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "command",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "schedule",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "present",
+          "depth": 0,
+          "description": "`present` or `absent`, for kinds that can remove what they manage.",
+          "options": [
+            "present",
+            "absent"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "root",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "user",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "cron.job",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Pull a container image (missing or always, detecting digest changes), or remove it.",
+      "details": "Pulls a container image with Docker, or removes it.\n\n```yaml\n- docker.image:\n    name: ghcr.io/example/profiler:1.4.0   # include the tag (or an @sha256 digest)\n    pull: missing                           # missing (default) | always\n    state: present                          # or absent\n```\n\nWith `pull: missing` the image is pulled only when `docker image inspect`\ncannot find it. With `pull: always` the image is pulled on every apply so a\nmoving tag such as `latest` is refreshed; the task is then reported as\nchanged only if the image's `RepoDigests` differ before and after the pull,\nbut because the registry is not consulted in plan mode it always appears as\na pending change in plans. Pin tags or digests where that is not wanted.\n\nRequires `docker` on the PATH (reported as blocked when missing). Removal\nruns `docker image rm` for an image Buckle pulled; an image still used by a\ncontainer is left in place. It holds the `docker` lock.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "missing",
+          "depth": 0,
+          "description": null,
+          "options": [
+            "always",
+            "missing"
+          ],
+          "path": "pull",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "present",
+          "depth": 0,
+          "description": "`present` or `absent`, for kinds that can remove what they manage.",
+          "options": [
+            "present",
+            "absent"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        }
+      ],
+      "kind": "docker.image",
+      "locks": [
+        "docker"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Ensure a file, symlink or directory does not exist.",
+      "details": "Ensures a file, symlink or directory does not exist.\n\n```yaml\n- file.absent:\n    path: /etc/motd.d/10-legacy\n    recursive: false      # required to delete a non-empty directory\n```\n\nA symlink is removed as a link and its target is left alone. A non-empty\ndirectory is reported as blocked unless `recursive: true`. A recursive\ndelete is refused for `/`, for any top-level directory (`/etc`, `/var`,\n`/home`, ...), for well-known system directories such as `/usr/lib` or\n`/var/lib`, for a path containing `..`, and for a path that is empty or\nhas surrounding whitespace (the usual sign of a template that rendered\nnothing). Because Buckle\ndeleted something that was not its own, there is nothing to undo when the\ntask is later removed from the configuration.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path to delete.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Delete directories together with their contents.",
+          "options": [],
+          "path": "recursive",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "file.absent",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Manage a marked block of lines inside a text file (blockinfile).",
+      "details": "Manages a block of lines between marker comments, like Ansible's `blockinfile`.\n\n```yaml\n- file.block:\n    path: /etc/hosts\n    marker: \"# {mark} nomad cluster\"      # {mark} becomes BEGIN / END\n    block: |\n      10.0.0.1 nomad-1\n      10.0.0.2 nomad-2\n    insert_after: '^127\\.0\\.0\\.1'          # optional; default is the end of the file\n```\n\nThe block, including its `BEGIN` and `END` marker lines, is inserted when\nmissing and rewritten in place when its content differs. `insert_after` and\n`insert_before` take a pattern (the last match wins) or `EOF` / `BOF` and\nonly matter when the block is first inserted. With `state: absent` the\nblock and its markers are deleted. The file must exist unless\n`create: true`; mode and ownership are preserved; `backup: true` keeps a\ntimestamped copy before each edit.\n\nThe marker lines delimit what Buckle owns, so removal deletes everything\nbetween them, and a file Buckle created is deleted if that leaves it empty.\nTwo blocks in one file need different `marker`s. Edits of one file are\nserialised across modules.\n\n`validate` is a command (argv) that checks the new content before it\nreplaces the file (and while planning); `{path}` stands for a private\ntemporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero\nexit fails the task and leaves the file untouched. Without `validate`,\n`/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with\n`visudo -cf {path}` and `sshd -t -f {path}` (when those tools are\ninstalled); `validate: []` turns that off.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path of the file to edit.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Keep a timestamped `.bak` copy before editing.",
+          "options": [],
+          "path": "backup",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "",
+          "depth": 0,
+          "description": "The lines of the block (may be empty, which leaves just the markers).",
+          "options": [],
+          "path": "block",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Create the file when it does not exist.",
+          "options": [],
+          "path": "create",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Insert after the last line matching this pattern, or `EOF`.",
+          "options": [],
+          "path": "insert_after",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Insert before the last line matching this pattern, or `BOF`.",
+          "options": [],
+          "path": "insert_before",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "# {mark} BUCKLE MANAGED BLOCK",
+          "depth": 0,
+          "description": "Marker line template containing `{mark}`.",
+          "options": [],
+          "path": "marker",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "present",
+          "depth": 0,
+          "description": "`present` or `absent`, for kinds that can remove what they manage.",
+          "options": [
+            "present",
+            "absent"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A command that checks the new content; `{path}` stands for the file to check.\nDefault: automatic for sudoers and sshd_config; `[]` disables.",
+          "options": [],
+          "path": "validate",
+          "required": false,
+          "secret": false,
+          "ty": "array of string?"
+        }
+      ],
+      "kind": "file.block",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Copy a file from the module's files/ directory to the host, with mode, owner and group.",
+      "details": "Copies a file from the module's `files/` directory to `dest`.\n\n```yaml\n- file.copy:\n    src: nomad/client.hcl        # relative to the module's files/ directory\n    dest: /etc/nomad.d/client.hcl\n    mode: \"0640\"                  # optional; owner and group too\n    owner: root\n    group: nomad\n    backup: true                  # keep a timestamped copy of the file being replaced\n```\n\nThe file is written atomically. Plans show a unified diff for text files\nand a digest change for binary ones. Removal deletes `dest` only if its\ncontent still matches what Buckle wrote; otherwise it is left in place.\n\n`validate` is a command (argv) that checks the new content before it\nreplaces the file (and while planning); `{path}` stands for a private\ntemporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero\nexit fails the task and leaves the file untouched. Without `validate`,\n`/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with\n`visudo -cf {path}` and `sshd -t -f {path}` (when those tools are\ninstalled); `validate: []` turns that off.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute destination path on the host.",
+          "options": [],
+          "path": "dest",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Source path, relative to the module's `files/` directory.",
+          "options": [],
+          "path": "src",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Keep a timestamped `.bak` copy of the destination before replacing its content.",
+          "options": [],
+          "path": "backup",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A command that checks the new content; `{path}` stands for the file to check.\nDefault: automatic for sudoers and sshd_config; `[]` disables.",
+          "options": [],
+          "path": "validate",
+          "required": false,
+          "secret": false,
+          "ty": "array of string?"
+        }
+      ],
+      "kind": "file.copy",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Ensure a directory exists with the given mode, owner and group (optionally recursively).",
+      "details": "Ensures a directory exists with the given permissions.\n\n```yaml\n- file.directory:\n    path: /var/lib/nomad\n    mode: \"0750\"\n    owner: nomad\n    group: nomad\n    recurse: false\n```\n\nMissing parent directories are created too. With `recurse: true` the\npermissions are also applied to everything already inside the directory\n(the mode applies to files as well as directories, so prefer setting\n`owner` and `group` when recursing). `recurse` is about permissions only.\n\nRemoval deletes the directory only if Buckle created it and it is empty\n(files that other tasks wrote into it are removed by those tasks first,\nsince removals run in reverse order). Contents Buckle did not create, such\nas the data a service keeps in `/var/lib/nomad`, are never deleted, and a\ndirectory that existed before Buckle managed it is never deleted.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path of the directory.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Apply the permissions to existing contents as well (never affects removal).",
+          "options": [],
+          "path": "recurse",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "file.directory",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Download a URL to a file, verifying a SHA-256 checksum, and write it atomically.",
+      "details": "Downloads a URL to `dest`, optionally verifying a SHA-256 checksum.\n\n```yaml\n- file.download:\n    url: https://releases.example.com/tool-1.2.3-linux-amd64\n    dest: /usr/local/bin/tool\n    mode: \"0755\"\n    checksum: \"sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"\n    # or: checksum: https://releases.example.com/tool-1.2.3.sha256\n    headers: { Authorization: \"Bearer {{ secrets.release_token }}\" }   # values may use secrets\n    force: false\n```\n\nWith `checksum`, the file is up to date when its SHA-256 matches, and the\ndownload is verified before anything is written: a mismatch is an error and\nleaves `dest` untouched. The checksum may be `sha256:<hex>`, a bare hex\ndigest, or the URL of a `.sha256` / `SHA256SUMS` file (the line naming the\ndownloaded file is used). Without `checksum`, an existing `dest` is\nconsidered up to date and is never re-downloaded, unless `force: true`,\nwhich downloads on every apply (and so always shows as a change).\n\nThe download is held in memory and written atomically. Removal deletes\n`dest` only if its content still matches what Buckle wrote.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute destination path.",
+          "options": [],
+          "path": "dest",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The URL to GET.",
+          "options": [],
+          "path": "url",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "`sha256:<hex>`, a bare hex digest, or the URL of a file containing one.",
+          "options": [],
+          "path": "checksum",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Download again even if `dest` exists (when no checksum is given).",
+          "options": [],
+          "path": "force",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "{}",
+          "depth": 0,
+          "description": "Extra request headers (also sent when fetching a checksum URL). Values\nmay reference secrets: `Authorization: \"Bearer {{ secrets.token }}\"`.",
+          "options": [],
+          "path": "headers",
+          "required": false,
+          "secret": true,
+          "ty": "map of secret string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        }
+      ],
+      "kind": "file.download",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Ensure a line is present in, replaced in or removed from a text file (lineinfile).",
+      "details": "Ensures a line is present in (or absent from) a text file, like Ansible's `lineinfile`.\n\n```yaml\n- file.line:\n    path: /etc/ssh/sshd_config\n    line: \"PasswordAuthentication no\"\n    regex: '^#?PasswordAuthentication\\b'   # replace the last matching line\n\n- file.line:                      # without `regex`: append when missing\n    path: /etc/hosts\n    line: \"10.0.0.5 vault.internal\"\n\n- file.line:                      # remove every matching line\n    path: /etc/fstab\n    state: absent\n    regex: '\\sswap\\s'\n```\n\nWith `state: present` (the default): when `regex` matches, the **last**\nmatching line is replaced by `line`; when nothing matches, `line` is\ninserted unless it is already in the file. Insertion goes after the last\nline matching `insert_after` (or `EOF`), before the last line matching\n`insert_before` (or `BOF`), and otherwise at the end of the file.\n\nWith `state: absent`, every line matching `regex` (or, without `regex`,\nequal to `line`) is deleted.\n\nThe file must exist unless `create: true`. Mode and ownership are\npreserved. `backup: true` keeps a timestamped copy before each edit.\n\n`validate` is a command (argv) that checks the new content before it\nreplaces the file (and while planning); `{path}` stands for a private\ntemporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero\nexit fails the task and leaves the file untouched. Without `validate`,\n`/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with\n`visudo -cf {path}` and `sshd -t -f {path}` (when those tools are\ninstalled); `validate: []` turns that off.\n\nRemoval reverts the edit: a line Buckle added is deleted again (one\noccurrence only, so an identical line another task owns stays), a line it\nreplaced is restored to its original text, and a file it created is deleted\nwhen it ends up empty. Edits made by `state: absent` are not restored.\n\nThe resource is identified by `path` and `regex` when a `regex` is given\n(else by `path` and `line`), so changing the `line` of a regex task updates\nthe same line in place and removal still restores the text from before\nBuckle's first edit. Edits of one file are serialised across modules.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path of the file to edit.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Keep a timestamped `.bak` copy before editing.",
+          "options": [],
+          "path": "backup",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Create the file when it does not exist.",
+          "options": [],
+          "path": "create",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Insert after the last line matching this pattern, or `EOF`.",
+          "options": [],
+          "path": "insert_after",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Insert before the last line matching this pattern, or `BOF`.",
+          "options": [],
+          "path": "insert_before",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "The line to ensure (required for `state: present`; must be a single line).",
+          "options": [],
+          "path": "line",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Pattern selecting the line to replace (present) or delete (absent).",
+          "options": [],
+          "path": "regex",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "present",
+          "depth": 0,
+          "description": "`present` or `absent`, for kinds that can remove what they manage.",
+          "options": [
+            "present",
+            "absent"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A command that checks the new content; `{path}` stands for the file to check.\nDefault: automatic for sudoers and sshd_config; `[]` disables.",
+          "options": [],
+          "path": "validate",
+          "required": false,
+          "secret": false,
+          "ty": "array of string?"
+        }
+      ],
+      "kind": "file.line",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Ensure a symbolic link exists and points at the given target.",
+      "details": "Ensures `path` is a symbolic link to `target`.\n\n```yaml\n- file.symlink:\n    path: /usr/local/bin/nomad\n    target: /opt/nomad/1.9.0/nomad\n    force: true       # replace an existing file (or empty directory) at `path`\n```\n\nA symlink pointing elsewhere is always replaced. Anything else at `path`\nblocks the plan unless `force: true`; `force` deletes a file but will not\ndelete a directory that has contents. Removal deletes the link if it still\npoints where Buckle pointed it.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path of the link.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "What the link points to (not required to exist).",
+          "options": [],
+          "path": "target",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Replace a regular file or empty directory found at `path`.",
+          "options": [],
+          "path": "force",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "file.symlink",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Render a template from the module's files/ directory (secret-aware) and write it to the host.",
+      "details": "Renders a template from the module's `files/` directory and writes the result to `dest`.\n\n```yaml\n- file.template:\n    src: nomad/server.hcl.j2\n    dest: /etc/nomad.d/server.hcl\n    mode: \"0640\"\n    owner: root\n    group: nomad\n    validate: [\"nomad\", \"config\", \"validate\", \"{path}\"]   # optional\n    backup: false\n```\n\nTemplates are rendered twice (design section 06): a redacted render, in\nwhich secrets appear as `«secret:NAME@fingerprint»` tokens, is used for plan\npreviews and the state shadow; the real render is written through a file\nsink and only its digest is kept. A plan therefore never contains a secret\nvalue, and a rotated secret shows up as a fingerprint change on exactly the\nlines that use it. When a file that contains secrets has drifted on disk,\nthe plan reports `content changed (digest a → b)` rather than a diff.\n\n`validate` is a command (argv) run against the rendered content before it\nreplaces the destination (and while planning); `{path}` is replaced with a\nprivate temporary file under `<state_dir>/tmp`, deleted afterwards. A\nnon-zero exit fails the task and leaves `dest` untouched. When the file\ncontains secrets, the validator's output is not echoed. Without\n`validate`, `/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are\nchecked with `visudo -cf {path}` and `sshd -t -f {path}` (when those tools\nare installed); `validate: []` turns that off.\n\nRemoval deletes `dest` only if its content still matches what Buckle wrote.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute destination path on the host.",
+          "options": [],
+          "path": "dest",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Template path, relative to the module's `files/` directory.",
+          "options": [],
+          "path": "src",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Keep a timestamped `.bak` copy of the destination before replacing its content.",
+          "options": [],
+          "path": "backup",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A command that checks the rendered file; `{path}` stands for the file to check.\nDefault: automatic for sudoers and sshd_config; `[]` disables.",
+          "options": [],
+          "path": "validate",
+          "required": false,
+          "secret": false,
+          "ty": "array of string?"
+        }
+      ],
+      "kind": "file.template",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Install a binary from a GitHub release, with arch mapping, version probe and checksum verification.",
+      "details": "Installs a binary from a GitHub release, upgrading it when a newer one appears.\n\n```yaml\n- github.release:\n    repo: atuinsh/atuin\n    version: latest                       # or \"v18.3.0\" / \"18.3.0\"\n    asset: \"atuin-{arch}-unknown-linux-gnu.tar.gz\"   # {version} {arch} {os} {tag}\n    arch_map: { x86_64: x86_64, aarch64: aarch64 }   # host arch -> asset arch; armv7l is skipped\n    extract: atuin                        # file inside an archive asset\n    dest: /usr/local/bin/atuin\n    mode: \"0755\"\n    probe: [\"atuin\", \"--version\"]         # prints the installed version\n    probe_regex: 'atuin (\\S+)'            # optional; default is the first x.y.z found\n    checksum_asset: \"atuin-{arch}-unknown-linux-gnu.tar.gz.sha256\"\n    token_env: GITHUB_TOKEN               # optional; name of an environment variable\n```\n\nThe plan compares the version printed by `probe` with the wanted release\n(`1.2.3 → 1.2.4`). `arch_map` extends the defaults `x86_64: amd64` and\n`aarch64: arm64`; a host architecture with no mapping is reported as\nblocked rather than failing, so a fleet can include hosts a release does not\nsupport. `{os}` is `linux`, `darwin` or `windows`; `{version}` has no\nleading `v`.\n\n`version: latest` asks the GitHub API for the newest release on every plan,\nwhich is rate limited to 60 requests an hour without a token; set\n`token_env` to the name of an environment variable holding a token (the\nvalue is only ever sent as an `Authorization` header). A pinned version\nwhose `probe` already reports it needs no API call. Without `probe`, an\nexisting `dest` counts as installed and is never upgraded (unless\n`checksum_asset` is given for a plain binary asset).\n\nArchive assets (`.tar.gz`, `.tgz`, `.tar`, `.zip`) need `extract`: the\npath or file name of the binary inside. With `checksum_asset` (the name of a\n`.sha256` or `SHA256SUMS` asset) the downloaded asset is verified before\nanything is written. Removal deletes `dest` only if it still matches what\nBuckle installed.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Asset file name; may use `{version}`, `{tag}`, `{arch}` and `{os}`.",
+          "options": [],
+          "path": "asset",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path to install the binary at.",
+          "options": [],
+          "path": "dest",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "`owner/name` of the repository.",
+          "options": [],
+          "path": "repo",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "{}",
+          "depth": 0,
+          "description": "Host architecture (as `uname -m` prints it) to the asset's spelling; extends the defaults.",
+          "options": [],
+          "path": "arch_map",
+          "required": false,
+          "secret": false,
+          "ty": "map of string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Name of a SHA-256 checksum asset in the release; may use the same placeholders as `asset`.",
+          "options": [],
+          "path": "checksum_asset",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "For archive assets: the binary's path or file name inside the archive.",
+          "options": [],
+          "path": "extract",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Command (argv) that prints the installed version.",
+          "options": [],
+          "path": "probe",
+          "required": false,
+          "secret": false,
+          "ty": "array of string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Regular expression selecting the version from the probe's output (first capture group, else the match).",
+          "options": [],
+          "path": "probe_regex",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Name of an environment variable holding a GitHub token.",
+          "options": [],
+          "path": "token_env",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "latest",
+          "depth": 0,
+          "description": "`latest`, `vX.Y.Z` or `X.Y.Z`.",
+          "options": [],
+          "path": "version",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "github.release",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Set the machine's hostname (live and in /etc/hostname).",
+      "details": "Sets the host's name, both live and in `/etc/hostname`.\n\n```yaml\n- hostname.set:\n    name: \"{{ host.id }}\"\n```\n\nThe plan compares the running (kernel) hostname and `/etc/hostname` (when\nit exists) with `name`; when they disagree with each other the change\nshows both. Applying runs `hostnamectl set-hostname` (falling back to\n`hostname` when `hostnamectl` is missing or cannot reach systemd, as in a\ncontainer) and rewrites `/etc/hostname`. With neither tool installed the\nplan is blocked.\n`name` must be a valid hostname: letters, digits and `-`/`.`, at most 253\ncharacters. Removal does nothing: Buckle does not know what the previous\nhostname should be, so a hostname is released rather than reverted.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "hostname.set",
+      "locks": [],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Manage public keys in a user's ~/.ssh/authorized_keys with correct permissions.",
+      "details": "Manages public keys in a user's `~/.ssh/authorized_keys`.\n\n```yaml\n- ssh.authorized_key:\n    user: deploy\n    key: |\n      ssh-ed25519 AAAAC3Nza... laptop\n      from=\"10.0.0.0/8\" ssh-ed25519 AAAAC3Nza... ci\n    state: present        # or absent\n    exclusive: false      # true: the file contains exactly these keys\n```\n\n`key` is one or more lines in `authorized_keys` format (blank lines and\n`#` comments are ignored). A key is identified by its type and base64\nbody, so changing its options or comment updates the existing line rather\nthan adding a second one. With `state: absent` the listed keys are deleted.\nWith `exclusive: true` (and `state: present`) every other key is deleted.\n\nThe `.ssh` directory is kept at mode 0700 and the file at 0600, owned by the\nuser (and by their private group when one with the user's name exists). If\nthe user does not exist yet (an earlier task creates it) the plan assumes\n`/home/<user>` (`/root` for root). Removal deletes the key lines Buckle\nadded and leaves the rest of the file, including an emptied file, alone.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "One or more public key lines.",
+          "options": [],
+          "path": "key",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "user",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Remove every key not listed (only with `state: present`).",
+          "options": [],
+          "path": "exclusive",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "present",
+          "depth": 0,
+          "description": "`present` or `absent`, for kinds that can remove what they manage.",
+          "options": [
+            "present",
+            "absent"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        }
+      ],
+      "kind": "ssh.authorized_key",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Create a swap file, add it to fstab and activate it; one resource owns all three.",
+      "details": "Creates and activates a swap file, and makes it permanent.\n\n```yaml\n- swap.file:\n    path: /swapfile\n    size_mb: 2048\n    swappiness: 10        # optional; sets vm.swappiness live and persistently\n```\n\nOne resource owns the file, its `/etc/fstab` line and the `swapon` state:\nthe plan is a no-op when `/proc/swaps` lists the file at the right size, the\nfstab entry exists, the file is mode 0600 and swappiness matches. Applying\ncreates the file (`fallocate`, or `dd` where that fails), sets mode 0600,\nruns `mkswap`, adds `<path> none swap sw 0 0` to `/etc/fstab` and runs\n`swapon`. A file of the wrong size is swapped off and recreated. Swappiness\nis applied with `sysctl -w vm.swappiness=N` and persisted in\n`/etc/sysctl.d/99-buckle-swap.conf`.\n\nAn existing file at `path` that is not an active swap area is only\nrecreated or formatted (`mkswap`) when Buckle created it or it already\ncarries a swap signature; anything else (a data file at the wrong path) is\nreported as blocked and left untouched.\n\nRemoval runs `swapoff`, deletes the fstab line and the file, but only for a\nswap file that Buckle created. It holds the `fstab` lock.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path of the swap file.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Size in MiB.",
+          "options": [],
+          "path": "size_mb",
+          "required": true,
+          "secret": false,
+          "ty": "integer"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "swappiness",
+          "required": false,
+          "secret": false,
+          "ty": "integer?"
+        }
+      ],
+      "kind": "swap.file",
+      "locks": [
+        "fstab"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Set a kernel parameter live and persist it in /etc/sysctl.d.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The sysctl key, e.g. `vm.swappiness`.",
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The value to set (a string, number or boolean).",
+          "options": [],
+          "path": "value",
+          "required": true,
+          "secret": false,
+          "ty": "string | integer | number | boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "The file to persist into; defaults to `/etc/sysctl.d/90-buckle-<module>.conf`.",
+          "options": [],
+          "path": "file",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "true",
+          "depth": 0,
+          "description": "Also write the setting to a sysctl.d file so it survives reboots.",
+          "options": [],
+          "path": "persist",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "sysctl.param",
+      "locks": [
+        "sysctl"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Run systemctl daemon-reload (a handler).",
+      "details": null,
+      "fields": [],
+      "kind": "systemd.daemon_reload",
+      "locks": [
+        "systemd"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "leave",
+      "shape": "object"
+    },
+    {
+      "description": "Write a systemd drop-in override (<unit>.d/<name>.conf) and reload systemd.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The drop-in's content (a template string).",
+          "options": [],
+          "path": "content",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The unit to override, e.g. `nomad.service`.",
+          "options": [],
+          "path": "unit",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "override.conf",
+          "depth": 0,
+          "description": "Drop-in file name; defaults to `override.conf`.",
+          "options": [],
+          "path": "name",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "{\"group\":null,\"mode\":null,\"owner\":null}",
+          "depth": 0,
+          "description": "Mode, owner and group of the file.",
+          "options": [],
+          "path": "perms",
+          "required": false,
+          "secret": false,
+          "ty": "object"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": null,
+          "options": [],
+          "path": "perms.group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "perms.mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": null,
+          "options": [],
+          "path": "perms.owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        }
+      ],
+      "kind": "systemd.dropin",
+      "locks": [
+        "systemd"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Reload a systemd unit's configuration, restarting it if it cannot reload (a handler).",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The unit to reload, e.g. `caddy.service`.",
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "systemd.reload",
+      "locks": [
+        "systemd"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "leave",
+      "shape": null
+    },
+    {
+      "description": "Restart a systemd unit (a handler).",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The unit to restart, e.g. `nomad.service`.",
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        }
+      ],
+      "kind": "systemd.restart",
+      "locks": [
+        "systemd"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "leave",
+      "shape": null
+    },
+    {
+      "description": "Enable, disable, start, stop, mask or unmask a systemd unit.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Unit name, e.g. `nomad.service` or `nomad`.",
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Running (`systemctl start`) when true, stopped when false.",
+          "options": [],
+          "path": "active",
+          "required": false,
+          "secret": false,
+          "ty": "boolean?"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Run `systemctl daemon-reload` before changing the unit.",
+          "options": [],
+          "path": "daemon_reload",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Start at boot (`systemctl enable`) when true, disable when false.",
+          "options": [],
+          "path": "enabled",
+          "required": false,
+          "secret": false,
+          "ty": "boolean?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Masked (cannot be started by anything) when true, unmasked when false.",
+          "options": [],
+          "path": "masked",
+          "required": false,
+          "secret": false,
+          "ty": "boolean?"
+        }
+      ],
+      "kind": "systemd.unit",
+      "locks": [
+        "systemd"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Set a ufw default policy (incoming, outgoing or routed).",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "`incoming`, `outgoing` or `routed`.",
+          "options": [
+            "incoming",
+            "outgoing",
+            "routed"
+          ],
+          "path": "direction",
+          "required": true,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "`allow`, `deny` or `reject`.",
+          "options": [
+            "allow",
+            "deny",
+            "reject"
+          ],
+          "path": "policy",
+          "required": true,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Change an incoming policy even when no rule keeps SSH or a management interface reachable.",
+          "options": [],
+          "path": "allow_lockout",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "ufw.default",
+      "locks": [
+        "ufw"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Add a ufw firewall rule (allow, deny, reject or limit).",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "`allow`, `deny`, `reject` or `limit` (rate-limit, for brute-force protection).",
+          "options": [
+            "allow",
+            "deny",
+            "reject",
+            "limit"
+          ],
+          "path": "rule",
+          "required": true,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A comment stored with the rule.",
+          "options": [],
+          "path": "comment",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "in",
+          "depth": 0,
+          "description": "`in` (default) or `out`.",
+          "options": [
+            "in",
+            "out"
+          ],
+          "path": "direction",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Source address or network.",
+          "options": [],
+          "path": "from_ip",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Network interface the rule applies to.",
+          "options": [],
+          "path": "interface",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "`tcp`, `udp` or `any`.",
+          "options": [
+            "tcp",
+            "udp",
+            "any"
+          ],
+          "path": "proto",
+          "required": false,
+          "secret": false,
+          "ty": "enum?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Destination address or network.",
+          "options": [],
+          "path": "to_ip",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Destination port, list or range.",
+          "options": [],
+          "path": "to_port",
+          "required": false,
+          "secret": false,
+          "ty": "string | integer | number | boolean?"
+        }
+      ],
+      "kind": "ufw.rule",
+      "locks": [
+        "ufw"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Enable or disable the ufw firewall and set its logging level.",
+      "details": null,
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Whether the firewall is enabled.",
+          "options": [],
+          "path": "enabled",
+          "required": true,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Enable even when no rule keeps SSH or a management interface reachable.",
+          "options": [],
+          "path": "allow_lockout",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Logging level: `off`, `on`, `low`, `medium`, `high` or `full`.",
+          "options": [],
+          "path": "logging",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        }
+      ],
+      "kind": "ufw.state",
+      "locks": [
+        "ufw"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Ensure a local user account exists with the given uid, groups, shell, home and password hash.",
+      "details": "Ensures a local user account exists with the given attributes (or is absent).\n\n```yaml\n- user.account:\n    name: sierra\n    uid: 1001                      # optional\n    group: sierra                  # primary group (must exist)\n    groups: [sudo, docker]         # supplementary groups, appended (never removed)\n    shell: /bin/bash\n    home: /home/sierra\n    create_home: true              # default: true, or false for `system: true`\n    system: false                  # a system account (useradd -r)\n    comment: \"Sierra Softworks\"\n    password: \"{{ secrets.sierra_password_hash }}\"   # a crypt(3) hash, not plaintext\n    state: present                 # or absent\n    remove_home: false             # with state: absent, or when removed from the config\n```\n\nUses `useradd`, `usermod` and `userdel`. Only the attributes you set are\ncompared and changed; `groups` are added with `usermod -a -G` and never\nremoved. A `password` is a pre-hashed value (`openssl passwd -6`) and may\nreference secrets: it is applied with `chpasswd -e`, which receives\n`name:hash` on **stdin** (through the secret sink), so it never appears on\na command line, in the plan or in logs. The plan compares the hash with\n`/etc/shadow` by digest; if the shadow file cannot be read the password is\nassumed to be correct.\n\nRemoving the task from the configuration deletes the account (`userdel`,\nwith `-r` only when `remove_home: true`) if Buckle created it, and is\nflagged as a cautionary removal.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "comment",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Create the home directory; defaults to true except for system accounts.",
+          "options": [],
+          "path": "create_home",
+          "required": false,
+          "secret": false,
+          "ty": "boolean?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Primary group.",
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Supplementary groups to be a member of.",
+          "options": [],
+          "path": "groups",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "home",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A password hash (crypt format); may be a template referencing secrets.",
+          "options": [],
+          "path": "password",
+          "required": false,
+          "secret": true,
+          "ty": "secret string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Delete the home directory together with the account.",
+          "options": [],
+          "path": "remove_home",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "shell",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "present",
+          "depth": 0,
+          "description": "`present` or `absent`, for kinds that can remove what they manage.",
+          "options": [
+            "present",
+            "absent"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "system",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "uid",
+          "required": false,
+          "secret": false,
+          "ty": "integer?"
+        }
+      ],
+      "kind": "user.account",
+      "locks": [
+        "users"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": true,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Ensure a local group exists with the given gid, or is absent.",
+      "details": "Ensures a local group exists (or is absent).\n\n```yaml\n- user.group:\n    name: nomad\n    gid: 4646          # optional\n    system: true       # a system group (low gid)\n    state: present     # or absent\n```\n\nUses `groupadd`, `groupmod` and `groupdel`. Removal is flagged as a\ncautionary change: when the task leaves the configuration the group is\ndeleted, but only if Buckle created it.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "name",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "gid",
+          "required": false,
+          "secret": false,
+          "ty": "integer?"
+        },
+        {
+          "default": "present",
+          "depth": 0,
+          "description": "`present` or `absent`, for kinds that can remove what they manage.",
+          "options": [
+            "present",
+            "absent"
+          ],
+          "path": "state",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "system",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "user.group",
+      "locks": [
+        "users"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": true,
+      "removal_default": "cleanup",
+      "shape": null
+    }
+  ]
+}
