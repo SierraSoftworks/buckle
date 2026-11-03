@@ -2657,6 +2657,29 @@ async fn bumping_a_var_inside_a_command_only_undoes_it_when_the_task_has_no_id(
     assert_eq!(plan.changes(), 1);
 }
 
+#[rstest]
+#[case::templated_string("'install tool-{{ vars.v }}'", None, true)]
+#[case::templated_argv("[install, 'tool-{{ vars.v }}']", None, true)]
+#[case::templated_with_id("'install tool-{{ vars.v }}'", Some("install-tool"), false)]
+#[case::literal("[install, tool]", None, false)]
+fn templated_commands_without_an_id_are_flagged(
+    #[case] run: &str,
+    #[case] id: Option<&str>,
+    #[case] flagged: bool,
+) {
+    let id_line = id.map(|i| format!("    id: {i}\n")).unwrap_or_default();
+    let yaml = format!(
+        "name: m\nvars: {{ v: '1.0' }}\ntasks:\n  - command.run: {{ run: {run}, unless: [false] }}\n{id_line}"
+    );
+    let report = validate(&revision("r1", FLEET, vec![module(&yaml)])).unwrap();
+    assert!(report.errors.is_empty(), "{report}");
+    assert_eq!(
+        report.warnings.iter().any(|w| w.message.contains("`id`")),
+        flagged,
+        "{report}"
+    );
+}
+
 #[tokio::test]
 async fn state_persists_across_runs_so_removed_modules_become_orphans() {
     let sys = FakeSystem::new();

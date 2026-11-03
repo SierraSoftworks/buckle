@@ -54,6 +54,10 @@ use tracing::instrument;
 /// **Removal.** With `remove`, the cleanup command runs when the task leaves
 /// the configuration (in the same `cwd`, with the non-secret `env`). Without it
 /// the removal is reported as "no cleanup defined".
+///
+/// **Identity.** The resource is keyed by its rendered command, so editing the
+/// command or a var inside it re-keys it (a removal plus an addition). Give a
+/// templated command, or one with `remove`, a stable task `id`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {

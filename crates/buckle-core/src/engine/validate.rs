@@ -361,6 +361,8 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             check_decl(&mut report, decl, &location);
             if let Some(problem) = command_run_without_id(decl) {
                 report.error(Some(name), &location, problem);
+            } else if let Some(problem) = command_run_templated_without_id(decl) {
+                report.warning(Some(name), &location, problem);
             }
         }
         for (hname, decl) in &m.config.handlers {
@@ -502,6 +504,24 @@ pub fn command_run_without_id(decl: &TaskDecl) -> Option<String> {
         .is_some_and(|m| m.contains_key(serde_yaml::Value::String("remove".into())));
     (decl.kind == "command.run" && has_remove && decl.id.is_none()).then(|| {
         "sets `remove:` but no `id`: a command.run is identified by its rendered command, so editing the command (or a var inside it) would run the old `remove:`; give the task a stable `id`".to_owned()
+    })
+}
+
+/// A `command.run` whose `run` is templated and has no `id` is re-keyed
+/// whenever a var inside it changes: the plan shows the old command removed
+/// and a new one added instead of a change to one resource. Harmless without
+/// `remove:` (see [`command_run_without_id`]), but noisy, so it is a warning.
+pub fn command_run_templated_without_id(decl: &TaskDecl) -> Option<String> {
+    if decl.kind != "command.run" || decl.id.is_some() {
+        return None;
+    }
+    let run = decl
+        .spec
+        .as_mapping()?
+        .get(serde_yaml::Value::String("run".into()))?;
+    let templated = serde_yaml::to_string(run).is_ok_and(|text| text.contains("{{"));
+    templated.then(|| {
+        "templates its `run:` but has no `id`: a command.run is identified by its rendered command, so changing a var inside it plans the old command as removed and a new one as added rather than a change; give the task a stable `id`".to_owned()
     })
 }
 
