@@ -203,6 +203,11 @@ impl FleetService {
         hello: &Hello,
         metadata_token: Option<String>,
     ) -> Result<Authenticated, (String, bool)> {
+        // A whois that errored says nothing about the agent: the server could
+        // not ask (tailscaled restarted, its socket went stale). Whatever the
+        // token path then says, the agent is told to retry on its normal
+        // backoff rather than the slow one for refused hosts.
+        let mut whois_error = None;
         if self.uses(AgentAuth::Tailscale)
             && let (Some(peer), Some(whois)) = (peer, &self.whois)
             && whois.covers(&peer)
@@ -287,12 +292,23 @@ impl FleetService {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(error = %e, "tailscale whois failed; trying token authentication")
+                    tracing::error!(error = %e, "tailscale whois failed; trying token authentication");
+                    whois_error = Some(e.description().to_string());
                 }
             }
         }
-        self.authenticate_by_token(peer, hello, metadata_token)
-            .await
+        let authed = self
+            .authenticate_by_token(peer, hello, metadata_token)
+            .await;
+        match (authed, whois_error) {
+            (Err((reason, _)), Some(error)) => Err((
+                format!(
+                    "The server could not ask tailscaled who this agent is ({error}), so it will be retried. {reason}"
+                ),
+                true,
+            )),
+            (authed, _) => authed,
+        }
     }
 
     /// Token authentication and bootstrap enrolment.
