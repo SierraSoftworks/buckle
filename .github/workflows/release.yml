@@ -79,7 +79,7 @@ jobs:
     needs: [version]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: versioned-manifests
       - uses: dtolnay/rust-toolchain@stable
@@ -115,10 +115,10 @@ jobs:
           - { os: windows, arch: amd64, run_on: windows-latest, target: x86_64-pc-windows-msvc, extension: ".exe" }
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: versioned-manifests
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ui-dist
           path: ui/dist
@@ -170,7 +170,7 @@ jobs:
     outputs:
       tag: ${{ steps.release.outputs.tag }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: binary-*
           path: dist
@@ -207,7 +207,7 @@ jobs:
           - { arch: arm64, run_on: ubuntu-24.04-arm, platform: linux/arm64 }
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binary-linux-${{ matrix.arch }}
           path: .
@@ -246,7 +246,7 @@ jobs:
     permissions:
       packages: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: digest-*
           path: /tmp/digests
