@@ -4,6 +4,7 @@
 //! so all of it is tested with a plain `cargo test` on the host target.
 
 pub mod blueprint;
+pub mod controls;
 pub mod diff;
 pub mod filter;
 pub mod fleet;

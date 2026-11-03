@@ -2,7 +2,7 @@
 // phase goes through a confirmation that names what it binds.
 
 import { describe, test } from "node:test";
-import { assert, eventually, heading, open } from "./helpers.mjs";
+import { assert, decide, decisions, eventually, heading, open } from "./helpers.mjs";
 
 const STATES = [
   "pending", "plan-pending", "planned", "held", "applying",
@@ -191,21 +191,21 @@ describe("approving a phase", () => {
 
   test("aborting asks for the rollout to be named", async () => {
     const { page, close } = await open("/rollouts/42");
-    await page.getByRole("button", { name: "Abort…" }).click();
+    await decide(page, "Abort…");
     const dialog = page.getByRole("dialog", { name: "Abort rollout #42" });
     const confirm = dialog.getByRole("button", { name: "Abort rollout" });
     assert.ok(await confirm.isDisabled());
     await dialog.getByRole("textbox", { name: /Type/ }).fill("#42");
     await confirm.click();
     await page.locator(".page-head .pill", { hasText: "aborted" }).waitFor();
-    assert.equal(await page.getByRole("button", { name: "Abort…" }).count(), 0, "a finished rollout has no actions");
+    assert.equal(await page.getByTestId("rollout-controls").count(), 0, "a finished rollout has no actions");
     await close();
   });
 
   test("rejecting a rollout held at a gate needs a reason and ends it", async () => {
     const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
     await page.locator(".page-head .pill", { hasText: "awaiting approval" }).waitFor();
-    await page.getByRole("button", { name: "Reject…" }).click();
+    await decide(page, "Reject…");
     const dialog = page.getByRole("dialog", { name: "Reject rollout #42" });
     const confirm = dialog.getByRole("button", { name: "Reject rollout" });
     await dialog.getByRole("textbox", { name: /Type/ }).fill("#42");
@@ -220,8 +220,10 @@ describe("approving a phase", () => {
   test("a running rollout offers no reject, only abort", async () => {
     const { page, close } = await open("/rollouts/42");
     await page.getByRole("button", { name: "Approve cloud…" }).waitFor();
-    assert.equal(await page.getByRole("button", { name: "Reject…" }).count(), 0);
-    await page.getByRole("button", { name: "Abort…" }).waitFor();
+    const { face, menu } = await decisions(page);
+    assert.equal(face, "Approve cloud…", "the approval waited on is the face");
+    assert.ok(!menu.includes("Reject…"));
+    for (const want of ["Pause", "Roll back…", "Abort…"]) assert.ok(menu.includes(want), want);
     await close();
   });
 

@@ -2,6 +2,7 @@
 
 pub mod blueprint;
 pub mod changes;
+pub mod commit;
 pub mod countdown;
 pub mod diff;
 pub mod error_block;
@@ -16,12 +17,14 @@ pub mod pipeline;
 pub mod plan;
 pub mod run_report;
 pub mod shell;
+pub mod split_button;
 pub mod theme;
 pub mod toast;
 pub mod ui;
 
 pub use blueprint::BlueprintView;
 pub use changes::Changes;
+pub use commit::{Commit, CommitCard};
 pub use countdown::Countdown;
 pub use diff::{DiffView, secret_text};
 pub use error_block::ErrorBlock;
@@ -34,6 +37,7 @@ pub use modal::Confirm;
 pub use pipeline::Pipeline;
 pub use plan::PlanGroupView;
 pub use run_report::RunReportView;
+pub use split_button::{MenuItem, SplitButton};
 pub use toast::{ToastHost, use_toast};
 pub use ui::{
     Button, Empty, ErrorState, HoverTip, Kind, Loading, PageHead, Panel, Pill, Refresh, TraceLink,

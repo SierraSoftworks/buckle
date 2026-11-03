@@ -6,25 +6,26 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{Fleet, PhaseState, PlanGroup, RolloutDetail, RolloutState, RolloutSummary};
+use buckle_api::{
+    Fleet, PhaseState, PlanGroup, RevisionStatus, RevisionSummary, RolloutDetail, RolloutState,
+    RolloutSummary,
+};
 use yew::prelude::*;
 
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Changes, Empty, ErrorState, HostLink, Loading, Meter, PageHead, Panel, Pill, Pipeline, Refresh,
-    RouteLink, Segment, meter::rollout_segments,
+    Changes, Commit, CommitCard, Empty, ErrorState, HostLink, Loading, Meter, PageHead, Panel,
+    Pill, Pipeline, Refresh, RouteLink, Segment, meter::rollout_segments,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{Bucket, attention, rollup};
 use crate::logic::fleet_plan::{Tally, fleet_tally, hosts_changed, summarise};
-use crate::logic::format::{age, commit, count, first_line, relative, rollout_label};
+use crate::logic::format::{age, commit, count, relative, rollout_label};
 use crate::logic::live::{apply_fleet, apply_revisions, apply_rollout, apply_rollouts};
 use crate::logic::pipeline::{fleet_map, layout};
-use crate::logic::tone::{
-    Tone, revision_status_tone, rollout_finished, rollout_state_label, rollout_state_tone,
-};
-use crate::pages::rollout::{Ask, controls, scope_of, use_rollout_actions, wanting_approval};
+use crate::logic::tone::{Tone, rollout_finished, rollout_state_label, rollout_state_tone};
+use crate::pages::rollout::{controls, scope_of, use_rollout_actions, wanting_approval};
 
 #[function_component(Overview)]
 pub fn overview() -> Html {
@@ -83,11 +84,13 @@ pub fn overview() -> Html {
             html! { <>
                 { tiles(f, now) }
                 <Panel title="Latest rollout" class="overview__rollout"
-                    actions={latest_id.as_deref().map(|id| html! {
-                        <RouteLink to={Route::rollout(id)} classes="btn btn--small">{ "Open rollout" }</RouteLink>
-                    }).unwrap_or_default()}>
+                    subtitle={rollout_live.as_ref().map(|d| AttrValue::from(format!("Rollout {} · {} · started {}",
+                        rollout_label(&d.summary.id), d.summary.triggered_by, relative(d.summary.started_at, now))))}
+                    actions={rollout_live.as_ref().filter(|_| auth.is_admin())
+                        .map(|d| controls(&d.summary, approvable(d, &plan_groups).as_deref(), &actions.open))
+                        .unwrap_or_default()}>
                     { match (&rollout_live, &rollout.error) {
-                        (Some(d), _) => latest(d, &plan_groups, auth.is_admin(), &actions.open, now),
+                        (Some(d), _) => latest(d, revisions_live.as_deref().unwrap_or(&[]), now),
                         (None, Some(e)) if waiting => html! { <ErrorState error={e.clone()} retry={rollout.reload.clone()} /> },
                         (None, _) if waiting => html! { <Loading /> },
                         (None, _) => html! { <Empty title="No rollouts yet"
@@ -132,39 +135,38 @@ pub fn overview() -> Html {
     }
 }
 
-/// The latest rollout's card: what it is, where it stands, and while it is
-/// live, its decisions for an administrator.
-fn latest(
-    d: &RolloutDetail,
-    plans: &[PlanGroup],
-    admin: bool,
-    open: &Callback<Ask>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Html {
-    let s = &d.summary;
-    let live = !rollout_finished(s.state);
+/// The phase an approval from the latest rollout's controls is for: the one
+/// the rollout page's approval pane would show, once it has plans to bind.
+fn approvable(d: &RolloutDetail, plans: &[PlanGroup]) -> Option<String> {
+    if rollout_finished(d.summary.state) {
+        return None;
+    }
     let pipeline = layout(d);
     let wanting = wanting_approval(&pipeline);
-    // The phase the rollout page's approval pane would show, once it has
-    // plans to bind.
-    let approve = wanting
+    wanting
         .iter()
         .find(|p| p.state == PhaseState::AwaitingApproval)
         .or(wanting.first())
         .filter(|p| !scope_of(p, plans).digests.is_empty())
-        .map(|p| p.name.clone());
+        .map(|p| p.name.clone())
+}
+
+/// The latest rollout's card: its commit (which opens it), where it stands
+/// and what each module changes.
+fn latest(
+    d: &RolloutDetail,
+    revisions: &[RevisionSummary],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Html {
+    let s = &d.summary;
     html! { <>
-        { rollout_head(s, d.fleet.as_ref().map(fleet_tally), now) }
+        <CommitCard commit={Commit::of_rollout(s, revisions)} rollout={s.clone()} boxed=true {now} />
+        { rollout_head(s, d.fleet.as_ref().map(fleet_tally)) }
         { module_changes(d) }
         if let Some(reason) = &s.pause_reason {
             <p class={classes!("note", (s.state == RolloutState::Paused).then_some("note--warn"))}>
                 <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
             </p>
-        }
-        if admin && live {
-            <div class="overview__controls" data-testid="rollout-controls">
-                { controls(s, approve.as_deref(), open) }
-            </div>
         }
     </> }
 }
@@ -275,18 +277,9 @@ fn module_changes(d: &RolloutDetail) -> Html {
     }
 }
 
-fn rollout_head(
-    s: &RolloutSummary,
-    tally: Option<Tally>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Html {
+fn rollout_head(s: &RolloutSummary, tally: Option<Tally>) -> Html {
     html! {
         <div class="rollout-head">
-            <RouteLink to={Route::rollout(&s.id)} classes="rollout-head__title">
-                { format!("Rollout {}", rollout_label(&s.id)) }
-            </RouteLink>
-            <span class="mono">{ commit(&s.revision) }</span>
-            <span class="rollout-head__message">{ format!("“{}”", first_line(&s.revision_message)) }</span>
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
             if let Some(tally) = tally { <Changes {tally} /> }
             if let Some(p) = &s.current_phase { <span class="muted">{ format!("in {p}") }</span> }
@@ -294,7 +287,6 @@ fn rollout_head(
                 <Meter segments={rollout_segments(s)} total={s.hosts_total as usize} />
                 <span class="muted small">{ format!("{}/{} done", s.hosts_done, s.hosts_total) }</span>
             </span>
-            <span class="muted">{ format!("started {}", relative(s.started_at, now)) }</span>
         </div>
     }
 }
@@ -340,33 +332,23 @@ fn attention_list(
 }
 
 fn recent(
-    list: &[buckle_api::RevisionSummary],
+    list: &[RevisionSummary],
     rollouts: &[RolloutSummary],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Html {
     html! {
-        <ul class="revlist">
+        <ol class="gitlog gitlog--compact">
             { for list.iter().take(5).map(|r| {
-                let outcome = r.rollout_id.as_ref().and_then(|id| rollouts.iter().find(|x| &x.id == id));
+                let rollout = r.rollout_id.as_ref().and_then(|id| rollouts.iter().find(|x| &x.id == id)).cloned();
                 html! {
-                    <li class="revlist__item">
-                        <span class="mono revlist__commit">{ commit(&r.commit) }</span>
-                        <span class="revlist__message">{ first_line(&r.message) }</span>
-                        if r.is_stable { <span class="badge badge--ok">{ "stable" }</span> }
-                        { match (r.status, outcome) {
-                            (buckle_api::RevisionStatus::Rejected, _) => html! { <Pill tone={revision_status_tone(r.status)} label="rejected" /> },
-                            (_, Some(o)) => html! {
-                                <RouteLink to={Route::rollout(&o.id)} classes="revlist__rollout">
-                                    <Pill tone={rollout_state_tone(o.state)} label={format!("{} {}", rollout_label(&o.id), rollout_state_label(o.state))} />
-                                </RouteLink>
-                            },
-                            _ => html! { <span class="muted">{ "not rolled out" }</span> },
-                        } }
-                        <span class="muted revlist__age">{ relative(r.created_at, now) }</span>
+                    <li class={classes!("gitlog__item", (r.status == RevisionStatus::Rejected).then_some("gitlog__item--rejected"), r.is_stable.then_some("gitlog__item--stable"))}
+                        data-revision={r.id.clone()}>
+                        <span class="gitlog__dot" aria-hidden="true" />
+                        <CommitCard commit={Commit::from(r)} {rollout} {now} />
                     </li>
                 }
             }) }
-            if list.len() > 5 { <li class="muted">{ format!("and {}", count(list.len() - 5, "older revision", "older revisions")) }</li> }
-        </ul>
+            if list.len() > 5 { <li class="gitlog__more muted">{ format!("and {}", count(list.len() - 5, "older revision", "older revisions")) }</li> }
+        </ol>
     }
 }
