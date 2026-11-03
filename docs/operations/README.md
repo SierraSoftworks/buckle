@@ -1,0 +1,37 @@
+# Operations
+
+Runbooks for running a fleet from the web UI: what to look at, which button to press and what it
+does. Every action here is also an [HTTP API call](../agent/server.md#api), and every one is
+recorded in the **Audit** log with its actor and note.
+
+| Runbook | When |
+|---|---|
+| [Bootstrapping hosts](./bootstrapping.md) | A new host joins the fleet. |
+| [Rolling out changes](./rollouts.md) | A commit lands and moves through the phases. |
+| [Recovering from failures](./recovery.md) | A host fails, a phase pauses, or a change has to be undone. |
+| [Managing hosts](./hosts.md) | Labels, drift, pausing and forgetting a host. |
+| [Upgrading Buckle](./upgrading.md) | A new release of the server or the agents. |
+
+## Who can do what
+
+Everyone who signs in can see everything. Only **admins** (`web.admin_acl` in
+[server.yaml](../agent/server.md#web)) see the buttons in these runbooks; a viewer sees the same pages
+without them. Destructive actions ask for the rollout, host or commit to be typed before they run.
+
+## The overview
+
+The overview is the place to start. The **latest rollout** card shows the revision being rolled out,
+what each module changes, and the decision it is waiting on at its top right.
+
+<Screenshot name="overview-rollout" alt="The latest rollout card, with its commit, state, per-module changes and the Approve split button" />
+
+**Fleet** draws every host once, as a block in the stage of the latest rollout it belongs to, and
+the hosts outside that rollout last. A block's colour is its state; hover it for the host and click
+it to open the host.
+
+<Screenshot name="overview-fleet" alt="The fleet map: one block per host, grouped by rollout stage" />
+
+**Needs attention** lists what an operator should look at: registrations waiting for approval,
+offline agents, agents on an unexpected version and hosts whose plan has gone stale.
+
+<Screenshot name="overview-attention" alt="The Needs attention list" />

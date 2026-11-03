@@ -27,8 +27,10 @@ const NAV: &[NavItem] = &[
     ("Hosts", icons::hosts, Route::Hosts),
     ("Revisions", icons::revisions, Route::Revisions),
     ("Audit", icons::audit, Route::Audit),
-    ("Reference", icons::reference, Route::Reference),
 ];
+
+/// The documentation site: modules, tasks, the command line and runbooks.
+pub const DOCS_URL: &str = "https://buckle.sierrasoftworks.com";
 
 fn section(route: &Route) -> Route {
     match route {
@@ -127,7 +129,15 @@ pub fn shell(props: &ShellProps) -> Html {
                     <div class="scrim" aria-hidden="true" onclick={close_nav} />
                 }
                 <aside id="sidebar" class={classes!("sidebar", (*open).then_some("sidebar--open"))}>
-                    <nav class="nav" aria-label="Sections">{ for nav }</nav>
+                    <nav class="nav" aria-label="Sections">
+                        { for nav }
+                        <a class="nav__item nav__item--external" href={DOCS_URL} target="_blank" rel="noopener"
+                            title="Modules, tasks, the command line and runbooks">
+                            <span class="nav__icon">{ icons::reference() }</span>
+                            <span class="nav__label">{ "Documentation" }</span>
+                            <span class="nav__hint" aria-hidden="true">{ icons::external() }</span>
+                        </a>
+                    </nav>
                 </aside>
                 <main class="app-main" id="main" tabindex="-1">
                     { props.children.clone() }

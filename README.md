@@ -152,7 +152,9 @@ are scrubbed of known secret values.
 
 ## Documentation
 
-The design lives in [`docs/design/`](docs/design/README.md); it describes the
+The user documentation, with setup guides, the command-line and task reference,
+and runbooks, is at **[buckle.sierrasoftworks.com](https://buckle.sierrasoftworks.com)**
+(source in [`docs/`](docs/)). The design lives in [`docs/design/`](docs/design/README.md); it describes the
 code as built and lists the known gaps (section 16). The `buckle catalog`
 command lists every task kind, fact provider and health check built into the
 binary, with their fields, and [`examples/nomad-cluster`](examples/nomad-cluster/README.md)
@@ -165,4 +167,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cd ui && trunk build          # the web UI (Yew, WebAssembly); embedded by the server at build time
+cd docs && npm ci --legacy-peer-deps && npm run dev    # the documentation site
+BUCKLE_BLESS_DOCS=1 cargo test -p buckle --bin buckle docs::   # regenerate its reference
+cd ui && npm run screenshots  # regenerate its screenshots
 ```

@@ -1,0 +1,34 @@
+:root {
+    --content-width: 90%;
+}
+
+// Screenshots carry their own rounded corners and shadow (see
+// ui/e2e/screenshots.mjs); each comes in both themes and shows the current one.
+.screenshot {
+    margin: 1rem 0;
+    text-align: center;
+
+    img {
+        max-width: 100%;
+        height: auto;
+    }
+
+    figcaption {
+        color: var(--vp-c-text-mute);
+        font-size: 0.9em;
+    }
+}
+
+.screenshot__dark,
+html[data-theme="dark"] .screenshot__light {
+    display: none;
+}
+
+html[data-theme="dark"] .screenshot__dark {
+    display: inline-block;
+}
+
+// Generated reference tables: keep field names on one line.
+.theme-default-content table td:first-child code {
+    white-space: nowrap;
+}

@@ -1,6 +1,8 @@
 //! `buckle`: one binary that plans, applies, runs as an agent or as the server.
 
 mod commands;
+#[cfg(test)]
+mod docs;
 mod http;
 mod migrate;
 mod render;

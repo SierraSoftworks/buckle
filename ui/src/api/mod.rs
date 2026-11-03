@@ -20,8 +20,8 @@ pub mod sse;
 use std::cell::RefCell;
 
 use buckle_api::{
-    ActionRequest, ApproveRequest, AuditEntry, Catalog, ContinueRequest, CsrfToken, ErrorBody,
-    Fleet, HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup, RejectRequest,
+    ActionRequest, ApproveRequest, AuditEntry, ContinueRequest, CsrfToken, ErrorBody, Fleet,
+    HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup, RejectRequest,
     RevisionSummary, RolloutDetail, RolloutSummary, RunReport, RunSummary, StartRollout,
     UpgradeRequest,
 };
@@ -453,12 +453,7 @@ pub async fn continue_host(
     .await
 }
 
-// ------------------------------------------------------------------ catalog and audit
-
-pub async fn catalog() -> Result<Catalog, ApiError> {
-    demo!(demo_store::catalog());
-    get("/catalog").await
-}
+// ------------------------------------------------------------------ audit
 
 /// A page of the audit log, newest first, optionally filtered with a filt-rs
 /// expression and continued from before an entry id. Without `progress`

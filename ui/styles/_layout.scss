@@ -100,6 +100,25 @@
     display: inline-flex;
     color: var(--fg-3);
   }
+
+  // Leaves the app: set apart from the sections above it.
+  &__item--external {
+    margin-top: 0.6rem;
+    border-top: 1px solid var(--line);
+    border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+    padding-top: 0.8rem;
+  }
+
+  &__hint {
+    display: inline-flex;
+    margin-left: auto;
+    color: var(--fg-3);
+
+    svg {
+      width: 0.85rem;
+      height: 0.85rem;
+    }
+  }
 }
 
 .app-main {

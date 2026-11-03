@@ -709,44 +709,6 @@
   white-space: nowrap;
 }
 
-// Reference
-.toc {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem 0.75rem;
-  margin: 0.25rem 0 1rem;
-
-  &__item {
-    color: var(--fg-2);
-    font-size: 0.82rem;
-  }
-}
-
-.kind {
-  scroll-margin-top: calc(var(--bar-h) + 1rem);
-
-  &__head {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.5rem;
-  }
-
-  &__name {
-    font-size: 1.02rem;
-    color: var(--brand);
-  }
-
-  &__desc {
-    margin: 0.3rem 0 0.5rem;
-  }
-
-  &__facts {
-    margin-bottom: 0.6rem;
-  }
-}
-
 @media (max-width: $narrow) {
   .labels,
   .timeline__item {
