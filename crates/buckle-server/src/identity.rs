@@ -26,7 +26,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// The only algorithm the issuer signs with; trust setups must allow it
-/// (Nomad: `JWTSupportedAlgs = ["ES256"]`).
+/// (Nomad: `SigningAlgs = ["ES256"]`).
 pub const ALGORITHM: &str = "ES256";
 
 /// What a credential may be used for, which binding rules map to policies.

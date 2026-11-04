@@ -274,7 +274,7 @@ ACL policies the rules bind to:
 ```json
 {
   "JWTValidationPubKeys": ["-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----\n"],
-  "JWTSupportedAlgs": ["ES256"],
+  "SigningAlgs": ["ES256"],
   "BoundIssuer": ["https://buckle.example.ts.net"],
   "BoundAudiences": ["home-nomad"],
   "ClaimMappings": { "purpose": "purpose", "host": "host" }

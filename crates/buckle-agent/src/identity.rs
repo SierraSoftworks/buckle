@@ -180,7 +180,7 @@ impl Login {
                         ],
                     )
                 };
-                let token: NomadAclToken = http
+                let response = http
                     .post(url)
                     .json(&NomadLoginRequest {
                         auth_method_name: auth_method,
@@ -188,11 +188,24 @@ impl Login {
                     })
                     .send()
                     .await
-                    .and_then(reqwest::Response::error_for_status)
-                    .map_err(failed)?
-                    .json()
-                    .await
                     .map_err(failed)?;
+                let status = response.status();
+                if !status.is_success() {
+                    // Nomad says why it refused (issuer, audience, signature,
+                    // no matching binding rule) in the body.
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(buckle_core::error::user(
+                        format!(
+                            "Nomad at {api} refused the login for {} ({status}): {}",
+                            identity.audience,
+                            refusal(&body, &identity.token)
+                        ),
+                        &[
+                            "Check the cluster's trust setup: a `jwt` auth method trusting Buckle's keys, with `BoundIssuer` equal to the server's issuer and `BoundAudiences` naming the cluster, and a binding rule for this purpose (see the server's identity docs).",
+                        ],
+                    ));
+                }
+                let token: NomadAclToken = response.json().await.map_err(failed)?;
                 tracing::debug!(accessor = %token.accessor_id, audience = %identity.audience, "logged in to Nomad");
                 Ok(Credential::Nomad {
                     secret_id: token.secret_id,
@@ -202,6 +215,18 @@ impl Login {
                 })
             }
         }
+    }
+}
+
+/// Nomad's reason for refusing a login, trimmed, without the token itself.
+fn refusal(body: &str, token: &str) -> String {
+    let body = body.trim().replace(token, "<token>");
+    if body.is_empty() {
+        return "no reason given".into();
+    }
+    match body.char_indices().nth(300) {
+        Some((i, _)) => format!("{}…", &body[..i]),
+        None => body,
     }
 }
 
@@ -479,7 +504,11 @@ mod tests {
     async fn a_refused_login_explains_the_trust_setup() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(400).set_body_string("no binding rules"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string(
+                    "unable to validate provided token: invalid issuer (iss) claim",
+                ),
+            )
             .mount(&server)
             .await;
         let (_, creds) = credentials(chrono::Duration::minutes(15));
@@ -487,7 +516,11 @@ mod tests {
             .get(&request(Purpose::Deploy), &nomad_login(&server))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("log in to Nomad"), "{err}");
+        let err = err.to_string();
+        assert!(
+            err.contains("refused the login") && err.contains("invalid issuer"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
