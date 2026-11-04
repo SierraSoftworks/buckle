@@ -28,7 +28,11 @@ These are accepted by every command.
 
 The OTLP endpoint can also come from the standard `OTEL_EXPORTER_OTLP_*` variables or from the
 `telemetry` section of `agent.yaml` and `server.yaml`; the flag wins. With an endpoint configured,
-each command exports one trace (a rollout is a single trace across the server and every agent).
+each command exports one trace (a rollout is a single trace across the server and every agent) and
+its log events as OTLP logs, linked to that trace. `buckle server` and `buckle agent` also write their
+logs to stdout (for Nomad and journald); other commands do so with `--verbose`, or whenever no
+endpoint is configured. `LOG_LEVEL` (`error`, `warn`, `info`, `debug`, `trace`; default `info`) sets
+the stdout level; OTLP export never drops below `info`.
 
 ## Exit codes
 
@@ -74,3 +78,4 @@ scalars, so a selector picks the same hosts everywhere:
 | `BUCKLE_AGENT_CONFIG` | `--config` of `agent` |
 | `BUCKLE_SERVER_CONFIG` | `--config` of `server` (set to `/config/server.yaml` in the container image) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `--otel-endpoint` of every command |
+| `LOG_LEVEL` | the stdout log level of every command |

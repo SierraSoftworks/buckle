@@ -39,8 +39,8 @@ sudo buckle up --source /srv/buckle-config --label role=worker
 
 <CliCommand command="agent" />
 
-You rarely run this yourself: the service does. Run it in a terminal with `--verbose` to watch what
-an agent does.
+You rarely run this yourself: the service does. Its logs go to stdout (the journal, under systemd)
+and, with an OTLP endpoint, to OTLP logs; set `LOG_LEVEL=debug` for more detail.
 
 ### Connected to a server
 
@@ -116,7 +116,7 @@ telemetry:
 | `drift.interval` | `15m` | How often to re-plan the applied revision and run health checks. |
 | `drift.correct` | `true` | Apply drift corrections; `false` only reports them. |
 | `vars` | `{}` | Host-specific variable overrides: the last, highest-precedence [vars](../modules/fleet.md#vars) layer. |
-| `telemetry.otlp_endpoint` | | Where to export traces and metrics. `--otel-endpoint` and `OTEL_EXPORTER_OTLP_*` take precedence. |
+| `telemetry.otlp_endpoint` | | Where to export traces, metrics and logs. `--otel-endpoint` and `OTEL_EXPORTER_OTLP_*` take precedence. |
 | `telemetry.otlp_headers` | `{}` | Extra OTLP headers, such as an API key. |
 | `workload_identity.token_file` | | For an [executor inside a cluster](./server.md#in-cluster-executors): the workload identity token file, read on every connect (Nomad: `secrets/nomad_buckle.jwt` from `identity { name = "buckle", aud = ["buckle"], file = true }`). Needs `host_id`. |
 | `workload_identity.jwks_url` | | The cluster's key set as the executor reaches it (Nomad: `/.well-known/jwks.json`), relayed to a server that cannot reach the cluster. |

@@ -228,7 +228,7 @@ Where the server may read the fleet secrets `buckle.yaml` references. See
 
 | Key | Description |
 |---|---|
-| `otlp_endpoint` | Where to export traces and metrics. `--otel-endpoint` and `OTEL_EXPORTER_OTLP_*` take precedence. |
+| `otlp_endpoint` | Where to export traces, metrics and logs (logs also go to stdout). `--otel-endpoint` and `OTEL_EXPORTER_OTLP_*` take precedence. |
 | `otlp_headers` | Extra OTLP headers, such as an API key. Values are redacted in logs. |
 | `trace_url_template` | A link to one trace in your tracing UI, containing `{trace_id}`. The UI links every rollout and run to its trace. |
 

@@ -1,8 +1,11 @@
-//! tracing-batteries session for the binary. OTLP export (traces and
-//! metrics) goes to `--otel-endpoint` / the standard `OTEL_EXPORTER_OTLP_*`
+//! tracing-batteries session for the binary. OTLP export (traces, metrics
+//! and logs) goes to `--otel-endpoint` / the standard `OTEL_EXPORTER_OTLP_*`
 //! environment variables or, when those are not set, to
 //! `telemetry.otlp_endpoint` and `telemetry.otlp_headers` from server.yaml
-//! (`buckle server`) or agent.yaml (`buckle agent`).
+//! (`buckle server`) or agent.yaml (`buckle agent`). The long-running
+//! `server` and `agent` also log to stdout (captured by Nomad and journald),
+//! as does every command with `--verbose`; `LOG_LEVEL` sets the stdout
+//! level.
 
 use tracing_batteries::{OpenTelemetry, Session};
 
@@ -38,6 +41,15 @@ fn otlp_target(
     (endpoint, headers)
 }
 
+/// Whether the command is a long-running service whose stdout is its log.
+fn is_service(command: &crate::commands::Command) -> bool {
+    match command {
+        crate::commands::Command::Server(args) => !args.print_fingerprint,
+        crate::commands::Command::Agent(_) => true,
+        _ => false,
+    }
+}
+
 pub fn session(cli: &crate::commands::Cli) -> Session {
     let (endpoint, headers) = match &cli.command {
         crate::commands::Command::Server(args) => {
@@ -54,11 +66,11 @@ pub fn session(cli: &crate::commands::Cli) -> Session {
         _ => otlp_target(cli.otel_endpoint.as_deref(), agent_telemetry(cli).as_ref()),
     };
     // Headers from OTEL_EXPORTER_OTLP_HEADERS win; with_header keeps them.
-    let mut otel = OpenTelemetry::new(endpoint).with_metrics();
+    let mut otel = OpenTelemetry::new(endpoint).with_metrics().with_logs();
     for (key, value) in headers {
         otel = otel.with_header(key, value);
     }
-    if cli.verbose {
+    if cli.verbose || is_service(&cli.command) {
         otel = otel.with_stdout(true);
     }
     Session::new("buckle", version())
@@ -94,5 +106,20 @@ mod tests {
         let (endpoint, _) = otlp_target(Some("http://flag:4317"), Some(&file));
         assert_eq!(endpoint, "http://flag:4317");
         assert_eq!(otlp_target(None, None).0, "");
+    }
+
+    #[test]
+    fn only_long_running_services_log_to_stdout_by_default() {
+        use clap::Parser;
+        for (args, expected) in [
+            (&["buckle", "server"][..], true),
+            (&["buckle", "agent"][..], true),
+            (&["buckle", "server", "--print-fingerprint"][..], false),
+            (&["buckle", "plan", "--config", "."][..], false),
+            (&["buckle", "facts"][..], false),
+        ] {
+            let cli = crate::commands::Cli::try_parse_from(args).unwrap();
+            assert_eq!(is_service(&cli.command), expected, "{args:?}");
+        }
     }
 }
