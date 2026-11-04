@@ -58,6 +58,32 @@ $tones: (
     }
   }
 
+  // Rolling back: orange.
+  &--caution {
+    background: var(--caution);
+    border-color: var(--caution);
+    color: var(--on-caution);
+
+    &:hover:not(:disabled) {
+      background: var(--caution-strong);
+      border-color: var(--caution-strong);
+      color: var(--on-caution);
+    }
+  }
+
+  // Reviewing what is proposed: blue.
+  &--info {
+    background: var(--active);
+    border-color: var(--active);
+    color: #fff;
+
+    &:hover:not(:disabled) {
+      background: var(--info);
+      border-color: var(--info);
+      color: #fff;
+    }
+  }
+
   &--danger {
     color: var(--danger);
     border-color: color-mix(in srgb, var(--danger) 45%, transparent);

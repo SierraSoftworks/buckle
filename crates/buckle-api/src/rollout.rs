@@ -141,6 +141,8 @@ pub struct RolloutSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub revision: String,
+    /// The revision's full commit message (subject, then body); rollouts
+    /// started before the body was kept carry the subject alone.
     pub revision_message: String,
     pub state: RolloutState,
     pub started_at: DateTime<Utc>,

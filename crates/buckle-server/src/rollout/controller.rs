@@ -2382,7 +2382,7 @@ impl Controller {
             triggered_by: actor.to_owned(),
             runtime: RolloutRuntime {
                 note: note.to_owned(),
-                revision_message: record.message.lines().next().unwrap_or_default().to_owned(),
+                revision_message: record.message.clone(),
                 ..Default::default()
             },
         };

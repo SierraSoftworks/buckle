@@ -98,7 +98,7 @@ rollout already in flight.
 ## 4. Let it converge
 
 The host converges with the next rollout, or in the **stragglers** stage of the current one once that
-rollout is promoted. To converge it now, start a rollout of the stable revision from **Revisions**
+rollout is promoted. To converge it now, start a rollout of the stable revision from **Rollouts**
 (see [Rolling out changes](./rollouts.md#start-a-rollout-by-hand)).
 
 When it is done, the host's **Summary** names the applied revision and **Health** shows its checks.

@@ -55,7 +55,7 @@ fn subject_route(e: &AuditEntry) -> Option<Route> {
     match e.action.split('.').next()? {
         "host" | "agent" => Some(Route::Host { id: subject }),
         "rollout" | "phase" => Some(Route::rollout(&subject)),
-        "revision" => Some(Route::Revisions),
+        "revision" => Some(Route::Rollouts),
         _ => None,
     }
 }

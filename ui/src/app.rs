@@ -161,7 +161,8 @@ fn switch(route: Route) -> Html {
         Route::Rollout { id } => html! { <pages::rollout::RolloutPage {id} /> },
         Route::Hosts => html! { <pages::hosts::Hosts /> },
         Route::Host { id } => html! { <pages::host::HostPage {id} /> },
-        Route::Revisions => html! { <pages::revisions::Revisions /> },
+        // Revisions and rollouts are one history now.
+        Route::Revisions => html! { <Redirect<Route> to={Route::Rollouts} /> },
         Route::Audit => html! { <pages::audit::Audit /> },
         Route::NotFound => html! { <pages::NotFound /> },
     }

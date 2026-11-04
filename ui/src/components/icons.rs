@@ -39,14 +39,6 @@ pub fn hosts() -> Html {
     </> })
 }
 
-pub fn revisions() -> Html {
-    icon(html! { <>
-        <circle cx="12" cy="12" r="3" />
-        <line x1="12" y1="3" x2="12" y2="9" />
-        <line x1="12" y1="15" x2="12" y2="21" />
-    </> })
-}
-
 pub fn audit() -> Html {
     icon(html! { <>
         <path d="M9 4h6l1 2h3v14H5V6h3z" />

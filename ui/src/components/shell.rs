@@ -25,7 +25,6 @@ const NAV: &[NavItem] = &[
     ("Overview", icons::overview, Route::Overview),
     ("Rollouts", icons::rollouts, Route::Rollouts),
     ("Hosts", icons::hosts, Route::Hosts),
-    ("Revisions", icons::revisions, Route::Revisions),
     ("Audit", icons::audit, Route::Audit),
 ];
 

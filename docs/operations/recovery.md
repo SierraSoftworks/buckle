@@ -8,7 +8,7 @@ decision below takes a note, which is kept in the audit log.
 | One host failed its apply or its health checks | The host | Retry, continue with checks waived, force apply, skip |
 | A phase ran out of failure budget and paused | The rollout | Fix and retry the hosts, then resume; or roll back, or abort |
 | The revision is wrong | The rollout | Roll back, abort, or push a fix |
-| A revision that already finished is wrong | The fleet | Push a revert, or roll the fleet back from Revisions |
+| A revision that already finished is wrong | The fleet | Push a revert, or roll the fleet back from Rollouts |
 | An agent lost the server after applying | Nothing | The agent rolls itself back (local rollback) |
 
 ## A failed host
@@ -60,11 +60,11 @@ A revision that completed is stable, so there is no rollout left to roll back. E
 
 - **Push a revert** (preferred). The fix goes through the same phases, approvals and bakes, and Git
   stays the record of what the fleet should be.
-- **Roll the fleet back** from **Revisions**: **Roll back fleet to this…** on an older valid
+- **Roll the fleet back** from **Rollouts**: **Rollback** on an older valid
   revision starts a rollout of it, typed confirmation first. Every gate, approval and bake still
   applies.
 
-<Screenshot name="revisions-rollback" alt="The dialog to roll the fleet back to an older revision" />
+<Screenshot name="rollouts-rollback" alt="The dialog to roll the fleet back to an older revision" />
 
 The next commit on the branch rolls forward again, so follow a fleet rollback with a commit that
 fixes or reverts the change.

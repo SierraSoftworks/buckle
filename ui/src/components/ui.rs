@@ -16,6 +16,8 @@ pub enum Kind {
     /// An action that destroys or undoes something.
     Danger,
     Subtle,
+    /// Rolling the fleet back: orange.
+    Caution,
 }
 
 #[derive(Properties, PartialEq)]
@@ -47,6 +49,7 @@ pub fn button(props: &ButtonProps) -> Html {
             Kind::Primary => Some("btn--primary"),
             Kind::Danger => Some("btn--danger"),
             Kind::Subtle => Some("btn--subtle"),
+            Kind::Caution => Some("btn--caution"),
         },
         props.small.then_some("btn--small"),
         props.busy.then_some("btn--busy"),
