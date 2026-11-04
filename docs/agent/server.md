@@ -270,11 +270,13 @@ signs); delete `retired.key` and restart again once a TTL has passed.
 binding rule per purpose; the agent logs in at `/v1/acl/login` with auth method `buckle`. Created
 once with a management token, alongside the `buckle-read`, `buckle-deploy` and `buckle-drain`
 ACL policies the rules bind to. Planning reads Nomad variables (Buckle's index and the
-workloads' own), which a namespace `read` policy does not grant, so `buckle-read` needs them:
+workloads' own), which a namespace `read` policy does not grant, and plans jobs, which Nomad
+allows only with `submit-job` (it has no plan-only capability), so `buckle-read` needs both:
 
 ```hcl
 namespace "*" {
   policy = "read"
+  capabilities = ["submit-job"]
   variables {
     path "*" { capabilities = ["read", "list"] }
   }
