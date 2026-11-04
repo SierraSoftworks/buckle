@@ -2014,6 +2014,7 @@ impl Controller {
                 .flatten()
                 .unwrap_or_default();
             if record.status == HostStatus::Active
+                && record.executor_of().is_none()
                 && let Ok(rev) = self.revisions.load(&stable).await
             {
                 let h = record.id.clone();
@@ -2731,7 +2732,8 @@ impl Controller {
         for (host, facts) in &hosts {
             self.host_seen
                 .insert(host.id.clone(), (host.status, host.effective_labels()));
-            if host.status != HostStatus::Active {
+            // An in-cluster executor runs no modules of its own.
+            if host.status != HostStatus::Active || host.executor_of().is_some() {
                 continue;
             }
             let ctx = crate::fleet::record_context(host, facts, fleet);
@@ -4257,7 +4259,10 @@ impl Controller {
         let candidates = self.load_targets(None).await.unwrap_or_default();
         for (host, facts) in candidates {
             let carried_here = carried.contains(&host.id);
-            if self.live[ri].find(&host.id).is_some() || host.status != HostStatus::Active {
+            if self.live[ri].find(&host.id).is_some()
+                || host.status != HostStatus::Active
+                || host.executor_of().is_some()
+            {
                 continue;
             }
             if !carried_here {
@@ -4384,7 +4389,7 @@ impl Controller {
         if let Some(c) = &record.cluster {
             self.clusters.insert(record.id.clone(), c.spec.clone());
         }
-        if record.status != HostStatus::Active {
+        if record.status != HostStatus::Active || record.executor_of().is_some() {
             return;
         }
         let ctx = crate::fleet::record_context(&record, &facts, &self.live[ri].revision.fleet);
@@ -4661,9 +4666,9 @@ impl Controller {
         hi: usize,
         targets: &[(crate::store::HostRecord, serde_json::Value)],
     ) -> Pick {
-        let Some(executors) = self.cluster_executors(ri, hi) else {
-            return Pick::None;
-        };
+        let executors = self.cluster_executors(ri, hi);
+        let target = self.live[ri].hosts[hi].host.as_str();
+        let parent = self.clusters.get(target).and_then(|s| s.cluster.as_deref());
         let fleet = &self.live[ri].revision.fleet;
         let busy = self.busy_elsewhere(usize::MAX);
         let inflight: HashSet<&str> = self
@@ -4683,9 +4688,12 @@ impl Controller {
                     .get(&h.id)
                     .is_some_and(|c| c.iter().any(|c| c == TARGETS_CAPABILITY))
             })
-            .filter(|(h, facts)| {
-                let ctx = crate::fleet::record_context(h, facts, fleet);
-                ctx.matches(&executors)
+            .filter(|(h, facts)| match h.executor_of() {
+                // An in-cluster executor speaks for its own cluster only.
+                Some(c) => c == target || parent == Some(c),
+                None => executors.as_ref().is_some_and(|executors| {
+                    crate::fleet::record_context(h, facts, fleet).matches(executors)
+                }),
             })
             .map(|(h, _)| h.id.as_str())
             .collect();
@@ -4846,6 +4854,7 @@ impl Controller {
         let revision = self.live[ri].record.revision.clone();
         let candidate = |this: &Self, host: &crate::store::HostRecord| {
             host.status == HostStatus::Active
+                && host.executor_of().is_none()
                 && this.live[ri].find(&host.id).is_none()
                 && !this.live[ri].record.runtime.untargeted.contains(&host.id)
                 && host.applied_revision.as_deref() != Some(revision.as_str())

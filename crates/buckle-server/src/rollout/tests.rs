@@ -229,6 +229,36 @@ impl Harness {
         );
     }
 
+    /// An in-cluster executor of `cluster`, enrolled by workload identity.
+    async fn enrol_executor(&mut self, host: &str, cluster: &str) {
+        let now = self.clock.now();
+        let (h, method) = (
+            host.to_owned(),
+            format!("{}{cluster}", crate::store::WORKLOAD_AUTH_PREFIX),
+        );
+        self.store
+            .call(move |db| {
+                db.hosts()
+                    .create(&NewHost {
+                        id: h,
+                        status: HostStatus::Active,
+                        token_hash: None,
+                        auth_method: method,
+                        at: now,
+                    })
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        self.scripts.insert(
+            host.to_owned(),
+            Arc::new(Mutex::new(Script {
+                digest: "plan-a".into(),
+                ..Default::default()
+            })),
+        );
+    }
+
     fn script(&self, host: &str, f: impl FnOnce(&mut Script)) {
         f(&mut self.scripts[host].lock().unwrap());
     }
@@ -3873,6 +3903,41 @@ async fn a_cluster_is_staged_between_its_nodes_modules_and_applied_through_an_ex
             "{a} missing from {actions:?}"
         );
     }
+}
+
+/// An executor running inside the cluster speaks for it, though no
+/// selector names it, and runs no modules of its own.
+#[tokio::test(start_paused = true)]
+async fn an_in_cluster_executor_serves_only_its_cluster() {
+    let mut h = Harness::new().await;
+    let other = "  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.groups contains \"nomad\"'\n    lab-nomad:\n      kind: nomad\n";
+    h.revision_with("r1", ONE_PHASE_ALL, other, FLAT).await;
+    h.enrol("n1", "nomad").await;
+    h.script("n1", |s| s.no_targets = true);
+    h.enrol_executor("home-nomad-executor", CLUSTER).await;
+    h.connect("n1", None);
+    h.connect("home-nomad-executor", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "home-nomad healthy", |_, hs| {
+            host(hs, CLUSTER).state == HostPhase::Healthy
+        })
+        .await;
+    assert_eq!(
+        host(&hosts, CLUSTER).runtime.executor.as_deref(),
+        Some("home-nomad-executor")
+    );
+    assert!(
+        hosts.iter().all(|x| x.host != "home-nomad-executor"),
+        "no row of its own"
+    );
+    assert_eq!(host(&hosts, "lab-nomad").runtime.executor, None);
+    let untargeted = h.sent(|to, m| {
+        to == "home-nomad-executor"
+            && targeted(m).is_none()
+            && matches!(m, SMsg::Plan(_) | SMsg::Apply(_))
+    });
+    assert!(untargeted.is_empty(), "{untargeted:?}");
 }
 
 /// A cluster none of whose candidate executors runs a pipeline per target is

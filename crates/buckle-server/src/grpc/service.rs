@@ -52,6 +52,8 @@ pub struct FleetService {
     pub joins: Arc<crate::join::Joins>,
     /// Signs the short-lived cluster credentials of `IssueIdentity`.
     pub identity: Arc<crate::identity::Issuer>,
+    /// Checks in-cluster executors' workload identities.
+    pub workload: Arc<crate::workload::WorkloadTrust>,
 }
 
 impl std::fmt::Debug for FleetService {
@@ -216,6 +218,9 @@ impl FleetService {
         // not ask (tailscaled restarted, its socket went stale). Whatever the
         // token path then says, the agent is told to retry on its normal
         // backoff rather than the slow one for refused hosts.
+        if !hello.workload_token.is_empty() {
+            return self.authenticate_workload(hello).await;
+        }
         let mut whois_error = None;
         if self.uses(AgentAuth::Tailscale)
             && let (Some(peer), Some(whois)) = (peer, &self.whois)
@@ -335,6 +340,118 @@ impl FleetService {
             )),
             (authed, _) => authed,
         }
+    }
+
+    /// An executor inside a cluster, by its workload identity: the cluster
+    /// whose `trust` accepts the token speaks for the host, which is enrolled
+    /// (active) on first contact and bound to that cluster. Each session
+    /// issues a fresh per-host token for the agent's other calls.
+    async fn authenticate_workload(&self, hello: &Hello) -> Result<Authenticated, (String, bool)> {
+        if !self.uses(AgentAuth::WorkloadIdentity) {
+            return Err((
+                "This server does not accept workload identities; add `workload_identity` to agents.auth.".into(),
+                false,
+            ));
+        }
+        if !auth::valid_host_id(&hello.host_id) {
+            return Err((
+                "An in-cluster executor needs a host_id of letters, digits, '.', '_' or '-'."
+                    .into(),
+                false,
+            ));
+        }
+        let candidates = self
+            .store
+            .call(|db| {
+                let mut out = Vec::new();
+                for row in db.hosts().clusters()? {
+                    let Some(info) = &row.cluster else { continue };
+                    let Some(trust) = info.spec.trust.as_deref().cloned() else {
+                        continue;
+                    };
+                    if info.spec.cluster.is_some() {
+                        continue;
+                    }
+                    out.push(crate::workload::Candidate {
+                        learned: db.kv().get(&crate::workload::learned_key(&row.id))?,
+                        cluster: row.id.clone(),
+                        kind: info.spec.kind,
+                        trust,
+                    });
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|e| (e.description().to_string(), true))?;
+        let jwks = (!hello.workload_jwks.is_empty()).then_some(hello.workload_jwks.as_str());
+        let verified = self
+            .workload
+            .verify(&candidates, &hello.workload_token, jwks)
+            .await
+            .map_err(|reason| (reason, false))?;
+        let id = hello.host_id.clone();
+        let method = format!("{}{}", crate::store::WORKLOAD_AUTH_PREFIX, verified.cluster);
+        let issued = auth::new_token();
+        let issued_hash = auth::hash_token(&issued);
+        let now = self.now();
+        let learn = verified.learn.clone();
+        let cluster = verified.cluster.clone();
+        let outcome = self
+            .store
+            .transaction(move |db| {
+                if let Some(keys) = &learn {
+                    db.kv().set(&crate::workload::learned_key(&cluster), keys)?;
+                }
+                match db.hosts().target(&id)? {
+                    Some(h) if h.auth_method.as_deref() != Some(method.as_str()) => Ok(Err(h.id)),
+                    Some(h) => {
+                        db.hosts().set_token_hash(&h.id, &issued_hash)?;
+                        Ok(Ok((h.status, false)))
+                    }
+                    None => {
+                        db.hosts().create(&NewHost {
+                            id: id.clone(),
+                            status: HostStatus::Active,
+                            token_hash: Some(issued_hash),
+                            auth_method: method,
+                            at: now,
+                        })?;
+                        Ok(Ok((HostStatus::Active, true)))
+                    }
+                }
+            })
+            .await
+            .map_err(|e| (e.description().to_string(), true))?;
+        let (status, created) = outcome.map_err(|id| {
+            (
+                format!(
+                    "'{id}' is already registered and is not {}'s executor; give the in-cluster executor its own host_id.",
+                    verified.cluster
+                ),
+                false,
+            )
+        })?;
+        if verified.learn.is_some() {
+            tracing::info!(buckle.target = %verified.cluster, "learned the cluster's signing keys from its executor");
+        }
+        if created {
+            self.controller.host_registered(&hello.host_id);
+            self.audit(
+                "controller",
+                "host.enrolled",
+                &hello.host_id,
+                format!(
+                    "{} enrolled as an executor of {} with its workload identity ({})",
+                    hello.host_id, verified.cluster, verified.subject
+                ),
+            )
+            .await;
+        }
+        Ok(Authenticated {
+            host: hello.host_id.clone(),
+            issued_token: Some(issued),
+            status,
+        })
     }
 
     /// Token authentication and bootstrap enrolment.
@@ -573,7 +690,8 @@ impl FleetService {
         };
         let stable = crate::views::stable_revision(&self.store, &self.revisions).await;
         let secrets = match (&stable, record.status) {
-            (Some(rev), HostStatus::Active) => {
+            // An in-cluster executor runs no modules, so it holds no host secrets.
+            (Some(rev), HostStatus::Active) if record.executor_of().is_none() => {
                 let ctx = crate::fleet::record_context(&record, &facts, &rev.fleet);
                 Some(self.secrets.for_host(rev, &ctx).await)
             }

@@ -1863,6 +1863,7 @@ pub fn clusters(now: DateTime<Utc>) -> Vec<HostSummary> {
                 identity: buckle_api::ClusterSpec::default_identity(),
                 cluster: None,
                 scope: Default::default(),
+                trust: None,
             },
             declared: true,
         }),

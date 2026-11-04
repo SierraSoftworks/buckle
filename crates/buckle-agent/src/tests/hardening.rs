@@ -1406,3 +1406,31 @@ async fn targeted_work_without_its_assignment_fails_with_a_reason() {
     assert!(refused.error.contains("no assignment"), "{refused:?}");
     h.stop().await.expect("clean exit");
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_in_cluster_executor_presents_its_current_workload_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = dir.path().join("nomad_buckle.jwt");
+    std::fs::write(&token_file, "jwt-one\n").unwrap();
+    let mut h = Harness::start(Setup {
+        yaml: format!(
+            "workload_identity: {{ token_file: {} }}\n",
+            token_file.display()
+        ),
+        ..Default::default()
+    })
+    .await;
+    let first = h.sessions.accept().await;
+    assert_eq!(first.hello.workload_token, "jwt-one");
+    assert_eq!(first.hello.host_id, "test-host");
+    first.send(welcome(None, Some("session-token"))).await;
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.read_token().ok().flatten().as_deref() == Some("session-token")).await;
+
+    // The scheduler rotated the token; the next session presents the new one.
+    std::fs::write(&token_file, "jwt-two").unwrap();
+    drop(first);
+    let second = h.sessions.accept().await;
+    assert_eq!(second.hello.workload_token, "jwt-two");
+    h.stop().await.expect("clean exit");
+}

@@ -671,6 +671,10 @@ impl TailscaleConfig {
 pub enum AgentAuth {
     Tailscale,
     Token,
+    /// An executor inside a cluster presents its workload identity token,
+    /// checked against the cluster's `trust`.
+    #[serde(rename = "workload_identity")]
+    WorkloadIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

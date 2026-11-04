@@ -46,6 +46,10 @@ pub struct Hello {
     pub unreported_apply_revisions: Vec<RevisionId>,
     /// The identity of the current boot, when the host exposes one.
     pub boot_id: Option<String>,
+    /// An in-cluster executor's workload identity token.
+    pub workload_token: Option<String>,
+    /// The cluster's key set as the executor read it (JWKS JSON).
+    pub workload_jwks: Option<String>,
 }
 
 impl std::fmt::Debug for Hello {
@@ -65,6 +69,11 @@ impl std::fmt::Debug for Hello {
                 &self.unreported_apply_revisions,
             )
             .field("boot_id", &self.boot_id)
+            .field(
+                "workload_token",
+                &self.workload_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("workload_jwks", &self.workload_jwks.is_some())
             .finish()
     }
 }

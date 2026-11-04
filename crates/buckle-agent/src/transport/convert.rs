@@ -66,6 +66,8 @@ pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
             .collect(),
         capabilities: CAPABILITIES.iter().map(|c| (*c).to_owned()).collect(),
         boot_id: hello.boot_id.clone().unwrap_or_default(),
+        workload_token: hello.workload_token.clone().unwrap_or_default(),
+        workload_jwks: hello.workload_jwks.clone().unwrap_or_default(),
     }
 }
 

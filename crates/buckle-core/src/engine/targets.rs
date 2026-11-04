@@ -338,6 +338,17 @@ fn validate_cluster(
             );
         }
     }
+    if let Some(trust) = &decl.trust {
+        if decl.cluster.is_some() {
+            report.error(
+                None,
+                format!("{location}.trust"),
+                "a scoped target is served by its cluster's executors; set `trust` on the cluster instead",
+            );
+        } else if let Some(problem) = trust.problem() {
+            report.error(None, format!("{location}.trust"), problem);
+        }
+    }
     match &decl.cluster {
         None => {
             if !decl.scope.is_empty() {
@@ -482,6 +493,18 @@ secrets:
     #[case::identity_secret_undeclared(
         &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    c:\n      kind: nomad\n      nodes: 'true'\n      identity: secret://NOPE\n")],
         "does not declare the secret 'NOPE'"
+    )]
+    #[case::trust_without_keys(
+        &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    c:\n      kind: nomad\n      nodes: 'true'\n      trust: { subjects: [default/x] }\n")],
+        "needs `jwks_url` or `keys`"
+    )]
+    #[case::trust_keys_not_a_jwks(
+        &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    c:\n      kind: nomad\n      nodes: 'true'\n      trust: { keys: { kid: a } }\n")],
+        "must be a JWKS document"
+    )]
+    #[case::trust_on_a_scoped_target(
+        &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    c: { kind: nomad, cluster: p, trust: { jwks_url: 'http://p:4646/.well-known/jwks.json' } }\n")],
+        "set `trust` on the cluster instead"
     )]
     #[case::nodes_select_clusters(
         &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    c:\n      kind: nomad\n      nodes: 'cluster.labels.x == 1'\n")],

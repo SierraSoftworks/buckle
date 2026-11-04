@@ -73,6 +73,14 @@ message Hello {
   // one. A server waiting on a reboot (ApplyResult.reboot) takes a session
   // from another boot as the host back from it.
   string boot_id = 12;
+  // An executor running inside a cluster: its workload identity token (a
+  // Nomad workload identity, a projected ServiceAccount token), checked
+  // against the cluster's `trust` under `agents.auth: workload_identity`.
+  string workload_token = 13;
+  // The cluster's current key set (JWKS JSON) as the executor reads it
+  // there, for a server that cannot reach the cluster: once the token
+  // verifies against a key the server already trusts, it learns the rest.
+  string workload_jwks = 14;
 }
 
 message Facts {

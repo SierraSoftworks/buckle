@@ -95,6 +95,7 @@ pub mod v1 {
                 .field("applied_revision", &self.applied_revision)
                 .field("last_plan_digest", &self.last_plan_digest)
                 .field("token", &redacted(&self.token))
+                .field("workload_token", &redacted(&self.workload_token))
                 .field("platform", &self.platform)
                 .field("arch", &self.arch)
                 .field("bootstrap", &self.bootstrap)
@@ -225,6 +226,7 @@ mod tests {
                 AgentMessage {
                     msg: Some(agent_message::Msg::Hello(Hello {
                         token: "tok-en-value".into(),
+                        workload_token: "tok-en-value".into(),
                         ..Default::default()
                     })),
                 }

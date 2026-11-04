@@ -118,7 +118,7 @@ and the fleet stays on the last valid one.
 
 | Key | Default | Description |
 |---|---|---|
-| `auth` | `[tailscale, token]` | How agents may authenticate; chosen per connection. |
+| `auth` | `[tailscale, token]` | How agents may authenticate; chosen per connection. `workload_identity` admits [in-cluster executors](#in-cluster-executors). |
 | `bootstrap_token` | | Lets a new host enrol over token auth. It only ever creates hosts: an id that is already registered must present its own per-host token. |
 | `registration` | `auto` | `auto` makes a new host active at once; `approve` keeps every new host pending until an admin approves it. |
 | `tailscale.allowed_tags` | `[]` | Tailnet nodes with one of these ACL tags may register (the `tag:` prefix is optional). |
@@ -132,6 +132,26 @@ and the fleet stays on the last valid one.
 | `desired_version` | server's version | The version the UI offers when an admin upgrades an agent. |
 | `disconnect_timeout` | `10m` | A host disconnected this long in the middle of its wave counts as failed. |
 | `apply_timeout` | `30m` | A host applying this long without a result counts as failed. |
+
+#### In-cluster executors
+
+An executor running inside a cluster (a Nomad job, a Kubernetes Deployment) authenticates with
+the token its scheduler gives it rather than a per-host token, so nothing is kept in the
+container. With `workload_identity` in `agents.auth`, an agent whose Hello carries a workload
+identity is accepted when exactly one cluster's [`trust`](../modules/fleet.md#clusters) does:
+
+- the token is signed (RS, PS, ES or EdDSA) by a key from `trust.jwks_url`, `trust.keys`, or a
+  key set learned from the executor, and carries `aud: buckle`, a live `exp` and `trust.issuer`;
+- it names one of `trust.subjects`: `namespace/job` from a Nomad identity's `nomad_namespace` and
+  `nomad_job_id` claims, else `sub`.
+
+The host (its configured `host_id`) is enrolled active on first contact and bound to the cluster:
+it is picked as the executor of that cluster and its scoped targets only, runs no modules of its
+own, and gets no host secrets. Each session issues it a fresh per-host token for its other calls.
+A server that cannot reach the cluster pins `trust.keys`; the executor relays the key set it
+reads inside the cluster (`workload_identity.jwks_url`), which the server keeps under kv
+`trust/<cluster>/jwks` once the token verified against a key it already trusted and the relayed
+set holds that same key, so it follows key rotation without a relay ever adding trust.
 
 #### Tailscale provisioning
 

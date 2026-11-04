@@ -22,7 +22,7 @@ pub use audit::{Audit, AuditFilter, NewAudit};
 pub use drift::Drift;
 pub use health::{HEALTH_EPOCHS, HealthEventRecord, HealthEvents};
 pub(crate) use hosts::status_str as hosts_status_str;
-pub use hosts::{HostRecord, Hosts, NewCluster, NewHost};
+pub use hosts::{HostRecord, Hosts, NewCluster, NewHost, WORKLOAD_AUTH_PREFIX};
 pub use kv::Kv;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
