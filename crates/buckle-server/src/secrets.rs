@@ -20,6 +20,9 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ServerSecrets {
     resolver: Arc<Resolver>,
+    /// The server's install key: cluster targets' fingerprint keys derive
+    /// from it.
+    key: Arc<InstallKey>,
 }
 
 impl std::fmt::Debug for ServerSecrets {
@@ -31,6 +34,7 @@ impl std::fmt::Debug for ServerSecrets {
 impl ServerSecrets {
     /// Builds a resolver from `secrets.providers` in server.yaml.
     pub fn new(config: &SecretsConfig, key: InstallKey) -> Self {
+        let derive_from = Arc::new(key.clone());
         let mut resolver = Resolver::new(key);
         if let Some(file) = &config.providers.file {
             if file.root.is_none() {
@@ -63,7 +67,28 @@ impl ServerSecrets {
         }
         Self {
             resolver: Arc::new(resolver),
+            key: derive_from,
         }
+    }
+
+    /// The key a cluster target's executors fingerprint planned values with
+    /// (Nomad variable items): one per target, the same for every executor
+    /// and every restart, so plan digests do not depend on who planned.
+    pub fn fingerprint_key(&self, target: &str) -> Vec<u8> {
+        TransportSink.key_bytes(&self.key.derive("cluster-fingerprints", target))
+    }
+
+    /// The bundle a cluster target's executor receives with a targeted
+    /// Assign: the secrets its selected workloads, matching vars overlays and
+    /// `secret://` identity reference.
+    pub async fn for_cluster(
+        &self,
+        revision: &Revision,
+        ctx: &HostContext,
+        identity: Option<&str>,
+    ) -> SecretBundle {
+        let names = buckle_core::engine::secret_names_for_cluster(revision, ctx, identity);
+        self.bundle(revision, &names).await
     }
 
     /// Names of secret references in `text` (`secrets.NAME`,

@@ -3830,6 +3830,38 @@ async fn a_cluster_is_staged_between_its_nodes_modules_and_applied_through_an_ex
     assert_eq!(applies[cluster_apply[0]].1, "n1");
     assert!(module_step.iter().all(|&i| i < cluster_apply[0]));
     assert!(whole.iter().all(|&i| i > cluster_apply[0]));
+    // The executor keeps nothing: every request for the cluster follows an
+    // Assign of its revision describing the cluster, with its secrets and
+    // fingerprint key.
+    let to_executor: Vec<SMsg> = h
+        .sent(|host, m| host == "n1" && targeted(m).is_some())
+        .into_iter()
+        .map(|(_, _, m)| m)
+        .collect();
+    let mut requests = 0;
+    for (i, m) in to_executor.iter().enumerate() {
+        let revision = match m {
+            SMsg::Plan(p) => &p.revision,
+            SMsg::Apply(a) => &a.revision,
+            // Health before the cluster applied anything names no revision.
+            SMsg::Health(hr) if !hr.revision.is_empty() => &hr.revision,
+            _ => continue,
+        };
+        requests += 1;
+        match i.checked_sub(1).map(|j| &to_executor[j]) {
+            Some(SMsg::Assign(a)) => {
+                assert_eq!(&a.revision, revision, "{m:?}");
+                let c = a
+                    .cluster
+                    .as_ref()
+                    .expect("the Assign describes the cluster");
+                assert_eq!(c.kind, "nomad");
+                assert_eq!(c.fingerprint_key.len(), 32);
+            }
+            other => panic!("{m:?} followed {other:?}, not an Assign"),
+        }
+    }
+    assert!(requests >= 2, "plan and apply: {to_executor:?}");
     let actions = h.audit_actions(&id).await;
     for a in [
         "rollout.phase.stage",

@@ -136,6 +136,39 @@ impl std::fmt::Debug for Welcome {
     }
 }
 
+/// A cluster target as a targeted Assign describes it. Its `Debug` hides the
+/// fingerprint key, which is zeroed when it is dropped.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct WireCluster {
+    /// `nomad` or `kubernetes`.
+    pub kind: String,
+    /// The cluster's API; empty: the executor's local default.
+    pub api: String,
+    /// `buckle_jwt`, `local`, `workload` or `secret://NAME`.
+    pub identity: String,
+    /// Effective labels.
+    pub labels: IndexMap<String, String>,
+    /// Keys the target's plan fingerprints.
+    pub fingerprint_key: Vec<u8>,
+}
+
+impl Drop for WireCluster {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.fingerprint_key);
+    }
+}
+
+impl std::fmt::Debug for WireCluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireCluster")
+            .field("kind", &self.kind)
+            .field("api", &self.api)
+            .field("identity", &self.identity)
+            .field("labels", &self.labels)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What changed about the host, pushed while connected.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostUpdate {
@@ -168,6 +201,8 @@ pub enum Instruction {
         tree_digest: Option<String>,
         /// The cluster target this concerns; `None` for the host itself.
         target: Option<String>,
+        /// For a cluster target: how to reach it.
+        cluster: Option<WireCluster>,
     },
     /// Plan the revision and report the plan.
     RequestPlan {
@@ -232,6 +267,8 @@ pub enum Instruction {
         traceparent: Option<String>,
         /// The cluster target to check; `None` for the host itself.
         target: Option<String>,
+        /// For a cluster target: the revision to check (its applied one).
+        revision: Option<RevisionId>,
     },
     /// Keepalive from the server; nothing to do.
     Ping,
@@ -260,8 +297,7 @@ pub enum Instruction {
 
 impl Instruction {
     /// The cluster target the instruction concerns, when it is not the host
-    /// itself. An agent that does not run workloads answers a targeted
-    /// RequestPlan with a failure and ignores the rest.
+    /// itself: the agent runs it through its cluster pipeline.
     pub fn target(&self) -> Option<&str> {
         match self {
             Instruction::Assign { target, .. }
@@ -418,6 +454,14 @@ pub enum Report {
         /// Why, for the operator.
         error: String,
     },
+    /// A report about a cluster target this agent executes for: the inner
+    /// report travels with `target` set.
+    For {
+        /// The cluster target.
+        target: String,
+        /// The report.
+        report: Box<Report>,
+    },
 }
 
 /// The outcome of an Upgrade, as reported to the server.
@@ -437,7 +481,19 @@ impl Report {
         match self {
             Report::ApplyResult { report_id, .. } => Some(*report_id),
             Report::LocalRollback(record) => Some(record.report_id),
+            Report::For { report, .. } => report.report_id(),
             _ => None,
+        }
+    }
+
+    /// `self` about the cluster `target`, or as it is for `None`.
+    pub fn about(self, target: Option<&str>) -> Report {
+        match target {
+            Some(target) => Report::For {
+                target: target.to_owned(),
+                report: Box::new(self),
+            },
+            None => self,
         }
     }
 }
@@ -456,6 +512,9 @@ pub enum DurableReport {
         outcome: serde_json::Value,
         /// The revision applied on the host after the run.
         applied_revision: Option<RevisionId>,
+        /// The cluster target the run was for; `None` for the host itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     /// A local or module rollback.
     LocalRollback(LocalRollbackRecord),
@@ -470,11 +529,16 @@ impl DurableReport {
         }
     }
 
-    /// The revision an ApplyResult reports on.
+    /// The revision an ApplyResult reports on, when it is about the host
+    /// itself (Hello announces those).
     pub fn apply_revision(&self) -> Option<&RevisionId> {
         match self {
-            DurableReport::ApplyResult { revision, .. } => Some(revision),
-            DurableReport::LocalRollback(_) => None,
+            DurableReport::ApplyResult {
+                revision,
+                target: None,
+                ..
+            } => Some(revision),
+            _ => None,
         }
     }
 
@@ -491,8 +555,25 @@ impl DurableReport {
                 revision: revision.clone(),
                 outcome: serde_json::to_value(outcome).unwrap_or_default(),
                 applied_revision: applied_revision.clone(),
+                target: None,
             }),
             Report::LocalRollback(record) => Some(DurableReport::LocalRollback(record.clone())),
+            Report::For { target, report } => match Self::from_report(report)? {
+                DurableReport::ApplyResult {
+                    report_id,
+                    revision,
+                    outcome,
+                    applied_revision,
+                    ..
+                } => Some(DurableReport::ApplyResult {
+                    report_id,
+                    revision,
+                    outcome,
+                    applied_revision,
+                    target: Some(target.clone()),
+                }),
+                other => Some(other),
+            },
             _ => None,
         }
     }
@@ -505,13 +586,17 @@ impl DurableReport {
                 revision,
                 outcome,
                 applied_revision,
+                target,
             } => match serde_json::from_value(outcome.clone()) {
-                Ok(outcome) => Some(Report::ApplyResult {
-                    report_id: *report_id,
-                    revision: revision.clone(),
-                    outcome,
-                    applied_revision: applied_revision.clone(),
-                }),
+                Ok(outcome) => Some(
+                    Report::ApplyResult {
+                        report_id: *report_id,
+                        revision: revision.clone(),
+                        outcome,
+                        applied_revision: applied_revision.clone(),
+                    }
+                    .about(target.as_deref()),
+                ),
                 Err(err) => {
                     tracing::warn!(report = report_id, error = %err, "dropping a stored apply result that no longer parses");
                     None

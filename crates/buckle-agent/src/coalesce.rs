@@ -63,11 +63,23 @@ fn keeps_its_place(event: &ApplyEvent) -> bool {
 /// Forwards events from `events` to `sink` until the channel closes,
 /// honouring [`EVENT_SPACING`]. Returns `(sent, dropped)`.
 pub async fn forward(
+    events: mpsc::Receiver<ApplyEvent>,
+    sink: ReportSink,
+    revision: RevisionId,
+    plan_digest: String,
+    spacing: Duration,
+) -> (usize, usize) {
+    forward_for(events, sink, revision, plan_digest, spacing, None).await
+}
+
+/// [`forward`] for the cluster `target` (`None`: the host itself).
+pub async fn forward_for(
     mut events: mpsc::Receiver<ApplyEvent>,
     sink: ReportSink,
     revision: RevisionId,
     plan_digest: String,
     spacing: Duration,
+    target: Option<String>,
 ) -> (usize, usize) {
     let mut pending: IndexMap<String, (chrono::DateTime<chrono::Utc>, ApplyEvent)> =
         IndexMap::new();
@@ -83,7 +95,8 @@ pub async fn forward(
             plan_digest: plan_digest.clone(),
             at,
             event,
-        };
+        }
+        .about(target.as_deref());
         async move { sink.send(report).await }
     };
 

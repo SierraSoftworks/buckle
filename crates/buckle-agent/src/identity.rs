@@ -237,6 +237,27 @@ impl Credentials {
         request: &IdentityRequest,
         login: &Login,
     ) -> buckle_core::Result<Credential> {
+        let http = self.http.clone();
+        self.get_with(request, login, |identity| async move {
+            login.login(&http, &identity).await
+        })
+        .await
+    }
+
+    /// [`Credentials::get`], exchanging a fresh identity through `exchange`
+    /// rather than [`Login::login`]: an executor logs in to Nomad over its
+    /// own API client (which also reaches a Unix socket). `login` still keys
+    /// the cache.
+    pub async fn get_with<F, Fut>(
+        &self,
+        request: &IdentityRequest,
+        login: &Login,
+        exchange: F,
+    ) -> buckle_core::Result<Credential>
+    where
+        F: FnOnce(IssuedIdentity) -> Fut,
+        Fut: std::future::Future<Output = buckle_core::Result<Credential>>,
+    {
         let key = (request.clone(), login.clone());
         let mut cache = self.cache.lock().await;
         let now = Utc::now();
@@ -245,7 +266,7 @@ impl Credentials {
             return Ok(c.clone());
         }
         let identity = self.transport.issue_identity(request).await?;
-        let credential = login.login(&self.http, &identity).await?;
+        let credential = exchange(identity).await?;
         cache.insert(key, credential.clone());
         Ok(credential)
     }

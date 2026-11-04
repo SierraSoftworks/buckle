@@ -40,6 +40,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+mod targets;
+
 /// Tunables of the session loop. The defaults are the design's values; tests
 /// shorten some of them.
 #[derive(Debug, Clone)]
@@ -144,6 +146,11 @@ enum Op {
     WatchdogCheck,
     /// Carries out a pending reboot (one a restart interrupted).
     Reboot,
+    /// Work for a cluster target this agent executes for.
+    Target {
+        target: String,
+        instruction: Box<Instruction>,
+    },
 }
 
 struct Queued {
@@ -186,6 +193,8 @@ struct Data {
     /// Tarball digests the server named for revisions (Assign, Welcome):
     /// every fetch of those revisions is verified against them.
     tree_digests: HashMap<RevisionId, String>,
+    /// The latest targeted Assigns, per cluster target and revision.
+    assignments: crate::cluster::Assignments,
 }
 
 struct Shared {
@@ -222,6 +231,8 @@ struct Shared {
     boot_id: Mutex<Option<String>>,
     /// Signalled whenever the server acknowledges reports.
     acked: Notify,
+    /// Runs the cluster targets this host executes for.
+    executor: crate::cluster::Executor,
 }
 
 enum SessionEnd {
@@ -396,8 +407,11 @@ impl Agent {
             use buckle_core::system::System;
             buckle_core::system::RealSystem::new().hostname()
         });
+        let executor =
+            crate::cluster::Executor::new(transport.clone(), Arc::new(crate::cluster::Network));
         Ok(Self {
             shared: Arc::new(Shared {
+                executor,
                 config,
                 options,
                 host_id,
@@ -424,6 +438,15 @@ impl Agent {
                 acked: Notify::new(),
             }),
         })
+    }
+
+    /// Reaches cluster targets through `connect` rather than over the
+    /// network (tests use an in-memory Nomad).
+    pub fn with_cluster_connect(mut self, connect: Arc<dyn crate::cluster::Connect>) -> Self {
+        if let Some(shared) = Arc::get_mut(&mut self.shared) {
+            shared.executor = crate::cluster::Executor::new(shared.transport.clone(), connect);
+        }
+        self
     }
 
     /// Runs until `shutdown` trips or an upgrade asks for a restart (exit
@@ -730,11 +753,16 @@ impl Shared {
                     Some(Instruction::Ping) => {}
                     Some(Instruction::Ack { report_ids }) => self.on_ack(&report_ids).await,
                     Some(Instruction::HostUpdate(update)) => self.on_host_update(update, queue).await,
-                    // Work for a cluster target: this agent runs none, so a
-                    // plan is answered with a failure the server can show
-                    // and anything else is logged and dropped.
+                    // Work for a cluster target this host executes for. As
+                    // for the host's own work, all but the Assign belong to
+                    // the session that asked.
                     Some(other) if other.target().is_some() => {
-                        self.refuse_targeted(other).await;
+                        let target = other.target().unwrap_or_default().to_owned();
+                        let bound = !matches!(other, Instruction::Assign { .. });
+                        queue.push(
+                            Op::Target { target, instruction: Box::new(other) },
+                            bound.then_some(generation),
+                        );
                     }
                     Some(other) => {
                         if let Some(op) = op_for(other) {
@@ -1108,6 +1136,10 @@ impl Shared {
                 self.reboot_if_pending().await;
             }
             Op::Reboot => self.reboot_if_pending().await,
+            Op::Target {
+                target,
+                instruction,
+            } => self.target_op(target, *instruction).await,
         }
     }
 
@@ -1979,6 +2011,8 @@ impl Shared {
             keep.push(w.to.clone());
             keep.push(w.from.clone());
         }
+        // Revisions of the cluster targets this host executes for.
+        keep.extend(data.assignments.revisions().cloned());
         keep
     }
 
@@ -2479,29 +2513,6 @@ impl Shared {
         // otherwise after the next Welcome.
         self.send_durable(Report::LocalRollback(record)).await;
     }
-    /// Answers an instruction aimed at a cluster target. This agent applies
-    /// revisions to its own host only, so a targeted plan fails with a
-    /// reason the server can show, and other targeted work is ignored.
-    async fn refuse_targeted(&self, instruction: Instruction) {
-        let target = instruction.target().unwrap_or_default().to_owned();
-        match instruction {
-            Instruction::RequestPlan { revision, .. } => {
-                tracing::warn!(%target, revision = %revision.short(), "asked to plan for a cluster target; this agent does not run workloads");
-                self.sink
-                    .send(Report::PlanFailed {
-                        revision,
-                        error: format!(
-                            "This agent does not run workloads, so it cannot plan for the cluster target '{target}'."
-                        ),
-                        target: Some(target),
-                    })
-                    .await;
-            }
-            other => {
-                tracing::warn!(%target, instruction = ?std::mem::discriminant(&other), "ignoring an instruction for a cluster target; this agent does not run workloads");
-            }
-        }
-    }
 }
 
 fn op_for(instruction: Instruction) -> Option<Op> {
@@ -2512,6 +2523,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             secrets,
             tree_digest,
             target: _,
+            cluster: _,
         } => Op::Assign {
             revision,
             stable,
@@ -2565,6 +2577,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             until,
             traceparent,
             target: _,
+            revision: _,
         } => Op::Health {
             request_id,
             scope,

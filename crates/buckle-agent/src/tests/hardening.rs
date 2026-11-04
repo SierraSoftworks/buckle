@@ -1262,22 +1262,138 @@ async fn a_pending_host_caches_the_stable_revision_only_once_it_is_active() {
     h.stop().await.expect("clean exit");
 }
 
+const CLUSTER_FLEET: &str = "version: 2\nfleet:\n  clusters:\n    home-nomad: { kind: nomad }\n";
+
+fn targeted_assign(revision: &str, digest: &str) -> pb::server_message::Msg {
+    pb::server_message::Msg::Assign(pb::Assign {
+        revision: revision.into(),
+        tree_digest: digest.into(),
+        target: "home-nomad".into(),
+        cluster: Some(pb::ClusterTarget {
+            kind: "nomad".into(),
+            identity: "buckle_jwt".into(),
+            fingerprint_key: vec![7; 32],
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[tokio::test(start_paused = true)]
-async fn work_for_a_cluster_target_is_refused_without_disturbing_the_host() {
+async fn an_executor_plans_applies_and_checks_a_cluster_target_beside_its_host() {
     let fake = FakeRunner::new();
-    let plan = plan_with_changes(&rev("rev1"), 1);
-    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    let host_plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![host_plan.clone()]);
+    let nomad = buckle_nomad::testing::FakeNomad::new();
     let mut h = Harness::start(Setup {
         runner: fake.clone(),
+        cluster: Some(nomad.clone()),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    assert!(session.hello.capabilities.contains(&"targets".to_owned()));
+    session.send(welcome(None, None)).await;
+    let job = r#"{"ID": "paste", "Type": "service", "TaskGroups": [{"Name": "api", "Count": 1, "Tasks": [{"Name": "paste"}]}]}"#;
+    let digest = h.fleet.add_revision(
+        "rev1",
+        crate::tests::bundle_files(&[
+            ("buckle.yaml", CLUSTER_FLEET),
+            (
+                "workloads/paste/workload.yaml",
+                "name: paste\njob: paste.nomad.hcl\n",
+            ),
+            ("workloads/paste/files/paste.nomad.hcl", job),
+        ]),
+    );
+
+    // Plan: answered for the target, logged in with a read identity.
+    session.send(targeted_assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Plan(pb::RequestPlan {
+            target: "home-nomad".into(),
+            revision: "rev1".into(),
+            select: String::new(),
+        }))
+        .await;
+    let planned = session.expect(plan_result).await;
+    assert_eq!(
+        (planned.target.as_str(), planned.error.as_str()),
+        ("home-nomad", "")
+    );
+    assert!(planned.changes > 0, "{planned:?}");
+    assert!(nomad.logins()[0].contains("Read"), "{:?}", nomad.logins());
+
+    // Apply: every event and the durable result name the target.
+    session.send(targeted_assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Apply(pb::Apply {
+            target: "home-nomad".into(),
+            approval_digest: planned.approval_digest.clone(),
+            ..apply("rev1", &planned.digest)
+        }))
+        .await;
+    let seen = session.collect_until(|m| apply_result(m).is_some()).await;
+    let events: Vec<pb::ApplyEvent> = seen
+        .iter()
+        .filter_map(|(_, m)| match m {
+            pb::agent_message::Msg::Apply(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!events.is_empty());
+    assert!(
+        events.iter().all(|e| e.target == "home-nomad"),
+        "{events:?}"
+    );
+    let result = seen.iter().find_map(|(_, m)| apply_result(m)).unwrap();
+    assert_eq!(result.target, "home-nomad");
+    assert!(result.succeeded, "{result:?}");
+    assert_eq!(result.applied_revision, "rev1");
+    assert!(nomad.job("default", "paste").is_some());
+
+    // Health of the cluster's applied revision.
+    session.send(targeted_assign("rev1", &digest)).await;
+    session
+        .send(pb::server_message::Msg::Health(pb::RunHealth {
+            request_id: "h1".into(),
+            scope: pb::HealthScope::Bake as i32,
+            target: "home-nomad".into(),
+            revision: "rev1".into(),
+            ..Default::default()
+        }))
+        .await;
+    let report = session.expect(health_report).await;
+    assert_eq!(report.target, "home-nomad");
+    assert!(
+        !report.results.is_empty() && report.results.iter().all(|r| r.passed),
+        "{report:?}"
+    );
+
+    // The host's own work is unaffected and names no target.
+    session.send(assign("rev1", &digest)).await;
+    session.send(request_plan("rev1")).await;
+    let own = session.expect(plan_result).await;
+    assert_eq!(
+        (own.target.as_str(), own.digest.as_str()),
+        ("", host_plan.digest.as_str())
+    );
+    assert!(
+        !fake.calls().iter().any(|c| matches!(c, Call::Apply { .. })),
+        "the cluster's apply must not run on the host"
+    );
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn targeted_work_without_its_assignment_fails_with_a_reason() {
+    let mut h = Harness::start(Setup {
+        cluster: Some(buckle_nomad::testing::FakeNomad::new()),
         ..Default::default()
     })
     .await;
     let mut session = h.sessions.accept().await;
     session.send(welcome(None, None)).await;
-    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
-    session.send(assign("rev1", &digest)).await;
-    // A plan for a cluster target fails, naming the target, so the server
-    // can show why; an apply for one is dropped.
     session
         .send(pb::server_message::Msg::Plan(pb::RequestPlan {
             target: "home-nomad".into(),
@@ -1287,24 +1403,6 @@ async fn work_for_a_cluster_target_is_refused_without_disturbing_the_host() {
         .await;
     let refused = session.expect(plan_result).await;
     assert_eq!(refused.target, "home-nomad");
-    assert!(
-        refused.error.contains("does not run workloads"),
-        "{refused:?}"
-    );
-    session
-        .send(pb::server_message::Msg::Apply(pb::Apply {
-            target: "home-nomad".into(),
-            ..apply("rev1", plan.digest.as_str())
-        }))
-        .await;
-    // The host's own work is unaffected.
-    session.send(request_plan("rev1")).await;
-    let planned = session.expect(plan_result).await;
-    assert_eq!(planned.error, "");
-    assert_eq!(planned.target, "");
-    assert!(
-        !fake.calls().iter().any(|c| matches!(c, Call::Apply { .. })),
-        "the targeted apply must not run on the host"
-    );
+    assert!(refused.error.contains("no assignment"), "{refused:?}");
     h.stop().await.expect("clean exit");
 }

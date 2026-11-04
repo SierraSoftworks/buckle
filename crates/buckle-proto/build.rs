@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".buckle.v1.SecretBundle",
             ".buckle.v1.Welcome",
             ".buckle.v1.Assign",
+            ".buckle.v1.ClusterTarget",
             ".buckle.v1.Hello",
             ".buckle.v1.HostUpdate",
         ])

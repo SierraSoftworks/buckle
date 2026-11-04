@@ -2,7 +2,8 @@
 //! messages in [`buckle_proto::v1`].
 
 use super::{
-    Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, UpgradeReport, Welcome, WireSecret,
+    Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, UpgradeReport, Welcome,
+    WireCluster, WireSecret,
 };
 use buckle_core::health::{HealthReport, HealthResult, HealthStatus};
 use buckle_core::plan::RevisionId;
@@ -32,12 +33,13 @@ fn json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
     })
 }
 
-/// The protobuf Hello.
 /// Optional behaviours this agent understands, announced in Hello:
-/// `force_plan` (an operator's force apply skips the digest check) and
-/// `approval_digest` (an approval binds the plan's intent).
-pub const CAPABILITIES: &[&str] = &["force_plan", "approval_digest"];
+/// `force_plan` (an operator's force apply skips the digest check),
+/// `approval_digest` (an approval binds the plan's intent) and `targets`
+/// (it runs a pipeline per cluster target it executes for).
+pub const CAPABILITIES: &[&str] = &["force_plan", "approval_digest", "targets"];
 
+/// The protobuf Hello.
 pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
     pb::Hello {
         host_id: hello.host_id.clone(),
@@ -122,6 +124,14 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             secrets: secrets_from_proto(a.secrets),
             tree_digest: non_empty(a.tree_digest),
             target: non_empty(a.target),
+            cluster: a.cluster.map(|mut c| WireCluster {
+                kind: std::mem::take(&mut c.kind),
+                api: std::mem::take(&mut c.api),
+                identity: std::mem::take(&mut c.identity),
+                labels: std::mem::take(&mut c.labels).into_iter().collect(),
+                // Moved, not copied: the WireCluster zeroes it on drop.
+                fingerprint_key: std::mem::take(&mut c.fingerprint_key),
+            }),
         },
         Msg::Plan(p) => Instruction::RequestPlan {
             revision: RevisionId(p.revision),
@@ -165,6 +175,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
                 until: h.until.as_ref().and_then(from_timestamp),
                 traceparent: non_empty(h.traceparent),
                 target: non_empty(h.target),
+                revision: non_empty(h.revision).map(RevisionId),
             }
         }
         Msg::Ping(_) => Instruction::Ping,
@@ -514,8 +525,30 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             boot_id: boot_id.clone().unwrap_or_default(),
             error: error.clone(),
         }),
+        Report::For { target, report } => {
+            let mut inner = report_to_proto(report);
+            if let Some(msg) = inner.msg.as_mut() {
+                set_target(msg, target);
+            }
+            return inner;
+        }
     };
     pb::AgentMessage { msg: Some(msg) }
+}
+
+/// Names the cluster `target` on a report that carries one.
+fn set_target(msg: &mut pb::agent_message::Msg, target: &str) {
+    use pb::agent_message::Msg;
+    let field = match msg {
+        Msg::Facts(m) => &mut m.target,
+        Msg::Plan(m) => &mut m.target,
+        Msg::Apply(m) => &mut m.target,
+        Msg::Result(m) => &mut m.target,
+        Msg::Health(m) => &mut m.target,
+        Msg::Drift(m) => &mut m.target,
+        _ => return,
+    };
+    *field = target.to_owned();
 }
 
 #[cfg(test)]

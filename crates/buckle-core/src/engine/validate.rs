@@ -660,6 +660,44 @@ pub fn secret_names_for_host(revision: &Revision, ctx: &HostContext) -> BTreeSet
     names
 }
 
+/// The declared secrets a cluster target's selected workloads and matching
+/// vars overlays reference, plus the one its `secret://` identity names:
+/// what its executor receives with a targeted Assign.
+pub fn secret_names_for_cluster(
+    revision: &Revision,
+    ctx: &HostContext,
+    identity: Option<&str>,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for workload in super::targets::selected_workloads(revision, ctx) {
+        if let Ok(yaml) = serde_yaml::to_string(&workload.config) {
+            names.extend(secret_references(&yaml));
+        }
+        for (_, template) in &workload.templates {
+            names.extend(secret_references(template));
+        }
+    }
+    for overlay in &revision.fleet.vars {
+        if let Some(when) = &overlay.when
+            && !ctx.matches(when)
+        {
+            continue;
+        }
+        if let Ok(yaml) = serde_yaml::to_string(&overlay.values) {
+            names.extend(secret_references(&yaml));
+        }
+        if let Some(file) = &overlay.file
+            && let Some(value) = revision.var_files.get(file)
+            && let Ok(yaml) = serde_yaml::to_string(value)
+        {
+            names.extend(secret_references(&yaml));
+        }
+    }
+    names.extend(identity.map(str::to_owned));
+    names.retain(|n| revision.fleet.secrets.contains_key(n));
+    names
+}
+
 #[cfg(test)]
 mod secret_scope_tests {
     use super::*;
@@ -719,6 +757,46 @@ mod secret_scope_tests {
     fn names(rev: &Revision, facts: serde_json::Value) -> Vec<String> {
         let ctx = host_context(rev, host("home"), &facts);
         secret_names_for_host(rev, &ctx).into_iter().collect()
+    }
+
+    #[test]
+    fn a_cluster_gets_the_secrets_of_its_selected_workloads_and_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "buckle.yaml",
+            "version: 2\nfleet:\n  clusters:\n    home-nomad: { kind: nomad, labels: { site: home } }\nvars:\n  - when: 'cluster.labels.site == \"home\"'\n    values: { region: '{{ secrets.REGION }}' }\n  - when: 'host.labels.site == \"home\"'\n    values: { token: '{{ secrets.HOST_ONLY }}' }\nsecrets:\n  DB: { env: A }\n  K8S: { env: B }\n  TOKEN: { env: C }\n  REGION: { env: D }\n  HOST_ONLY: { env: E }\n  ADMIN: { env: F }\n",
+        );
+        write(
+            repo.path(),
+            "workloads/atuin/workload.yaml",
+            "name: atuin\nwhen: 'cluster.kind == \"nomad\"'\nvariables:\n  nomad/jobs/atuin: { DB: '{{ secrets.DB }}' }\n",
+        );
+        write(
+            repo.path(),
+            "workloads/grafana/workload.yaml",
+            "name: grafana\nwhen: 'cluster.kind == \"kubernetes\"'\nsecrets:\n  admin: { password: '{{ secrets.K8S }}' }\n",
+        );
+        write(
+            repo.path(),
+            "modules/users/module.yaml",
+            "name: users\ntasks:\n  - user.account: { name: a, password: '{{ secrets.ADMIN }}' }\n",
+        );
+        let rev = super::super::loader::load_dir(repo.path(), RevisionId::new("r")).unwrap();
+        let ctx = cluster_context(
+            &rev,
+            HostIdentity {
+                id: "home-nomad".into(),
+                labels: [("site".to_string(), serde_json::json!("home"))]
+                    .into_iter()
+                    .collect(),
+            },
+            crate::model::ClusterKind::Nomad,
+        );
+        let names: Vec<String> = secret_names_for_cluster(&rev, &ctx, Some("TOKEN"))
+            .into_iter()
+            .collect();
+        assert_eq!(names, vec!["DB", "REGION", "TOKEN"]);
     }
 
     #[test]

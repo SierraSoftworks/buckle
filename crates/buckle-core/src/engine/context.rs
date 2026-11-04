@@ -194,8 +194,17 @@ pub fn layer_vars(
     agent_vars: &Vars,
     ctx: &HostContext,
 ) -> crate::Result<Vars> {
-    let mut vars: Vars = module
-        .vars
+    layer_vars_over(revision, &module.vars, agent_vars, ctx)
+}
+
+/// [`layer_vars`] over any defaults: a module's or a workload's `vars`.
+pub fn layer_vars_over(
+    revision: &Revision,
+    defaults: &IndexMap<String, serde_yaml::Value>,
+    agent_vars: &Vars,
+    ctx: &HostContext,
+) -> crate::Result<Vars> {
+    let mut vars: Vars = defaults
         .iter()
         .map(|(k, v)| (k.clone(), yaml_to_json(v)))
         .collect();

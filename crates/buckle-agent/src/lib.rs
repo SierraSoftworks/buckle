@@ -10,6 +10,7 @@
 
 pub mod backoff;
 pub mod bundle;
+pub mod cluster;
 pub mod coalesce;
 pub mod config;
 pub mod identity;
