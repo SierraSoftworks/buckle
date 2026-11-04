@@ -90,9 +90,9 @@ pub(crate) async fn plan(cx: &Context, spec: &VariableSpec) -> Result<Step> {
         match live_items.get(k) {
             None => lines.push(format!("+ {k} = {}", shown(cx, desired))),
             Some(l) if !ApiSink.matches(desired, l) => lines.push(format!(
-                "~ {k} = {} (was \u{ab}value@{}\u{bb})",
-                shown(cx, desired),
-                ApiSink.fingerprint_live(&cx.fingerprints, l)
+                "- {k} = \u{ab}value@{}\u{bb}\n+ {k} = {}",
+                ApiSink.fingerprint_live(&cx.fingerprints, l),
+                shown(cx, desired)
             )),
             Some(_) => {}
         }
@@ -108,7 +108,7 @@ pub(crate) async fn plan(cx: &Context, spec: &VariableSpec) -> Result<Step> {
     for k in &dropped {
         if let Some(l) = live_items.get(*k) {
             lines.push(format!(
-                "- {k} (was \u{ab}value@{}\u{bb})",
+                "- {k} = \u{ab}value@{}\u{bb}",
                 ApiSink.fingerprint_live(&cx.fingerprints, l)
             ));
         }

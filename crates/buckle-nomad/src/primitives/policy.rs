@@ -153,12 +153,12 @@ pub(crate) async fn plan(cx: &Context, spec: &PolicySpec) -> Result<Step> {
                 .to_string();
             }
             if !acl_same {
-                text.push_str(&format!("~ JobACL: {} => {}\n", l["JobACL"], acl));
+                text.push_str(&format!("- JobACL: {}\n+ JobACL: {acl}\n", l["JobACL"]));
             }
             if !desc_same {
                 text.push_str(&format!(
-                    "~ Description: {} => {:?}\n",
-                    l["Description"], description
+                    "- Description: {}\n+ Description: {description:?}\n",
+                    l["Description"]
                 ));
             }
             (
