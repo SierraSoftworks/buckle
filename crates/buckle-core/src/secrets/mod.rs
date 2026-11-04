@@ -15,7 +15,8 @@
 //! * [`sinks`] — [`sinks::FileSink`] (rendered files), [`sinks::ProcessEnvSink`]
 //!   (child process environment and stdin) and [`sinks::TransportSink`]
 //!   (server-to-agent assignment via [`SecretStore::export`], and the agent's
-//!   [`cache`]). [`sinks::Sink`] is sealed.
+//!   [`cache`]) and [`sinks::ApiSink`] (values stored through a cluster API,
+//!   such as Nomad variables). [`sinks::Sink`] is sealed.
 //! * the template renderer (`crate::template`), for real renders.
 //! * [`redact`], which searches command output for known values.
 //!

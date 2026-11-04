@@ -3,7 +3,7 @@
 //! plaintext. Each test runs once per value (rstest `#[values]`).
 
 use super::cache::SecretCache;
-use super::sinks::{ProcessEnvSink, TransportSink, Witness};
+use super::sinks::{ApiSink, ProcessEnvSink, TransportSink, Witness};
 use super::*;
 use crate::plan::{Diff, ModulePlan, Plan, Planned, ResourceKey, RevisionId, Step, TaskRef};
 use crate::selectors::{HostContext, HostIdentity, Vars};
@@ -721,4 +721,41 @@ fn template_error_debug_never_shows_values(
         let shown = format!("{err:?} {err:#?} {err:#}");
         assert_no_leak(&shown, &value, "template error Debug");
     }
+}
+
+#[rstest]
+fn api_sink_compares_and_fingerprints_without_showing_values(
+    #[values(
+        Awkward::Empty,
+        Awkward::Simple,
+        Awkward::Newlines,
+        Awkward::TemplateSyntax,
+        Awkward::Unicode,
+        Awkward::VeryLong,
+        Awkward::Quotes,
+        Awkward::UrlChars
+    )]
+    v: Awkward,
+) {
+    let value = v.value();
+    let ctx = ctx_with(store_with(&value));
+    let desired = Templater::new()
+        .render_sensitive("{{ secrets.s }}", &ctx)
+        .unwrap();
+    let live = ApiSink.receive(value.clone());
+    assert!(ApiSink.matches(&desired, &live));
+    assert!(!ApiSink.matches(&desired, &ApiSink.receive(format!("{value}x"))));
+
+    let fp = ApiSink.fingerprint(&key(), &desired);
+    assert_eq!(fp, ApiSink.fingerprint_live(&key(), &live));
+    let body = ApiSink.json_body(serde_json::json!({"Path": "p"}), "Items", [("k", &desired)]);
+    for (what, out) in [
+        ("fingerprint", format!("{fp} {fp:?}")),
+        ("live", format!("{live:?} {live}")),
+        ("body", format!("{body:?} {body}")),
+    ] {
+        assert_no_leak(&out, &value, what);
+    }
+    let wire: serde_json::Value = serde_json::from_slice(ApiSink.open(&body)).unwrap();
+    assert_eq!(wire["Items"]["k"], serde_json::Value::String(value));
 }

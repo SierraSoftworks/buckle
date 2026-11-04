@@ -6,7 +6,7 @@
 //! code outside `buckle-core` cannot mint a [`Witness`] by implementing the
 //! trait for its own type.
 
-use super::{Rendered, Secret, Sensitive};
+use super::{Fingerprint, InstallKey, Rendered, Secret, Sensitive};
 use crate::system::{Command, FilePerms, System};
 use std::path::Path;
 
@@ -25,10 +25,12 @@ mod sealed {
     impl Sealed for super::FileSink {}
     impl Sealed for super::ProcessEnvSink {}
     impl Sealed for super::TransportSink {}
+    impl Sealed for super::ApiSink {}
 }
 
 /// Implemented by the types that may open secrets. Sealed: the
-/// implementors are [`FileSink`], [`ProcessEnvSink`] and [`TransportSink`].
+/// implementors are [`FileSink`], [`ProcessEnvSink`], [`TransportSink`] and
+/// [`ApiSink`].
 pub trait Sink: sealed::Sealed {
     /// A witness that lets this sink call [`Secret::reveal`] or [`Sensitive::expose`].
     fn witness(&self) -> Witness {
@@ -186,6 +188,92 @@ impl ProcessEnvSink {
 pub struct TransportSink;
 
 impl Sink for TransportSink {}
+
+/// Sends values to a remote API that stores them (a Nomad variable, a
+/// Kubernetes Secret), and reads them back for comparison.
+///
+/// Values read from such an API are [`Sensitive`] from the moment they are
+/// parsed ([`ApiSink::receive`]); desired and live values are compared here
+/// ([`ApiSink::matches`]) and shown only as keyed fingerprints
+/// ([`ApiSink::fingerprint`]), so neither side leaves the executor. A request
+/// body is assembled as [`Sensitive`] bytes and opened only at the call that
+/// puts it on the wire ([`ApiSink::open`]).
+///
+/// ```
+/// use buckle_core::secrets::sinks::ApiSink;
+/// use buckle_core::secrets::{InstallKey, Rendered};
+///
+/// let key = InstallKey::from_bytes([7u8; 32]);
+/// let desired = Rendered::Plain("TZ=Europe/London".into());
+/// let live = ApiSink.receive("TZ=Europe/London".into());
+/// assert!(ApiSink.matches(&desired, &live));
+/// assert_eq!(ApiSink.fingerprint(&key, &desired), ApiSink.fingerprint_live(&key, &live));
+///
+/// let body = ApiSink.json_body(serde_json::json!({"Path": "nomad/jobs"}), "Items", [("TZ", &desired)]);
+/// let wire: serde_json::Value = serde_json::from_slice(ApiSink.open(&body)).unwrap();
+/// assert_eq!(wire["Items"]["TZ"], "TZ=Europe/London");
+/// ```
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ApiSink;
+
+impl Sink for ApiSink {}
+
+impl ApiSink {
+    /// Wraps a value read back from an API, which may hold a secret.
+    pub fn receive(&self, value: String) -> Sensitive<String> {
+        Sensitive::new(value)
+    }
+
+    /// Whether the desired value equals the live one, revealing neither.
+    pub fn matches(&self, desired: &Rendered, live: &Sensitive<String>) -> bool {
+        self.text(desired) == live.expose(self.witness()).as_str()
+    }
+
+    /// The keyed fingerprint of a desired value: safe to show, digest and stamp.
+    pub fn fingerprint(&self, key: &InstallKey, value: &Rendered) -> Fingerprint {
+        key.fingerprint(self.text(value))
+    }
+
+    /// The keyed fingerprint of a live value, comparable with [`ApiSink::fingerprint`].
+    pub fn fingerprint_live(&self, key: &InstallKey, value: &Sensitive<String>) -> Fingerprint {
+        key.fingerprint(value.expose(self.witness()))
+    }
+
+    /// A JSON request body: `envelope` (an object, secret-free) with `field`
+    /// set to an object of string `items`, which may hold secrets.
+    pub fn json_body<'a>(
+        &self,
+        mut envelope: serde_json::Value,
+        field: &str,
+        items: impl IntoIterator<Item = (&'a str, &'a Rendered)>,
+    ) -> Sensitive<Vec<u8>> {
+        let object: serde_json::Map<String, serde_json::Value> = items
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_owned(),
+                    serde_json::Value::String(self.text(v).to_owned()),
+                )
+            })
+            .collect();
+        if let Some(map) = envelope.as_object_mut() {
+            map.insert(field.to_owned(), serde_json::Value::Object(object));
+        }
+        Sensitive::new(serde_json::to_vec(&envelope).unwrap_or_default())
+    }
+
+    /// The bytes of a request body, for the call that sends it and nothing else.
+    pub fn open<'a>(&self, body: &'a Sensitive<Vec<u8>>) -> &'a [u8] {
+        body.expose(self.witness())
+    }
+
+    fn text<'a>(&self, value: &'a Rendered) -> &'a str {
+        match value {
+            Rendered::Plain(text) => text,
+            Rendered::Sensitive(s) => s.expose(self.witness()),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

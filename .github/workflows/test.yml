@@ -92,7 +92,15 @@ jobs:
         run: cargo fmt --all --check
       - if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # The Nomad executor's integration tests (crates/buckle-nomad/tests)
+      # run against a dev agent here and skip on the other runners.
+      - if: matrix.os == 'ubuntu-latest'
+        name: Start a Nomad dev agent
+        run: scripts/nomad-dev-agent.sh
       - run: cargo test --workspace --no-fail-fast
+      - if: failure() && matrix.os == 'ubuntu-latest'
+        name: Nomad agent log
+        run: cat "$RUNNER_TEMP/nomad-dev/agent.log" || true
 
   ui:
     name: UI

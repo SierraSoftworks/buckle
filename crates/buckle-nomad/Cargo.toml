@@ -1,0 +1,42 @@
+[package]
+name = "buckle-nomad"
+description = "Nomad executor primitives for Buckle cluster targets."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# An in-memory Nomad for tests of code built on these primitives.
+testing = []
+
+[dependencies]
+buckle-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+hcl-rs.workspace = true
+human-errors.workspace = true
+indexmap.workspace = true
+percent-encoding.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+
+[dev-dependencies]
+buckle-core = { workspace = true, features = ["testing"] }
+pretty_assertions.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
+wiremock.workspace = true
