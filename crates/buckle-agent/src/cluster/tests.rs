@@ -124,7 +124,7 @@ fn paste() -> Vec<(String, String)> {
 }
 
 async fn apply(ex: &Executor, a: &Assignment) -> ApplyOutcome {
-    let planned = ex.plan(a, Purpose::Deploy, None).await.unwrap();
+    let planned = ex.plan(a, None).await.unwrap();
     let (tx, mut rx) = mpsc::channel(256);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let outcome = ex.apply(&planned, tx).await;
@@ -138,7 +138,7 @@ async fn a_workload_plans_applies_and_then_plans_as_a_no_op() {
     let ex = executor(&fake);
     let a = assignment(revision("r1", &paste()), ClusterIdentity::BuckleJwt, 7);
 
-    let planned = ex.plan(&a, Purpose::Read, None).await.unwrap();
+    let planned = ex.plan(&a, None).await.unwrap();
     let plan = &planned.plan;
     assert_eq!(plan.host, TARGET);
     assert_eq!(plan.modules.len(), 1);
@@ -159,7 +159,7 @@ async fn a_workload_plans_applies_and_then_plans_as_a_no_op() {
     assert!(fake.entity("namespace", "apps").is_some());
     assert!(fake.variable("apps", "nomad/jobs/paste").is_some());
 
-    let again = ex.plan(&a, Purpose::Read, None).await.unwrap().plan;
+    let again = ex.plan(&a, None).await.unwrap().plan;
     assert_eq!(again.changes(), 0, "{again:#?}");
     assert!(again.removals.is_empty(), "{:?}", again.removals);
 }
@@ -183,6 +183,22 @@ async fn buckle_identities_log_in_per_purpose_and_authenticate_requests() {
 }
 
 #[tokio::test]
+async fn plans_deploy_and_health_checks_read() {
+    // Nomad's job plan needs submit-job, so only health checks stay read-only.
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = assignment(revision("r1", &paste()), ClusterIdentity::BuckleJwt, 7);
+    ex.plan(&a, None).await.unwrap();
+    assert_eq!(fake.logins(), vec![format!("jwt:{TARGET}:Deploy")]);
+    ex.health(&a, HealthScope::Bake, None, None).await.unwrap();
+    assert!(
+        fake.logins().contains(&format!("jwt:{TARGET}:Read")),
+        "{:?}",
+        fake.logins()
+    );
+}
+
+#[tokio::test]
 async fn a_secret_identity_sends_the_secret_as_the_token() {
     let fake = FakeNomad::new();
     let ex = executor(&fake);
@@ -191,7 +207,7 @@ async fn a_secret_identity_sends_the_secret_as_the_token() {
         ClusterIdentity::Secret("DB".into()),
         7,
     );
-    ex.plan(&a, Purpose::Read, None).await.unwrap();
+    ex.plan(&a, None).await.unwrap();
     assert!(fake.logins().is_empty());
     assert!(fake.tokens().iter().all(|t| t == SECRET));
 }
@@ -209,17 +225,12 @@ async fn plan_digests_depend_on_the_targets_key_not_the_executor(
     let one = executor(&fake)
         .plan(
             &assignment(rev.clone(), ClusterIdentity::BuckleJwt, 7),
-            Purpose::Read,
             None,
         )
         .await
         .unwrap();
     let two = executor(&fake)
-        .plan(
-            &assignment(rev, ClusterIdentity::BuckleJwt, other),
-            Purpose::Read,
-            None,
-        )
+        .plan(&assignment(rev, ClusterIdentity::BuckleJwt, other), None)
         .await
         .unwrap();
     assert_eq!(one.plan.digest == two.plan.digest, same);
@@ -242,7 +253,7 @@ async fn a_removed_workload_is_planned_as_a_removal_and_stopped() {
         ClusterIdentity::Local,
         7,
     );
-    let plan = ex.plan(&a, Purpose::Read, None).await.unwrap().plan;
+    let plan = ex.plan(&a, None).await.unwrap().plan;
     let removed: Vec<String> = plan
         .removals
         .iter()
@@ -269,7 +280,7 @@ async fn a_workload_that_cannot_be_planned_is_indeterminate_and_keeps_its_object
     // The secret its variable reads did not reach the executor.
     let mut a = assignment(revision("r2", &paste()), ClusterIdentity::Local, 7);
     a.secrets = Arc::new(SecretStore::new());
-    let planned = ex.plan(&a, Purpose::Read, None).await.unwrap();
+    let planned = ex.plan(&a, None).await.unwrap();
     assert_eq!(planned.plan.indeterminate.len(), 1);
     assert_eq!(planned.plan.indeterminate[0].module, "paste");
     assert!(
@@ -294,7 +305,7 @@ async fn workloads_apply_after_the_workloads_they_need() {
         "name: nomad\ntasks: []\n".into(),
     ));
     let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
-    let planned = executor(&fake).plan(&a, Purpose::Read, None).await.unwrap();
+    let planned = executor(&fake).plan(&a, None).await.unwrap();
     let order: Vec<&str> = planned
         .plan
         .modules
@@ -352,10 +363,7 @@ async fn kubernetes_clusters_are_refused_with_a_reason() {
     let mut spec = (*a.spec).clone();
     spec.kind = ClusterKind::Kubernetes;
     a.spec = Arc::new(spec);
-    let err = executor(&fake)
-        .plan(&a, Purpose::Read, None)
-        .await
-        .unwrap_err();
+    let err = executor(&fake).plan(&a, None).await.unwrap_err();
     assert!(
         err.description().contains("Nomad clusters only"),
         "{}",

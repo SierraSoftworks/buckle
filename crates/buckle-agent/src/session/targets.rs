@@ -4,7 +4,6 @@
 
 use super::{Report, Shared, health_error_report};
 use crate::cluster::{Assignment, ClusterPlan, TargetSpec};
-use crate::identity::Purpose;
 use crate::sink::ReportSink;
 use crate::transport::grpc::set_parent_from_traceparent;
 use crate::transport::{Instruction, WireCluster, WireSecret};
@@ -189,7 +188,7 @@ impl Shared {
     async fn target_plan(&self, target: String, revision: RevisionId) {
         let planned = async {
             let a = self.assignment(&target, &revision).await?;
-            self.executor.plan(&a, Purpose::Read, None).await
+            self.executor.plan(&a, None).await
         }
         .await;
         match planned {
@@ -223,9 +222,7 @@ impl Shared {
     ) {
         let planned = async {
             let a = self.assignment(&target, &revision).await?;
-            self.executor
-                .plan(&a, Purpose::Deploy, rollout.as_deref())
-                .await
+            self.executor.plan(&a, rollout.as_deref()).await
         }
         .await;
         let planned = match planned {
