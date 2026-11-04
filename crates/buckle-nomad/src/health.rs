@@ -160,7 +160,12 @@ async fn services(nomad: &Nomad, ns: &str, allocs: &[Value]) -> Result<Option<He
             "namespace",
             ns,
         );
-        let Some(checks) = nomad.get::<BTreeMap<String, Value>>(&url).await? else {
+        // Nomad answers `null` for an allocation without Nomad-native checks.
+        let Some(checks) = nomad
+            .get::<Option<BTreeMap<String, Value>>>(&url)
+            .await?
+            .flatten()
+        else {
             continue;
         };
         for c in checks.values() {

@@ -278,7 +278,7 @@ impl FakeNomad {
                     _ => (200, json!([])),
                 }
             }
-            ("GET", ["allocation", _, "checks"]) => (200, json!({})),
+            ("GET", ["allocation", _, "checks"]) => (200, Value::Null),
             ("GET", ["job", id]) => match s.jobs.get(&(ns.clone(), (*id).to_owned())) {
                 Some(j) => (200, j.clone()),
                 None => not_found,
