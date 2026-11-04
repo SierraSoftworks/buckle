@@ -240,11 +240,23 @@ pub fn rollout_page(props: &Props) -> Html {
         if admin { { controls(s, focused.filter(|p| !scope_of(p, &plan_groups).digests.is_empty()).map(|p| p.name.as_str()), &open) } }
     </> };
 
+    // The approval pane shows its phase's plans; every other plan (earlier
+    // phases, already applying) stays visible beneath it.
     let approval = match focused {
         Some(phase) if !finished => {
-            approval_pane(phase, &wanting, &d, &plan_groups, admin, &focus_phase)
+            let scope = scope_of(phase, &plan_groups);
+            let rest: Vec<PlanGroup> = plan_groups
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !scope.groups.contains(i))
+                .map(|(_, g)| g.clone())
+                .collect();
+            html! { <>
+                { approval_pane(phase, &wanting, &d, &plan_groups, admin, &focus_phase) }
+                { all_plans("Other plans", &rest, d.fleet.as_ref()) }
+            </> }
         }
-        _ => all_plans(&plan_groups, d.fleet.as_ref()),
+        _ => all_plans("Plans", &plan_groups, d.fleet.as_ref()),
     };
 
     let dialog = actions.dialog(&d, &plan_groups);
@@ -550,6 +562,15 @@ fn approval_pane(
         })
         .map(|p| p.name.as_str())
         .collect();
+    // A cluster, or a step after one, is planned once its stage opens, so it
+    // has no plan before then by design.
+    let (deferred, missing): (Vec<&String>, Vec<&String>) =
+        scope.without_plan.iter().partition(|name| {
+            phase.hosts.iter().any(|h| {
+                &h.host == *name && (h.kind == buckle_api::TargetKind::Cluster || h.stage > 0)
+            })
+        });
+    let names = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
     let focus_names: Vec<String> = phase.hosts.iter().map(|h| h.host.clone()).collect();
     let tabs = (wanting.len() > 1).then(|| {
         html! {
@@ -583,7 +604,11 @@ fn approval_pane(
                 <p class="note">{ format!("{} still running; an approval given now is held until {} is reached.", earlier_running.join(", "), phase.name) }</p>
             }
             if scope.groups.is_empty() {
-                <Empty title="No plans yet" message="Plans arrive as the hosts answer; this phase can be approved once they have." />
+                if missing.is_empty() && !deferred.is_empty() {
+                    <Empty title="No plans yet" message={format!("{} plans when its stage opens; this phase can be approved once it has.", names(&deferred))} />
+                } else {
+                    <Empty title="No plans yet" message="Plans arrive as the hosts answer; this phase can be approved once they have." />
+                }
             }
             <PlanViews fleet={d.fleet.as_ref().map(|f| f.restrict(&scope.hosts))}
                 groups={scope.groups.iter().map(|i| plans[*i].clone()).collect::<Vec<_>>()}
@@ -595,10 +620,15 @@ fn approval_pane(
                     <p class="muted small">{ "Checked on each host before it applies, through its bake, and on every updated host again before the next phase starts." }</p>
                 </div>
             }
-            if !scope.without_plan.is_empty() {
+            if !missing.is_empty() {
                 <p class="note note--warn">
                     { format!("{} no plan yet ({}): not covered by this approval. A host that misses its wave moves to the stragglers stage.",
-                        count(scope.without_plan.len(), "host has", "hosts have"), scope.without_plan.join(", ")) }
+                        count(missing.len(), "host has", "hosts have"), names(&missing)) }
+                </p>
+            }
+            if !deferred.is_empty() && !scope.groups.is_empty() {
+                <p class="note">
+                    { format!("Planned when its stage opens, so not covered by this approval: {}.", names(&deferred)) }
                 </p>
             }
             <div class="approval__actions">
@@ -613,12 +643,12 @@ fn approval_pane(
     }
 }
 
-fn all_plans(plans: &[PlanGroup], fleet: Option<&FleetPlan>) -> Html {
+fn all_plans(title: &'static str, plans: &[PlanGroup], fleet: Option<&FleetPlan>) -> Html {
     if plans.is_empty() {
         return html! {};
     }
     html! {
-        <Panel title="Plans" subtitle={format!("{} across the rollout", count(plans.len(), "distinct plan", "distinct plans"))}>
+        <Panel {title} subtitle={format!("{} across the rollout", count(plans.len(), "distinct plan", "distinct plans"))}>
             <PlanViews fleet={fleet.cloned()} groups={plans.to_vec()} />
         </Panel>
     }

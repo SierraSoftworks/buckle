@@ -247,13 +247,15 @@ impl Executor {
     /// Plans `a`. Pure: reads the cluster, changes nothing. A workload that
     /// cannot be planned is indeterminate (its objects are never orphans);
     /// one that is unreachable fails the plan.
+    ///
+    /// Plans with a `deploy` credential: Nomad's job plan needs `submit-job`
+    /// (it has no plan-only capability), which leaves `read` read-only.
     pub async fn plan(
         &self,
         a: &Assignment,
-        purpose: Purpose,
         rollout: Option<&str>,
     ) -> buckle_core::Result<ClusterPlan> {
-        let nomad = self.client(a, purpose, rollout).await?;
+        let nomad = self.client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
         let workloads = a.workloads(&ctx);
         let implicit = implicit_namespaces(&nomad, &workloads).await?;

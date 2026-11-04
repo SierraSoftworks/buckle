@@ -1307,7 +1307,7 @@ async fn an_executor_plans_applies_and_checks_a_cluster_target_beside_its_host()
         ]),
     );
 
-    // Plan: answered for the target, logged in with a read identity.
+    // Plan: answered for the target, logged in with a deploy identity.
     session.send(targeted_assign("rev1", &digest)).await;
     session
         .send(pb::server_message::Msg::Plan(pb::RequestPlan {
@@ -1322,7 +1322,7 @@ async fn an_executor_plans_applies_and_checks_a_cluster_target_beside_its_host()
         ("home-nomad", "")
     );
     assert!(planned.changes > 0, "{planned:?}");
-    assert!(nomad.logins()[0].contains("Read"), "{:?}", nomad.logins());
+    assert!(nomad.logins()[0].contains("Deploy"), "{:?}", nomad.logins());
 
     // Apply: every event and the durable result name the target.
     session.send(targeted_assign("rev1", &digest)).await;
