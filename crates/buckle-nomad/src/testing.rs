@@ -24,6 +24,8 @@ struct State {
     pools: BTreeMap<String, Value>,
     volumes: Vec<Value>,
     outcome: String,
+    /// Jobs whose deployments stay `running` until released.
+    held: std::collections::BTreeSet<(String, String)>,
     requests: Vec<(String, String)>,
     /// The `X-Nomad-Token` of each request (empty when none).
     tokens: Vec<String>,
@@ -67,6 +69,24 @@ impl FakeNomad {
     /// How the next deployments end: `successful`, `failed`, `cancelled`.
     pub fn deployment_outcome(&self, outcome: &str) {
         self.state.lock().unwrap().outcome = outcome.into();
+    }
+
+    /// Keeps the deployment of `ns`/`id` running until [`Self::release`].
+    pub fn hold(&self, ns: &str, id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .held
+            .insert((ns.into(), id.into()));
+    }
+
+    /// Lets a held deployment end in the configured outcome.
+    pub fn release(&self, ns: &str, id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .held
+            .remove(&(ns.into(), id.into()));
     }
 
     /// A stored job, as `GET /v1/job/:id` returns it.
@@ -335,7 +355,7 @@ impl FakeNomad {
                 Some(j) => (
                     200,
                     json!({
-                        "Status": s.outcome,
+                        "Status": if s.held.contains(&(ns.clone(), (*id).to_owned())) { "running" } else { s.outcome.as_str() },
                         "JobModifyIndex": j["JobModifyIndex"],
                         "JobVersion": j["Version"],
                         "TaskGroups": {"api": {"HealthyAllocs": 1, "DesiredTotal": 1}},
