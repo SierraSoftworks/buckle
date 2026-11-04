@@ -452,10 +452,29 @@
   }
 }
 
-.approval__actions {
+// The approve button in the plans panel's head keeps its tooltip while
+// disabled (a disabled button gets no pointer events).
+.approval__button {
+  display: inline-flex;
+}
+
+// Each of the plan's warnings, a banner beside the approval notes: icon,
+// wrapping text, then the phases or hosts it concerns.
+.plan-warning {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.6rem;
-  margin-top: 0.9rem;
+  align-items: flex-start;
+  gap: 0.5rem;
+
+  .plan-warning__icon {
+    display: inline-flex;
+    flex: none;
+    margin-top: 0.15rem;
+    color: var(--warn);
+  }
+
+  .step__text {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
 }

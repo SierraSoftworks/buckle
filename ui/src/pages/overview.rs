@@ -6,9 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{
-    Fleet, PhaseState, PlanGroup, RevisionSummary, RolloutDetail, RolloutState, RolloutSummary,
-};
+use buckle_api::{Fleet, PlanGroup, RevisionSummary, RolloutDetail, RolloutState, RolloutSummary};
 use yew::prelude::*;
 
 use crate::api;
@@ -25,7 +23,9 @@ use crate::logic::format::{age, commit, relative, rollout_label};
 use crate::logic::live::{apply_fleet, apply_revisions, apply_rollout, apply_rollouts};
 use crate::logic::pipeline::{fleet_map, layout};
 use crate::logic::tone::{Tone, rollout_finished, rollout_state_label, rollout_state_tone};
-use crate::pages::rollout::{controls, scope_of, use_rollout_actions, wanting_approval};
+use crate::pages::rollout::{
+    controls, next_approval, phase_approvable, use_rollout_actions, wanting_approval,
+};
 
 #[function_component(Overview)]
 pub fn overview() -> Html {
@@ -145,18 +145,15 @@ pub fn overview() -> Html {
 }
 
 /// The phase an approval from the latest rollout's controls is for: the one
-/// the rollout page's approval pane would show, once it has plans to bind.
+/// the rollout page's plans panel would approve, once the phases before it
+/// have finished and it has plans to bind.
 fn approvable(d: &RolloutDetail, plans: &[PlanGroup]) -> Option<String> {
     if rollout_finished(d.summary.state) {
         return None;
     }
     let pipeline = layout(d);
-    let wanting = wanting_approval(&pipeline);
-    wanting
-        .iter()
-        .find(|p| p.state == PhaseState::AwaitingApproval)
-        .or(wanting.first())
-        .filter(|p| !scope_of(p, plans).digests.is_empty())
+    next_approval(&wanting_approval(&pipeline))
+        .filter(|p| phase_approvable(d, p, plans))
         .map(|p| p.name.clone())
 }
 

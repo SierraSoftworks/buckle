@@ -114,10 +114,11 @@ const SHOTS = [
   },
   { name: "host-drift", path: "/hosts/hz-3", target: (p) => panel(p, "Drift") },
   { name: "rollout-pipeline", path: "/rollouts/42", target: (p) => panel(p, "Pipeline") },
-  { name: "rollout-approval", path: "/rollouts/42", target: (p) => p.locator("#approval") },
+  { name: "rollout-approval", path: "/rollouts/42", target: (p) => p.locator("#plans") },
   {
     name: "rollout-approve",
     path: "/rollouts/42",
+    flags: "awaiting",
     setup: async (p) => {
       await p.getByRole("button", { name: "Approve cloud…" }).click();
       await dialog(p).getByRole("checkbox", { name: /I have reviewed/ }).check();

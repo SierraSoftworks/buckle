@@ -632,6 +632,40 @@ fn host<'a>(hosts: &'a [RolloutHostRecord], id: &str) -> &'a RolloutHostRecord {
 
 const TWO_PHASES: &str = "  settle: 2m\n  health: { bake: 1m }\n  phases:\n    - { name: canary, select: 'host.groups contains \"canary\"', approval: required }\n    - { name: web, select: 'host.groups contains \"web\"', parallel: 2 }\n";
 
+const GATED_SECOND: &str = "  settle: 2m\n  health: { bake: 5m }\n  phases:\n    - { name: canary, select: 'host.groups contains \"canary\"' }\n    - { name: web, select: 'host.groups contains \"web\"', approval: required }\n";
+
+#[tokio::test(start_paused = true)]
+async fn a_phase_is_approved_only_once_the_phases_before_it_finish() {
+    let mut h = Harness::new().await;
+    h.revision("r1", GATED_SECOND).await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.connect("c1", None);
+    h.connect("w1", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "web planned while the canary runs", |_, hs| {
+        host(hs, "w1").plan_digest.is_some() && host(hs, "c1").state != HostPhase::Healthy
+    })
+    .await;
+    let approve = || Command::Approve {
+        rollout: id.clone(),
+        phase: "web".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    };
+    let early = h.command(approve()).await.unwrap_err();
+    assert_eq!(early.kind, CommandErrorKind::Conflict);
+    assert!(
+        early.error.to_string().contains("canary"),
+        "{}",
+        early.error
+    );
+
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+    h.command(approve()).await.unwrap();
+    h.wait_state(&id, RolloutState::Completed).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn approval_gates_the_canary_and_waves_respect_parallel() {
     let mut h = Harness::new().await;

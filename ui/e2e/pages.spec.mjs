@@ -16,7 +16,7 @@ describe("every page renders in demo mode", () => {
     // The latest rollout with its controls, the fleet on its stages (hosts
     // outside it last), the attention list, recent revisions.
     // The controls sit at the top right of the card they act on.
-    await page.locator(".overview__rollout .panel__actions").getByTestId("rollout-controls").getByRole("button", { name: "Approve cloud…" }).waitFor();
+    await page.locator(".overview__rollout .panel__actions").getByTestId("rollout-controls").getByRole("button", { name: "Pause" }).waitFor();
     // What each module of the latest rollout changes, in the shared pill.
     const nomad = page.locator('.overview__rollout .module-changes__item[data-module="nomad"]');
     await nomad.waitFor();
@@ -35,7 +35,7 @@ describe("every page renders in demo mode", () => {
   });
 
   test("the overview approves and pauses the latest rollout in place", async () => {
-    const { page, close } = await open("/");
+    const { page, close } = await open("/", { flags: "awaiting" });
     const controls = page.getByTestId("rollout-controls");
     await controls.getByRole("button", { name: "Approve cloud…" }).click();
     const dialog = page.getByRole("dialog", { name: "Approve cloud of rollout #42" });

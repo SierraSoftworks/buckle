@@ -2633,6 +2633,24 @@ impl Controller {
                 "This rollout has no phase '{phase}'."
             )));
         };
+        // An approval gate keeps a change from rolling out blind: a phase is
+        // approved only once every phase before it has finished, so its
+        // approver has seen how they went.
+        let running: Vec<&str> = self.live[ri].record.runtime.phases[..pi]
+            .iter()
+            .filter(|p| !matches!(p.state, PhaseState::Done | PhaseState::Skipped))
+            .map(|p| p.name.as_str())
+            .collect();
+        if !running.is_empty() {
+            return Err(CommandError::conflict(
+                format!(
+                    "Phase '{phase}' can be approved once {} {} finished.",
+                    running.join(", "),
+                    if running.len() == 1 { "has" } else { "have" }
+                ),
+                &["Review its plans now; approve it when the rollout reaches it."],
+            ));
+        }
         let hosts = self.live[ri].phase_hosts(pi);
         let planned: Vec<(String, String)> = hosts
             .iter()

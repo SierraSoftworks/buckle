@@ -52,14 +52,14 @@ describe("session", () => {
   });
 
   test("a server without sign-in permits everything and says so", async () => {
-    const { page, close } = await open("/rollouts/42", { flags: "auth=off" });
+    const { page, close } = await open("/rollouts/42", { flags: "auth=off&awaiting" });
     await page.getByText("no sign-in", { exact: true }).waitFor();
     await page.getByRole("button", { name: "Approve cloud…" }).waitFor();
     await close();
   });
 
   test("without sign-in, admin_acl still decides who may act", async () => {
-    const { page, close } = await open("/rollouts/42", { flags: "auth=off&role=viewer" });
+    const { page, close } = await open("/rollouts/42", { flags: "auth=off&role=viewer&awaiting" });
     await page.getByText("no sign-in", { exact: true }).waitFor();
     await page.getByText("read only", { exact: true }).waitFor();
     await page.getByText("Approving needs an administrator (admin_acl).").waitFor();

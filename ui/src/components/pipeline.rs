@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{HostRolloutState, HostSummary, RolloutDetail, RolloutHost, RolloutPhase};
+use buckle_api::{HostRolloutState, HostSummary, RolloutDetail, RolloutHost};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
@@ -17,9 +17,7 @@ use super::meter::{Meter, stage_segments};
 use super::ui::Pill;
 use crate::app::Route;
 use crate::logic::format::{config_duration, relative, short};
-use crate::logic::pipeline::{
-    Gate, GateKind, GateState, OUTSIDE_STAGE, Stage, gate_check_tone, layout,
-};
+use crate::logic::pipeline::{Gate, GateKind, GateState, OUTSIDE_STAGE, Stage, layout};
 use crate::logic::tone::{
     LEGEND, Tone, awaited_reboot, block_look, host_error_headline, host_error_tone,
     host_state_class, host_state_label, outside_block_look, phase_state_label, phase_state_tone,
@@ -128,21 +126,6 @@ fn gate(gate: &Gate, first: bool, now: DateTime<Utc>) -> Html {
             <span class="gate__icon">{ icon }</span>
             <span class="gate__label">{ gate.label() }</span>
         </div>
-    }
-}
-
-/// A phase's health gate (design §12 mock): one chip per required check of
-/// the modules its hosts apply, red where a host fails it.
-pub fn health_gate(phase: &RolloutPhase) -> Html {
-    if phase.health_checks.is_empty() {
-        return html! {};
-    }
-    html! {
-        <ul class="gate-checks" aria-label={format!("Health gate of {}", phase.name)}>
-            { for phase.health_checks.iter().map(|c| html! {
-                <li><Pill tone={gate_check_tone(phase, c)} label={c.clone()} /></li>
-            }) }
-        </ul>
     }
 }
 

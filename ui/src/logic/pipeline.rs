@@ -267,30 +267,6 @@ fn gate(phase: &RolloutPhase, hosts: &[&RolloutHost], plans: &[PlanGroup]) -> Ga
     }
 }
 
-/// How one check of a phase's health gate stands, for its chip: failing on
-/// one of the phase's hosts, waived on one, held by a finished phase, or not
-/// yet decided.
-pub fn gate_check_tone(phase: &RolloutPhase, check: &str) -> super::tone::Tone {
-    use super::tone::Tone;
-    if phase
-        .hosts
-        .iter()
-        .any(|h| h.failed_checks.iter().any(|c| c == check))
-    {
-        Tone::Danger
-    } else if phase
-        .hosts
-        .iter()
-        .any(|h| h.waived_checks.iter().any(|c| c == check))
-    {
-        Tone::Mute
-    } else if phase.state == PhaseState::Done {
-        Tone::Ok
-    } else {
-        Tone::Neutral
-    }
-}
-
 /// The stage the fleet map puts hosts the rollout did not include in.
 pub const OUTSIDE_STAGE: &str = "not in this rollout";
 
@@ -777,26 +753,6 @@ mod tests {
             );
             assert!(gate.because_destructive, "{name}");
         }
-    }
-
-    #[test]
-    fn health_gate_chips_follow_the_phase_hosts_checks() {
-        use crate::logic::tone::Tone;
-        let mut failed = host("pi-5", "home", HostRolloutState::Failed, 10);
-        failed.failed_checks = vec!["nomad/api".into()];
-        let mut waived = host("pi-6", "home", HostRolloutState::Healthy, 10);
-        waived.waived_checks = vec!["backup/marker".into()];
-        let mut home = phase("home", PhaseState::Running, "auto", vec![failed, waived]);
-        home.health_checks = vec![
-            "nomad/api".into(),
-            "backup/marker".into(),
-            "nomad/unit".into(),
-        ];
-        assert_eq!(gate_check_tone(&home, "nomad/api"), Tone::Danger);
-        assert_eq!(gate_check_tone(&home, "backup/marker"), Tone::Mute);
-        assert_eq!(gate_check_tone(&home, "nomad/unit"), Tone::Neutral);
-        home.state = PhaseState::Done;
-        assert_eq!(gate_check_tone(&home, "nomad/unit"), Tone::Ok);
     }
 
     #[test]
