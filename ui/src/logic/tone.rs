@@ -401,6 +401,9 @@ mod tests {
             updated_at: Utc::now(),
             bake_until: None,
             reboot: None,
+            kind: Default::default(),
+            stage: 0,
+            executor: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -411,6 +414,8 @@ mod tests {
     fn host(health: HealthSummary, connection: Connection) -> HostSummary {
         HostSummary {
             id: "pi-1".into(),
+            kind: Default::default(),
+            cluster: None,
             status: HostStatus::Active,
             connection,
             agent_labels: BTreeMap::new(),

@@ -3,7 +3,7 @@
 //! card wherever a host is named, so hovering answers "how is it?" and a
 //! click opens the host for everything else.
 
-use buckle_api::{Connection, HostStatus, HostSummary, UpgradeState};
+use buckle_api::{Connection, HealthSummary, HostStatus, HostSummary, UpgradeState};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
@@ -45,7 +45,15 @@ pub fn host_link(props: &HostLinkProps) -> Html {
 pub fn host_state_pills(h: &HostSummary) -> Html {
     let offline = h.connection == Connection::Offline;
     html! { <>
-        if offline {
+        // A cluster target has no agent of its own: its badge replaces the
+        // connection, and health shows once something has read it.
+        if let Some(c) = &h.cluster {
+            <Pill tone={Tone::Info} label={format!("{} cluster", c.spec.kind)}
+                title={if c.declared { "a cluster target declared in buckle.yaml" } else { "a cluster target created through the API" }} />
+            if h.health != HealthSummary::Unknown {
+                <Pill tone={health_tone(h.health)} label={health_label(h.health)} />
+            }
+        } else if offline {
             <Pill tone={Tone::Neutral} label="offline" title={format!("last reading: {}", health_label(h.health))} />
         } else {
             <Pill tone={health_tone(h.health)} label={health_label(h.health)} />

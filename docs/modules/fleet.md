@@ -1,7 +1,8 @@
 # The fleet
 
 `buckle.yaml`, at the root of the configuration repository, describes the fleet as a whole: how
-hosts are grouped, which variables apply to them, which secrets exist, and how a revision rolls out.
+hosts are grouped, which clusters they form, which variables apply to them, which secrets exist,
+and how a revision rolls out.
 
 ```yaml
 version: 2
@@ -12,6 +13,12 @@ fleet:
     cloud:         'host.facts.cloud.provider in ["oci", "azure"]'
     nomad-clients: 'host.labels.role == "worker"'
     canary:        'host.labels.canary == true'
+  clusters:
+    home-nomad:
+      kind: nomad
+      nodes:     'host.groups contains "nomad-servers" || host.groups contains "nomad-clients"'
+      executors: 'host.groups contains "nomad-servers"'
+      labels: { site: home }
 
 vars:
   - file: vars/defaults.yaml
@@ -49,6 +56,45 @@ when: 'host.groups contains "nomad-clients"'
 A group whose selector reads a fact that has never been collected is *uncertain* for that host,
 and so is every module whose `when` reads `host.groups`: those modules are left alone until the
 fact arrives, rather than treated as unselected and removed.
+
+A group may also be written over `cluster.*`, in which case it is a group of
+[clusters](#clusters). A selector names one of the two namespaces: a `host.*` group is never true
+for a cluster, and a `cluster.*` group never for a host.
+
+## Clusters
+
+`fleet.clusters` declares the fleet's Nomad and Kubernetes clusters as *targets*: things a
+revision applies [workloads](./workloads.md) to, the way it applies modules to hosts. A cluster
+has no agent of its own; Buckle reaches it through the hosts that belong to it.
+
+```yaml
+fleet:
+  clusters:
+    home-nomad:
+      kind: nomad                                   # nomad or kubernetes
+      api: http://127.0.0.1:4646                    # as an executor reaches it; absent: the local default
+      nodes:     'host.groups contains "nomad-servers" || host.groups contains "nomad-clients"'
+      executors: 'host.groups contains "nomad-servers"'   # which hosts may speak for it; absent: nodes
+      identity: buckle_jwt                          # buckle_jwt (default), local, workload or secret://NAME
+      labels: { site: home }
+    lab-k3s-team-a:
+      kind: kubernetes
+      cluster: lab-k3s                              # a scoped target: part of another cluster
+      scope: { namespaces: [team-a] }
+```
+
+| Key | Meaning |
+|---|---|
+| `nodes` | A [selector](./expressions.md) over `host.*` choosing the cluster's members: what a workload's `module:` edge and a module's `workload:` edge refer to. |
+| `executors` | Which of the hosts may apply workloads to the cluster. Defaults to `nodes`. |
+| `identity` | How an executor authenticates to the API: a token Buckle issues (`buckle_jwt`), the host's own credentials (`local`), the scheduler's workload identity (`workload`), or a declared secret (`secret://NAME`). |
+| `labels` | Seed labels, as an agent's are for a host. Operators may add to them in the UI, and `cluster.labels.*` selects on the result. |
+| `cluster`, `scope` | A *scoped* target is part of another cluster and may touch only the namespaces listed. |
+
+Declared clusters appear beside the hosts in the UI and under `GET /api/v1/targets`, with their
+spec and seed labels following the repository. Operators can also create clusters that are not in
+the repository with `POST /api/v1/targets` (`kind: cluster`), and pause, relabel or forget those
+through the same routes as hosts.
 
 ## Vars
 
@@ -159,5 +205,9 @@ Each phase:
 Without `phases`, one implicit phase selects every host, one at a time. Hosts that no phase
 selects are reported on the rollout and left on their current revision, so end with a
 `select: 'true'` phase if every host should follow.
+
+Inside a phase, `needs` that cross a cluster boundary (`module:` on a workload, `workload:` on a
+module) order its targets into stages; see
+[Stages inside a phase](../operations/rollouts.md#stages-inside-a-phase).
 
 See [Rolling out changes](../operations/rollouts.md) for what each phase does, step by step.

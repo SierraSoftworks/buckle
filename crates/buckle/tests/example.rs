@@ -336,7 +336,7 @@ fn module_dependencies_and_notifications_resolve(example: Example) {
         .map(|m| (m.config.name.as_str(), m))
         .collect();
     for (name, module) in &modules {
-        for need in &module.config.needs {
+        for need in &module.config.module_needs() {
             assert!(
                 modules.contains_key(need.as_str()),
                 "{name} needs '{need}', which is not a module"
@@ -506,7 +506,7 @@ fn a_selected_module_only_needs_selected_modules(
     let selected = example.selected(&host);
     let names = module_names(&selected);
     for s in &selected {
-        for need in &s.module.config.needs {
+        for need in &s.module.config.module_needs() {
             assert!(
                 names.contains(need),
                 "{} is selected on {} but needs {need}, which is not",

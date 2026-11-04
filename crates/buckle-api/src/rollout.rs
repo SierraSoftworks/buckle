@@ -93,6 +93,18 @@ pub struct RolloutHost {
     /// The reboot the host's run asked for in this rollout, once it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reboot: Option<HostReboot>,
+    /// A host, or a cluster applied through an executor.
+    #[serde(default)]
+    pub kind: crate::TargetKind,
+    /// The dependency stage inside the phase the target's current step runs
+    /// in (0-based): cross-layer `needs` put a cluster after the modules its
+    /// workloads need, and a host's dependent modules after the cluster.
+    #[serde(default)]
+    pub stage: u32,
+    /// For a cluster: the host agent speaking for it in this rollout, once
+    /// one is picked (`None` reads "awaiting executor").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
 }
 
 /// A reboot a rollout host's run asked for.
@@ -131,6 +143,14 @@ pub struct RolloutPhase {
     /// pre-phase re-check hold the phase to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub health_checks: Vec<String>,
+    /// How many dependency stages the phase's targets are laid out in (1
+    /// when nothing crosses a cluster boundary).
+    #[serde(default = "one")]
+    pub stages: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

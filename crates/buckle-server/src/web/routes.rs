@@ -8,9 +8,10 @@ use crate::store::{AuditFilter, NewAudit, kv::keys};
 use actix_web::http::StatusCode;
 use actix_web::{HttpMessage, HttpRequest, HttpResponse, web};
 use buckle_api::{
-    ActionRequest, ApproveRequest, ContinueRequest, CsrfToken, Fleet, FleetCounts, HealthResultDto,
-    HealthSummary, HostDetail, HostPatch, HostPreview, HostStatus, LiveEvent, Me, Page,
-    RejectRequest, ResourceSummary, RolloutState, RunSummary, StartRollout, UpgradeRequest,
+    ActionRequest, ApproveRequest, ClusterInfo, ContinueRequest, CreateTarget, CsrfToken, Fleet,
+    FleetCounts, HealthResultDto, HealthSummary, HostDetail, HostPatch, HostPreview, HostStatus,
+    LiveEvent, Me, Page, RejectRequest, ResourceSummary, RolloutState, RunSummary, StartRollout,
+    TargetKind, UpgradeRequest,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -42,6 +43,15 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/hosts/{id}/preview", web::post().to(host_preview))
             .route("/hosts/{id}/upgrade", web::post().to(host_upgrade))
             .route("/hosts/{id}/{action}", web::post().to(host_action))
+            // Targets: hosts and cluster targets behind one set of routes.
+            // The host routes above stay as the host-only view.
+            .route("/targets", web::get().to(targets))
+            .route("/targets", web::post().to(target_create))
+            .route("/targets/{id}", web::get().to(host_detail))
+            .route("/targets/{id}", web::patch().to(host_patch))
+            .route("/targets/{id}", web::delete().to(host_forget))
+            .route("/targets/{id}/preview", web::post().to(host_preview))
+            .route("/targets/{id}/{action}", web::post().to(host_action))
             .route("/join", web::get().to(join_options))
             .route("/join", web::post().to(join_create))
             .route("/join/tailscale/callback", web::get().to(join_callback))
@@ -90,6 +100,13 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/hosts/h/approve"),
     ("POST", "/api/v1/hosts/h/pause"),
     ("POST", "/api/v1/hosts/h/resume"),
+    ("GET", "/api/v1/targets"),
+    ("POST", "/api/v1/targets"),
+    ("GET", "/api/v1/targets/t"),
+    ("PATCH", "/api/v1/targets/t"),
+    ("DELETE", "/api/v1/targets/t"),
+    ("POST", "/api/v1/targets/t/preview"),
+    ("POST", "/api/v1/targets/t/pause"),
     ("GET", "/api/v1/join"),
     ("POST", "/api/v1/join"),
     ("GET", "/api/v1/join/j"),
@@ -422,19 +439,29 @@ async fn audit_action(
     }
 }
 
-async fn summaries(state: &AppState) -> Result<Vec<buckle_api::HostSummary>, ApiError> {
+/// The summary rows of the targets of `kind` (`None`: every kind), with the
+/// reference revision's declared clusters synced first.
+async fn summaries_of(
+    state: &AppState,
+    kind: Option<TargetKind>,
+) -> Result<Vec<buckle_api::HostSummary>, ApiError> {
+    let fleet = crate::views::reference_revision_synced(&state.store, &state.revisions).await;
     let rows = state
         .store
-        .call(|db| {
+        .call(move |db| {
+            let records = match kind {
+                Some(TargetKind::Host) => db.hosts().list()?,
+                Some(TargetKind::Cluster) => db.hosts().clusters()?,
+                None => db.hosts().targets()?,
+            };
             let mut out = Vec::new();
-            for h in db.hosts().list()? {
+            for h in records {
                 let facts = db.hosts().latest_facts(&h.id)?.map(|(f, _)| f);
                 out.push((h, facts.unwrap_or(serde_json::Value::Null)));
             }
             Ok(out)
         })
         .await?;
-    let fleet = crate::views::reference_revision(&state.store, &state.revisions).await;
     Ok(rows
         .iter()
         .map(|(h, f)| {
@@ -445,8 +472,16 @@ async fn summaries(state: &AppState) -> Result<Vec<buckle_api::HostSummary>, Api
         .collect())
 }
 
+/// The summary rows of the hosts.
+async fn summaries(state: &AppState) -> Result<Vec<buckle_api::HostSummary>, ApiError> {
+    summaries_of(state, Some(TargetKind::Host)).await
+}
+
 async fn fleet(state: Data, _: Authenticated) -> ApiResult {
-    let hosts = summaries(&state).await?;
+    let mut hosts = summaries_of(&state, None).await?;
+    let clusters: Vec<_> = hosts
+        .extract_if(.., |h| h.kind == TargetKind::Cluster)
+        .collect();
     let (stable, active) = state
         .store
         .call(|db| {
@@ -462,6 +497,7 @@ async fn fleet(state: Data, _: Authenticated) -> ApiResult {
         .await?;
     let mut counts = FleetCounts {
         total: hosts.len() as u32,
+        clusters: clusters.len() as u32,
         ..Default::default()
     };
     for h in &hosts {
@@ -474,6 +510,7 @@ async fn fleet(state: Data, _: Authenticated) -> ApiResult {
     }
     Ok(HttpResponse::Ok().json(Fleet {
         hosts,
+        clusters,
         stable_revision: stable,
         active_rollout: active,
         counts,
@@ -486,12 +523,90 @@ async fn hosts(state: Data, _: Authenticated) -> ApiResult {
     Ok(HttpResponse::Ok().json(summaries(&state).await?))
 }
 
+/// `GET /targets`: every target, hosts and clusters alike.
+async fn targets(state: Data, _: Authenticated) -> ApiResult {
+    Ok(HttpResponse::Ok().json(summaries_of(&state, None).await?))
+}
+
+/// `POST /targets`: creates a cluster target. Hosts register themselves,
+/// so only `kind: cluster` is accepted.
+async fn target_create(
+    state: Data,
+    admin: Administrative,
+    body: web::Json<CreateTarget>,
+) -> ApiResult {
+    let create = body.into_inner();
+    let id = create.id.trim().to_owned();
+    if id.is_empty() || id.chars().any(|c| c.is_whitespace() || c == '/') {
+        return Err(ApiError::bad_request(
+            "A target id must be a non-empty name without whitespace or '/'.",
+        ));
+    }
+    if create.kind != TargetKind::Cluster {
+        return Err(ApiError::bad_request(
+            "Only cluster targets are created through the API; a host registers itself through its agent.",
+        ));
+    }
+    let Some(spec) = create.cluster else {
+        return Err(ApiError::bad_request(
+            "A cluster target needs `cluster` (its kind, nodes, executors and identity).",
+        ));
+    };
+    let fleet = crate::views::reference_revision_synced(&state.store, &state.revisions).await;
+    let existing = state.store.call(|db| db.hosts().targets()).await?;
+    if existing.iter().any(|t| t.id == id) {
+        return Err(ApiError::conflict(format!(
+            "A target named '{id}' already exists."
+        )));
+    }
+    crate::targets::check_spec(&id, &spec, &existing, fleet.as_deref())
+        .map_err(ApiError::bad_request)?;
+    let actor = admin.0.actor();
+    let detail = serde_json::to_value(&spec).ok();
+    let new = crate::store::NewCluster {
+        id: id.clone(),
+        cluster: ClusterInfo {
+            spec,
+            declared: false,
+        },
+        agent_labels: create.labels,
+        labels: std::collections::BTreeMap::new(),
+        notes: create.notes,
+        status: HostStatus::Active,
+        at: chrono::Utc::now(),
+    };
+    state
+        .store
+        .call(move |db| db.hosts().create_cluster(&new))
+        .await?;
+    audit_action(
+        &state,
+        &actor,
+        "target.create",
+        &id,
+        format!("{actor} created the cluster target {id}"),
+        detail,
+    )
+    .await;
+    let summary = host_changed(&state, &id).await?;
+    Ok(HttpResponse::Created().json(summary))
+}
+
 async fn summary_or_404(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {
     let mut summary = crate::views::load_summary(&state.store, &state.revisions, id)
         .await
-        .ok_or_else(|| ApiError::not_found(format!("No host '{id}'.")))?;
+        .ok_or_else(|| ApiError::not_found(format!("No target '{id}'.")))?;
     summary.upgrade = state.upgrades.get(id);
     Ok(summary)
+}
+
+/// The audit noun for a target: `host.*` actions for hosts, `target.*` for
+/// cluster targets.
+fn audit_noun(kind: TargetKind) -> &'static str {
+    match kind {
+        TargetKind::Host => "host",
+        TargetKind::Cluster => "target",
+    }
 }
 
 fn resources(row: Option<crate::store::RolloutHostRecord>) -> Vec<ResourceSummary> {
@@ -725,9 +840,33 @@ async fn host_patch(
     body: web::Json<HostPatch>,
 ) -> ApiResult {
     let id = path.into_inner();
-    summary_or_404(&state, &id).await?;
+    let current = summary_or_404(&state, &id).await?;
     let patch = body.into_inner();
-    let (i2, p2) = (id.clone(), patch.clone());
+    let cluster = match (&patch.cluster, &current.cluster) {
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(ApiError::bad_request(format!(
+                "'{id}' is a host; only a cluster target has a `cluster` spec."
+            )));
+        }
+        (Some(_), Some(info)) if info.declared => {
+            return Err(ApiError::conflict(format!(
+                "The cluster target '{id}' is declared in buckle.yaml; change it there."
+            )));
+        }
+        (Some(spec), Some(_)) => {
+            let fleet =
+                crate::views::reference_revision_synced(&state.store, &state.revisions).await;
+            let existing = state.store.call(|db| db.hosts().targets()).await?;
+            crate::targets::check_spec(&id, spec, &existing, fleet.as_deref())
+                .map_err(ApiError::bad_request)?;
+            Some(ClusterInfo {
+                spec: spec.clone(),
+                declared: false,
+            })
+        }
+    };
+    let (i2, p2, seed) = (id.clone(), patch.clone(), current.agent_labels.clone());
     state
         .store
         .call(move |db| {
@@ -737,6 +876,9 @@ async fn host_patch(
             if let Some(notes) = &p2.notes {
                 db.hosts().set_notes(&i2, notes)?;
             }
+            if let Some(info) = &cluster {
+                db.hosts().set_cluster(&i2, info, &seed)?;
+            }
             Ok(())
         })
         .await?;
@@ -744,7 +886,7 @@ async fn host_patch(
     audit_action(
         &state,
         &actor,
-        "host.update",
+        &format!("{}.update", audit_noun(current.kind)),
         &id,
         format!("{actor} updated {id}"),
         serde_json::to_value(&patch).ok(),
@@ -756,15 +898,26 @@ async fn host_patch(
 async fn host_forget(state: Data, admin: Administrative, path: web::Path<String>) -> ApiResult {
     let id = path.into_inner();
     let i2 = id.clone();
+    let current = state
+        .store
+        .call(move |db| db.hosts().target(&i2))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("No target '{id}'.")))?;
+    if current.cluster.as_ref().is_some_and(|c| c.declared) {
+        return Err(ApiError::conflict(format!(
+            "The cluster target '{id}' is declared in buckle.yaml; remove it there."
+        )));
+    }
+    let i2 = id.clone();
     if !state.store.call(move |db| db.hosts().delete(&i2)).await? {
-        return Err(ApiError::not_found(format!("No host '{id}'.")));
+        return Err(ApiError::not_found(format!("No target '{id}'.")));
     }
     state.upgrades.forget(&id);
     let actor = admin.0.actor();
     audit_action(
         &state,
         &actor,
-        "host.forget",
+        &format!("{}.forget", audit_noun(current.kind)),
         &id,
         format!("{actor} forgot {id}"),
         None,
@@ -792,7 +945,7 @@ async fn host_action(
         ("resume", HostStatus::Paused) => HostStatus::Active,
         ("approve" | "pause" | "resume", s) => {
             return Err(ApiError::conflict(format!(
-                "Host '{id}' is {s:?}; it cannot be {action}d."
+                "Target '{id}' is {s:?}; it cannot be {action}d."
             )));
         }
         _ => return Err(ApiError::not_found(format!("No host action '{action}'."))),
@@ -806,7 +959,7 @@ async fn host_action(
     audit_action(
         &state,
         &actor,
-        &format!("host.{action}"),
+        &format!("{}.{action}", audit_noun(current.kind)),
         &id,
         format!("{actor} {action}d {id}"),
         None,
@@ -973,12 +1126,12 @@ async fn host_preview(
     let (host, facts) = state
         .store
         .call(move |db| {
-            let h = db.hosts().get(&i2)?;
+            let h = db.hosts().target(&i2)?;
             let f = db.hosts().latest_facts(&i2)?.map(|(f, _)| f);
             Ok((h, f.unwrap_or(serde_json::Value::Null)))
         })
         .await?;
-    let mut host = host.ok_or_else(|| ApiError::not_found(format!("No host '{id}'.")))?;
+    let mut host = host.ok_or_else(|| ApiError::not_found(format!("No target '{id}'.")))?;
     if let Some(labels) = body.into_inner().labels {
         host.labels = labels;
     }

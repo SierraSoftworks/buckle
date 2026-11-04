@@ -42,6 +42,7 @@ const sections = {
         children: [
             "/modules/README.md",
             "/modules/fleet.md",
+            "/modules/workloads.md",
             "/modules/expressions.md",
             "/modules/secrets.md",
             "/modules/health.md",

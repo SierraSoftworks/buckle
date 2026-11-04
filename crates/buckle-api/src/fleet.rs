@@ -29,9 +29,17 @@ pub enum HealthSummary {
     Unknown,
 }
 
+/// The summary row of a target: a host, or (with `kind: cluster` and
+/// `cluster` set) a cluster target that has no agent of its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostSummary {
     pub id: String,
+    /// `host` from servers that predate cluster targets.
+    #[serde(default)]
+    pub kind: crate::TargetKind,
+    /// The cluster half of a cluster target; absent for a host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<crate::ClusterInfo>,
     pub status: HostStatus,
     pub connection: Connection,
     /// Seed labels reported by the agent.
@@ -222,13 +230,17 @@ pub struct CheckEpoch {
     pub last_at: DateTime<Utc>,
 }
 
-/// `PATCH /api/v1/hosts/{id}`.
+/// `PATCH /api/v1/hosts/{id}` and `PATCH /api/v1/targets/{id}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// A new spec for a cluster target an operator created; rejected for a
+    /// host and for a cluster `buckle.yaml` declares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<crate::ClusterSpec>,
 }
 
 /// `POST /api/v1/hosts/{id}/preview` → which groups and phase a label set yields.
@@ -244,6 +256,9 @@ pub struct HostPreview {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fleet {
     pub hosts: Vec<HostSummary>,
+    /// Cluster targets, declared in `buckle.yaml` or created through the API.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clusters: Vec<HostSummary>,
     pub stable_revision: Option<String>,
     pub active_rollout: Option<String>,
     pub counts: FleetCounts,
@@ -266,6 +281,9 @@ pub struct FleetCounts {
     pub drifted: u32,
     pub pending: u32,
     pub paused: u32,
+    /// Cluster targets; not part of `total`, which counts hosts.
+    #[serde(default)]
+    pub clusters: u32,
 }
 
 #[cfg(test)]
@@ -312,6 +330,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(fleet.server_version, None);
+        assert_eq!(fleet.hosts[0].kind, TargetKind::Host);
+        assert_eq!(fleet.hosts[0].cluster, None);
+        assert!(fleet.clusters.is_empty());
 
         let rollout: RolloutSummary = serde_json::from_value(json!({
             "id": "42", "revision": "r", "revision_message": "m", "state": "rolling",

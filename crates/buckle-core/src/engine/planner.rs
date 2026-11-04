@@ -532,7 +532,7 @@ impl<'a> Planner<'a> {
             let mut blocked: Vec<(&str, String)> = selected
                 .iter()
                 .filter_map(|(name, m)| {
-                    m.config.needs.iter().find_map(|need| {
+                    m.config.module_needs().iter().find_map(|need| {
                         indeterminate.iter().find(|i| &i.module == need).map(|i| {
                             let what = if i.plan_error {
                                 "could not be planned"
@@ -561,7 +561,7 @@ impl<'a> Planner<'a> {
         indeterminate.sort_by(|a, b| a.module.cmp(&b.module));
         let mut graph = Graph::new();
         for (name, module) in &selected {
-            for need in &module.config.needs {
+            for need in &module.config.module_needs() {
                 if !selected.contains_key(need.as_str()) {
                     let reason = if self.revision.module(need).is_some() {
                         format!("'{need}' is not selected on this host")
@@ -580,7 +580,7 @@ impl<'a> Planner<'a> {
                     ));
                 }
             }
-            graph.add(name, &module.config.needs);
+            graph.add(name, &module.config.module_needs());
         }
         let order = graph.topo_order().map_err(|cycle| {
             crate::error::user(
@@ -718,7 +718,7 @@ impl<'a> Planner<'a> {
         }
         Ok(PreparedModule {
             name: name.to_owned(),
-            needs: module.config.needs.clone(),
+            needs: module.config.module_needs(),
             ctx,
             source: module.source.clone(),
             tasks,
@@ -1162,7 +1162,7 @@ impl<'a> Planner<'a> {
     ) -> Vec<(Removal, RichRemoval)> {
         let mut graph = Graph::new();
         for m in &self.revision.modules {
-            graph.add(&m.config.name, &m.config.needs);
+            graph.add(&m.config.name, &m.config.module_needs());
         }
         let topo = graph.topo_order().unwrap_or_default();
         let rank = |module: &str| -> (usize, String) {
@@ -1425,9 +1425,8 @@ pub(super) async fn plan_with(
     };
     for module in &selection.order {
         let name = module.config.name.clone();
-        if let Some(dep) = module
-            .config
-            .needs
+        let module_needs = module.config.module_needs();
+        if let Some(dep) = module_needs
             .iter()
             .find(|d| problems.iter().any(|p| &p.module == *d))
         {
@@ -1441,7 +1440,7 @@ pub(super) async fn plan_with(
         }
         let mut waiting_on = Vec::new();
         let mut reasons = Vec::new();
-        for dep in &module.config.needs {
+        for dep in &module_needs {
             if deferred.iter().any(|d| &d.module == dep) {
                 waiting_on.push(dep.clone());
                 reasons.push(format!("waits for {dep}, which is deferred"));
@@ -1485,11 +1484,11 @@ pub(super) async fn plan_with(
             }
         }
         if !reasons.is_empty() {
-            let mut waits = module.config.needs.clone();
+            let mut waits = module_needs.clone();
             waits.extend(
                 waiting_on
                     .iter()
-                    .filter(|w| !module.config.needs.contains(w))
+                    .filter(|w| !module_needs.contains(w))
                     .cloned(),
             );
             needs.insert(name.clone(), waits);
@@ -1516,7 +1515,7 @@ pub(super) async fn plan_with(
         };
         match planner.plan_module(prepared, &contexts).await {
             Ok(m) => {
-                needs.insert(name.clone(), module.config.needs.clone());
+                needs.insert(name.clone(), module_needs);
                 order.push(name);
                 planned.push(m);
             }
@@ -1569,11 +1568,12 @@ pub(super) async fn plan_with(
             skipped.push(name);
             continue;
         }
-        let mut waits = module.config.needs.clone();
+        let module_needs = module.config.module_needs();
+        let mut waits = module_needs.clone();
         waits.extend(
             waiting_on
                 .iter()
-                .filter(|w| !module.config.needs.contains(w))
+                .filter(|w| !module_needs.contains(w))
                 .cloned(),
         );
         needs.insert(name.clone(), waits);
@@ -1664,7 +1664,7 @@ pub(super) fn ancestors(revision: &Revision, name: &str) -> BTreeSet<String> {
     let mut stack = vec![name.to_owned()];
     while let Some(current) = stack.pop() {
         if let Some(m) = revision.module(&current) {
-            for need in &m.config.needs {
+            for need in &m.config.module_needs() {
                 if out.insert(need.clone()) {
                     stack.push(need.clone());
                 }

@@ -701,6 +701,7 @@ async fn an_apply_re_plans_with_the_select_of_the_approved_plan() {
     let select = "task.tags contains \"network\"";
     session
         .send(pb::server_message::Msg::Plan(pb::RequestPlan {
+            target: String::new(),
             revision: "rev1".into(),
             select: select.into(),
         }))
@@ -1258,5 +1259,52 @@ async fn a_pending_host_caches_the_stable_revision_only_once_it_is_active() {
         }))
         .await;
     wait_until(|| store.has_revision(&rev("stable1"))).await;
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn work_for_a_cluster_target_is_refused_without_disturbing_the_host() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    fake.with_plans(&rev("rev1"), vec![plan.clone()]);
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    // A plan for a cluster target fails, naming the target, so the server
+    // can show why; an apply for one is dropped.
+    session
+        .send(pb::server_message::Msg::Plan(pb::RequestPlan {
+            target: "home-nomad".into(),
+            revision: "rev1".into(),
+            select: String::new(),
+        }))
+        .await;
+    let refused = session.expect(plan_result).await;
+    assert_eq!(refused.target, "home-nomad");
+    assert!(
+        refused.error.contains("does not run workloads"),
+        "{refused:?}"
+    );
+    session
+        .send(pb::server_message::Msg::Apply(pb::Apply {
+            target: "home-nomad".into(),
+            ..apply("rev1", plan.digest.as_str())
+        }))
+        .await;
+    // The host's own work is unaffected.
+    session.send(request_plan("rev1")).await;
+    let planned = session.expect(plan_result).await;
+    assert_eq!(planned.error, "");
+    assert_eq!(planned.target, "");
+    assert!(
+        !fake.calls().iter().any(|c| matches!(c, Call::Apply { .. })),
+        "the targeted apply must not run on the host"
+    );
     h.stop().await.expect("clean exit");
 }

@@ -1,7 +1,8 @@
 //! The persisted shape of a rollout: what the controller checkpoints on every
 //! transition so a restart resumes rather than restarts.
 
-use buckle_api::{HostRolloutState, PhaseState, RolloutState};
+use super::stages::Step;
+use buckle_api::{HostRolloutState, PhaseState, RolloutState, TargetKind};
 use buckle_core::model::{ApprovalPolicy, Parallelism};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -147,6 +148,16 @@ pub struct PhaseRuntime {
     pub gate: Option<GateRuntime>,
     #[serde(default)]
     pub bake_until: Option<DateTime<Utc>>,
+    /// How many dependency stages the phase's targets are laid out in.
+    #[serde(default = "one")]
+    pub stages: u32,
+    /// The highest stage opened so far (its targets may plan and start).
+    #[serde(default)]
+    pub open_stage: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 impl PhaseRuntime {
@@ -339,6 +350,50 @@ pub struct HostRuntime {
     /// apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reboot: Option<RebootWait>,
+    /// A host, or a cluster applied through an executor.
+    #[serde(default)]
+    pub kind: TargetKind,
+    /// The target's steps through its phase, in stage order (see
+    /// [`super::stages`]). Empty means one whole step in stage 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Step>,
+    /// Index into `steps` of the step being worked on.
+    #[serde(default)]
+    pub step: usize,
+    /// The stage of the current step (what the phase's wave logic gates on).
+    #[serde(default)]
+    pub stage: u32,
+    /// For a cluster: the host agent its messages travel through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+}
+
+impl HostRuntime {
+    /// The step being worked on (a whole step when none were laid out).
+    pub fn current_step(&self) -> Step {
+        self.steps
+            .get(self.step)
+            .cloned()
+            .unwrap_or_else(super::stages::whole)
+    }
+
+    /// The step after the current one, if any.
+    pub fn next_step(&self) -> Option<&Step> {
+        self.steps.get(self.step + 1)
+    }
+
+    /// Whether the plan of the current step waits for its stage to open: a
+    /// cluster's (it depends on the stages before it), or any later step.
+    pub fn plan_deferred(&self) -> bool {
+        self.kind == TargetKind::Cluster || self.step > 0
+    }
+
+    /// Lays the target out as `steps` and points it at the first.
+    pub fn set_steps(&mut self, steps: Vec<Step>) {
+        self.stage = steps.first().map_or(0, |s| s.stage);
+        self.steps = steps;
+        self.step = 0;
+    }
 }
 
 /// A reboot a rollout waits out.

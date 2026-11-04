@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use buckle_api::{
     Connection, Fleet, FleetCounts, HealthSummary, HostDetail, HostStatus, HostSummary, LiveEvent,
-    RevisionSummary, RolloutDetail, RolloutSummary,
+    RevisionSummary, RolloutDetail, RolloutSummary, TargetKind,
 };
 
 use super::tone::rollout_active;
@@ -47,9 +47,19 @@ pub fn apply_hosts(hosts: &mut Vec<HostSummary>, event: &LiveEvent) -> bool {
 
 pub fn apply_fleet(fleet: &mut Fleet, event: &LiveEvent) {
     match event {
+        // A cluster target changes the clusters list; the host counts stay.
+        LiveEvent::HostChanged { host } if host.kind == TargetKind::Cluster => {
+            fleet.hosts.retain(|h| h.id != host.id);
+            if apply_hosts(&mut fleet.clusters, event) {
+                fleet.counts = recount(&fleet.hosts);
+                fleet.counts.clusters = fleet.clusters.len() as u32;
+            }
+        }
         LiveEvent::HostChanged { .. } => {
+            fleet.clusters.retain(|c| c.id != event_host_id(event));
             if apply_hosts(&mut fleet.hosts, event) {
                 fleet.counts = recount(&fleet.hosts);
+                fleet.counts.clusters = fleet.clusters.len() as u32;
             }
         }
         LiveEvent::RolloutChanged { rollout } => {
@@ -60,6 +70,13 @@ pub fn apply_fleet(fleet: &mut Fleet, event: &LiveEvent) {
             }
         }
         _ => {}
+    }
+}
+
+fn event_host_id(event: &LiveEvent) -> &str {
+    match event {
+        LiveEvent::HostChanged { host } => host.id.as_str(),
+        _ => "",
     }
 }
 
@@ -292,6 +309,8 @@ mod tests {
     fn host(id: &str, health: HealthSummary) -> HostSummary {
         HostSummary {
             id: id.into(),
+            kind: Default::default(),
+            cluster: None,
             status: HostStatus::Active,
             connection: Connection::Online,
             agent_labels: BTreeMap::new(),
@@ -350,6 +369,9 @@ mod tests {
             updated_at: Utc::now(),
             bake_until: None,
             reboot: None,
+            kind: Default::default(),
+            stage: 0,
+            executor: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -371,6 +393,7 @@ mod tests {
             approved_at: None,
             bake_until: None,
             health_checks: vec![],
+            stages: 1,
         }
     }
 
@@ -381,6 +404,7 @@ mod tests {
                 host("pi-1", HealthSummary::Healthy),
                 host("pi-2", HealthSummary::Healthy),
             ],
+            clusters: vec![],
             stable_revision: None,
             active_rollout: None,
             counts: FleetCounts::default(),
@@ -402,12 +426,21 @@ mod tests {
             },
         );
         assert_eq!(fleet.counts.total, 3);
+
+        // A cluster target lands in the clusters list, not among the hosts.
+        let mut cluster = host("home-nomad", HealthSummary::Unknown);
+        cluster.kind = TargetKind::Cluster;
+        apply_fleet(&mut fleet, &LiveEvent::HostChanged { host: cluster });
+        assert_eq!(fleet.counts.total, 3);
+        assert_eq!(fleet.counts.clusters, 1);
+        assert_eq!(fleet.clusters[0].id, "home-nomad");
     }
 
     #[test]
     fn the_active_rollout_follows_rollout_transitions() {
         let mut fleet = Fleet {
             hosts: vec![],
+            clusters: vec![],
             stable_revision: None,
             active_rollout: None,
             counts: FleetCounts::default(),

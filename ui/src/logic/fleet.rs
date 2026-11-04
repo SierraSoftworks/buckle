@@ -346,6 +346,8 @@ mod tests {
     fn host(id: &str) -> HostSummary {
         HostSummary {
             id: id.into(),
+            kind: Default::default(),
+            cluster: None,
             status: HostStatus::Active,
             connection: Connection::Online,
             agent_labels: BTreeMap::new(),
@@ -502,6 +504,9 @@ mod tests {
             updated_at: now,
             bake_until: None,
             reboot: None,
+            kind: Default::default(),
+            stage: 0,
+            executor: None,
             needs_approval: stale,
             needs_attention: false,
             error_detail: None,
@@ -544,6 +549,7 @@ mod tests {
                 approved_at: None,
                 bake_until: None,
                 health_checks: vec![],
+                stages: 1,
             }],
             plans: vec![],
             fleet: None,

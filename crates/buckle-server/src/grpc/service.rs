@@ -639,7 +639,21 @@ impl FleetService {
 
     async fn route(&self, host: &str, msg: agent_message::Msg) {
         let now = self.now();
-        let h = host.to_owned();
+        // A report naming a cluster target is about that target, not the
+        // executor that sent it: its facts, plan, run, health and drift are
+        // stored under the cluster's row. Report ids stay the agent's.
+        let target: String = match &msg {
+            agent_message::Msg::Facts(f) => f.target.clone(),
+            agent_message::Msg::Plan(p) => p.target.clone(),
+            agent_message::Msg::Apply(e) => e.target.clone(),
+            agent_message::Msg::Result(r) => r.target.clone(),
+            agent_message::Msg::Health(r) => r.target.clone(),
+            agent_message::Msg::Drift(d) => d.target.clone(),
+            _ => String::new(),
+        };
+        let subject: &str = if target.is_empty() { host } else { &target };
+        let h = subject.to_owned();
+        let agent = host.to_owned();
         // Durable reports (ApplyResult, LocalRollback) carry a report id the
         // agent keeps until acknowledged; it re-sends them after every
         // Welcome, so only their first arrival has effects. `first` is
@@ -787,7 +801,7 @@ impl FleetService {
                         if let Some(id) = durable_id
                             && !db
                                 .reports()
-                                .first_arrival(&run.host, id, "apply_result", now)?
+                                .first_arrival(&agent, id, "apply_result", now)?
                         {
                             return Ok(None);
                         }
@@ -987,6 +1001,9 @@ impl FleetService {
             self.controller.agent_message(host, msg);
         }
         if notify_ui {
+            if subject != host {
+                self.publish_host(subject).await;
+            }
             self.publish_host(host).await;
         }
     }

@@ -1,7 +1,9 @@
 //! Scenario 3: a phased rollout. The canary phase waits for sign-off and
 //! approval applies only the canary; after its bake and the pre-phase gate the
-//! rollout advances; promotion opens the stragglers stage, which picks up a
-//! host enrolled mid-rollout (design §10 "Controller algorithm").
+//! rollout advances. A host enrolled mid-rollout joins its phase when that
+//! phase has not started yet; one whose phase has already run waits for the
+//! stragglers stage, which promotion opens (design §10 "Controller
+//! algorithm").
 
 use crate::common::{self, APP_CONF, CANARY_THEN_REST};
 use buckle_api::{HostRolloutState, PhaseState, RolloutState};
@@ -75,8 +77,16 @@ async fn canary_approval_applies_only_the_canary_then_the_rollout_advances_and_s
     let canary = phase(&detail, "canary").unwrap();
     assert_eq!(canary.approved_by.as_deref(), Some("anonymous"));
 
-    // A host enrolled after the freeze is not part of any phase of this rollout.
+    // Hosts enrolled after the freeze: web-3's phase has not started, so it
+    // joins it; canary-2's phase is running, so it is left for the stragglers.
     world.spawn(common::host("web-3"));
+    world.spawn(common::host("canary-2").label("canary", "true"));
+    let detail = world
+        .wait_rollout(&id, "web-3 admitted to the rest phase", |d| {
+            rollout_host(d, "web-3").is_some_and(|h| h.phase == "rest")
+        })
+        .await;
+    assert!(rollout_host(&detail, "canary-2").is_none());
 
     // The canary bakes, the gate passes, the rest phase runs and the revision is promoted.
     let detail = world
@@ -86,11 +96,12 @@ async fn canary_approval_applies_only_the_canary_then_the_rollout_advances_and_s
         .await;
     assert_eq!(phase(&detail, "canary").unwrap().state, PhaseState::Done);
     assert_eq!(phase(&detail, "rest").unwrap().state, PhaseState::Done);
-    for h in ["canary-1", "web-1", "web-2"] {
+    for h in ["canary-1", "web-1", "web-2", "web-3"] {
         let row = rollout_host(&detail, h).unwrap();
         assert_eq!(row.state, HostRolloutState::Healthy, "{h}");
         assert!(row.wave.is_some(), "{h} ran in a wave");
     }
+    assert_eq!(rollout_host(&detail, "web-3").unwrap().phase, "rest");
     let fleet = world
         .wait_fleet("v2 to be stable", |f| {
             f.stable_revision.as_deref() == Some(v2.as_str())
@@ -98,19 +109,24 @@ async fn canary_approval_applies_only_the_canary_then_the_rollout_advances_and_s
         .await;
     assert_eq!(fleet.active_rollout, None);
     let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
-    for kind in ["rollout.approve", "rollout.phase.done", "revision.promoted"] {
+    for kind in [
+        "rollout.approve",
+        "rollout.target.admitted",
+        "rollout.phase.done",
+        "revision.promoted",
+    ] {
         assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
     }
 
-    // Promotion opened the stragglers stage, which takes the late host to the
-    // new stable revision.
+    // Promotion opened the stragglers stage, which takes the host that missed
+    // its phase to the new stable revision.
     let detail = world
-        .wait_rollout(&id, "web-3 healthy in the stragglers stage", |d| {
+        .wait_rollout(&id, "canary-2 healthy in the stragglers stage", |d| {
             phase(d, "stragglers").is_some_and(|p| {
                 p.virtual_stage
                     && p.hosts
                         .iter()
-                        .any(|h| h.host == "web-3" && h.state == HostRolloutState::Healthy)
+                        .any(|h| h.host == "canary-2" && h.state == HostRolloutState::Healthy)
             })
         })
         .await;
@@ -119,11 +135,11 @@ async fn canary_approval_applies_only_the_canary_then_the_rollout_advances_and_s
         PhaseState::Open
     );
     world
-        .wait_host("web-3", "on v2", |h| {
+        .wait_host("canary-2", "on v2", |h| {
             h.applied_revision.as_deref() == Some(v2.as_str())
         })
         .await;
-    for h in ["canary-1", "web-1", "web-2", "web-3"] {
+    for h in ["canary-1", "web-1", "web-2", "web-3", "canary-2"] {
         assert_eq!(
             world.agent(h).file(APP_CONF),
             Some(common::app_conf(2)),
