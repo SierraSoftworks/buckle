@@ -1,5 +1,6 @@
 //! Controller scenarios driven by scripted fake hosts on tokio's paused clock.
 
+use super::controller::TARGETS_CAPABILITY;
 use super::model::{HostPhase, RolloutHostRecord, RolloutRecord, STRAGGLERS};
 use super::*;
 use crate::clock::{Clock, TokioClock};
@@ -7,7 +8,7 @@ use crate::events::EventBus;
 use crate::secrets::ServerSecrets;
 use crate::source::cache::RevisionCache;
 use crate::store::{NewHost, RevisionRecord, Store};
-use buckle_api::{HostStatus, RevisionStatus, RolloutState};
+use buckle_api::{HostStatus, RevisionStatus, RolloutState, TargetKind};
 use buckle_core::secrets::InstallKey;
 use buckle_proto::v1::{
     self as pb, ApplyResult, HealthReport, HealthScope, LocalRollback, PlanResult,
@@ -65,6 +66,12 @@ struct Script {
     boot_id: Option<String>,
     /// Applies ask for this reboot.
     reboot: Option<pb::Reboot>,
+    /// The agent does not announce the `targets` capability (it runs no
+    /// pipeline per target), so it is never picked as an executor.
+    no_targets: bool,
+    /// Never answer an Apply aimed at a cluster target (the agent's own
+    /// applies are answered).
+    silent_target_apply: bool,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -85,9 +92,11 @@ struct Harness {
 
 const KEY: [u8; 32] = [9; 32];
 
-fn fleet_yaml(rollout: &str) -> String {
+/// `buckle.yaml` with the tier groups, `clusters` (a `fleet.clusters` block,
+/// or empty) and the `rollout` section.
+fn fleet_yaml_with(rollout: &str, clusters: &str) -> String {
     format!(
-        "version: 2\nfleet:\n  groups:\n    canary: 'host.labels.tier == \"canary\"'\n    web: 'host.labels.tier == \"web\"'\n    db: 'host.labels.tier == \"db\"'\nrollout:\n{rollout}"
+        "version: 2\nfleet:\n  groups:\n    canary: 'host.labels.tier == \"canary\"'\n    web: 'host.labels.tier == \"web\"'\n    db: 'host.labels.tier == \"db\"'\n    nomad: 'host.labels.tier == \"nomad\"'\n{clusters}rollout:\n{rollout}"
     )
 }
 
@@ -158,9 +167,20 @@ impl Harness {
     }
 
     async fn revision(&self, id: &str, rollout: &str) {
+        self.revision_with(id, rollout, "", &[]).await;
+    }
+
+    /// A revision with `clusters` declared and `files` (modules, workloads)
+    /// beside `buckle.yaml`.
+    async fn revision_with(&self, id: &str, rollout: &str, clusters: &str, files: &[(&str, &str)]) {
         let dir = self.revisions.dir(id);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("buckle.yaml"), fleet_yaml(rollout)).unwrap();
+        std::fs::write(dir.join("buckle.yaml"), fleet_yaml_with(rollout, clusters)).unwrap();
+        for (path, content) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
         let now = self.clock.now();
         let rec = RevisionRecord {
             id: id.into(),
@@ -237,11 +257,13 @@ impl Harness {
                 let reply = |msg: AMsg| handle.agent_message(&name, msg);
                 match m {
                     SMsg::Plan(p) if s.plan_error.is_some() => reply(AMsg::Plan(PlanResult {
+                        target: p.target.clone(),
                         revision: p.revision,
                         error: s.plan_error.clone().unwrap_or_default(),
                         ..Default::default()
                     })),
                     SMsg::Plan(p) => reply(AMsg::Plan(PlanResult {
+                        target: p.target.clone(),
                         revision: p.revision,
                         digest: s.digest.clone(),
                         changes: 1,
@@ -283,7 +305,7 @@ impl Harness {
                             continue;
                         }
                         reply(AMsg::Health(HealthReport {
-                            target: String::new(),
+                            target: h.target.clone(),
                             scope: h.scope,
                             request_id: h.request_id,
                             revision: String::new(),
@@ -299,7 +321,7 @@ impl Harness {
                         }));
                     }
                     SMsg::Apply(mut a) => {
-                        if s.silent_apply {
+                        if s.silent_apply || (s.silent_target_apply && !a.target.is_empty()) {
                             continue;
                         }
                         // A force apply, or an Apply binding the plan's
@@ -309,6 +331,7 @@ impl Harness {
                             !a.approval_digest.is_empty() && a.approval_digest == s.intent;
                         if a.force_plan || (bound_intent && a.plan_digest != s.digest) {
                             reply(AMsg::Plan(PlanResult {
+                                target: a.target.clone(),
                                 revision: a.revision.clone(),
                                 digest: s.digest.clone(),
                                 changes: 1,
@@ -330,6 +353,7 @@ impl Harness {
                                 sc.digest = fresh.clone();
                             }
                             reply(AMsg::Plan(PlanResult {
+                                target: a.target.clone(),
                                 revision: a.revision,
                                 digest: fresh.clone(),
                                 changes: 3,
@@ -344,6 +368,7 @@ impl Harness {
                         if !s.stale_deferred.is_empty() {
                             script.lock().unwrap().stale_deferred.clear();
                             reply(AMsg::Result(ApplyResult {
+                                target: a.target.clone(),
                                 revision: a.revision.clone(),
                                 plan_digest: a.plan_digest,
                                 succeeded: false,
@@ -355,6 +380,7 @@ impl Harness {
                         }
                         if s.apply_blocked {
                             reply(AMsg::Result(ApplyResult {
+                                target: a.target.clone(),
                                 revision: a.revision.clone(),
                                 plan_digest: a.plan_digest,
                                 succeeded: false,
@@ -366,6 +392,7 @@ impl Harness {
                         }
                         let failed = s.apply_fail.clone();
                         reply(AMsg::Result(ApplyResult {
+                            target: a.target.clone(),
                             revision: a.revision.clone(),
                             plan_digest: a.plan_digest,
                             succeeded: failed.is_none(),
@@ -393,6 +420,7 @@ impl Harness {
                     }
                     SMsg::Rollback(_) if s.silent_rollback => {}
                     SMsg::Rollback(r) => reply(AMsg::Result(ApplyResult {
+                        target: r.target.clone(),
                         revision: r.revision.clone(),
                         succeeded: true,
                         applied_revision: r.revision,
@@ -406,7 +434,10 @@ impl Harness {
 
     /// Connects `host` with a Hello naming `unreported` apply revisions.
     fn connect_with(&mut self, host: &str, applied: Option<&str>, unreported: Vec<String>) {
-        let legacy = self.scripts[host].lock().unwrap().legacy_agent;
+        let (legacy, no_targets) = {
+            let s = self.scripts[host].lock().unwrap();
+            (s.legacy_agent, s.no_targets)
+        };
         self.handle.connected(Connected {
             host: host.to_owned(),
             applied_revision: applied.map(str::to_owned),
@@ -415,8 +446,14 @@ impl Harness {
             new_session: true,
             capabilities: if legacy {
                 vec![]
-            } else {
+            } else if no_targets {
                 vec!["force_plan".into(), "approval_digest".into()]
+            } else {
+                vec![
+                    "force_plan".into(),
+                    "approval_digest".into(),
+                    TARGETS_CAPABILITY.into(),
+                ]
             },
             boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
         });
@@ -3618,5 +3655,297 @@ async fn a_result_that_arrives_after_the_reboot_goes_straight_to_baking() {
             .await
             .iter()
             .any(|a| a == "rollout.host.rebooted")
+    );
+}
+
+/// A target that appears after the freeze joins a phase the rollout has not
+/// reached yet (late admission); one whose phase is already running waits
+/// for the stragglers stage, as before.
+#[tokio::test(start_paused = true)]
+async fn a_target_appearing_mid_rollout_joins_a_phase_not_yet_started() {
+    let mut h = Harness::new().await;
+    h.revision("r1", TWO_PHASES).await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.connect("c1", None);
+    h.connect("w1", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+
+    // Enrolled while the canary phase waits: `web` has not started, so the
+    // host joins it on connecting; a second canary host has missed its phase.
+    h.enrol("late-web", "web").await;
+    h.handle.host_registered("late-web");
+    h.connect("late-web", None);
+    h.enrol("late-canary", "canary").await;
+    h.handle.host_changed("late-canary");
+    let (_, hosts) = h
+        .wait(&id, "late web host admitted and planned", |_, hs| {
+            hs.iter()
+                .any(|x| x.host == "late-web" && x.state == HostPhase::Planned)
+        })
+        .await;
+    assert_eq!(host(&hosts, "late-web").phase, "web");
+    assert!(
+        !hosts.iter().any(|x| x.host == "late-canary"),
+        "a phase already reached is not joined"
+    );
+
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "canary".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "late-web").state, HostPhase::Healthy);
+    assert_eq!(host(&hosts, "late-web").phase, "web");
+    assert!(r.runtime.stragglers_open);
+    assert_eq!(host(&hosts, "late-canary").phase, STRAGGLERS);
+    let actions = h.audit_actions(&id).await;
+    assert!(actions.iter().any(|a| a == "rollout.target.admitted"));
+}
+
+// ---------------------------------------------------------------- clusters
+
+/// A Nomad cluster whose nodes (and so executors) are the `nomad` tier.
+const NOMAD_CLUSTER: &str = "  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.groups contains \"nomad\"'\n";
+const CLUSTER: &str = "home-nomad";
+const ONE_PHASE_ALL: &str =
+    "  health: { bake: 30s }\n  phases:\n    - { name: all, select: 'true', parallel: 4 }\n";
+
+/// `nomad` on the nodes, a workload needing it, and `backup` needing the
+/// workload: three stages.
+const LAYERED: &[(&str, &str)] = &[
+    (
+        "modules/nomad/module.yaml",
+        "name: nomad\nwhen: 'host.groups contains \"nomad\"'\n",
+    ),
+    (
+        "modules/backup/module.yaml",
+        "name: backup\nwhen: 'host.groups contains \"nomad\"'\nneeds: ['workload:postgres']\n",
+    ),
+    (
+        "workloads/postgres/workload.yaml",
+        "name: postgres\nneeds: ['module:nomad']\njob: postgres.hcl\n",
+    ),
+    (
+        "workloads/postgres/files/postgres.hcl",
+        "job \"postgres\" {}\n",
+    ),
+];
+
+/// One workload with no cross-layer needs: one stage.
+const FLAT: &[(&str, &str)] = &[
+    (
+        "workloads/postgres/workload.yaml",
+        "name: postgres\njob: postgres.hcl\n",
+    ),
+    (
+        "workloads/postgres/files/postgres.hcl",
+        "job \"postgres\" {}\n",
+    ),
+];
+
+/// The cluster a message is aimed at, if any.
+fn targeted(m: &SMsg) -> Option<&str> {
+    match m {
+        SMsg::Assign(a) => Some(a.target.as_str()),
+        SMsg::Plan(p) => Some(p.target.as_str()),
+        SMsg::Apply(a) => Some(a.target.as_str()),
+        SMsg::Health(h) => Some(h.target.as_str()),
+        _ => None,
+    }
+    .filter(|t| !t.is_empty())
+}
+
+/// Cross-layer `needs` lay a phase out in stages: the nodes' `nomad` module
+/// first, the cluster's workload next (planned when its stage opens, through
+/// an executor picked among the nodes), and the module needing the workload
+/// last, as a second whole-revision step of the same hosts.
+#[tokio::test(start_paused = true)]
+async fn a_cluster_is_staged_between_its_nodes_modules_and_applied_through_an_executor() {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, LAYERED)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.enrol("n2", "nomad").await;
+    h.connect("n1", None);
+    h.connect("n2", None);
+    let id = h.start("r1").await;
+    let (r, hosts) = h
+        .wait(&id, "the freeze", |_, hs| {
+            hs.iter().any(|x| x.host == CLUSTER)
+        })
+        .await;
+    assert_eq!(r.runtime.phases[0].stages, 3);
+    let cluster = host(&hosts, CLUSTER);
+    assert_eq!(cluster.runtime.kind, TargetKind::Cluster);
+    assert_eq!(cluster.state, HostPhase::PlanPending);
+    assert_eq!(cluster.runtime.stage, 1);
+    assert_eq!(cluster.runtime.executor, None);
+    for n in ["n1", "n2"] {
+        let steps: Vec<(u32, bool)> = host(&hosts, n)
+            .runtime
+            .steps
+            .iter()
+            .map(|s| (s.stage, s.select().contains("nomad")))
+            .collect();
+        assert_eq!(steps, [(0, true), (2, false)], "{n}");
+    }
+    assert!(
+        h.sent(|_, m| targeted(m).is_some()).is_empty(),
+        "a cluster plans when its stage opens, not at the freeze"
+    );
+
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let cluster = host(&hosts, CLUSTER);
+    assert_eq!(cluster.state, HostPhase::Healthy);
+    assert_eq!(cluster.runtime.executor.as_deref(), Some("n1"));
+    for n in ["n1", "n2"] {
+        assert_eq!(host(&hosts, n).state, HostPhase::Healthy, "{n}");
+        assert_eq!(host(&hosts, n).runtime.step, 1, "{n} ran both steps");
+    }
+    // The nodes' module step, then the cluster over n1's session, then the
+    // nodes' whole-revision step.
+    let applies = h.applies();
+    let index = |pred: &dyn Fn(&pb::Apply) -> bool| -> Vec<usize> {
+        applies
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| pred(&a.2))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let module_step = index(&|a| a.target.is_empty() && a.select.contains("nomad"));
+    let cluster_apply = index(&|a| a.target == CLUSTER);
+    let whole = index(&|a| a.target.is_empty() && a.select.is_empty());
+    assert_eq!(
+        (module_step.len(), cluster_apply.len(), whole.len()),
+        (2, 1, 2),
+        "{applies:?}"
+    );
+    assert_eq!(applies[cluster_apply[0]].1, "n1");
+    assert!(module_step.iter().all(|&i| i < cluster_apply[0]));
+    assert!(whole.iter().all(|&i| i > cluster_apply[0]));
+    let actions = h.audit_actions(&id).await;
+    for a in [
+        "rollout.phase.stage",
+        "rollout.host.staged",
+        "rollout.target.executor",
+    ] {
+        assert!(
+            actions.iter().any(|x| x == a),
+            "{a} missing from {actions:?}"
+        );
+    }
+}
+
+/// A cluster none of whose candidate executors runs a pipeline per target is
+/// handed nothing, waits through the grace, misses its phase and converges
+/// in the stragglers stage once a capable host connects.
+#[tokio::test(start_paused = true)]
+async fn a_cluster_without_a_capable_executor_misses_its_phase_and_converges_in_stragglers() {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, FLAT)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.script("n1", |s| s.no_targets = true);
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "n1 healthy", |_, hs| {
+            host(hs, "n1").state == HostPhase::Healthy
+        })
+        .await;
+    let cluster = host(&hosts, CLUSTER);
+    assert_eq!(cluster.state, HostPhase::PlanPending);
+    assert_eq!(cluster.runtime.executor, None);
+    assert!(
+        cluster.runtime.disconnected_at.is_some(),
+        "awaiting an executor runs the disconnect grace"
+    );
+    assert!(
+        h.sent(|_, m| targeted(m).is_some()).is_empty(),
+        "an agent without the capability is never handed cluster work"
+    );
+
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(r.runtime.stragglers_open);
+    assert_eq!(host(&hosts, CLUSTER).phase, STRAGGLERS);
+    assert_eq!(host(&hosts, CLUSTER).state, HostPhase::PlanPending);
+
+    h.enrol("n2", "nomad").await;
+    h.connect("n2", None);
+    let (_, hosts) = h
+        .wait(&id, "cluster healthy in stragglers", |_, hs| {
+            host(hs, CLUSTER).state == HostPhase::Healthy
+        })
+        .await;
+    assert_eq!(
+        host(&hosts, CLUSTER).runtime.executor.as_deref(),
+        Some("n2")
+    );
+    assert_eq!(host(&hosts, "n2").state, HostPhase::Healthy);
+    let to_n2 = h.sent(|host, m| host == "n2" && targeted(m) == Some(CLUSTER));
+    assert!(
+        to_n2.iter().any(|(_, _, m)| matches!(m, SMsg::Apply(_))),
+        "the cluster's apply travels over n2's session: {to_n2:?}"
+    );
+}
+
+/// An executor that stays away past the disconnect timeout mid-apply is
+/// replaced: the cluster re-plans through the next candidate and finishes
+/// there, with every pick in the audit log.
+#[tokio::test(start_paused = true)]
+async fn a_lost_executor_is_replaced_and_the_cluster_re_planned_through_the_next() {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, FLAT)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.enrol("n2", "nomad").await;
+    h.script("n1", |s| s.silent_target_apply = true);
+    h.connect("n1", None);
+    h.connect("n2", None);
+    let id = h.start("r1").await;
+    h.wait(
+        &id,
+        "nodes healthy, cluster applying through n1",
+        |_, hs| {
+            let c = host(hs, CLUSTER);
+            c.state == HostPhase::Applying
+                && c.runtime.executor.as_deref() == Some("n1")
+                && host(hs, "n1").state == HostPhase::Healthy
+                && host(hs, "n2").state == HostPhase::Healthy
+        },
+    )
+    .await;
+    h.disconnect("n1");
+    h.wait(&id, "cluster re-planned through n2", |_, hs| {
+        host(hs, CLUSTER).runtime.executor.as_deref() == Some("n2")
+    })
+    .await;
+    h.connect("n1", None);
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let cluster = host(&hosts, CLUSTER);
+    assert_eq!(cluster.state, HostPhase::Healthy);
+    assert_eq!(cluster.runtime.executor.as_deref(), Some("n2"));
+    assert_eq!(
+        h.applies()
+            .iter()
+            .filter(|a| a.1 == "n2" && a.2.target == CLUSTER)
+            .count(),
+        1
+    );
+    let actions = h.audit_actions(&id).await;
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| *a == "rollout.target.executor")
+            .count(),
+        3,
+        "picked, lost, picked again: {actions:?}"
     );
 }

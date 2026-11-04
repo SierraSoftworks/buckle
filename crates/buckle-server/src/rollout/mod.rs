@@ -6,6 +6,7 @@
 mod controller;
 pub mod link;
 pub mod model;
+pub mod stages;
 pub mod view;
 
 pub use controller::{

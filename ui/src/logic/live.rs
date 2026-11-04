@@ -369,6 +369,9 @@ mod tests {
             updated_at: Utc::now(),
             bake_until: None,
             reboot: None,
+            kind: Default::default(),
+            stage: 0,
+            executor: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -390,6 +393,7 @@ mod tests {
             approved_at: None,
             bake_until: None,
             health_checks: vec![],
+            stages: 1,
         }
     }
 

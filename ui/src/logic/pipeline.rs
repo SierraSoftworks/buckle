@@ -327,6 +327,9 @@ pub fn fleet_map(detail: &RolloutDetail, fleet: &[HostSummary]) -> RolloutDetail
             updated_at: h.last_seen.unwrap_or(h.first_seen),
             bake_until: None,
             reboot: None,
+            kind: Default::default(),
+            stage: 0,
+            executor: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -347,6 +350,7 @@ pub fn fleet_map(detail: &RolloutDetail, fleet: &[HostSummary]) -> RolloutDetail
             approved_at: None,
             bake_until: None,
             health_checks: vec![],
+            stages: 1,
         });
     }
     map
@@ -435,6 +439,9 @@ mod tests {
             updated_at: Utc::now() - Duration::seconds(age_secs),
             bake_until: None,
             reboot: None,
+            kind: Default::default(),
+            stage: 0,
+            executor: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -461,6 +468,7 @@ mod tests {
             approved_at: None,
             bake_until: None,
             health_checks: vec![],
+            stages: 1,
         }
     }
 

@@ -381,6 +381,9 @@ fn entry(
         updated_at: now - Duration::minutes(mins_ago),
         bake_until: None,
         reboot: None,
+        kind: Default::default(),
+        stage: 0,
+        executor: None,
         needs_approval: false,
         needs_attention: false,
         error_detail: None,
@@ -410,6 +413,7 @@ fn phase(
         approved_at: None,
         bake_until: None,
         health_checks: gate_checks(name),
+        stages: 1,
     }
 }
 
