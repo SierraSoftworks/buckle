@@ -3631,28 +3631,23 @@ async fn a_target_appearing_mid_rollout_joins_a_phase_not_yet_started() {
     h.wait_state(&id, RolloutState::AwaitingApproval).await;
 
     // Enrolled while the canary phase waits: `web` has not started, so the
-    // host joins it; a second canary host has missed its phase.
+    // host joins it on connecting; a second canary host has missed its phase.
     h.enrol("late-web", "web").await;
     h.handle.host_registered("late-web");
+    h.connect("late-web", None);
     h.enrol("late-canary", "canary").await;
     h.handle.host_changed("late-canary");
     let (_, hosts) = h
-        .wait(&id, "late web host admitted", |_, hs| {
-            hs.iter().any(|x| x.host == "late-web")
+        .wait(&id, "late web host admitted and planned", |_, hs| {
+            hs.iter()
+                .any(|x| x.host == "late-web" && x.state == HostPhase::Planned)
         })
         .await;
-    let late = host(&hosts, "late-web");
-    assert_eq!(late.phase, "web");
-    assert_eq!(late.state, HostPhase::PlanPending);
+    assert_eq!(host(&hosts, "late-web").phase, "web");
     assert!(
         !hosts.iter().any(|x| x.host == "late-canary"),
         "a phase already reached is not joined"
     );
-    h.connect("late-web", None);
-    h.wait(&id, "late host planned", |_, hs| {
-        host(hs, "late-web").state == HostPhase::Planned
-    })
-    .await;
 
     h.command(Command::Approve {
         rollout: id.clone(),

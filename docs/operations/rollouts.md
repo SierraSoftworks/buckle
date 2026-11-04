@@ -107,10 +107,11 @@ When the last phase completes, the revision is **promoted** to stable: it is wha
 what a rollback returns to. Hosts that missed their phase (offline, held or skipped) converge in the
 **stragglers** stage, `stragglers.parallel` at a time.
 
-A target that appears while the rollout runs (a host enrolled and approved, a cluster created
-through the API) joins the phase its selector names if the rollout has not reached that phase yet,
-and is planned and approved with it. One whose phase is already running, or over, waits for the
-stragglers stage.
+A target that appears while the rollout runs (a host that connects enrolled and approved, a
+cluster created through the API) joins the phase its selector names if the rollout has not reached
+that phase yet, and is planned and approved with it. One whose phase is already running, or over,
+waits for the stragglers stage. A running rollout has first call on such a host: the stable
+revision's stragglers stage takes it only when no phase does.
 
 ## Pausing
 

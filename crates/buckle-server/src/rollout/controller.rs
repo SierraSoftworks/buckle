@@ -1181,6 +1181,11 @@ impl Controller {
                 self.on_row_reachable(ri, hi, &c).await;
             }
         }
+        // A running rollout gets first call on a host that appears: only
+        // then does the stable revision's stragglers stage consider it.
+        for ri in 0..self.live.len() {
+            self.admit_late_targets(ri, Some(&c.host)).await;
+        }
         self.maybe_add_straggler(&c.host, c.applied_revision.as_deref())
             .await;
         self.assign_waiting_executors().await;
@@ -1839,13 +1844,10 @@ impl Controller {
         } else {
             self.excluded.insert(host.to_owned());
         }
+        // Registration precedes the Hello's labels in the store, so a late
+        // host is admitted to a running rollout when it connects, not here.
         self.host_seen
             .insert(host.to_owned(), (record.status, record.effective_labels()));
-        if record.status == HostStatus::Active {
-            for ri in 0..self.live.len() {
-                self.admit_late_targets(ri).await;
-            }
-        }
     }
 
     async fn on_host_changed(&mut self, host: &str) {
@@ -1888,7 +1890,7 @@ impl Controller {
             && r.status == HostStatus::Active
         {
             for ri in 0..self.live.len() {
-                self.admit_late_targets(ri).await;
+                self.admit_late_targets(ri, Some(host)).await;
             }
             if self.connected(host) {
                 self.on_connected(Connected {
@@ -3742,7 +3744,7 @@ impl Controller {
                 );
                 // Targets that appeared since the freeze join a phase that
                 // has not started yet.
-                self.admit_late_targets(ri).await;
+                self.admit_late_targets(ri, None).await;
                 changed = true;
                 continue;
             }
@@ -3987,6 +3989,17 @@ impl Controller {
             .collect()
     }
 
+    /// Another live rollout (running, or stable with its stragglers stage
+    /// open) has a row for `host`: it speaks for the agent until that row is
+    /// done, so no second rollout admits the host meanwhile.
+    fn spoken_for_elsewhere(&self, ri: usize, host: &str) -> bool {
+        self.live.iter().enumerate().any(|(rj, l)| {
+            rj != ri
+                && (l.record.is_active() || l.record.runtime.stragglers_open)
+                && l.find(host).is_some_and(|hi| !l.hosts[hi].state.finished())
+        })
+    }
+
     fn start_gate(&mut self, ri: usize, p: usize) {
         let targets: Vec<usize> = (0..self.live[ri].hosts.len())
             .filter(|&hi| {
@@ -4226,6 +4239,12 @@ impl Controller {
             return;
         }
         if applied == Some(self.live[ri].record.revision.as_str()) {
+            return;
+        }
+        // A host a running rollout admitted to one of its phases converges
+        // there; taking it to the older stable revision as well would have
+        // two rollouts speak for one agent.
+        if self.spoken_for_elsewhere(ri, host) {
             return;
         }
         if self.live[ri]
@@ -4655,7 +4674,12 @@ impl Controller {
     /// created) to a phase of rollout `ri` that has not started yet; the
     /// phase's stages are laid out again around them. Anything matching a
     /// phase already reached waits for the stragglers stage, as before.
-    async fn admit_late_targets(&mut self, ri: usize) {
+    /// Admits targets that appeared since the freeze (`only` that host, or
+    /// every host) to a phase the rollout has not reached yet: the first
+    /// phase their selector names, when its index is above the current one.
+    /// Called when a host connects (its Hello labels are stored by then),
+    /// when a host's status or labels change, and when a phase ends.
+    async fn admit_late_targets(&mut self, ri: usize, only: Option<&str>) {
         if !self.live[ri].record.is_running() {
             return;
         }
@@ -4664,19 +4688,45 @@ impl Controller {
         if current + 1 >= phases.len() {
             return;
         }
-        let Ok(targets) = self.load_targets().await else {
-            return;
+        let revision = self.live[ri].record.revision.clone();
+        let candidate = |this: &Self, host: &crate::store::HostRecord| {
+            host.status == HostStatus::Active
+                && this.live[ri].find(&host.id).is_none()
+                && !this.live[ri].record.runtime.untargeted.contains(&host.id)
+                && host.applied_revision.as_deref() != Some(revision.as_str())
+                && !this.spoken_for_elsewhere(ri, &host.id)
+        };
+        let candidates: Vec<(crate::store::HostRecord, serde_json::Value)> = match only {
+            Some(host) => {
+                if self.live[ri].find(host).is_some() || self.spoken_for_elsewhere(ri, host) {
+                    return;
+                }
+                let h = host.to_owned();
+                let found = self
+                    .store
+                    .call(move |db| {
+                        let Some(rec) = db.hosts().get(&h)? else {
+                            return Ok(None);
+                        };
+                        let facts = db.hosts().latest_facts(&h)?.map(|(f, _)| f);
+                        Ok(Some((rec, facts.unwrap_or(serde_json::Value::Null))))
+                    })
+                    .await;
+                match found {
+                    Ok(Some(found)) => vec![found],
+                    _ => return,
+                }
+            }
+            None => match self.load_targets().await {
+                Ok(targets) => targets,
+                Err(_) => return,
+            },
         };
         let now = self.now();
-        let revision = self.live[ri].record.revision.clone();
         let id = self.live[ri].record.id.clone();
         let mut touched: BTreeSet<usize> = BTreeSet::new();
-        for (host, facts) in &targets {
-            if host.status != HostStatus::Active
-                || self.live[ri].find(&host.id).is_some()
-                || self.live[ri].record.runtime.untargeted.contains(&host.id)
-                || host.applied_revision.as_deref() == Some(revision.as_str())
-            {
+        for (host, facts) in &candidates {
+            if !candidate(self, host) {
                 continue;
             }
             let ctx = crate::fleet::record_context(host, facts, &self.live[ri].revision.fleet);
@@ -4718,6 +4768,18 @@ impl Controller {
             );
             touched.insert(pi);
         }
+        if touched.is_empty() {
+            return;
+        }
+        // Stages are laid out over the whole phase (a cluster's nodes among
+        // them), so they need every target, not just the one admitted.
+        let targets = match only {
+            Some(_) => match self.load_targets().await {
+                Ok(targets) => targets,
+                Err(_) => candidates,
+            },
+            None => candidates,
+        };
         for pi in touched {
             self.compute_stages(ri, pi, &targets);
             for hi in self.live[ri].phase_hosts(pi) {
