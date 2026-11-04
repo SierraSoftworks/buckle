@@ -24,7 +24,10 @@ describe("every page renders in demo mode", () => {
     await page.locator('.overview__fleet .stage[data-stage="not in this rollout"] a.block').first().waitFor();
     const drawn = await page.locator(".overview__fleet a.block").count();
     const total = Number(await page.locator(".tile--plain .tile__value").textContent());
-    assert.equal(drawn, total, "every host in the fleet is on the map");
+    // Cluster targets are drawn beside the hosts but are not counted in the total.
+    const clusters = await page.locator('.overview__fleet a.block').filter({ has: page.locator(".block__name", { hasText: /^home-nomad$/ }) }).count();
+    assert.equal(drawn - clusters, total, "every host in the fleet is on the map");
+    assert.ok(clusters >= 1, "clusters are on the map");
     assert.match(await page.locator(".attention").textContent(), /awaiting registration approval/);
     assert.match(await page.locator(".attention").textContent(), /expected 2\.0\.0-dev\.5/);
     assert.equal(await page.locator(".grid--overview .gitlog__item").count(), 5);
