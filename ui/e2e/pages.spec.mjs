@@ -108,6 +108,8 @@ describe("every page renders in demo mode", () => {
     // Secrets are only ever tokens.
     const drift = await page.locator(".drift").last().textContent();
     assert.match(drift, /«secret:nomad_server@3f9a»/);
+    // Collapsed facts are not in the page until opened.
+    assert.doesNotMatch(await page.locator(".tree").textContent(), /distribution/);
     await page.locator(".tree summary", { hasText: "os" }).click();
     assert.match(await page.locator(".tree").textContent(), /distribution/);
     await close();
