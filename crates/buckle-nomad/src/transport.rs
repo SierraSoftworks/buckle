@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use buckle_core::Result;
-use buckle_core::error::{system, user, wrap_user};
+use buckle_core::error::{user, wrap_user};
 use std::time::Duration;
 
 /// One HTTP request, relative to the agent's address.
@@ -261,7 +261,7 @@ impl Transport for UnixTransport {
         tokio::time::timeout(REQUEST_TIMEOUT, call)
             .await
             .map_err(|_| {
-                system(
+                buckle_core::error::system(
                     format!("The Nomad API at {addr} did not answer in time."),
                     &["Check that the Nomad agent is running."],
                 )
