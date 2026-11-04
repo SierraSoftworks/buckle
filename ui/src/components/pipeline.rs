@@ -89,9 +89,15 @@ pub fn pipeline(props: &PipelineProps) -> Html {
 }
 
 fn gate(gate: &Gate, first: bool, now: DateTime<Utc>) -> Html {
-    // Before the first stage there is nothing to pass unless it needs approval.
-    if first && gate.kind == GateKind::Auto {
-        return html! {};
+    // Only approvals are drawn as gates. The health check between stages is
+    // implicit: it shows only when it holds the rollout (paused), otherwise
+    // the stages are just spaced apart.
+    if gate.kind == GateKind::Auto && gate.state != GateState::Blocked {
+        return if first {
+            html! {}
+        } else {
+            html! { <div class="gate gate--plain" aria-hidden="true" /> }
+        };
     }
     let state = match gate.state {
         GateState::Waiting => "waiting",
