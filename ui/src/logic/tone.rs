@@ -411,6 +411,8 @@ mod tests {
     fn host(health: HealthSummary, connection: Connection) -> HostSummary {
         HostSummary {
             id: "pi-1".into(),
+            kind: Default::default(),
+            cluster: None,
             status: HostStatus::Active,
             connection,
             agent_labels: BTreeMap::new(),

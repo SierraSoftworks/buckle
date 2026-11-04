@@ -13,6 +13,7 @@ pub mod plan;
 pub mod revision;
 pub mod rollout;
 pub mod run;
+pub mod target;
 mod words;
 
 pub use audit::*;
@@ -26,6 +27,7 @@ pub use plan::*;
 pub use revision::*;
 pub use rollout::*;
 pub use run::*;
+pub use target::*;
 
 use serde::{Deserialize, Serialize};
 

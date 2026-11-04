@@ -789,6 +789,8 @@ fn revision_with_vars(
         modules,
         var_files: files,
         unloaded: Vec::new(),
+        workloads: Vec::new(),
+        unloaded_workloads: Vec::new(),
     })
 }
 

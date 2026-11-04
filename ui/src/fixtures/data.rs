@@ -299,6 +299,8 @@ pub fn hosts(now: DateTime<Utc>) -> Vec<HostSummary> {
             let offline = s.offline_mins.is_some();
             HostSummary {
                 id: s.id.clone(),
+                kind: Default::default(),
+                cluster: None,
                 status: if pending {
                     HostStatus::Pending
                 } else if s.id == "lab-4" {
@@ -1837,8 +1839,52 @@ fn facts(host: &HostSummary) -> Value {
     })
 }
 
+/// The cluster targets the demo fleet declares: one Nomad cluster made of
+/// the nomad hosts.
+pub fn clusters(now: DateTime<Utc>) -> Vec<HostSummary> {
+    let seed = labels(&[("site", "home"), ("cluster", "home")]);
+    vec![HostSummary {
+        id: "home-nomad".into(),
+        kind: buckle_api::TargetKind::Cluster,
+        cluster: Some(buckle_api::ClusterInfo {
+            spec: buckle_api::ClusterSpec {
+                kind: buckle_api::ClusterKind::Nomad,
+                description: "The home Nomad cluster.".into(),
+                api: Some("http://127.0.0.1:4646".into()),
+                nodes: Some(
+                    "host.groups contains \"nomad-servers\" || host.groups contains \"nomad-clients\""
+                        .into(),
+                ),
+                executors: Some("host.groups contains \"nomad-servers\"".into()),
+                identity: buckle_api::ClusterSpec::default_identity(),
+                cluster: None,
+                scope: Default::default(),
+            },
+            declared: true,
+        }),
+        status: HostStatus::Active,
+        connection: Connection::Offline,
+        agent_labels: seed.clone(),
+        labels: BTreeMap::new(),
+        effective_labels: seed,
+        groups: vec![],
+        platform: None,
+        arch: None,
+        agent_version: None,
+        applied_revision: None,
+        health: HealthSummary::Unknown,
+        health_at: None,
+        drifted: false,
+        first_seen: now - Duration::days(30),
+        last_seen: None,
+        notes: String::new(),
+        upgrade: None,
+    }]
+}
+
 pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
-    let pending = host.status == HostStatus::Pending;
+    let pending =
+        host.status == HostStatus::Pending || host.kind == buckle_api::TargetKind::Cluster;
     let rev = host.applied_revision.clone().unwrap_or_default();
     let resources = if pending {
         vec![]

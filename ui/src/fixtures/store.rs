@@ -26,6 +26,8 @@ use crate::logic::live;
 
 pub(super) struct State {
     pub hosts: Vec<HostSummary>,
+    /// Cluster targets, listed beside the hosts.
+    pub clusters: Vec<HostSummary>,
     pub details: Vec<HostDetail>,
     pub rollouts: Vec<RolloutDetail>,
     pub revisions: Vec<RevisionSummary>,
@@ -43,7 +45,12 @@ impl State {
         let now = Utc::now();
         let empty = flag("empty").is_some();
         let hosts = if empty { vec![] } else { data::hosts(now) };
-        let details = hosts.iter().map(|h| data::host_detail(h, now)).collect();
+        let clusters = if empty { vec![] } else { data::clusters(now) };
+        let details = hosts
+            .iter()
+            .chain(clusters.iter())
+            .map(|h| data::host_detail(h, now))
+            .collect();
         let mut rollouts = if empty { vec![] } else { data::rollouts(now) };
         if flag("awaiting").is_some()
             && let Some(active) = rollouts.iter_mut().find(|r| r.summary.id == "42")
@@ -52,6 +59,7 @@ impl State {
         }
         Self {
             hosts,
+            clusters,
             details,
             rollouts,
             revisions: if empty { vec![] } else { data::revisions(now) },
@@ -173,9 +181,12 @@ pub fn fleet() -> Result<Fleet, ApiError> {
             .iter()
             .find(|r| crate::logic::tone::rollout_active(r.summary.state))
             .map(|r| r.summary.id.clone());
+        let mut counts = live::recount(&s.hosts);
+        counts.clusters = s.clusters.len() as u32;
         Ok(Fleet {
-            counts: live::recount(&s.hosts),
+            counts,
             hosts: s.hosts.clone(),
+            clusters: s.clusters.clone(),
             stable_revision: s
                 .revisions
                 .iter()

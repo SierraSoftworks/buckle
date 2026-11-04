@@ -669,7 +669,7 @@ fn labels_editor(props: &LabelsProps) -> Html {
                 wasm_bindgen_futures::spawn_local(async move {
                     let patch = HostPatch {
                         labels: Some(labels),
-                        notes: None,
+                        ..Default::default()
                     };
                     preview.set(Some(api::preview_host(&id, &patch).await));
                 });
@@ -741,7 +741,7 @@ fn labels_editor(props: &LabelsProps) -> Html {
                     &id,
                     &HostPatch {
                         labels: Some(labels),
-                        notes: None,
+                        ..Default::default()
                     },
                 )
                 .await
@@ -895,8 +895,8 @@ fn notes_editor(props: &NotesProps) -> Html {
                 match api::patch_host(
                     &id,
                     &HostPatch {
-                        labels: None,
                         notes: Some(notes),
+                        ..Default::default()
                     },
                 )
                 .await

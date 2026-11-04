@@ -1,5 +1,6 @@
 //! Validation of a loaded revision beyond what loading itself checks:
-//! module graph, rollout phase names, secret references and template syntax.
+//! module graph, rollout phase names, secret references, template syntax and
+//! the cluster layer (`fleet.clusters`, workloads, cross-layer `needs`).
 
 use crate::secrets::ServerSecrets;
 use buckle_core::engine::Revision;
@@ -17,10 +18,10 @@ pub fn validate(revision: &Revision) -> Vec<String> {
             ));
         }
     }
-    let graph: BTreeMap<&str, &[String]> = revision
+    let graph: BTreeMap<&str, Vec<String>> = revision
         .modules
         .iter()
-        .map(|m| (m.config.name.as_str(), m.config.needs.as_slice()))
+        .map(|m| (m.config.name.as_str(), m.config.module_needs()))
         .collect();
     for (module, needs) in &graph {
         for n in needs.iter() {
@@ -77,10 +78,12 @@ pub fn validate(revision: &Revision) -> Vec<String> {
             }
         }
     }
+    let targets = buckle_core::engine::validate_targets(revision);
+    errors.extend(targets.errors.iter().map(|e| format!("{e}.")));
     errors
 }
 
-fn find_cycle(graph: &BTreeMap<&str, &[String]>) -> Option<Vec<String>> {
+fn find_cycle(graph: &BTreeMap<&str, Vec<String>>) -> Option<Vec<String>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Mark {
         Visiting,
@@ -88,7 +91,7 @@ fn find_cycle(graph: &BTreeMap<&str, &[String]>) -> Option<Vec<String>> {
     }
     fn visit<'a>(
         node: &'a str,
-        graph: &BTreeMap<&'a str, &'a [String]>,
+        graph: &'a BTreeMap<&'a str, Vec<String>>,
         marks: &mut BTreeMap<&'a str, Mark>,
         path: &mut Vec<&'a str>,
     ) -> Option<Vec<String>> {
@@ -150,6 +153,9 @@ mod tests {
     #[case(&[("buckle.yaml", "version: 2\nrollout:\n  phases:\n    - { name: canary, select: 'true' }\n    - { name: Canary, select: 'true' }\n")], "more than once")]
     #[case(&[("buckle.yaml", "version: 2\nrollout:\n  phases:\n    - { name: stragglers, select: 'true' }\n")], "reserved")]
     #[case(&[("buckle.yaml", "version: 2\n"), ("modules/a/module.yaml", "name: a\n"), ("modules/a/files/x.j2", "{{ secrets[\"nope\"] }}")], "does not declare")]
+    #[case(&[("buckle.yaml", "version: 2\n"), ("modules/a/module.yaml", "name: a\nneeds: ['workload:nope']\n")], "needs the workload 'nope'")]
+    #[case(&[("buckle.yaml", "version: 2\n"), ("workloads/w/workload.yaml", "name: w\nwhen: 'host.labels.x == 1'\njob: w.hcl\n"), ("workloads/w/files/w.hcl", "")], "selects on `host.*`")]
+    #[case(&[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    c:\n      kind: nomad\n      nodes: 'true'\n      identity: secret://NOPE\n")], "does not declare the secret 'NOPE'")]
     fn invalid_revisions_are_reported(#[case] files: &[(&str, &str)], #[case] needle: &str) {
         let errors = validate(&load(files));
         assert!(errors.iter().any(|e| e.contains(needle)), "{errors:?}");
@@ -158,10 +164,21 @@ mod tests {
     #[test]
     fn a_valid_revision_has_no_errors() {
         let rev = load(&[
-            ("buckle.yaml", "version: 2\nsecrets:\n  tok: { env: TOK }\n"),
-            ("modules/a/module.yaml", "name: a\nneeds: [b]\n"),
+            (
+                "buckle.yaml",
+                "version: 2\nfleet:\n  clusters:\n    c: { kind: nomad, nodes: 'host.labels.nomad == true' }\nsecrets:\n  tok: { env: TOK }\n",
+            ),
+            (
+                "modules/a/module.yaml",
+                "name: a\nneeds: [b, 'workload:w']\n",
+            ),
             ("modules/b/module.yaml", "name: b\n"),
             ("modules/a/files/x.j2", "{{ secrets.tok }}"),
+            (
+                "workloads/w/workload.yaml",
+                "name: w\nneeds: ['module:b']\njob: w.hcl\n",
+            ),
+            ("workloads/w/files/w.hcl", "job {}"),
         ]);
         assert_eq!(validate(&rev), Vec::<String>::new());
     }

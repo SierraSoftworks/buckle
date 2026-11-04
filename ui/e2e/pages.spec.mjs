@@ -114,13 +114,19 @@ describe("every page renders in demo mode", () => {
     const { page, close } = await open("/hosts");
     assert.equal(await heading(page), "Hosts");
     await page.getByTestId("hosts-table").waitFor();
-    assert.equal(await page.locator("tbody tr").first().getAttribute("data-host"), "rpi-new");
-    assert.equal(await page.locator("tbody tr").count(), 27);
+    // Hosts and clusters are separate tables: the filters act on the hosts.
+    const rows = page.getByTestId("hosts-table").locator("tbody tr");
+    assert.equal(await rows.first().getAttribute("data-host"), "rpi-new");
+    assert.equal(await rows.count(), 27);
+    const clusters = page.getByTestId("clusters-table").locator("tbody tr");
+    assert.equal(await clusters.count(), 1);
+    await clusters.first().getByText("nomad cluster").waitFor();
     await page.getByRole("button", { name: /^Failing/ }).click();
-    await eventually(async () => assert.equal(await page.locator("tbody tr").count(), 2));
+    await eventually(async () => assert.equal(await rows.count(), 2));
     assert.match(page.url(), /show=failing/);
     await page.getByRole("searchbox", { name: "Search hosts" }).fill("hz-");
-    await eventually(async () => assert.equal(await page.locator("tbody tr").count(), 1));
+    await eventually(async () => assert.equal(await rows.count(), 1));
+    await eventually(async () => assert.equal(await clusters.count(), 0));
     await close();
   });
 

@@ -21,15 +21,18 @@ mod executor;
 mod graph;
 pub mod loader;
 mod planner;
+pub mod targets;
 pub mod validate;
 
 #[cfg(test)]
 mod tests;
 
 pub use context::merged_labels;
+pub use targets::{selected_workloads, validate_targets};
 pub use validate::{
-    HostSummary, ValidationIssue, ValidationReport, host_context, reads_unknown_facts,
-    secret_names_for_host, validate, validate_host, validate_with_facts,
+    HostSummary, ValidationIssue, ValidationReport, cluster_context, host_context,
+    reads_unknown_facts, secret_names_for_host, validate, validate_host, validate_with_facts,
+    with_groups,
 };
 
 use crate::error::ErrorReport;
@@ -47,24 +50,57 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// A loaded revision: the fleet config plus every module and its files.
+/// A loaded revision: the fleet config plus every module and workload and
+/// their files.
 #[derive(Debug)]
 pub struct Revision {
     pub id: RevisionId,
     pub fleet: FleetConfig,
     pub modules: Vec<LoadedModule>,
+    /// The workloads under `workloads/`: what the revision's cluster targets
+    /// run. Hosts never plan them; the server hands them to a cluster's
+    /// executor.
+    pub workloads: Vec<LoadedWorkload>,
     /// Raw contents of every `vars` overlay file referenced by the fleet config.
     pub var_files: indexmap::IndexMap<PathBuf, serde_yaml::Value>,
     /// Directories under `modules/` that have no `module.yaml`. Their module
     /// is indeterminate: resources recorded under that name are never treated
     /// as orphans, because the directory may be a module mid-edit.
     pub unloaded: Vec<String>,
+    /// Directories under `workloads/` that have no `workload.yaml`.
+    pub unloaded_workloads: Vec<String>,
 }
 
 impl Revision {
     /// The module with this name, if the revision has one.
     pub fn module(&self, name: &str) -> Option<&LoadedModule> {
         self.modules.iter().find(|m| m.config.name == name)
+    }
+
+    /// The workload with this name, if the revision has one.
+    pub fn workload(&self, name: &str) -> Option<&LoadedWorkload> {
+        self.workloads.iter().find(|w| w.config.name == name)
+    }
+}
+
+/// One workload of a revision: its parsed `workload.yaml`, a reader for its
+/// `files/` directory and the templates (`.j2`) found there.
+pub struct LoadedWorkload {
+    pub config: crate::model::WorkloadConfig,
+    pub source: Arc<dyn Source>,
+    /// Every file under `files/` by relative path, for validation (the specs
+    /// a workload names must exist) and for templates.
+    pub files: Vec<PathBuf>,
+    /// Templates under `files/` keyed by relative path.
+    pub templates: Vec<(PathBuf, String)>,
+}
+
+impl std::fmt::Debug for LoadedWorkload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedWorkload")
+            .field("workload", &self.config.name)
+            .field("files", &self.files.len())
+            .finish()
     }
 }
 

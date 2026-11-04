@@ -74,7 +74,9 @@ pub fn log_report(report: &Report) {
             removals = plan.removals.len(),
             "planned"
         ),
-        Report::PlanFailed { revision, error } => {
+        Report::PlanFailed {
+            revision, error, ..
+        } => {
             tracing::error!(revision = %revision.short(), %error, "planning failed")
         }
         Report::StalePlan { plan, .. } => {
@@ -184,10 +186,12 @@ fn assignment(revision: RevisionId, secrets: Vec<WireSecret>) -> [Instruction; 3
             stable: true,
             secrets,
             tree_digest: None,
+            target: None,
         },
         Instruction::RequestPlan {
             revision: revision.clone(),
             select: None,
+            target: None,
         },
         Instruction::Apply {
             revision,
@@ -199,6 +203,7 @@ fn assignment(revision: RevisionId, secrets: Vec<WireSecret>) -> [Instruction; 3
             select: None,
             rollout_id: None,
             phase: None,
+            target: None,
         },
     ]
 }

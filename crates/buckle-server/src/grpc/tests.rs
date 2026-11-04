@@ -251,6 +251,7 @@ async fn bootstrap_enrolment_issues_a_per_host_token() {
     // Reports are routed to the store.
     tx.send(AgentMessage {
         msg: Some(agent_message::Msg::Facts(Facts {
+            target: String::new(),
             json: br#"{"os":{"family":"debian"}}"#.to_vec(),
             collected_at: None,
         })),

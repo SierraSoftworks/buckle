@@ -114,6 +114,8 @@ mod tests {
     fn host(id: &str, first_seen: DateTime<Utc>) -> HostSummary {
         HostSummary {
             id: id.into(),
+            kind: Default::default(),
+            cluster: None,
             status: HostStatus::Active,
             connection: Connection::Online,
             agent_labels: Default::default(),

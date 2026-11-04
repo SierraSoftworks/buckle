@@ -22,7 +22,7 @@ pub use audit::{Audit, AuditFilter, NewAudit};
 pub use drift::Drift;
 pub use health::{HEALTH_EPOCHS, HealthEventRecord, HealthEvents};
 pub(crate) use hosts::status_str as hosts_status_str;
-pub use hosts::{HostRecord, Hosts, NewHost};
+pub use hosts::{HostRecord, Hosts, NewCluster, NewHost};
 pub use kv::Kv;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
@@ -269,6 +269,13 @@ WHERE e.id IN (SELECT MAX(id) FROM health_events GROUP BY host, module, check_na
     // actions without rendered text), so content-only re-plans stay approved.
     r#"
 ALTER TABLE approvals ADD COLUMN approval_digests TEXT NOT NULL DEFAULT '[]';
+"#,
+    // 7: cluster targets share the hosts table: `kind` tells them apart and
+    // `cluster` holds the spec (JSON) of a cluster target.
+    r#"
+ALTER TABLE hosts ADD COLUMN kind TEXT NOT NULL DEFAULT 'host';
+ALTER TABLE hosts ADD COLUMN cluster TEXT;
+CREATE INDEX hosts_kind ON hosts(kind);
 "#,
 ];
 

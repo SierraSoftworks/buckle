@@ -730,6 +730,12 @@ impl Shared {
                     Some(Instruction::Ping) => {}
                     Some(Instruction::Ack { report_ids }) => self.on_ack(&report_ids).await,
                     Some(Instruction::HostUpdate(update)) => self.on_host_update(update, queue).await,
+                    // Work for a cluster target: this agent runs none, so a
+                    // plan is answered with a failure the server can show
+                    // and anything else is logged and dropped.
+                    Some(other) if other.target().is_some() => {
+                        self.refuse_targeted(other).await;
+                    }
                     Some(other) => {
                         if let Some(op) = op_for(other) {
                             // Plans, health answers, applies and rollbacks
@@ -1414,6 +1420,7 @@ impl Shared {
                     .send(Report::PlanFailed {
                         revision,
                         error: err.description(),
+                        target: None,
                     })
                     .await;
             }
@@ -1451,6 +1458,7 @@ impl Shared {
                     .send(Report::PlanFailed {
                         revision,
                         error: err.description(),
+                        target: None,
                     })
                     .await;
             }
@@ -1572,6 +1580,7 @@ impl Shared {
                     .send(Report::PlanFailed {
                         revision,
                         error: err.description(),
+                        target: None,
                     })
                     .await;
                 return;
@@ -1643,6 +1652,7 @@ impl Shared {
                     .send(Report::PlanFailed {
                         revision: rev.id.clone(),
                         error: err.description(),
+                        target: None,
                     })
                     .await;
             }
@@ -1715,6 +1725,7 @@ impl Shared {
                     .send(Report::PlanFailed {
                         revision,
                         error: err.description(),
+                        target: None,
                     })
                     .await;
             }
@@ -2468,6 +2479,29 @@ impl Shared {
         // otherwise after the next Welcome.
         self.send_durable(Report::LocalRollback(record)).await;
     }
+    /// Answers an instruction aimed at a cluster target. This agent applies
+    /// revisions to its own host only, so a targeted plan fails with a
+    /// reason the server can show, and other targeted work is ignored.
+    async fn refuse_targeted(&self, instruction: Instruction) {
+        let target = instruction.target().unwrap_or_default().to_owned();
+        match instruction {
+            Instruction::RequestPlan { revision, .. } => {
+                tracing::warn!(%target, revision = %revision.short(), "asked to plan for a cluster target; this agent does not run workloads");
+                self.sink
+                    .send(Report::PlanFailed {
+                        revision,
+                        error: format!(
+                            "This agent does not run workloads, so it cannot plan for the cluster target '{target}'."
+                        ),
+                        target: Some(target),
+                    })
+                    .await;
+            }
+            other => {
+                tracing::warn!(%target, instruction = ?std::mem::discriminant(&other), "ignoring an instruction for a cluster target; this agent does not run workloads");
+            }
+        }
+    }
 }
 
 fn op_for(instruction: Instruction) -> Option<Op> {
@@ -2477,6 +2511,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             stable,
             secrets,
             tree_digest,
+            target: _,
         } => Op::Assign {
             revision,
             stable,
@@ -2484,7 +2519,11 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             tree_digest,
             desired: true,
         },
-        Instruction::RequestPlan { revision, select } => Op::Plan { revision, select },
+        Instruction::RequestPlan {
+            revision,
+            select,
+            target: _,
+        } => Op::Plan { revision, select },
         Instruction::Apply {
             revision,
             plan_digest,
@@ -2495,6 +2534,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             select,
             rollout_id,
             phase,
+            target: _,
         } => Op::Apply {
             revision,
             plan_digest,
@@ -2511,6 +2551,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             reason,
             rollout_id,
             traceparent,
+            target: _,
         } => Op::Rollback {
             revision,
             reason,
@@ -2523,6 +2564,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             modules,
             until,
             traceparent,
+            target: _,
         } => Op::Health {
             request_id,
             scope,

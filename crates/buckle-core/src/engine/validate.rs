@@ -5,8 +5,8 @@
 
 use super::{Revision, graph::Graph};
 use crate::facts::Facts;
-use crate::model::TaskDecl;
-use crate::selectors::HostIdentity;
+use crate::model::{Need, TaskDecl};
+use crate::selectors::{HostContext, HostIdentity, selector_namespaces};
 use crate::template::Templater;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -143,7 +143,7 @@ fn module_file(module: &str) -> String {
 }
 
 /// Collects every string scalar in a YAML value.
-fn yaml_strings<'a>(value: &'a serde_yaml::Value, out: &mut Vec<&'a str>) {
+pub(super) fn yaml_strings<'a>(value: &'a serde_yaml::Value, out: &mut Vec<&'a str>) {
     match value {
         serde_yaml::Value::String(s) => out.push(s),
         serde_yaml::Value::Sequence(items) => items.iter().for_each(|v| yaml_strings(v, out)),
@@ -194,12 +194,11 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
 
     // Fleet-level text.
     for (name, selector) in &revision.fleet.fleet.groups {
-        check_secrets(
-            &mut report,
-            None,
-            &format!("buckle.yaml fleet.groups.{name}"),
-            selector.raw(),
-        );
+        let location = format!("buckle.yaml fleet.groups.{name}");
+        check_secrets(&mut report, None, &location, selector.raw());
+        if let Some(problem) = super::targets::mixed_namespaces(selector.raw()) {
+            report.warning(None, &location, problem);
+        }
     }
     for (i, overlay) in revision.fleet.vars.iter().enumerate() {
         let location = format!("buckle.yaml vars[{i}]");
@@ -257,10 +256,14 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             );
         }
     }
+    // `workload:` edges are the cluster layer's to check (`validate_targets`).
     let mut graph = Graph::new();
     for m in &revision.modules {
-        graph.add(&m.config.name, &m.config.needs);
-        for need in &m.config.needs {
+        graph.add(&m.config.name, &m.config.module_needs());
+        for need in m.config.needs() {
+            let Need::Module(need) = need else {
+                continue;
+            };
             if !seen.contains_key(need.as_str()) {
                 report.error(
                     Some(&m.config.name),
@@ -268,7 +271,7 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
                     format!("needs the module '{need}', which does not exist"),
                 );
             }
-            if need == &m.config.name {
+            if need == m.config.name {
                 report.error(
                     Some(&m.config.name),
                     module_file(&m.config.name),
@@ -300,7 +303,11 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
         let name = m.config.name.as_str();
         let file = module_file(name);
         if let Some(when) = &m.config.when {
-            check_secrets(&mut report, Some(name), &format!("{file} when"), when.raw());
+            let location = format!("{file} when");
+            check_secrets(&mut report, Some(name), &location, when.raw());
+            if let Some(problem) = host_selector_problem(when.raw()) {
+                report.error(Some(name), &location, problem);
+            }
         }
         for (k, v) in &m.config.vars {
             let mut strings = Vec::new();
@@ -339,6 +346,9 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             }
             if let Some(when) = &decl.when {
                 check_secrets(report, Some(name), location, when.raw());
+                if let Some(problem) = host_selector_problem(when.raw()) {
+                    report.error(Some(name), location, format!("`when` {problem}"));
+                }
             }
             for notify in &decl.notify {
                 let (target_module, handler) = match notify.split_once(':') {
@@ -407,7 +417,18 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
         }
     }
 
+    report.merge(super::targets::validate_targets(revision));
+
     Ok(report)
+}
+
+/// The problem with a selector that must be evaluated against hosts (a
+/// module's or task's `when`) naming `cluster.*`, if it does: on a host that
+/// namespace is null, so the module could never be selected.
+fn host_selector_problem(raw: &str) -> Option<String> {
+    selector_namespaces(raw).cluster.then(|| {
+        "selects on `cluster.*`, but a module is evaluated against hosts and `cluster.*` is null there; a workload (workloads/NAME/workload.yaml) is what runs on a cluster".to_owned()
+    })
 }
 
 /// What a dry planning pass decided for one host (`buckle validate --facts`).
@@ -539,8 +560,24 @@ pub fn host_context(
     revision: &Revision,
     host: HostIdentity,
     facts: &serde_json::Value,
-) -> crate::selectors::HostContext {
-    let mut ctx = crate::selectors::HostContext::new(host).with_facts(facts.clone());
+) -> HostContext {
+    with_groups(revision, HostContext::new(host).with_facts(facts.clone()))
+}
+
+/// The selector context for a cluster target: `cluster.id`, `cluster.kind`,
+/// `cluster.labels.*` and the fleet's groups, of which only those written
+/// over `cluster.*` (or over neither namespace) can match.
+pub fn cluster_context(
+    revision: &Revision,
+    identity: HostIdentity,
+    kind: crate::model::ClusterKind,
+) -> HostContext {
+    with_groups(revision, HostContext::for_cluster(identity, kind))
+}
+
+/// `ctx` with the fleet's groups evaluated in declaration order, so a group
+/// may refer to earlier ones.
+pub fn with_groups(revision: &Revision, mut ctx: HostContext) -> HostContext {
     let mut groups = Vec::new();
     for (name, filter) in &revision.fleet.fleet.groups {
         if ctx.matches(filter) {
@@ -581,10 +618,7 @@ pub fn reads_unknown_facts(raw: &str, facts: &serde_json::Value) -> bool {
 /// module or overlay whose `when` reads facts the context does not have
 /// ([`reads_unknown_facts`]) is included, as it may well be selected once
 /// they are known.
-pub fn secret_names_for_host(
-    revision: &Revision,
-    ctx: &crate::selectors::HostContext,
-) -> BTreeSet<String> {
+pub fn secret_names_for_host(revision: &Revision, ctx: &HostContext) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for module in &revision.modules {
         let cfg = &module.config;

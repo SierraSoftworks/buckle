@@ -1,17 +1,88 @@
-//! The filt-rs context for a host: everything a `when:` selector, a group
+//! The filt-rs context for a target: everything a `when:` selector, a group
 //! definition or a phase selector may reference, as flat dotted keys.
 //!
-//! * `host.id`, `host.labels.<k>`, `host.groups` (tuple)
-//! * `host.facts.<path.to.leaf>` (facts tree, leaves only; objects are null)
+//! * on a host: `host.id`, `host.labels.<k>`, `host.groups` (tuple),
+//!   `host.facts.<path.to.leaf>` (facts tree, leaves only; objects are null)
+//! * on a cluster target: `cluster.id`, `cluster.kind`, `cluster.labels.<k>`,
+//!   `cluster.groups`, `cluster.facts.<path>`, the same way
 //! * `vars.<name>` (scalars and lists)
 //! * `secrets.<name>` (a redacting secret value), `secrets.<name>.present`, `secrets.<name>.fingerprint`
 //! * `module.name`, `module.tags`, `task.kind`, `task.id`, `task.tags` when evaluating inside a module/task
+//!
+//! The two namespaces are disjoint: `host.*` is null on a cluster and
+//! `cluster.*` is null on a host, and a selector applies only to the targets
+//! whose namespace it names ([`HostContext::applies`]), so `!(host.labels.x)`
+//! never leaks onto a cluster.
 
+use crate::model::ClusterKind;
 use crate::secrets::SecretStore;
 use crate::{FilterValue, Filterable};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// What a rollout deploys to: a host (an enrolled agent) or a cluster (a
+/// virtual target an executor speaks for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    #[default]
+    Host,
+    Cluster,
+}
+
+impl TargetKind {
+    /// The selector namespace of this kind of target.
+    pub fn namespace(self) -> &'static str {
+        match self {
+            TargetKind::Host => "host",
+            TargetKind::Cluster => "cluster",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.namespace()
+    }
+}
+
+impl std::fmt::Display for TargetKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+static HOST_NS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\bhost\.").expect("static regex compiles"));
+static CLUSTER_NS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\bcluster\.").expect("static regex compiles"));
+
+/// Which target namespaces a selector names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Namespaces {
+    pub host: bool,
+    pub cluster: bool,
+}
+
+impl Namespaces {
+    /// Whether a selector naming these namespaces applies to a target of
+    /// `kind`: it names that kind's namespace, or names neither (`true`,
+    /// `vars.x == 1`), so a selector written for the other kind alone is
+    /// simply false here.
+    pub fn applies_to(self, kind: TargetKind) -> bool {
+        match kind {
+            TargetKind::Host => self.host || !self.cluster,
+            TargetKind::Cluster => self.cluster || !self.host,
+        }
+    }
+}
+
+/// The target namespaces (`host.*`, `cluster.*`) a selector's text names.
+pub fn selector_namespaces(raw: &str) -> Namespaces {
+    Namespaces {
+        host: HOST_NS.is_match(raw),
+        cluster: CLUSTER_NS.is_match(raw),
+    }
+}
 
 /// Labels as reported by the agent and managed on the server: string keys to
 /// scalar JSON values (strings, numbers, booleans).
@@ -50,7 +121,8 @@ pub fn typed_labels<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)
 /// Variables after overlay resolution.
 pub type Vars = IndexMap<String, serde_json::Value>;
 
-/// Identity and attributes of the host being planned.
+/// Identity and attributes of the target being planned: a host, or a
+/// cluster target (whose id and labels live here too, read as `cluster.*`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostIdentity {
     pub id: String,
@@ -58,10 +130,14 @@ pub struct HostIdentity {
     pub labels: Labels,
 }
 
-/// The evaluation context for selectors and templates on one host.
+/// The evaluation context for selectors and templates on one target.
 #[derive(Clone, Default)]
 pub struct HostContext {
     pub host: HostIdentity,
+    /// Which namespace the identity is read through: `host.*` or `cluster.*`.
+    pub target: TargetKind,
+    /// For a cluster target, its scheduler (`cluster.kind`).
+    pub cluster_kind: Option<ClusterKind>,
     pub groups: Vec<String>,
     /// The facts tree as collected by fact providers, mounted at `host.facts`.
     pub facts: serde_json::Value,
@@ -88,6 +164,8 @@ impl std::fmt::Debug for HostContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostContext")
             .field("host", &self.host)
+            .field("target", &self.target)
+            .field("cluster_kind", &self.cluster_kind)
             .field("groups", &self.groups)
             .field("vars", &self.vars.keys().collect::<Vec<_>>())
             .field("secrets", &self.secrets.names().collect::<Vec<_>>())
@@ -103,6 +181,23 @@ impl HostContext {
             host,
             ..Default::default()
         }
+    }
+
+    /// The context of a cluster target: `identity` is read as `cluster.id`
+    /// and `cluster.labels.*`, and `host.*` is null.
+    pub fn for_cluster(identity: HostIdentity, kind: ClusterKind) -> Self {
+        Self {
+            host: identity,
+            target: TargetKind::Cluster,
+            cluster_kind: Some(kind),
+            ..Default::default()
+        }
+    }
+
+    /// Whether `filter` applies to this kind of target at all (see
+    /// [`Namespaces::applies_to`]).
+    pub fn applies(&self, filter: &crate::Filter) -> bool {
+        selector_namespaces(filter.raw()).applies_to(self.target)
     }
 
     pub fn with_facts(mut self, facts: serde_json::Value) -> Self {
@@ -154,9 +249,15 @@ impl HostContext {
         self.try_matches(filter).unwrap_or(false)
     }
 
-    /// Evaluates a selector against this host, reporting evaluation errors.
-    /// The error text names the filter, never the values it compared.
+    /// Evaluates a selector against this target, reporting evaluation
+    /// errors. A selector written for the other kind of target alone (a
+    /// `host.*` selector on a cluster, a `cluster.*` one on a host) is
+    /// `false` without being evaluated. The error text names the filter,
+    /// never the values it compared.
     pub fn try_matches(&self, filter: &crate::Filter) -> Result<bool, String> {
+        if !self.applies(filter) {
+            return Ok(false);
+        }
         filter.matches(self).map_err(|e| {
             format!(
                 "the selector `{}` could not be evaluated: {e}",
@@ -165,11 +266,15 @@ impl HostContext {
         })
     }
 
-    /// The template context (`host`, `vars`, `module`, `task`) as JSON. Secrets
-    /// are added by the templater as a special object, never as JSON.
+    /// The template context (`host` or `cluster`, `vars`, `module`, `task`)
+    /// as JSON. Secrets are added by the templater as a special object, never
+    /// as JSON.
     pub fn template_json(&self) -> serde_json::Value {
         let mut host = serde_json::Map::new();
         host.insert("id".into(), serde_json::Value::String(self.host.id.clone()));
+        if let Some(kind) = self.cluster_kind {
+            host.insert("kind".into(), serde_json::Value::String(kind.to_string()));
+        }
         host.insert(
             "labels".into(),
             serde_json::Value::Object(self.host.labels.clone().into_iter().collect()),
@@ -186,7 +291,10 @@ impl HostContext {
         );
         host.insert("facts".into(), self.facts.clone());
         let mut root = serde_json::Map::new();
-        root.insert("host".into(), serde_json::Value::Object(host));
+        root.insert(
+            self.target.namespace().into(),
+            serde_json::Value::Object(host),
+        );
         root.insert(
             "vars".into(),
             serde_json::Value::Object(self.vars.clone().into_iter().collect()),
@@ -236,9 +344,23 @@ pub fn lookup_path<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a se
 impl Filterable for HostContext {
     fn get(&self, key: &str) -> FilterValue<'_> {
         let lower = key.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("host.") {
+        // The identity is read through the namespace of the target's kind
+        // only; the other namespace is null here.
+        let identity = lower
+            .strip_prefix("host.")
+            .filter(|_| self.target == TargetKind::Host)
+            .or_else(|| {
+                lower
+                    .strip_prefix("cluster.")
+                    .filter(|_| self.target == TargetKind::Cluster)
+            });
+        if let Some(rest) = identity {
             return match rest {
                 "id" => self.host.id.as_str().into(),
+                "kind" => match self.cluster_kind {
+                    Some(kind) => kind.as_str().into(),
+                    None => FilterValue::Null,
+                },
                 "groups" => FilterValue::Tuple(
                     self.groups
                         .iter()
@@ -263,6 +385,9 @@ impl Filterable for HostContext {
                     }
                 }
             };
+        }
+        if lower.starts_with("host.") || lower.starts_with("cluster.") {
+            return FilterValue::Null;
         }
         if let Some(var) = lower.strip_prefix("vars.") {
             return self
@@ -429,6 +554,79 @@ mod tests {
     fn selectors_resolve_against_the_host_context(#[case] expr: &str, #[case] expected: bool) {
         let filter = Filter::new(expr).expect("filter parses");
         assert_eq!(ctx().matches(&filter), expected, "{expr}");
+    }
+
+    fn cluster_ctx() -> HostContext {
+        let mut labels = Labels::new();
+        labels.insert("cluster".into(), "home".into());
+        HostContext::for_cluster(
+            HostIdentity {
+                id: "home-nomad".into(),
+                labels,
+            },
+            ClusterKind::Nomad,
+        )
+        .with_groups(vec!["home-cluster".into()])
+        .with_facts(serde_json::json!({"version": "1.9.3", "nodes": 3}))
+    }
+
+    #[rstest]
+    #[case(r#"cluster.id == "home-nomad""#, true)]
+    #[case(r#"cluster.kind == "nomad""#, true)]
+    #[case(r#"cluster.kind in ["nomad", "kubernetes"]"#, true)]
+    #[case(r#"cluster.labels.cluster == "home""#, true)]
+    #[case(r#"cluster.groups contains "home-cluster""#, true)]
+    #[case(r#"cluster.facts.nodes >= 3"#, true)]
+    #[case(r#"cluster.labels.missing == true"#, false)]
+    #[case(r#"host.id == "home-nomad""#, false)]
+    #[case(r#"host.groups contains "home-cluster""#, false)]
+    #[case(r#"!(host.labels.canary == true)"#, false)]
+    #[case(r#"true"#, true)]
+    #[case(
+        r#"host.groups contains "home" || cluster.labels.cluster == "home""#,
+        true
+    )]
+    fn cluster_selectors_resolve_against_a_cluster_context(
+        #[case] expr: &str,
+        #[case] expected: bool,
+    ) {
+        let filter = Filter::new(expr).expect("filter parses");
+        assert_eq!(cluster_ctx().matches(&filter), expected, "{expr}");
+    }
+
+    #[rstest]
+    #[case(r#"cluster.kind == "nomad""#, false)]
+    #[case(r#"!(cluster.labels.canary == true)"#, false)]
+    #[case(r#"cluster.id == "pi-1""#, false)]
+    #[case(r#"host.id == "pi-1" || cluster.kind == "nomad""#, true)]
+    #[case(r#"true"#, true)]
+    #[case(r#"vars.swap_mb == 1024"#, true)]
+    fn cluster_selectors_never_match_a_host(#[case] expr: &str, #[case] expected: bool) {
+        let filter = Filter::new(expr).expect("filter parses");
+        assert_eq!(ctx().matches(&filter), expected, "{expr}");
+    }
+
+    #[rstest]
+    #[case("host.labels.x == 1", true, false)]
+    #[case("cluster.kind == \"nomad\"", false, true)]
+    #[case("HOST.id == \"a\" && Cluster.id == \"b\"", true, true)]
+    #[case("vars.a == 1", false, false)]
+    #[case("host.facts.fqdn == \"cluster.local\"", true, true)]
+    fn selector_namespaces_are_read_from_the_text(
+        #[case] raw: &str,
+        #[case] host: bool,
+        #[case] cluster: bool,
+    ) {
+        assert_eq!(selector_namespaces(raw), Namespaces { host, cluster });
+    }
+
+    #[test]
+    fn a_cluster_context_templates_under_cluster() {
+        let json = cluster_ctx().template_json();
+        assert_eq!(json["cluster"]["id"], "home-nomad");
+        assert_eq!(json["cluster"]["kind"], "nomad");
+        assert_eq!(json["cluster"]["labels"]["cluster"], "home");
+        assert!(json.get("host").is_none());
     }
 
     #[test]
