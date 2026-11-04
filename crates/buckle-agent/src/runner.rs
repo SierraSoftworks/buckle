@@ -73,6 +73,20 @@ pub trait Runner: Send + Sync + 'static {
         scope: HealthScope,
         modules: Option<&[String]>,
     ) -> buckle_core::Result<HealthReport>;
+
+    /// The identity of the current boot, when the host exposes one.
+    async fn boot_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Reboots the host, as a run asked for. Returns once the reboot has been
+    /// started (the agent is normally stopped shortly after).
+    async fn reboot(&self) -> buckle_core::Result<()> {
+        Err(buckle_core::error::user(
+            "This agent cannot reboot the host.",
+            &["Reboot the host by hand."],
+        ))
+    }
 }
 
 /// The production runner: [`Engine`] against the real host.
@@ -192,6 +206,14 @@ impl Runner for EngineRunner {
         modules: Option<&[String]>,
     ) -> buckle_core::Result<HealthReport> {
         Engine::health(&self.inputs(revision, ctx)?, scope, modules).await
+    }
+
+    async fn boot_id(&self) -> Option<String> {
+        buckle_core::reboot::boot_id(self.system.as_ref()).await
+    }
+
+    async fn reboot(&self) -> buckle_core::Result<()> {
+        buckle_core::reboot::reboot(self.system.as_ref()).await
     }
 }
 

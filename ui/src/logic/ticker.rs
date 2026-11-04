@@ -2,7 +2,8 @@
 //! time, as segments of a bar, and every event of its trail as a marker over
 //! it. The server's audit trail keeps outcomes (healthy, failed, held, …)
 //! but not ordinary progress, so applying and baking are also read from the
-//! host's run: applying from its start, baking from its end.
+//! host's run: applying from its start, baking from its end. A reboot is in
+//! the trail: rebooting from the run's result, baking once the host is back.
 
 use buckle_api::{HostRolloutState, RolloutEvent};
 use chrono::{DateTime, Duration, Utc};
@@ -33,8 +34,9 @@ pub struct Ticker<'a> {
     pub until: DateTime<Utc>,
     pub segments: Vec<Segment>,
     pub markers: Vec<Marker<'a>>,
-    /// The end of a bake still under way: the bar runs on to it, dashed.
-    pub bake_until: Option<DateTime<Utc>>,
+    /// The end of a timed state still under way (a bake, or the wait for a
+    /// reboot): the bar runs on to it, dashed.
+    pub planned: Option<(HostRolloutState, DateTime<Utc>)>,
 }
 
 impl Ticker<'_> {
@@ -56,6 +58,8 @@ pub struct Source<'a> {
     pub run_started: Option<DateTime<Utc>>,
     pub run_finished: Option<DateTime<Utc>>,
     pub bake_until: Option<DateTime<Utc>>,
+    /// When a rebooting host must be back by.
+    pub reboot_until: Option<DateTime<Utc>>,
     pub now: DateTime<Utc>,
 }
 
@@ -72,7 +76,8 @@ pub fn transition(kind: &str) -> Option<HostRolloutState> {
         "planned" | "baseline" => HostRolloutState::Planned,
         "held" => HostRolloutState::Held,
         "applying" | "rolling_back" => HostRolloutState::Applying,
-        "baking" => HostRolloutState::Baking,
+        "rebooting" => HostRolloutState::Rebooting,
+        "baking" | "rebooted" => HostRolloutState::Baking,
         "healthy" => HostRolloutState::Healthy,
         "failed" => HostRolloutState::Failed,
         "skipped" => HostRolloutState::Skipped,
@@ -152,10 +157,14 @@ pub fn ticker(src: Source<'_>) -> Option<Ticker<'_>> {
             Some(hi.map_or(t, |h: DateTime<Utc>| h.max(t))),
         )
     });
-    let bake_until = src
-        .bake_until
-        .filter(|b| src.state == HostRolloutState::Baking && *b > src.now);
-    if let Some(b) = bake_until {
+    let planned = match src.state {
+        HostRolloutState::Baking => src.bake_until,
+        HostRolloutState::Rebooting => src.reboot_until,
+        _ => None,
+    }
+    .filter(|b| *b > src.now)
+    .map(|b| (src.state, b));
+    if let Some((_, b)) = planned {
         until = until.map(|u| u.max(b));
     }
     let (from, until) = (from.take()?, until.take()?);
@@ -166,7 +175,7 @@ pub fn ticker(src: Source<'_>) -> Option<Ticker<'_>> {
         until,
         segments,
         markers: Vec::new(),
-        bake_until,
+        planned,
     };
     // Each marker takes the first lane its neighbour on the left leaves room in.
     let mut ends: Vec<f64> = Vec::new();
@@ -225,6 +234,7 @@ mod tests {
             run_started: None,
             run_finished: None,
             bake_until: None,
+            reboot_until: None,
             now: at(600),
         }
     }
@@ -318,7 +328,35 @@ mod tests {
         assert!(last.ongoing);
         assert_eq!(last.until, at(600), "to now");
         assert_eq!(t.until, at(900), "the bar shows what is left");
-        assert_eq!(t.bake_until, Some(at(900)));
+        assert_eq!(t.planned, Some((HostRolloutState::Baking, at(900))));
+    }
+
+    #[test]
+    fn a_reboot_sits_between_the_run_and_its_bake() {
+        use HostRolloutState::*;
+        let rebooting = [ev(81, "rollout.host.rebooting")];
+        let src = Source {
+            run_started: Some(at(20)),
+            run_finished: Some(at(80)),
+            reboot_until: Some(at(900)),
+            ..source(&rebooting, Rebooting)
+        };
+        let t = ticker(src).unwrap();
+        assert_eq!(states(&t), vec![(Applying, 20, 81), (Rebooting, 81, 600)]);
+        assert_eq!(t.planned, Some((Rebooting, at(900))), "the wait runs on");
+
+        let back = [rebooting[0].clone(), ev(200, "rollout.host.rebooted")];
+        let src = Source {
+            run_started: Some(at(20)),
+            run_finished: Some(at(80)),
+            bake_until: Some(at(900)),
+            ..source(&back, Baking)
+        };
+        let t = ticker(src).unwrap();
+        assert_eq!(
+            states(&t),
+            vec![(Applying, 20, 81), (Rebooting, 81, 200), (Baking, 200, 600)]
+        );
     }
 
     #[test]

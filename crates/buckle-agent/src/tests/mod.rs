@@ -7,6 +7,7 @@
 
 mod fake_server;
 mod hardening;
+mod reboot;
 mod scenarios;
 
 use crate::config::AgentConfig;

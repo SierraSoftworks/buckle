@@ -904,6 +904,19 @@ impl FleetService {
                 }
                 Ok(true)
             }
+            agent_message::Msg::RebootFailed(f) => {
+                self.audit(
+                    host,
+                    "host.reboot_failed",
+                    host,
+                    format!(
+                        "{host}: the reboot its run asked for did not happen: {}",
+                        f.error
+                    ),
+                )
+                .await;
+                Ok(true)
+            }
             agent_message::Msg::Hello(_) => Ok(true),
         };
         match &stored {
@@ -927,7 +940,8 @@ impl FleetService {
             agent_message::Msg::Health(_)
             | agent_message::Msg::Result(_)
             | agent_message::Msg::Rollback(_)
-            | agent_message::Msg::Upgrade(_) => true,
+            | agent_message::Msg::Upgrade(_)
+            | agent_message::Msg::RebootFailed(_) => true,
             _ => false,
         };
         if matches!(
@@ -936,6 +950,7 @@ impl FleetService {
                 | agent_message::Msg::Result(_)
                 | agent_message::Msg::Health(_)
                 | agent_message::Msg::Rollback(_)
+                | agent_message::Msg::RebootFailed(_)
         ) {
             self.controller.agent_message(host, msg);
         }
@@ -1189,6 +1204,7 @@ impl Fleet for FleetService {
             unreported_apply_revisions: hello.unreported_apply_revisions.clone(),
             new_session: true,
             capabilities: hello.capabilities.clone(),
+            boot_id: (!hello.boot_id.is_empty()).then(|| hello.boot_id.clone()),
         });
         self.publish_host(&host).await;
 

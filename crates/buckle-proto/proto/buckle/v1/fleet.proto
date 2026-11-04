@@ -38,6 +38,7 @@ message AgentMessage {
     Drift drift = 8;
     LocalRollback rollback = 9;
     UpgradeResult upgrade = 10;
+    RebootFailed reboot_failed = 11;
   }
 }
 
@@ -63,6 +64,10 @@ message Hello {
   // Optional behaviours this agent understands (e.g. "force_plan"), so the
   // server can offer them only where they work.
   repeated string capabilities = 11;
+  // The identity of the current boot (Linux boot_id), when the host exposes
+  // one. A server waiting on a reboot (ApplyResult.reboot) takes a session
+  // from another boot as the host back from it.
+  string boot_id = 12;
 }
 
 message Facts {
@@ -156,6 +161,27 @@ message ApplyResult {
   // Deferred modules not applied because their real plan diverged from the
   // approved preview: the host needs re-planning and approval, not repair.
   repeated string stale_modules = 17;
+  // The run asked for a reboot. The agent reboots once the server has
+  // acknowledged this result (or after a short grace with no session).
+  Reboot reboot = 18;
+}
+
+message Reboot {
+  // How long the agent waits after the acknowledgement before rebooting.
+  google.protobuf.Duration delay = 1;
+  // How long the server waits for the agent to come back from a new boot.
+  google.protobuf.Duration timeout = 2;
+  // The boot the run happened in (Hello.boot_id).
+  string boot_id = 3;
+  // What asked for it: `module/kind[key]` or `owner:handler`.
+  repeated string requested_by = 4;
+}
+
+// The reboot an ApplyResult announced could not be started: the host stays
+// up on the boot it ran in.
+message RebootFailed {
+  string boot_id = 1;
+  string error = 2;
 }
 
 enum HealthScope {

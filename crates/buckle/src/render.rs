@@ -862,6 +862,7 @@ mod tests {
             removals_run: vec![],
             started_at: None,
             finished_at: None,
+            reboot: None,
         }
     }
 

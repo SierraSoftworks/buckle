@@ -25,6 +25,9 @@ pub enum HostPhase {
     Held,
     /// Apply sent; waiting for ApplyResult.
     Applying,
+    /// Applied, and the run asked for a reboot: waiting for the agent to
+    /// come back from a new boot (or the reboot timeout) before baking.
+    Rebooting,
     /// Applied; checks repeating for the bake window.
     Baking,
     /// Applied and baked.
@@ -49,6 +52,7 @@ impl HostPhase {
             HostPhase::Planned | HostPhase::Baseline => HostRolloutState::Planned,
             HostPhase::Held => HostRolloutState::Held,
             HostPhase::Applying | HostPhase::RollingBack => HostRolloutState::Applying,
+            HostPhase::Rebooting => HostRolloutState::Rebooting,
             HostPhase::Baking => HostRolloutState::Baking,
             HostPhase::Healthy => HostRolloutState::Healthy,
             HostPhase::Failed => HostRolloutState::Failed,
@@ -62,7 +66,7 @@ impl HostPhase {
     pub fn in_flight(self) -> bool {
         matches!(
             self,
-            HostPhase::Baseline | HostPhase::Applying | HostPhase::Baking
+            HostPhase::Baseline | HostPhase::Applying | HostPhase::Rebooting | HostPhase::Baking
         )
     }
 
@@ -86,6 +90,7 @@ impl HostPhase {
             HostPhase::Baseline => "baseline",
             HostPhase::Held => "held",
             HostPhase::Applying => "applying",
+            HostPhase::Rebooting => "rebooting",
             HostPhase::Baking => "baking",
             HostPhase::Healthy => "healthy",
             HostPhase::Failed => "failed",
@@ -329,6 +334,47 @@ pub struct HostRuntime {
     /// agent runs whatever it plans. Cleared by the result or a re-plan.
     #[serde(default)]
     pub force_plan: bool,
+    /// The reboot the host's run asked for. Kept once the host is back, so
+    /// that its bake checks the host after the reboot; cleared by the next
+    /// apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reboot: Option<RebootWait>,
+}
+
+/// A reboot a rollout waits out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebootWait {
+    /// The boot the run happened in: a session from another boot is the
+    /// host back. `None` from hosts that expose no boot id (any new session
+    /// counts).
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    pub requested_by: Vec<String>,
+    /// When the result announcing it arrived.
+    pub since: DateTime<Utc>,
+    /// When the host fails if it is not back.
+    pub until: DateTime<Utc>,
+    #[serde(default)]
+    pub back_at: Option<DateTime<Utc>>,
+}
+
+impl RebootWait {
+    /// Whether a session from `boot` is the host back from this reboot.
+    pub fn back_on(&self, boot: Option<&str>) -> bool {
+        match (self.boot_id.as_deref(), boot) {
+            (Some(then), Some(now)) => then != now,
+            _ => true,
+        }
+    }
+
+    pub fn view(&self) -> buckle_api::HostReboot {
+        buckle_api::HostReboot {
+            requested_by: self.requested_by.clone(),
+            since: self.since,
+            until: self.until,
+            back_at: self.back_at,
+        }
+    }
 }
 
 /// One `rollout_hosts` row.

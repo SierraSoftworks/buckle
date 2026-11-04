@@ -4304,3 +4304,87 @@ async fn a_handler_whose_owner_never_started_is_reported_as_run_under_its_owner(
         vec![("test.file[/lo/nomad]", StepState::NotRun)]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reboots
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+struct RebootSpec {
+    #[serde(default)]
+    run: String,
+    #[serde(default)]
+    delay_s: u64,
+}
+
+/// Asks for a reboot, as `system.reboot` does.
+struct TestReboot;
+
+#[async_trait]
+impl Task for TestReboot {
+    type Spec = RebootSpec;
+    const KIND: &'static str = "test.reboot";
+
+    fn key(_spec: &RebootSpec) -> String {
+        "reboot".into()
+    }
+
+    async fn plan(&self, _cx: &Cx, _spec: &RebootSpec) -> crate::Result<Planned> {
+        Ok(Planned::change(Diff::Opaque {
+            summary: "reboot".into(),
+        }))
+    }
+
+    async fn apply(&self, cx: &Cx, spec: &RebootSpec, _p: &Planned) -> crate::Result<Applied> {
+        record(&spec.run, format!("reboot requested by {}", cx.module));
+        Ok(
+            Applied::changed("reboot requested").with_reboot(crate::reboot::RebootRequest::new(
+                Duration::from_secs(spec.delay_s),
+                Duration::from_secs(300),
+            )),
+        )
+    }
+}
+
+crate::register_task!(TestReboot);
+
+#[rstest]
+#[case::handler_notified(
+    "name: pi\ntasks:\n  - test.file: { path: /rb/a, run: rb1 }\n    notify: [reboot]\nhandlers:\n  reboot: { test.reboot: { run: rb1, delay_s: 7 } }\nhealth:\n  - name: flaky\n    test.flaky: { run: rb1, pass_after: 100 }\n    interval: 1s\n",
+    "rb1",
+    Some(("pi:reboot", 7))
+)]
+#[case::task(
+    "name: pi\ntasks:\n  - test.reboot: { run: rb2 }\nhealth:\n  - name: flaky\n    test.flaky: { run: rb2, pass_after: 100 }\n    interval: 1s\n",
+    "rb2",
+    Some(("pi/test.reboot[reboot]", 0))
+)]
+#[case::handler_not_notified(
+    "name: pi\ntasks:\n  - test.file: { path: /rb/c, run: rb3, unchanged: true }\n    notify: [reboot]\nhandlers:\n  reboot: { test.reboot: { run: rb3 } }\n",
+    "rb3",
+    None
+)]
+#[tokio::test(start_paused = true)]
+async fn a_reboot_is_collected_for_after_the_run_and_defers_health(
+    #[case] yaml: &str,
+    #[case] run: &str,
+    #[case] expected: Option<(&str, u64)>,
+) {
+    let rev = revision(
+        "r1",
+        "version: 2\nrollout: { settle: 2s }\n",
+        vec![module(yaml)],
+    );
+    let (outcome, _) = apply(&inputs(rev, &FakeSystem::new())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    let got = outcome
+        .reboot
+        .as_ref()
+        .map(|r| (r.requested_by.join(","), r.delay.as_secs()));
+    assert_eq!(got, expected.map(|(by, d)| (by.to_owned(), d)));
+    if expected.is_some() {
+        // The check that would fail before the reboot never ran.
+        assert!(!calls(run).iter().any(|c| c.starts_with("health attempt")));
+        assert!(outcome.health.unwrap().results.is_empty());
+    }
+}

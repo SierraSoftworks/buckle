@@ -222,6 +222,12 @@
     background: var(--active);
   }
 
+  // Gone for a reboot on purpose: in flight, but hollow until it is back.
+  &--rebooting {
+    background: var(--active-soft);
+    border: 1px dashed var(--active);
+  }
+
   &--baking {
     background: var(--active);
     animation: bake 1.8s ease-in-out infinite;

@@ -122,6 +122,9 @@ handlers:
   restart: { systemd.restart: { name: docker } }
 ```
 
+A [`system.reboot`](./tasks/system.md#system-reboot) handler reboots the host once, after the whole
+run has finished and been reported, and a rollout waits for the host to come back.
+
 ## Removal
 
 Buckle records every resource it applies. When a task leaves the configuration, or its module or

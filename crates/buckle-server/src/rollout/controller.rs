@@ -6,8 +6,8 @@
 
 use super::link::HostLink;
 use super::model::{
-    GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, RolloutHostRecord, RolloutRecord,
-    RolloutRuntime, STRAGGLERS,
+    GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, RebootWait, RolloutHostRecord,
+    RolloutRecord, RolloutRuntime, STRAGGLERS,
 };
 use super::view;
 use crate::clock::Clock;
@@ -90,6 +90,8 @@ pub struct Connected {
     pub new_session: bool,
     /// Optional behaviours the agent announced (`Hello.capabilities`).
     pub capabilities: Vec<String>,
+    /// The boot the agent is running in (`Hello.boot_id`), when it said.
+    pub boot_id: Option<String>,
 }
 
 /// Operator actions (design §10 "Paused offers four operator decisions").
@@ -478,6 +480,8 @@ struct Controller {
     online: HashSet<String>,
     /// What each host's agent announced in its last Hello (`force_plan`, …).
     capabilities: HashMap<String, Vec<String>>,
+    /// The boot each host's current (or last) session runs in.
+    boot_ids: HashMap<String, String>,
     /// Each host's status and effective labels as last seen, so a host
     /// update that changes neither (e.g. notes) is not acted on.
     host_seen: HashMap<String, (HostStatus, BTreeMap<String, String>)>,
@@ -528,13 +532,23 @@ fn rollback_target(h: &RolloutHostRecord) -> bool {
 /// Host states that wait on the agent: the disconnect clock starts for them
 /// on load (after a restart) and when their session drops, so a host still
 /// to plan or apply is not taken for offline, and missed, inside the
-/// reconnect grace.
+/// reconnect grace. A rebooting host is meant to be away: its reboot
+/// timeout bounds the wait instead.
 fn awaits_reconnect(state: HostPhase) -> bool {
-    state.in_flight()
-        || matches!(
-            state,
-            HostPhase::RollingBack | HostPhase::PlanPending | HostPhase::Planned
-        )
+    state != HostPhase::Rebooting
+        && (state.in_flight()
+            || matches!(
+                state,
+                HostPhase::RollingBack | HostPhase::PlanPending | HostPhase::Planned
+            ))
+}
+
+/// The shortest bake after a reboot, so that services coming up get checked.
+const MIN_POST_REBOOT_BAKE: u64 = 60;
+
+fn duration_of(d: Option<&prost_types::Duration>) -> chrono::Duration {
+    d.map(|d| chrono::Duration::seconds(d.seconds) + chrono::Duration::nanoseconds(d.nanos as i64))
+        .unwrap_or_default()
 }
 
 fn traceparent_of(span: &Span) -> Option<String> {
@@ -705,6 +719,7 @@ impl Controller {
             excluded,
             online: HashSet::new(),
             capabilities: HashMap::new(),
+            boot_ids: HashMap::new(),
             host_seen,
             flush_retry: None,
             flush_failures: 0,
@@ -963,6 +978,7 @@ impl Controller {
                 agent_message::Msg::Result(r) => self.on_apply_result(&host, r),
                 agent_message::Msg::Health(h) => self.on_health(&host, h),
                 agent_message::Msg::Rollback(r) => self.on_local_rollback(&host, r),
+                agent_message::Msg::RebootFailed(f) => self.on_reboot_failed(&host, f),
                 _ => {}
             },
             Input::RevisionAdded(id) => self.on_revision_added(&id).await,
@@ -1027,6 +1043,10 @@ impl Controller {
         if c.new_session {
             self.capabilities
                 .insert(c.host.clone(), c.capabilities.clone());
+            match &c.boot_id {
+                Some(boot) => self.boot_ids.insert(c.host.clone(), boot.clone()),
+                None => self.boot_ids.remove(&c.host),
+            };
         }
         for ri in 0..self.live.len() {
             let Some(hi) = self.live[ri].find(&c.host) else {
@@ -1053,13 +1073,14 @@ impl Controller {
                 HostPhase::Applying => {
                     // The agent skips an Apply whose session ended before it
                     // started, so the server re-sends it (same plan digest,
-                    // same approval token) unless the host already shows the
-                    // target revision (it finished: bake) or announces the
-                    // apply as running or its result as still to come.
-                    if c.applied_revision.as_deref() == Some(target.as_str()) {
-                        self.start_bake(ri, hi);
-                    } else if !c.new_session || c.unreported_apply_revisions.contains(&target) {
+                    // same approval token) unless the host announces the
+                    // apply as running or its result as still to come (the
+                    // result says how it went, and whether it rebooted), or
+                    // already shows the target revision (it finished: bake).
+                    if !c.new_session || c.unreported_apply_revisions.contains(&target) {
                         tracing::debug!(host = %c.host, "the apply is running or its result is on its way");
+                    } else if c.applied_revision.as_deref() == Some(target.as_str()) {
+                        self.start_bake(ri, hi);
                     } else if let Some(run) = self.finished_run(ri, hi).await {
                         // The result was stored but never reached the
                         // controller (e.g. a server restart in between).
@@ -1082,6 +1103,18 @@ impl Controller {
                         self.fail_host(ri, hi, &why);
                     } else {
                         self.resend_apply(ri, hi);
+                    }
+                }
+                HostPhase::Rebooting if c.new_session => {
+                    let back = self.live[ri].hosts[hi]
+                        .runtime
+                        .reboot
+                        .as_ref()
+                        .is_none_or(|w| w.back_on(c.boot_id.as_deref()));
+                    if back {
+                        self.back_from_reboot(ri, hi);
+                    } else {
+                        tracing::debug!(host = %c.host, "reconnected before rebooting; still waiting for the reboot");
                     }
                 }
                 HostPhase::Baking if self.bake_seconds(ri, hi) > 0 => {
@@ -1361,8 +1394,15 @@ impl Controller {
                     }
                     // The agent accepted and ran the approved plan.
                     self.live[ri].hosts[hi].runtime.stale_refusals = 0;
+                    if let Some(reboot) = &result.reboot {
+                        self.await_reboot(ri, hi, reboot);
+                    }
                     if result.succeeded {
-                        self.start_bake(ri, hi);
+                        if self.live[ri].hosts[hi].runtime.reboot.is_some() {
+                            self.on_reboot_announced(ri, hi);
+                        } else {
+                            self.start_bake(ri, hi);
+                        }
                     } else {
                         {
                             let h = &mut self.live[ri].hosts[hi];
@@ -2764,6 +2804,7 @@ impl Controller {
         h.runtime.applied = true;
         h.runtime.apply_started_at = Some(now);
         h.runtime.apply_resends = 0;
+        h.runtime.reboot = None;
         let host = h.host.clone();
         self.set_host_state(ri, hi, HostPhase::Applying, "apply sent");
         self.touch_host(ri, hi);
@@ -2780,6 +2821,7 @@ impl Controller {
             .get(pi)
             .map(|p| p.bake_seconds)
             .unwrap_or(0);
+        let bake = self.reboot_bake(ri, hi, bake);
         let until = now + chrono::Duration::seconds(bake as i64);
         {
             let h = &mut self.live[ri].hosts[hi];
@@ -2796,12 +2838,119 @@ impl Controller {
 
     /// The bake window of host `hi`'s phase, in seconds.
     fn bake_seconds(&self, ri: usize, hi: usize) -> u64 {
-        self.live[ri].hosts[hi]
+        let bake = self.live[ri].hosts[hi]
             .runtime
             .phase_index
             .and_then(|i| self.live[ri].record.runtime.phases.get(i))
             .map(|p| p.bake_seconds)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        self.reboot_bake(ri, hi, bake)
+    }
+
+    /// A host back from a reboot bakes for at least `settle` (and a minute),
+    /// and must report: its run deferred health checks to after the reboot.
+    fn reboot_bake(&self, ri: usize, hi: usize, bake: u64) -> u64 {
+        let back = self.live[ri].hosts[hi]
+            .runtime
+            .reboot
+            .as_ref()
+            .is_some_and(|w| w.back_at.is_some());
+        if !back {
+            return bake;
+        }
+        let settle = self.live[ri].record.policy.settle.as_secs();
+        bake.max(settle).max(MIN_POST_REBOOT_BAKE)
+    }
+
+    /// Records the reboot a host's result announced.
+    fn await_reboot(&mut self, ri: usize, hi: usize, reboot: &pb::Reboot) {
+        let now = self.now();
+        let wait = duration_of(reboot.delay.as_ref()) + duration_of(reboot.timeout.as_ref());
+        self.live[ri].hosts[hi].runtime.reboot = Some(RebootWait {
+            boot_id: non_empty(&reboot.boot_id),
+            requested_by: reboot.requested_by.clone(),
+            since: now,
+            until: now + wait,
+            back_at: None,
+        });
+        self.touch_host(ri, hi);
+    }
+
+    /// The host applied and is about to reboot: wait for it, unless the
+    /// result reached the server only after the reboot (on a session from
+    /// another boot).
+    fn on_reboot_announced(&mut self, ri: usize, hi: usize) {
+        let host = self.live[ri].hosts[hi].host.clone();
+        let boot = self.boot_ids.get(&host).cloned();
+        let Some(wait) = self.live[ri].hosts[hi].runtime.reboot.clone() else {
+            return;
+        };
+        self.live[ri].hosts[hi].runtime.disconnected_at = None;
+        let already_back = self.connected(&host)
+            && wait.boot_id.is_some()
+            && boot.is_some()
+            && wait.back_on(boot.as_deref());
+        let why = if wait.requested_by.is_empty() {
+            "applied; rebooting".to_owned()
+        } else {
+            format!("applied; rebooting for {}", wait.requested_by.join(", "))
+        };
+        self.set_host_state(ri, hi, HostPhase::Rebooting, &why);
+        if already_back {
+            self.back_from_reboot(ri, hi);
+        }
+    }
+
+    /// The agent is back from a new boot: bake it.
+    fn back_from_reboot(&mut self, ri: usize, hi: usize) {
+        let now = self.now();
+        let (host, phase, rollout, trace, since) = {
+            let live = &mut self.live[ri];
+            let h = &mut live.hosts[hi];
+            let since = h.runtime.reboot.as_mut().map(|w| {
+                w.back_at = Some(now);
+                w.since
+            });
+            (
+                h.host.clone(),
+                h.phase.clone(),
+                live.record.id.clone(),
+                live.record.runtime.trace_id.clone(),
+                since.unwrap_or(now),
+            )
+        };
+        let took = (now - since).num_seconds().max(0);
+        self.audit(
+            "controller",
+            "rollout.host.rebooted",
+            &rollout,
+            format!("{host}: back from its reboot after {took}s; baking"),
+            serde_json::json!({"host": host, "phase": phase, "seconds": took}),
+            trace,
+        );
+        self.start_bake(ri, hi);
+    }
+
+    /// The agent could not start the reboot its result announced.
+    fn on_reboot_failed(&mut self, host: &str, failed: pb::RebootFailed) {
+        let boot = non_empty(&failed.boot_id);
+        for ri in 0..self.live.len() {
+            let Some(hi) = self.live[ri].find(host) else {
+                continue;
+            };
+            let h = &self.live[ri].hosts[hi];
+            if h.state != HostPhase::Rebooting
+                || h.runtime
+                    .reboot
+                    .as_ref()
+                    .is_some_and(|w| boot.is_some() && w.back_on(boot.as_deref()))
+            {
+                continue;
+            }
+            let why = format!("the reboot did not happen: {}", failed.error);
+            self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+            self.fail_host(ri, hi, &why);
+        }
     }
 
     /// How long after its bake window a connected host that never sent a
@@ -2922,7 +3071,11 @@ impl Controller {
                         .runtime
                         .phase_index
                         .and_then(|i| l.record.runtime.phases.get(i))
-                        .is_some_and(|p| p.bake_seconds > 0);
+                        .is_some_and(|p| p.bake_seconds > 0)
+                        || h.runtime
+                            .reboot
+                            .as_ref()
+                            .is_some_and(|w| w.back_at.is_some());
                     if let Some(u) = h.runtime.bake_until {
                         if u > now
                             || (h.runtime.failing_since.is_empty()
@@ -2940,6 +3093,11 @@ impl Controller {
                 }
                 if let Some(d) = h.runtime.disconnected_at {
                     consider(d + timeout);
+                }
+                if h.state == HostPhase::Rebooting
+                    && let Some(w) = &h.runtime.reboot
+                {
+                    consider(w.until);
                 }
                 if h.state == HostPhase::Applying
                     && let Some(started) = h.runtime.apply_started_at
@@ -3006,6 +3164,23 @@ impl Controller {
                             continue;
                         }
                     }
+                }
+                let h = &self.live[ri].hosts[hi];
+                if h.state == HostPhase::Rebooting
+                    && let Some(w) = h.runtime.reboot.clone()
+                    && w.until <= now
+                {
+                    let secs = (w.until - w.since).num_seconds().max(0);
+                    let why = if self.connected(&host) {
+                        format!(
+                            "still up on the same boot {secs}s after its run asked for a reboot"
+                        )
+                    } else {
+                        format!("did not come back from its reboot within {secs}s")
+                    };
+                    self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                    self.fail_host(ri, hi, &why);
+                    continue;
                 }
                 let h = &self.live[ri].hosts[hi];
                 if h.state == HostPhase::Applying

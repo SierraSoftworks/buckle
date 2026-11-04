@@ -77,6 +77,24 @@ pub struct AgentState {
     /// `unacked_reports` on load.
     #[serde(default, skip_serializing)]
     pub pending_rollbacks: Vec<LocalRollbackRecord>,
+    /// A reboot a run asked for, kept until the host is back from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reboot: Option<PendingReboot>,
+}
+
+/// A reboot a reported run asked for. The agent reboots once the report that
+/// announced it is acknowledged; on start, a different boot id means the host
+/// is back from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReboot {
+    /// The durable report (ApplyResult or LocalRollback) that announced it.
+    pub report_id: u64,
+    /// What was asked for, with the boot the run happened in.
+    pub request: buckle_core::reboot::RebootRequest,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+    /// When the reboot command was started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// How many unacknowledged reports are kept; the oldest go first.

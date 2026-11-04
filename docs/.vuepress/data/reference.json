@@ -193,6 +193,17 @@
             "required": false,
             "short": null,
             "value": "WAIVE_CHECKS"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--no-reboot",
+            "help": "Do not reboot when the run asks for it (`system.reboot`); say so instead",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": null
           }
         ],
         "path": "apply",
@@ -2982,6 +2993,50 @@
       ],
       "removal_caution": false,
       "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Reboot the host once the run has finished (a handler, or a task guarded by only_if).",
+      "details": "Reboots the host after the run.\n\n```yaml\nhandlers:\n  reboot:\n    system.reboot:\n      delay: 5s          # wait after the run has been reported (default 5s)\n      timeout: 10m       # how long a rollout waits for the host to come back (default 5m)\n\ntasks:                   # or as a task, guarded so it only reboots when needed\n  - system.reboot: { only_if: \"test -f /run/reboot-required\" }\n```\n\nThe task never reboots in the middle of a run. Applying it asks for a\nreboot; the run carries on through every module, handler and removal, and\nthe host reboots once, after the run has been reported (to the server, or\non screen for `buckle apply`). Health checks the run had not reached when\nthe reboot was asked for run after the reboot instead, as part of the bake.\nIn a rollout the host shows as rebooting, and fails only if its agent has\nnot reconnected from a new boot within `timeout`.\n\nA drift correction never reboots on its own; the reboot it asked for is\nlogged and left to the next apply or to an operator.\n\nWithout `only_if` the task plans a change on every run, so as a task (not a\nhandler) it would reboot the host on every apply: plans flag it.",
+      "fields": [
+        {
+          "default": "5s",
+          "depth": 0,
+          "description": "How long to wait after the run has been reported, e.g. `5s`.",
+          "options": [],
+          "path": "delay",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Reboot only when this read-only probe exits 0. Runs in plan mode too.",
+          "options": [],
+          "path": "only_if",
+          "required": false,
+          "secret": false,
+          "ty": "string | array of string?"
+        },
+        {
+          "default": "5m",
+          "depth": 0,
+          "description": "How long a rollout waits for the host to come back, e.g. `5m`.",
+          "options": [],
+          "path": "timeout",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        }
+      ],
+      "kind": "system.reboot",
+      "locks": [],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "leave",
       "shape": null
     },
     {

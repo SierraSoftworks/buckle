@@ -63,6 +63,24 @@ pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
             .map(|r| r.0.clone())
             .collect(),
         capabilities: CAPABILITIES.iter().map(|c| (*c).to_owned()).collect(),
+        boot_id: hello.boot_id.clone().unwrap_or_default(),
+    }
+}
+
+fn duration_to_proto(d: std::time::Duration) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: d.as_secs() as i64,
+        nanos: d.subsec_nanos() as i32,
+    }
+}
+
+/// The reboot a run asked for, as announced in its ApplyResult.
+pub fn reboot_to_proto(reboot: &buckle_core::reboot::RebootRequest) -> pb::Reboot {
+    pb::Reboot {
+        delay: Some(duration_to_proto(reboot.delay)),
+        timeout: Some(duration_to_proto(reboot.timeout)),
+        boot_id: reboot.boot_id.clone().unwrap_or_default(),
+        requested_by: reboot.requested_by.clone(),
     }
 }
 
@@ -428,6 +446,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
                 .filter(|m| m.stale)
                 .map(|m| m.module.clone())
                 .collect(),
+            reboot: outcome.reboot.as_ref().map(reboot_to_proto),
             failed_checks: outcome
                 .health
                 .as_ref()
@@ -475,6 +494,10 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
                 error,
             })
         }
+        Report::RebootFailed { boot_id, error } => Msg::RebootFailed(pb::RebootFailed {
+            boot_id: boot_id.clone().unwrap_or_default(),
+            error: error.clone(),
+        }),
     };
     pb::AgentMessage { msg: Some(msg) }
 }

@@ -44,6 +44,8 @@ pub struct Hello {
     /// Revisions whose apply is running, or whose result is not yet
     /// acknowledged (it follows the Welcome).
     pub unreported_apply_revisions: Vec<RevisionId>,
+    /// The identity of the current boot, when the host exposes one.
+    pub boot_id: Option<String>,
 }
 
 impl std::fmt::Debug for Hello {
@@ -62,6 +64,7 @@ impl std::fmt::Debug for Hello {
                 "unreported_apply_revisions",
                 &self.unreported_apply_revisions,
             )
+            .field("boot_id", &self.boot_id)
             .finish()
     }
 }
@@ -362,6 +365,13 @@ pub enum Report {
         version: String,
         /// What happened.
         outcome: UpgradeReport,
+    },
+    /// The reboot a reported run asked for could not be started.
+    RebootFailed {
+        /// The boot the host is still on.
+        boot_id: Option<String>,
+        /// Why, for the operator.
+        error: String,
     },
 }
 

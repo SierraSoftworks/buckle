@@ -282,35 +282,10 @@ impl CommandRun {
         Ok(None)
     }
 
-    /// Runs an `unless` / `only_if` probe. A probe whose program is not
-    /// installed behaves as a shell would report it, exiting 127 ("command not
-    /// found"), rather than failing the plan: `unless: [nomad, version]`
-    /// before nomad is installed means "not installed yet, run".
+    /// Runs an `unless` / `only_if` probe ([`hostkit::probe_with`]), as the
+    /// task's user.
     async fn probe(&self, cx: &Cx, spec: &Spec, command: Command) -> Result<Output> {
-        let program = command.program.clone();
-        let not_found = move || Output {
-            code: Some(127),
-            stdout: Vec::new(),
-            stderr: format!("{program}: command not found").into_bytes(),
-            timed_out: false,
-        };
-        let present = if command.program.contains('/') {
-            cx.system
-                .stat(std::path::Path::new(&command.program))
-                .await?
-                .is_some()
-        } else {
-            cx.system.which(&command.program).await?.is_some()
-        };
-        if !present {
-            return Ok(not_found());
-        }
-        let command = self.wrap(cx, spec, command)?;
-        match cx.system.run(command.clone()).await {
-            Ok(out) => Ok(out),
-            // The program vanished between the lookup and the start.
-            Err(_) => Ok(not_found()),
-        }
+        hostkit::probe_with(cx, command, |c| self.wrap(cx, spec, c)).await
     }
 
     fn changed(spec: &Spec, out: &Output) -> bool {

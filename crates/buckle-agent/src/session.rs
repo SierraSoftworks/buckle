@@ -18,7 +18,7 @@ use crate::coalesce;
 use crate::config::AgentConfig;
 use crate::runner::{RunContext, Runner};
 use crate::sink::ReportSink;
-use crate::store::{AgentState, Store};
+use crate::store::{AgentState, PendingReboot, Store};
 use crate::transport::grpc::set_parent_from_traceparent;
 use crate::transport::{
     DurableReport, Hello, Instruction, LocalRollbackRecord, Report, RevisionSource, Session,
@@ -69,6 +69,10 @@ pub struct AgentOptions {
     /// How long a new session may go without a Welcome before the agent
     /// gives up on it and reconnects with backoff (30 s).
     pub welcome_timeout: Duration,
+    /// How long the agent waits for the server to acknowledge the result
+    /// that announced a reboot before rebooting anyway (60 s). The result is
+    /// durable: it is re-sent after the reboot.
+    pub reboot_ack_grace: Duration,
 }
 
 impl Default for AgentOptions {
@@ -84,6 +88,7 @@ impl Default for AgentOptions {
             event_spacing: coalesce::EVENT_SPACING,
             shutdown_grace: Duration::from_secs(60),
             welcome_timeout: Duration::from_secs(30),
+            reboot_ack_grace: Duration::from_secs(60),
         }
     }
 }
@@ -137,6 +142,8 @@ enum Op {
         when_idle: bool,
     },
     WatchdogCheck,
+    /// Carries out a pending reboot (one a restart interrupted).
+    Reboot,
 }
 
 struct Queued {
@@ -211,6 +218,10 @@ struct Shared {
     /// The server refused the stored per-host token: present the bootstrap
     /// token instead (a forgotten host registers afresh, design §08).
     use_bootstrap: AtomicBool,
+    /// The identity of the current boot (read on start).
+    boot_id: Mutex<Option<String>>,
+    /// Signalled whenever the server acknowledges reports.
+    acked: Notify,
 }
 
 enum SessionEnd {
@@ -261,6 +272,7 @@ fn failed_outcome(plan: &Plan, error: &buckle_core::Error, started: Instant) -> 
         removals_run: Vec::new(),
         started_at: None,
         finished_at: None,
+        reboot: None,
     }
 }
 
@@ -408,6 +420,8 @@ impl Agent {
                 use_bootstrap: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
                 session_span: Mutex::new(None),
+                boot_id: Mutex::new(None),
+                acked: Notify::new(),
             }),
         })
     }
@@ -438,6 +452,10 @@ impl Agent {
             queue.clone(),
             ticker_cancel.clone(),
         ));
+        if shared.data.lock().await.agent.pending_reboot.is_some() {
+            // A reboot a restart interrupted: carry it out before anything else.
+            queue.push(Op::Reboot, None);
+        }
         queue.push(
             Op::Facts {
                 force_report: false,
@@ -559,6 +577,30 @@ impl Shared {
             agent.facts = state.facts;
         }
         agent.migrate_legacy();
+        let boot_id = self.runner.boot_id().await;
+        if let Ok(mut guard) = self.boot_id.lock() {
+            *guard = boot_id.clone();
+        }
+        if let Some(pending) = agent.pending_reboot.clone() {
+            let rebooted = match (&pending.request.boot_id, &boot_id) {
+                (Some(then), Some(now)) => then != now,
+                // No boot ids to compare: a reboot that was started is taken
+                // as done.
+                _ => pending.issued_at.is_some(),
+            };
+            if rebooted {
+                tracing::info!(by = ?pending.request.requested_by, "back from the reboot the last run asked for");
+                agent.pending_reboot = None;
+                // The local rollback window counts from the host being back.
+                if let Some(w) = agent.watchdog.as_mut() {
+                    w.deadline_at = chrono::Utc::now()
+                        + chrono::Duration::from_std(w.after).unwrap_or(chrono::Duration::MAX);
+                }
+                if let Err(err) = self.store.save_agent_state(&agent) {
+                    tracing::error!(error = %err.description(), "could not persist the agent's session state");
+                }
+            }
+        }
         if let Some(persisted) = agent.watchdog.clone() {
             tracing::info!(from = %persisted.from.short(), to = %persisted.to.short(), "resuming the local rollback watchdog");
             if let Ok(mut guard) = self.watchdog.lock() {
@@ -632,7 +674,12 @@ impl Shared {
             platform: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             bootstrap,
+            boot_id: self.current_boot(),
         }
+    }
+
+    fn current_boot(&self) -> Option<String> {
+        self.boot_id.lock().ok().and_then(|g| g.clone())
     }
 
     async fn drive(
@@ -865,6 +912,8 @@ impl Shared {
             tracing::debug!(?ids, "the server acknowledged reports");
             self.save_agent(&data);
         }
+        drop(data);
+        self.acked.notify_waiters();
     }
 
     /// Records `report` as durable (kept until acknowledged) and sends it.
@@ -988,6 +1037,7 @@ impl Shared {
                 .instrument(span)
                 .await;
                 self.set_applying(None);
+                self.reboot_if_pending().await;
             }
             Op::Rollback {
                 revision,
@@ -1003,7 +1053,8 @@ impl Shared {
                     rollback = true
                 );
                 set_parent_from_traceparent(&span, traceparent.as_deref());
-                self.rollback(revision, reason).instrument(span).await
+                self.rollback(revision, reason).instrument(span).await;
+                self.reboot_if_pending().await;
             }
             Op::Health {
                 request_id,
@@ -1047,8 +1098,10 @@ impl Shared {
                     buckle.host = %self.host_id
                 );
                 self.follow_session(&span);
-                self.watchdog_check().instrument(span).await
+                self.watchdog_check().instrument(span).await;
+                self.reboot_if_pending().await;
             }
+            Op::Reboot => self.reboot_if_pending().await,
         }
     }
 
@@ -1432,7 +1485,7 @@ impl Shared {
         ));
         let result = self.runner.apply(rev.clone(), ctx, plan, tx).await;
         let _ = forwarder.await;
-        let outcome = match result {
+        let mut outcome = match result {
             Ok(outcome) => outcome,
             Err(err) => {
                 if let Some(stale) = buckle_core::engine::StalePlan::find(&err) {
@@ -1462,8 +1515,14 @@ impl Shared {
             }
             data.agent.applied_revision.clone()
         };
+        if let Some(reboot) = outcome.reboot.as_mut() {
+            reboot.boot_id = self.current_boot();
+        }
         if report {
             let report_id = self.next_report_id().await;
+            if let Some(reboot) = &outcome.reboot {
+                self.schedule_reboot(report_id, reboot.clone()).await;
+            }
             self.send_durable(Report::ApplyResult {
                 report_id,
                 revision: rev.id.clone(),
@@ -1974,10 +2033,12 @@ impl Shared {
                         tracing::warn!(modules = ?rolled_back, "not correcting drift: modules were rolled back after a failure; waiting for the server");
                     }
                     if self.config.drift.correct && !paused && rolled_back.is_empty() {
-                        corrected = self
-                            .run_apply(rev.clone(), &ctx, &plan, false, true)
-                            .await
-                            .succeeded;
+                        let outcome = self.run_apply(rev.clone(), &ctx, &plan, false, true).await;
+                        if let Some(reboot) = &outcome.reboot {
+                            // An unattended pass never reboots the host.
+                            tracing::warn!(by = ?reboot.requested_by, "the drift correction asked for a reboot; not rebooting on its own: reboot the host or apply from the server");
+                        }
+                        corrected = outcome.succeeded;
                     }
                 }
                 self.sink
@@ -2248,6 +2309,109 @@ impl Shared {
         }
     }
 
+    // ------------------------------------------------------------ reboots
+
+    /// Remembers the reboot announced by durable report `report_id`, so that
+    /// it is carried out once the server has stored the report, and survives
+    /// a restart in between.
+    async fn schedule_reboot(&self, report_id: u64, request: buckle_core::reboot::RebootRequest) {
+        tracing::info!(by = ?request.requested_by, delay = ?request.delay, "the run asked for a reboot");
+        let mut data = self.data.lock().await;
+        data.agent.pending_reboot = Some(PendingReboot {
+            report_id,
+            request,
+            requested_at: chrono::Utc::now(),
+            issued_at: None,
+        });
+        self.save_agent(&data);
+    }
+
+    /// Carries out the pending reboot: waits for the server to acknowledge
+    /// the report that announced it (at most `reboot_ack_grace`), then for
+    /// its delay, then reboots and waits to be stopped. Nothing else runs in
+    /// between. A reboot that cannot be started, or a host still up a
+    /// `timeout` later, is reported as failed and forgotten.
+    async fn reboot_if_pending(&self) {
+        let Some(pending) = self.data.lock().await.agent.pending_reboot.clone() else {
+            return;
+        };
+        if pending.issued_at.is_some() {
+            // Started before, and the host is still on the same boot.
+            self.reboot_failed("the host did not reboot after the reboot was started")
+                .await;
+            return;
+        }
+        let deadline = Instant::now() + self.options.reboot_ack_grace;
+        loop {
+            let acked = self.acked.notified();
+            tokio::pin!(acked);
+            acked.as_mut().enable();
+            let pending_ack = self
+                .data
+                .lock()
+                .await
+                .agent
+                .unacked_reports
+                .iter()
+                .any(|r| r.report_id() == pending.report_id);
+            if !pending_ack {
+                break;
+            }
+            tokio::select! {
+                _ = acked => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    tracing::warn!("rebooting before the server acknowledged the result; it is sent again after the reboot");
+                    break;
+                }
+                _ = self.stop.cancelled() => return,
+            }
+        }
+        tokio::time::sleep(pending.request.delay).await;
+        if self.stopping.load(Ordering::SeqCst) || self.stop.is_cancelled() {
+            // Stopping anyway: the reboot is carried out on the next start.
+            return;
+        }
+        {
+            let mut data = self.data.lock().await;
+            if let Some(p) = data.agent.pending_reboot.as_mut() {
+                p.issued_at = Some(chrono::Utc::now());
+            }
+            self.save_agent(&data);
+        }
+        tracing::warn!(by = ?pending.request.requested_by, "rebooting the host");
+        if let Err(err) = self.runner.reboot().await {
+            self.reboot_failed(&err.description()).await;
+            return;
+        }
+        let until = Instant::now() + pending.request.timeout;
+        while Instant::now() < until {
+            if self.stopping.load(Ordering::SeqCst) || self.stop.is_cancelled() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250).min(pending.request.timeout)).await;
+        }
+        self.reboot_failed(&format!(
+            "the host was still up {} after the reboot was started",
+            humantime_serde::re::humantime::format_duration(pending.request.timeout)
+        ))
+        .await;
+    }
+
+    async fn reboot_failed(&self, error: &str) {
+        tracing::error!(%error, "the reboot the run asked for did not happen");
+        {
+            let mut data = self.data.lock().await;
+            data.agent.pending_reboot = None;
+            self.save_agent(&data);
+        }
+        self.sink
+            .send(Report::RebootFailed {
+                boot_id: self.current_boot(),
+                error: error.to_owned(),
+            })
+            .await;
+    }
+
     async fn local_rollback(&self, watchdog: Watchdog, reason: String) {
         let from = watchdog.state.from.clone();
         let to = watchdog.state.to.clone();
@@ -2261,6 +2425,7 @@ impl Shared {
             Ok::<_, buckle_core::Error>(self.run_apply(rev, &ctx, &plan, false, true).await)
         }
         .await;
+        let reboot = result.as_ref().ok().and_then(|o| o.reboot.clone());
         let (succeeded, rollback_error, rollback_outcome) = match result {
             Ok(outcome) => (
                 outcome.succeeded,
@@ -2282,6 +2447,11 @@ impl Shared {
             tracing::error!(%reason, error = ?rollback_error, "the local rollback failed; the host needs attention");
         }
         let report_id = self.next_report_id().await;
+        if let Some(reboot) = reboot {
+            // Restoring the stable revision asked for a reboot (boot
+            // configuration, say): it follows the report like an apply's.
+            self.schedule_reboot(report_id, reboot).await;
+        }
         let record = LocalRollbackRecord {
             report_id,
             from,

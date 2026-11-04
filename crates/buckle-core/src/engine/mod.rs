@@ -306,6 +306,11 @@ pub struct ApplyOutcome {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
+    /// A step or handler of the run asked for a reboot: whoever drove the run
+    /// reboots the host once it has been reported. Health checks the run had
+    /// not reached by then were left for after the reboot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reboot: Option<crate::reboot::RebootRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

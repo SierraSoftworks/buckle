@@ -1092,6 +1092,7 @@ mod tests {
             }],
             started_at: Some(t(0)),
             finished_at: Some(t(60)),
+            reboot: None,
         }
     }
 

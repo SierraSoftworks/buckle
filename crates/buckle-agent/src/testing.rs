@@ -79,6 +79,7 @@ pub fn succeeded(plan: &Plan) -> ApplyOutcome {
         removals_run: vec![],
         started_at: None,
         finished_at: None,
+        reboot: None,
     }
 }
 
@@ -138,6 +139,8 @@ pub enum Call {
         /// The modules.
         modules: Option<Vec<String>>,
     },
+    /// `reboot`.
+    Reboot,
 }
 
 type HealthFn = Box<dyn Fn(&RevisionId, HealthScope) -> HealthReport + Send + Sync>;
@@ -157,6 +160,8 @@ pub struct FakeRunner {
     drift_flags: Mutex<Vec<(&'static str, RevisionId, bool)>>,
     calls: Mutex<Vec<Call>>,
     changed: Notify,
+    boot_id: Mutex<Option<String>>,
+    reboot_error: Mutex<Option<String>>,
 }
 
 impl Default for FakeRunner {
@@ -173,6 +178,8 @@ impl Default for FakeRunner {
             drift_flags: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             changed: Notify::new(),
+            boot_id: Mutex::new(Some("boot-1".into())),
+            reboot_error: Mutex::new(None),
         }
     }
 }
@@ -235,6 +242,26 @@ impl FakeRunner {
     pub fn with_plan_facts(&self, facts: Facts) -> &Self {
         *lock(&self.plan_facts) = Some(facts);
         self
+    }
+
+    /// Reports `boot_id` as the current boot (`boot-1` by default).
+    pub fn with_boot_id(&self, boot_id: Option<&str>) -> &Self {
+        *lock(&self.boot_id) = boot_id.map(str::to_owned);
+        self
+    }
+
+    /// Makes `reboot` fail with `message`.
+    pub fn with_reboot_error(&self, message: &str) -> &Self {
+        *lock(&self.reboot_error) = Some(message.to_owned());
+        self
+    }
+
+    /// How often `reboot` was called.
+    pub fn reboots(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Reboot))
+            .count()
     }
 
     /// Every call so far.
@@ -362,6 +389,18 @@ impl Runner for FakeRunner {
         });
         let report = (lock(&self.health))(&revision.id, scope);
         Ok(report)
+    }
+
+    async fn boot_id(&self) -> Option<String> {
+        lock(&self.boot_id).clone()
+    }
+
+    async fn reboot(&self) -> buckle_core::Result<()> {
+        self.record(Call::Reboot);
+        match lock(&self.reboot_error).clone() {
+            Some(message) => Err(buckle_core::error::user(message, &["Reboot by hand."])),
+            None => Ok(()),
+        }
     }
 }
 
