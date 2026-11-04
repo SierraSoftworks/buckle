@@ -6,8 +6,8 @@
 //!   request for it, so nothing about the cluster is kept between them.
 //! * [`Executor`] compiles the revision's selected workloads into
 //!   [`buckle_nomad`] primitives, plans them into an ordinary
-//!   [`Plan`] (one module per workload), applies them in `needs` order and
-//!   runs their implicit health checks. Ownership lives in the cluster
+//!   [`Plan`] (one module per workload), applies them concurrently as
+//!   `needs` allow and runs their implicit health checks. Ownership lives in the cluster
 //!   (stamps and the index variable); objects of workloads that went away
 //!   are planned as removals.
 //! * Credentials come from Buckle-issued identities ([`crate::identity`]),
@@ -35,6 +35,7 @@ use buckle_nomad::primitives::{
 };
 use buckle_nomad::{Context, Kind, Nomad, ObjectKey, Workload, WorkloadPlan};
 use chrono::Utc;
+use futures::stream::{FuturesUnordered, StreamExt};
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -145,11 +146,20 @@ impl std::fmt::Debug for Executor {
     }
 }
 
+/// How many workloads of one target apply at once. A job's step lasts
+/// until its deployment finishes, so the cap bounds open deployments (and
+/// their polling), not CPU.
+const PARALLEL_WORKLOADS: usize = 8;
+
 /// One workload's part of a plan.
 struct Unit {
     name: String,
     cx: Context,
     plan: WorkloadPlan,
+    /// The workloads that must apply first: the selected ones it `needs`
+    /// (planned or not) and earlier ones creating a namespace, node pool or
+    /// resource, which it may land in.
+    after: BTreeSet<String>,
 }
 
 /// A cluster plan: what the server sees ([`ClusterPlan::plan`]) and what
@@ -268,9 +278,22 @@ impl Executor {
         let mut undecided: BTreeSet<String> = BTreeSet::new();
         let mut earlier: Vec<ObjectKey> = Vec::new();
         let mut namespaces_created: BTreeSet<String> = BTreeSet::new();
+        let selected: BTreeSet<String> = workloads.iter().map(|w| w.config.name.clone()).collect();
+        // Earlier workloads that create cluster-wide objects others land in.
+        let mut landing: BTreeSet<String> = BTreeSet::new();
 
         for w in workloads {
             let name = w.config.name.clone();
+            let mut after: BTreeSet<String> = w
+                .config
+                .needs()
+                .into_iter()
+                .filter_map(|n| match n {
+                    buckle_core::model::Need::Workload(dep) if selected.contains(&dep) => Some(dep),
+                    _ => None,
+                })
+                .collect();
+            after.extend(landing.iter().cloned());
             let compiled = if w.config.uses_kubernetes_keys() {
                 Err(buckle_core::error::user(
                     format!(
@@ -306,7 +329,13 @@ impl Executor {
             };
             match planned {
                 Ok((cx, plan)) => {
-                    earlier.extend(plan.created());
+                    let created = plan.created();
+                    if created.iter().any(|k| {
+                        matches!(k.kind, Kind::Namespace | Kind::NodePool | Kind::Resource)
+                    }) {
+                        landing.insert(name.clone());
+                    }
+                    earlier.extend(created);
                     declared.extend(plan.keys());
                     for step in &plan.steps {
                         warnings.extend(
@@ -316,7 +345,12 @@ impl Executor {
                         );
                     }
                     modules.push(module_plan(&name, &w.config.needs, &plan));
-                    units.push(Unit { name, cx, plan });
+                    units.push(Unit {
+                        name,
+                        cx,
+                        plan,
+                        after,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(target = %a.target, workload = %name, error = %e.description(), "a workload could not be planned");
@@ -384,8 +418,10 @@ impl Executor {
         })
     }
 
-    /// Applies `planned` in order, stopping at the first failure; then its
-    /// removals. Events stream to `events`; the outcome says what happened.
+    /// Applies `planned`'s workloads as their `needs` allow, several at once
+    /// ([`PARALLEL_WORKLOADS`]); after the first failure nothing more starts
+    /// (running ones finish). Then its removals. Events stream to `events`;
+    /// the outcome says what happened.
     pub async fn apply(
         &self,
         planned: &ClusterPlan,
@@ -399,143 +435,49 @@ impl Executor {
                 let _ = events.send(e).await;
             }
         };
-        let mut results: Vec<ModuleOutcome> = Vec::new();
+        let mut outcomes: Vec<Option<ModuleOutcome>> = vec![None; planned.units.len()];
         let mut failure: Option<(String, buckle_core::Error)> = None;
         let mut changes = 0;
+        let mut applied: BTreeSet<&str> = BTreeSet::new();
+        let mut running = FuturesUnordered::new();
+        let mut waiting: Vec<usize> = (0..planned.units.len()).collect();
 
-        for unit in &planned.units {
-            let module = unit.name.clone();
-            if failure.is_some() {
-                results.push(ModuleOutcome::new(&module, ModuleStatus::NotStarted));
-                continue;
-            }
-            let core = planned.plan.modules.iter().find(|m| m.module == module);
-            let mut steps: Vec<StepOutcome> = core
-                .map(|m| {
-                    m.steps
-                        .iter()
-                        .map(|s| {
-                            let state = if s.planned.is_change() {
-                                StepState::Pending
-                            } else {
-                                StepState::Unchanged
-                            };
-                            StepOutcome::planned(s, state)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            emit(ApplyEvent::ModuleStarted {
-                module: module.clone(),
-            })
-            .await;
-            let module_started = Utc::now();
-            let module_clock = tokio::time::Instant::now();
-            let mut module_changes = 0;
-            let mut module_error: Option<buckle_core::Error> = None;
-
-            if let Some((key, reason)) = unit.plan.blocked() {
-                module_error = Some(buckle_core::error::user(
-                    format!("{key} cannot be applied: {reason}"),
-                    &["Resolve the conflict and plan again."],
-                ));
-            }
-            for (i, step) in unit.plan.steps.iter().enumerate() {
-                if module_error.is_some() || !step.is_change() {
-                    continue;
-                }
-                let resource = resource_key(&module, &step.key);
-                let id = buckle_core::engine::step_id(&resource);
-                let kind = step.key.kind.task_kind().to_owned();
-                emit(ApplyEvent::StepStarted {
-                    module: module.clone(),
-                    task_id: step.key.key(),
-                    id: id.clone(),
-                    kind: kind.clone(),
-                })
-                .await;
-                let step_started = Utc::now();
-                let clock = tokio::time::Instant::now();
-                let applied = step.apply(&unit.cx).await;
-                let outcome = steps.get_mut(i);
-                match applied {
-                    Ok(applied) => {
-                        if applied.changed {
-                            module_changes += 1;
-                        }
-                        emit(ApplyEvent::StepFinished {
-                            module: module.clone(),
-                            task_id: step.key.key(),
-                            id,
-                            kind,
-                            changed: applied.changed,
-                            summary: applied.summary.clone(),
-                        })
-                        .await;
-                        if let Some(o) = outcome {
-                            o.state = if applied.changed {
-                                StepState::Changed
-                            } else {
-                                StepState::Unchanged
-                            };
-                            o.result = Some(applied.summary);
-                            o.started_at = Some(step_started);
-                            o.finished_at = Some(Utc::now());
-                            o.duration_ms = Some(clock.elapsed().as_millis() as u64);
-                        }
+        loop {
+            if failure.is_none() {
+                waiting.retain(|&i| {
+                    let unit = &planned.units[i];
+                    let ready = running.len() < PARALLEL_WORKLOADS
+                        && unit.after.iter().all(|d| applied.contains(d.as_str()));
+                    if ready {
+                        let events = &events;
+                        running.push(async move { (i, apply_unit(planned, unit, events).await) });
                     }
-                    Err(e) => {
-                        let report = ErrorReport::of(&e);
-                        emit(ApplyEvent::StepFailed {
-                            module: module.clone(),
-                            task_id: step.key.key(),
-                            id,
-                            kind,
-                            error: report.one_line(),
-                            error_detail: Some(report.clone()),
-                        })
-                        .await;
-                        if let Some(o) = outcome {
-                            o.state = StepState::Failed;
-                            o.started_at = Some(step_started);
-                            o.finished_at = Some(Utc::now());
-                            o.duration_ms = Some(clock.elapsed().as_millis() as u64);
-                            o.error_detail = Some(report);
-                        }
-                        module_error = Some(e);
-                    }
-                }
+                    !ready
+                });
             }
-            let status = match &module_error {
-                Some(_) => {
-                    for o in steps.iter_mut().filter(|o| o.state == StepState::Pending) {
-                        o.state = StepState::NotRun;
-                    }
-                    ModuleStatus::Failed
-                }
-                None if module_changes > 0 => ModuleStatus::Applied,
-                None => ModuleStatus::Unchanged,
+            let Some((i, (outcome, error))) = running.next().await else {
+                break;
             };
-            emit(ApplyEvent::ModuleFinished {
-                module: module.clone(),
-                status,
-            })
-            .await;
-            changes += module_changes;
-            let mut result = ModuleOutcome {
-                changes: module_changes,
-                duration_ms: module_clock.elapsed().as_millis() as u64,
-                steps,
-                started_at: Some(module_started),
-                finished_at: Some(Utc::now()),
-                ..ModuleOutcome::new(&module, status)
-            };
-            if let Some(e) = module_error {
-                result = result.with_error(ErrorReport::of(&e));
-                failure = Some((module, e));
+            changes += outcome.changes;
+            match error {
+                Some(e) => {
+                    failure.get_or_insert((outcome.module.clone(), e));
+                }
+                None => {
+                    applied.insert(planned.units[i].name.as_str());
+                }
             }
-            results.push(result);
+            outcomes[i] = Some(outcome);
         }
+        // Not started: after a failure, or needing a workload that failed or
+        // could not be planned.
+        let mut results: Vec<ModuleOutcome> = outcomes
+            .into_iter()
+            .zip(&planned.units)
+            .map(|(o, u)| {
+                o.unwrap_or_else(|| ModuleOutcome::new(&u.name, ModuleStatus::NotStarted))
+            })
+            .collect();
 
         // Workloads that could not be planned were not applied.
         for i in &planned.plan.indeterminate {
@@ -697,6 +639,142 @@ impl Executor {
         }
         Ok(HealthReport { scope, results })
     }
+}
+
+/// Applies one workload's steps in order, stopping at the first failure.
+async fn apply_unit(
+    planned: &ClusterPlan,
+    unit: &Unit,
+    events: &mpsc::Sender<ApplyEvent>,
+) -> (ModuleOutcome, Option<buckle_core::Error>) {
+    let emit = |e: ApplyEvent| async move {
+        let _ = events.send(e).await;
+    };
+    let module = unit.name.clone();
+    let core = planned.plan.modules.iter().find(|m| m.module == module);
+    let mut steps: Vec<StepOutcome> = core
+        .map(|m| {
+            m.steps
+                .iter()
+                .map(|s| {
+                    let state = if s.planned.is_change() {
+                        StepState::Pending
+                    } else {
+                        StepState::Unchanged
+                    };
+                    StepOutcome::planned(s, state)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    emit(ApplyEvent::ModuleStarted {
+        module: module.clone(),
+    })
+    .await;
+    let module_started = Utc::now();
+    let module_clock = tokio::time::Instant::now();
+    let mut module_changes = 0;
+    let mut module_error: Option<buckle_core::Error> = None;
+
+    if let Some((key, reason)) = unit.plan.blocked() {
+        module_error = Some(buckle_core::error::user(
+            format!("{key} cannot be applied: {reason}"),
+            &["Resolve the conflict and plan again."],
+        ));
+    }
+    for (i, step) in unit.plan.steps.iter().enumerate() {
+        if module_error.is_some() || !step.is_change() {
+            continue;
+        }
+        let resource = resource_key(&module, &step.key);
+        let id = buckle_core::engine::step_id(&resource);
+        let kind = step.key.kind.task_kind().to_owned();
+        emit(ApplyEvent::StepStarted {
+            module: module.clone(),
+            task_id: step.key.key(),
+            id: id.clone(),
+            kind: kind.clone(),
+        })
+        .await;
+        let step_started = Utc::now();
+        let clock = tokio::time::Instant::now();
+        let applied = step.apply(&unit.cx).await;
+        let outcome = steps.get_mut(i);
+        match applied {
+            Ok(applied) => {
+                if applied.changed {
+                    module_changes += 1;
+                }
+                emit(ApplyEvent::StepFinished {
+                    module: module.clone(),
+                    task_id: step.key.key(),
+                    id,
+                    kind,
+                    changed: applied.changed,
+                    summary: applied.summary.clone(),
+                })
+                .await;
+                if let Some(o) = outcome {
+                    o.state = if applied.changed {
+                        StepState::Changed
+                    } else {
+                        StepState::Unchanged
+                    };
+                    o.result = Some(applied.summary);
+                    o.started_at = Some(step_started);
+                    o.finished_at = Some(Utc::now());
+                    o.duration_ms = Some(clock.elapsed().as_millis() as u64);
+                }
+            }
+            Err(e) => {
+                let report = ErrorReport::of(&e);
+                emit(ApplyEvent::StepFailed {
+                    module: module.clone(),
+                    task_id: step.key.key(),
+                    id,
+                    kind,
+                    error: report.one_line(),
+                    error_detail: Some(report.clone()),
+                })
+                .await;
+                if let Some(o) = outcome {
+                    o.state = StepState::Failed;
+                    o.started_at = Some(step_started);
+                    o.finished_at = Some(Utc::now());
+                    o.duration_ms = Some(clock.elapsed().as_millis() as u64);
+                    o.error_detail = Some(report);
+                }
+                module_error = Some(e);
+            }
+        }
+    }
+    let status = match &module_error {
+        Some(_) => {
+            for o in steps.iter_mut().filter(|o| o.state == StepState::Pending) {
+                o.state = StepState::NotRun;
+            }
+            ModuleStatus::Failed
+        }
+        None if module_changes > 0 => ModuleStatus::Applied,
+        None => ModuleStatus::Unchanged,
+    };
+    emit(ApplyEvent::ModuleFinished {
+        module: module.clone(),
+        status,
+    })
+    .await;
+    let mut result = ModuleOutcome {
+        changes: module_changes,
+        duration_ms: module_clock.elapsed().as_millis() as u64,
+        steps,
+        started_at: Some(module_started),
+        finished_at: Some(Utc::now()),
+        ..ModuleOutcome::new(&module, status)
+    };
+    if let Some(e) = &module_error {
+        result = result.with_error(ErrorReport::of(e));
+    }
+    (result, module_error)
 }
 
 /// Exchanges a Buckle-issued JWT for a Nomad ACL token through the cluster's

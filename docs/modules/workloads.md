@@ -50,7 +50,7 @@ removal: stop
 | Key | Meaning |
 |---|---|
 | `when` | Selects the clusters the workload runs on, over [`cluster.*`](./expressions.md#cluster-selectors). Absent: every cluster. |
-| `needs` | Order within the layer (a bare name is another workload) and across it (`module:NAME` waits for a module on the cluster's hosts; a module's `needs: ['workload:NAME']` waits for a workload). Cycles are rejected. |
+| `needs` | Order within the layer (a bare name is another workload) and across it (`module:NAME` waits for a module on the cluster's hosts; a module's `needs: ['workload:NAME']` waits for a workload). Cycles are rejected. A cluster's workloads apply concurrently unless one needs another, or an earlier workload creates the namespace or node pool it uses. |
 | `vars` | Defaults, overridden by the fleet's `vars` overlays; on Nomad, those the job declares a `variable` for become its HCL2 variables (fleet overlays reach every target, and Nomad refuses undeclared ones). |
 | `namespace` | The namespace the workload's entities live in, created if missing. Absent: the scheduler's default. |
 | `health` | Checks beside the implicit ones (the job's deployment and allocations; a Deployment's rollout). |

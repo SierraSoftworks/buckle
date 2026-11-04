@@ -317,6 +317,85 @@ async fn workloads_apply_after_the_workloads_they_need() {
     assert_eq!(order, vec!["z-db", "a-web"]);
 }
 
+/// While `first`'s deployment is held, whether `second` gets submitted.
+async fn submitted_alongside(
+    files: Vec<(String, String)>,
+    first: (&str, &str),
+    second: (&str, &str),
+) -> (bool, ApplyOutcome) {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
+    let planned = ex.plan(&a, None).await.unwrap();
+    for (ns, id) in [first, second] {
+        fake.hold(ns, id);
+    }
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let watch = async {
+        while fake.job(first.0, first.1).is_none() {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        // Long enough for several deployment polls.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let alongside = fake.job(second.0, second.1).is_some();
+        for (ns, id) in [first, second] {
+            fake.release(ns, id);
+        }
+        alongside
+    };
+    let (alongside, outcome) = tokio::join!(watch, ex.apply(&planned, tx));
+    drain.await.unwrap();
+    (alongside, outcome)
+}
+
+#[rstest]
+#[case::independent("", "", "default", true)]
+#[case::needed("needs: [z-db]\n", "", "default", false)]
+// a-web creates the namespace z-db's job lands in.
+#[case::namespace_created_earlier("namespace: apps\n", "namespace: apps\n", "apps", false)]
+#[tokio::test(start_paused = true)]
+async fn workloads_deploy_concurrently_unless_one_waits_for_another(
+    #[case] web: &str,
+    #[case] db: &str,
+    #[case] ns: &str,
+    #[case] concurrent: bool,
+) {
+    let mut files = workload_files("a-web", web);
+    files.extend(workload_files("z-db", db));
+    let (first, second) = if web.contains("needs") {
+        ((ns, "z-db"), (ns, "a-web"))
+    } else {
+        ((ns, "a-web"), (ns, "z-db"))
+    };
+    let (alongside, outcome) = submitted_alongside(files, first, second).await;
+    assert_eq!(alongside, concurrent);
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    assert!(
+        outcome
+            .module_results
+            .iter()
+            .all(|m| m.status == ModuleStatus::Applied)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_workload_needing_a_failed_one_does_not_start() {
+    let fake = FakeNomad::new();
+    fake.deployment_outcome("failed");
+    let mut files = workload_files("a-web", "needs: [z-db]\n");
+    files.extend(workload_files("z-db", ""));
+    let outcome = apply(
+        &executor(&fake),
+        &assignment(revision("r1", &files), ClusterIdentity::Local, 7),
+    )
+    .await;
+    assert!(!outcome.succeeded);
+    assert_eq!(outcome.failed_module.as_deref(), Some("z-db"));
+    assert_eq!(outcome.not_started, vec!["a-web"]);
+    assert!(fake.job("default", "a-web").is_none());
+}
+
 #[tokio::test]
 async fn health_checks_the_jobs_of_the_selected_workloads() {
     let fake = FakeNomad::new();
