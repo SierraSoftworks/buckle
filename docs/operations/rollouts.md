@@ -63,9 +63,14 @@ then what depends on it, and so on, each stage applying `parallel` targets at a 
 modules sit on both sides of a workload is applied in two steps, its dependent modules after the
 cluster, and shows as pending with the stage it waits for in between.
 
-A cluster's plan, and any later step's, is taken when its stage opens rather than when the rollout
-starts, because it depends on what the stages before it did; a plan that arrives then needs
-approval like any other under `approval: required` or `if_destructive`. A cluster with no
+Every target is planned when the rollout starts, as a **preview** where its stage has not opened
+yet (later phases, clusters after their nodes), and planned again when its stage opens, since it
+depends on what came before. The fresh plan is what applies: one matching what the phase's
+approval covered goes ahead, one that changed is marked *changed since preview* (audit
+`rollout.target.plan_drifted`) and needs approval again under `approval: required` (or
+`if_destructive` when destructive); auto phases apply it. A cluster with no free executor at the
+start, or whose preview fails (an earlier stage provides what it needs), stays unplanned until its
+stage opens. A host's later steps are planned when their stage opens. A cluster with no
 connected host matching its `executors` selector reads *awaiting executor*; it misses its phase
 after the disconnect grace, like an offline host, and converges in the stragglers stage once one
 appears. A phase without cross-layer `needs` is one stage, as before.
