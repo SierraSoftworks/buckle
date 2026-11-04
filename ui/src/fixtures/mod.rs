@@ -27,7 +27,7 @@
 //! compiled into debug builds only: a release bundle carries no fixtures.
 
 #[cfg(debug_assertions)]
-mod data;
+pub(crate) mod data;
 #[cfg(debug_assertions)]
 pub mod live;
 #[cfg(debug_assertions)]

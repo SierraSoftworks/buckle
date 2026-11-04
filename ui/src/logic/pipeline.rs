@@ -297,7 +297,12 @@ pub const OUTSIDE_STAGE: &str = "not in this rollout";
 /// The fleet laid over a rollout's stages, for the Overview's map: the
 /// rollout's hosts that are still in the fleet where the rollout put them,
 /// and every other host in a trailing [`OUTSIDE_STAGE`].
-pub fn fleet_map(detail: &RolloutDetail, fleet: &[HostSummary]) -> RolloutDetail {
+pub fn fleet_map(
+    detail: &RolloutDetail,
+    fleet: &[HostSummary],
+    clusters: &[HostSummary],
+) -> RolloutDetail {
+    let fleet: Vec<&HostSummary> = fleet.iter().chain(clusters).collect();
     let known: BTreeSet<&str> = fleet.iter().map(|h| h.id.as_str()).collect();
     let mut map = detail.clone();
     for phase in &mut map.phases {
@@ -327,7 +332,7 @@ pub fn fleet_map(detail: &RolloutDetail, fleet: &[HostSummary]) -> RolloutDetail
             updated_at: h.last_seen.unwrap_or(h.first_seen),
             bake_until: None,
             reboot: None,
-            kind: Default::default(),
+            kind: h.kind,
             stage: 0,
             executor: None,
             bake: None,
@@ -841,5 +846,37 @@ mod tests {
             h.waived_checks = waived.into_iter().map(Into::into).collect();
             assert_eq!(standings(&h), want, "{state:?}");
         }
+    }
+
+    #[test]
+    fn fleet_map_keeps_clusters_in_their_stages() {
+        let now = Utc::now();
+        let mut cluster = host("home-nomad", "home", HostRolloutState::Healthy, 5);
+        cluster.kind = buckle_api::TargetKind::Cluster;
+        let d = detail(
+            vec![phase(
+                "home",
+                PhaseState::Running,
+                "auto",
+                vec![host("pi-1", "home", HostRolloutState::Healthy, 5), cluster],
+            )],
+            vec![],
+        );
+        let summary = |id: &str, kind| HostSummary {
+            id: id.into(),
+            kind,
+            ..crate::fixtures::data::hosts(now)[0].clone()
+        };
+        let hosts = [summary("pi-1", Default::default())];
+        let clusters = [
+            summary("home-nomad", buckle_api::TargetKind::Cluster),
+            summary("lab-nomad", buckle_api::TargetKind::Cluster),
+        ];
+        let map = fleet_map(&d, &hosts, &clusters);
+        let names = |p: &RolloutPhase| p.hosts.iter().map(|h| h.host.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&map.phases[0]), ["pi-1", "home-nomad"]);
+        let outside = map.phases.last().unwrap();
+        assert_eq!(names(outside), ["lab-nomad"]);
+        assert_eq!(outside.hosts[0].kind, buckle_api::TargetKind::Cluster);
     }
 }

@@ -75,8 +75,12 @@ pub fn overview() -> Html {
         (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={fleet.reload.clone()} /> },
         (None, None) => html! { <Loading label="Reading the fleet…" /> },
         (Some(f), _) => {
-            let hosts: BTreeMap<String, _> =
-                f.hosts.iter().map(|h| (h.id.clone(), h.clone())).collect();
+            let hosts: BTreeMap<String, _> = f
+                .hosts
+                .iter()
+                .chain(&f.clusters)
+                .map(|h| (h.id.clone(), h.clone()))
+                .collect();
             let waiting = latest_id.is_some() && rollout_live.is_none();
             let plan_groups = rollout_live
                 .as_ref()
@@ -101,7 +105,7 @@ pub fn overview() -> Html {
                 <Panel title="Fleet" class="overview__fleet"
                     subtitle="Every host on the latest rollout's stages: its state in that rollout, with its current health and connection">
                     { match &rollout_live {
-                        Some(d) => html! { <Pipeline detail={fleet_map(d, &f.hosts)} hosts={hosts.clone()} {now} /> },
+                        Some(d) => html! { <Pipeline detail={fleet_map(d, &f.hosts, &f.clusters)} hosts={hosts.clone()} {now} /> },
                         None if waiting => html! { <Loading /> },
                         None => html! { <Empty title="No stages yet" message="The fleet is laid out on a rollout's stages once the first rollout starts." /> },
                     } }
