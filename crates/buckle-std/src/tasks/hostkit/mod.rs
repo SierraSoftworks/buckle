@@ -831,6 +831,10 @@ mod registry_tests {
                 json!({"src": "a.j2", "dest": "/b", "mode": "0600", "validate": ["x", "{path}"]}),
             ),
             (
+                "file.tree",
+                json!({"src": "d", "dest": "/d", "mode": "0640", "dir_mode": "0750", "owner": "root", "templates": true, "exclude": ["*.md"], "purge": true}),
+            ),
+            (
                 "file.directory",
                 json!({"path": "/d", "mode": "0750", "recurse": true}),
             ),
@@ -973,6 +977,7 @@ mod registry_tests {
             "file.copy",
             "file.template",
             "file.directory",
+            "file.tree",
             "file.download",
             "archive.extract",
             "github.release",

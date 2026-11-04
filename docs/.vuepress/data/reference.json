@@ -2454,6 +2454,112 @@
       "shape": null
     },
     {
+      "description": "Copy a directory of files (optionally templated) from the module's files/ directory to the host.",
+      "details": "Copies every file under a directory of the module's `files/` to `dest`.\n\n```yaml\n- file.tree:\n    src: compose                  # a directory under the module's files/\n    dest: /opt/compose\n    mode: \"0640\"                  # files; owner and group apply to directories too\n    dir_mode: \"0750\"\n    owner: root\n    group: docker\n    templates: true               # render `*.j2` files (secret-aware), dropping the suffix\n    exclude: [\"*.md\", \".git\"]     # globs over paths relative to `src` / `dest`\n    purge: false                  # also delete files under dest that are not in the tree\n```\n\nThe tree is one resource keyed by `dest`, and its plan shows a diff per\nfile. Buckle owns the files it writes: a file dropped from the module is\ndeleted on the next apply (or left in place, and reported, if it was\nedited by hand since), and a hand-edited file that is still in the module\nis reported as drift and overwritten. Directories Buckle created are\nremoved once empty. A file already on the host with the same content is\nadopted rather than owned, so neither of those ever deletes it.\n\nWith `templates: true`, files ending in `.j2` are rendered like\n`file.template` (secrets never reach the plan or state) and written without\nthe suffix; other files are copied byte for byte. With `purge: true`,\nanything else under `dest` (that `exclude` does not match) is deleted as\nwell, so `dest` holds exactly the tree.\n\nRemoval deletes the files Buckle wrote that are unchanged since, then the\ndirectories it created if they are empty.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute destination directory on the host (created if missing).",
+          "options": [],
+          "path": "dest",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Source directory, relative to the module's `files/` directory (`.` for all of it).",
+          "options": [],
+          "path": "src",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode for `dest` and the directories in the tree, such as `\"0755\"`.",
+          "options": [],
+          "path": "dir_mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Skip paths matching these globs (`*` and `?`), matched against the\nrelative path, its parent directories and its file name.",
+          "options": [],
+          "path": "exclude",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Also delete everything under `dest` that is not in the tree (and not excluded).",
+          "options": [],
+          "path": "purge",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Render files ending in `.j2` as templates and write them without the suffix.",
+          "options": [],
+          "path": "templates",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "file.tree",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
       "description": "Clone a git repository and keep it at a branch, tag or commit, never resetting local changes.",
       "details": "Clones a git repository and keeps its working tree at a branch, tag or commit.\n\n```yaml\n- git.repository:\n    repo: https://github.com/geerlingguy/rpi-clone.git\n    path: /opt/rpi-clone\n    ref: master           # branch, tag or full commit id; default: the remote's default branch\n    owner: pi             # run git as this user and own the tree\n    group: pi\n    depth: 1              # shallow clone/fetch\n    recursive: true       # also init and update submodules\n    update: true          # false: clone once, never move HEAD afterwards\n  tags: [network]\n```\n\nThe plan compares the checkout's `HEAD` with what `git ls-remote` reports\nfor `ref` on `repo`, so planning contacts the remote (a full 40 or 64\ncharacter commit id is compared without it). A branch is checked out as a\nlocal branch tracking `origin/<ref>`; a tag or commit is checked out\ndetached. When `ref` names both a branch and a tag, the branch wins.\n\nA working tree with uncommitted changes to tracked files is never reset:\na plan that would move `HEAD` is blocked instead. A non-empty `path` that\nis not a git repository is blocked too. `owner` runs every git command as\nthat user (with `runuser`, so their SSH keys and git config apply) and\n`owner`/`group` are applied recursively after each change.\n\nRemoval deletes the clone only if Buckle created it, it has no local\nchanges (tracked or untracked), and `HEAD` is still the commit Buckle last\nchecked out. Otherwise it is left in place.",
       "fields": [

@@ -319,7 +319,7 @@ fn included(patterns: &[String], original: &Path, stripped: &Path) -> bool {
 }
 
 /// A minimal glob: `*` matches any run of characters, `?` any single one.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0, 0);

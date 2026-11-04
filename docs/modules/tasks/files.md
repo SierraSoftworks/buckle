@@ -64,6 +64,35 @@ Templates can read `host`, `vars` and `secrets`; a new file whose render used a 
 
 <KindReference registry="tasks" kind="file.template" />
 
+## file.tree
+
+Copy a directory of files from the module's `files/`, as one resource with a diff per file. Files
+Buckle wrote are its own: one dropped from the module is deleted on the next apply (or left, and
+reported, if it was edited by hand since), and directories it created go once they are empty.
+
+```yaml
+- file.tree:
+    src: compose                 # files/compose/** → /opt/compose/**
+    dest: /opt/compose
+    mode: "0640"
+    dir_mode: "0750"
+    group: docker
+    templates: true              # *.j2 files are rendered (secret-aware) and lose the suffix
+    exclude: ["*.md"]
+  notify: [compose-up]
+```
+
+```yaml
+# Own the whole directory: anything else in it (except `exclude` matches) is deleted.
+- file.tree: { src: dashboards, dest: /var/lib/grafana/dashboards, purge: true }
+```
+
+<KindReference registry="tasks" kind="file.tree" />
+
+A file already on the host with the same content is adopted, not owned, so it is never deleted.
+Deletions show in the plan's diff but do not make the plan destructive for `approval:
+if_destructive`.
+
 ## file.directory
 
 Ensure a directory exists, creating missing parents.
