@@ -655,7 +655,11 @@ async fn a_phase_is_approved_only_once_the_phases_before_it_finish() {
     };
     let early = h.command(approve()).await.unwrap_err();
     assert_eq!(early.kind, CommandErrorKind::Conflict);
-    assert!(early.error.to_string().contains("canary"), "{}", early.error);
+    assert!(
+        early.error.to_string().contains("canary"),
+        "{}",
+        early.error
+    );
 
     h.wait_state(&id, RolloutState::AwaitingApproval).await;
     h.command(approve()).await.unwrap();
