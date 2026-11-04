@@ -84,25 +84,26 @@ describe("the rollout pipeline", () => {
 });
 
 describe("approving a phase", () => {
-  test("reviews deduplicated plans and confirms with the hosts and destructive steps named", async () => {
+  test("reviews every phase's plans in one view and approves a phase from it", async () => {
     const { page, close } = await open("/rollouts/42");
-    const pane = page.locator("#approval");
-    await pane.getByRole("heading", { name: "Approve phase: cloud" }).waitFor();
+    const pane = page.locator("#plans");
+    const approval = pane.locator('section.approval[data-phase="cloud"]');
+    await approval.getByRole("heading", { name: "Approve phase: cloud" }).waitFor();
+    assert.equal(await pane.getByRole("tab", { name: /canary|home|cloud/ }).count(), 0, "no tab per phase");
+    assert.match(await approval.textContent(), /1 host has no plan yet \(az-1\)/);
     await pane.getByRole("tab", { name: "By distinct plan" }).click();
-    // Two distinct plans for twelve hosts, the destructive one flagged, the
-    // secret rotation shown only as tokens.
-    assert.equal(await pane.locator("details.plan").count(), 2);
+    // Every distinct plan of the rollout, whatever its phase, the
+    // destructive one flagged, the secret rotation shown only as tokens.
+    assert.equal(await pane.locator("details.plan").count(), 3);
     assert.equal(await pane.locator("details.plan--destructive").count(), 1);
+    const hosts = await pane.locator(".plan__hosts").allTextContents();
+    assert.ok(hosts.some((h) => /canary: pi-1 · home: pi-2/.test(h)), "hosts are named by phase");
+    assert.ok(hosts.some((h) => /everything-else: lab-1, lab-2/.test(h)), "later phases' plans are listed too");
     assert.match(await pane.textContent(), /«secret:nomad_server@3f9a»/);
     assert.match(await pane.textContent(), /Rotates nomad_server/);
     assert.ok((await pane.locator(".step--destructive").count()) >= 4);
-    assert.match(await pane.textContent(), /1 host has no plan yet \(az-1\)/);
-    // Plans outside the phase being approved stay listed beneath it.
-    const other = page.locator("section.panel", { has: page.getByRole("heading", { name: "Other plans" }) });
-    await other.waitFor();
-    assert.match(await other.textContent(), /distinct plan/, "earlier phases' plans stay visible");
 
-    await page.getByRole("button", { name: "Approve cloud…" }).click();
+    await approval.getByRole("button", { name: "Approve phase cloud…" }).click();
     const dialog = page.getByRole("dialog", { name: "Approve cloud of rollout #42" });
     await dialog.waitFor();
     const summary = await dialog.getByTestId("approval-summary").textContent();
@@ -126,9 +127,9 @@ describe("approving a phase", () => {
     await close();
   });
 
-  test("shows the union across hosts with fact placeholders", async () => {
+  test("shows the union across hosts and phases with fact placeholders", async () => {
     const { page, close } = await open("/rollouts/42");
-    const fleet = page.locator("#approval").getByTestId("fleet-plan");
+    const fleet = page.locator("#plans").getByTestId("fleet-plan");
     await fleet.waitFor();
     const module = (resource) => fleet.locator(`details.plan-module:has(li[data-resource="${resource}"])`);
     // Modules start closed, headed by what they change on how many hosts;
@@ -140,11 +141,19 @@ describe("approving a phase", () => {
     const nomad = module("file.template[/etc/nomad.d/client.hcl]");
     const nomadHead = nomad.locator("> summary");
     assert.match(await nomadHead.getByTestId("tally").textContent(), /~\d+/);
-    assert.match(await nomadHead.getByTestId("hosts-changed").textContent(), /all \d+ hosts changed/);
+    // nomad changes every host but the lab's: the phases it changes, their
+    // hosts on hover.
+    const nomadHosts = nomadHead.getByTestId("hosts-changed");
+    assert.match(await nomadHosts.textContent(), /^canary, home, cloud changed$/);
+    assert.match(await nomadHosts.getAttribute("title"), /^canary: pi-1 · home: .* · cloud: /);
     assert.match(
       await module("file.absent[/etc/grey/agent.token]").locator("> summary").getByTestId("hosts-changed").textContent(),
-      /4 changed · \d+ unchanged/,
+      /^4 of 12 in cloud changed$/,
     );
+    // A change on part of the fleet names the phases it covers.
+    const removals = fleet.locator("details.plan-module--removals");
+    await removals.locator("> summary").click();
+    assert.match(await removals.locator(".plan-module__body .scope").first().textContent(), /^4 of 12 in cloud$/);
 
     // Warnings are one block too, each a single wrapping line of text.
     const warnings = fleet.locator("details.plan-module--warnings");
@@ -173,7 +182,7 @@ describe("approving a phase", () => {
     const tip = page.getByRole("tooltip");
     await tip.waitFor();
     assert.match(await tip.textContent(), /host\.id/);
-    assert.match(await tip.textContent(), /oci-1/);
+    assert.match(await tip.textContent(), /pi-1/);
 
     await close();
   });

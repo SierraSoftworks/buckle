@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    ApproveRequest, ContinueRequest, FleetPlan, HostRolloutState, HostSummary, LiveEvent,
-    PlanGroup, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
+    ApproveRequest, ContinueRequest, HostRolloutState, HostSummary, LiveEvent, PlanGroup,
+    RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -19,13 +19,13 @@ use crate::components::icons;
 use crate::components::meter::stage_segments;
 use crate::components::ui::Copyable;
 use crate::components::{
-    ActionMenu, Button, Changes, Commit, CommitCard, Confirm, Countdown, Empty, ErrorBlock,
-    ErrorState, HostLink, HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill,
-    Pipeline, PlanViews, Refresh, RouteLink, RunReportView, SplitButton, TraceLink, use_toast,
+    ActionMenu, Button, Changes, Commit, CommitCard, Confirm, Countdown, ErrorBlock, ErrorState,
+    HostLink, HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill, Pipeline, PlanViews,
+    Refresh, RouteLink, RunReportView, SplitButton, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::controls::{Decision, Standing, decisions};
-use crate::logic::fleet_plan::fleet_tally;
+use crate::logic::fleet_plan::{Phases, fleet_tally};
 use crate::logic::format::{count, relative, rollout_label, short, since, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{self, GateKind, GateState, host_checks, layout};
@@ -183,7 +183,6 @@ pub fn rollout_page(props: &Props) -> Html {
         });
     }
     let actions = use_rollout_actions(id.clone(), detail.set.clone());
-    let focus_phase = use_state(|| None::<String>);
 
     let Some(d) = live else {
         return html! {
@@ -224,14 +223,12 @@ pub fn rollout_page(props: &Props) -> Html {
 
     let pipeline = layout(&d);
     let wanting = wanting_approval(&pipeline);
-    let focused = focus_phase
-        .as_ref()
-        .and_then(|n| wanting.iter().find(|p| &p.name == n))
-        .or_else(|| {
-            wanting
-                .iter()
-                .find(|p| p.state == buckle_api::PhaseState::AwaitingApproval)
-        })
+    // The head's approval is for the phase the rollout waits on, else the
+    // first that wants one; every phase wanting one is approved on its own
+    // from the plans panel.
+    let focused = wanting
+        .iter()
+        .find(|p| p.state == buckle_api::PhaseState::AwaitingApproval)
         .or(wanting.first())
         .copied();
 
@@ -240,24 +237,8 @@ pub fn rollout_page(props: &Props) -> Html {
         if admin { { controls(&d, focused.filter(|p| !scope_of(p, &plan_groups).digests.is_empty()).map(|p| p.name.as_str()), &open) } }
     </> };
 
-    // The approval pane shows its phase's plans; every other plan (earlier
-    // phases, already applying) stays visible beneath it.
-    let approval = match focused {
-        Some(phase) if !finished => {
-            let scope = scope_of(phase, &plan_groups);
-            let rest: Vec<PlanGroup> = plan_groups
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !scope.groups.contains(i))
-                .map(|(_, g)| g.clone())
-                .collect();
-            html! { <>
-                { approval_pane(phase, &wanting, &d, &plan_groups, admin, &focus_phase) }
-                { all_plans("Other plans", &rest, d.fleet.as_ref()) }
-            </> }
-        }
-        _ => all_plans("Plans", &plan_groups, d.fleet.as_ref()),
-    };
+    let approving: &[&RolloutPhase] = if finished { &[] } else { &wanting };
+    let plans_panel = plans_panel(approving, &d, &plan_groups, admin, &open);
 
     let dialog = actions.dialog(&d, &plan_groups);
 
@@ -285,7 +266,7 @@ pub fn rollout_page(props: &Props) -> Html {
             <Panel title="Pipeline" subtitle={format!("{} hosts in {} stages · {}/{} done", s.hosts_total, d.phases.len(), s.hosts_done, s.hosts_total)}>
                 <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
             </Panel>
-            { approval }
+            { plans_panel }
             <Panel title="Hosts" subtitle="By stage. Click a row for the host's way through this rollout and its run report; hover a name for the host">
                 <HostTable detail={d.clone()} plans={plan_groups.clone()} admin={admin && !finished} on_ask={open.clone()} on_run={actions.now.clone()} {activity} {hosts} {now} />
             </Panel>
@@ -604,14 +585,64 @@ pub(crate) fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalSco
     approval_scope(&approval_hosts(phase), plans)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn approval_pane(
-    phase: &RolloutPhase,
+/// The rollout's plans as one view across every phase, headed by an
+/// approval for each phase that wants one: the plans are reviewed together,
+/// approved phase by phase.
+fn plans_panel(
     wanting: &[&RolloutPhase],
     d: &RolloutDetail,
     plans: &[PlanGroup],
     admin: bool,
-    focus: &UseStateHandle<Option<String>>,
+    open: &Callback<Ask>,
+) -> Html {
+    if plans.is_empty() && wanting.is_empty() {
+        return html! {};
+    }
+    let phases = Phases(
+        d.phases
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.hosts.iter().map(|h| h.host.clone()).collect(),
+                )
+            })
+            .collect(),
+    );
+    let in_phases = d.phases.iter().filter(|p| !p.hosts.is_empty()).count();
+    let mut subtitle = format!(
+        "{} across {}",
+        count(plans.len(), "distinct plan", "distinct plans"),
+        count(in_phases, "phase", "phases")
+    );
+    if !wanting.is_empty() {
+        let names: Vec<&str> = wanting.iter().map(|p| p.name.as_str()).collect();
+        subtitle.push_str(&format!(" · approval wanted: {}", names.join(", ")));
+    }
+    html! {
+        <Panel title="Plans" id="plans" {subtitle}
+            class={classes!((!wanting.is_empty()).then_some("panel--approval"))}>
+            if !wanting.is_empty() {
+                <div class="approvals" data-testid="approvals">
+                    { for wanting.iter().map(|p| approval(p, d, plans, admin, open)) }
+                </div>
+            }
+            if !plans.is_empty() {
+                <PlanViews fleet={d.fleet.clone()} groups={plans.to_vec()} {phases}
+                    open_destructive={!wanting.is_empty()} />
+            }
+        </Panel>
+    }
+}
+
+/// One phase's approval: what it binds, what it leaves out, its health
+/// gate, and (for an administrator) a button to approve it.
+fn approval(
+    phase: &RolloutPhase,
+    d: &RolloutDetail,
+    plans: &[PlanGroup],
+    admin: bool,
+    open: &Callback<Ask>,
 ) -> Html {
     let scope = scope_of(phase, plans);
     let index = d
@@ -638,54 +669,38 @@ fn approval_pane(
             })
         });
     let names = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
-    let focus_names: Vec<String> = phase.hosts.iter().map(|h| h.host.clone()).collect();
-    let tabs = (wanting.len() > 1).then(|| {
-        html! {
-            <div class="tabs" role="tablist" aria-label="Phases needing approval">
-                { for wanting.iter().map(|p| {
-                    let name = p.name.clone();
-                    let focus = focus.clone();
-                    let selected = p.name == phase.name;
-                    html! {
-                        <button type="button" role="tab" aria-selected={selected.to_string()}
-                            class={classes!("tabs__tab", selected.then_some("tabs__tab--active"))}
-                            onclick={Callback::from(move |_| focus.set(Some(name.clone())))}>
-                            { p.name.clone() }
-                        </button>
-                    }
-                }) }
-            </div>
-        }
-    });
     let policy = if phase.approval == "if_destructive" {
         "approval: if_destructive, and a plan here is destructive"
     } else {
         "approval: required"
     };
+    let approve = (admin && !scope.digests.is_empty()).then(|| {
+        let (open, name) = (open.clone(), phase.name.clone());
+        html! {
+            <Button kind={Kind::Primary} small=true label={format!("Approve phase {}…", phase.name)}
+                onclick={Callback::from(move |_: MouseEvent| open.emit(Ask::Approve(name.clone())))}>
+                { "Approve…" }
+            </Button>
+        }
+    });
     html! {
-        <Panel title={format!("Approve phase: {}", phase.name)} id="approval"
-            subtitle={format!("Plans · {} · {} distinct · {policy}", count(scope.hosts.len() + scope.without_plan.len(), "host", "hosts"), scope.digests.len())}
-            class="panel--approval">
-            { tabs.unwrap_or_default() }
+        <section class="approval" data-phase={phase.name.clone()} aria-label={format!("Approve phase: {}", phase.name)}>
+            <div class="approval__head">
+                <h4 class="subhead">{ format!("Approve phase: {}", phase.name) }</h4>
+                <span class="muted small">{ format!("{} · {} · {policy}",
+                    count(scope.hosts.len() + scope.without_plan.len(), "host", "hosts"),
+                    count(scope.digests.len(), "distinct plan", "distinct plans")) }</span>
+                { approve.unwrap_or_default() }
+            </div>
             if !earlier_running.is_empty() {
                 <p class="note">{ format!("{} still running; an approval given now is held until {} is reached.", earlier_running.join(", "), phase.name) }</p>
             }
             if scope.groups.is_empty() {
                 if missing.is_empty() && !deferred.is_empty() {
-                    <Empty title="No plans yet" message={format!("{} plans when its stage opens; this phase can be approved once it has.", names(&deferred))} />
+                    <p class="muted">{ format!("No plans yet: {} plans when its stage opens; this phase can be approved once it has.", names(&deferred)) }</p>
                 } else {
-                    <Empty title="No plans yet" message="Plans arrive as the hosts answer; this phase can be approved once they have." />
+                    <p class="muted">{ "No plans yet: plans arrive as the hosts answer; this phase can be approved once they have." }</p>
                 }
-            }
-            <PlanViews fleet={d.fleet.as_ref().map(|f| f.restrict(&scope.hosts))}
-                groups={scope.groups.iter().map(|i| plans[*i].clone()).collect::<Vec<_>>()}
-                focus={focus_names.clone()} open_first=true />
-            if !phase.health_checks.is_empty() {
-                <div class="approval__gate" data-testid="health-gate">
-                    <h4 class="subhead">{ "Health gate" }</h4>
-                    { crate::components::pipeline::health_gate(phase) }
-                    <p class="muted small">{ "Checked on each host before it applies, through its bake, and on every updated host again before the next phase starts." }</p>
-                </div>
             }
             if !missing.is_empty() {
                 <p class="note note--warn">
@@ -698,26 +713,21 @@ fn approval_pane(
                     { format!("Planned when its stage opens, so not covered by this approval: {}.", names(&deferred)) }
                 </p>
             }
-            <div class="approval__actions">
-                if admin {
-                    <span class="muted small">{ format!("Approving {} binds {} for {}. A host whose plan changes after approval asks again.",
-                        phase.name, count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</span>
-                } else {
-                    <p class="muted">{ "Approving needs an administrator (admin_acl)." }</p>
+            if !phase.health_checks.is_empty() {
+                <div class="approval__gate" data-testid="health-gate">
+                    <span class="muted small">{ "Health gate, checked on each host before it applies, through its bake, and on every updated host again before the next phase starts:" }</span>
+                    { crate::components::pipeline::health_gate(phase) }
+                </div>
+            }
+            if admin {
+                if !scope.digests.is_empty() {
+                    <p class="muted small">{ format!("Approving {} binds {} for {}. A host whose plan changes after approval asks again.",
+                        phase.name, count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</p>
                 }
-            </div>
-        </Panel>
-    }
-}
-
-fn all_plans(title: &'static str, plans: &[PlanGroup], fleet: Option<&FleetPlan>) -> Html {
-    if plans.is_empty() {
-        return html! {};
-    }
-    html! {
-        <Panel {title} subtitle={format!("{} across the rollout", count(plans.len(), "distinct plan", "distinct plans"))}>
-            <PlanViews fleet={fleet.cloned()} groups={plans.to_vec()} />
-        </Panel>
+            } else {
+                <p class="muted small">{ "Approving needs an administrator (admin_acl)." }</p>
+            }
+        </section>
     }
 }
 

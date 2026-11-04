@@ -121,17 +121,102 @@ pub fn hosts_changed(total: usize, changed: usize) -> String {
     }
 }
 
+/// A rollout's phases in order, each with its hosts: a plan across phases
+/// names the phases a line covers rather than its hosts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Phases(pub Vec<(String, Vec<String>)>);
+
+impl Phases {
+    /// Each phase's hosts among `all` (the hosts under review), empty
+    /// phases left out.
+    fn within<'a>(&'a self, all: &[String]) -> Vec<(&'a str, Vec<&'a String>)> {
+        self.0
+            .iter()
+            .map(|(n, h)| {
+                (
+                    n.as_str(),
+                    h.iter().filter(|h| all.contains(h)).collect::<Vec<_>>(),
+                )
+            })
+            .filter(|(_, h)| !h.is_empty())
+            .collect()
+    }
+}
+
 /// Whether `hosts` covers every one of `all`, and how to say who it covers:
-/// `all 5 hosts`, a short list of names, or `3 of 5 hosts`.
-pub fn scope_label(all: &[String], hosts: &[String]) -> (bool, String) {
+/// `all 5 hosts`; across phases, its [`phase_label`]; else a short list
+/// of names, or `3 of 5 hosts`.
+pub fn scope_label(all: &[String], hosts: &[String], phases: &Phases) -> (bool, String) {
     let fleet_wide = !all.is_empty() && all.iter().all(|h| hosts.contains(h));
-    let label = match (fleet_wide, all.len(), hosts.len()) {
-        (true, 1, _) => all[0].clone(),
-        (true, n, _) => format!("all {n} hosts"),
-        (false, _, 1 | 2) => hosts.join(", "),
-        (false, n, k) => format!("{k} of {}", count(n, "host", "hosts")),
+    if fleet_wide {
+        return match all.len() {
+            1 => (true, all[0].clone()),
+            n => (true, format!("all {n} hosts")),
+        };
+    }
+    if let Some(label) = phase_label(all, hosts, phases) {
+        return (false, label);
+    }
+    let label = match (all.len(), hosts.len()) {
+        (_, 1 | 2) => hosts.join(", "),
+        (n, k) => format!("{k} of {}", count(n, "host", "hosts")),
     };
-    (fleet_wide, label)
+    (false, label)
+}
+
+/// Who part of `all` is, said by phase where the rollout has more than one
+/// under review: the up to three whole phases it covers (`home, cloud`), or
+/// more than two hosts of one phase (`4 of 12 in cloud`).
+pub fn phase_label(all: &[String], hosts: &[String], phases: &Phases) -> Option<String> {
+    let within = phases.within(all);
+    let touched: Vec<&(&str, Vec<&String>)> = within
+        .iter()
+        .filter(|(_, h)| h.iter().any(|x| hosts.contains(x)))
+        .collect();
+    let placed = hosts
+        .iter()
+        .all(|x| within.iter().any(|(_, h)| h.contains(&x)));
+    if within.len() < 2 || !placed {
+        return None;
+    }
+    let whole = touched
+        .iter()
+        .all(|(_, h)| h.iter().all(|x| hosts.contains(x)));
+    match (whole, touched.as_slice()) {
+        (true, t) if !t.is_empty() && t.len() <= 3 => {
+            Some(t.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "))
+        }
+        (false, [(name, h)]) if hosts.len() > 2 => {
+            Some(format!("{} of {} in {name}", hosts.len(), h.len()))
+        }
+        _ => None,
+    }
+}
+
+/// The hosts a line covers, by phase where there are phases:
+/// `home: pi-2 · cloud: oci-1, oci-2`.
+pub fn scope_title(hosts: &[String], phases: &Phases) -> String {
+    let mut parts: Vec<String> = phases
+        .0
+        .iter()
+        .filter_map(|(n, h)| {
+            let here: Vec<&str> = h
+                .iter()
+                .filter(|x| hosts.contains(x))
+                .map(String::as_str)
+                .collect();
+            (!here.is_empty()).then(|| format!("{n}: {}", here.join(", ")))
+        })
+        .collect();
+    let elsewhere: Vec<&str> = hosts
+        .iter()
+        .filter(|x| !phases.0.iter().any(|(_, h)| h.contains(x)))
+        .map(String::as_str)
+        .collect();
+    if !elsewhere.is_empty() {
+        parts.push(elsewhere.join(", "));
+    }
+    parts.join(" · ")
 }
 
 #[cfg(test)]
@@ -279,15 +364,60 @@ mod tests {
     #[test]
     fn scope_reads_as_all_hosts_or_names_the_subset() {
         let all = names(&["a", "b", "c", "d"]);
-        assert_eq!(scope_label(&all, &all), (true, "all 4 hosts".into()));
+        let none = Phases::default();
+        assert_eq!(scope_label(&all, &all, &none), (true, "all 4 hosts".into()));
         assert_eq!(
-            scope_label(&all, &names(&["a", "c"])),
+            scope_label(&all, &names(&["a", "c"]), &none),
             (false, "a, c".into())
         );
         assert_eq!(
-            scope_label(&all, &names(&["a", "b", "c"])),
+            scope_label(&all, &names(&["a", "b", "c"]), &none),
             (false, "3 of 4 hosts".into())
         );
-        assert!(scope_label(&names(&["a"]), &names(&["a"])).0);
+        assert!(scope_label(&names(&["a"]), &names(&["a"]), &none).0);
+    }
+
+    fn phases() -> Phases {
+        Phases(vec![
+            ("canary".into(), names(&["a"])),
+            ("home".into(), names(&["b", "c", "d"])),
+            ("cloud".into(), names(&["e", "f", "g", "h"])),
+            ("lab".into(), names(&["i"])),
+            // Not under review: no plan yet.
+            ("later".into(), names(&["z"])),
+        ])
+    }
+
+    #[test]
+    fn across_phases_scope_names_the_phases_it_covers() {
+        let all = names(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+        for (hosts, want) in [
+            (&["a"][..], "canary"),
+            (&["b", "c", "d"], "home"),
+            (&["a", "e", "f", "g", "h"], "canary, cloud"),
+            (
+                &["a", "b", "c", "d", "e", "f", "g", "h"],
+                "canary, home, cloud",
+            ),
+            (&["e", "f", "g"], "3 of 4 in cloud"),
+            (&["e", "f"], "e, f"),
+            (&["a", "b", "e"], "3 of 9 hosts"),
+        ] {
+            assert_eq!(
+                scope_label(&all, &names(hosts), &phases()),
+                (false, want.into()),
+                "{hosts:?}"
+            );
+        }
+        assert_eq!(scope_label(&all, &all, &phases()).1, "all 9 hosts");
+    }
+
+    #[test]
+    fn scope_title_groups_hosts_by_phase() {
+        assert_eq!(
+            scope_title(&names(&["a", "e", "f", "x"]), &phases()),
+            "canary: a · cloud: e, f · x"
+        );
+        assert_eq!(scope_title(&names(&["a", "b"]), &Phases::default()), "a, b");
     }
 }

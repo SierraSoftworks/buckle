@@ -11,17 +11,13 @@ use yew::prelude::*;
 use super::changes::Changes;
 use super::diff::{DiffView, secret_text};
 use super::icons;
-use crate::logic::fleet_plan::Tally;
+use crate::logic::fleet_plan::{Phases, Tally, scope_title};
 use crate::logic::format::{count, short};
 use crate::logic::plan::review;
 
 #[derive(Properties, PartialEq)]
 pub struct PlanGroupProps {
     pub group: PlanGroup,
-    /// The hosts of the phase under review; others sharing the plan are
-    /// listed apart.
-    #[prop_or_default]
-    pub focus: Vec<String>,
     #[prop_or_default]
     pub open: bool,
 }
@@ -30,11 +26,7 @@ pub struct PlanGroupProps {
 pub fn plan_group(props: &PlanGroupProps) -> Html {
     let g = &props.group;
     let r = g.plan.as_ref().map(review);
-    let (here, elsewhere): (Vec<&String>, Vec<&String>) = if props.focus.is_empty() {
-        (g.hosts.iter().collect(), Vec::new())
-    } else {
-        g.hosts.iter().partition(|h| props.focus.contains(h))
-    };
+    let phases = use_context::<Phases>().unwrap_or_default();
     let destructive = r
         .as_ref()
         .map(|r| r.destructive())
@@ -42,7 +34,7 @@ pub fn plan_group(props: &PlanGroupProps) -> Html {
     let summary = html! {
         <summary class="plan__summary">
             <span class="plan__digest mono" title={g.digest.clone()}>{ short(&g.digest) }</span>
-            <span class="plan__hosts">{ here.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ") }</span>
+            <span class="plan__hosts">{ scope_title(&g.hosts, &phases) }</span>
             <span class="plan__counts">
                 { count(g.changes as usize, "change", "changes") }
                 if g.removals > 0 { { " · " }{ count(g.removals as usize, "removal", "removals") } }
@@ -57,9 +49,6 @@ pub fn plan_group(props: &PlanGroupProps) -> Html {
             data-digest={g.digest.clone()}>
             { summary }
             <div class="plan__body">
-                if !elsewhere.is_empty() {
-                    <p class="muted">{ format!("Also the plan of {} in other stages.", elsewhere.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ")) }</p>
-                }
                 { match &g.plan {
                     Some(plan) => body(plan),
                     None => html! { <p class="muted">{ "The plan document is not available; the counts above come from the server's summary." }</p> },

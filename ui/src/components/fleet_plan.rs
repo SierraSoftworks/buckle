@@ -1,5 +1,5 @@
-//! A rollout's plan as one union across its hosts: each change marked as
-//! fleet-wide or naming the hosts it applies to, host-specific values shown
+//! A rollout's plan as one union across its hosts and phases: each change
+//! marked as fleet-wide or naming the phases or hosts it applies to, host-specific values shown
 //! as fact placeholders (with sample values on hover), and a tab per version
 //! where a change still differs between hosts.
 
@@ -15,7 +15,9 @@ use super::plan::{
     rehome, rehomed_block, removal, removals_block, step_class, step_detail, step_line, warning,
     warnings_block,
 };
-use crate::logic::fleet_plan::{hosts_changed, scope_label, summarise};
+use crate::logic::fleet_plan::{
+    Phases, hosts_changed, phase_label, scope_label, scope_title, summarise,
+};
 use crate::logic::format::count;
 
 #[derive(Properties, PartialEq)]
@@ -23,28 +25,32 @@ pub struct FleetPlanProps {
     pub plan: FleetPlan,
 }
 
-/// Which hosts a line applies to: all of them, or a named subset.
-fn scope(all: &[String], hosts: &[String]) -> Html {
-    let (fleet_wide, label) = scope_label(all, hosts);
+/// Which hosts a line applies to: all of them, or a named subset (by
+/// phase, across phases).
+fn scope(all: &[String], hosts: &[String], phases: &Phases) -> Html {
+    let (fleet_wide, label) = scope_label(all, hosts, phases);
     html! {
         <span class={classes!("scope", if fleet_wide { "scope--all" } else { "scope--subset" })}
-            title={hosts.join(", ")}>
+            title={scope_title(hosts, phases)}>
             { label }
         </span>
     }
 }
 
-fn shared_scope<T>(all: &[String], s: &Shared<T>) -> Html {
-    scope(all, &s.hosts)
+fn shared_scope<T>(all: &[String], s: &Shared<T>, phases: &Phases) -> Html {
+    scope(all, &s.hosts, phases)
 }
 
-/// How many of the hosts under review a block changes, for its heading.
-fn changed_of(all: &[String], changed: &[String]) -> Html {
+/// How many of the hosts under review a block changes, for its heading;
+/// across phases, the phases it changes where they say it.
+fn changed_of(all: &[String], changed: &[String], phases: &Phases) -> Html {
     let fleet_wide = all.iter().all(|h| changed.contains(h));
     html! {
         <span class={classes!("scope", if fleet_wide { "scope--all" } else { "scope--subset" })}
-            title={changed.join(", ")} data-testid="hosts-changed">
-            { hosts_changed(all.len(), changed.len()) }
+            title={scope_title(changed, phases)} data-testid="hosts-changed">
+            { (!fleet_wide).then(|| phase_label(all, changed, phases)).flatten()
+                .map(|p| format!("{p} changed"))
+                .unwrap_or_else(|| hosts_changed(all.len(), changed.len())) }
         </span>
     }
 }
@@ -56,11 +62,11 @@ fn union<T>(list: &[Shared<T>]) -> Vec<String> {
 }
 
 /// A line's scope, unless it is the same as its module's.
-fn scope_within(all: &[String], module: &[String], hosts: &[String]) -> Html {
+fn scope_within(all: &[String], module: &[String], hosts: &[String], phases: &Phases) -> Html {
     if module.iter().all(|h| hosts.contains(h)) {
         html! {}
     } else {
-        scope(all, hosts)
+        scope(all, hosts, phases)
     }
 }
 
@@ -68,6 +74,8 @@ fn scope_within(all: &[String], module: &[String], hosts: &[String]) -> Html {
 pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
     let p = &props.plan;
     let all = &p.hosts;
+    let phases = use_context::<Phases>().unwrap_or_default();
+    let ph = &phases;
     let exemplars = use_memo(p.facts.clone(), |f| {
         FactExemplars(Rc::new(FleetPlan {
             facts: f.clone(),
@@ -79,8 +87,8 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
         let warned = union(&p.warnings);
         warnings_block(
             p.warnings.len(),
-            scope(all, &warned),
-            html! { { for p.warnings.iter().map(|w| warning(&w.value, scope_within(all, &warned, &w.hosts))) } },
+            scope(all, &warned, ph),
+            html! { { for p.warnings.iter().map(|w| warning(&w.value, scope_within(all, &warned, &w.hosts, ph))) } },
         )
     });
     // Modules that change nothing anywhere are left out; the rest are
@@ -95,13 +103,13 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
         let within = summary.changed.clone();
         Some(block(
             "",
-            module_head(&m.module, &m.needs, !m.deferred.is_empty(), summary.tally, changed_of(all, &summary.changed)),
+            module_head(&m.module, &m.needs, !m.deferred.is_empty(), summary.tally, changed_of(all, &summary.changed, ph)),
             html! {
                 <ul class="steps">
                     { for changed.into_iter().map(|s| html! {
                         <FleetStepView step={s.clone()} all={all.clone()} module={within.clone()} />
                     }) }
-                    { for m.handlers.iter().map(|h| handler(&m.module, &h.value, scope_within(all, &within, &h.hosts))) }
+                    { for m.handlers.iter().map(|h| handler(&m.module, &h.value, scope_within(all, &within, &h.hosts, ph))) }
                 </ul>
             },
         ))
@@ -109,15 +117,15 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
     let removals = (!p.removals.is_empty()).then(|| {
         removals_block(
             p.removals.len(),
-            changed_of(all, &union(&p.removals)),
-            html! { { for p.removals.iter().map(|r| removal(&r.value, shared_scope(all, r))) } },
+            changed_of(all, &union(&p.removals), ph),
+            html! { { for p.removals.iter().map(|r| removal(&r.value, shared_scope(all, r, ph))) } },
         )
     });
     let rehomed = (!p.rehomed.is_empty()).then(|| {
         rehomed_block(
             p.rehomed.len(),
-            changed_of(all, &union(&p.rehomed)),
-            html! { { for p.rehomed.iter().map(|r| rehome(&r.value, shared_scope(all, r))) } },
+            changed_of(all, &union(&p.rehomed), ph),
+            html! { { for p.rehomed.iter().map(|r| rehome(&r.value, shared_scope(all, r, ph))) } },
         )
     });
     let notes = |title: &str,
@@ -133,7 +141,7 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
             "",
             notes_head(title, aside, list.len()),
             html! { <>
-                <ul class="steps">{ for list.iter().map(|n| note(&n.value, glyph, class, shared_scope(all, n))) }</ul>
+                <ul class="steps">{ for list.iter().map(|n| note(&n.value, glyph, class, shared_scope(all, n, ph))) }</ul>
                 { footer }
             </> },
         )
@@ -142,7 +150,12 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
         <ContextProvider<FactExemplars> context={(*exemplars).clone()}>
             <div class="fleet-plan" data-testid="fleet-plan">
                 <p class="fleet-plan__intro muted small">
-                    { format!("The modules that change something on {}, each with what it changes on how many; open one for its diffs. ", count(all.len(), "host", "hosts")) }
+                    { format!("The modules that change something on {}{}, each with what it changes on how many; open one for its diffs. ",
+                        count(all.len(), "host", "hosts"),
+                        match ph.0.iter().filter(|(_, h)| h.iter().any(|x| all.contains(x))).count() {
+                            0 | 1 => String::new(),
+                            n => format!(" in {n} phases"),
+                        }) }
                     if !p.facts.is_empty() {
                         { " " }<span class="fact fact--legend">{ icons::host() }<span class="fact__path">{ "fact" }</span></span>
                         { " stands for a value that differs per host; hover it for examples." }
@@ -178,6 +191,7 @@ struct FleetStepProps {
 #[function_component(FleetStepView)]
 fn fleet_step_view(props: &FleetStepProps) -> Html {
     let s = &props.step;
+    let phases = use_context::<Phases>().unwrap_or_default();
     let variant = use_state(|| 0usize);
     let index = (*variant).min(s.variants.len().saturating_sub(1));
     let Some(chosen) = s.variants.get(index) else {
@@ -185,7 +199,7 @@ fn fleet_step_view(props: &FleetStepProps) -> Html {
     };
     let changed: Vec<String> = s.changed_hosts().cloned().collect();
     let extra = html! { <>
-        { scope_within(&props.all, &props.module, &changed) }
+        { scope_within(&props.all, &props.module, &changed, &phases) }
         if s.variants.len() > 1 {
             <span class="badge badge--info" title="The change differs between hosts beyond their facts.">
                 { format!("varies: {} versions", s.variants.len()) }
@@ -222,29 +236,31 @@ pub struct PlanViewsProps {
     pub fleet: Option<FleetPlan>,
     /// The distinct plans, for the per-plan view and hosts' own renders.
     pub groups: Vec<PlanGroup>,
-    /// The hosts under review (see [`super::plan::PlanGroupProps::focus`]).
+    /// The rollout's phases and their hosts, so a line names the phases it
+    /// covers.
     #[prop_or_default]
-    pub focus: Vec<String>,
-    /// Open the first and any destructive plan in the per-plan view.
+    pub phases: Phases,
+    /// Open any destructive plan in the per-plan view.
     #[prop_or_default]
-    pub open_first: bool,
+    pub open_destructive: bool,
 }
 
-/// The plans under review, as one fleet-wide union (the default) or as the
-/// distinct plans that approval binds.
+/// A rollout's plans across all its phases, as one fleet-wide union (the
+/// default) or as the distinct plans that approval binds.
 #[function_component(PlanViews)]
 pub fn plan_views(props: &PlanViewsProps) -> Html {
     let by_plan = use_state(|| false);
     let by_plan_view = html! {
         <div class="plans">
-            { for props.groups.iter().enumerate().map(|(n, g)| html! {
-                <super::PlanGroupView group={g.clone()} focus={props.focus.clone()}
-                    open={props.open_first && (n == 0 || g.destructive)} />
+            { for props.groups.iter().map(|g| html! {
+                <super::PlanGroupView group={g.clone()} open={props.open_destructive && g.destructive} />
             }) }
         </div>
     };
     let Some(fleet) = props.fleet.as_ref().filter(|f| !f.hosts.is_empty()) else {
-        return by_plan_view;
+        return html! {
+            <ContextProvider<Phases> context={props.phases.clone()}>{ by_plan_view }</ContextProvider<Phases>>
+        };
     };
     let tab = |label: &'static str, selected: bool, value: bool| {
         let by_plan = by_plan.clone();
@@ -256,12 +272,14 @@ pub fn plan_views(props: &PlanViewsProps) -> Html {
             </button>
         }
     };
-    html! { <>
-        <div class="tabs tabs--small" role="tablist" aria-label="Plan view">
-            { tab("Across the fleet", !*by_plan, false) }
-            { tab("By distinct plan", *by_plan, true) }
-        </div>
-        if *by_plan { { by_plan_view } }
-        else { <FleetPlanView plan={fleet.clone()} /> }
-    </> }
+    html! {
+        <ContextProvider<Phases> context={props.phases.clone()}>
+            <div class="tabs tabs--small" role="tablist" aria-label="Plan view">
+                { tab("Across the fleet", !*by_plan, false) }
+                { tab("By distinct plan", *by_plan, true) }
+            </div>
+            if *by_plan { { by_plan_view } }
+            else { <FleetPlanView plan={fleet.clone()} /> }
+        </ContextProvider<Phases>>
+    }
 }
