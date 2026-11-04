@@ -65,6 +65,10 @@ impl LocalTransport {
 /// Logs a report the way local mode shows it.
 pub fn log_report(report: &Report) {
     match report {
+        Report::For { target, report } => {
+            let _span = tracing::info_span!("target", %target).entered();
+            log_report(report)
+        }
         Report::Facts(_) => tracing::debug!("facts collected"),
         Report::Heartbeat { busy, .. } => tracing::debug!(busy, "heartbeat"),
         Report::Plan(plan) => tracing::info!(
@@ -187,6 +191,7 @@ fn assignment(revision: RevisionId, secrets: Vec<WireSecret>) -> [Instruction; 3
             secrets,
             tree_digest: None,
             target: None,
+            cluster: None,
         },
         Instruction::RequestPlan {
             revision: revision.clone(),

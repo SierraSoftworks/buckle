@@ -20,9 +20,10 @@ The directory name must equal the workload's `name`. `files/` holds the specs th
 name; files ending in `.j2` are rendered as [templates](./expressions.md#templates) first.
 
 ::: tip Status
-This release loads and validates workloads and records cluster targets. Scheduling workloads onto
-a cluster's executors, and the Nomad and Kubernetes task kinds that apply them, arrive in the
-following releases; until then a workload is planned as a no-op.
+Nomad workloads are planned, applied and health checked through one of the cluster's executors,
+which needs no cluster state of its own: the server sends the cluster's spec and secrets before
+each request, and ownership is read back from the cluster. Kubernetes clusters, a workload's extra
+`health` checks, `ignore`, `restart_on` and cluster `scope` are not yet applied by executors.
 :::
 
 ## workload.yaml

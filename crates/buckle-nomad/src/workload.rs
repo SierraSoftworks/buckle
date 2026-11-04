@@ -46,8 +46,15 @@ impl Workload {
 
     /// Plans every key. Pure: nothing in the cluster changes.
     pub async fn plan(&self, cx: &Context) -> Result<WorkloadPlan> {
+        self.plan_after(cx, &[]).await
+    }
+
+    /// [`Workload::plan`] after workloads that apply first and create
+    /// `earlier` (a namespace this workload's job lands in, say): those
+    /// objects plan as present-to-be rather than missing.
+    pub async fn plan_after(&self, cx: &Context, earlier: &[ObjectKey]) -> Result<WorkloadPlan> {
         let mut steps = Vec::new();
-        let mut created: Vec<ObjectKey> = Vec::new();
+        let mut created: Vec<ObjectKey> = earlier.to_vec();
         for p in self.primitives() {
             let step = p.plan(cx, &created).await?;
             if matches!(
@@ -84,6 +91,22 @@ pub struct WorkloadPlan {
 impl WorkloadPlan {
     pub fn changes(&self) -> usize {
         self.steps.iter().filter(|s| s.is_change()).count()
+    }
+
+    /// The objects the apply creates.
+    pub fn created(&self) -> Vec<ObjectKey> {
+        self.steps
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.planned,
+                    buckle_core::plan::Planned::Change {
+                        diff: buckle_core::plan::Diff::Create { .. }
+                    }
+                )
+            })
+            .map(|s| s.key.clone())
+            .collect()
     }
 
     /// The objects this workload declares, for orphan detection.

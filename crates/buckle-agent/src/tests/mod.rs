@@ -55,6 +55,32 @@ pub struct Setup {
     /// Builds a runner to use instead of `runner`, given the state
     /// directory (`runner` is then only reachable if the wrapper delegates).
     pub custom_runner: Option<RunnerFactory>,
+    /// The Nomad cluster targets reach (else none is reachable).
+    pub cluster: Option<buckle_nomad::testing::FakeNomad>,
+}
+
+/// Reaches every cluster target through one in-memory Nomad.
+struct FakeCluster(buckle_nomad::testing::FakeNomad);
+
+impl crate::cluster::Connect for FakeCluster {
+    fn nomad(
+        &self,
+        _target: &str,
+        _spec: &crate::cluster::TargetSpec,
+    ) -> buckle_core::Result<buckle_nomad::Nomad> {
+        Ok(self.0.client())
+    }
+}
+
+/// A revision bundle of `files` (`buckle.yaml` among them).
+pub fn bundle_files(files: &[(&str, &str)]) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (path, content) in files {
+        let p = dir.path().join(path);
+        std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+        std::fs::write(p, content).expect("write");
+    }
+    crate::bundle::pack_dir(dir.path()).expect("pack")
 }
 
 /// Builds a runner for a state directory.
@@ -68,6 +94,7 @@ impl Default for Setup {
             tcp: false,
             prepare: None,
             custom_runner: None,
+            cluster: None,
         }
     }
 }
@@ -110,7 +137,11 @@ impl Harness {
             Some(build) => build(&state_dir),
             None => setup.runner.clone(),
         };
-        let agent = Agent::new(config, transport, runner, updater.clone(), options).expect("agent");
+        let mut agent =
+            Agent::new(config, transport, runner, updater.clone(), options).expect("agent");
+        if let Some(fake) = setup.cluster {
+            agent = agent.with_cluster_connect(Arc::new(FakeCluster(fake)));
+        }
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn(agent.run(shutdown.clone()));
         Self {

@@ -120,6 +120,23 @@ impl InstallKey {
         Fingerprint(short)
     }
 
+    /// A key for `purpose` and `subject`, derived from this one: stable for
+    /// as long as this key is, and revealing nothing about it.
+    pub fn derive(&self, purpose: &str, subject: &str) -> InstallKey {
+        let domain = format!("buckle.derive/{purpose}\0");
+        InstallKey::from_bytes(self.mac(domain.as_bytes(), subject.as_bytes()))
+    }
+
+    /// The key material, for a sink.
+    pub(crate) fn bytes(&self, _: sinks::Witness) -> &[u8; 32] {
+        self.0.expose_secret()
+    }
+
+    /// Wraps key material received on the wire; `None` unless it is 32 bytes.
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        <[u8; 32]>::try_from(bytes).ok().map(Self::from_bytes)
+    }
+
     /// HMAC-SHA256 of `domain || bytes` under this key. Fingerprints use an
     /// empty domain (so they stay stable); other uses, such as the agent's
     /// cache integrity tag, pass a distinct domain string.

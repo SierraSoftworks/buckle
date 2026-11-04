@@ -189,6 +189,14 @@ pub struct TransportSink;
 
 impl Sink for TransportSink {}
 
+impl TransportSink {
+    /// The key material of `key`, for the wire: the server hands a cluster
+    /// target's fingerprint key ([`InstallKey::derive`]) to its executor.
+    pub fn key_bytes(&self, key: &InstallKey) -> Vec<u8> {
+        key.bytes(self.witness()).to_vec()
+    }
+}
+
 /// Sends values to a remote API that stores them (a Nomad variable, a
 /// Kubernetes Secret), and reads them back for comparison.
 ///
@@ -260,6 +268,12 @@ impl ApiSink {
             map.insert(field.to_owned(), serde_json::Value::Object(object));
         }
         Sensitive::new(serde_json::to_vec(&envelope).unwrap_or_default())
+    }
+
+    /// A secret used as the API's credential (a `secret://` cluster
+    /// identity), for the client that sends it as a header.
+    pub fn credential(&self, secret: &Secret) -> secrecy::SecretString {
+        secrecy::SecretString::from(secret.reveal(self.witness()).trim().to_owned())
     }
 
     /// The bytes of a request body, for the call that sends it and nothing else.

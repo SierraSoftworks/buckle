@@ -335,6 +335,28 @@ message Assign {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 5;
+  // For a cluster target: how its executor reaches it. The server sends a
+  // targeted Assign ahead of every RequestPlan, Apply, Rollback and
+  // RunHealth for the cluster, so an executor keeps nothing between them.
+  ClusterTarget cluster = 6;
+}
+
+// A cluster target as its executor needs it. `secrets` on the Assign are
+// the ones the cluster's selected workloads (and its identity) reference.
+message ClusterTarget {
+  // nomad or kubernetes.
+  string kind = 1;
+  // The cluster's API; empty: the executor's local default.
+  string api = 2;
+  // buckle_jwt, local, workload or secret://NAME.
+  string identity = 3;
+  // Effective labels (repository seed labels with operator overrides), for
+  // `cluster.labels.*` in workload selectors and templates.
+  map<string, string> labels = 4;
+  // Keys the fingerprints of values the executor plans by fingerprint
+  // (Nomad variable items). Derived per target by the server, so every
+  // executor of the target makes the same plan digest.
+  bytes fingerprint_key = 5;
 }
 
 message RequestPlan {
@@ -397,6 +419,10 @@ message RunHealth {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 6;
+  // For a cluster target: the revision whose workloads to check (the
+  // cluster's applied revision; an executor keeps none). Empty for a host,
+  // which checks its own applied revision.
+  string revision = 7;
 }
 
 message Ping {

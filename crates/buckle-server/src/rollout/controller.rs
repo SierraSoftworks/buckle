@@ -472,6 +472,14 @@ enum Out {
         revision: String,
         stable: bool,
     },
+    /// Work for a cluster over its executor's session, sent behind a
+    /// targeted Assign of the revision it concerns: the executor keeps
+    /// nothing about the cluster between instructions.
+    Targeted {
+        session: String,
+        target: String,
+        msg: Box<ServerMessage>,
+    },
 }
 
 /// A host agent speaks for clusters only once it announces it runs a
@@ -1095,8 +1103,16 @@ impl Controller {
             return;
         };
         let target = self.row_target(ri, hi);
-        self.outbox
-            .push(Out::Msg(session, Box::new(stamp_target(msg(m), &target))));
+        let m = Box::new(stamp_target(msg(m), &target));
+        self.outbox.push(if target.is_empty() {
+            Out::Msg(session, m)
+        } else {
+            Out::Targeted {
+                session,
+                target,
+                msg: m,
+            }
+        });
     }
 
     /// The `target` a row's messages carry: the cluster's id, or empty for
@@ -1326,6 +1342,7 @@ impl Controller {
                     hi,
                     server_message::Msg::Health(RunHealth {
                         target: String::new(),
+                        revision: String::new(),
                         request_id,
                         scope: HealthScope::Rollout as i32,
                         modules: vec![],
@@ -3123,6 +3140,7 @@ impl Controller {
             hi,
             server_message::Msg::Health(RunHealth {
                 target: String::new(),
+                revision: String::new(),
                 request_id,
                 scope: HealthScope::Baseline as i32,
                 modules: vec![],
@@ -3380,6 +3398,7 @@ impl Controller {
             hi,
             server_message::Msg::Health(RunHealth {
                 target: String::new(),
+                revision: String::new(),
                 request_id,
                 scope: HealthScope::Bake as i32,
                 modules: vec![],
@@ -4120,6 +4139,7 @@ impl Controller {
                     hi,
                     server_message::Msg::Health(RunHealth {
                         target: String::new(),
+                        revision: String::new(),
                         request_id: rid,
                         scope: HealthScope::Rollout as i32,
                         modules: vec![],
@@ -5082,6 +5102,15 @@ impl Controller {
                         undeliverable.insert(session);
                     }
                 }
+                Out::Targeted {
+                    session,
+                    target,
+                    msg,
+                } => {
+                    if !self.send_targeted(&session, &target, *msg).await {
+                        undeliverable.insert(session);
+                    }
+                }
             }
         }
         // A message that could not be delivered means the session is gone:
@@ -5116,34 +5145,8 @@ impl Controller {
         revision: &str,
         stable: bool,
     ) -> bool {
-        let rev = match self.revisions.load(revision).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(revision = %revision, error = %e, "the revision to assign could not be loaded");
-                return true;
-            }
-        };
-        let h = host.to_owned();
-        let rid = revision.to_owned();
-        let found = self
-            .store
-            .call(move |db| {
-                let rec = db.hosts().get(&h)?;
-                let facts = db.hosts().latest_facts(&h)?.map(|(f, _)| f);
-                let digest = db.revisions().get(&rid)?.and_then(|r| r.tarball_digest);
-                Ok((rec, facts.unwrap_or(serde_json::Value::Null), digest))
-            })
-            .await;
-        let Ok((Some(record), facts, tree_digest)) = found else {
+        let Some(assign) = self.assign_message(host, target, revision, stable).await else {
             return true;
-        };
-        // A cluster's secrets reach its executor through the workloads'
-        // own sink (a later step); the host's bundle is the host's.
-        let secrets = if target.is_empty() {
-            let ctx = crate::fleet::record_context(&record, &facts, &rev.fleet);
-            self.secrets.for_host(&rev, &ctx).await
-        } else {
-            pb::SecretBundle::default()
         };
         let select = self
             .live
@@ -5155,16 +5158,7 @@ impl Controller {
                     .map(|hi| self.row_select(ri, hi))
             })
             .unwrap_or_default();
-        let assigned = self.link.send(
-            host,
-            msg(server_message::Msg::Assign(Assign {
-                target: target.to_owned(),
-                revision: revision.to_owned(),
-                stable,
-                secrets: Some(secrets),
-                tree_digest: tree_digest.unwrap_or_default(),
-            })),
-        );
+        let assigned = self.link.send(host, assign);
         let planned = self.link.send(
             host,
             msg(server_message::Msg::Plan(RequestPlan {
@@ -5174,6 +5168,122 @@ impl Controller {
             })),
         );
         assigned && planned
+    }
+
+    /// Sends `m` for the cluster `target` over `session`, behind a targeted
+    /// Assign of the revision it concerns (for health, the cluster's applied
+    /// revision, which the request then names); `false` when the session is
+    /// gone.
+    async fn send_targeted(&mut self, session: &str, target: &str, mut m: ServerMessage) -> bool {
+        let revision = match &m.msg {
+            Some(server_message::Msg::Plan(p)) => p.revision.clone(),
+            Some(server_message::Msg::Apply(a)) => a.revision.clone(),
+            Some(server_message::Msg::Rollback(r)) => r.revision.clone(),
+            Some(server_message::Msg::Health(_)) => {
+                let t = target.to_owned();
+                self.store
+                    .call(move |db| Ok(db.hosts().target(&t)?.and_then(|r| r.applied_revision)))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        if let Some(server_message::Msg::Health(h)) = &mut m.msg {
+            h.revision = revision.clone();
+        }
+        if !revision.is_empty() {
+            let stable = self.stable.as_deref() == Some(revision.as_str());
+            if let Some(assign) = self
+                .assign_message(session, target, &revision, stable)
+                .await
+                && !self.link.send(session, assign)
+            {
+                return false;
+            }
+        }
+        self.link.send(session, m)
+    }
+
+    /// The Assign of `revision` for `host` itself (empty `target`) or for
+    /// the cluster `target` it executes: for a cluster, how to reach it and
+    /// the secrets its workloads reference. `None` when the revision or a
+    /// record cannot be loaded (logged).
+    async fn assign_message(
+        &mut self,
+        host: &str,
+        target: &str,
+        revision: &str,
+        stable: bool,
+    ) -> Option<ServerMessage> {
+        let rev = match self.revisions.load(revision).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(revision = %revision, error = %e, "the revision to assign could not be loaded");
+                return None;
+            }
+        };
+        let h = if target.is_empty() { host } else { target }.to_owned();
+        let rid = revision.to_owned();
+        let found = self
+            .store
+            .call(move |db| {
+                let rec = db.hosts().target(&h)?;
+                let facts = db.hosts().latest_facts(&h)?.map(|(f, _)| f);
+                let digest = db.revisions().get(&rid)?.and_then(|r| r.tarball_digest);
+                Ok((rec, facts.unwrap_or(serde_json::Value::Null), digest))
+            })
+            .await;
+        let Ok((Some(record), facts, tree_digest)) = found else {
+            return None;
+        };
+        let ctx = crate::fleet::record_context(&record, &facts, &rev.fleet);
+        let (secrets, cluster) = if target.is_empty() {
+            (self.secrets.for_host(&rev, &ctx).await, None)
+        } else {
+            let Some(spec) = record.cluster.as_ref().map(|c| &c.spec) else {
+                tracing::warn!(target = %target, "not a cluster target; nothing assigned");
+                return None;
+            };
+            // The revision's declaration wins over the stored record, which
+            // follows the reference revision.
+            let declared = rev.fleet.fleet.clusters.get(target);
+            let kind = declared
+                .map(|d| d.kind.as_str())
+                .unwrap_or(crate::targets::core_kind(spec.kind).as_str())
+                .to_owned();
+            let api = declared
+                .map(|d| d.api.clone())
+                .unwrap_or_else(|| spec.api.clone())
+                .unwrap_or_default();
+            let identity = declared
+                .map(|d| d.identity.to_string())
+                .unwrap_or_else(|| spec.identity.clone());
+            let secret = buckle_core::model::ClusterIdentity::parse(&identity)
+                .ok()
+                .and_then(|i| i.secret().map(str::to_owned));
+            let secrets = self
+                .secrets
+                .for_cluster(&rev, &ctx, secret.as_deref())
+                .await;
+            let cluster = pb::ClusterTarget {
+                kind,
+                api,
+                identity,
+                labels: record.effective_labels().into_iter().collect(),
+                fingerprint_key: self.secrets.fingerprint_key(target),
+            };
+            (secrets, Some(cluster))
+        };
+        Some(msg(server_message::Msg::Assign(Assign {
+            target: target.to_owned(),
+            revision: revision.to_owned(),
+            stable,
+            secrets: Some(secrets),
+            tree_digest: tree_digest.unwrap_or_default(),
+            cluster,
+        })))
     }
 }
 

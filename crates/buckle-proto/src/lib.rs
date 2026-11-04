@@ -61,6 +61,27 @@ pub mod v1 {
                 .field("stable", &self.stable)
                 .field("secrets", &self.secrets)
                 .field("tree_digest", &self.tree_digest)
+                .field("target", &self.target)
+                .field("cluster", &self.cluster)
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for ClusterTarget {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ClusterTarget")
+                .field("kind", &self.kind)
+                .field("api", &self.api)
+                .field("identity", &self.identity)
+                .field("labels", &self.labels)
+                .field(
+                    "fingerprint_key",
+                    &if self.fingerprint_key.is_empty() {
+                        ""
+                    } else {
+                        "<redacted>"
+                    },
+                )
                 .finish()
         }
     }
@@ -192,6 +213,10 @@ mod tests {
                 "{:?}",
                 Assign {
                     secrets: bundle(),
+                    cluster: Some(ClusterTarget {
+                        fingerprint_key: b"hunter2".to_vec(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }
             ),

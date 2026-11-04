@@ -23,6 +23,10 @@ struct State {
     volumes: Vec<Value>,
     outcome: String,
     requests: Vec<(String, String)>,
+    /// The `X-Nomad-Token` of each request (empty when none).
+    tokens: Vec<String>,
+    /// The JWTs presented to `/v1/acl/login`.
+    logins: Vec<String>,
 }
 
 /// The fake. Cheap to clone; clones share state.
@@ -133,10 +137,28 @@ impl FakeNomad {
         self.state.lock().unwrap().requests.clone()
     }
 
+    /// The `X-Nomad-Token` each request carried, in order (empty: none).
+    pub fn tokens(&self) -> Vec<String> {
+        self.state.lock().unwrap().tokens.clone()
+    }
+
+    /// The JWTs presented to `POST /v1/acl/login`. A login answers with the
+    /// ACL token `acl:<jwt>`.
+    pub fn logins(&self) -> Vec<String> {
+        self.state.lock().unwrap().logins.clone()
+    }
+
     /// Every request body seen, for leak checks.
     fn handle(&self, req: &Request) -> (u16, Value) {
         let mut s = self.state.lock().unwrap();
         s.requests.push((req.method.into(), req.path.clone()));
+        let token = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("X-Nomad-Token"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        s.tokens.push(token);
         let (path, query) = req.path.split_once('?').unwrap_or((&req.path, ""));
         let q = |k: &str| -> Option<String> {
             query
@@ -393,6 +415,18 @@ impl FakeNomad {
             ("DELETE", ["volume", "host", id]) => {
                 s.volumes.retain(|v| v["ID"] != json!(id));
                 (200, Value::Null)
+            }
+            ("POST", ["acl", "login"]) => {
+                let jwt = body["LoginToken"].as_str().unwrap_or_default().to_owned();
+                s.logins.push(jwt.clone());
+                (
+                    200,
+                    json!({
+                        "AccessorID": format!("accessor-{index}"),
+                        "SecretID": format!("acl:{jwt}"),
+                        "ExpirationTime": (chrono::Utc::now() + chrono::Duration::minutes(15)).to_rfc3339(),
+                    }),
+                )
             }
             ("GET", ["quotas"]) => not_found,
             _ => not_found,
