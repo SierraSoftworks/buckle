@@ -183,7 +183,7 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
         });
     }
     let enforce_index = plan["JobModifyIndex"].as_u64().unwrap_or(0);
-    let rendered = Redacted::plain(diff::render_job_diff(&plan["Diff"]));
+    let rendered = diff::render_job_diff(&plan["Diff"]);
     let groups = if preview.is_empty() {
         String::new()
     } else {
@@ -192,11 +192,18 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
     let planned = match live {
         None => Planned::change(Diff::Create {
             summary: format!("register {key}{groups}"),
-            preview: Some(rendered),
+            // Every line is an addition: show the job without the markers.
+            preview: Some(Redacted::plain(
+                rendered
+                    .lines()
+                    .map(|l| l.get(1..).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )),
         }),
         Some(_) => Planned::change(Diff::Update {
             summary: format!("update {key}{groups}"),
-            unified: Some(rendered),
+            unified: Some(Redacted::plain(rendered)),
         }),
     };
     Ok(Step {

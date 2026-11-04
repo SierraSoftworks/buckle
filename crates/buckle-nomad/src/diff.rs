@@ -10,7 +10,8 @@ pub fn subset(desired: &Value, live: &Value, exact: &[&str]) -> bool {
     field_changes(desired, live, exact).is_empty()
 }
 
-/// The fields of `desired` that differ from `live`, as `path: old => new` lines.
+/// The fields of `desired` that differ from `live`, one unified diff entry
+/// each: `+ path: new`, `- path: old`, or a `-`/`+` pair for an edit.
 pub fn field_changes(desired: &Value, live: &Value, exact: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     walk("", desired, live, exact, &mut out);
@@ -27,7 +28,7 @@ fn walk(path: &str, desired: &Value, live: &Value, exact: &[&str], out: &mut Vec
                 match l.get(k) {
                     Some(lv) if is_exact => {
                         if dv != lv {
-                            out.push(format!("~ {p}: {} => {}", short(lv), short(dv)));
+                            out.push(edited(&p, lv, dv));
                         }
                     }
                     Some(lv) => walk(&p, dv, lv, exact, out),
@@ -51,8 +52,13 @@ fn walk(path: &str, desired: &Value, live: &Value, exact: &[&str], out: &mut Vec
         (d, Value::Null) if is_empty(d) => {}
         (d, l) if d == l => {}
         (Value::Number(d), Value::Number(l)) if d.as_f64() == l.as_f64() => {}
-        (d, l) => out.push(format!("~ {path}: {} => {}", short(l), short(d))),
+        (d, l) => out.push(edited(path, l, d)),
     }
+}
+
+/// One changed field, as the `-`/`+` pair of a unified diff.
+fn edited(path: &str, live: &Value, desired: &Value) -> String {
+    format!("- {path}: {}\n+ {path}: {}", short(live), short(desired))
 }
 
 fn is_empty(v: &Value) -> bool {
@@ -82,116 +88,143 @@ fn short(v: &Value) -> String {
     }
 }
 
-/// Renders Nomad's structured job diff (`/v1/job/:id/plan` with `Diff`) the
-/// way `nomad job plan` prints it, skipping unchanged fields.
+/// Renders Nomad's structured job diff (`/v1/job/:id/plan` with `Diff`) as a
+/// unified diff, so it reads like Buckle's other diffs: the first column is
+/// `+`/`-` for added and removed lines (an edited field is a `-`/`+` pair) and
+/// blank for the job, groups, tasks and blocks that hold them; indentation
+/// after it carries the nesting. Unchanged fields are skipped.
 pub fn render_job_diff(diff: &Value) -> String {
-    let mut out = String::new();
-    let ty = diff["Type"].as_str().unwrap_or("None");
-    out.push_str(&format!("{} Job: {}\n", marker(ty), diff["ID"]));
-    fields(diff, 1, &mut out);
-    objects(diff, 1, &mut out);
+    let mut out = Vec::new();
+    let notes = |n: &Value, key: &str| match &n[key] {
+        Value::Object(u) => u
+            .iter()
+            .map(|(k, n)| format!("{n} {k}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => String::new(),
+    };
+    let head = |n: &Value, label: &str, key: &str| {
+        let notes = notes(n, key);
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({notes})")
+        };
+        format!("{label} {}{notes}", n["Name"])
+    };
+
+    let ty = kind(diff);
+    out.push(line(ty, 0, &format!("Job {}", diff["ID"])));
+    body(diff, ty, 1, &mut out);
     for tg in diff["TaskGroups"].as_array().into_iter().flatten() {
-        let ty = tg["Type"].as_str().unwrap_or("None");
-        let updates = tg["Updates"]
-            .as_object()
-            .map(|u| {
-                u.iter()
-                    .map(|(k, n)| format!("{n} {k}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .filter(|s| !s.is_empty())
-            .map(|s| format!(" ({s})"))
-            .unwrap_or_default();
-        if ty == "None" && updates.is_empty() {
+        let ty = kind(tg);
+        if ty == "None" && notes(tg, "Updates").is_empty() {
             continue;
         }
-        out.push_str(&format!(
-            "{}{} Task Group: {}{updates}\n",
-            indent(1),
-            marker(ty),
-            tg["Name"]
-        ));
-        fields(tg, 2, &mut out);
-        objects(tg, 2, &mut out);
+        out.push(line(ty, 1, &head(tg, "Task Group", "Updates")));
+        body(tg, ty, 2, &mut out);
         for task in tg["Tasks"].as_array().into_iter().flatten() {
-            let ty = task["Type"].as_str().unwrap_or("None");
+            let ty = kind(task);
             if ty == "None" {
                 continue;
             }
-            let notes = task["Annotations"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .filter(|s| !s.is_empty())
-                .map(|s| format!(" ({s})"))
-                .unwrap_or_default();
-            out.push_str(&format!(
-                "{}{} Task: {}{notes}\n",
-                indent(2),
-                marker(ty),
-                task["Name"]
-            ));
-            fields(task, 3, &mut out);
-            objects(task, 3, &mut out);
+            out.push(line(ty, 2, &head(task, "Task", "Annotations")));
+            body(task, ty, 3, &mut out);
         }
     }
-    out
+    out.join("\n") + "\n"
 }
 
-fn fields(node: &Value, depth: usize, out: &mut String) {
+fn kind(node: &Value) -> &str {
+    node["Type"].as_str().unwrap_or("None")
+}
+
+/// The changed fields and blocks of a node whose own change is `parent`.
+fn body(node: &Value, parent: &str, depth: usize, out: &mut Vec<String>) {
     for f in node["Fields"].as_array().into_iter().flatten() {
-        let ty = f["Type"].as_str().unwrap_or("None");
-        if ty == "None" {
-            continue;
-        }
-        let name = f["Name"].as_str().unwrap_or("");
-        let (old, new) = (
-            f["Old"].as_str().unwrap_or(""),
-            f["New"].as_str().unwrap_or(""),
-        );
-        let value = match ty {
-            "Added" => format!("{new:?}"),
-            "Deleted" => format!("{old:?}"),
-            _ => format!("{old:?} => {new:?}"),
-        };
-        out.push_str(&format!(
-            "{}{} {name}: {value}\n",
-            indent(depth),
-            marker(ty)
-        ));
+        field(f, depth, out);
     }
-}
-
-fn objects(node: &Value, depth: usize, out: &mut String) {
     for o in node["Objects"].as_array().into_iter().flatten() {
-        let ty = o["Type"].as_str().unwrap_or("None");
+        let ty = kind(o);
         if ty == "None" {
             continue;
         }
+        // A block inside an added or removed node is added or removed with it.
+        let ty = if ty == "Edited" && parent != "Edited" {
+            parent
+        } else {
+            ty
+        };
         let name = o["Name"].as_str().unwrap_or("");
-        out.push_str(&format!("{}{} {name} {{\n", indent(depth), marker(ty)));
-        fields(o, depth + 1, out);
-        objects(o, depth + 1, out);
-        out.push_str(&format!("{}}}\n", indent(depth + 1)));
+        out.push(line(ty, depth, &format!("{name} {{")));
+        body(o, ty, depth + 1, out);
+        out.push(line(ty, depth, "}"));
     }
 }
 
-fn marker(ty: &str) -> &'static str {
+fn field(f: &Value, depth: usize, out: &mut Vec<String>) {
+    let ty = kind(f);
+    if ty == "None" {
+        return;
+    }
+    let name = f["Name"].as_str().unwrap_or("");
+    let (old, new) = (
+        f["Old"].as_str().unwrap_or(""),
+        f["New"].as_str().unwrap_or(""),
+    );
+    if old.contains('\n') || new.contains('\n') {
+        // Templates and other text blocks: diff them line by line.
+        let (old, new) = match ty {
+            "Added" => ("", new),
+            "Deleted" => (old, ""),
+            _ => (old, new),
+        };
+        out.push(line(ty, depth, &format!("{name}: <<EOF")));
+        let text = similar::TextDiff::from_lines(old, new);
+        // Three lines of context around each change, as in other unified diffs.
+        for (i, group) in text.grouped_ops(3).iter().enumerate() {
+            if i > 0 {
+                out.push(line("Edited", depth + 1, "…"));
+            }
+            for change in group.iter().flat_map(|op| text.iter_changes(op)) {
+                let ty = match change.tag() {
+                    similar::ChangeTag::Insert => "Added",
+                    similar::ChangeTag::Delete => "Deleted",
+                    similar::ChangeTag::Equal => "Edited",
+                };
+                out.push(line(
+                    ty,
+                    depth + 1,
+                    change.value().trim_end_matches(['\r', '\n']),
+                ));
+            }
+        }
+        out.push(line(ty, depth, "EOF"));
+        return;
+    }
     match ty {
-        "Added" => "+",
-        "Deleted" => "-",
-        "Edited" => "+/-",
-        _ => " ",
+        "Added" => out.push(line(ty, depth, &format!("{name}: {new:?}"))),
+        "Deleted" => out.push(line(ty, depth, &format!("{name}: {old:?}"))),
+        _ => {
+            out.push(line("Deleted", depth, &format!("{name}: {old:?}")));
+            out.push(line("Added", depth, &format!("{name}: {new:?}")));
+        }
     }
 }
 
-fn indent(depth: usize) -> String {
-    "  ".repeat(depth)
+/// One unified diff line: the change marker, then two spaces per level.
+fn line(ty: &str, depth: usize, text: &str) -> String {
+    let marker = match ty {
+        "Added" => '+',
+        "Deleted" => '-',
+        _ => ' ',
+    };
+    format!("{marker}{}{text}", "  ".repeat(depth))
 }
 
 /// The scheduler preview of a job plan, one line per group:
@@ -292,29 +325,98 @@ mod tests {
         assert_eq!(field_changes(&desired, &live, &["Meta"]).len(), changes);
     }
 
-    #[test]
-    fn job_diffs_render_changed_fields_only() {
-        let diff = json!({
-            "Type": "Edited", "ID": "paste",
-            "Fields": [{"Type": "None", "Name": "Priority", "Old": "50", "New": "50"}],
+    /// The `bender` plan from Ben's screenshot: meta keys added and removed,
+    /// an edited image inside an edited task, and an untouched field.
+    fn edited_job() -> Value {
+        json!({
+            "Type": "Edited", "ID": "bender",
+            "Fields": [
+                {"Type": "None", "Name": "Priority", "Old": "50", "New": "50"},
+                {"Type": "Added", "Name": "Meta[buckle.module]", "Old": "", "New": "bender"},
+                {"Type": "Deleted", "Name": "Meta[pack.name]", "Old": "bender", "New": ""}
+            ],
             "TaskGroups": [{
-                "Type": "Edited", "Name": "api", "Updates": {"create/destroy update": 1},
+                "Type": "Edited", "Name": "api", "Updates": {"create/destroy update": 1, "ignore": 1},
                 "Tasks": [{
-                    "Type": "Edited", "Name": "paste", "Annotations": ["forces create/destroy update"],
+                    "Type": "Edited", "Name": "bender", "Annotations": ["forces create/destroy update"],
                     "Objects": [{"Type": "Edited", "Name": "Config", "Fields": [
-                        {"Type": "Edited", "Name": "image", "Old": "tclip:1", "New": "tclip:2"}
+                        {"Type": "Edited", "Name": "image", "Old": "bender:main@sha256:213a", "New": "bender:main"}
+                    ]}, {"Type": "Added", "Name": "Template", "Fields": [
+                        {"Type": "Added", "Name": "EmbeddedTmpl", "Old": "", "New": "a = 1\nb = 2\n"}
                     ]}]
                 }]
             }]
-        });
-        let text = render_job_diff(&diff);
-        assert!(text.contains("+/- Job: \"paste\""), "{text}");
+        })
+    }
+
+    /// The lines of a unified diff with the given marker, marker stripped and trimmed.
+    fn marked(text: &str, marker: char) -> Vec<&str> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix(marker))
+            .map(str::trim)
+            .collect()
+    }
+
+    #[test]
+    fn job_diffs_render_as_unified_diffs() {
+        let text = render_job_diff(&edited_job());
         assert!(
-            text.contains("Task Group: \"api\" (1 create/destroy update)"),
+            text.lines()
+                .all(|l| l.starts_with(['+', '-', ' ']) && !l.starts_with("+/-")),
             "{text}"
         );
-        assert!(text.contains("image: \"tclip:1\" => \"tclip:2\""), "{text}");
+        let (added, removed) = (marked(&text, '+'), marked(&text, '-'));
+        assert!(added.contains(&"Meta[buckle.module]: \"bender\""), "{text}");
+        assert!(removed.contains(&"Meta[pack.name]: \"bender\""), "{text}");
+        assert!(
+            removed.contains(&"image: \"bender:main@sha256:213a\""),
+            "{text}"
+        );
+        assert!(added.contains(&"image: \"bender:main\""), "{text}");
+        // An added block's text is added line by line, braces included.
+        for l in ["Template {", "a = 1", "b = 2", "}"] {
+            assert!(added.contains(&l), "{l} in {text}");
+        }
         assert!(!text.contains("Priority"), "{text}");
+        // Containers are context, nested by indentation.
+        let context = marked(&text, ' ');
+        assert!(
+            context.contains(&"Task Group \"api\" (1 create/destroy update, 1 ignore)"),
+            "{text}"
+        );
+        let indent = |needle: &str| {
+            let l = text.lines().find(|l| l.contains(needle)).unwrap();
+            l.len() - l[1..].trim_start().len()
+        };
+        assert!(
+            indent("Job ") < indent("Task Group")
+                && indent("Task Group") < indent("Task \"")
+                && indent("Task \"") < indent("image:"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn edited_text_fields_diff_line_by_line() {
+        let diff = json!({"Type": "Edited", "ID": "j", "Fields": [
+            {"Type": "Edited", "Name": "Tmpl", "Old": "a\nb\nc\n", "New": "a\nB\nc\n"}
+        ]});
+        let text = render_job_diff(&diff);
+        assert_eq!(marked(&text, '-'), vec!["b"], "{text}");
+        assert_eq!(marked(&text, '+'), vec!["B"], "{text}");
+        assert!(marked(&text, ' ').contains(&"a"), "context kept: {text}");
+    }
+
+    #[test]
+    fn edited_entity_fields_are_removed_then_added() {
+        let changes = field_changes(
+            &json!({"Description": "y"}),
+            &json!({"Description": "x"}),
+            &[],
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(marked(&changes[0], '-'), vec!["Description: \"x\""]);
+        assert_eq!(marked(&changes[0], '+'), vec!["Description: \"y\""]);
     }
 
     #[test]
