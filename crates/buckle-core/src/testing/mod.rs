@@ -630,6 +630,7 @@ pub struct CxBuilder {
     mode: Mode,
     module: String,
     previous: Option<Arc<crate::state::ResourceRecord>>,
+    clusters: Option<Arc<dyn crate::task::ClusterCredentials>>,
 }
 
 impl CxBuilder {
@@ -644,6 +645,7 @@ impl CxBuilder {
             mode: Mode::Apply,
             module: "test".into(),
             previous: None,
+            clusters: None,
         }
     }
 
@@ -655,6 +657,12 @@ impl CxBuilder {
 
     pub fn source(mut self, source: MemorySource) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Cluster credentials, as an agent would provide them.
+    pub fn clusters(mut self, clusters: Arc<dyn crate::task::ClusterCredentials>) -> Self {
+        self.clusters = Some(clusters);
         self
     }
 
@@ -690,6 +698,7 @@ impl CxBuilder {
             secrets,
             waived_checks: Arc::new(Vec::new()),
             previous: self.previous,
+            clusters: self.clusters,
         }
     }
 }

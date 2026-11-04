@@ -268,7 +268,8 @@ signs); delete `retired.key` and restart again once a TTL has passed.
 
 **Nomad trust.** A `jwt` auth method holding Buckle's public keys (Nomad needs no URL) and a
 binding rule per purpose; the agent logs in at `/v1/acl/login` with auth method `buckle`. Created
-once with a management token, which the `nomad` host module does through `command.run`:
+once with a management token, alongside the `buckle-read`, `buckle-deploy` and `buckle-drain`
+ACL policies the rules bind to:
 
 ```json
 {

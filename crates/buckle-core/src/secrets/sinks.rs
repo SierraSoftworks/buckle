@@ -142,6 +142,20 @@ impl ProcessEnvSink {
         command.sensitive_env = true;
     }
 
+    /// Adds a credential (a cluster token) to the environment.
+    pub fn inject_credential(
+        &self,
+        command: &mut Command,
+        name: impl Into<String>,
+        value: &secrecy::SecretString,
+    ) {
+        use secrecy::ExposeSecret as _;
+        command
+            .env
+            .insert(name.into(), value.expose_secret().to_owned());
+        command.sensitive_env = true;
+    }
+
     /// Adds a rendered sensitive value to the environment.
     pub fn inject_sensitive(
         &self,

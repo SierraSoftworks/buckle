@@ -226,6 +226,7 @@ pub(super) struct Planner<'a> {
     pub drift: bool,
     /// JSON schemas by task kind, for secret-field aware spec rendering.
     schemas: Mutex<HashMap<&'static str, Arc<serde_json::Value>>>,
+    pub clusters: Option<Arc<dyn crate::task::ClusterCredentials>>,
 }
 
 impl<'a> Planner<'a> {
@@ -251,6 +252,7 @@ impl<'a> Planner<'a> {
             templater: Arc::new(build_templater(revision)?),
             drift: false,
             schemas: Mutex::new(HashMap::new()),
+            clusters: None,
         })
     }
 
@@ -268,6 +270,7 @@ impl<'a> Planner<'a> {
             &inputs.agent_vars,
         )?;
         planner.drift = inputs.drift;
+        planner.clusters = inputs.clusters.clone();
         planner.plan_system = Arc::new(crate::system::PlanGuard::new(
             inputs.system.clone(),
             inputs.scratch_dirs.clone(),
@@ -340,6 +343,7 @@ impl<'a> Planner<'a> {
             secrets: self.secrets.clone(),
             waived_checks: self.waived.clone(),
             previous: None,
+            clusters: self.clusters.clone(),
         }
     }
 

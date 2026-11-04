@@ -44,6 +44,7 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-batteries.workspace = true
 update-rs.workspace = true
+secrecy.workspace = true
 url.workspace = true
 zeroize = "1.9"
 

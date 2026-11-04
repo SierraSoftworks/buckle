@@ -494,6 +494,7 @@ pub(crate) async fn facts_to(args: FactsArgs, out: &mut dyn Write) -> buckle_cor
         secrets: Arc::new(SecretStore::new()),
         waived_checks: Arc::new(Vec::new()),
         previous: None,
+        clusters: None,
     };
     for provider in &args.providers {
         if !buckle_core::facts::registry().contains_key(provider.as_str()) {

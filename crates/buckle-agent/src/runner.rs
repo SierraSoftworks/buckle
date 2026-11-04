@@ -41,6 +41,8 @@ pub struct RunContext {
     /// removals (an unattended pass must not remove on an uncertain
     /// selection; held modules are listed in `plan.held`).
     pub drift: bool,
+    /// Cluster credentials for `command.run` `identity`.
+    pub clusters: Option<Arc<dyn buckle_core::task::ClusterCredentials>>,
 }
 
 /// Plans, applies, checks health and collects facts for the agent.
@@ -147,6 +149,7 @@ impl EngineRunner {
             .with_stable_revision(ctx.stable_revision.clone())
             .with_agent_vars(ctx.vars.clone())
             .with_drift(ctx.drift)
+            .with_clusters(ctx.clusters.clone())
             .with_removals(!ctx.drift))
     }
 }
@@ -164,6 +167,7 @@ impl Runner for EngineRunner {
             secrets: Arc::new(SecretStore::new()),
             waived_checks: Arc::new(Vec::new()),
             previous: None,
+            clusters: None,
         };
         let mut facts = previous.clone();
         if facts.tree.is_null() {

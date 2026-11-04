@@ -233,6 +233,8 @@ struct Shared {
     acked: Notify,
     /// Runs the cluster targets this host executes for.
     executor: crate::cluster::Executor,
+    /// Cluster credentials tasks ask for (`command.run` `identity`).
+    credentials: Arc<crate::identity::Credentials>,
 }
 
 enum SessionEnd {
@@ -412,6 +414,10 @@ impl Agent {
         Ok(Self {
             shared: Arc::new(Shared {
                 executor,
+                credentials: Arc::new(crate::identity::Credentials::new(
+                    transport.clone(),
+                    reqwest::Client::new(),
+                )),
                 config,
                 options,
                 host_id,
@@ -1346,6 +1352,10 @@ impl Shared {
             stable_revision,
             vars: vars_json(&self.config.vars),
             drift: false,
+            clusters: Some(Arc::new(crate::identity::TaskCredentials {
+                credentials: self.credentials.clone(),
+                revision: Some(revision.clone()),
+            })),
         }
     }
 

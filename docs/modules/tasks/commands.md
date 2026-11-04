@@ -68,7 +68,28 @@ counts as a change, which is what fires handlers. `unless` and `only_if` also ru
   id: docker-network-edge
 ```
 
+```yaml
+# Drain this node before a reboot, with a credential the server issues for the cluster.
+- command.run:
+    run: ["nomad", "node", "drain", "-self", "-enable", "-deadline", "10m", "-yes"]
+    unless: >-
+      nomad node status -self -json | grep -Eq '"SchedulingEligibility": *"ineligible"'
+    identity: { cluster: home-nomad }   # purpose: drain, passed as NOMAD_TOKEN
+  id: nomad-drain
+```
+
 <KindReference registry="tasks" kind="command.run" />
+
+**Cluster identity.** `identity` asks the server for a short-lived credential for a cluster
+target, which reaches the command and its probes (not `remove`) in `env`. It is handled like a
+secret: never planned, logged or stored, and output is not captured unless `capture: always`.
+
+- **Grant**: `drain` (the default) goes to the cluster's `nodes`, `read` and `deploy` to its
+  `executors`; the cluster needs `identity: buckle_jwt` and the trust setup in
+  [the server docs](../../agent/server.md).
+- **Exchange**: Nomad logs in through the `buckle` auth method at `api`, else `NOMAD_ADDR`, else
+  `http://127.0.0.1:4646`; Kubernetes (`kind: kubernetes`) takes the JWT as a bearer token.
+- **Local runs** have no server to ask, so the task fails there.
 
 `run`, `unless`, `only_if` and `remove` are an argv list (run directly) or a string (run with
 `sh -c`). With `user`, all four run as that account; the step is blocked while `runuser` is

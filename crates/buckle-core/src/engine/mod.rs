@@ -163,6 +163,9 @@ pub struct Inputs {
     /// agent passes `<state_dir>/tmp`). Any other mutation while planning is
     /// refused (see [`crate::system::PlanGuard`]).
     pub scratch_dirs: Vec<PathBuf>,
+    /// Cluster credentials for tasks that ask for one (`command.run`
+    /// `identity`); `None` where no agent can issue them.
+    pub clusters: Option<Arc<dyn crate::task::ClusterCredentials>>,
 }
 
 impl Inputs {
@@ -194,7 +197,17 @@ impl Inputs {
             removals: true,
             drift: false,
             scratch_dirs: Vec::new(),
+            clusters: None,
         }
+    }
+
+    /// Cluster credentials for tasks that ask for one.
+    pub fn with_clusters(
+        mut self,
+        clusters: Option<Arc<dyn crate::task::ClusterCredentials>>,
+    ) -> Self {
+        self.clusters = clusters;
+        self
     }
 
     /// A directory planning may write to (e.g. `<state_dir>/tmp`).

@@ -281,6 +281,78 @@ impl Credentials {
     }
 }
 
+/// The credentials `command.run` `identity` asks for, issued for the
+/// revision being run.
+#[derive(Debug, Clone)]
+pub struct TaskCredentials {
+    pub credentials: Arc<Credentials>,
+    pub revision: Option<RevisionId>,
+}
+
+impl Purpose {
+    fn parse(purpose: &str) -> buckle_core::Result<Self> {
+        match purpose {
+            "read" => Ok(Purpose::Read),
+            "deploy" => Ok(Purpose::Deploy),
+            "drain" => Ok(Purpose::Drain),
+            other => Err(buckle_core::error::user(
+                format!("'{other}' is not an identity purpose."),
+                &["Use read, deploy or drain."],
+            )),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl buckle_core::task::ClusterCredentials for TaskCredentials {
+    async fn credential(
+        &self,
+        request: &buckle_core::task::CredentialRequest,
+    ) -> buckle_core::Result<secrecy::SecretString> {
+        let login = match request.kind {
+            buckle_core::model::ClusterKind::Kubernetes => Login::Kubernetes,
+            buckle_core::model::ClusterKind::Nomad => {
+                let address = request
+                    .api
+                    .clone()
+                    .or_else(|| {
+                        std::env::var("NOMAD_ADDR")
+                            .ok()
+                            .filter(|a| a.starts_with("http"))
+                    })
+                    .unwrap_or_else(|| crate::cluster::DEFAULT_NOMAD_ADDR.to_owned());
+                let api = url::Url::parse(&address).map_err(|e| {
+                    buckle_core::error::wrap_user(
+                        e,
+                        format!("The Nomad API address {address} is not a URL."),
+                        &["Set `identity.api` to a URL like http://127.0.0.1:4646."],
+                    )
+                })?;
+                Login::Nomad {
+                    api,
+                    auth_method: Login::DEFAULT_NOMAD_AUTH_METHOD.to_owned(),
+                }
+            }
+        };
+        let credential = self
+            .credentials
+            .get(
+                &IdentityRequest {
+                    target: request.target.clone(),
+                    purpose: Purpose::parse(&request.purpose)?,
+                    revision: self.revision.clone(),
+                    rollout: None,
+                },
+                &login,
+            )
+            .await?;
+        Ok(match credential {
+            Credential::Nomad { secret_id, .. } => secret_id.into(),
+            Credential::Bearer { token, .. } => token.into(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +580,27 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(issuing.issued.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn tasks_get_the_credential_itself() {
+        use buckle_core::task::{ClusterCredentials as _, CredentialRequest};
+        use secrecy::ExposeSecret as _;
+        let (issuing, creds) = credentials(chrono::Duration::minutes(15));
+        let tasks = TaskCredentials {
+            credentials: Arc::new(creds),
+            revision: Some(RevisionId::new("abc")),
+        };
+        let mut request = CredentialRequest {
+            target: "lab".into(),
+            purpose: "read".into(),
+            kind: buckle_core::model::ClusterKind::Kubernetes,
+            api: None,
+        };
+        let token = tasks.credential(&request).await.unwrap();
+        assert_eq!(token.expose_secret(), "jwt-1");
+        request.purpose = "admin".into();
+        assert!(tasks.credential(&request).await.is_err());
+        assert_eq!(issuing.issued.load(Ordering::SeqCst), 1);
     }
 }
