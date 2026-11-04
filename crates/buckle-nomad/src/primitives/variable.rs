@@ -133,6 +133,7 @@ pub(crate) async fn plan(cx: &Context, spec: &VariableSpec) -> Result<Step> {
         digest,
         items: spec.items.keys().cloned().collect(),
         id: None,
+        live_vars: Default::default(),
     };
 
     let mut items: IndexMap<String, Rendered> = live_items

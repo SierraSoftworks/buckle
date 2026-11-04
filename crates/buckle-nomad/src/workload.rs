@@ -1,47 +1,32 @@
-//! A workload compiled for a Nomad cluster: its keys as primitives in the
-//! implicit order (resources, namespaces, node pools, volumes, variables,
-//! policies, then the job), planned together and applied in that order.
+//! A workload compiled for a Nomad cluster: its `resources` as primitives in
+//! the order the workload lists them, planned together and applied in that
+//! order (and removed in reverse).
 
-use crate::primitives::{
-    Context, EntityKind, EntitySpec, JobSpec, Kind, ObjectKey, PolicySpec, Primitive, Removal,
-    Step, VariableSpec, VolumeSpec,
-};
+use crate::primitives::{Context, Kind, ObjectKey, Primitive, Removal, Step};
 use buckle_core::Result;
 use buckle_core::task::Applied;
 
-/// The Nomad keys of one workload, with files read and values rendered.
+/// The Nomad resources of one workload, with files read and values rendered,
+/// in apply order.
 #[derive(Debug, Clone, Default)]
 pub struct Workload {
     pub name: String,
-    pub job: Option<JobSpec>,
-    pub volumes: Vec<VolumeSpec>,
-    pub variables: Vec<VariableSpec>,
-    pub policies: Vec<PolicySpec>,
-    pub namespaces: Vec<EntitySpec>,
-    pub node_pools: Vec<EntitySpec>,
-    pub resources: Vec<EntitySpec>,
+    pub primitives: Vec<Primitive>,
     pub removal: Removal,
 }
 
 impl Workload {
+    pub fn new(name: impl Into<String>, primitives: Vec<Primitive>) -> Self {
+        Self {
+            name: name.into(),
+            primitives,
+            removal: Removal::default(),
+        }
+    }
+
     /// The primitives in apply order.
-    pub fn primitives(&self) -> Vec<Primitive> {
-        let mut out: Vec<Primitive> = Vec::new();
-        out.extend(self.resources.iter().cloned().map(Primitive::Entity));
-        out.extend(self.namespaces.iter().cloned().map(|mut e| {
-            e.kind = EntityKind::Namespace;
-            Primitive::Entity(e)
-        }));
-        out.extend(self.node_pools.iter().cloned().map(|mut e| {
-            e.kind = EntityKind::NodePool;
-            Primitive::Entity(e)
-        }));
-        out.extend(self.volumes.iter().cloned().map(Primitive::Volume));
-        out.extend(self.variables.iter().cloned().map(Primitive::Variable));
-        out.extend(self.policies.iter().cloned().map(Primitive::Policy));
-        out.extend(self.job.iter().cloned().map(Primitive::Job));
-        out.sort_by_key(Primitive::kind);
-        out
+    pub fn primitives(&self) -> &[Primitive] {
+        &self.primitives
     }
 
     /// Plans every key. Pure: nothing in the cluster changes.
@@ -55,7 +40,7 @@ impl Workload {
     pub async fn plan_after(&self, cx: &Context, earlier: &[ObjectKey]) -> Result<WorkloadPlan> {
         let mut steps = Vec::new();
         let mut created: Vec<ObjectKey> = earlier.to_vec();
-        for p in self.primitives() {
+        for p in &self.primitives {
             let step = p.plan(cx, &created).await?;
             if matches!(
                 step.planned,
@@ -139,10 +124,11 @@ impl WorkloadPlan {
     }
 }
 
-/// The job of a workload, when it has one, for health and actions.
-pub fn job_key(plan: &WorkloadPlan) -> Option<&ObjectKey> {
+/// The jobs of a workload, for health and actions.
+pub fn job_keys(plan: &WorkloadPlan) -> Vec<&ObjectKey> {
     plan.steps
         .iter()
         .map(|s| &s.key)
-        .find(|k| k.kind == Kind::Job)
+        .filter(|k| k.kind == Kind::Job)
+        .collect()
 }

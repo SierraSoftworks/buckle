@@ -22,7 +22,9 @@ use buckle_core::engine::{
 };
 use buckle_core::error::ErrorReport;
 use buckle_core::health::{HealthReport, HealthResult, HealthScope, HealthStatus};
-use buckle_core::model::{ClusterIdentity, ClusterKind, RemovalPolicy, WorkloadRemoval};
+use buckle_core::model::{
+    ClusterIdentity, ClusterKind, RemovalPolicy, ResourceEntry, ResourceKind, WorkloadRemoval,
+};
 use buckle_core::plan::{
     Indeterminate, ModulePlan, Plan, Removal, ResourceKey, RevisionId, Step, TaskRef,
 };
@@ -31,7 +33,8 @@ use buckle_core::secrets::{InstallKey, SecretStore};
 use buckle_core::selectors::{HostContext, HostIdentity};
 use buckle_core::template::Templater;
 use buckle_nomad::primitives::{
-    Attach, EntityKind, EntitySpec, JobSpec, Orphan, PolicySpec, VariableSpec, VolumeSpec,
+    Attach, EntityKind, EntitySpec, JobSpec, Orphan, PolicySpec, Primitive, VariableSpec,
+    VolumeSpec,
 };
 use buckle_nomad::{Context, Kind, Nomad, ObjectKey, Workload, WorkloadPlan};
 use chrono::Utc;
@@ -311,7 +314,9 @@ impl Executor {
                         && implicit.missing.contains(ns)
                         && namespaces_created.insert(ns.to_owned())
                     {
-                        workload.namespaces.push(implicit_namespace(ns));
+                        workload
+                            .primitives
+                            .insert(0, Primitive::Entity(implicit_namespace(ns)));
                     }
                     let cx = Context::new(
                         nomad.clone(),
@@ -612,7 +617,7 @@ impl Executor {
                     duration_ms: 0,
                 };
             let owned = jobs.remove(module).unwrap_or_default();
-            if w.config.job.is_some() && owned.is_empty() {
+            if w.config.jobs().next().is_some() && owned.is_empty() {
                 results.push(result(
                     "job",
                     "nomad.job",
@@ -894,11 +899,11 @@ async fn implicit_namespaces(
 }
 
 fn implicit_namespace(ns: &str) -> EntitySpec {
-    EntitySpec {
-        kind: EntityKind::Namespace,
-        file: "workload.yaml namespace".to_owned(),
-        hcl: format!("name = {}\n", serde_json::Value::String(ns.to_owned())),
-    }
+    EntitySpec::new(
+        EntityKind::Namespace,
+        "workload.yaml namespace",
+        format!("name = {}\n", serde_json::Value::String(ns.to_owned())),
+    )
 }
 
 /// `workload.yaml`'s Nomad keys with its files read, its `.j2` files and
@@ -957,106 +962,111 @@ async fn compile(
         }
     };
 
-    let job = match &cfg.job {
-        Some(decl) => {
-            let mut files = IndexMap::new();
-            for (var, file) in &cfg.files {
-                files.insert(var.clone(), read(file.clone()).await?);
-            }
-            Some(JobSpec {
-                file: decl.file.clone(),
-                hcl: read(decl.file.clone()).await?,
-                vars: vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                files,
-                namespace: cfg.namespace.clone(),
-            })
-        }
-        None => None,
-    };
-    let mut volumes = Vec::new();
-    for file in &cfg.volumes {
-        volumes.push(VolumeSpec {
-            file: file.clone(),
-            hcl: read(file.clone()).await?,
-        });
-    }
-    let mut policies = Vec::new();
-    for p in &cfg.policies {
-        policies.push(PolicySpec {
-            file: p.file.clone(),
-            rules: read(p.file.clone()).await?,
-            name: None,
-            description: cfg.description.clone(),
-            attach: p.attach.as_ref().map(|a| Attach {
-                namespace: a.namespace.clone().or_else(|| cfg.namespace.clone()),
-                job: a.job.clone(),
-                group: a.group.clone(),
-                task: a.task.clone(),
-            }),
-        });
-    }
-    let entity = |kind: EntityKind, file: &String| {
-        let read = &read;
-        let file = file.clone();
-        async move {
-            Ok::<_, buckle_core::Error>(EntitySpec {
-                kind,
-                hcl: read(file.clone()).await?,
-                file,
-            })
-        }
-    };
-    let mut namespaces = Vec::new();
-    for file in &cfg.namespaces {
-        namespaces.push(entity(EntityKind::Namespace, file).await?);
-    }
-    let mut node_pools = Vec::new();
-    for file in &cfg.node_pools {
-        node_pools.push(entity(EntityKind::NodePool, file).await?);
-    }
-    let mut resources = Vec::new();
-    for r in &cfg.resources {
-        resources.push(entity(EntityKind::resource(&r.kind)?, &r.file).await?);
-    }
     let namespace = cfg
         .namespace
         .clone()
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "default".to_owned());
-    let mut variables = Vec::new();
-    for (path, items) in &cfg.variables {
-        let mut rendered = IndexMap::new();
-        for (key, value) in items {
-            let item_ctx = ctx.in_task("nomad.variable", path, &[]);
-            rendered.insert(
-                key.clone(),
-                templater.render_sensitive(value, &item_ctx).map_err(|e| {
-                    buckle_core::error::wrap_user(
-                        e,
-                        format!(
-                            "The item {key} of variable {path} (workload {}) could not be rendered.",
-                            cfg.name
-                        ),
-                        &["Check the template and that the secrets it reads are declared."],
-                    )
-                })?,
-            );
-        }
-        variables.push(VariableSpec {
-            namespace: namespace.clone(),
-            path: path.clone(),
-            items: rendered,
-        });
+    let paths = |entry: &ResourceEntry| {
+        buckle_core::fieldpath::FieldPath::parse_all(&entry.ignore).map_err(|e| {
+            buckle_core::error::wrap_user(
+                e,
+                format!(
+                    "The {} of workload {} has an `ignore` path that is not valid.",
+                    entry.describe(),
+                    cfg.name
+                ),
+                &["Run `buckle validate` to see every problem with the workload."],
+            )
+        })
+    };
+    let mut primitives = Vec::with_capacity(cfg.resources.len());
+    for entry in &cfg.resources {
+        let file = entry.file.clone().unwrap_or_default();
+        let primitive = match entry.kind {
+            ResourceKind::Job => {
+                let mut files = IndexMap::new();
+                for (var, name) in cfg.files.iter().chain(entry.files.iter()) {
+                    files.insert(var.clone(), read(name.clone()).await?);
+                }
+                Primitive::Job(JobSpec {
+                    hcl: read(file.clone()).await?,
+                    file,
+                    vars: vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    files,
+                    namespace: cfg.namespace.clone(),
+                    live_vars: entry.live_vars.clone(),
+                    ignore: paths(entry)?,
+                })
+            }
+            ResourceKind::Volume => Primitive::Volume(VolumeSpec {
+                hcl: read(file.clone()).await?,
+                file,
+            }),
+            ResourceKind::Policy => Primitive::Policy(PolicySpec {
+                rules: read(file.clone()).await?,
+                file,
+                name: entry.name.clone(),
+                description: cfg.description.clone(),
+                attach: entry.attach.as_ref().map(|a| Attach {
+                    namespace: a.namespace.clone().or_else(|| cfg.namespace.clone()),
+                    job: a.job.clone(),
+                    group: a.group.clone(),
+                    task: a.task.clone(),
+                }),
+            }),
+            ResourceKind::Namespace | ResourceKind::NodePool | ResourceKind::Quota => {
+                let kind = match entry.kind {
+                    ResourceKind::Namespace => EntityKind::Namespace,
+                    ResourceKind::NodePool => EntityKind::NodePool,
+                    _ => EntityKind::Quota,
+                };
+                Primitive::Entity(EntitySpec {
+                    ignore: paths(entry)?,
+                    ..EntitySpec::new(kind, file.clone(), read(file).await?)
+                })
+            }
+            ResourceKind::Secret => {
+                let path = entry.name.clone().unwrap_or_default();
+                let mut rendered = IndexMap::new();
+                for (key, value) in &entry.items {
+                    let item_ctx = ctx.in_task("nomad.variable", &path, &[]);
+                    rendered.insert(
+                        key.clone(),
+                        templater.render_sensitive(value, &item_ctx).map_err(|e| {
+                            buckle_core::error::wrap_user(
+                                e,
+                                format!(
+                                    "The item {key} of variable {path} (workload {}) could not be rendered.",
+                                    cfg.name
+                                ),
+                                &["Check the template and that the secrets it reads are declared."],
+                            )
+                        })?,
+                    );
+                }
+                Primitive::Variable(VariableSpec {
+                    namespace: namespace.clone(),
+                    path,
+                    items: rendered,
+                })
+            }
+            ResourceKind::Manifest => {
+                return Err(buckle_core::error::user(
+                    format!(
+                        "The workload {} lists {}, which a Nomad cluster cannot apply.",
+                        cfg.name,
+                        entry.describe()
+                    ),
+                    &["Narrow the workload's `when` to `cluster.kind == \"kubernetes\"`."],
+                ));
+            }
+        };
+        primitives.push(primitive);
     }
     Ok(Workload {
         name: cfg.name.clone(),
-        job,
-        volumes,
-        variables,
-        policies,
-        namespaces,
-        node_pools,
-        resources,
+        primitives,
         removal: nomad_removal(cfg.removal),
     })
 }

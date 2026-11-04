@@ -37,6 +37,11 @@ pub struct Entry {
     /// For volumes: the id Nomad assigned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// For jobs: the workload's value of each `live_vars` variable when
+    /// Buckle last registered the job, so that a change the workload makes
+    /// to such a variable is told apart from a value another tool pinned.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub live_vars: std::collections::BTreeMap<String, String>,
 }
 
 impl Entry {

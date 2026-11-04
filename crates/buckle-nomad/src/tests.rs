@@ -66,11 +66,19 @@ fn variables(items: &[(&str, Rendered)]) -> VariableSpec {
 }
 
 fn workload(job: Option<JobSpec>) -> Workload {
-    Workload {
-        name: "atuin".into(),
-        job,
-        ..Default::default()
-    }
+    Workload::new("atuin", job.into_iter().map(Primitive::Job).collect())
+}
+
+/// The `atuin` workload with `primitives` in that order.
+fn with(primitives: Vec<Primitive>) -> Workload {
+    Workload::new("atuin", primitives)
+}
+
+fn volume() -> Primitive {
+    Primitive::Volume(VolumeSpec {
+        file: "atuin.volume.hcl".into(),
+        hcl: "name = \"atuin\"\ntype = \"host\"\nplugin_id = \"mkdir\"\n".into(),
+    })
 }
 
 #[track_caller]
@@ -254,14 +262,14 @@ async fn a_job_in_a_namespace_created_by_the_same_workload_plans_as_a_registrati
     let fake = FakeNomad::new();
     let mut spec = atuin_job("atuin:1");
     spec.hcl = spec.hcl.replacen('{', "{\"Namespace\":\"team-a\",", 1);
-    let w = Workload {
-        namespaces: vec![EntitySpec {
-            kind: EntityKind::Namespace,
-            file: "team-a.namespace.hcl".into(),
-            hcl: "name = \"team-a\"\ndescription = \"Team A\"".into(),
-        }],
-        ..workload(Some(spec))
-    };
+    let w = with(vec![
+        Primitive::Entity(EntitySpec::new(
+            EntityKind::Namespace,
+            "team-a.namespace.hcl",
+            "name = \"team-a\"\ndescription = \"Team A\"",
+        )),
+        Primitive::Job(spec),
+    ]);
     let cx = cx(&fake, "r1");
     let plan = w.plan(&cx).await.unwrap();
     assert_eq!(
@@ -279,16 +287,13 @@ async fn a_job_in_a_namespace_created_by_the_same_workload_plans_as_a_registrati
 async fn variables_plan_by_fingerprint_and_never_show_secret_values() {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");
-    let w = Workload {
-        variables: vec![variables(&[
-            (
-                "DATABASE_URL",
-                render("postgres://atuin:{{ secrets.db }}@db/atuin"),
-            ),
-            ("OPEN_REGISTRATION", Rendered::Plain("false".into())),
-        ])],
-        ..workload(None)
-    };
+    let w = with(vec![Primitive::Variable(variables(&[
+        (
+            "DATABASE_URL",
+            render("postgres://atuin:{{ secrets.db }}@db/atuin"),
+        ),
+        ("OPEN_REGISTRATION", Rendered::Plain("false".into())),
+    ]))]);
     let plan = w.plan(&cx).await.unwrap();
     let shown = format!(
         "{:?} {}",
@@ -319,13 +324,10 @@ async fn variables_plan_by_fingerprint_and_never_show_secret_values() {
 async fn items_operators_add_stay_and_items_dropped_from_the_workload_go() {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");
-    let both = Workload {
-        variables: vec![variables(&[
-            ("A", Rendered::Plain("1".into())),
-            ("B", Rendered::Plain("2".into())),
-        ])],
-        ..workload(None)
-    };
+    let both = with(vec![Primitive::Variable(variables(&[
+        ("A", Rendered::Plain("1".into())),
+        ("B", Rendered::Plain("2".into())),
+    ]))]);
     both.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
     let mut items: Vec<(String, String)> = fake
         .variable("default", "nomad/jobs/atuin")
@@ -340,10 +342,10 @@ async fn items_operators_add_stay_and_items_dropped_from_the_workload_go() {
     fake.put_variable("default", "nomad/jobs/atuin", &items);
     assert_eq!(both.plan(&cx).await.unwrap().changes(), 0);
 
-    let only_a = Workload {
-        variables: vec![variables(&[("A", Rendered::Plain("1".into()))])],
-        ..workload(None)
-    };
+    let only_a = with(vec![Primitive::Variable(variables(&[(
+        "A",
+        Rendered::Plain("1".into()),
+    )]))]);
     let plan = only_a.plan(&cx).await.unwrap();
     let Planned::Change {
         diff: Diff::Update {
@@ -365,10 +367,10 @@ async fn a_variable_changed_after_its_plan_is_refused_without_echoing_values() {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");
     fake.put_variable("default", "nomad/jobs/atuin", &[("DATABASE_URL", "old")]);
-    let w = Workload {
-        variables: vec![variables(&[("DATABASE_URL", render("{{ secrets.db }}"))])],
-        ..workload(None)
-    };
+    let w = with(vec![Primitive::Variable(variables(&[(
+        "DATABASE_URL",
+        render("{{ secrets.db }}"),
+    )]))]);
     let plan = w.plan(&cx).await.unwrap();
     fake.put_variable("default", "nomad/jobs/atuin", &[("DATABASE_URL", SECRET)]);
     let err = plan.apply(&cx).await.unwrap_err();
@@ -384,8 +386,8 @@ async fn a_variable_changed_after_its_plan_is_refused_without_echoing_values() {
 async fn policies_namespaces_and_pools_are_stamped_and_converge() {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");
-    let w = Workload {
-        policies: vec![PolicySpec {
+    let w = with(vec![
+        Primitive::Policy(PolicySpec {
             file: "atuin.policy.hcl".into(),
             rules: "namespace \"default\" { variables { path \"nomad/jobs/atuin\" { capabilities = [\"read\"] } } }\n".into(),
             attach: Some(Attach {
@@ -393,14 +395,13 @@ async fn policies_namespaces_and_pools_are_stamped_and_converge() {
                 ..Default::default()
             }),
             ..Default::default()
-        }],
-        node_pools: vec![EntitySpec {
-            kind: EntityKind::NodePool,
-            file: "pis.pool.hcl".into(),
-            hcl: "node_pool \"pis\" {\n  description = \"Pis\"\n}\n".into(),
-        }],
-        ..workload(None)
-    };
+        }),
+        Primitive::Entity(EntitySpec::new(
+            EntityKind::NodePool,
+            "pis.pool.hcl",
+            "node_pool \"pis\" {\n  description = \"Pis\"\n}\n",
+        )),
+    ]);
     w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
     let policy = fake.entity("policy", "atuin").unwrap();
     assert!(
@@ -421,14 +422,11 @@ async fn policies_namespaces_and_pools_are_stamped_and_converge() {
 async fn existing_unmanaged_objects_are_adopted_with_a_warning() {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");
-    let w = Workload {
-        namespaces: vec![EntitySpec {
-            kind: EntityKind::Namespace,
-            file: "default.namespace.hcl".into(),
-            hcl: "name = \"default\"\ndescription = \"Default\"".into(),
-        }],
-        ..workload(None)
-    };
+    let w = with(vec![Primitive::Entity(EntitySpec::new(
+        EntityKind::Namespace,
+        "default.namespace.hcl",
+        "name = \"default\"\ndescription = \"Default\"",
+    ))]);
     let plan = w.plan(&cx).await.unwrap();
     assert!(
         plan.steps[0].warnings[0].contains("adopts"),
@@ -441,13 +439,7 @@ async fn existing_unmanaged_objects_are_adopted_with_a_warning() {
 async fn volumes_are_created_once_and_listed_in_the_index() {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");
-    let w = Workload {
-        volumes: vec![VolumeSpec {
-            file: "atuin.volume.hcl".into(),
-            hcl: "name = \"atuin\"\ntype = \"host\"\nplugin_id = \"mkdir\"\n".into(),
-        }],
-        ..workload(None)
-    };
+    let w = with(vec![volume()]);
     w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
     assert_eq!(fake.volumes().len(), 1);
     assert_eq!(w.plan(&cx).await.unwrap().changes(), 0);
@@ -472,19 +464,16 @@ async fn orphans_are_found_from_stamps_and_the_index_and_removed_by_policy(
 ) {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");
-    let w = Workload {
-        variables: vec![variables(&[("A", Rendered::Plain("1".into()))])],
-        volumes: vec![VolumeSpec {
-            file: "atuin.volume.hcl".into(),
-            hcl: "name = \"atuin\"\ntype = \"host\"\nplugin_id = \"mkdir\"\n".into(),
-        }],
-        policies: vec![PolicySpec {
+    let w = with(vec![
+        volume(),
+        Primitive::Variable(variables(&[("A", Rendered::Plain("1".into()))])),
+        Primitive::Policy(PolicySpec {
             file: "atuin.policy.hcl".into(),
             rules: "namespace \"default\" {}\n".into(),
             ..Default::default()
-        }],
-        ..workload(Some(atuin_job("atuin:1")))
-    };
+        }),
+        Primitive::Job(atuin_job("atuin:1")),
+    ]);
     w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
 
     let found = orphans(&cx, &[]).await.unwrap();
@@ -526,34 +515,40 @@ async fn a_job_without_a_namespace_lands_in_the_workloads() {
     assert!(fake.job("team-a", "atuin").is_some());
 }
 
-/// atuin's job with its image tag from `var.version`, optionally declared to
-/// nomad-auto-update.
-fn versioned_job(autoupdate: bool) -> JobSpec {
-    let meta = if autoupdate {
-        serde_json::json!({"autoupdate.version": "docker:atuin:latest"})
-    } else {
-        serde_json::json!({})
-    };
+/// atuin's job with its image tag from `var.version`, optionally handed to
+/// an updater with `live_vars`.
+fn versioned_job(live: bool, version: &str) -> JobSpec {
     let mut spec = job(serde_json::json!({
-        "ID": "atuin", "Type": "service", "Meta": meta,
+        "ID": "atuin", "Type": "service", "Meta": {"autoupdate.version": "docker:atuin:latest"},
         "TaskGroups": [{"Name": "api", "Count": 1, "Tasks": [{"Name": "atuin", "Config": {"image": "atuin:${var.version}"}}]}],
     }));
     spec.vars
-        .insert("version".into(), serde_json::json!("latest"));
+        .insert("version".into(), serde_json::json!(version));
+    if live {
+        spec.live_vars = vec!["version".into()];
+    }
     spec
 }
 
+/// Re-registers the running job the way nomad-auto-update does: the image
+/// pinned to a digest, the submission's `version` flag with it.
+fn pin_by_updater(fake: &FakeNomad, pinned: &str) {
+    let sub = fake.submission("default", "atuin").expect("a submission");
+    let mut job = fake.job("default", "atuin").unwrap();
+    job["TaskGroups"][0]["Tasks"][0]["Config"]["image"] = format!("atuin:{pinned}").into();
+    let mut pinned_sub = sub.clone();
+    pinned_sub["VariableFlags"]["version"] = pinned.into();
+    fake.reregister("default", "atuin", job, pinned_sub);
+}
+
 #[rstest::rstest]
-#[case::declared_to_the_updater(true, 0)]
-#[case::not_declared(false, 1)]
+#[case::live_var(true, 0)]
+#[case::not_live(false, 1)]
 #[tokio::test]
-async fn an_updaters_pin_is_kept_only_for_variables_it_owns(
-    #[case] autoupdate: bool,
-    #[case] changes: usize,
-) {
+async fn an_updaters_pin_is_kept_for_live_vars_only(#[case] live: bool, #[case] changes: usize) {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");
-    let w = workload(Some(versioned_job(autoupdate)));
+    let w = workload(Some(versioned_job(live, "latest")));
     w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
 
     // The source and values are kept for the updater to re-render.
@@ -561,12 +556,84 @@ async fn an_updaters_pin_is_kept_only_for_variables_it_owns(
     assert_eq!(sub["VariableFlags"]["version"], "latest");
     assert!(sub["Source"].as_str().unwrap().contains("${var.version}"));
 
-    // nomad-auto-update pins the tag to its digest.
-    let mut pinned = fake.job("default", "atuin").unwrap();
-    pinned["TaskGroups"][0]["Tasks"][0]["Config"]["image"] = "atuin:latest@sha256:abc".into();
-    let mut pinned_sub = sub.clone();
-    pinned_sub["VariableFlags"]["version"] = "latest@sha256:abc".into();
-    fake.reregister("default", "atuin", pinned, pinned_sub);
-
+    pin_by_updater(&fake, "latest@sha256:abc");
     assert_eq!(w.plan(&cx).await.unwrap().changes(), changes);
+}
+
+#[tokio::test]
+async fn a_live_var_the_workload_changes_wins_once_then_the_updater_owns_it_again() {
+    let fake = FakeNomad::new();
+    let cx = cx(&fake, "r1");
+    workload(Some(versioned_job(true, "v1")))
+        .plan(&cx)
+        .await
+        .unwrap()
+        .apply(&cx)
+        .await
+        .unwrap();
+    pin_by_updater(&fake, "v1@sha256:abc");
+
+    // The workload moves to v2: that wins over the pin.
+    let w = workload(Some(versioned_job(true, "v2")));
+    let plan = w.plan(&cx).await.unwrap();
+    assert_eq!(plan.changes(), 1);
+    plan.apply(&cx).await.unwrap();
+    assert_eq!(
+        fake.job("default", "atuin").unwrap()["TaskGroups"][0]["Tasks"][0]["Config"]["image"],
+        "atuin:v2"
+    );
+    let idx = index::read(&fake.client(), "home-nomad").await.unwrap();
+    assert_eq!(
+        idx.find(Kind::Job, "default", "atuin").unwrap().live_vars["version"],
+        "v2"
+    );
+
+    // The updater pins v2; the unchanged workload leaves the pin alone.
+    pin_by_updater(&fake, "v2@sha256:def");
+    assert_eq!(w.plan(&cx).await.unwrap().changes(), 0);
+}
+
+#[tokio::test]
+async fn a_live_var_the_spec_does_not_declare_is_a_warning() {
+    let fake = FakeNomad::new();
+    let cx = cx(&fake, "r1");
+    let mut spec = atuin_job("atuin:1");
+    spec.live_vars = vec!["nope".into()];
+    let plan = workload(Some(spec)).plan(&cx).await.unwrap();
+    assert!(
+        plan.steps[0].warnings.iter().any(|w| w.contains("'nope'")),
+        "{:?}",
+        plan.steps[0].warnings
+    );
+}
+
+#[tokio::test]
+async fn ignored_fields_take_the_live_value_in_plans_and_applies() {
+    use buckle_core::fieldpath::FieldPath;
+    let fake = FakeNomad::new();
+    let cx = cx(&fake, "r1");
+    let mut spec = atuin_job("atuin:1");
+    spec.ignore = vec![FieldPath::parse("TaskGroups[*].Tasks[*].Config.image").unwrap()];
+    let w = workload(Some(spec));
+    w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
+
+    // Another tool changes the image: not a change, and an apply after an
+    // unrelated edit keeps it.
+    fake.edit_job("default", "atuin", |j| {
+        j["TaskGroups"][0]["Tasks"][0]["Config"]["image"] = "atuin:1@sha256:abc".into();
+    });
+    assert_eq!(w.plan(&cx).await.unwrap().changes(), 0);
+
+    let mut bumped = atuin_job("atuin:1");
+    bumped.hcl = bumped.hcl.replacen("\"Count\":1", "\"Count\":2", 1);
+    bumped.ignore = vec![FieldPath::parse("TaskGroups[*].Tasks[*].Config.image").unwrap()];
+    let plan = workload(Some(bumped)).plan(&cx).await.unwrap();
+    assert_eq!(plan.changes(), 1);
+    plan.apply(&cx).await.unwrap();
+    let live = fake.job("default", "atuin").unwrap();
+    assert_eq!(live["TaskGroups"][0]["Count"], 2);
+    assert_eq!(
+        live["TaskGroups"][0]["Tasks"][0]["Config"]["image"],
+        "atuin:1@sha256:abc"
+    );
 }

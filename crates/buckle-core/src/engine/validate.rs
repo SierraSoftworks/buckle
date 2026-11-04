@@ -770,7 +770,7 @@ mod secret_scope_tests {
         write(
             repo.path(),
             "workloads/atuin/workload.yaml",
-            "name: atuin\nwhen: 'cluster.kind == \"nomad\"'\nvariables:\n  nomad/jobs/atuin: { DB: '{{ secrets.DB }}' }\n",
+            "name: atuin\nwhen: 'cluster.kind == \"nomad\"'\nresources:\n  - { secret: nomad/jobs/atuin, items: { DB: '{{ secrets.DB }}' } }\n",
         );
         write(
             repo.path(),

@@ -1301,7 +1301,7 @@ async fn an_executor_plans_applies_and_checks_a_cluster_target_beside_its_host()
             ("buckle.yaml", CLUSTER_FLEET),
             (
                 "workloads/paste/workload.yaml",
-                "name: paste\njob: paste.nomad.hcl\n",
+                "name: paste\nresources: [paste.nomad.hcl]\n",
             ),
             ("workloads/paste/files/paste.nomad.hcl", job),
         ]),

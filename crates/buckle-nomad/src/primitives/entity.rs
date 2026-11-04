@@ -125,6 +125,20 @@ pub struct EntitySpec {
     pub kind: EntityKind,
     pub file: String,
     pub hcl: String,
+    /// Field paths of the live entity that may differ from the spec; the
+    /// live value is kept.
+    pub ignore: Vec<buckle_core::fieldpath::FieldPath>,
+}
+
+impl EntitySpec {
+    pub fn new(kind: EntityKind, file: impl Into<String>, hcl: impl Into<String>) -> Self {
+        Self {
+            kind,
+            file: file.into(),
+            hcl: hcl.into(),
+            ignore: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +197,9 @@ pub(crate) async fn plan(cx: &Context, spec: &EntitySpec) -> Result<Step> {
     let kind = spec.kind;
     let key = ObjectKey::new(kind.kind(), "", &name);
     let live = cx.nomad.get_indexed::<Value>(&kind.get_url(&name)).await?;
+    if let Some(l) = &live {
+        buckle_core::fieldpath::adopt_all(&spec.ignore, &mut desired, &l.value);
+    }
     let live_stamps = live.as_ref().and_then(|l| read_stamps(kind, &l.value));
     let owner = Owner::of(live_stamps, live.is_some(), &cx.target);
     if let Some(reason) = owner.conflict(&key.to_string()) {
@@ -312,11 +329,7 @@ mod tests {
     use serde_json::json;
 
     fn spec(kind: EntityKind, hcl: &str) -> EntitySpec {
-        EntitySpec {
-            kind,
-            file: "x.hcl".into(),
-            hcl: hcl.into(),
-        }
+        EntitySpec::new(kind, "x.hcl", hcl)
     }
 
     #[test]

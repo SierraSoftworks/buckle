@@ -103,11 +103,7 @@ fn job(id: &str, sleep: &str) -> JobSpec {
 async fn a_job_deploys_converges_updates_and_stops() {
     let nomad = nomad_or_skip!();
     let target = "it-job";
-    let w = |sleep: &str| Workload {
-        name: "it".into(),
-        job: Some(job("buckle-it-job", sleep)),
-        ..Default::default()
-    };
+    let w = |sleep: &str| Workload::new("it", vec![Primitive::Job(job("buckle-it-job", sleep))]);
 
     let plan = w("3600").plan(&cx(&nomad, target, "r1")).await.unwrap();
     assert!(
@@ -171,12 +167,10 @@ async fn a_job_deploys_converges_updates_and_stops() {
 
     // A count change places one allocation and leaves the running one alone.
     let mut scaled = w("3601");
-    scaled
-        .job
-        .as_mut()
-        .unwrap()
-        .vars
-        .insert("count".into(), serde_json::json!(2));
+    let Some(Primitive::Job(job)) = scaled.primitives.first_mut() else {
+        panic!("the workload starts with its job");
+    };
+    job.vars.insert("count".into(), serde_json::json!(2));
     let plan = scaled.plan(&cx(&nomad, target, "r4")).await.unwrap();
     let preview = plan.steps[0].preview.join("; ");
     assert!(
@@ -201,11 +195,8 @@ async fn a_job_deploys_converges_updates_and_stops() {
 async fn a_job_changed_after_its_plan_is_refused() {
     let nomad = nomad_or_skip!();
     let cx = cx(&nomad, "it-enforce", "r1");
-    let w = |sleep: &str| Workload {
-        name: "it".into(),
-        job: Some(job("buckle-it-enforce", sleep)),
-        ..Default::default()
-    };
+    let w =
+        |sleep: &str| Workload::new("it", vec![Primitive::Job(job("buckle-it-enforce", sleep))]);
     w("3600").plan(&cx).await.unwrap().apply(&cx).await.unwrap();
     let stale = w("3601").plan(&cx).await.unwrap();
     w("3602").plan(&cx).await.unwrap().apply(&cx).await.unwrap();
@@ -229,36 +220,39 @@ async fn a_job_changed_after_its_plan_is_refused() {
 async fn variables_policies_namespaces_and_pools_converge_and_purge() {
     let nomad = nomad_or_skip!();
     let cx = cx(&nomad, "it-entities", "r1");
-    let w = Workload {
-        name: "it".into(),
-        namespaces: vec![EntitySpec {
-            kind: EntityKind::Namespace,
-            file: "it.namespace.hcl".into(),
-            hcl: "name = \"buckle-it\"\ndescription = \"Buckle integration tests\"\nmeta { owner = \"buckle\" }\n".into(),
-        }],
-        node_pools: vec![EntitySpec {
-            kind: EntityKind::NodePool,
-            file: "it.pool.hcl".into(),
-            hcl: "node_pool \"buckle-it\" {\n  description = \"Buckle integration tests\"\n}\n".into(),
-        }],
-        variables: vec![VariableSpec {
-            namespace: "buckle-it".into(),
-            path: "nomad/jobs/buckle-it".into(),
-            items: [("TZ".to_owned(), Rendered::Plain("Europe/London".into()))].into_iter().collect(),
-        }],
-        policies: vec![PolicySpec {
-            file: "buckle-it.policy.hcl".into(),
-            rules: "namespace \"buckle-it\" {\n  variables {\n    path \"nomad/jobs/buckle-it\" {\n      capabilities = [\"read\"]\n    }\n  }\n}\n".into(),
-            description: "Integration test policy".into(),
-            attach: Some(Attach {
-                namespace: Some("buckle-it".into()),
-                job: "buckle-it".into(),
+    let w = Workload::new(
+        "it",
+        vec![
+            Primitive::Entity(EntitySpec::new(
+                EntityKind::Namespace,
+                "it.namespace.hcl",
+                "name = \"buckle-it\"\ndescription = \"Buckle integration tests\"\nmeta { owner = \"buckle\" }\n",
+            )),
+            Primitive::Entity(EntitySpec::new(
+                EntityKind::NodePool,
+                "it.pool.hcl",
+                "node_pool \"buckle-it\" {\n  description = \"Buckle integration tests\"\n}\n",
+            )),
+            Primitive::Variable(VariableSpec {
+                namespace: "buckle-it".into(),
+                path: "nomad/jobs/buckle-it".into(),
+                items: [("TZ".to_owned(), Rendered::Plain("Europe/London".into()))]
+                    .into_iter()
+                    .collect(),
+            }),
+            Primitive::Policy(PolicySpec {
+                file: "buckle-it.policy.hcl".into(),
+                rules: "namespace \"buckle-it\" {\n  variables {\n    path \"nomad/jobs/buckle-it\" {\n      capabilities = [\"read\"]\n    }\n  }\n}\n".into(),
+                description: "Integration test policy".into(),
+                attach: Some(Attach {
+                    namespace: Some("buckle-it".into()),
+                    job: "buckle-it".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+        ],
+    );
 
     let plan = w.plan(&cx).await.unwrap();
     assert_eq!(plan.changes(), 4, "{:?}", plan.steps);
@@ -281,9 +275,9 @@ async fn variables_policies_namespaces_and_pools_converge_and_purge() {
 async fn a_host_volume_is_created_once() {
     let nomad = nomad_or_skip!();
     let cx = cx(&nomad, "it-volume", "r1");
-    let w = Workload {
-        name: "it".into(),
-        volumes: vec![VolumeSpec {
+    let w = Workload::new(
+        "it",
+        vec![Primitive::Volume(VolumeSpec {
             file: "it.volume.hcl".into(),
             hcl: r#"
 name      = "buckle-it"
@@ -295,9 +289,8 @@ capability {
 }
 "#
             .into(),
-        }],
-        ..Default::default()
-    };
+        })],
+    );
     w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
     assert_eq!(w.plan(&cx).await.unwrap().changes(), 0);
     let found = orphans(&cx, &[]).await.unwrap();

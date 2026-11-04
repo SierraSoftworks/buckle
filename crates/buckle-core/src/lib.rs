@@ -23,6 +23,7 @@ pub mod digest;
 pub mod engine;
 pub mod error;
 pub mod facts;
+pub mod fieldpath;
 pub mod health;
 pub mod model;
 pub mod plan;

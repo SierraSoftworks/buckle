@@ -3888,10 +3888,10 @@ const LAYERED: &[(&str, &str)] = &[
     ),
     (
         "workloads/postgres/workload.yaml",
-        "name: postgres\nneeds: ['module:nomad']\njob: postgres.hcl\n",
+        "name: postgres\nneeds: ['module:nomad']\nresources: [postgres.nomad.hcl]\n",
     ),
     (
-        "workloads/postgres/files/postgres.hcl",
+        "workloads/postgres/files/postgres.nomad.hcl",
         "job \"postgres\" {}\n",
     ),
 ];
@@ -3900,10 +3900,10 @@ const LAYERED: &[(&str, &str)] = &[
 const FLAT: &[(&str, &str)] = &[
     (
         "workloads/postgres/workload.yaml",
-        "name: postgres\njob: postgres.hcl\n",
+        "name: postgres\nresources: [postgres.nomad.hcl]\n",
     ),
     (
-        "workloads/postgres/files/postgres.hcl",
+        "workloads/postgres/files/postgres.nomad.hcl",
         "job \"postgres\" {}\n",
     ),
 ];

@@ -9,6 +9,7 @@ use crate::index::{self, Entry};
 use crate::stamps::{self, Owner, Stamps};
 use buckle_core::Result;
 use buckle_core::error::{system, user};
+use buckle_core::fieldpath::{FieldPath, adopt_all};
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::secrets::Redacted;
 use buckle_core::task::Applied;
@@ -31,6 +32,14 @@ pub struct JobSpec {
     /// canonicalises a missing namespace to `default`, so a spec that names
     /// `default` explicitly also lands here.
     pub namespace: Option<String>,
+    /// Variables another tool owns once the job runs (nomad-auto-update's
+    /// pinned digests and tags): the live submission's value is the input,
+    /// unless the workload's own value changed since Buckle last wrote it.
+    pub live_vars: Vec<String>,
+    /// Field paths of the live job that may differ from the spec: the live
+    /// value is adopted before the plan, so neither the diff nor the apply
+    /// touches them.
+    pub ignore: Vec<FieldPath>,
 }
 
 impl JobSpec {
@@ -96,46 +105,87 @@ fn submission(spec: &JobSpec, vars: &IndexMap<String, Value>) -> Value {
     json!({"Format": "hcl2", "Source": spec.hcl, "VariableFlags": flags})
 }
 
-/// The variables an updater owns once the job runs: those the job's meta
-/// names as `autoupdate.<var>` (nomad-auto-update), with the values of the
-/// live version's submission. Rendering with them keeps the updater's pins
-/// (an image digest, a release tag) instead of resetting them each plan.
-async fn pinned_by_updater(
+/// What the plan found out about the job's `live_vars`.
+struct LiveVars {
+    /// The values to render with, over the workload's.
+    pinned: IndexMap<String, Value>,
+    /// The workload's own value of each live var, as a `-var` flag, for the
+    /// index: the next plan compares against it to tell a change the
+    /// workload made from a value another tool pinned.
+    written: std::collections::BTreeMap<String, String>,
+    warnings: Vec<String>,
+}
+
+/// Resolves the spec's `live_vars` against the live version's submission
+/// and the index. A live var whose workload value equals what Buckle last
+/// wrote (or has no record yet) takes the live value; one the workload
+/// changed takes the workload's, so an operator's edit wins once and the
+/// tool owns the variable again from there.
+async fn live_vars(
     cx: &Context,
     spec: &JobSpec,
-    job: &Value,
-    live: &Value,
+    live: Option<&Value>,
     ns: &str,
     id: &str,
-) -> Result<IndexMap<String, Value>> {
+    previous: Option<&Entry>,
+) -> Result<LiveVars> {
     let declared = spec.declared_vars();
-    let owned: Vec<&str> = job["Meta"]
-        .as_object()
-        .into_iter()
-        .flat_map(|m| m.keys())
-        .filter_map(|k| k.strip_prefix("autoupdate."))
-        .filter(|v| declared.contains_key(*v))
-        .collect();
-    if owned.is_empty() {
-        return Ok(IndexMap::new());
-    }
-    let version = live["Version"].as_u64().unwrap_or(0).to_string();
-    let url = with_query(
-        &with_query(&format!("/v1/job/{}/submission", seg(id)), "namespace", ns),
-        "version",
-        &version,
-    );
-    let Some(live_sub) = cx.nomad.get::<Value>(&url).await? else {
-        return Ok(IndexMap::new());
+    let mut out = LiveVars {
+        pinned: IndexMap::new(),
+        written: Default::default(),
+        warnings: Vec::new(),
     };
-    Ok(owned
-        .into_iter()
-        .filter_map(|v| {
-            live_sub["VariableFlags"][v]
-                .as_str()
-                .map(|s| (v.to_owned(), Value::String(s.to_owned())))
+    if spec.live_vars.is_empty() {
+        return Ok(out);
+    }
+    let declares = |name: &str| {
+        hcl::parse(&spec.hcl).is_ok_and(|body| {
+            body.blocks().any(|b| {
+                b.identifier() == "variable"
+                    && b.labels().first().is_some_and(|l| l.as_str() == name)
+            })
         })
-        .collect())
+    };
+    let mut flags: Option<Value> = None;
+    if let Some(live) = live {
+        let version = live["Version"].as_u64().unwrap_or(0).to_string();
+        let url = with_query(
+            &with_query(&format!("/v1/job/{}/submission", seg(id)), "namespace", ns),
+            "version",
+            &version,
+        );
+        flags = cx
+            .nomad
+            .get::<Value>(&url)
+            .await?
+            .map(|sub| sub["VariableFlags"].clone());
+    }
+    for name in &spec.live_vars {
+        if !declared.contains_key(name) && !declares(name) {
+            out.warnings.push(format!(
+                "live_vars names '{name}', which {} declares no variable for.",
+                spec.file
+            ));
+            continue;
+        }
+        let workload = declared.get(name).map(crate::hcl::flag);
+        if let Some(w) = &workload {
+            out.written.insert(name.clone(), w.clone());
+        }
+        let live_value = flags
+            .as_ref()
+            .and_then(|f| f[name].as_str())
+            .map(str::to_owned);
+        let Some(live_value) = live_value else {
+            continue;
+        };
+        let last = previous.and_then(|e| e.live_vars.get(name));
+        let changed_in_workload = matches!((last, &workload), (Some(l), Some(w)) if l != w);
+        if !changed_in_workload {
+            out.pinned.insert(name.clone(), Value::String(live_value));
+        }
+    }
+    Ok(out)
 }
 
 async fn parse(cx: &Context, spec: &JobSpec, vars: &IndexMap<String, Value>) -> Result<Value> {
@@ -184,13 +234,17 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
     if let Some(reason) = owner.conflict(&key.to_string()) {
         return Ok(Step::blocked(key, reason));
     }
+    let idx = index::read(&cx.nomad, &cx.target).await?;
+    let previous = idx.find(Kind::Job, &ns, &id);
+    let owned = live_vars(cx, spec, live.as_ref(), &ns, &id, previous).await?;
+    let mut warnings = owned.warnings;
+    if !owned.pinned.is_empty() {
+        vars = variables(spec, &owned.pinned);
+        job = parse(cx, spec, &vars).await?;
+        job["Namespace"] = Value::String(ns.clone());
+    }
     if let Some(live) = &live {
-        let pinned = pinned_by_updater(cx, spec, &job, live, &ns, &id).await?;
-        if !pinned.is_empty() {
-            vars = variables(spec, &pinned);
-            job = parse(cx, spec, &vars).await?;
-            job["Namespace"] = Value::String(ns.clone());
-        }
+        adopt_all(&spec.ignore, &mut job, live);
     }
     let submission = submission(spec, &vars);
     // Only the owner stamps go in the job's meta: Nomad passes job meta to
@@ -199,22 +253,21 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
     // and digest live in the target's index instead.
     Stamps::stamp_owner(&cx.target, &cx.module, &mut job);
     let digest = stamps::short_digest(&(&spec.hcl, &spec.declared_vars(), &spec.files));
-    let idx = index::read(&cx.nomad, &cx.target).await?;
     let entry = Entry {
         kind: Kind::Job,
         namespace: ns.clone(),
         name: id.clone(),
         module: cx.module.clone(),
-        revision: match idx.find(Kind::Job, &ns, &id) {
+        revision: match previous {
             Some(p) if p.digest == digest && p.module == cx.module => p.revision.clone(),
             _ => cx.revision.clone(),
         },
         digest,
         items: Vec::new(),
         id: None,
+        live_vars: owned.written,
     };
 
-    let mut warnings = Vec::new();
     if owner == Owner::Unmanaged {
         warnings.push(format!(
             "{key} exists and is not managed by Buckle; applying adopts it."

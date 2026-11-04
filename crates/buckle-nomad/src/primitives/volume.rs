@@ -179,6 +179,7 @@ pub(crate) async fn plan(cx: &Context, spec: &VolumeSpec) -> Result<Step> {
         digest,
         items: Vec::new(),
         id: live.clone(),
+        live_vars: Default::default(),
     };
     let planned = match (&live, listed) {
         (Some(id), Some(e)) if e.id.as_deref() == Some(id) && e.module == cx.module => {
