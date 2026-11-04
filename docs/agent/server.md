@@ -78,6 +78,10 @@ telemetry:
   otlp_endpoint: http://otel-collector.example.internal:4317
   otlp_headers: { x-honeycomb-team: "${{ env.HONEYCOMB_KEY }}" }
   trace_url_template: https://ui.honeycomb.io/example/environments/prod/trace?trace_id={trace_id}
+
+identity:
+  issuer: https://buckle.example.ts.net
+  ttl: 15m
 ```
 
 ### listen
@@ -205,6 +209,75 @@ A rollout is one trace, from the server's `rollout.run` span down through every 
 task and health check spans. The server also exports two gauges: `buckle.rollout.hosts` (by
 rollout, phase and state) and `buckle.agent.connected`.
 
+### identity
+
+The server issues short-lived JWTs that agents exchange for cluster credentials, so no Nomad or
+Kubernetes token is stored anywhere. It signs; it holds nothing that can reach a cluster.
+
+| Key | Default | Description |
+|---|---|---|
+| `issuer` | `web.base_url`, else `buckle` | The tokens' `iss`, and the base URL clusters fetch `/.well-known/openid-configuration` and `/.well-known/jwks.json` from. |
+| `ttl` | `15m` | How long a token lives (1m to 1h). Agents fetch one before a plan, apply or health pass and reuse it while it lasts. |
+
+**Issue.** An agent calls `IssueIdentity { target, purpose }`. The server grants it only for a
+cluster target declared in a revision the host may fetch, with `identity: buckle_jwt`, and only
+when the host matches the target's `executors` selector (purposes `read` and `deploy`) or its
+`nodes` selector (`drain`, for its own node). Grants and refusals are audited (`identity.issued`,
+`identity.denied`).
+
+| Claim | Value |
+|---|---|
+| `iss` | `identity.issuer` |
+| `sub`, `host` | The requesting host, e.g. `pi-1`. |
+| `aud`, `target` | The cluster target, e.g. `home-nomad`. |
+| `cluster` | The cluster the target is on (differs for a scoped target). |
+| `purpose` | `read`, `deploy` or `drain`. |
+| `rollout` | The rollout the credential serves, when any. |
+
+**Keys.** One ES256 key at `data_dir/identity/signing.key`, generated on first start and
+published at `/.well-known/jwks.json` and, as PEM, at `/.well-known/buckle-identity.pem`. To
+rotate, move `signing.key` to `retired.key` and restart (both keys are published, the new one
+signs); delete `retired.key` and restart again once a TTL has passed.
+
+**Nomad trust.** A `jwt` auth method holding Buckle's public keys (Nomad needs no URL) and a
+binding rule per purpose; the agent logs in at `/v1/acl/login` with auth method `buckle`. Created
+once with a management token, which the `nomad` host module does through `command.run`:
+
+```json
+{
+  "JWTValidationPubKeys": ["-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----\n"],
+  "JWTSupportedAlgs": ["ES256"],
+  "BoundIssuer": ["https://buckle.example.ts.net"],
+  "BoundAudiences": ["home-nomad"],
+  "ClaimMappings": { "purpose": "purpose", "host": "host" }
+}
+```
+
+```sh
+nomad acl auth-method create -name buckle -type JWT -max-token-ttl 15m \
+  -token-locality global -config @buckle-auth.json
+for purpose in read deploy drain; do
+  nomad acl binding-rule create -auth-method buckle -bind-type policy \
+    -bind-name "buckle-$purpose" -selector "value.purpose == \"$purpose\""
+done
+```
+
+**Kubernetes trust.** A structured authentication config trusting the issuer, with RBAC bound to
+the mapped users (`buckle:pi-1`) or groups (`buckle:deploy`). The API server fetches the discovery
+document over HTTPS, so `issuer` must be an HTTPS URL it trusts: serve the HTTP listener through
+`tailscale serve` for a publicly trusted tailnet certificate, or pin a private CA in
+`certificateAuthority`. k3s takes the file as `--kube-apiserver-arg=authentication-config=…`.
+
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+jwt:
+  - issuer: { url: https://buckle.example.ts.net, audiences: [lab-k3s] }
+    claimMappings:
+      username: { claim: sub, prefix: "buckle:" }
+      groups: { expression: '["buckle:" + claims.purpose]' }
+```
+
 ## API
 
 The UI is a client of the REST API under `/api/v1`, which you can script against with the same
@@ -218,3 +291,4 @@ session cookie or behind the same ACLs. Useful endpoints:
 | `GET /api/v1/catalog` | The task kinds, fact providers and health checks this server knows, with their JSON schemas. |
 | `GET /api/v1/events` | Server-sent events for live updates. |
 | `POST /api/v1/webhooks/source` | Git push notifications. |
+| `GET /.well-known/openid-configuration`, `/.well-known/jwks.json`, `/.well-known/buckle-identity.pem` | The identity issuer's discovery document and public keys (unauthenticated). |

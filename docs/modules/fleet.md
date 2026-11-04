@@ -87,7 +87,7 @@ fleet:
 |---|---|
 | `nodes` | A [selector](./expressions.md) over `host.*` choosing the cluster's members: what a workload's `module:` edge and a module's `workload:` edge refer to. |
 | `executors` | Which of the hosts may apply workloads to the cluster. Defaults to `nodes`. |
-| `identity` | How an executor authenticates to the API: a token Buckle issues (`buckle_jwt`), the host's own credentials (`local`), the scheduler's workload identity (`workload`), or a declared secret (`secret://NAME`). |
+| `identity` | How an executor authenticates to the API: a token Buckle issues (`buckle_jwt`, see [identity](../agent/server.md#identity)), the host's own credentials (`local`), the scheduler's workload identity (`workload`), or a declared secret (`secret://NAME`). |
 | `labels` | Seed labels, as an agent's are for a host. Operators may add to them in the UI, and `cluster.labels.*` selects on the result. |
 | `cluster`, `scope` | A *scoped* target is part of another cluster and may touch only the namespaces listed. |
 

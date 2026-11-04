@@ -165,6 +165,14 @@ async fn server_full(
         guard: guard.clone(),
         upgrades: upgrades.clone(),
         joins: joins.clone(),
+        identity: Arc::new(
+            crate::identity::Issuer::load(
+                &data.path().join("identity"),
+                &Default::default(),
+                "buckle".into(),
+            )
+            .unwrap(),
+        ),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -473,9 +481,17 @@ async fn fetch_revision_code(addr: SocketAddr, token: &str, revision: &str) -> t
 }
 
 async fn build_revision(s: &Server, id: &str) -> crate::store::RevisionRecord {
+    build_revision_with(s, id, "version: 2\n").await
+}
+
+async fn build_revision_with(
+    s: &Server,
+    id: &str,
+    buckle_yaml: &str,
+) -> crate::store::RevisionRecord {
     let tree = s.data.path().join(format!("tree-{id}"));
     std::fs::create_dir_all(tree.join("modules/m")).unwrap();
-    std::fs::write(tree.join("buckle.yaml"), "version: 2\n").unwrap();
+    std::fs::write(tree.join("buckle.yaml"), buckle_yaml).unwrap();
     std::fs::write(
         tree.join("modules/m/module.yaml"),
         format!("name: m\n# {id}\n"),
@@ -1255,4 +1271,181 @@ async fn a_requested_upgrade_is_resent_until_the_agent_reconnects_on_it() {
         }
         assert!(found, "{action} is audited");
     }
+}
+
+// ------------------------------------------------------------ identity issuance
+
+const CLUSTERS: &str = r#"version: 2
+fleet:
+  clusters:
+    home-nomad:
+      kind: nomad
+      nodes: 'host.labels.nomad == true'
+      executors: 'host.labels.role == "server"'
+    lab-k3s:
+      kind: kubernetes
+      nodes: 'true'
+      identity: local
+"#;
+
+/// An active host `id` with `labels`, enrolled by token, on stable revision `abc`.
+async fn identity_host(labels: &[(&str, &str)]) -> (Server, String) {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let token = expect_welcome(reply).issued_token;
+    build_revision_with(&s, "abc", CLUSTERS).await;
+    let labels: std::collections::BTreeMap<String, String> = labels
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    s.store
+        .call(move |db| {
+            db.kv()
+                .set(crate::store::kv::keys::STABLE_REVISION, "abc")?;
+            db.hosts().set_labels("pi-1", &labels).map(|_| ())
+        })
+        .await
+        .unwrap();
+    (s, token)
+}
+
+async fn issue(
+    s: &Server,
+    token: &str,
+    target: &str,
+    purpose: buckle_proto::v1::IdentityPurpose,
+) -> Result<buckle_proto::v1::IssuedIdentity, tonic::Status> {
+    let mut client = FleetClient::connect(format!("http://{}", s.addr))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(buckle_proto::v1::IssueIdentityRequest {
+        target: target.into(),
+        purpose: purpose as i32,
+        ..Default::default()
+    });
+    request
+        .metadata_mut()
+        .insert(buckle_proto::TOKEN_METADATA_KEY, token.parse().unwrap());
+    client.issue_identity(request).await.map(|r| r.into_inner())
+}
+
+async fn audit_actions(s: &Server) -> Vec<(String, String)> {
+    s.store
+        .call(|db| {
+            Ok(db
+                .audit()
+                .list(&crate::store::AuditFilter {
+                    limit: 100,
+                    ..Default::default()
+                })?
+                .0
+                .into_iter()
+                .filter(|e| e.action.starts_with("identity."))
+                .map(|e| (e.action, e.subject.unwrap_or_default()))
+                .collect())
+        })
+        .await
+        .unwrap()
+}
+
+#[rstest::rstest]
+#[case::executor_deploys(&[("role", "server"), ("nomad", "true")], "home-nomad", buckle_proto::v1::IdentityPurpose::Deploy, tonic::Code::Ok)]
+#[case::node_drains(&[("nomad", "true")], "home-nomad", buckle_proto::v1::IdentityPurpose::Drain, tonic::Code::Ok)]
+#[case::node_cannot_deploy(&[("nomad", "true")], "home-nomad", buckle_proto::v1::IdentityPurpose::Deploy, tonic::Code::PermissionDenied)]
+#[case::outsider_cannot_drain(&[("role", "server")], "home-nomad", buckle_proto::v1::IdentityPurpose::Drain, tonic::Code::PermissionDenied)]
+#[case::local_identity(&[], "lab-k3s", buckle_proto::v1::IdentityPurpose::Read, tonic::Code::PermissionDenied)]
+#[case::undeclared(&[("role", "server")], "nowhere", buckle_proto::v1::IdentityPurpose::Read, tonic::Code::NotFound)]
+#[case::no_purpose(&[("role", "server")], "home-nomad", buckle_proto::v1::IdentityPurpose::Unspecified, tonic::Code::InvalidArgument)]
+#[tokio::test]
+async fn identities_are_granted_by_the_cluster_selectors_and_audited(
+    #[case] labels: &[(&str, &str)],
+    #[case] target: &str,
+    #[case] purpose: buckle_proto::v1::IdentityPurpose,
+    #[case] expected: tonic::Code,
+) {
+    let (s, token) = identity_host(labels).await;
+    let got = issue(&s, &token, target, purpose).await;
+    assert_eq!(
+        got.as_ref()
+            .map_err(|e| e.code())
+            .err()
+            .unwrap_or(tonic::Code::Ok),
+        expected,
+        "{got:?}"
+    );
+    let audit = audit_actions(&s).await;
+    match expected {
+        tonic::Code::Ok => {
+            let issued = got.unwrap();
+            assert_eq!(issued.audience, target);
+            assert!(!issued.token.is_empty());
+            assert_eq!(
+                audit,
+                vec![("identity.issued".to_string(), target.to_string())]
+            );
+        }
+        tonic::Code::InvalidArgument => assert!(audit.is_empty()),
+        _ => assert_eq!(
+            audit,
+            vec![("identity.denied".to_string(), target.to_string())]
+        ),
+    }
+}
+
+#[tokio::test]
+async fn identities_need_the_per_host_token() {
+    let (s, _) = identity_host(&[("role", "server")]).await;
+    let err = issue(
+        &s,
+        "wrong",
+        "home-nomad",
+        buckle_proto::v1::IdentityPurpose::Read,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+#[rstest::rstest]
+#[case::executor(r#"host.labels.role == "server""#, tonic::Code::Ok)]
+#[case::not_an_executor(r#"host.labels.role == "db""#, tonic::Code::PermissionDenied)]
+#[tokio::test]
+async fn clusters_created_through_the_api_grant_by_their_selectors(
+    #[case] executors: &'static str,
+    #[case] expected: tonic::Code,
+) {
+    let (s, token) = identity_host(&[("role", "server")]).await;
+    s.store
+        .call(move |db| {
+            db.hosts()
+                .create_cluster(&crate::store::NewCluster {
+                    id: "edge".into(),
+                    cluster: buckle_api::ClusterInfo {
+                        spec: buckle_api::ClusterSpec {
+                            kind: buckle_api::ClusterKind::Kubernetes,
+                            description: String::new(),
+                            api: None,
+                            nodes: None,
+                            executors: Some(executors.into()),
+                            identity: "buckle_jwt".into(),
+                            cluster: None,
+                            scope: Default::default(),
+                        },
+                        declared: false,
+                    },
+                    agent_labels: Default::default(),
+                    labels: Default::default(),
+                    notes: String::new(),
+                    status: HostStatus::Active,
+                    at: chrono::Utc::now(),
+                })
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+    let got = issue(&s, &token, "edge", buckle_proto::v1::IdentityPurpose::Read).await;
+    assert_eq!(
+        got.map(|_| tonic::Code::Ok).unwrap_or_else(|e| e.code()),
+        expected
+    );
 }

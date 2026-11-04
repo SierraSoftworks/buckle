@@ -14,7 +14,8 @@ use buckle_api::{Connection as LinkState, HealthSummary, HostStatus, LiveEvent, 
 use buckle_proto::v1::fleet_server::{Fleet, FleetServer};
 use buckle_proto::v1::{
     Ack, AgentMessage, Chunk, FetchBlobRequest, FetchRevisionRequest, FetchSecretsRequest, Hello,
-    Rejected, SecretBundle, ServerMessage, Welcome, agent_message, server_message,
+    IssueIdentityRequest, IssuedIdentity, Rejected, SecretBundle, ServerMessage, Welcome,
+    agent_message, server_message,
 };
 use futures::{Stream, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,6 +50,8 @@ pub struct FleetService {
     pub upgrades: Arc<crate::upgrades::AgentUpgrades>,
     /// Join commands whose tokens enrol new hosts.
     pub joins: Arc<crate::join::Joins>,
+    /// Signs the short-lived cluster credentials of `IssueIdentity`.
+    pub identity: Arc<crate::identity::Issuer>,
 }
 
 impl std::fmt::Debug for FleetService {
@@ -169,7 +172,7 @@ impl FleetService {
     }
 
     async fn audit(&self, actor: &str, action: &str, subject: &str, message: String) {
-        let entry = NewAudit {
+        self.audit_entry(NewAudit {
             at: self.now(),
             actor: actor.to_owned(),
             action: action.to_owned(),
@@ -178,7 +181,11 @@ impl FleetService {
             message,
             detail: None,
             trace_id: None,
-        };
+        })
+        .await
+    }
+
+    async fn audit_entry(&self, entry: NewAudit) {
         if let Ok(e) = self.store.call(move |db| db.audit().add(&entry)).await {
             self.events.publish(LiveEvent::Audit {
                 entry: buckle_api::AuditEntryRef {
@@ -1381,5 +1388,129 @@ impl Fleet for FleetService {
         let bundle = self.secrets.fetch(&revision, &ctx, &req.names).await;
         tracing::info!(buckle.host = %host, requested = req.names.len(), granted = bundle.secrets.len(), "secrets fetched");
         Ok(Response::new(bundle))
+    }
+
+    async fn issue_identity(
+        &self,
+        request: Request<IssueIdentityRequest>,
+    ) -> Result<Response<IssuedIdentity>, Status> {
+        use crate::identity::{Grant, Purpose};
+        use buckle_proto::v1::IdentityPurpose;
+        let host = self.caller(&request).await?;
+        let req = request.into_inner();
+        let purpose = match req.purpose() {
+            IdentityPurpose::Read => Purpose::Read,
+            IdentityPurpose::Deploy => Purpose::Deploy,
+            IdentityPurpose::Drain => Purpose::Drain,
+            IdentityPurpose::Unspecified => {
+                return Err(Status::invalid_argument("name the identity's purpose"));
+            }
+        };
+        let revision = if req.revision.is_empty() {
+            self.store
+                .call(|db| db.kv().get(crate::store::kv::keys::STABLE_REVISION))
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| Status::failed_precondition("the fleet has no stable revision"))?
+        } else {
+            req.revision.clone()
+        };
+        self.entitled_to(&host, &revision).await?;
+        let (h, rollout, t) = (host.clone(), req.rollout_id.clone(), req.target.clone());
+        let (record, facts, rollout_known, stored) = self
+            .store
+            .call(move |db| {
+                Ok((
+                    db.hosts().get(&h)?,
+                    db.hosts().latest_facts(&h)?.map(|(f, _)| f),
+                    rollout.is_empty() || db.rollouts().get(&rollout)?.is_some(),
+                    db.hosts().target(&t)?,
+                ))
+            })
+            .await
+            .map_err(internal)?;
+        let record = record.ok_or_else(|| Status::unauthenticated("unknown host"))?;
+        if !rollout_known {
+            return Err(Status::invalid_argument("no such rollout"));
+        }
+        let loaded = self
+            .revisions
+            .load(&revision)
+            .await
+            .map_err(|_| Status::not_found("no such revision"))?;
+        let ctx = crate::fleet::record_context(
+            &record,
+            &facts.unwrap_or(serde_json::Value::Null),
+            &loaded.fleet,
+        );
+        let denied = |reason: String| NewAudit {
+            at: self.now(),
+            actor: host.clone(),
+            action: "identity.denied".into(),
+            outcome: "denied".into(),
+            subject: Some(req.target.clone()),
+            message: format!(
+                "{host} was refused a {purpose} identity for {}: {reason}",
+                req.target
+            ),
+            detail: Some(serde_json::json!({ "purpose": purpose, "revision": revision })),
+            trace_id: None,
+        };
+        let Some(trust) = crate::fleet::cluster_trust(&loaded.fleet, stored.as_ref(), &req.target)
+        else {
+            let reason = format!("revision {revision} declares no cluster {}", req.target);
+            self.audit_entry(denied(reason.clone())).await;
+            return Err(Status::not_found(reason));
+        };
+        if let Err(reason) = trust.authorise(&ctx, purpose) {
+            self.audit_entry(denied(reason.clone())).await;
+            return Err(Status::permission_denied(reason));
+        }
+        let grant = Grant {
+            host: host.clone(),
+            target: trust.target.clone(),
+            cluster: trust.cluster.clone(),
+            purpose,
+            rollout: (!req.rollout_id.is_empty()).then(|| req.rollout_id.clone()),
+        };
+        let issued = self.identity.issue(&grant, self.now()).map_err(internal)?;
+        tracing::info!(
+            buckle.host = %host,
+            buckle.target = %grant.target,
+            %purpose,
+            jti = %issued.id,
+            "identity issued"
+        );
+        self.audit_entry(NewAudit {
+            at: issued.issued_at,
+            actor: host.clone(),
+            action: "identity.issued".into(),
+            outcome: "ok".into(),
+            subject: Some(grant.target.clone()),
+            message: format!(
+                "{host} was issued a {purpose} identity for {} until {}",
+                grant.target,
+                issued.expires_at.format("%H:%M:%S UTC")
+            ),
+            detail: Some(serde_json::json!({
+                "jti": issued.id,
+                "purpose": purpose,
+                "revision": revision,
+                "rollout": grant.rollout,
+                "expires_at": issued.expires_at,
+            })),
+            trace_id: None,
+        })
+        .await;
+        Ok(Response::new(IssuedIdentity {
+            token: issued.token,
+            expires_at: Some(prost_types::Timestamp {
+                seconds: issued.expires_at.timestamp(),
+                nanos: 0,
+            }),
+            issuer: self.identity.issuer().to_owned(),
+            audience: grant.target,
+            id: issued.id,
+        }))
     }
 }

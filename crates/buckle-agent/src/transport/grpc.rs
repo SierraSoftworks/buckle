@@ -393,6 +393,64 @@ impl Transport for GrpcTransport {
             .into_inner();
         Ok(super::convert::secrets_from_proto(Some(bundle)))
     }
+
+    async fn issue_identity(
+        &self,
+        request: &crate::identity::IdentityRequest,
+    ) -> buckle_core::Result<crate::identity::IssuedIdentity> {
+        use crate::identity::Purpose;
+        let token = self.token();
+        let message = pb::IssueIdentityRequest {
+            target: request.target.clone(),
+            purpose: match request.purpose {
+                Purpose::Read => pb::IdentityPurpose::Read,
+                Purpose::Deploy => pb::IdentityPurpose::Deploy,
+                Purpose::Drain => pb::IdentityPurpose::Drain,
+            } as i32,
+            revision: request
+                .revision
+                .as_ref()
+                .map(|r| r.0.clone())
+                .unwrap_or_default(),
+            rollout_id: request.rollout.clone().unwrap_or_default(),
+        };
+        let issued = self
+            .client()
+            .issue_identity(self.request(message, token.as_deref()))
+            .await
+            .map_err(|status| {
+                let advice: &[&str] = match status.code() {
+                    tonic::Code::PermissionDenied | tonic::Code::NotFound => &[
+                        "Check the cluster's `nodes` and `executors` selectors and its `identity` in buckle.yaml.",
+                    ],
+                    tonic::Code::Unimplemented => {
+                        &["Upgrade the Buckle server; it predates cluster identities."]
+                    }
+                    _ => &["Check the server's logs for details."],
+                };
+                buckle_core::error::wrap_user(
+                    status,
+                    format!("The server did not issue an identity for {}.", request.target),
+                    advice,
+                )
+            })?
+            .into_inner();
+        let expires_at = issued
+            .expires_at
+            .and_then(|t| chrono::DateTime::from_timestamp(t.seconds, t.nanos.max(0) as u32))
+            .ok_or_else(|| {
+                buckle_core::error::system(
+                    "The server issued an identity without an expiry.",
+                    &["Report this issue."],
+                )
+            })?;
+        Ok(crate::identity::IssuedIdentity {
+            token: issued.token,
+            expires_at,
+            audience: issued.audience,
+            id: issued.id,
+        })
+    }
 }
 
 #[cfg(test)]

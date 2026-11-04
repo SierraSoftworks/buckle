@@ -312,6 +312,23 @@ pub trait Transport: Send + Sync + 'static {
         revision: &RevisionId,
         names: &[String],
     ) -> buckle_core::Result<Vec<WireSecret>>;
+
+    /// Asks the control plane for a short-lived identity for a cluster
+    /// target. Only a server issues them.
+    async fn issue_identity(
+        &self,
+        request: &crate::identity::IdentityRequest,
+    ) -> buckle_core::Result<crate::identity::IssuedIdentity> {
+        Err(buckle_core::error::user(
+            format!(
+                "There is no Buckle server to issue an identity for {}.",
+                request.target
+            ),
+            &[
+                "Use `identity: local` or a `secret://` credential for clusters reached without a server.",
+            ],
+        ))
+    }
 }
 
 /// Agent → control plane messages, transport-neutral. The gRPC transport

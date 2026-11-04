@@ -318,4 +318,33 @@ impl Fleet for FakeFleet {
             .collect();
         Ok(Response::new(pb::SecretBundle { secrets }))
     }
+
+    /// Echoes the request in the token; refuses the target `denied`.
+    async fn issue_identity(
+        &self,
+        request: Request<pb::IssueIdentityRequest>,
+    ) -> Result<Response<pb::IssuedIdentity>, Status> {
+        let r = request.into_inner();
+        if r.target == "denied" {
+            return Err(Status::permission_denied(
+                "test-host is not an executor for denied",
+            ));
+        }
+        Ok(Response::new(pb::IssuedIdentity {
+            token: format!(
+                "{}/{:?}/{}/{}",
+                r.target,
+                r.purpose(),
+                r.revision,
+                r.rollout_id
+            ),
+            expires_at: Some(prost_types::Timestamp {
+                seconds: 1_893_456_000,
+                nanos: 0,
+            }),
+            issuer: "buckle".into(),
+            audience: r.target,
+            id: "jti-1".into(),
+        }))
+    }
 }

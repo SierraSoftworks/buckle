@@ -2427,3 +2427,51 @@ async fn run_reports_are_served_per_host_and_per_rollout_host() {
         .unwrap();
     assert_eq!(host.run_id.as_deref(), Some(run_id.as_str()));
 }
+
+#[actix_web::test]
+async fn the_identity_issuer_publishes_its_keys_without_sign_in() {
+    let keys = tempfile::tempdir().unwrap();
+    let issuer = Arc::new(
+        crate::identity::Issuer::load(
+            keys.path(),
+            &Default::default(),
+            "https://buckle.example".into(),
+        )
+        .unwrap(),
+    );
+    let kid = issuer.kid().to_owned();
+    // Sign-in is required everywhere else; /.well-known/ stays open.
+    let e = env_with(
+        WebConfig {
+            user_acl: acl("false"),
+            ..Default::default()
+        },
+        |s| s.identity = Some(issuer),
+    )
+    .await;
+    let svc = test::init_service(app(e.state.clone())).await;
+    let get = |uri: &str| test::TestRequest::get().uri(uri).to_request();
+
+    let resp = test::call_service(&svc, get("/.well-known/openid-configuration")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(
+        doc["jwks_uri"],
+        "https://buckle.example/.well-known/jwks.json"
+    );
+
+    let resp = test::call_service(&svc, get("/.well-known/jwks.json")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let jwks: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(jwks["keys"][0]["kid"], kid.as_str());
+
+    let resp = test::call_service(&svc, get("/.well-known/buckle-identity.pem")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let pem = test::read_body(resp).await;
+    assert!(String::from_utf8_lossy(&pem).contains("BEGIN PUBLIC KEY"));
+
+    let none = env(WebConfig::default()).await;
+    let svc = test::init_service(app(none.state.clone())).await;
+    let resp = test::call_service(&svc, get("/.well-known/jwks.json")).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no issuer, no keys");
+}

@@ -12,6 +12,7 @@ pub mod backoff;
 pub mod bundle;
 pub mod coalesce;
 pub mod config;
+pub mod identity;
 pub mod install;
 pub mod runner;
 pub mod session;
