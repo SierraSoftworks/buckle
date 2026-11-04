@@ -43,6 +43,11 @@ agents:
   tailscale:
     allowed_tags: ["tag:buckle"]
     allowed_users: ["ops@example.com"]
+    provisioning:                   # Add an agent joins hosts to the tailnet
+      client_id: "${{ env.TS_OAUTH_CLIENT_ID }}"
+      client_secret: "${{ env.TS_OAUTH_CLIENT_SECRET }}"
+  join:
+    server_url: http://buckle.example.ts.net:7700
   # tailscale_socket: /var/run/tailscale/tailscaled.sock
   minimum_agent_version: "2.0.0"
   desired_version: "2.3.1"
@@ -114,11 +119,49 @@ and the fleet stays on the last valid one.
 | `registration` | `auto` | `auto` makes a new host active at once; `approve` keeps every new host pending until an admin approves it. |
 | `tailscale.allowed_tags` | `[]` | Tailnet nodes with one of these ACL tags may register (the `tag:` prefix is optional). |
 | `tailscale.allowed_users` | `[]` | Tailnet nodes owned by one of these login names may register. With both lists empty, every new tailnet node waits for approval. |
+| `tailscale.provisioning` | | A Tailscale OAuth app that issues the auth key a [join command](../operations/bootstrapping.md) uses to put a new host on the tailnet; see below. |
+| `join.server_url` | `web.base_url`'s host, `listen.grpc`'s port | The gRPC URL join commands point agents at. |
+| `join.install_url` | this server's release | The directory `install.sh` and `install.ps1` are fetched from (a mirror, say). |
+| `join.ttl` | `1h` | How long a join command's single-use keys work; at most an hour. |
 | `tailscale_socket` | `/var/run/tailscale/tailscaled.sock` | The `tailscaled` LocalAPI socket used to identify tailnet peers. |
 | `minimum_agent_version` | | Older agents are refused (before anything is recorded, so they can enrol once upgraded). |
 | `desired_version` | server's version | The version the UI offers when an admin upgrades an agent. |
 | `disconnect_timeout` | `10m` | A host disconnected this long in the middle of its wave counts as failed. |
 | `apply_timeout` | `30m` | A host applying this long without a result counts as failed. |
+
+#### Tailscale provisioning
+
+With `tailscale.provisioning`, **Add an agent** puts a single-use Tailscale auth key into the join
+command, so a new host joins the tailnet and enrols in one paste. The OAuth client secret never
+leaves the server; the key works once and expires within the hour. `flow` picks how the key is
+issued:
+
+- **`app`** (default): Tailscale's [device provisioning](https://tailscale.com/docs/features/oauth-apps/device-provisioning)
+  flow. Each command asks the admin creating it to consent in Tailscale.
+  1. Create an OAuth app with scope `auth_keys:create:once` and redirect URI
+     `{web.base_url}/api/v1/join/tailscale/callback`.
+  2. The node is owned by the consenting admin and advertises one of `tags`, so `allowed_tags`
+     admits it. The admin must own those tags in the tailnet policy's `tagOwners`.
+- **`client`**: an [OAuth client](https://tailscale.com/kb/1215/oauth-clients) with the
+  `auth_keys` scope and the tags assigned. The server mints a tagged, pre-approved key itself,
+  with no consent step and no `web.base_url` needed.
+
+```yaml
+agents:
+  tailscale:
+    allowed_tags: ["tag:buckle"]
+    provisioning:
+      flow: client
+      client_id: "${{ env.TS_OAUTH_CLIENT_ID }}"
+      client_secret: "${{ env.TS_OAUTH_CLIENT_SECRET }}"
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `flow` | `app` | `app` (admin consents per command) or `client` (server mints tagged keys). |
+| `client_id`, `client_secret` | | The OAuth app's or client's credentials. |
+| `tags` | `allowed_tags` | The tags the wizard offers; the first is the default. Required for `client`. |
+| `node_attributes` | `[]` | `custom:…` attributes stamped on the node (`app` only); each must be on the app's `allowedNodeAttributes`. |
 
 Per-host labels, pauses and notes are managed in the UI and stored in the database, not here.
 

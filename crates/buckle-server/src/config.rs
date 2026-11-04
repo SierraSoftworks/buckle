@@ -85,6 +85,54 @@ impl ServerConfig {
                 ],
             ));
         }
+        if let Some(p) = &self.agents.tailscale.provisioning {
+            if p.flow == ProvisioningFlow::App && self.web.base_url.is_none() {
+                return Err(buckle_core::error::user(
+                    "`web.base_url` is required when `agents.tailscale.provisioning` is configured, so Tailscale can return to the server.",
+                    &[
+                        "Set web.base_url to the public URL operators use, and register {base_url}/api/v1/join/tailscale/callback as the OAuth app's redirect URI.",
+                    ],
+                ));
+            }
+            if let Some(p) = &self.agents.tailscale.provisioning
+                && [&p.api_url, &p.login_url]
+                    .iter()
+                    .any(|u| url::Url::parse(u).is_err())
+            {
+                return Err(buckle_core::error::user(
+                    "`agents.tailscale.provisioning.api_url` and `login_url` must be URLs.",
+                    &["Remove them to use Tailscale's own."],
+                ));
+            }
+            if !self.agents.auth.contains(&AgentAuth::Tailscale) {
+                return Err(buckle_core::error::user(
+                    "`agents.tailscale.provisioning` joins hosts to the tailnet, but `agents.auth` does not accept Tailscale.",
+                    &["Add `tailscale` to agents.auth, or remove the provisioning section."],
+                ));
+            }
+            if p.flow == ProvisioningFlow::Client
+                && p.tags.is_empty()
+                && self.agents.tailscale.allowed_tags.is_empty()
+            {
+                return Err(buckle_core::error::user(
+                    "`agents.tailscale.provisioning.flow: client` mints tagged keys, but no tags are configured.",
+                    &[
+                        "Set provisioning.tags (or agents.tailscale.allowed_tags) to tags the OAuth client owns.",
+                    ],
+                ));
+            }
+        }
+        if self.agents.join.ttl.is_zero() || self.agents.join.ttl > Duration::from_secs(3600) {
+            return Err(buckle_core::error::user(
+                format!(
+                    "`agents.join.ttl` ({:?}) must be between 1s and 1h.",
+                    self.agents.join.ttl
+                ),
+                &[
+                    "Tailscale provisioning keys last an hour, so join commands cannot outlive that.",
+                ],
+            ));
+        }
         if self.web.oidc.is_some() && self.web.base_url.is_none() {
             return Err(buckle_core::error::user(
                 "`web.base_url` is required when OIDC is configured, so the callback URL can be built.",
@@ -301,6 +349,9 @@ pub struct AgentsConfig {
     /// Which tailnet nodes are trusted as agents (design §02, §08).
     #[serde(default)]
     pub tailscale: TailscaleConfig,
+    /// What the join commands generated for new hosts contain.
+    #[serde(default)]
+    pub join: JoinConfig,
     /// How long a host may stay disconnected in the middle of its wave
     /// before the rollout counts it as failed.
     #[serde(
@@ -330,6 +381,7 @@ impl std::fmt::Debug for AgentsConfig {
             .field("desired_version", &self.desired_version)
             .field("tailscale_socket", &self.tailscale_socket)
             .field("tailscale", &self.tailscale)
+            .field("join", &self.join)
             .field("disconnect_timeout", &self.disconnect_timeout)
             .field("apply_timeout", &self.apply_timeout)
             .finish()
@@ -363,6 +415,7 @@ impl Default for AgentsConfig {
             desired_version: None,
             tailscale_socket: Self::default_tailscale_socket(),
             tailscale: TailscaleConfig::default(),
+            join: JoinConfig::default(),
             disconnect_timeout: Self::default_disconnect_timeout(),
             apply_timeout: Self::default_apply_timeout(),
         }
@@ -400,6 +453,125 @@ pub struct TailscaleConfig {
     pub allowed_tags: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Joins new hosts to the tailnet from the Add an agent wizard.
+    #[serde(default)]
+    pub provisioning: Option<TailscaleProvisioning>,
+}
+
+/// `agents.tailscale.provisioning`: Tailscale OAuth credentials the server
+/// uses to issue the single-use auth key a join command uses to put a new
+/// host on the tailnet. The client secret stays on the server: join commands
+/// carry only the key.
+///
+/// ```yaml
+/// agents:
+///   tailscale:
+///     allowed_tags: ["tag:buckle"]
+///     provisioning:
+///       flow: app
+///       client_id: "${{ env.TS_OAUTH_CLIENT_ID }}"
+///       client_secret: "${{ env.TS_OAUTH_CLIENT_SECRET }}"
+/// ```
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TailscaleProvisioning {
+    #[serde(default)]
+    pub flow: ProvisioningFlow,
+    pub client_id: String,
+    pub client_secret: String,
+    /// The ACL tags a joined node may carry (the wizard offers them, first
+    /// as the default). Absent: `allowed_tags`.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Custom node attributes (`custom:…`) Tailscale stamps on the node;
+    /// each must be on the app's `allowedNodeAttributes` (`app` flow only).
+    #[serde(default)]
+    pub node_attributes: Vec<String>,
+    /// Tailscale's API and consent screen; overridden only by tests.
+    #[serde(default = "TailscaleProvisioning::default_api_url")]
+    pub api_url: String,
+    #[serde(default = "TailscaleProvisioning::default_login_url")]
+    pub login_url: String,
+}
+
+impl std::fmt::Debug for TailscaleProvisioning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TailscaleProvisioning")
+            .field("flow", &self.flow)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field("tags", &self.tags)
+            .field("node_attributes", &self.node_attributes)
+            .field("api_url", &self.api_url)
+            .field("login_url", &self.login_url)
+            .finish()
+    }
+}
+
+/// How the server gets a new host's Tailscale auth key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvisioningFlow {
+    /// An OAuth app (device provisioning, scope `auth_keys:create:once`,
+    /// redirect URI `{web.base_url}/api/v1/join/tailscale/callback`): the
+    /// admin creating each join command consents in Tailscale, and the node
+    /// is owned by them and advertises the chosen tags (which they must own
+    /// in `tagOwners`).
+    #[default]
+    App,
+    /// An OAuth client (scope `auth_keys`, owning the tags): the server mints
+    /// a tagged, pre-approved key itself, with no consent step.
+    Client,
+}
+
+impl TailscaleProvisioning {
+    fn default_api_url() -> String {
+        "https://api.tailscale.com".into()
+    }
+    fn default_login_url() -> String {
+        "https://login.tailscale.com".into()
+    }
+}
+
+/// `agents.join`: what generated join commands point new hosts at.
+///
+/// ```yaml
+/// agents:
+///   join:
+///     server_url: http://buckle.example.ts.net:7700
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinConfig {
+    /// The gRPC URL agents dial. Absent: `web.base_url`'s host with the
+    /// `listen.grpc` port (`http://` when `listen.tls.mode` is `none`).
+    #[serde(default)]
+    pub server_url: Option<String>,
+    /// Where `install.sh` and `install.ps1` are fetched from (a directory
+    /// URL). Absent: this server's own release on GitHub, or the latest
+    /// release for a development build.
+    #[serde(default)]
+    pub install_url: Option<String>,
+    /// How long a join command's keys work (default and most 1h, the life
+    /// of a Tailscale provisioning key).
+    #[serde(default = "JoinConfig::default_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+}
+
+impl JoinConfig {
+    fn default_ttl() -> Duration {
+        Duration::from_secs(3600)
+    }
+}
+
+impl Default for JoinConfig {
+    fn default() -> Self {
+        Self {
+            server_url: None,
+            install_url: None,
+            ttl: Self::default_ttl(),
+        }
+    }
 }
 
 impl TailscaleConfig {
@@ -804,6 +976,69 @@ secrets:
             cfg.secrets.providers.env.as_ref().unwrap().deny,
             vec!["AWS_*".to_string()]
         );
+    }
+
+    const PROVISIONING: &str = "  tailscale:\n    allowed_tags: [\"tag:buckle\"]\n    provisioning: { client_id: c, client_secret: shh }\n";
+
+    #[test]
+    fn tailscale_provisioning_parses_with_tailscales_endpoints() {
+        let yaml = EXAMPLE.replace(
+            "  tailscale:\n    allowed_tags: [\"tag:buckle\"]\n    allowed_users: [ops@example.com]\n",
+            PROVISIONING,
+        );
+        let cfg = with_env(&yaml).unwrap();
+        let p = cfg.agents.tailscale.provisioning.as_ref().unwrap();
+        assert_eq!(p.api_url, "https://api.tailscale.com");
+        assert_eq!(cfg.agents.join.ttl, Duration::from_secs(3600));
+        assert!(!format!("{cfg:?}").contains("shh"));
+    }
+
+    #[test]
+    fn the_client_flow_needs_no_callback_but_needs_tags() {
+        let client = PROVISIONING.replace("{ client_id", "{ flow: client, client_id");
+        let yaml = EXAMPLE
+            .replace(
+                "  tailscale:\n    allowed_tags: [\"tag:buckle\"]\n    allowed_users: [ops@example.com]\n",
+                &client,
+            )
+            .replace("  base_url: https://buckle.example.ts.net\n", "");
+        let yaml = yaml.split("  oidc:").next().unwrap().to_owned();
+        let cfg = with_env(&yaml).unwrap();
+        let p = cfg.agents.tailscale.provisioning.as_ref().unwrap();
+        assert_eq!(p.flow, ProvisioningFlow::Client);
+
+        let untagged = yaml.replace("    allowed_tags: [\"tag:buckle\"]\n", "");
+        let err = with_env(&untagged).unwrap_err();
+        assert!(err.description().contains("tags"), "{}", err.description());
+    }
+
+    #[rstest]
+    #[case::no_base_url("  base_url: https://buckle.example.ts.net\n", "", "web.base_url")]
+    #[case::no_tailscale_auth("  auth: [tailscale, token]\n", "  auth: [token]\n", "agents.auth")]
+    #[case::long_ttl(
+        "  registration: approve\n",
+        "  registration: approve\n  join: { ttl: 2h }\n",
+        "agents.join.ttl"
+    )]
+    fn provisioning_needs_a_callback_and_tailscale_auth(
+        #[case] from: &str,
+        #[case] to: &str,
+        #[case] named: &str,
+    ) {
+        let yaml = EXAMPLE
+            .replace(
+                "  tailscale:\n    allowed_tags: [\"tag:buckle\"]\n    allowed_users: [ops@example.com]\n",
+                PROVISIONING,
+            )
+            .replace(from, to);
+        let yaml = if named == "web.base_url" {
+            // OIDC needs a base URL too; take it out of the picture.
+            yaml.split("  oidc:").next().unwrap().to_owned()
+        } else {
+            yaml
+        };
+        let err = with_env(&yaml).unwrap_err();
+        assert!(err.description().contains(named), "{}", err.description());
     }
 
     #[test]

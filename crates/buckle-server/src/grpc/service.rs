@@ -47,6 +47,8 @@ pub struct FleetService {
     pub guard: Arc<SessionGuard>,
     /// Agent upgrades requested from the UI or API.
     pub upgrades: Arc<crate::upgrades::AgentUpgrades>,
+    /// Join commands whose tokens enrol new hosts.
+    pub joins: Arc<crate::join::Joins>,
 }
 
 impl std::fmt::Debug for FleetService {
@@ -237,12 +239,19 @@ impl FleetService {
                         ));
                     }
                     let id = identity.node.clone();
-                    let status = if admitted {
+                    let now = self.now();
+                    // A join command an admin created is that admin's
+                    // approval: it skips `registration: approve`.
+                    let joined = (!hello.token.is_empty())
+                        .then(|| self.joins.redeem(&hello.token, &identity.node, now))
+                        .flatten();
+                    let status = if joined.is_some() {
+                        HostStatus::Active
+                    } else if admitted {
                         self.initial_status()
                     } else {
                         HostStatus::Pending
                     };
-                    let now = self.now();
                     let created = self
                         .store
                         .call(move |db| match db.hosts().get(&id)? {
@@ -263,6 +272,12 @@ impl FleetService {
                         })
                         .await
                         .map_err(|e| (e.description().to_string(), true))?;
+                    if let Some(j) = &joined
+                        && !created.is_some_and(|c| c.1)
+                    {
+                        // Not a new host: the token stays for the one it was made for.
+                        self.joins.release(&j.ticket);
+                    }
                     let Some(created) = created else {
                         tracing::debug!(host = %identity.node, "a token-enrolled host on the tailnet; authenticating by token");
                         return self
@@ -273,12 +288,16 @@ impl FleetService {
                         // A forgotten host registering afresh: the controller
                         // still excludes it until told.
                         self.controller.host_registered(&identity.node);
+                        let how = match &joined {
+                            Some(j) => format!(" with a join command from {}", j.created_by),
+                            None => String::new(),
+                        };
                         self.audit(
                             "controller",
                             "host.registered",
                             &identity.node,
                             format!(
-                                "{} registered over the tailnet ({:?})",
+                                "{} registered over the tailnet{how} ({:?})",
                                 identity.node, created.0
                             ),
                         )
@@ -355,19 +374,14 @@ impl FleetService {
                 status: host.status,
             });
         }
-        let Some(bootstrap) = &self.agents.bootstrap_token else {
-            return Err(("The token is not recognised.".into(), false));
-        };
-        // Anything that is not a per-host token is a bootstrap attempt;
-        // throttle them per address so the bootstrap token cannot be guessed.
+        // Anything that is not a per-host token is an enrolment attempt;
+        // throttle them per address so neither the bootstrap token nor a
+        // join token can be guessed.
         if !self.guard.allow_enrolment(peer.map(|p| p.ip())) {
             return Err((
                 "Too many enrolment attempts from this address; try again in a minute.".into(),
                 true,
             ));
-        }
-        if !auth::constant_time_eq(&token, bootstrap) {
-            return Err(("The token is not recognised.".into(), false));
         }
         if !auth::valid_host_id(&hello.host_id) {
             return Err((
@@ -375,10 +389,24 @@ impl FleetService {
                 false,
             ));
         }
+        let joined = self.joins.redeem(&token, &hello.host_id, self.now());
+        let bootstrapped = self
+            .agents
+            .bootstrap_token
+            .as_deref()
+            .is_some_and(|b| auth::constant_time_eq(&token, b));
+        if joined.is_none() && !bootstrapped {
+            return Err(("The token is not recognised.".into(), false));
+        }
         let id = hello.host_id.clone();
         let issued = auth::new_token();
         let issued_hash = auth::hash_token(&issued);
-        let status = self.initial_status();
+        // A join command is the creating admin's approval.
+        let status = if joined.is_some() {
+            HostStatus::Active
+        } else {
+            self.initial_status()
+        };
         let now = self.now();
         let outcome = self
             .store
@@ -401,6 +429,9 @@ impl FleetService {
             })
             .await
             .map_err(|e| (e.description().to_string(), true))?;
+        if let (Err(_), Some(j)) = (&outcome, &joined) {
+            self.joins.release(&j.ticket);
+        }
         match outcome {
             Err(id) => Err((
                 format!(
@@ -412,14 +443,15 @@ impl FleetService {
                 // A forgotten host enrolling afresh: the controller still
                 // excludes it until told.
                 self.controller.host_registered(&hello.host_id);
+                let how = match &joined {
+                    Some(j) => format!("a join command from {}", j.created_by),
+                    None => "the bootstrap token".into(),
+                };
                 self.audit(
                     "controller",
                     "host.enrolled",
                     &hello.host_id,
-                    format!(
-                        "{} enrolled with the bootstrap token ({status:?})",
-                        hello.host_id
-                    ),
+                    format!("{} enrolled with {how} ({status:?})", hello.host_id),
                 )
                 .await;
                 Ok(Authenticated {

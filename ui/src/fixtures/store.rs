@@ -15,6 +15,9 @@ use buckle_api::{
     PhaseState, RevisionStatus, RevisionSummary, RolloutDetail, RolloutEvent, RolloutState,
     RolloutSummary, RunReport, RunSummary, UpgradeState,
 };
+use buckle_api::{
+    JoinMethod, JoinOptions, JoinPlatform, JoinRequest, JoinState, JoinTicket, TailscaleJoinOptions,
+};
 use chrono::Utc;
 
 use super::{data, flag};
@@ -31,6 +34,8 @@ pub(super) struct State {
     pub outbox: Vec<LiveEvent>,
     /// How far `?demo&live` has moved pi-4's run on.
     pub run_frame: usize,
+    /// Join commands made with Add an agent.
+    pub joins: Vec<JoinTicket>,
 }
 
 impl State {
@@ -53,6 +58,7 @@ impl State {
             audit: if empty { vec![] } else { data::audit(now) },
             outbox: Vec::new(),
             run_frame: 0,
+            joins: Vec::new(),
         }
     }
 
@@ -807,5 +813,128 @@ pub fn audit(
             .then(|| items.last().map(|e| e.id.to_string()))
             .flatten();
         Ok(Page { items, next, total })
+    })
+}
+
+// ------------------------------------------------------------------ joining hosts
+
+/// A tailnet server with Tailscale provisioning that also takes tokens.
+pub fn join_options() -> Result<JoinOptions, ApiError> {
+    admin()?;
+    Ok(JoinOptions {
+        methods: vec![JoinMethod::Tailscale, JoinMethod::Token],
+        server_url: "http://buckle.example.ts.net:7700".into(),
+        tailscale: Some(TailscaleJoinOptions {
+            tags: vec!["tag:buckle".into(), "tag:edge".into()],
+            consent: true,
+        }),
+        ttl_seconds: 3600,
+        approval_required: true,
+    })
+}
+
+/// What the server would render, near enough to review the wizard by.
+fn demo_command(r: &JoinRequest, tags: &[String]) -> String {
+    let windows = r.platform == JoinPlatform::Windows;
+    let (head, cont) = if windows {
+        (
+            "& ([scriptblock]::Create((irm https://github.com/SierraSoftworks/buckle/releases/latest/download/install.ps1)))",
+            " `",
+        )
+    } else {
+        (
+            "curl -fsSL https://github.com/SierraSoftworks/buckle/releases/latest/download/install.sh | sudo sh -s --",
+            " \\",
+        )
+    };
+    let mut lines = vec![head.to_owned()];
+    if r.method == JoinMethod::Tailscale {
+        let (key, tag_flag, host_flag) = if windows {
+            ("-TailscaleAuthKey", "-TailscaleTags", "-TailscaleHostname")
+        } else {
+            (
+                "--tailscale-auth-key",
+                "--tailscale-tags",
+                "--tailscale-hostname",
+            )
+        };
+        lines.push(format!("  {key} tskey-auth-kDEMO1CNTRL-0123456789abcdef"));
+        let tags = if tags.is_empty() {
+            "tag:buckle".to_owned()
+        } else {
+            tags.join(",")
+        };
+        lines.push(format!("  {tag_flag} {tags}"));
+        if let Some(h) = &r.host_id {
+            lines.push(format!("  {host_flag} {h}"));
+        }
+    }
+    lines.push("  up --server http://buckle.example.ts.net:7700".into());
+    lines.push("    --insecure-plaintext".into());
+    lines.push("    --token 3f9a0c4e1b7d2a6f9c0e".into());
+    if let Some(h) = &r.host_id {
+        lines.push(format!("    --host-id {h}"));
+    }
+    for (k, v) in &r.labels {
+        lines.push(format!("    --label {k}={v}"));
+    }
+    let last = lines.len() - 1;
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| if i == last { l } else { format!("{l}{cont}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn create_join(r: &JoinRequest) -> Result<JoinTicket, ApiError> {
+    admin()?;
+    let now = Utc::now();
+    let platform = serde_json::to_value(r.platform)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let id = format!("demo-{platform}-{}", now.timestamp_millis());
+    let ticket = JoinTicket {
+        id: id.clone(),
+        platform: r.platform,
+        method: r.method,
+        host_id: r.host_id.clone(),
+        labels: r.labels.clone(),
+        created_by: actor(),
+        created_at: now,
+        expires_at: now + chrono::Duration::hours(1),
+        state: match r.method {
+            // Consent is skipped: the demo comes straight back with a key.
+            JoinMethod::Tailscale => JoinState::Authorize {
+                authorize_url: format!("/hosts?join={id}"),
+            },
+            JoinMethod::Token => JoinState::Ready {
+                command: demo_command(r, &[]),
+            },
+        },
+    };
+    with(|s| {
+        let mut stored = ticket.clone();
+        if r.method == JoinMethod::Tailscale {
+            stored.state = JoinState::Ready {
+                command: demo_command(r, &r.tailscale_tags),
+            };
+        }
+        s.joins.push(stored);
+        s.record(
+            &actor(),
+            "join.created",
+            &ticket.id,
+            format!("{} created a join command", actor()),
+        );
+    });
+    Ok(ticket)
+}
+
+pub fn join_ticket(id: &str) -> Result<JoinTicket, ApiError> {
+    admin()?;
+    with(|s| s.joins.iter().find(|t| t.id == id).cloned()).ok_or_else(|| {
+        ApiError::NotFound("That join command does not exist or has expired.".into())
     })
 }

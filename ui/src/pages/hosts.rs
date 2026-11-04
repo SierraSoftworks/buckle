@@ -2,8 +2,9 @@
 //! offline, plus anything out of the ordinary), effective labels, platform,
 //! applied revision (quiet when stable) and last contact. Hover a name for
 //! the host's card, click a row to open it. Pending registrations come first
-//! so they are approved rather than forgotten. Admins can upgrade every
-//! reachable agent behind the server's version at once.
+//! so they are approved rather than forgotten. Admins can add an agent (the
+//! bootstrap wizard, [`super::add_agent`]) and upgrade every reachable agent
+//! behind the server's version at once.
 
 use buckle_api::{Connection, HostStatus, HostSummary};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,9 @@ struct Query {
     show: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     q: String,
+    /// The Add an agent ticket Tailscale returned with.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    join: String,
 }
 
 const FILTERS: &[(&str, &str)] = &[
@@ -66,7 +70,17 @@ pub fn hosts() -> Html {
     let live = use_live_value(&fleet, apply_fleet);
     let approving = use_state(|| None::<String>);
     let upgrading = use_state(|| false);
+    let adding = use_state(|| false);
     let busy = use_state(|| false);
+    // Back from Tailscale with a ticket: the wizard stays open on it until closed.
+    {
+        let adding = adding.clone();
+        use_effect_with(query.join.is_empty(), move |empty| {
+            if !*empty {
+                adding.set(true);
+            }
+        });
+    }
     let error = use_state(|| None::<String>);
 
     let set_query = {
@@ -207,7 +221,11 @@ pub fn hosts() -> Html {
         (None, None) => html! { <Loading label="Loading hosts…" /> },
         (Some(f), _) if f.hosts.is_empty() => html! {
             <Empty title="No hosts have enrolled"
-                message="Install the agent on a host and enrol it with a token or over Tailscale; it appears here awaiting approval." />
+                message="Add an agent to get the one command that installs Buckle on a host and enrols it.">
+                if auth.is_admin() {
+                    <Button kind={Kind::Primary} onclick={{ let a = adding.clone(); Callback::from(move |_| a.set(true)) }}>{ "Add an agent…" }</Button>
+                }
+            </Empty>
         },
         (Some(f), _) => {
             let show = if query.show.is_empty() {
@@ -298,8 +316,25 @@ pub fn hosts() -> Html {
                     if auth.is_admin() && !upgrade_ids.is_empty() {
                         <Button onclick={{ let u = upgrading.clone(); Callback::from(move |_| u.set(true)) }}>{ "Upgrade all agents…" }</Button>
                     }
+                    if auth.is_admin() {
+                        <Button kind={Kind::Primary} onclick={{ let a = adding.clone(); Callback::from(move |_| a.set(true)) }}>{ icons::plus() }{ "Add an agent…" }</Button>
+                    }
                 </> }} />
             <Panel>{ body }</Panel>
+            if auth.is_admin() && *adding {
+                <super::add_agent::AddAgent
+                    hosts={live.as_ref().map(|f| f.hosts.clone()).unwrap_or_default()}
+                    resume={(!query.join.is_empty()).then(|| query.join.clone())}
+                    on_close={{
+                        let (adding, set_query, query) = (adding.clone(), set_query.clone(), query.clone());
+                        Callback::from(move |_| {
+                            adding.set(false);
+                            if !query.join.is_empty() {
+                                set_query(Query { join: String::new(), ..query.clone() });
+                            }
+                        })
+                    }} />
+            }
             if let Some(id) = (*approving).clone() {
                 <Confirm title={format!("Approve {id}")} confirm_label={format!("Approve {id}")}
                     busy={*busy} error={(*error).clone()} on_confirm={approve}

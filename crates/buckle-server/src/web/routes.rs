@@ -42,6 +42,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/hosts/{id}/preview", web::post().to(host_preview))
             .route("/hosts/{id}/upgrade", web::post().to(host_upgrade))
             .route("/hosts/{id}/{action}", web::post().to(host_action))
+            .route("/join", web::get().to(join_options))
+            .route("/join", web::post().to(join_create))
+            .route("/join/tailscale/callback", web::get().to(join_callback))
+            .route("/join/{id}", web::get().to(join_ticket))
             .route("/revisions", web::get().to(revisions))
             .route("/revisions/{id}", web::get().to(revision))
             .route("/revisions/{id}/rollout", web::post().to(start_rollout))
@@ -86,6 +90,10 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/hosts/h/approve"),
     ("POST", "/api/v1/hosts/h/pause"),
     ("POST", "/api/v1/hosts/h/resume"),
+    ("GET", "/api/v1/join"),
+    ("POST", "/api/v1/join"),
+    ("GET", "/api/v1/join/j"),
+    ("GET", "/api/v1/join/tailscale/callback?state=s"),
     ("GET", "/api/v1/revisions"),
     ("GET", "/api/v1/revisions/r"),
     ("POST", "/api/v1/revisions/r/rollout"),
@@ -862,6 +870,96 @@ async fn host_upgrade(
         host: summary.clone(),
     });
     Ok(HttpResponse::Ok().json(summary))
+}
+
+fn join_error(e: crate::join::JoinError) -> ApiError {
+    use crate::join::JoinError;
+    match e {
+        JoinError::Invalid(m) => ApiError::bad_request(m),
+        JoinError::TooMany => ApiError::too_many_because(e.to_string()),
+        JoinError::NotFound => ApiError::not_found(e.to_string()),
+    }
+}
+
+async fn join_options(state: Data, _: Administrative) -> ApiResult {
+    Ok(HttpResponse::Ok().json(state.joins.settings().options()))
+}
+
+async fn join_create(
+    state: Data,
+    admin: Administrative,
+    body: web::Json<buckle_api::JoinRequest>,
+) -> ApiResult {
+    let actor = admin.0.actor();
+    let ticket = state
+        .joins
+        .create(body.into_inner(), &actor, chrono::Utc::now())
+        .await
+        .map_err(join_error)?;
+    let host = ticket.host_id.as_deref().unwrap_or("a new host");
+    tracing::info!(buckle.host = %host, method = ?ticket.method, "created a join command");
+    audit_action(
+        &state,
+        &actor,
+        "join.created",
+        &ticket.id,
+        format!(
+            "{actor} created a join command for {host} ({}, {})",
+            ticket.platform.label(),
+            match ticket.method {
+                buckle_api::JoinMethod::Tailscale => "over Tailscale",
+                buckle_api::JoinMethod::Token => "with a join token",
+            }
+        ),
+        None,
+    )
+    .await;
+    Ok(HttpResponse::Created().json(ticket))
+}
+
+async fn join_ticket(state: Data, admin: Administrative, path: web::Path<String>) -> ApiResult {
+    let ticket = state
+        .joins
+        .get(&path.into_inner(), &admin.0.actor(), chrono::Utc::now())
+        .map_err(join_error)?;
+    Ok(HttpResponse::Ok().json(ticket))
+}
+
+#[derive(Deserialize)]
+struct TailscaleCallback {
+    state: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Where Tailscale sends the admin's browser after consent: back to the
+/// hosts page, which reopens the wizard on the ticket.
+async fn join_callback(
+    state: Data,
+    admin: Administrative,
+    query: web::Query<TailscaleCallback>,
+) -> ApiResult {
+    let q = query.into_inner();
+    let location = match state
+        .joins
+        .complete_tailscale(
+            &q.state,
+            q.code.as_deref(),
+            q.error.as_deref(),
+            &admin.0.actor(),
+            chrono::Utc::now(),
+        )
+        .await
+    {
+        Ok(id) => format!("/hosts?join={id}"),
+        Err(_) => "/hosts?join=expired".to_owned(),
+    };
+    Ok(HttpResponse::SeeOther()
+        .insert_header(("location", location))
+        .insert_header(("cache-control", "no-store"))
+        .finish())
 }
 
 async fn host_preview(

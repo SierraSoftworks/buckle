@@ -11,6 +11,7 @@ pub mod fleet;
 pub mod fleet_plan;
 pub mod format;
 pub mod health;
+pub mod join;
 pub mod labels;
 pub mod live;
 pub mod pipeline;
