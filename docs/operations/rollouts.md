@@ -76,15 +76,15 @@ A phase with `approval: required` (or `if_destructive`, when a plan removes or d
 waits at its gate. The rollout's **Plans** panel shows what every phase will do in one view, with
 an **Approve** button for the next phase that wants an approval in its head:
 
-- **Notes**: what that approval leaves out (hosts without a plan yet), the plan's warnings, and the
-  phase's health gate. A phase is approved only once every phase before it has finished, so an
-  approval is never given blind; until then its button is disabled and a note says what it waits on.
+- **Notes**: what that approval leaves out (hosts without a plan yet) and each of the plan's
+  warnings. A phase is approved only once every phase before it has finished, so an approval is
+  never given blind; until then its button is disabled and a note says what it waits on.
 - **Across the fleet**: one entry per module, with the phases (or hosts) it changes; hover for the
   hosts by phase. Values that differ per host read as placeholders such as `«fact:host.id»`.
 - **By distinct plan**: hosts with identical plans grouped together by phase, destructive steps
   flagged.
 
-<Screenshot name="rollout-approval" alt="The Plans panel: its Approve button, the approval's notes and warnings, then the plan across every phase by module" />
+<Screenshot name="rollout-approval" alt="The Plans panel: its Approve button, the approval's notes and a banner per warning, then the plan across every phase by module" />
 
 Secrets never appear in a plan: a rotated secret shows as a token such as
 `«secret:nomad_server@3f9a»`, and a template that uses it as the lines it changes.

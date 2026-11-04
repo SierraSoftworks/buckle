@@ -66,9 +66,6 @@ describe("the rollout pipeline", () => {
     await tip.getByText("backup/marker").waitFor();
     const api = tip.locator('[data-check="nomad/api"] .pill');
     assert.match(await api.getAttribute("class"), /tone-danger/, "pi-5 failed nomad/api");
-    const gate = page.getByTestId("health-gate");
-    await gate.getByText("nomad/unit").waitFor();
-    assert.equal(await gate.locator(".pill").count(), 4, "the cloud stage's four required checks");
     await close();
   });
 
@@ -95,8 +92,9 @@ describe("approving a phase", () => {
     assert.equal(await page.getByTestId("rollout-controls").getByRole("button", { name: "Approve cloud…" }).count(), 0, "nor from the head");
     assert.equal(await pane.getByRole("tab", { name: /canary|home|cloud/ }).count(), 0, "no tab per phase");
     assert.match(await pane.textContent(), /1 host in cloud has no plan yet \(az-1\)/);
-    // The plan's warnings sit beside the approval's notes.
-    assert.match(await pane.getByTestId("plan-warnings").textContent(), /2 warnings/);
+    // The plan's warnings sit beside the approval's notes, the health gate does not.
+    assert.equal(await pane.getByTestId("plan-warning").count(), 2);
+    assert.equal(await pane.getByText(/Health gate/).count(), 0);
     await pane.getByRole("tab", { name: "By distinct plan" }).click();
     // Every distinct plan of the rollout, whatever its phase, the
     // destructive one flagged, the secret rotation shown only as tokens.
@@ -168,15 +166,17 @@ describe("approving a phase", () => {
     assert.match(await removals.locator(".plan-module__body .scope").first().textContent(), /^4 of 12 in cloud$/);
 
     // Warnings are a banner above the plan, each a single wrapping line of text.
-    const warnings = page.locator("#plans").getByTestId("plan-warnings");
+    const warnings = page.locator("#plans").getByTestId("plan-warning");
     assert.equal(await fleet.locator("details.plan-module--warnings").count(), 0, "not a block of the plan");
-    assert.match(await warnings.textContent(), /2 warnings/);
-    const long = warnings.locator(".step__text", { hasText: "released: left in place" });
+    assert.equal(await warnings.count(), 2, "a banner per warning");
+    const banner = warnings.filter({ hasText: "released: left in place" });
+    assert.match(await banner.locator(".scope").textContent(), /^4 of 12 in cloud$/);
+    const long = banner.locator(".step__text");
     await long.waitFor();
     assert.equal(await long.locator(".fact").count(), 1, "the host's name reads as a placeholder");
     const box = await long.boundingBox();
-    const pane = await warnings.boundingBox();
-    assert.ok(box.x + box.width <= pane.x + pane.width + 1, "a long warning wraps inside the banner");
+    const pane = await banner.boundingBox();
+    assert.ok(box.x + box.width <= pane.x + pane.width + 1, "a long warning wraps inside its banner");
 
     // Opening a module shows its diffs, host values as placeholders.
     await nomadHead.click();

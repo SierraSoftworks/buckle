@@ -8,11 +8,11 @@ use std::rc::Rc;
 use buckle_api::{FleetPlan, FleetStep, PlanGroup, Shared};
 use yew::prelude::*;
 
-use super::diff::FactExemplars;
+use super::diff::{FactExemplars, secret_text};
 use super::icons;
 use super::plan::{
     DEFERRED_NOTE, HELD_NOTE, INDETERMINATE_NOTE, block, handler, module_head, note, notes_head,
-    rehome, rehomed_block, removal, removals_block, step_class, step_detail, step_line, warning,
+    rehome, rehomed_block, removal, removals_block, step_class, step_detail, step_line,
 };
 use crate::logic::fleet_plan::{
     Phases, hosts_changed, phase_label, scope_label, scope_title, summarise,
@@ -219,7 +219,7 @@ fn fleet_step_view(props: &FleetStepProps) -> Html {
     }
 }
 
-/// The plan's warnings as one banner beside the rollout's other notes, each
+/// The plan's warnings, each a banner beside the rollout's other notes,
 /// naming its phases or hosts where it does not concern every host.
 #[function_component(FleetWarnings)]
 fn fleet_warnings(props: &FleetPlanProps) -> Html {
@@ -236,12 +236,13 @@ fn fleet_warnings(props: &FleetPlanProps) -> Html {
     }
     html! {
         <ContextProvider<FactExemplars> context={(*exemplars).clone()}>
-        <div class="note note--warn plan-warnings" data-testid="plan-warnings">
-            <strong class="plan-warnings__head">{ icons::alert() }{ count(p.warnings.len(), "warning", "warnings") }</strong>
-            <ul class="steps">
-                { for p.warnings.iter().map(|w| warning(&w.value, scope_within(&p.hosts, &p.hosts, &w.hosts, &phases))) }
-            </ul>
-        </div>
+        { for p.warnings.iter().map(|w| html! {
+            <div class="note note--warn plan-warning" data-testid="plan-warning">
+                <span class="plan-warning__icon">{ icons::alert() }</span>
+                <span class="step__text">{ secret_text(&w.value) }</span>
+                { scope_within(&p.hosts, &p.hosts, &w.hosts, &phases) }
+            </div>
+        }) }
         </ContextProvider<FactExemplars>>
     }
 }

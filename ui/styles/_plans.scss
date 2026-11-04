@@ -458,20 +458,23 @@
   display: inline-flex;
 }
 
-// The plan's warnings, raised to a banner beside the approval notes.
-.plan-warnings {
-  .plan-warnings__head {
+// Each of the plan's warnings, a banner beside the approval notes: icon,
+// wrapping text, then the phases or hosts it concerns.
+.plan-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+
+  .plan-warning__icon {
     display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
+    flex: none;
+    margin-top: 0.15rem;
+    color: var(--warn);
   }
 
-  .steps {
-    margin: 0.3rem 0 0;
-  }
-
-  .step--warning {
-    padding-left: 0;
-    background: none;
+  .step__text {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 }

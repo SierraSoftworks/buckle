@@ -673,7 +673,7 @@ fn plans_panel(
 
 /// One phase's approval: its button (for the panel's head, disabled until
 /// the phases before it finish) and its notes, on what it binds and leaves
-/// out, and its health gate.
+/// out.
 fn approval(
     phase: &RolloutPhase,
     d: &RolloutDetail,
@@ -753,13 +753,6 @@ fn approval(
             <p class="note">
                 { format!("Planned when its stage opens, so not covered by the approval of {}: {}.", phase.name, names(&deferred)) }
             </p>
-        }
-        if !phase.health_checks.is_empty() {
-            <div class="approval__gate" data-testid="health-gate"
-                title="Checked on each host before it applies, through its bake, and on every updated host again before the next phase starts.">
-                <span class="muted small">{ format!("Health gate of {}:", phase.name) }</span>
-                { crate::components::pipeline::health_gate(phase) }
-            </div>
         }
     </> };
     (button, notes)
