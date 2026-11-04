@@ -991,14 +991,14 @@ textarea.input {
   margin: 0.5rem 0;
 }
 
+// A row's ⋮ menu beside its details toggle, on one line.
 .row-controls {
   white-space: nowrap;
   text-align: right;
-}
 
-// A row's actions behind "⋮": the menu opens below it, right aligned.
-.split--kebab {
-  vertical-align: middle;
+  > * {
+    vertical-align: middle;
+  }
 }
 
 .more {

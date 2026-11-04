@@ -29,8 +29,9 @@ according to `rollout.supersede`.
 ## 2. Watch the pipeline
 
 Every targeted agent sends a plan, then each phase applies in waves of `parallel` hosts. The
-pipeline shows each phase as a stage, its hosts as blocks, and the gate between stages: approved,
-passed (its health gate held), or waiting.
+pipeline shows each phase as a stage, its hosts as blocks, and an approval gate before each stage
+that needs one: approved, needs approval, or waiting. The health check between stages is drawn only
+when it holds the rollout (paused).
 
 <Screenshot name="rollout-pipeline" alt="The rollout pipeline: stages with a block per host, and the gates between them" />
 

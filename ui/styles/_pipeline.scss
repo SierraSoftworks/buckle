@@ -163,9 +163,10 @@
       border-color: var(--info);
     }
 
+    // The tint over an opaque surface, so the bar does not show through.
     .gate__icon {
       border-color: var(--info);
-      background: var(--info-soft);
+      background: linear-gradient(var(--info-soft), var(--info-soft)), var(--surface);
     }
   }
 
