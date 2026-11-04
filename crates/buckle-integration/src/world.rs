@@ -89,6 +89,7 @@ impl World {
             data: dir.path().join("data"),
             source: dir.path().join("config"),
             secrets: dir.path().join("secrets"),
+            source_lock: Default::default(),
         };
         fleet.write(&paths.source);
         let proxy = Proxy::start().await;
@@ -152,7 +153,11 @@ impl World {
     /// Writes `fleet` into the source directory and waits for the server to
     /// store the revision it produces (valid or rejected). Returns its id.
     pub async fn publish(&self, fleet: &Fleet) -> RevisionSummary {
-        fleet.write(&self.paths.source);
+        {
+            // A scan sees the tree before or after, never half written.
+            let _writing = self.paths.source_lock.write().await;
+            fleet.write(&self.paths.source);
+        }
         let id = self.source_revision();
         eventually(
             &format!("revision {} to be stored", &id[..8]),

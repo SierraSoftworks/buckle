@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +38,9 @@ pub struct ServerPaths {
     pub source: PathBuf,
     /// The file secret provider's root.
     pub secrets: PathBuf,
+    /// Held for writing while the source directory is rewritten; the
+    /// server's scans hold it for reading, so none sees a half-written tree.
+    pub source_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Why a start-up attempt failed.
@@ -112,7 +116,10 @@ impl TestServer {
             .expect("the certificate loads")
             .expect("auto TLS has a fingerprint");
         let shutdown = CancellationToken::new();
-        let mut task = tokio::spawn(buckle_server::run(config, shutdown.clone()));
+        let hooks = buckle_server::Hooks {
+            source_lock: Some(paths.source_lock.clone()),
+        };
+        let mut task = tokio::spawn(buckle_server::run_with(config, shutdown.clone(), hooks));
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(0)
             .build()
