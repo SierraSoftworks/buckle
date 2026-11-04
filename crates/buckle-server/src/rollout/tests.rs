@@ -4125,3 +4125,160 @@ async fn a_lost_executor_is_replaced_and_the_cluster_re_planned_through_the_next
         "picked, lost, picked again: {actions:?}"
     );
 }
+
+/// Retrying a rollout paused on failed plans re-plans every failed host and
+/// carries on from the same phase (it does not accept the failures and move
+/// on, as resuming does).
+#[tokio::test(start_paused = true)]
+async fn retrying_a_rollout_replans_every_failed_host() {
+    let mut h = Harness::new().await;
+    h.revision("r1", ONE_PHASE_TWO_WIDE).await;
+    for x in ["a", "b"] {
+        h.enrol(x, "web").await;
+        h.script(x, |s| s.plan_error = Some("identity refused".into()));
+        h.connect(x, None);
+    }
+    let id = h.start("r1").await;
+    let (r, _) = h
+        .wait(&id, "paused with both failed", |r, hs| {
+            r.state == RolloutState::Paused && hs.iter().all(|x| x.state == HostPhase::Failed)
+        })
+        .await;
+    assert_eq!(r.runtime.pause.as_ref().unwrap().kind, "failure_budget");
+    for x in ["a", "b"] {
+        h.script(x, |s| s.plan_error = None);
+    }
+    h.command(Command::RetryFailed {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    assert_eq!(r.runtime.phases[0].accepted_failures, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retrying_a_rollout_without_failures_is_refused() {
+    let mut h = Harness::new().await;
+    h.revision("r1", ONE_PHASE_TWO_WIDE).await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.silent_apply = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "applying", |_, hs| {
+        host(hs, "a").state == HostPhase::Applying
+    })
+    .await;
+    let err = h
+        .command(Command::RetryFailed {
+            rollout: id.clone(),
+            note: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, CommandErrorKind::Conflict);
+}
+
+const LONG_BAKE: &str = "  settle: 10m\n  health: { bake: 1h }\n  phases:\n    - { name: web, select: 'true', parallel: 2 }\n";
+
+/// Skipping a bake (one host's, or every baking host's) counts it as baked
+/// at once, instead of waiting out the window.
+#[rstest::rstest]
+#[case::one_host(Some("a"))]
+#[case::rollout(None)]
+#[tokio::test(start_paused = true)]
+async fn skipping_a_bake_finishes_the_host_now(#[case] target: Option<&str>) {
+    let mut h = Harness::new().await;
+    h.revision("r1", LONG_BAKE).await;
+    for x in ["a", "b"] {
+        h.enrol(x, "web").await;
+        h.connect(x, None);
+    }
+    let id = h.start("r1").await;
+    h.wait(&id, "baking", |_, hs| {
+        hs.iter().all(|x| x.state == HostPhase::Baking)
+    })
+    .await;
+    h.command(Command::SkipBake {
+        rollout: id.clone(),
+        host: target.map(String::from),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h.snapshot(&id).await;
+    for x in ["a", "b"] {
+        let skipped = target.is_none_or(|t| t == x);
+        let want = if skipped {
+            HostPhase::Healthy
+        } else {
+            HostPhase::Baking
+        };
+        assert_eq!(host(&hosts, x).state, want, "{x}");
+    }
+}
+
+/// A bake with failing checks is not skipped: skipping never passes a
+/// regression.
+#[tokio::test(start_paused = true)]
+async fn a_bake_with_failing_checks_cannot_be_skipped() {
+    let mut h = Harness::new().await;
+    h.revision("r1", LONG_BAKE).await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.bake_fail = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "failing in its bake", |_, hs| {
+        let a = host(hs, "a");
+        a.state == HostPhase::Baking && !a.runtime.failing_since.is_empty()
+    })
+    .await;
+    for target in [Some("a".to_string()), None] {
+        let err = h
+            .command(Command::SkipBake {
+                rollout: id.clone(),
+                host: target,
+                note: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, CommandErrorKind::Conflict);
+    }
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Baking);
+}
+
+/// A host whose plan is not applied yet can be planned again: it gets a fresh
+/// plan and keeps waiting for its approval, nothing applies.
+#[tokio::test(start_paused = true)]
+async fn a_planned_host_can_be_planned_again_before_it_applies() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+    let plans = || h.sent(|x, m| x == "a" && matches!(m, SMsg::Plan(_))).len();
+    let before = plans();
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: "a".into(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h
+        .wait(&id, "planned again", |_, hs| {
+            host(hs, "a").state == HostPhase::Planned
+        })
+        .await;
+    assert!(plans() > before, "a fresh plan is requested");
+    assert!(!host(&hosts, "a").runtime.released, "it keeps its place");
+    assert!(h.applies().is_empty(), "nothing applies without approval");
+}

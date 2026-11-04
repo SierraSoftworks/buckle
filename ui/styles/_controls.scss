@@ -991,6 +991,16 @@ textarea.input {
   margin: 0.5rem 0;
 }
 
+.row-controls {
+  white-space: nowrap;
+  text-align: right;
+}
+
+// A row's actions behind "⋮": the menu opens below it, right aligned.
+.split--kebab {
+  vertical-align: middle;
+}
+
 .more {
   display: flex;
   justify-content: center;

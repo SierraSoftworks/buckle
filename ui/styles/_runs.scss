@@ -108,6 +108,14 @@
   &--compact &__raw {
     font-size: 0.76rem;
   }
+
+  // What can be done about it, at its foot.
+  &__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+  }
 }
 
 // A run report.

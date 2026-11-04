@@ -584,7 +584,45 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
         let detail = s.rollout_mut(id)?;
         let before = detail.events.len();
         let state = detail.summary.state;
+        // Host-wide decisions: they act on the rollout's failed or baking
+        // hosts, and a retry lifts a pause.
+        let hosts = |want: HostRolloutState| {
+            detail
+                .phases
+                .iter()
+                .flat_map(|p| &p.hosts)
+                .filter(|h| h.state == want)
+                .count()
+        };
         let next = match (action, state) {
+            ("retry", s)
+                if !crate::logic::tone::rollout_finished(s)
+                    && hosts(HostRolloutState::Failed) > 0 =>
+            {
+                detail
+                    .phases
+                    .iter_mut()
+                    .flat_map(|p| p.hosts.iter_mut())
+                    .filter(|h| h.state == HostRolloutState::Failed)
+                    .for_each(replan);
+                if s == RolloutState::Paused {
+                    RolloutState::Rolling
+                } else {
+                    s
+                }
+            }
+            ("skip-bake", s)
+                if !crate::logic::tone::rollout_finished(s)
+                    && hosts(HostRolloutState::Baking) > 0 =>
+            {
+                detail
+                    .phases
+                    .iter_mut()
+                    .flat_map(|p| p.hosts.iter_mut())
+                    .filter(|h| h.state == HostRolloutState::Baking)
+                    .for_each(skip_bake);
+                s
+            }
             (
                 "pause",
                 RolloutState::Rolling
@@ -729,6 +767,19 @@ fn host_entry(
     Ok(snapshot)
 }
 
+/// A host re-planned (retried): its plan and error are gone until it answers.
+fn replan(h: &mut buckle_api::RolloutHost) {
+    h.state = HostRolloutState::PlanPending;
+    h.error = None;
+    h.error_detail = None;
+    h.failed_checks.clear();
+}
+
+fn skip_bake(h: &mut buckle_api::RolloutHost) {
+    h.state = HostRolloutState::Healthy;
+    h.bake_until = None;
+}
+
 pub fn rollout_host_action(
     id: &str,
     host: &str,
@@ -739,10 +790,16 @@ pub fn rollout_host_action(
     with(|s| {
         host_entry(s, id, host, |h| {
             match (action, h.state) {
-                ("retry", HostRolloutState::Failed | HostRolloutState::RolledBack) => {
-                    h.state = HostRolloutState::Applying;
-                    h.error = None;
-                }
+                (
+                    "retry",
+                    HostRolloutState::PlanPending
+                    | HostRolloutState::Planned
+                    | HostRolloutState::Failed
+                    | HostRolloutState::Held
+                    | HostRolloutState::Skipped
+                    | HostRolloutState::Pending,
+                ) => replan(h),
+                ("skip-bake", HostRolloutState::Baking) => skip_bake(h),
                 ("skip", _) => {
                     h.state = HostRolloutState::Skipped;
                     h.error = Some(format!("Skipped by {}: {note}", actor()));

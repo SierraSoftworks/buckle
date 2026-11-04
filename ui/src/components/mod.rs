@@ -39,7 +39,7 @@ pub use pipeline::Pipeline;
 pub use plan::PlanGroupView;
 pub use revision::{RevisionLog, use_revision_actions};
 pub use run_report::RunReportView;
-pub use split_button::{MenuItem, SplitButton};
+pub use split_button::{ActionMenu, MenuItem, SplitButton};
 pub use toast::{ToastHost, use_toast};
 pub use ui::{
     Button, Empty, ErrorState, HoverTip, Kind, Loading, PageHead, Panel, Pill, Refresh, TraceLink,

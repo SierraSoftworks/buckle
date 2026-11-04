@@ -1,6 +1,6 @@
 //! The rollout-wide decisions an operator is offered, as one split button:
-//! the decision the rollout is waiting on (approve, else pause or resume) on
-//! its face, and the rest behind its menu.
+//! the decision the rollout is waiting on (approve, else pause, retry or
+//! resume) on its face, and the rest behind its menu.
 
 use buckle_api::{RevisionStatus, RevisionSummary, RolloutState, RolloutSummary};
 use chrono::{DateTime, Utc};
@@ -61,6 +61,13 @@ pub enum Decision {
     Reject,
     Pause,
     Resume,
+    /// Re-plan the rollout's failed hosts.
+    Retry,
+    /// Resume past failures: accept them and move on (the resume of a
+    /// rollout that paused with failed hosts).
+    SkipPhase,
+    /// Count the baking hosts as baked now.
+    SkipBake,
     Rollback,
     Abort,
 }
@@ -72,6 +79,9 @@ impl Decision {
             Decision::Reject => "Reject…".into(),
             Decision::Pause => "Pause".into(),
             Decision::Resume => "Resume".into(),
+            Decision::Retry => "Retry".into(),
+            Decision::SkipPhase => "Skip this phase…".into(),
+            Decision::SkipBake => "Skip bake period…".into(),
             Decision::Rollback => "Roll back…".into(),
             Decision::Abort => "Abort…".into(),
         }
@@ -93,23 +103,37 @@ pub struct Decisions {
     pub menu: Vec<Decision>,
 }
 
+/// What the rollout's hosts call for: how many failed, how many bake.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Standing {
+    pub failed: usize,
+    pub baking: usize,
+}
+
 /// What an operator can decide for a rollout in `state`, with `approve` the
-/// phase an approval is wanted for (and has plans to bind). Nothing once the
-/// rollout has finished.
-pub fn decisions(state: RolloutState, approve: Option<&str>) -> Option<Decisions> {
+/// phase an approval is wanted for (and has plans to bind). A rollout that
+/// paused with failed hosts offers retrying them on its face, and resuming
+/// past them as skipping the phase. Nothing once the rollout has finished.
+pub fn decisions(state: RolloutState, approve: Option<&str>, hosts: Standing) -> Option<Decisions> {
     if rollout_finished(state) {
         return None;
     }
-    let hold = match state {
-        RolloutState::Paused => Some(Decision::Resume),
-        RolloutState::RollingBack => None,
-        _ => Some(Decision::Pause),
+    let failed = hosts.failed > 0;
+    let hold: &[Decision] = match state {
+        RolloutState::Paused if failed => &[Decision::Retry, Decision::SkipPhase],
+        RolloutState::Paused => &[Decision::Resume],
+        RolloutState::RollingBack => &[],
+        _ if failed => &[Decision::Pause, Decision::Retry],
+        _ => &[Decision::Pause],
     };
     let mut all: Vec<Decision> = approve
         .map(|p| Decision::Approve(p.to_string()))
         .into_iter()
-        .chain(hold)
+        .chain(hold.iter().cloned())
         .collect();
+    if hosts.baking > 0 && state != RolloutState::RollingBack {
+        all.push(Decision::SkipBake);
+    }
     if state == RolloutState::AwaitingApproval {
         all.push(Decision::Reject);
     }
@@ -220,7 +244,8 @@ mod tests {
             (RolloutState::RollingBack, None, Abort),
         ];
         for (state, approve, face) in cases {
-            let d = decisions(state, approve).expect("a live rollout has decisions");
+            let d = decisions(state, approve, Standing::default())
+                .expect("a live rollout has decisions");
             assert_eq!(d.primary, face, "{state:?}");
             assert!(
                 !d.menu.contains(&face),
@@ -231,7 +256,7 @@ mod tests {
 
     #[test]
     fn the_menu_holds_abort_and_rollback_where_they_apply() {
-        let menu = |s, a| decisions(s, a).unwrap().menu;
+        let menu = |s, a| decisions(s, a, Standing::default()).unwrap().menu;
         assert!(menu(RolloutState::Rolling, None).contains(&Rollback));
         assert!(menu(RolloutState::Rolling, None).contains(&Abort));
         assert!(menu(RolloutState::Paused, None).contains(&Rollback));
@@ -249,7 +274,42 @@ mod tests {
             RolloutState::RolledBack,
             RolloutState::Aborted,
         ] {
-            assert_eq!(decisions(s, None), None);
+            assert_eq!(decisions(s, None, Standing::default()), None);
         }
+    }
+
+    #[test]
+    fn failed_hosts_put_retry_first_and_resume_becomes_skipping_the_phase() {
+        let failed = Standing {
+            failed: 2,
+            baking: 0,
+        };
+        let d = decisions(RolloutState::Paused, None, failed).unwrap();
+        assert_eq!(d.primary, Retry);
+        assert!(d.menu.contains(&SkipPhase));
+        assert!(!d.menu.contains(&Resume));
+        // Running with failures within budget: retry is in the menu.
+        let d = decisions(RolloutState::Rolling, None, failed).unwrap();
+        assert_eq!(d.primary, Pause);
+        assert!(d.menu.contains(&Retry));
+        assert!(!d.menu.contains(&SkipPhase));
+    }
+
+    #[test]
+    fn baking_hosts_offer_skipping_the_bake() {
+        let baking = Standing {
+            failed: 0,
+            baking: 1,
+        };
+        for (state, offered) in [
+            (RolloutState::Baking, true),
+            (RolloutState::Paused, true),
+            (RolloutState::RollingBack, false),
+        ] {
+            let d = decisions(state, None, baking).unwrap();
+            assert_eq!(d.menu.contains(&SkipBake), offered, "{state:?}");
+        }
+        let d = decisions(RolloutState::Baking, None, Standing::default()).unwrap();
+        assert!(!d.menu.contains(&SkipBake));
     }
 }
