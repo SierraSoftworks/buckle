@@ -77,7 +77,7 @@ fn connection_error(
 fn status_error(status: tonic::Status, what: &str) -> buckle_core::Error {
     let advice: &[&str] = match status.code() {
         tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => &[
-            "The server did not accept this host's token. Re-enrol with `buckle install agent --token <bootstrap>` or ask an admin to approve the host.",
+            "The server did not accept this host's token. Re-enrol with `buckle up --token <bootstrap>` or ask an admin to approve the host.",
         ],
         tonic::Code::Unavailable => {
             &["The server is unreachable; the agent keeps retrying with backoff."]

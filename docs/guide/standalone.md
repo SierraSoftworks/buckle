@@ -95,7 +95,7 @@ Removing a package, user or group asks for confirmation; pass `--yes` to accept 
 Install the agent in local mode to apply every change to the directory as it happens:
 
 ```sh
-sudo buckle install agent --source /srv/buckle-config --label role=worker
+sudo buckle up --source /srv/buckle-config --label role=worker
 ```
 
 This writes `/etc/buckle/agent.yaml` and installs a `buckle-agent` service (systemd on Linux,
@@ -104,7 +104,7 @@ runs the binary you installed it with, so put Buckle somewhere permanent such as
 `/usr/local/bin/buckle` first.
 
 ```yaml
-# /etc/buckle/agent.yaml (written by install agent)
+# /etc/buckle/agent.yaml (written by buckle up)
 source: /srv/buckle-config
 labels:
   role: worker

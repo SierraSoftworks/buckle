@@ -13,7 +13,7 @@ pub struct ServerArgs {
     pub config: PathBuf,
 
     /// Print the SHA-256 fingerprint of the gRPC TLS certificate (generating
-    /// it in `auto` mode) for `buckle install agent --ca-fingerprint`, then exit.
+    /// it in `auto` mode) for `buckle up --ca-fingerprint`, then exit.
     #[arg(long)]
     pub print_fingerprint: bool,
 }

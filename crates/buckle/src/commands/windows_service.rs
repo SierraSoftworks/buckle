@@ -1,5 +1,5 @@
 //! The Windows Service Control Manager entry point for `buckle agent`
-//! (`--windows-service`, which `buckle install agent` puts in the service's
+//! (`--windows-service`, which `buckle up` puts in the service's
 //! command line). The SCM calls `service_main` on its own thread; it reports
 //! the service as running, runs the agent on the process's tokio runtime and
 //! turns Stop and Shutdown requests into a graceful shutdown (the agent

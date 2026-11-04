@@ -60,7 +60,7 @@ impl AgentConfig {
                     "Could not read the agent configuration at {}.",
                     path.display()
                 ),
-                &["Run `buckle install agent` to create it, or pass --config."],
+                &["Run `buckle up` to create it, or pass --config."],
             )
         })?;
         let config: AgentConfig = serde_yaml::from_str(&text).to_human_error()?;

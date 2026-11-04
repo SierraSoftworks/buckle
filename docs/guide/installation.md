@@ -14,6 +14,40 @@ Each task kind lists the platforms it supports in the [task reference](../module
 Planning a task on a platform it does not support is a plan error for its module, so guard such
 modules with a `when` on `host.facts.os.family`.
 
+## One-line installer
+
+The installer downloads the release binary for the host's platform, verifies it against the
+SHA-256 digest GitHub publishes, installs it, and then runs whatever Buckle command follows its own
+options. This is how [Add an agent](../operations/bootstrapping.md) bootstraps a new host in one
+paste.
+
+```sh
+# Linux and macOS: installs /usr/local/bin/buckle
+curl -fsSL https://github.com/SierraSoftworks/buckle/releases/latest/download/install.sh | sudo sh -s --
+
+# …and enrol the host in the same step
+curl -fsSL https://github.com/SierraSoftworks/buckle/releases/latest/download/install.sh | sudo sh -s -- \
+  up --server http://buckle.example.ts.net:7700 --insecure-plaintext --label role=worker
+```
+
+```powershell
+# Windows, from an elevated PowerShell: installs $env:ProgramFiles\Buckle\buckle.exe
+& ([scriptblock]::Create((irm https://github.com/SierraSoftworks/buckle/releases/latest/download/install.ps1))) `
+  up --server http://buckle.example.ts.net:7700 --insecure-plaintext --label role=worker
+```
+
+| Option (`install.sh` / `install.ps1`) | Effect |
+|---|---|
+| `--version` / `-Version` | Install this release instead of the latest. |
+| `--install-dir` / `-InstallDir` | Install somewhere else. |
+| `--tailscale-auth-key` / `-TailscaleAuthKey` (or `TS_AUTHKEY`) | Join the tailnet first: installs Tailscale when it is missing (Linux and Windows; on macOS install the app first), then `tailscale up` with this key. Skipped when the node is already on a tailnet. |
+| `--tailscale-hostname` / `-TailscaleHostname` | The node name to join as. |
+| `--tailscale-tags` / `-TailscaleTags` | ACL tags to advertise, comma-separated. |
+| `--tailscale-arg` / `-TailscaleArg` | Another argument for `tailscale up`, repeatable. |
+
+Each release also carries its own copy (`releases/download/v2.4.0/install.sh`), which is what the
+server's generated join commands use.
+
 ## Homebrew
 
 ```sh
@@ -32,6 +66,8 @@ platform:
 | `buckle-darwin-amd64` | macOS Intel |
 | `buckle-darwin-arm64` | macOS Apple silicon |
 | `buckle-windows-amd64.exe` | Windows x86_64 |
+
+Or by hand:
 
 ```sh
 curl -fsSL -o /usr/local/bin/buckle \

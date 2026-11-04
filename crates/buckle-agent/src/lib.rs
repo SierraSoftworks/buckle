@@ -6,7 +6,7 @@
 //! * [`session`] — the session loop, operations, drift, heartbeats and the
 //!   local rollback watchdog.
 //! * [`runner`] — the seam to the engine ([`runner::EngineRunner`]).
-//! * [`install`] and [`update`] — `buckle install agent` and self-update.
+//! * [`install`] and [`update`] — `buckle up` and self-update.
 
 pub mod backoff;
 pub mod bundle;

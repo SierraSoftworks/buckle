@@ -51,4 +51,4 @@ sudo buckle update            # the latest release
 sudo buckle update --to 2.3.1 # a specific one
 ```
 
-See [`buckle update`](../agent/maintenance.md#update). Re-run `buckle install agent` afterwards if the binary moved, so the service runs the new path.
+See [`buckle update`](../agent/maintenance.md#update). Re-run `buckle up` afterwards if the binary moved, so the service runs the new path.

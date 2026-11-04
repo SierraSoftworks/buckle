@@ -124,7 +124,7 @@ authenticate, and the server accepts both.
 ### With a bootstrap token
 
 ```sh
-sudo buckle install agent \
+sudo buckle up \
   --server https://buckle.example.com:7700 \
   --token "$BUCKLE_BOOTSTRAP_TOKEN" \
   --ca-fingerprint sha256:3f9a… \
@@ -155,7 +155,7 @@ agents:
 ```
 
 ```sh
-sudo buckle install agent \
+sudo buckle up \
   --server http://buckle.example.ts.net:7700 --insecure-plaintext \
   --label role=worker
 ```

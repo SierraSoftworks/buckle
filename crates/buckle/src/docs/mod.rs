@@ -298,7 +298,9 @@ mod tests {
         assert_eq!(config.short.as_deref(), Some("-c"));
         assert_eq!(config.env.as_deref(), Some("BUCKLE_CONFIG"));
         assert!(config.required);
-        assert!(cli.commands.iter().any(|c| c.path == "install agent"));
+        assert!(cli.commands.iter().any(|c| c.path == "up"));
+        // The old spelling still works but is not advertised.
+        assert!(!cli.commands.iter().any(|c| c.path.starts_with("install")));
         assert!(cli.global.iter().any(|a| a.flag == "--verbose"));
         let migrate = cli.commands.iter().find(|c| c.path == "migrate").unwrap();
         assert!(migrate.args.iter().any(|a| a.flag == "<V1_DIR>"));

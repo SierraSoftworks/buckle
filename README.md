@@ -8,7 +8,7 @@ as a persistent agent on every host, and runs as the server that watches Git and
 orchestrates rollouts across the fleet with a web UI.
 
 - **Lightweight.** One binary (agent, server and web UI), no interpreter, no
-  SSH. Bootstrapping a host is `buckle install agent --server …`.
+  SSH. Bootstrapping a host is `buckle up --server …`.
 - **Fast.** Modules run as a dependency graph in parallel; plan is a pure read
   phase (it cannot write to the host) and apply touches only what changed.
 - **Safe to converge.** Thirty typed, idempotent task kinds with plans and diffs;
@@ -26,7 +26,7 @@ orchestrates rollouts across the fleet with a web UI.
 
 Linux (Debian and Ubuntu, amd64 and arm64) is fully supported. macOS and Windows
 run the agent and the platform-neutral tasks (files, commands, downloads,
-archives, GitHub releases); `buckle install agent` installs a service on systemd,
+archives, GitHub releases); `buckle up` installs a service on systemd,
 launchd and the Windows Service Control Manager.
 
 > Buckle 2.0 replaces the 1.x bootstrapper. The configuration format changed
@@ -108,11 +108,11 @@ buckle server --config server.yaml
 buckle server --config server.yaml --print-fingerprint   # the certificate to pin on agents
 
 # on each host: writes /etc/buckle/agent.yaml and installs the service, which runs `buckle agent`
-buckle install agent --server https://buckle.example.ts.net:7700 --label role=worker
-buckle install agent --server https://buckle.example.com:7700 --token "$BOOTSTRAP" --ca-fingerprint sha256:…
+buckle up --server https://buckle.example.ts.net:7700 --label role=worker
+buckle up --server https://buckle.example.com:7700 --token "$BOOTSTRAP" --ca-fingerprint sha256:…
 
 # no server: watch a local directory and apply it on every change
-buckle install agent --source /srv/buckle-config
+buckle up --source /srv/buckle-config
 buckle agent --config /etc/buckle/agent.yaml [--allow-secret-exec op]
 ```
 
@@ -120,7 +120,7 @@ Agents keep one gRPC stream open to the server, receive revisions as commits
 land in Git, plan them, and apply when the rollout reaches their phase. Over
 Tailscale the server identifies agents by node name (and trusts only the tags or
 users listed under `agents.tailscale`); elsewhere agents enrol with a bootstrap
-token and pin the server's certificate. Without systemd, `install agent` writes
+token and pin the server's certificate. Without systemd, `buckle up` writes
 the configuration and prints the command that starts the agent.
 
 Rollouts are described in `buckle.yaml`:

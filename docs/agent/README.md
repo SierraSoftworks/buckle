@@ -11,7 +11,7 @@ Every role Buckle plays is a subcommand of the one `buckle` binary.
 | [`facts`](./local.md#facts) | Print what Buckle knows about this host. |
 | [`validate`](./local.md#validate) | Check a configuration directory, optionally dry-planning fixture hosts. |
 | [`agent`](./agent.md#agent) | Run the long-lived agent. |
-| [`install agent`](./agent.md#install-agent) | Write `agent.yaml` and install the agent as a service. |
+| [`up`](./agent.md#up) | Bootstrap this host as an agent: write `agent.yaml` and install the service. |
 | [`server`](./server.md#server) | Run the fleet server and web UI. |
 | [`catalog`](./maintenance.md#catalog) | List the task kinds, fact providers and health checks this binary knows. |
 | [`update`](./maintenance.md#update) | Replace this binary with another release. |
@@ -46,7 +46,7 @@ Error(usr):    Could not read the agent configuration at /etc/buckle/agent.yaml.
 ╰────── cause: No such file or directory (os error 2)
 
 ╭─ Advice ──────────────────────────────────────────────────────────╮
-│  • Run `buckle install agent` to create it, or pass --config.     │
+│  • Run `buckle up` to create it, or pass --config.     │
 ╰───────────────────────────────────────────────────────────────────╯
 ```
 

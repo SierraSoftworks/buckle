@@ -9,7 +9,7 @@ pub struct InstallArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum InstallWhat {
-    /// Install the agent: write agent.yaml and a service unit, then start it.
+    /// Install the agent (the same as `buckle up`).
     Agent(InstallAgentArgs),
 }
 
@@ -21,8 +21,8 @@ pub struct InstallAgentArgs {
     /// Local configuration directory to watch instead of a server.
     #[arg(long)]
     pub source: Option<PathBuf>,
-    /// Bootstrap token for enrolment (not needed over Tailscale).
-    #[arg(long)]
+    /// Bootstrap or join token for enrolment (not needed over Tailscale).
+    #[arg(long, env = "BUCKLE_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
     /// Pin the server certificate by fingerprint (sha256:…).
     #[arg(long, conflicts_with = "ca_file")]
@@ -66,46 +66,49 @@ fn parse_label(s: &str) -> Result<(String, String), String> {
 
 pub async fn run(args: InstallArgs) -> buckle_core::Result<i32> {
     match args.what {
-        InstallWhat::Agent(a) => {
-            let config = buckle_agent::AgentConfig {
-                server: a.server,
-                source: a.source,
-                host_id: a.host_id,
-                labels: a.labels.into_iter().collect(),
-                state_dir: a.state_dir.unwrap_or_else(|| {
-                    if cfg!(windows) {
-                        r"C:\ProgramData\buckle".into()
-                    } else {
-                        "/var/lib/buckle".into()
-                    }
-                }),
-                bootstrap_token: a.token,
-                tls: buckle_agent::config::TlsConfig {
-                    ca_fingerprint: a.ca_fingerprint,
-                    ca_file: a.ca_file,
-                    insecure_plaintext: a.insecure_plaintext,
-                },
-                drift: Default::default(),
-                vars: Default::default(),
-                telemetry: Default::default(),
-                local_secret_exec: Vec::new(),
-            };
-            config.validate()?;
-            let options = buckle_agent::InstallOptions {
-                no_service: a.no_service,
-                exe: None,
-            };
-            match buckle_agent::install(&config, &a.config, &options).await? {
-                buckle_agent::InstallOutcome::FilesOnly { start_command } => println!(
-                    "Wrote {}; start the agent with `{start_command}` (no service was installed).",
-                    a.config.display(),
-                ),
-                buckle_agent::InstallOutcome::Service => println!(
-                    "Installed and started the {} service.",
-                    buckle_agent::install::SERVICE_NAME
-                ),
-            }
-            Ok(0)
-        }
+        InstallWhat::Agent(a) => up(a).await,
     }
+}
+
+/// `buckle up`: writes agent.yaml, then installs and starts the service.
+pub async fn up(a: InstallAgentArgs) -> buckle_core::Result<i32> {
+    let config = buckle_agent::AgentConfig {
+        server: a.server,
+        source: a.source,
+        host_id: a.host_id,
+        labels: a.labels.into_iter().collect(),
+        state_dir: a.state_dir.unwrap_or_else(|| {
+            if cfg!(windows) {
+                r"C:\ProgramData\buckle".into()
+            } else {
+                "/var/lib/buckle".into()
+            }
+        }),
+        bootstrap_token: a.token,
+        tls: buckle_agent::config::TlsConfig {
+            ca_fingerprint: a.ca_fingerprint,
+            ca_file: a.ca_file,
+            insecure_plaintext: a.insecure_plaintext,
+        },
+        drift: Default::default(),
+        vars: Default::default(),
+        telemetry: Default::default(),
+        local_secret_exec: Vec::new(),
+    };
+    config.validate()?;
+    let options = buckle_agent::InstallOptions {
+        no_service: a.no_service,
+        exe: None,
+    };
+    match buckle_agent::install(&config, &a.config, &options).await? {
+        buckle_agent::InstallOutcome::FilesOnly { start_command } => println!(
+            "Wrote {}; start the agent with `{start_command}` (no service was installed).",
+            a.config.display(),
+        ),
+        buckle_agent::InstallOutcome::Service => println!(
+            "Installed and started the {} service.",
+            buckle_agent::install::SERVICE_NAME
+        ),
+    }
+    Ok(0)
 }
