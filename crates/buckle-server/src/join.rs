@@ -55,6 +55,8 @@ pub struct JoinSettings {
     pub methods: Vec<JoinMethod>,
     pub approval_required: bool,
     pub tailscale: Option<Provisioning>,
+    /// `agents.auth` admits in-cluster executors by workload identity.
+    pub workload_identity: bool,
 }
 
 /// Tailscale provisioning with what the flow needs resolved.
@@ -131,6 +133,7 @@ impl JoinSettings {
             methods,
             approval_required: config.agents.registration == Registration::Approve,
             tailscale,
+            workload_identity: config.agents.auth.contains(&AgentAuth::WorkloadIdentity),
         }
     }
 
@@ -392,6 +395,7 @@ impl Default for Joins {
             methods: vec![JoinMethod::Token],
             approval_required: false,
             tailscale: None,
+            workload_identity: true,
         })
     }
 }

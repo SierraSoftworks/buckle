@@ -153,6 +153,13 @@ reads inside the cluster (`workload_identity.jwks_url`), which the server keeps 
 `trust/<cluster>/jwks` once the token verified against a key it already trusted and the relayed
 set holds that same key, so it follows key rotation without a relay ever adding trust.
 
+**Add a cluster** on the Hosts page (or `GET /api/v1/targets/{id}/executor`) renders a Nomad
+executor: a `buckle-executor` job running `ghcr.io/sierrasoftworks/buckle` with a `buckle`
+workload identity and the Task API, the ACL policy attached to the job, the two commands that
+install them (`nomad acl policy apply -job …`, `nomad job run …`), and the cluster's `trust`.
+Re-run the job with a newer image tag to upgrade it. Workloads declaring `namespaces` or
+`policies` need a management token, which the executor's policy does not grant.
+
 #### Tailscale provisioning
 
 With `tailscale.provisioning`, **Add an agent** puts a single-use Tailscale auth key into the join

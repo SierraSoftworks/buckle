@@ -14,6 +14,7 @@
 pub mod clock;
 pub mod config;
 pub mod events;
+pub mod executor_job;
 pub mod fleet;
 pub mod grpc;
 pub mod identity;

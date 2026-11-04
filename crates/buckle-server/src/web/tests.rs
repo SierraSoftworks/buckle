@@ -469,6 +469,21 @@ async fn cluster_targets_are_declared_or_created_and_listed_beside_hosts() {
     .await;
     assert_eq!(hosts.len(), 1, "the host list stays hosts only");
 
+    // A declared Nomad cluster has an executor job; a host has none.
+    let executor = |id: &str| {
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/targets/{id}/executor"))
+            .cookie(cookie.clone())
+            .to_request()
+    };
+    let job = test::call_service(&app, executor("home-nomad")).await;
+    assert_eq!(job.status(), StatusCode::OK);
+    let job: buckle_api::ExecutorSpec = test::read_body_json(job).await;
+    assert_eq!(job.host_id, "home-nomad-executor");
+    assert!(job.job.contains("workload_identity"), "{}", job.job);
+    let host = test::call_service(&app, executor("pi-1")).await;
+    assert_eq!(host.status(), StatusCode::BAD_REQUEST);
+
     // A declared cluster cannot be forgotten or respecified through the API.
     let forget = test::call_service(
         &app,

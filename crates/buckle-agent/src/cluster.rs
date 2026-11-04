@@ -117,14 +117,20 @@ impl Connect for Network {
     }
 }
 
-/// The Nomad API a target is reached at: its `api`, else `NOMAD_ADDR`, else
+/// The Nomad API a target is reached at: its `api`, else `NOMAD_ADDR` (the
+/// other way round for a `workload` identity), else
 /// the local agent.
 pub fn nomad_address(spec: &TargetSpec) -> String {
-    spec.api
-        .clone()
-        .filter(|a| !a.is_empty())
-        .or_else(|| std::env::var("NOMAD_ADDR").ok().filter(|a| !a.is_empty()))
-        .unwrap_or_else(|| DEFAULT_NOMAD_ADDR.to_owned())
+    let env = std::env::var("NOMAD_ADDR").ok().filter(|a| !a.is_empty());
+    let api = spec.api.clone().filter(|a| !a.is_empty());
+    // Inside the cluster the scheduler's address (its Task API socket) is
+    // the one that takes the workload's token; `api` is how hosts reach it.
+    let ordered = if spec.identity == ClusterIdentity::Workload {
+        env.or(api)
+    } else {
+        api.or(env)
+    };
+    ordered.unwrap_or_else(|| DEFAULT_NOMAD_ADDR.to_owned())
 }
 
 /// Plans, applies and checks cluster targets.

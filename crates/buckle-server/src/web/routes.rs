@@ -50,6 +50,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/targets/{id}", web::get().to(host_detail))
             .route("/targets/{id}", web::patch().to(host_patch))
             .route("/targets/{id}", web::delete().to(host_forget))
+            .route("/targets/{id}/executor", web::get().to(target_executor))
             .route("/targets/{id}/preview", web::post().to(host_preview))
             .route("/targets/{id}/{action}", web::post().to(host_action))
             .route("/join", web::get().to(join_options))
@@ -106,6 +107,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("PATCH", "/api/v1/targets/t"),
     ("DELETE", "/api/v1/targets/t"),
     ("POST", "/api/v1/targets/t/preview"),
+    ("GET", "/api/v1/targets/t/executor"),
     ("POST", "/api/v1/targets/t/pause"),
     ("GET", "/api/v1/join"),
     ("POST", "/api/v1/join"),
@@ -590,6 +592,27 @@ async fn target_create(
     .await;
     let summary = host_changed(&state, &id).await?;
     Ok(HttpResponse::Created().json(summary))
+}
+
+/// `GET /targets/{id}/executor`: the job that runs an executor inside the
+/// cluster, with its ACL policy, setup commands and the trust it needs.
+async fn target_executor(state: Data, _: Administrative, path: web::Path<String>) -> ApiResult {
+    let id = path.into_inner();
+    let lookup = id.clone();
+    let record = state
+        .store
+        .call(move |db| db.hosts().target(&lookup))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("No target '{id}'.")))?;
+    let spec = record.cluster.map(|c| c.spec).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "'{id}' is a host; only a cluster has an executor job."
+        ))
+    })?;
+    let rendered =
+        crate::executor_job::render(&id, &spec, state.joins.settings(), &state.server_version)
+            .map_err(ApiError::bad_request)?;
+    Ok(HttpResponse::Ok().json(rendered))
 }
 
 async fn summary_or_404(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {
