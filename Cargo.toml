@@ -9,6 +9,7 @@ members = [
     "crates/buckle-agent",
     "crates/buckle-server",
     "crates/buckle-integration",
+    "crates/buckle-nomad",
 ]
 # The `ui` crate is compiled to WebAssembly with `trunk` and embedded into the
 # server at build time; it is excluded so that `cargo build` of the workspace
@@ -30,6 +31,7 @@ buckle-proto = { path = "crates/buckle-proto" }
 buckle-api = { path = "crates/buckle-api" }
 buckle-agent = { path = "crates/buckle-agent" }
 buckle-server = { path = "crates/buckle-server" }
+buckle-nomad = { path = "crates/buckle-nomad" }
 
 # Core
 aho-corasick = "1.1.5"
@@ -84,6 +86,12 @@ tonic-prost-build = "0.14.9"
 protoc-bin-vendored = "3.3.0"
 tower = "0.5.3"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+hyper = "1.12"
+http-body-util = "0.1.5"
+
+# Clusters
+bytes = "1.12"
+hcl-rs = "0.20.0"
 
 # Server
 actix-web = { version = "4.18", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "cookies", "unicode"] }
