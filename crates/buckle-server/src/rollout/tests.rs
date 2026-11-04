@@ -3615,3 +3615,58 @@ async fn a_result_that_arrives_after_the_reboot_goes_straight_to_baking() {
             .any(|a| a == "rollout.host.rebooted")
     );
 }
+
+/// A target that appears after the freeze joins a phase the rollout has not
+/// reached yet (late admission); one whose phase is already running waits
+/// for the stragglers stage, as before.
+#[tokio::test(start_paused = true)]
+async fn a_target_appearing_mid_rollout_joins_a_phase_not_yet_started() {
+    let mut h = Harness::new().await;
+    h.revision("r1", TWO_PHASES).await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.connect("c1", None);
+    h.connect("w1", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+
+    // Enrolled while the canary phase waits: `web` has not started, so the
+    // host joins it; a second canary host has missed its phase.
+    h.enrol("late-web", "web").await;
+    h.handle.host_registered("late-web");
+    h.enrol("late-canary", "canary").await;
+    h.handle.host_changed("late-canary");
+    let (_, hosts) = h
+        .wait(&id, "late web host admitted", |_, hs| {
+            hs.iter().any(|x| x.host == "late-web")
+        })
+        .await;
+    let late = host(&hosts, "late-web");
+    assert_eq!(late.phase, "web");
+    assert_eq!(late.state, HostPhase::PlanPending);
+    assert!(
+        !hosts.iter().any(|x| x.host == "late-canary"),
+        "a phase already reached is not joined"
+    );
+    h.connect("late-web", None);
+    h.wait(&id, "late host planned", |_, hs| {
+        host(hs, "late-web").state == HostPhase::Planned
+    })
+    .await;
+
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "canary".into(),
+        digests: vec!["plan-a".into()],
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "late-web").state, HostPhase::Healthy);
+    assert_eq!(host(&hosts, "late-web").phase, "web");
+    assert!(r.runtime.stragglers_open);
+    assert_eq!(host(&hosts, "late-canary").phase, STRAGGLERS);
+    let actions = h.audit_actions(&id).await;
+    assert!(actions.iter().any(|a| a == "rollout.target.admitted"));
+}

@@ -88,6 +88,9 @@ pub fn host(
             .reboot
             .as_ref()
             .map(super::model::RebootWait::view),
+        kind: h.runtime.kind,
+        stage: h.runtime.stage,
+        executor: h.runtime.executor.clone(),
     }
 }
 
@@ -178,6 +181,7 @@ pub fn detail(
                 approved_at: approval.map(|a| a.at),
                 bake_until: p.bake_until,
                 health_checks: Vec::new(),
+                stages: p.stages,
             }
         })
         .collect();

@@ -12,6 +12,16 @@ pub enum HostStatus {
     Paused,
 }
 
+/// What a rollout deploys to: a host running an agent, or a cluster whose
+/// workloads an executor (a host agent the server picks) applies for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    #[default]
+    Host,
+    Cluster,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Connection {

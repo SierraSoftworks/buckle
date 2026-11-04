@@ -17,6 +17,9 @@ pub mod keys {
     /// rollout controller has not yet persisted its reaction to (replayed at
     /// start-up); `<prefix><host>/<report id>`.
     pub const PENDING_REPORT_PREFIX: &str = "controller.pending_report.";
+    /// Prefix of each cluster's last executor (the host agent speaking for
+    /// it), `<prefix><cluster>`; a pick stays with it while it qualifies.
+    pub const EXECUTOR_PREFIX: &str = "executor/";
 }
 
 /// Repository over the `kv` table.
