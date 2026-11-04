@@ -26,6 +26,15 @@ pub enum Need {
     Workload(String),
 }
 
+impl From<buckle_core::model::Need> for Need {
+    fn from(need: buckle_core::model::Need) -> Self {
+        match need {
+            buckle_core::model::Need::Module(n) => Need::Module(n),
+            buckle_core::model::Need::Workload(n) => Need::Workload(n),
+        }
+    }
+}
+
 impl Need {
     /// Parses a `needs` entry written on a module.
     pub fn on_module(raw: &str) -> Need {

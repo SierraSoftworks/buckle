@@ -74,6 +74,9 @@ message Facts {
   // The facts document as JSON.
   bytes json = 1;
   google.protobuf.Timestamp collected_at = 2;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 3;
 }
 
 message Heartbeat {
@@ -102,6 +105,9 @@ message PlanResult {
   // modules) without rendered text; what an approval binds. Empty from
   // agents that predate it.
   string approval_digest = 10;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 11;
 }
 
 message ApplyEvent {
@@ -120,6 +126,9 @@ message ApplyEvent {
   string step_state = 7;
   // The step's error, structured, when it failed.
   ErrorDetail error = 8;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 9;
 }
 
 // A structured error: what went wrong, the causes beneath it (outermost
@@ -164,6 +173,9 @@ message ApplyResult {
   // The run asked for a reboot. The agent reboots once the server has
   // acknowledged this result (or after a short grace with no session).
   Reboot reboot = 18;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 19;
 }
 
 message Reboot {
@@ -212,6 +224,9 @@ message HealthReport {
   string request_id = 2;
   string revision = 3;
   repeated HealthResult results = 4;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 5;
 }
 
 message Drift {
@@ -222,6 +237,9 @@ message Drift {
   uint32 removals = 4;
   bool corrected = 5;
   bytes plan_json = 6;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 7;
 }
 
 message LocalRollback {
@@ -309,12 +327,18 @@ message Assign {
   SecretBundle secrets = 3;
   // Digest of the revision tarball, for cache validation.
   string tree_digest = 4;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 5;
 }
 
 message RequestPlan {
   string revision = 1;
   // Optional task selector (filt-rs) to restrict the plan.
   string select = 2;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 3;
 }
 
 message Apply {
@@ -340,6 +364,9 @@ message Apply {
   // The approved intent digest (PlanResult.approval_digest). When set, the
   // agent compares it with its fresh plan's intent instead of plan_digest.
   string approval_digest = 11;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 12;
 }
 
 message Rollback {
@@ -348,6 +375,9 @@ message Rollback {
   string rollout_id = 3;
   // W3C trace context of the span driving this rollback, when traced.
   string traceparent = 4;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 5;
 }
 
 message RunHealth {
@@ -359,6 +389,9 @@ message RunHealth {
   google.protobuf.Timestamp until = 4;
   // W3C trace context of the span requesting the checks, when traced.
   string traceparent = 5;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 6;
 }
 
 message Ping {

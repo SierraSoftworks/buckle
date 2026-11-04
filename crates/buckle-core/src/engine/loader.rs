@@ -1,9 +1,9 @@
 //! Loads a revision from a directory tree. Lane 1 completes validation
 //! (selectors parse, templates parse, module graph acyclic, secrets declared).
 
-use super::{LoadedModule, Revision};
+use super::{LoadedModule, LoadedWorkload, Revision};
 use crate::error::HumanizableResult;
-use crate::model::{FleetConfig, ModuleConfig};
+use crate::model::{FleetConfig, ModuleConfig, WorkloadConfig};
 use crate::plan::RevisionId;
 use crate::task::DirSource;
 use std::path::Path;
@@ -18,7 +18,8 @@ fn shown(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Reads `buckle.yaml`, every `modules/*/module.yaml` and the `vars` files.
+/// Reads `buckle.yaml`, every `modules/*/module.yaml` and
+/// `workloads/*/workload.yaml`, and the `vars` files.
 pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
     let fleet_path = root.join("buckle.yaml");
     let fleet_yaml = std::fs::read_to_string(&fleet_path).map_err(|e| {
@@ -95,6 +96,71 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
         }
     }
 
+    let mut workloads = Vec::new();
+    let mut unloaded_workloads = Vec::new();
+    let workloads_dir = root.join("workloads");
+    if workloads_dir.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(&workloads_dir)
+            .to_human_error()?
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let dir = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !dir.is_dir() || name.starts_with('.') {
+                continue;
+            }
+            let workload_yaml = dir.join("workload.yaml");
+            if !workload_yaml.is_file() {
+                unloaded_workloads.push(name);
+                continue;
+            }
+            let yaml = std::fs::read_to_string(&workload_yaml).to_human_error()?;
+            let config = WorkloadConfig::parse(&yaml).map_err(|e| {
+                crate::error::wrap_user(
+                    e,
+                    format!(
+                        "The workload at {} is invalid.",
+                        shown(root, &workload_yaml)
+                    ),
+                    &["Fix the workload.yaml and run `buckle validate` again."],
+                )
+            })?;
+            if config.name != name {
+                return Err(crate::error::user(
+                    format!(
+                        "The workload in directory '{name}' is named '{}'; the two must match.",
+                        config.name
+                    ),
+                    &["Rename the directory or the workload so that they agree."],
+                ));
+            }
+            let files_dir = dir.join("files");
+            let mut files = Vec::new();
+            let mut templates = Vec::new();
+            if files_dir.is_dir() {
+                for path in walk(&files_dir) {
+                    let Ok(rel) = path.strip_prefix(&files_dir) else {
+                        continue;
+                    };
+                    files.push(rel.to_path_buf());
+                    if path.extension().is_some_and(|e| e == "j2")
+                        && let Ok(content) = std::fs::read_to_string(&path)
+                    {
+                        templates.push((rel.to_path_buf(), content));
+                    }
+                }
+            }
+            workloads.push(LoadedWorkload {
+                config,
+                source: Arc::new(DirSource::new(files_dir)),
+                files,
+                templates,
+            });
+        }
+    }
+
     let mut var_files = indexmap::IndexMap::new();
     for (index, overlay) in fleet.vars.iter().enumerate() {
         if let Some(file) = &overlay.file {
@@ -135,8 +201,10 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
         id,
         fleet,
         modules,
+        workloads,
         var_files,
         unloaded,
+        unloaded_workloads,
     })
 }
 
@@ -179,6 +247,64 @@ mod tests {
                 .any(|(p, _)| p.ends_with("motd.j2"))
         );
         assert_eq!(rev.var_files.len(), 1);
+    }
+
+    #[test]
+    fn workloads_load_with_their_files_and_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("buckle.yaml"), "version: 2\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("workloads/paste/files")).unwrap();
+        std::fs::write(
+            dir.path().join("workloads/paste/workload.yaml"),
+            "name: paste\njob: paste.nomad.hcl\nvolumes: [paste.volume.hcl]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("workloads/paste/files/paste.nomad.hcl"),
+            "job \"paste\" {}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("workloads/paste/files/paste.volume.hcl"),
+            "name = \"paste\"",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("workloads/grafana/files")).unwrap();
+        std::fs::write(
+            dir.path().join("workloads/grafana/workload.yaml"),
+            "name: grafana\nmanifests: [grafana.yaml.j2]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("workloads/grafana/files/grafana.yaml.j2"),
+            "image: grafana:{{ vars.v }}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("workloads/half")).unwrap();
+        let rev = load_dir(dir.path(), RevisionId::new("t")).unwrap();
+        let names: Vec<&str> = rev
+            .workloads
+            .iter()
+            .map(|w| w.config.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["grafana", "paste"]);
+        assert_eq!(rev.unloaded_workloads, vec!["half"]);
+        assert!(rev.modules.is_empty());
+        let paste = rev.workload("paste").unwrap();
+        assert_eq!(paste.files.len(), 2);
+        assert!(paste.templates.is_empty());
+        let grafana = rev.workload("grafana").unwrap();
+        assert_eq!(grafana.templates.len(), 1);
+    }
+
+    #[test]
+    fn workload_directory_and_name_must_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("buckle.yaml"), "version: 2\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("workloads/a")).unwrap();
+        std::fs::write(dir.path().join("workloads/a/workload.yaml"), "name: b\n").unwrap();
+        let err = load_dir(dir.path(), RevisionId::new("t")).unwrap_err();
+        assert!(err.description().contains("'a'"), "{}", err.description());
     }
 
     #[test]

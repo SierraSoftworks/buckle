@@ -166,6 +166,8 @@ pub enum Instruction {
         secrets: Vec<WireSecret>,
         /// Digest of the revision tarball, for cache validation.
         tree_digest: Option<String>,
+        /// The cluster target this concerns; `None` for the host itself.
+        target: Option<String>,
     },
     /// Plan the revision and report the plan.
     RequestPlan {
@@ -173,6 +175,8 @@ pub enum Instruction {
         revision: RevisionId,
         /// Optional filt-rs task selector.
         select: Option<String>,
+        /// The cluster target to plan for; `None` for the host itself.
+        target: Option<String>,
     },
     /// Apply the revision if its fresh plan has the approved digest.
     Apply {
@@ -198,6 +202,8 @@ pub enum Instruction {
         rollout_id: Option<String>,
         /// The rollout phase, for tracing.
         phase: Option<String>,
+        /// The cluster target to apply to; `None` for the host itself.
+        target: Option<String>,
     },
     /// Apply this (older) revision now.
     Rollback {
@@ -209,6 +215,8 @@ pub enum Instruction {
         rollout_id: Option<String>,
         /// W3C trace context of the span driving the rollback.
         traceparent: Option<String>,
+        /// The cluster target to roll back; `None` for the host itself.
+        target: Option<String>,
     },
     /// Run health checks now.
     RunHealth {
@@ -222,6 +230,8 @@ pub enum Instruction {
         until: Option<chrono::DateTime<chrono::Utc>>,
         /// W3C trace context of the requesting span.
         traceparent: Option<String>,
+        /// The cluster target to check; `None` for the host itself.
+        target: Option<String>,
     },
     /// Keepalive from the server; nothing to do.
     Ping,
@@ -246,6 +256,22 @@ pub enum Instruction {
         /// Whether reconnecting can help.
         retry: bool,
     },
+}
+
+impl Instruction {
+    /// The cluster target the instruction concerns, when it is not the host
+    /// itself. An agent that does not run workloads answers a targeted
+    /// RequestPlan with a failure and ignores the rest.
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            Instruction::Assign { target, .. }
+            | Instruction::RequestPlan { target, .. }
+            | Instruction::Apply { target, .. }
+            | Instruction::Rollback { target, .. }
+            | Instruction::RunHealth { target, .. } => target.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Where a revision's content comes from.
@@ -309,6 +335,8 @@ pub enum Report {
         revision: RevisionId,
         /// The error, for the operator.
         error: String,
+        /// The cluster target the plan was for; `None` for the host itself.
+        target: Option<String>,
     },
     /// An Apply was refused because the fresh plan differs from the approved one.
     StalePlan {

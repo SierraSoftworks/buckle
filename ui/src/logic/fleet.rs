@@ -346,6 +346,8 @@ mod tests {
     fn host(id: &str) -> HostSummary {
         HostSummary {
             id: id.into(),
+            kind: Default::default(),
+            cluster: None,
             status: HostStatus::Active,
             connection: Connection::Online,
             agent_labels: BTreeMap::new(),

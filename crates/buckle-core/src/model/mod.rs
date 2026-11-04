@@ -1,12 +1,20 @@
-//! The configuration model: `buckle.yaml` (fleet) and `module.yaml` (module).
+//! The configuration model: `buckle.yaml` (fleet), `module.yaml` (module)
+//! and `workload.yaml` (workload).
 //!
 //! Everything here is plain data with serde derives. Selectors are
 //! [`filt_rs::Filter`]s; string fields that may contain `{{ }}` are kept as raw
 //! strings and rendered by the engine with the host's context.
 
+mod cluster;
 mod task_decl;
+mod workload;
 
+pub use cluster::{ClusterDecl, ClusterIdentity, ClusterKind, ClusterScope, yaml_scalar_text};
 pub use task_decl::{RetryPolicy, TaskDecl};
+pub use workload::{
+    Items, JobDecl, Layer, Need, PolicyAttach, PolicyDecl, ResourceDecl, WorkloadConfig,
+    WorkloadRemoval,
+};
 
 use crate::Filter;
 use indexmap::IndexMap;
@@ -56,9 +64,13 @@ impl FleetConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FleetSection {
-    /// Derived groups: name → selector over host labels and facts.
+    /// Derived groups: name → selector over a target's labels and facts
+    /// (`host.*` for hosts, `cluster.*` for clusters).
     #[serde(default)]
     pub groups: IndexMap<String, Filter>,
+    /// The clusters this repository declares as targets, by name.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub clusters: IndexMap<String, ClusterDecl>,
 }
 
 /// One entry in the `vars` list.
@@ -381,7 +393,9 @@ pub struct ModuleConfig {
     /// Selects the hosts this module applies to. Absent means every host.
     #[serde(default)]
     pub when: Option<Filter>,
-    /// Modules that must apply before this one (ordering and fact dependency).
+    /// Modules that must apply before this one (ordering and fact
+    /// dependency), and `workload:NAME` for a workload on the cluster this
+    /// host is a node of (resolved by the rollout controller, not here).
     #[serde(default)]
     pub needs: Vec<String>,
     #[serde(default)]
@@ -406,6 +420,27 @@ impl ModuleConfig {
     pub fn parse(yaml: &str) -> crate::Result<Self> {
         use crate::error::HumanizableResult;
         serde_yaml::from_str(yaml).to_human_error()
+    }
+
+    /// The `needs` edges, parsed.
+    pub fn needs(&self) -> Vec<Need> {
+        self.needs
+            .iter()
+            .map(|n| Need::parse(n, Layer::Module))
+            .collect()
+    }
+
+    /// The modules this module needs: its `needs` without the `workload:`
+    /// edges, which order it against a cluster's workloads rather than
+    /// against other modules on the host.
+    pub fn module_needs(&self) -> Vec<String> {
+        self.needs()
+            .into_iter()
+            .filter_map(|n| match n {
+                Need::Module(name) => Some(name),
+                Need::Workload(_) => None,
+            })
+            .collect()
     }
 }
 
@@ -516,6 +551,13 @@ version: 2
 fleet:
   groups:
     nomad: 'host.labels.role == "worker"'
+    home-cluster: 'cluster.labels.cluster == "home"'
+  clusters:
+    home-nomad:
+      kind: nomad
+      api: http://127.0.0.1:4646
+      nodes: 'host.groups contains "nomad"'
+      labels: { cluster: home }
 vars:
   - file: vars/defaults.yaml
   - when: 'host.groups contains "home"'
@@ -533,7 +575,12 @@ rollout:
     #[test]
     fn fleet_config_parses_the_documented_shape() {
         let cfg = FleetConfig::parse(FLEET).expect("fleet config parses");
-        assert_eq!(cfg.fleet.groups.len(), 1);
+        assert_eq!(cfg.fleet.groups.len(), 2);
+        let cluster = &cfg.fleet.clusters["home-nomad"];
+        assert_eq!(cluster.kind, ClusterKind::Nomad);
+        assert_eq!(cluster.api.as_deref(), Some("http://127.0.0.1:4646"));
+        assert_eq!(cluster.identity, ClusterIdentity::BuckleJwt);
+        assert_eq!(cluster.text_labels()["cluster"], "home");
         assert_eq!(cfg.vars.len(), 2);
         assert!(
             cfg.vars[0].when.is_none(),
@@ -627,6 +674,7 @@ removal: { policy: cleanup }
     fn module_config_parses_tasks_handlers_and_health() {
         let m = ModuleConfig::parse(MODULE).expect("module parses");
         assert_eq!(m.needs, vec!["tailscale", "docker"]);
+        assert_eq!(m.module_needs(), vec!["tailscale", "docker"]);
         assert_eq!(m.tasks.len(), 3);
         assert_eq!(m.tasks[0].kind, "apt.package");
         assert_eq!(m.tasks[1].notify, vec!["nomad"]);
@@ -640,6 +688,23 @@ removal: { policy: cleanup }
         assert_eq!(m.health[1].display_name(), "systemd");
         assert!(!m.health[1].required);
         assert_eq!(m.facts.provides, vec!["nomad"]);
+    }
+
+    #[test]
+    fn a_module_needs_only_names_modules_on_the_host() {
+        let m = ModuleConfig::parse(
+            "name: backup\nneeds: [docker, workload:postgresql, module:nomad]\n",
+        )
+        .unwrap();
+        assert_eq!(m.module_needs(), vec!["docker", "nomad"]);
+        assert_eq!(
+            m.needs(),
+            vec![
+                Need::Module("docker".into()),
+                Need::Workload("postgresql".into()),
+                Need::Module("nomad".into())
+            ]
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod rollout;
 pub mod secrets;
 pub mod source;
 pub mod store;
+pub mod targets;
 pub mod upgrades;
 pub mod views;
 pub mod web;

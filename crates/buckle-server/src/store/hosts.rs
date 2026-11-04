@@ -1,16 +1,26 @@
 //! Hosts: enrolment, labels, status, connection state and latest facts.
+//!
+//! Cluster targets live in the same table with `kind = 'cluster'` and their
+//! spec in `cluster`, so status, labels, notes, health and drift work alike
+//! for both. [`Hosts::get`] and [`Hosts::list`] see hosts only; the
+//! `target`/`targets`/`clusters` methods see every kind.
 
 use super::{db_error, from_json, parse_ts, parse_ts_opt, to_json, ts};
-use buckle_api::{Connection as LinkState, HealthSummary, HostStatus};
+use buckle_api::{ClusterInfo, Connection as LinkState, HealthSummary, HostStatus, TargetKind};
 use buckle_core::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::collections::BTreeMap;
 
-/// One row of `hosts`.
+/// One row of `hosts`: a host, or a cluster target.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostRecord {
     pub id: String,
+    pub kind: TargetKind,
+    /// The cluster half of a cluster target; `None` for a host.
+    pub cluster: Option<ClusterInfo>,
+    /// For a host, the labels its agent reports; for a cluster, the labels
+    /// its declaration (or creation) seeded.
     pub agent_labels: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
     pub status: HostStatus,
@@ -51,12 +61,25 @@ pub struct NewHost {
     pub at: DateTime<Utc>,
 }
 
+/// What is needed to create a cluster target.
+#[derive(Debug, Clone)]
+pub struct NewCluster {
+    pub id: String,
+    pub cluster: ClusterInfo,
+    /// Seed labels: the declaration's, or the creating request's.
+    pub agent_labels: BTreeMap<String, String>,
+    pub labels: BTreeMap<String, String>,
+    pub notes: String,
+    pub status: HostStatus,
+    pub at: DateTime<Utc>,
+}
+
 /// Repository over `hosts` and `host_facts`.
 pub struct Hosts<'c> {
     conn: &'c Connection,
 }
 
-const COLUMNS: &str = "host_id, agent_labels, labels, status, notes, token_hash, platform, arch, agent_version, applied_revision, last_plan_digest, connection, auth_method, first_seen, last_seen, health, health_at, drifted";
+const COLUMNS: &str = "host_id, agent_labels, labels, status, notes, token_hash, platform, arch, agent_version, applied_revision, last_plan_digest, connection, auth_method, first_seen, last_seen, health, health_at, drifted, kind, cluster";
 
 pub(crate) fn status_str(s: HostStatus) -> &'static str {
     match s {
@@ -112,6 +135,8 @@ fn row(r: &Row<'_>) -> rusqlite::Result<RawHost> {
         health: r.get(15)?,
         health_at: r.get(16)?,
         drifted: r.get(17)?,
+        kind: r.get(18)?,
+        cluster: r.get(19)?,
     })
 }
 
@@ -134,12 +159,20 @@ struct RawHost {
     health: String,
     health_at: Option<String>,
     drifted: bool,
+    kind: String,
+    cluster: Option<String>,
 }
 
 impl RawHost {
     fn into_record(self) -> Result<HostRecord> {
         Ok(HostRecord {
             id: self.id,
+            kind: if self.kind == "cluster" {
+                TargetKind::Cluster
+            } else {
+                TargetKind::Host
+            },
+            cluster: self.cluster.map(|c| from_json(&c)).transpose()?,
             agent_labels: from_json(&self.agent_labels)?,
             labels: from_json(&self.labels)?,
             status: parse_status(&self.status),
@@ -183,8 +216,43 @@ impl<'c> Hosts<'c> {
         })
     }
 
-    /// The host, if known.
+    /// Creates a cluster target. Fails if a target of that id exists.
+    pub fn create_cluster(&self, cluster: &NewCluster) -> Result<HostRecord> {
+        self.conn
+            .execute(
+                "INSERT INTO hosts (host_id, kind, cluster, agent_labels, labels, notes, status, first_seen) VALUES (?1, 'cluster', ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    cluster.id,
+                    to_json(&cluster.cluster)?,
+                    to_json(&cluster.agent_labels)?,
+                    to_json(&cluster.labels)?,
+                    cluster.notes,
+                    status_str(cluster.status),
+                    ts(cluster.at)
+                ],
+            )
+            .map_err(db_error)?;
+        self.target(&cluster.id)?.ok_or_else(|| {
+            buckle_core::error::system("A cluster target vanished right after it was created.", &[])
+        })
+    }
+
+    /// The host, if known. A cluster target of that id is not a host.
     pub fn get(&self, id: &str) -> Result<Option<HostRecord>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM hosts WHERE host_id = ?1 AND kind = 'host'"),
+                params![id],
+                row,
+            )
+            .optional()
+            .map_err(db_error)?
+            .map(RawHost::into_record)
+            .transpose()
+    }
+
+    /// The target (host or cluster) of this id, if known.
+    pub fn target(&self, id: &str) -> Result<Option<HostRecord>> {
         self.conn
             .query_row(
                 &format!("SELECT {COLUMNS} FROM hosts WHERE host_id = ?1"),
@@ -211,11 +279,27 @@ impl<'c> Hosts<'c> {
             .transpose()
     }
 
-    /// Every host, by id.
+    /// Every host, by id (cluster targets excluded).
     pub fn list(&self) -> Result<Vec<HostRecord>> {
+        self.select("WHERE kind = 'host'")
+    }
+
+    /// Every target of every kind, by id.
+    pub fn targets(&self) -> Result<Vec<HostRecord>> {
+        self.select("")
+    }
+
+    /// Every cluster target, by id.
+    pub fn clusters(&self) -> Result<Vec<HostRecord>> {
+        self.select("WHERE kind = 'cluster'")
+    }
+
+    fn select(&self, filter: &str) -> Result<Vec<HostRecord>> {
         let mut stmt = self
             .conn
-            .prepare(&format!("SELECT {COLUMNS} FROM hosts ORDER BY host_id"))
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM hosts {filter} ORDER BY host_id"
+            ))
             .map_err(db_error)?;
         let rows = stmt
             .query_map([], row)
@@ -223,6 +307,24 @@ impl<'c> Hosts<'c> {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
         rows.into_iter().map(RawHost::into_record).collect()
+    }
+
+    /// Replaces a cluster target's spec and seed labels (a declaration that
+    /// changed, or an operator's edit).
+    pub fn set_cluster(
+        &self,
+        id: &str,
+        cluster: &ClusterInfo,
+        agent_labels: &BTreeMap<String, String>,
+    ) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE hosts SET cluster = ?2, agent_labels = ?3 WHERE host_id = ?1 AND kind = 'cluster'",
+                params![id, to_json(cluster)?, to_json(agent_labels)?],
+            )
+            .map_err(db_error)?;
+        Ok(n > 0)
     }
 
     /// Records a Hello: version, platform, seed labels and connection.
@@ -487,6 +589,71 @@ mod tests {
         assert_eq!(host.effective_labels()["role"], "canary");
         assert_eq!(host.agent_labels["role"], "worker");
         assert!(found.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn cluster_targets_share_the_table_but_not_the_host_views() {
+        let store = Store::in_memory().await.unwrap();
+        let now = Utc::now();
+        let spec = buckle_api::ClusterSpec {
+            kind: buckle_api::ClusterKind::Nomad,
+            description: String::new(),
+            api: None,
+            nodes: Some("host.groups contains \"nomad\"".into()),
+            executors: None,
+            identity: buckle_api::ClusterSpec::default_identity(),
+            cluster: None,
+            scope: Default::default(),
+        };
+        let (host, target, hosts, targets, clusters) = store
+            .call(move |db| {
+                db.hosts().create(&NewHost {
+                    id: "pi-1".into(),
+                    status: HostStatus::Active,
+                    token_hash: None,
+                    auth_method: "token".into(),
+                    at: now,
+                })?;
+                db.hosts().create_cluster(&NewCluster {
+                    id: "home-nomad".into(),
+                    cluster: ClusterInfo {
+                        spec: spec.clone(),
+                        declared: true,
+                    },
+                    agent_labels: [("site".to_string(), "home".to_string())].into(),
+                    labels: BTreeMap::new(),
+                    notes: String::new(),
+                    status: HostStatus::Active,
+                    at: now,
+                })?;
+                db.hosts()
+                    .set_health("home-nomad", HealthSummary::Healthy, now)?;
+                Ok((
+                    db.hosts().get("home-nomad")?,
+                    db.hosts().target("home-nomad")?,
+                    db.hosts().list()?,
+                    db.hosts().targets()?,
+                    db.hosts().clusters()?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(host.is_none(), "a cluster is not a host");
+        let target = target.expect("the cluster is a target");
+        assert_eq!(target.kind, TargetKind::Cluster);
+        assert_eq!(
+            target.cluster.as_ref().map(|c| c.spec.kind),
+            Some(buckle_api::ClusterKind::Nomad)
+        );
+        assert!(target.cluster.as_ref().is_some_and(|c| c.declared));
+        assert_eq!(target.effective_labels()["site"], "home");
+        assert_eq!(target.health, HealthSummary::Healthy);
+        assert_eq!(
+            hosts.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["pi-1"]
+        );
+        assert_eq!(targets.len(), 2);
+        assert_eq!(clusters.len(), 1);
     }
 
     #[tokio::test]

@@ -346,6 +346,7 @@ async fn hosts_can_be_relabelled_approved_and_previewed() {
             .set_json(buckle_api::HostPatch {
                 labels: Some(labels.clone()),
                 notes: Some("in the cupboard".into()),
+                cluster: None,
             })
             .to_request(),
     )
@@ -415,6 +416,203 @@ async fn hosts_can_be_relabelled_approved_and_previewed() {
     )
     .await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[actix_web::test]
+async fn cluster_targets_are_declared_or_created_and_listed_beside_hosts() {
+    let e = env(WebConfig {
+        admin_acl: acl("true"),
+        ..Default::default()
+    })
+    .await;
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    revision(
+        &e,
+        "r1",
+        "version: 2\nfleet:\n  groups:\n    home: 'cluster.labels.site == \"home\"'\n  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.labels.nomad == true'\n      labels: { site: home }\n",
+    )
+    .await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+
+    // Listing the fleet materialises the declared cluster beside the hosts.
+    let fleet: buckle_api::Fleet = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        fleet
+            .hosts
+            .iter()
+            .map(|h| h.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pi-1"]
+    );
+    assert_eq!(fleet.clusters.len(), 1);
+    let declared = &fleet.clusters[0];
+    assert_eq!(declared.id, "home-nomad");
+    assert_eq!(declared.kind, buckle_api::TargetKind::Cluster);
+    assert!(declared.cluster.as_ref().is_some_and(|c| c.declared));
+    assert_eq!(declared.groups, vec!["home"]);
+    assert_eq!((fleet.counts.total, fleet.counts.clusters), (1, 1));
+    let hosts: Vec<buckle_api::HostSummary> = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/v1/hosts").to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(hosts.len(), 1, "the host list stays hosts only");
+
+    // A declared cluster cannot be forgotten or respecified through the API.
+    let forget = test::call_service(
+        &app,
+        test::TestRequest::delete()
+            .uri("/api/v1/targets/home-nomad")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(forget.status(), StatusCode::CONFLICT);
+
+    // An operator creates a cluster target; bad specs are refused.
+    let spec = buckle_api::ClusterSpec {
+        kind: buckle_api::ClusterKind::Kubernetes,
+        description: String::new(),
+        api: Some("https://10.0.0.1:6443".into()),
+        nodes: Some("host.labels.k3s == true".into()),
+        executors: None,
+        identity: "local".into(),
+        cluster: None,
+        scope: Default::default(),
+    };
+    let create = |body: buckle_api::CreateTarget| {
+        test::TestRequest::post()
+            .uri("/api/v1/targets")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(body)
+            .to_request()
+    };
+    let bad = test::call_service(
+        &app,
+        create(buckle_api::CreateTarget {
+            id: "lab-k3s".into(),
+            kind: buckle_api::TargetKind::Cluster,
+            cluster: Some(buckle_api::ClusterSpec {
+                nodes: Some("cluster.kind == \"nomad\"".into()),
+                ..spec.clone()
+            }),
+            labels: Default::default(),
+            notes: String::new(),
+        }),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let taken = test::call_service(
+        &app,
+        create(buckle_api::CreateTarget {
+            id: "pi-1".into(),
+            kind: buckle_api::TargetKind::Cluster,
+            cluster: Some(spec.clone()),
+            labels: Default::default(),
+            notes: String::new(),
+        }),
+    )
+    .await;
+    assert_eq!(taken.status(), StatusCode::CONFLICT);
+    let created = test::call_service(
+        &app,
+        create(buckle_api::CreateTarget {
+            id: "lab-k3s".into(),
+            kind: buckle_api::TargetKind::Cluster,
+            cluster: Some(spec.clone()),
+            labels: [("site".to_string(), "lab".to_string())].into(),
+            notes: "the lab".into(),
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let summary: buckle_api::HostSummary = test::read_body_json(created).await;
+    assert_eq!(summary.kind, buckle_api::TargetKind::Cluster);
+    assert_eq!(summary.effective_labels["site"], "lab");
+    assert!(
+        summary
+            .cluster
+            .as_ref()
+            .is_some_and(|c| !c.declared && c.spec == spec)
+    );
+
+    // Its spec can be changed, and it can be paused and forgotten.
+    let patched = test::call_service(
+        &app,
+        test::TestRequest::patch()
+            .uri("/api/v1/targets/lab-k3s")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(buckle_api::HostPatch {
+                cluster: Some(buckle_api::ClusterSpec {
+                    executors: Some("host.labels.k3s_server == true".into()),
+                    ..spec.clone()
+                }),
+                ..Default::default()
+            })
+            .to_request(),
+    )
+    .await;
+    assert_eq!(patched.status(), StatusCode::OK);
+    let summary: buckle_api::HostSummary = test::read_body_json(patched).await;
+    assert_eq!(
+        summary
+            .cluster
+            .as_ref()
+            .and_then(|c| c.spec.executors.clone())
+            .as_deref(),
+        Some("host.labels.k3s_server == true")
+    );
+    let paused = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/targets/lab-k3s/pause")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(paused.status(), StatusCode::OK);
+    let targets: Vec<buckle_api::HostSummary> = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/v1/targets").to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(targets.len(), 3);
+    let forgotten = test::call_service(
+        &app,
+        test::TestRequest::delete()
+            .uri("/api/v1/targets/lab-k3s")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(forgotten.status(), StatusCode::NO_CONTENT);
+    let detail = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/targets/lab-k3s")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(detail.status(), StatusCode::NOT_FOUND);
 }
 
 #[actix_web::test]
