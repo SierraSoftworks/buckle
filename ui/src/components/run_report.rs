@@ -414,26 +414,55 @@ fn health_bucket(b: &Bucket<'_>, t0: DateTime<Utc>) -> Html {
         return html! { <span class="hbar__bucket hbar__bucket--empty" role="listitem" aria-label="no readings yet" /> };
     };
     let span = format!("{} to {}", since(b.from, t0), since(b.until, t0));
+    let pop = html! { <>
+        <span class="hbar__when small muted" title={format!("{} to {}", timestamp(b.from), timestamp(b.until))}>{ span.clone() }</span>
+        <ul class="hbar__checks">
+            { for b.checks.iter().map(|c| html! {
+                <li class="hbar__check" data-check={c.reading.check.clone()} data-state={c.state.slug()}>
+                    <Pill tone={check_status_tone(&c.reading.status)} label={c.reading.status.clone()} />
+                    <span class="mono">{ c.reading.check.clone() }</span>
+                    <span class="badge">{ c.reading.scope.clone() }</span>
+                    if !c.reading.required { <span class="muted small">{ "informational" }</span> }
+                    if let Some(reason) = &c.reading.reason { <span class="hbar__reason">{ reason.clone() }</span> }
+                    if c.carried {
+                        <span class="muted small" title={timestamp(c.reading.at)}>{ format!("last read {}", since(c.reading.at, t0)) }</span>
+                    }
+                </li>
+            }) }
+        </ul>
+    </> };
     html! {
-        <span class={classes!("hbar__bucket", state.tone().class())} role="listitem" tabindex="0"
-            data-state={state.slug()} aria-label={format!("{}: {span}", state.label())}>
-            <span class="hbar__pop" role="tooltip">
-                <span class="hbar__when small muted" title={format!("{} to {}", timestamp(b.from), timestamp(b.until))}>{ span }</span>
-                <ul class="hbar__checks">
-                    { for b.checks.iter().map(|c| html! {
-                        <li class="hbar__check" data-check={c.reading.check.clone()} data-state={c.state.slug()}>
-                            <Pill tone={check_status_tone(&c.reading.status)} label={c.reading.status.clone()} />
-                            <span class="mono">{ c.reading.check.clone() }</span>
-                            <span class="badge">{ c.reading.scope.clone() }</span>
-                            if !c.reading.required { <span class="muted small">{ "informational" }</span> }
-                            if let Some(reason) = &c.reading.reason { <span class="hbar__reason">{ reason.clone() }</span> }
-                            if c.carried {
-                                <span class="muted small" title={timestamp(c.reading.at)}>{ format!("last read {}", since(c.reading.at, t0)) }</span>
-                            }
-                        </li>
-                    }) }
-                </ul>
-            </span>
+        <HealthSlice class={classes!("hbar__bucket", state.tone().class())} state={state.slug()}
+            label={format!("{}: {span}", state.label())} {pop} />
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct SliceProps {
+    class: Classes,
+    state: AttrValue,
+    label: AttrValue,
+    pop: Html,
+}
+
+/// A slice of a health bar. Its popover joins the page on first hover or
+/// focus (CSS shows and hides it from then on): a report has a popover per
+/// slice per module, and adding them all up front is most of what the page
+/// inserts.
+#[function_component(HealthSlice)]
+fn health_slice(props: &SliceProps) -> Html {
+    let shown = use_state_eq(|| false);
+    let (enter, focus) = {
+        let (a, b) = (shown.clone(), shown.clone());
+        (
+            Callback::from(move |_: MouseEvent| a.set(true)),
+            Callback::from(move |_: FocusEvent| b.set(true)),
+        )
+    };
+    html! {
+        <span class={props.class.clone()} role="listitem" tabindex="0" data-state={props.state.clone()}
+            aria-label={props.label.clone()} onmouseenter={enter} onfocus={focus}>
+            if *shown { <span class="hbar__pop" role="tooltip">{ props.pop.clone() }</span> }
         </span>
     }
 }
