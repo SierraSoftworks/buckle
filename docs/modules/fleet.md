@@ -160,4 +160,8 @@ Without `phases`, one implicit phase selects every host, one at a time. Hosts th
 selects are reported on the rollout and left on their current revision, so end with a
 `select: 'true'` phase if every host should follow.
 
+Inside a phase, `needs` that cross a cluster boundary (`module:` on a workload, `workload:` on a
+module) order its targets into stages; see
+[Stages inside a phase](../operations/rollouts.md#stages-inside-a-phase).
+
 See [Rolling out changes](../operations/rollouts.md) for what each phase does, step by step.

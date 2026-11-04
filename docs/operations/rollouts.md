@@ -51,6 +51,24 @@ A host's way through a phase:
 A phase that exceeds `max_failures` stops according to `rollout.on_failure`; see
 [Recovering from failures](./recovery.md).
 
+### Stages inside a phase
+
+Within a phase, order comes from `needs`. Between the modules of one host that is the agent's
+business and makes no difference to the pipeline; an edge that crosses a cluster boundary does. A
+workload that needs `module:nomad` waits for that module on the cluster's nodes, and a module that
+needs `workload:postgresql` waits for the workload on the cluster its host is a node of. The
+controller resolves those edges into **stages**: everything with no cross-layer dependency first,
+then what depends on it, and so on, each stage applying `parallel` targets at a time. A host whose
+modules sit on both sides of a workload is applied in two steps, its dependent modules after the
+cluster, and shows as pending with the stage it waits for in between.
+
+A cluster's plan, and any later step's, is taken when its stage opens rather than when the rollout
+starts, because it depends on what the stages before it did; a plan that arrives then needs
+approval like any other under `approval: required` or `if_destructive`. A cluster with no
+connected host matching its `executors` selector reads *awaiting executor*; it misses its phase
+after the disconnect grace, like an offline host, and converges in the stragglers stage once one
+appears. A phase without cross-layer `needs` is one stage, as before.
+
 ## 3. Review and approve
 
 A phase with `approval: required` (or `if_destructive`, when a plan removes or deletes something)
@@ -88,6 +106,11 @@ the rollout and its run report.
 When the last phase completes, the revision is **promoted** to stable: it is what new hosts get and
 what a rollback returns to. Hosts that missed their phase (offline, held or skipped) converge in the
 **stragglers** stage, `stragglers.parallel` at a time.
+
+A target that appears while the rollout runs (a host enrolled and approved, a cluster created
+through the API) joins the phase its selector names if the rollout has not reached that phase yet,
+and is planned and approved with it. One whose phase is already running, or over, waits for the
+stragglers stage.
 
 ## Pausing
 

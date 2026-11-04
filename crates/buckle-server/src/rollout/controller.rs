@@ -2298,18 +2298,24 @@ impl Controller {
                         &["Wait for the host's plan or apply to finish, then force it."],
                     ));
                 }
-                if !self.connected(&host) {
+                let Some(session) = self.row_session(ri, hi).filter(|s| self.connected(s)) else {
+                    let what = match self.live[ri].hosts[hi].runtime.kind {
+                        TargetKind::Host => format!("Host '{host}' is not connected."),
+                        TargetKind::Cluster => {
+                            format!("Cluster '{host}' has no connected executor.")
+                        }
+                    };
                     return Err(CommandError::conflict(
-                        format!("Host '{host}' is not connected."),
+                        what,
                         &["Wait for the agent to reconnect, then force it again."],
                     ));
-                }
+                };
                 // Applying whatever the host plans needs an agent that can
                 // skip its digest check; an older one still applies a host
                 // held at baseline with its approved plan.
                 let force_plan = self
                     .capabilities
-                    .get(&host)
+                    .get(&session)
                     .is_some_and(|c| c.iter().any(|c| c == "force_plan"));
                 if !force_plan && state != HostPhase::Held {
                     return Err(CommandError::conflict(
