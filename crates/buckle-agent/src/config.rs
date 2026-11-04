@@ -35,6 +35,10 @@ pub struct AgentConfig {
     pub vars: IndexMap<String, serde_yaml::Value>,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// For an executor running inside a cluster: the workload identity it
+    /// authenticates with (`agents.auth: workload_identity` on the server).
+    #[serde(default)]
+    pub workload_identity: Option<WorkloadIdentityConfig>,
     /// In local mode (`source`), programs the `exec` secret provider may run
     /// (e.g. `op`). Never read from agent.yaml: only an explicit command-line
     /// flag (`buckle agent --allow-secret-exec op`) enables it, as on the
@@ -82,6 +86,14 @@ impl AgentConfig {
                     "Use `server` to connect to a Buckle server, or `source` to watch a local directory.",
                 ],
             )),
+            (Some(_), None) if self.workload_identity.is_some() && self.host_id.is_none() => {
+                Err(buckle_core::error::user(
+                    "The agent configuration sets `workload_identity` without `host_id`.",
+                    &[
+                        "Give the in-cluster executor a stable `host_id` (such as `home-nomad-executor`): its container's hostname changes with every allocation.",
+                    ],
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -90,6 +102,20 @@ impl AgentConfig {
     pub fn is_local(&self) -> bool {
         self.source.is_some()
     }
+}
+
+/// Where an in-cluster executor finds its workload identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadIdentityConfig {
+    /// The token file the scheduler keeps current (Nomad:
+    /// `secrets/nomad_buckle.jwt` with `identity { file = true }`;
+    /// Kubernetes: a projected ServiceAccount token).
+    pub token_file: PathBuf,
+    /// The cluster's key set as the executor reaches it, relayed to a server
+    /// that cannot reach the cluster itself so it can follow key rotation.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -173,5 +199,15 @@ tls: { ca_fingerprint: "sha256:abc" }
         let local: AgentConfig = serde_yaml::from_str("source: /srv/config\n").unwrap();
         local.validate().unwrap();
         assert!(local.is_local());
+    }
+
+    #[test]
+    fn an_in_cluster_executor_needs_a_stable_host_id() {
+        let wi = "server: x\nworkload_identity: { token_file: /secrets/nomad_buckle.jwt }\n";
+        let unnamed: AgentConfig = serde_yaml::from_str(wi).unwrap();
+        assert!(unnamed.validate().is_err());
+        let named: AgentConfig =
+            serde_yaml::from_str(&format!("{wi}host_id: home-nomad-executor\n")).unwrap();
+        named.validate().unwrap();
     }
 }

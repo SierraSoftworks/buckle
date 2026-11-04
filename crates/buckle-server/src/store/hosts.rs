@@ -40,7 +40,20 @@ pub struct HostRecord {
     pub drifted: bool,
 }
 
+/// `auth_method` of a host enrolled by workload identity: the prefix, then
+/// the cluster it executes for.
+pub const WORKLOAD_AUTH_PREFIX: &str = "workload_identity:";
+
 impl HostRecord {
+    /// For an executor running inside a cluster, the cluster it speaks for.
+    /// Such a host runs no modules of its own; it only executes for that
+    /// cluster and the targets scoped to it.
+    pub fn executor_of(&self) -> Option<&str> {
+        self.auth_method
+            .as_deref()
+            .and_then(|m| m.strip_prefix(WORKLOAD_AUTH_PREFIX))
+    }
+
     /// Agent labels overlaid with server labels (server labels win).
     pub fn effective_labels(&self) -> BTreeMap<String, String> {
         let mut out = self.agent_labels.clone();
@@ -604,6 +617,7 @@ mod tests {
             identity: buckle_api::ClusterSpec::default_identity(),
             cluster: None,
             scope: Default::default(),
+            trust: None,
         };
         let (host, target, hosts, targets, clusters) = store
             .call(move |db| {

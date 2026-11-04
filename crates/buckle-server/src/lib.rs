@@ -27,6 +27,7 @@ pub mod targets;
 pub mod upgrades;
 pub mod views;
 pub mod web;
+pub mod workload;
 
 pub use config::ServerConfig;
 
@@ -225,6 +226,7 @@ pub async fn run_with(
         upgrades: upgrades.clone(),
         joins: joins.clone(),
         identity: issuer.clone(),
+        workload: Default::default(),
     };
     let grpc_listener = tokio::net::TcpListener::bind(&config.listen.grpc)
         .await

@@ -26,6 +26,14 @@ pub fn spec_from_decl(decl: &ClusterDecl) -> ClusterSpec {
         scope: buckle_api::ClusterScope {
             namespaces: decl.scope.namespaces.clone(),
         },
+        trust: decl.trust.as_ref().map(|t| {
+            Box::new(buckle_api::ClusterTrust {
+                jwks_url: t.jwks_url.clone(),
+                keys: t.keys_json(),
+                issuer: t.issuer.clone(),
+                subjects: t.subjects.clone(),
+            })
+        }),
     }
 }
 
@@ -72,6 +80,21 @@ pub fn check_spec(
         return Err(format!(
             "`identity` names the secret '{secret}', which buckle.yaml does not declare under `secrets`."
         ));
+    }
+    if let Some(trust) = &spec.trust {
+        if spec.cluster.is_some() {
+            return Err("A scoped target is served by its cluster's executors; set `trust` on the cluster instead.".to_owned());
+        }
+        if let Some(problem) =
+            buckle_core::model::trust_problem(trust.jwks_url.as_deref(), trust.keys.as_deref())
+        {
+            return Err(format!("{problem}."));
+        }
+        if let Some(keys) = &trust.keys
+            && serde_json::from_str::<jsonwebtoken::jwk::JwkSet>(keys).is_err()
+        {
+            return Err("`trust.keys` holds a key Buckle cannot read; give RSA, EC or Ed25519 public keys in JWK form.".to_owned());
+        }
     }
     match &spec.cluster {
         None if !spec.scope.is_empty() => Err(
@@ -252,6 +275,7 @@ secrets:
             identity: ClusterSpec::default_identity(),
             cluster: None,
             scope: Default::default(),
+            trust: None,
         }
     }
 

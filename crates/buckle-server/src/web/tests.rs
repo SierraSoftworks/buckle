@@ -491,6 +491,7 @@ async fn cluster_targets_are_declared_or_created_and_listed_beside_hosts() {
         identity: "local".into(),
         cluster: None,
         scope: Default::default(),
+        trust: None,
     };
     let create = |body: buckle_api::CreateTarget| {
         test::TestRequest::post()

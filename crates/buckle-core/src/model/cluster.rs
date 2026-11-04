@@ -167,6 +167,77 @@ pub struct ClusterDecl {
     pub cluster: Option<String>,
     #[serde(default, skip_serializing_if = "ClusterScope::is_empty")]
     pub scope: ClusterScope,
+    /// Which workload identities may speak for the cluster from inside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<ClusterTrust>,
+}
+
+/// How an in-cluster executor proves it speaks for the cluster: a workload
+/// identity token (Nomad `identity` block, projected ServiceAccount token)
+/// signed by one of the cluster's keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTrust {
+    /// Where the server reads the cluster's signing keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_url: Option<String>,
+    /// The cluster's key set (a JWKS document, as a mapping or JSON text),
+    /// for a cluster the server cannot reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<serde_json::Value>,
+    /// The `iss` tokens must carry; absent: any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// `namespace/job` (Nomad) or `sub` (Kubernetes) of the executors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+}
+
+/// Why a cluster's trust cannot be used, if it cannot: it must say where the
+/// keys are or carry them, as an `http(s)` URL and a JWKS document.
+pub fn trust_problem(jwks_url: Option<&str>, keys: Option<&str>) -> Option<String> {
+    if jwks_url.is_none() && keys.is_none() {
+        return Some(
+            "`trust` needs `jwks_url` or `keys`, so the server knows the cluster's signing keys"
+                .to_owned(),
+        );
+    }
+    if let Some(url) = jwks_url
+        && !(url.starts_with("https://") || url.starts_with("http://"))
+    {
+        return Some(format!("`trust.jwks_url` '{url}' must be an http(s) URL"));
+    }
+    if let Some(keys) = keys {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(keys);
+        let has_keys = parsed
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("keys"))
+            .and_then(|k| k.as_array())
+            .is_some_and(|k| !k.is_empty());
+        if !has_keys {
+            return Some(
+                "`trust.keys` must be a JWKS document: `{ keys: [ ... ] }` with at least one key"
+                    .to_owned(),
+            );
+        }
+    }
+    None
+}
+
+impl ClusterTrust {
+    /// Why this trust cannot be used, if it cannot.
+    pub fn problem(&self) -> Option<String> {
+        trust_problem(self.jwks_url.as_deref(), self.keys_json().as_deref())
+    }
+
+    /// The pinned key set as JSON text.
+    pub fn keys_json(&self) -> Option<String> {
+        self.keys.as_ref().map(|k| match k {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+    }
 }
 
 impl ClusterDecl {

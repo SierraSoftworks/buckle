@@ -106,6 +106,46 @@ pub struct ClusterSpec {
     pub cluster: Option<String>,
     #[serde(default, skip_serializing_if = "ClusterScope::is_empty")]
     pub scope: ClusterScope,
+    /// How executors running inside the cluster prove they speak for it
+    /// (`agents.auth: workload_identity`). Absent: none may.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<Box<ClusterTrust>>,
+}
+
+/// Which workload identities the server accepts as the cluster's in-cluster
+/// executor: tokens signed by one of the cluster's keys, for `buckle`, naming
+/// one of `subjects`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterTrust {
+    /// Where the server reads the cluster's signing keys (Nomad:
+    /// `/.well-known/jwks.json`, Kubernetes: `/openid/v1/jwks`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_url: Option<String>,
+    /// The key set itself (JWKS JSON), for a cluster the server cannot reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
+    /// The `iss` the tokens must carry; absent: any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Who may speak for the cluster: `namespace/job` for Nomad, the `sub`
+    /// for Kubernetes. Empty: the kind's default executor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+}
+
+impl ClusterTrust {
+    /// The subjects a token may name, with the kind's default.
+    pub fn subjects(&self, kind: ClusterKind) -> Vec<String> {
+        if !self.subjects.is_empty() {
+            return self.subjects.clone();
+        }
+        vec![match kind {
+            ClusterKind::Nomad => "default/buckle-executor".to_owned(),
+            ClusterKind::Kubernetes => {
+                "system:serviceaccount:buckle-system:buckle-executor".to_owned()
+            }
+        }]
+    }
 }
 
 impl ClusterSpec {

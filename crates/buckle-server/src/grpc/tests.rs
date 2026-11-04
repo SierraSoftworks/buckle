@@ -173,6 +173,7 @@ async fn server_full(
             )
             .unwrap(),
         ),
+        workload: Default::default(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1430,6 +1431,7 @@ async fn clusters_created_through_the_api_grant_by_their_selectors(
                             identity: "buckle_jwt".into(),
                             cluster: None,
                             scope: Default::default(),
+                            trust: None,
                         },
                         declared: false,
                     },
@@ -1448,4 +1450,112 @@ async fn clusters_created_through_the_api_grant_by_their_selectors(
         got.map(|_| tonic::Code::Ok).unwrap_or_else(|e| e.code()),
         expected
     );
+}
+
+fn workload_hello(host: &str, token: &str) -> AgentMessage {
+    AgentMessage {
+        msg: Some(agent_message::Msg::Hello(Hello {
+            host_id: host.into(),
+            agent_version: "2.0.0".into(),
+            workload_token: token.into(),
+            capabilities: vec!["targets".into()],
+            ..Default::default()
+        })),
+    }
+}
+
+/// A server accepting workload identities, with `home-nomad` trusting the
+/// test cluster key.
+async fn workload_server(auth: Vec<AgentAuth>) -> Server {
+    use crate::workload::tests::{CLUSTER, jwks};
+    let s = server(Registration::Approve, None, auth).await;
+    let keys = jwks(&[&CLUSTER]);
+    s.store
+        .call(move |db| {
+            db.hosts()
+                .create_cluster(&crate::store::NewCluster {
+                    id: "home-nomad".into(),
+                    cluster: buckle_api::ClusterInfo {
+                        spec: buckle_api::ClusterSpec {
+                            kind: buckle_api::ClusterKind::Nomad,
+                            description: String::new(),
+                            api: None,
+                            nodes: None,
+                            executors: None,
+                            identity: "workload".into(),
+                            cluster: None,
+                            scope: Default::default(),
+                            trust: Some(Box::new(buckle_api::ClusterTrust {
+                                keys: Some(keys),
+                                ..Default::default()
+                            })),
+                        },
+                        declared: false,
+                    },
+                    agent_labels: Default::default(),
+                    labels: Default::default(),
+                    notes: String::new(),
+                    status: HostStatus::Active,
+                    at: chrono::Utc::now(),
+                })
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+    s
+}
+
+fn executor_token(job: &str) -> String {
+    use crate::workload::tests::{CLUSTER, mint, nomad_claims};
+    mint(&CLUSTER, "k1", &nomad_claims(job))
+}
+
+#[tokio::test]
+async fn an_in_cluster_executor_enrols_with_its_workload_identity() {
+    let s = workload_server(vec![AgentAuth::Token, AgentAuth::WorkloadIdentity]).await;
+    let token = executor_token("buckle-executor");
+    let (tx, _stream, reply) = open(s.addr, workload_hello("home-nomad-executor", &token)).await;
+    let first = expect_welcome(reply);
+    // The cluster's trust is the operator's approval: no pending state.
+    assert_eq!(first.status, "active");
+    let host = s
+        .store
+        .call(|db| db.hosts().get("home-nomad-executor"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(host.executor_of(), Some("home-nomad"));
+    assert_eq!(
+        host.token_hash.as_deref(),
+        Some(auth::hash_token(&first.issued_token).as_str()),
+        "its other calls use the issued token"
+    );
+    drop(tx);
+
+    let (_tx, _stream, reply) = open(s.addr, workload_hello("home-nomad-executor", &token)).await;
+    let again = expect_welcome(reply);
+    assert!(!again.issued_token.is_empty() && again.issued_token != first.issued_token);
+}
+
+#[rstest::rstest]
+#[case::not_accepted(vec![AgentAuth::Token], "buckle-executor", "home-nomad-executor", "add `workload_identity`")]
+#[case::another_job(vec![AgentAuth::WorkloadIdentity], "paste", "home-nomad-executor", "trusted subjects")]
+#[case::a_hosts_name(vec![AgentAuth::Token, AgentAuth::WorkloadIdentity], "buckle-executor", "pi-1", "its own host_id")]
+#[case::a_clusters_name(vec![AgentAuth::WorkloadIdentity], "buckle-executor", "home-nomad", "its own host_id")]
+#[tokio::test]
+async fn workload_identities_are_refused_with_a_reason(
+    #[case] auth: Vec<AgentAuth>,
+    #[case] job: &str,
+    #[case] host: &str,
+    #[case] reason: &str,
+) {
+    let s = workload_server(auth.clone()).await;
+    if auth.contains(&AgentAuth::Token) {
+        let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+        expect_welcome(reply);
+    }
+    let (_tx, _stream, reply) = open(s.addr, workload_hello(host, &executor_token(job))).await;
+    let rejected = expect_rejected(reply);
+    assert!(rejected.reason.contains(reason), "{}", rejected.reason);
+    assert!(!rejected.retry);
 }

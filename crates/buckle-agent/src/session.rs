@@ -659,6 +659,7 @@ impl Shared {
     }
 
     async fn hello(&self) -> Hello {
+        let (workload_token, workload_jwks) = self.workload_identity().await;
         let data = self.data.lock().await;
         let issued = self.store.read_token().unwrap_or_else(|err| {
             tracing::warn!(error = %err.description(), "could not read the per-host token");
@@ -698,7 +699,48 @@ impl Shared {
             arch: std::env::consts::ARCH.to_owned(),
             bootstrap,
             boot_id: self.current_boot(),
+            workload_token,
+            workload_jwks,
         }
+    }
+
+    /// The workload identity token (read afresh: the scheduler rotates it)
+    /// and the cluster's key set, for an in-cluster executor.
+    async fn workload_identity(&self) -> (Option<String>, Option<String>) {
+        let Some(wi) = &self.config.workload_identity else {
+            return (None, None);
+        };
+        let token = match tokio::fs::read_to_string(&wi.token_file).await {
+            Ok(t) if !t.trim().is_empty() => Some(t.trim().to_owned()),
+            Ok(_) => {
+                tracing::error!(file = %wi.token_file.display(), "the workload identity token file is empty");
+                None
+            }
+            Err(err) => {
+                tracing::error!(file = %wi.token_file.display(), error = %err, "could not read the workload identity token");
+                None
+            }
+        };
+        let jwks = match &wi.jwks_url {
+            None => None,
+            Some(url) => {
+                let got = async {
+                    reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()?
+                        .get(url)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .text()
+                        .await
+                }
+                .await;
+                got.map_err(|err| tracing::warn!(%url, error = %err, "could not read the cluster's signing keys to relay"))
+                    .ok()
+            }
+        };
+        (token, jwks)
     }
 
     fn current_boot(&self) -> Option<String> {

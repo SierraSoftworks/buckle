@@ -9,7 +9,10 @@ mod cluster;
 mod task_decl;
 mod workload;
 
-pub use cluster::{ClusterDecl, ClusterIdentity, ClusterKind, ClusterScope, yaml_scalar_text};
+pub use cluster::{
+    ClusterDecl, ClusterIdentity, ClusterKind, ClusterScope, ClusterTrust, trust_problem,
+    yaml_scalar_text,
+};
 pub use task_decl::{RetryPolicy, TaskDecl};
 pub use workload::{
     Items, JobDecl, Layer, Need, PolicyAttach, PolicyDecl, ResourceDecl, WorkloadConfig,

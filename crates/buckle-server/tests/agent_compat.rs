@@ -86,6 +86,8 @@ async fn the_agent_transport_enrols_is_assigned_and_fetches_a_verified_revision(
             bootstrap: true,
             unreported_apply_revisions: vec![],
             boot_id: None,
+            workload_token: None,
+            workload_jwks: None,
         })
         .await
         .expect("the session opens over pinned TLS");

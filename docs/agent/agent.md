@@ -118,6 +118,8 @@ telemetry:
 | `vars` | `{}` | Host-specific variable overrides: the last, highest-precedence [vars](../modules/fleet.md#vars) layer. |
 | `telemetry.otlp_endpoint` | | Where to export traces and metrics. `--otel-endpoint` and `OTEL_EXPORTER_OTLP_*` take precedence. |
 | `telemetry.otlp_headers` | `{}` | Extra OTLP headers, such as an API key. |
+| `workload_identity.token_file` | | For an [executor inside a cluster](./server.md#in-cluster-executors): the workload identity token file, read on every connect (Nomad: `secrets/nomad_buckle.jwt` from `identity { name = "buckle", aud = ["buckle"], file = true }`). Needs `host_id`. |
+| `workload_identity.jwks_url` | | The cluster's key set as the executor reaches it (Nomad: `/.well-known/jwks.json`), relayed to a server that cannot reach the cluster. |
 
 Unknown keys are rejected, so a misspelt key fails at start-up instead of being ignored.
 

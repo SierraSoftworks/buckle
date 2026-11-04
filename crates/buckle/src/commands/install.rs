@@ -93,6 +93,7 @@ pub async fn up(a: InstallAgentArgs) -> buckle_core::Result<i32> {
         drift: Default::default(),
         vars: Default::default(),
         telemetry: Default::default(),
+        workload_identity: None,
         local_secret_exec: Vec::new(),
     };
     config.validate()?;
