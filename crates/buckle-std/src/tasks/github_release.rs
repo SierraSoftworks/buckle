@@ -21,14 +21,14 @@ use tracing::instrument;
 /// - github.release:
 ///     repo: atuinsh/atuin
 ///     version: latest                       # or "v18.3.0" / "18.3.0"
-///     asset: "atuin-{arch}-unknown-linux-gnu.tar.gz"   # {version} {arch} {os} {tag}
+///     asset: "atuin-{arch}-unknown-linux-musl.tar.gz"  # {version} {arch} {os} {tag}
 ///     arch_map: { x86_64: x86_64, aarch64: aarch64 }   # host arch -> asset arch; armv7l is skipped
 ///     extract: atuin                        # file inside an archive asset
 ///     dest: /usr/local/bin/atuin
 ///     mode: "0755"
 ///     probe: ["atuin", "--version"]         # prints the installed version
 ///     probe_regex: 'atuin (\S+)'            # optional; default is the first x.y.z found
-///     checksum_asset: "atuin-{arch}-unknown-linux-gnu.tar.gz.sha256"
+///     checksum_asset: "atuin-{arch}-unknown-linux-musl.tar.gz.sha256"
 ///     token_env: GITHUB_TOKEN               # optional; name of an environment variable
 /// ```
 ///
@@ -50,8 +50,11 @@ use tracing::instrument;
 /// Archive assets (`.tar.gz`, `.tgz`, `.tar`, `.zip`) need `extract`: the
 /// path or file name of the binary inside. With `checksum_asset` (the name of a
 /// `.sha256` or `SHA256SUMS` asset) the downloaded asset is verified before
-/// anything is written. Removal deletes `dest` only if it still matches what
-/// Buckle installed.
+/// anything is written. With `probe`, an install that does not then report the
+/// release's version fails and puts the previous binary back, so an asset that
+/// cannot run on the host (e.g. a glibc build on an older glibc) is reported
+/// rather than reinstalled on every rollout. Removal deletes `dest` only if it
+/// still matches what Buckle installed.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
@@ -287,8 +290,8 @@ impl GithubRelease {
         })
     }
 
-    /// The installed version according to `probe`, or `None` when it is not installed.
-    async fn installed_version(&self, cx: &Cx, spec: &Spec) -> Result<Option<String>> {
+    /// What `probe` reports, or `None` when the task has no probe.
+    async fn probe(&self, cx: &Cx, spec: &Spec) -> Result<Option<Probed>> {
         let Some(argv) = &spec.probe else {
             return Ok(None);
         };
@@ -298,27 +301,83 @@ impl GithubRelease {
                 &["Give the program and its arguments, e.g. [\"atuin\", \"--version\"]."],
             ));
         };
-        // A probe that cannot run at all is how "not installed" looks.
-        let Ok(out) = cx.system.run(command).await else {
-            return Ok(None);
+        let line = command.display_line();
+        // A probe that cannot run is how "not installed" looks; when `dest`
+        // exists it is how a binary that does not suit the host looks.
+        let out = match cx.system.run(command).await {
+            Ok(out) => out,
+            Err(_) => return Ok(Some(Probed::Failed(format!("`{line}` could not be run")))),
         };
         if !out.success() {
-            return Ok(None);
+            let status = match (out.timed_out, out.code) {
+                (true, _) => "timed out".to_owned(),
+                (false, Some(code)) => format!("exited {code}"),
+                (false, None) => "was killed by a signal".to_owned(),
+            };
+            let detail = out
+                .stderr_str()
+                .lines()
+                .chain(out.stdout_str().lines())
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|l| format!(": {}", hostkit::clip(l, 200)))
+                .unwrap_or_default();
+            return Ok(Some(Probed::Failed(format!("`{line}` {status}{detail}"))));
         }
         let text = format!("{}\n{}", out.stdout_str(), out.stderr_str());
-        Ok(match &spec.probe_regex {
+        let version = match &spec.probe_regex {
             Some(pattern) => {
                 let re = hostkit::compile_regex(pattern, "probe_regex")?;
                 re.captures(&text)
-                    .map(|c| {
-                        c.get(1)
-                            .or_else(|| c.get(0))
-                            .map(|m| bare(m.as_str()).to_owned())
-                    })
-                    .unwrap_or(None)
+                    .and_then(|c| c.get(1).or_else(|| c.get(0)))
+                    .map(|m| bare(m.as_str()).to_owned())
             }
             None => hostkit::find_version(&text),
-        })
+        };
+        Ok(Some(match version {
+            Some(v) => Probed::Version(v),
+            None => Probed::Failed(format!("`{line}` printed no version")),
+        }))
+    }
+
+    /// Checks that the binary just written reports the release's version, and
+    /// puts the previous binary back when it does not: a binary that cannot
+    /// run on this host would otherwise be reinstalled on every rollout.
+    async fn verify(
+        &self,
+        cx: &Cx,
+        spec: &Spec,
+        resolved: &Resolved,
+        previous: Option<Vec<u8>>,
+        perms: &FilePerms,
+    ) -> Result<()> {
+        let problem = match self.probe(cx, spec).await? {
+            None => return Ok(()),
+            Some(Probed::Version(v)) if v == resolved.version => return Ok(()),
+            Some(Probed::Version(v)) => format!("reports version {v}"),
+            Some(Probed::Failed(reason)) => reason,
+        };
+        let dest = spec.dest.display();
+        let restored = match previous {
+            Some(bytes) => {
+                cx.system.write_atomic(&spec.dest, &bytes, perms).await?;
+                "the previous binary was put back"
+            }
+            None => {
+                cx.system.remove(&spec.dest, false).await?;
+                "it was removed again"
+            }
+        };
+        Err(error::user(
+            format!(
+                "{} {} was written to {dest}, but {problem}; {restored}.",
+                spec.repo, resolved.version
+            ),
+            &[
+                "Check that the asset suits this host: its architecture and C library (a glibc build needs at least the glibc it was built against; a musl build has no such need).",
+                "Check that `probe` runs the binary at `dest` and that `probe_regex` selects the release's version.",
+            ],
+        ))
     }
 
     async fn download_headers(&self, cx: &Cx, spec: &Spec) -> Result<Vec<(String, String)>> {
@@ -326,6 +385,23 @@ impl GithubRelease {
             self.api_headers(cx, spec, "application/octet-stream")
         } else {
             Ok(vec![("User-Agent".to_owned(), "buckle".to_owned())])
+        }
+    }
+}
+
+/// The outcome of running `probe`.
+#[derive(Debug, Clone, PartialEq)]
+enum Probed {
+    Version(String),
+    /// Why no version could be read.
+    Failed(String),
+}
+
+impl Probed {
+    fn version(&self) -> Option<&str> {
+        match self {
+            Probed::Version(v) => Some(v),
+            Probed::Failed(_) => None,
         }
     }
 }
@@ -374,7 +450,8 @@ impl GithubRelease {
             }
         };
 
-        let installed = self.installed_version(cx, spec).await?;
+        let probed = self.probe(cx, spec).await?;
+        let installed = probed.as_ref().and_then(Probed::version).map(str::to_owned);
         let pinned = spec.version.trim() != "latest";
         if pinned && installed.as_deref() == Some(bare(&spec.version)) {
             return Ok(Inspection {
@@ -420,7 +497,22 @@ impl GithubRelease {
                     _ => settled(perm_changes),
                 }
             }
-            (None, _) => Planned::change(Diff::Create {
+            (None, Some(_)) => {
+                // `dest` exists but does not report a version: reinstalling is
+                // the fix, and the probe's failure says why it keeps recurring.
+                let why = match &probed {
+                    Some(Probed::Failed(reason)) => format!(" ({reason})"),
+                    _ => String::new(),
+                };
+                Planned::change(Diff::Update {
+                    summary: format!(
+                        "reinstall {} {} at {dest}{why}",
+                        spec.repo, resolved.version
+                    ),
+                    unified: None,
+                })
+            }
+            (None, None) => Planned::change(Diff::Create {
                 summary: format!("install {} {} to {dest}", spec.repo, resolved.version),
                 preview: None,
             }),
@@ -572,11 +664,16 @@ impl Task for GithubRelease {
         };
 
         let existing = cx.system.stat(&spec.dest).await?;
+        let previous = match &existing {
+            Some(_) => cx.system.read(&spec.dest).await?,
+            None => None,
+        };
         let mut perms = hostkit::effective_perms(&spec.perms, existing.as_ref());
         if perms.mode.is_none() {
             perms.mode = Some(archive_mode.filter(|m| m & 0o111 != 0).unwrap_or(0o755));
         }
         cx.system.write_atomic(&spec.dest, &binary, &perms).await?;
+        self.verify(cx, spec, &resolved, previous, &perms).await?;
         Ok(hostkit::written(
             format!(
                 "installed {} {} to {}",
@@ -655,6 +752,13 @@ mod tests {
         let probe = sys.clone();
         sys.on_command("tool", &["--version"], move |_| {
             match probe.file_string("/usr/local/bin/tool") {
+                // A build the host's libc cannot load.
+                Some(content) if content.contains("broken") => buckle_core::system::Output {
+                    code: Some(1),
+                    stdout: vec![],
+                    stderr: GLIBC_ERROR.as_bytes().to_vec(),
+                    timed_out: false,
+                },
                 Some(content) => {
                     ok_output(&format!("tool {}\n", content.trim_start_matches("binary ")))
                 }
@@ -668,11 +772,17 @@ mod tests {
         })
     }
 
+    const GLIBC_ERROR: &str = "tool: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found (required by tool)\n";
+
     fn with_release(sys: FakeSystem, tag: &str) -> FakeSystem {
         let bin = format!("binary {}", tag.trim_start_matches('v'));
+        with_release_binary(sys, tag, &bin)
+    }
+
+    fn with_release_binary(sys: FakeSystem, tag: &str, bin: &str) -> FakeSystem {
         let archive = tar_gz(&[
             ("tool-dir/", "", 0o755),
-            ("tool-dir/tool", &bin, 0o755),
+            ("tool-dir/tool", bin, 0o755),
             ("tool-dir/README", "r", 0o644),
         ]);
         let name = format!("tool_{}_linux_amd64.tar.gz", tag.trim_start_matches('v'));
@@ -1064,6 +1174,37 @@ mod tests {
             plan_class(&GithubRelease, &cx(&sys), &stale).await,
             Class::Change
         );
+    }
+
+    #[tokio::test]
+    async fn a_binary_that_does_not_run_plans_a_reinstall_with_the_reason() {
+        let sys = with_release(host("x86_64", Some("broken 1.2.4")), "v1.2.4");
+        let planned = GithubRelease.plan(&cx(&sys), &s(json!({}))).await.unwrap();
+        let summary = diff(&planned).summary().to_owned();
+        assert!(summary.contains("reinstall"), "{summary}");
+        assert!(summary.contains("GLIBC_2.39"), "{summary}");
+    }
+
+    #[rstest]
+    #[case::fresh_install(None, None)]
+    #[case::upgrade(Some("1.2.3"), Some("binary 1.2.3"))]
+    #[case::reinstall(Some("broken 1.2.4"), Some("binary broken 1.2.4"))]
+    #[tokio::test]
+    async fn a_release_that_does_not_run_fails_and_keeps_the_previous_binary(
+        #[case] installed: Option<&str>,
+        #[case] kept: Option<&str>,
+    ) {
+        let sys = with_release_binary(host("x86_64", installed), "v1.2.4", "broken 1.2.4");
+        let err = GithubRelease
+            .apply(&cx(&sys), &s(json!({})), &Planned::NoOp)
+            .await
+            .unwrap_err();
+        assert!(
+            err.description().contains("GLIBC_2.39"),
+            "{}",
+            err.description()
+        );
+        assert_eq!(sys.file_string("/usr/local/bin/tool").as_deref(), kept);
     }
 
     #[tokio::test]

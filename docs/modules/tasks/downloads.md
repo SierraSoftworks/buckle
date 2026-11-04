@@ -65,14 +65,14 @@ verify, unpack, install, check the version" sequence.
 - github.release:
     repo: atuinsh/atuin
     version: '{{ vars.atuin_version }}'
-    asset: "atuin-{arch}-unknown-linux-gnu.tar.gz"
+    asset: "atuin-{arch}-unknown-linux-musl.tar.gz"
     arch_map: { x86_64: x86_64, aarch64: aarch64 }   # anything else (armv7l) is blocked, not failed
     extract: atuin
     dest: /usr/local/bin/atuin
     mode: "0755"
     probe: ["atuin", "--version"]
     probe_regex: 'atuin (\S+)'
-    checksum_asset: "atuin-{arch}-unknown-linux-gnu.tar.gz.sha256"
+    checksum_asset: "atuin-{arch}-unknown-linux-musl.tar.gz.sha256"
   tags: [network]
 ```
 
@@ -93,6 +93,11 @@ verify, unpack, install, check the version" sequence.
 
 Pin a version: `latest` asks the GitHub API on every plan, and the anonymous limit is 60 requests
 an hour per address.
+
+After installing, `probe` must report the release's version, or the apply fails and the previous
+binary is put back. A binary that exists but will not run plans as a reinstall naming the probe's
+error. Prefer `musl` assets where a release has them: `gnu` builds need a glibc at least as new as
+the one they were built against.
 
 ## docker.image
 
