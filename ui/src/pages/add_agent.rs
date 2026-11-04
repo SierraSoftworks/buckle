@@ -9,6 +9,8 @@
 
 use buckle_api::{HostSummary, JoinMethod, JoinOptions, JoinPlatform, JoinState, JoinTicket};
 use yew::prelude::*;
+
+use crate::components::ui::{Note, NoteKind};
 use yew_router::prelude::*;
 
 use crate::api::{self, ApiError};
@@ -392,7 +394,7 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
                         </div>
                         <span class="field__hint">{ "The agent's own labels: they decide its groups and rollout phase." }</span>
                     </div>
-                    if let Some(p) = problem { <p class="note note--danger" role="alert">{ p }</p> }
+                    if let Some(p) = problem { <Note kind={NoteKind::Danger}>{ p }</Note> }
                 </> },
                 html! { <>
                     <Button kind={Kind::Subtle} onclick={go(Step::Platform)}>{ "Back" }</Button>
@@ -406,7 +408,7 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
         (Step::Command, _, _) => {
             let body = match (&*ticket, &*error) {
                 (_, Some(e)) => {
-                    html! { <p class="note note--danger" role="alert">{ e.clone() }</p> }
+                    html! { <Note kind={NoteKind::Danger}>{ e.clone() }</Note> }
                 }
                 (None, None) => html! { <Loading label="Loading the join command…" /> },
                 (Some(t), None) => command_view(t, opts, &props.hosts),
@@ -434,7 +436,7 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
 fn command_view(t: &JoinTicket, options: Option<&JoinOptions>, hosts: &[HostSummary]) -> Html {
     match &t.state {
         JoinState::Failed { reason } => html! {
-            <p class="note note--danger" role="alert">{ reason.clone() }</p>
+            <Note kind={NoteKind::Danger}>{ reason.clone() }</Note>
         },
         JoinState::Authorize { .. } => html! { <Loading label="Waiting for Tailscale…" /> },
         JoinState::Ready { command } => {

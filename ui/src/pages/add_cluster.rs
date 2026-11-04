@@ -6,6 +6,8 @@
 use buckle_api::{ClusterKind, ClusterSpec, ClusterTrust, CreateTarget, ExecutorSpec, TargetKind};
 use yew::prelude::*;
 
+use crate::components::ui::{Note, NoteKind};
+
 use crate::api;
 use crate::components::modal::Modal;
 use crate::components::{Button, Kind, Loading, icons};
@@ -231,7 +233,7 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
                             <span class="field__hint">{ "Where the server reads the keys the cluster signs workload identities with." }</span>
                         </label>
                     }
-                    if let Some(p) = problem { <p class="note note--danger" role="alert">{ p }</p> }
+                    if let Some(p) = problem { <Note kind={NoteKind::Danger}>{ p }</Note> }
                 </> },
                 html! { <>
                     <Button kind={Kind::Subtle} onclick={close.clone()}>{ "Cancel" }</Button>
@@ -248,7 +250,7 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
                     html! { <Loading label="Rendering the executor job…" /> }
                 }
                 (Executor::Inside, Some(Err(e))) => {
-                    html! { <p class="note note--danger" role="alert">{ e.clone() }</p> }
+                    html! { <Note kind={NoteKind::Danger}>{ e.clone() }</Note> }
                 }
                 (Executor::Inside, Some(Ok(s))) => executor_view(s),
             };

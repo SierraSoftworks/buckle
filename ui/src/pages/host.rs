@@ -15,6 +15,8 @@ use buckle_api::{
 use chrono::{DateTime, Utc};
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
+
+use crate::components::ui::{Note, NoteKind};
 use yew_router::prelude::*;
 
 use crate::api::{self, ApiError};
@@ -780,7 +782,7 @@ fn labels_editor(props: &LabelsProps) -> Html {
         // Without the server's answer, the merge can still be shown: which
         // groups and phase it yields is the server's to say.
         other => html! { <>
-            if let Some(Err(e)) = other { <p class="note note--warn">{ format!("No preview of groups and phase: {e}") }</p> }
+            if let Some(Err(e)) = other { <Note kind={NoteKind::Warn}>{ format!("No preview of groups and phase: {e}") }</Note> }
             else { <p class="muted small">{ "Previewing…" }</p> }
             if let Some(w) = &wanted {
                 <div class="preview__row">
@@ -833,9 +835,9 @@ fn labels_editor(props: &LabelsProps) -> Html {
                         </ul>
                     }
                     if props.rollout_active && !changed.is_empty() {
-                        <p class="note">{ "A rollout is in progress: the change applies to the next rollout's selection and does not move this host between phases mid-flight." }</p>
+                        <Note>{ "A rollout is in progress: the change applies to the next rollout's selection and does not move this host between phases mid-flight." }</Note>
                     }
-                    if let Some(e) = &*save_error { <p class="note note--danger" role="alert">{ e.clone() }</p> }
+                    if let Some(e) = &*save_error { <Note kind={NoteKind::Danger}>{ e.clone() }</Note> }
                     if props.admin {
                         <div class="row-actions">
                             <Button kind={Kind::Primary} onclick={save} busy={*saving} disabled={changed.is_empty() || wanted.is_none()}>{ "Save labels" }</Button>

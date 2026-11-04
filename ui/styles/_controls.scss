@@ -715,22 +715,46 @@ textarea.input {
   }
 }
 
+// Every banner (`components::ui::Note`): a rule and icon in its kind's
+// colour, the text in the body colour, an aside (hosts, phases) at the end.
 .note {
+  --note-tone: var(--info);
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
   margin: 0.5rem 0;
   padding: 0.45rem 0.7rem;
-  border-left: 3px solid var(--info);
+  border-left: 3px solid var(--note-tone);
   background: var(--info-soft);
   border-radius: var(--radius-sm);
+  color: var(--fg);
   font-size: 0.85rem;
 
   &--warn {
-    border-left-color: var(--warn);
+    --note-tone: var(--warn);
     background: var(--warn-soft);
   }
 
   &--danger {
-    border-left-color: var(--danger);
+    --note-tone: var(--danger);
     background: var(--danger-soft);
+  }
+
+  &__icon {
+    display: inline-flex;
+    flex: none;
+    margin-top: 0.1rem;
+    color: var(--note-tone);
+  }
+
+  &__text {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  > .scope {
+    flex: none;
   }
 }
 
