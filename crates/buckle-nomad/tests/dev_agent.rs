@@ -87,9 +87,14 @@ fn job(id: &str, sleep: &str) -> JobSpec {
     JobSpec {
         file: format!("{id}.nomad.hcl"),
         hcl: JOB.replace("JOB_ID", id),
-        vars: [("sleep".to_owned(), serde_json::json!(sleep))]
-            .into_iter()
-            .collect(),
+        // A fleet-wide var the job does not declare, as an unconditional
+        // vars overlay gives every target: Nomad refuses it, so it is left out.
+        vars: [
+            ("sleep".to_owned(), serde_json::json!(sleep)),
+            ("nomad_region".to_owned(), serde_json::json!("global")),
+        ]
+        .into_iter()
+        .collect(),
         ..Default::default()
     }
 }

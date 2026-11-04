@@ -33,6 +33,28 @@ pub struct JobSpec {
     pub namespace: Option<String>,
 }
 
+impl JobSpec {
+    /// The vars the spec declares a `variable` for. Fleet overlays apply to
+    /// every target, and Nomad refuses a value for an undeclared variable, so
+    /// the rest are left out. A spec that does not parse here keeps them all
+    /// and lets Nomad's parser report the problem.
+    pub fn declared_vars(&self) -> IndexMap<String, Value> {
+        let Ok(body) = hcl::parse(&self.hcl) else {
+            return self.vars.clone();
+        };
+        let declared: std::collections::HashSet<&str> = body
+            .blocks()
+            .filter(|b| b.identifier() == "variable")
+            .filter_map(|b| b.labels().first().map(|l| l.as_str()))
+            .collect();
+        self.vars
+            .iter()
+            .filter(|(name, _)| declared.contains(name.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Pending {
     job: Value,
@@ -50,7 +72,7 @@ const POLL: Duration = Duration::from_secs(2);
 pub const DEPLOYMENT_TIMEOUT: Duration = Duration::from_secs(3600);
 
 async fn parse(cx: &Context, spec: &JobSpec) -> Result<Value> {
-    let mut vars = spec.vars.clone();
+    let mut vars = spec.declared_vars();
     for (name, content) in &spec.files {
         vars.insert(name.clone(), Value::String(content.clone()));
     }
@@ -103,7 +125,7 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
     // change (a count bump included) into a destructive update. The revision
     // and digest live in the target's index instead.
     Stamps::stamp_owner(&cx.target, &cx.module, &mut job);
-    let digest = stamps::short_digest(&(&spec.hcl, &spec.vars, &spec.files));
+    let digest = stamps::short_digest(&(&spec.hcl, &spec.declared_vars(), &spec.files));
     let idx = index::read(&cx.nomad, &cx.target).await?;
     let entry = Entry {
         kind: Kind::Job,
@@ -396,4 +418,29 @@ pub(crate) async fn owned(cx: &Context) -> Result<Vec<Orphan>> {
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::declared_only(
+        "variable \"image\" {\n  type = string\n}\njob \"paste\" {}\n",
+        &["image"]
+    )]
+    #[case::unparseable_keeps_all("job \"paste\" {", &["image", "nomad_region"])]
+    fn only_declared_vars_reach_nomad(#[case] hcl: &str, #[case] expected: &[&str]) {
+        let spec = JobSpec {
+            hcl: hcl.into(),
+            vars: [("image", json!("tclip")), ("nomad_region", json!("global"))]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+            ..Default::default()
+        };
+        let names: Vec<String> = spec.declared_vars().into_keys().collect();
+        assert_eq!(names, expected);
+    }
 }
