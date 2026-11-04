@@ -2,7 +2,8 @@
 //! offline, plus anything out of the ordinary), effective labels, platform,
 //! applied revision (quiet when stable) and last contact. Hover a name for
 //! the host's card, click a row to open it. Pending registrations come first
-//! so they are approved rather than forgotten.
+//! so they are approved rather than forgotten. Admins can upgrade every
+//! reachable agent behind the server's version at once.
 
 use buckle_api::{Connection, HostStatus, HostSummary};
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,8 @@ use crate::components::{
     RouteLink, host_state_pills, icons, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
-use crate::logic::fleet::{expected_version, matches_filter};
-use crate::logic::format::{age, commit, relative, timestamp};
+use crate::logic::fleet::{agents_behind, expected_version, matches_filter, same_version};
+use crate::logic::format::{age, commit, count, relative, timestamp};
 use crate::logic::live::apply_fleet;
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -64,6 +65,7 @@ pub fn hosts() -> Html {
     let fleet = use_fetch((), |_| api::fleet());
     let live = use_live_value(&fleet, apply_fleet);
     let approving = use_state(|| None::<String>);
+    let upgrading = use_state(|| false);
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
 
@@ -118,6 +120,70 @@ pub fn hosts() -> Html {
                     Err(e) => error.set(Some(e.to_string())),
                 }
                 busy.set(false);
+            });
+        })
+    };
+
+    // The version agents converge to, and who is not on it yet.
+    let target = live
+        .as_ref()
+        .and_then(|f| f.desired_agent_version.clone().or(f.server_version.clone()));
+    let behind = live
+        .as_ref()
+        .zip(target.as_deref())
+        .map(|(f, t)| agents_behind(&f.hosts, t))
+        .unwrap_or_default();
+    let upgrade_ids: Vec<String> = behind.upgradable.iter().map(|h| h.id.clone()).collect();
+    // Nobody left to upgrade (here or elsewhere): the dialog closes for good.
+    {
+        let upgrading = upgrading.clone();
+        use_effect_with(upgrade_ids.is_empty(), move |empty| {
+            if *empty {
+                upgrading.set(false);
+            }
+        });
+    }
+
+    let upgrade_all = {
+        let (upgrading, busy, toast, reload) = (
+            upgrading.clone(),
+            busy.clone(),
+            toast.clone(),
+            fleet.reload.clone(),
+        );
+        let (ids, target) = (upgrade_ids.clone(), target.clone().unwrap_or_default());
+        Callback::from(move |_note: String| {
+            let (upgrading, busy, toast, reload) = (
+                upgrading.clone(),
+                busy.clone(),
+                toast.clone(),
+                reload.clone(),
+            );
+            let (ids, target) = (ids.clone(), target.clone());
+            busy.set(true);
+            wasm_bindgen_futures::spawn_local(async move {
+                let results = futures::future::join_all(
+                    ids.iter()
+                        .map(|id| api::upgrade_host(id, Some(target.clone()))),
+                )
+                .await;
+                let failed: Vec<String> = results
+                    .into_iter()
+                    .filter_map(|r| r.err().map(|e| e.to_string()))
+                    .collect();
+                let asked = ids.len() - failed.len();
+                if asked > 0 {
+                    toast.ok(format!(
+                        "{} will upgrade to {target} once idle.",
+                        count(asked, "agent", "agents")
+                    ));
+                }
+                if !failed.is_empty() {
+                    toast.error(format!("Not upgraded: {}", failed.join(" ")));
+                }
+                busy.set(false);
+                upgrading.set(false);
+                reload.emit(());
             });
         })
     };
@@ -215,7 +281,7 @@ pub fn hosts() -> Html {
                             </tr></thead>
                             <tbody>{ for rows.into_iter().map(|h| row(h, &Expect {
                                 stable: f.stable_revision.as_deref(),
-                                agent: expected_version(&f.hosts, f.desired_agent_version.as_deref().or(f.server_version.as_deref())),
+                                agent: expected_version(&f.hosts, target.as_deref()),
                             }, &on_open, now)) }</tbody>
                         </table>
                     </div>
@@ -227,7 +293,12 @@ pub fn hosts() -> Html {
     html! {
         <div class="page page--wide">
             <PageHead title="Hosts" subtitle={html! { "Every enrolled agent. Label changes apply to the next rollout's selection." }}
-                actions={html! { <Refresh loading={fleet.loading} reload={fleet.reload.clone()} /> }} />
+                actions={html! { <>
+                    <Refresh loading={fleet.loading} reload={fleet.reload.clone()} />
+                    if auth.is_admin() && !upgrade_ids.is_empty() {
+                        <Button onclick={{ let u = upgrading.clone(); Callback::from(move |_| u.set(true)) }}>{ "Upgrade all agents…" }</Button>
+                    }
+                </> }} />
             <Panel>{ body }</Panel>
             if let Some(id) = (*approving).clone() {
                 <Confirm title={format!("Approve {id}")} confirm_label={format!("Approve {id}")}
@@ -235,6 +306,25 @@ pub fn hosts() -> Html {
                     on_cancel={{ let a = approving.clone(); let e = error.clone(); Callback::from(move |_| { a.set(None); e.set(None); }) }}>
                     <p>{ format!("{id} enrolled and is waiting to join the fleet. Once approved it is assigned the stable revision and is selected by the next rollout like any other host.") }</p>
                     <p class="muted">{ "Check the host's labels and facts first if you did not enrol it yourself." }</p>
+                </Confirm>
+            }
+            if *upgrading && !upgrade_ids.is_empty() {
+                <Confirm title={format!("Upgrade agents to {}", target.clone().unwrap_or_default())}
+                    confirm_label={format!("Upgrade {}", count(upgrade_ids.len(), "agent", "agents"))}
+                    busy={*busy} on_confirm={upgrade_all}
+                    on_cancel={{ let u = upgrading.clone(); Callback::from(move |_| u.set(false)) }}>
+                    <p>{ "Each agent downloads the release from GitHub, verifies its digest and swaps its binary once nothing else is queued, then restarts into it." }</p>
+                    <ul class="confirm__facts" data-testid="upgrade-all-hosts">
+                        { for behind.upgradable.iter().map(|h| html! {
+                            <li><span class="mono">{ h.id.clone() }</span>{ format!(" from {}", h.agent_version.as_deref().unwrap_or("an unknown version")) }</li>
+                        }) }
+                    </ul>
+                    if !behind.offline.is_empty() {
+                        <p class="muted">{ format!(
+                            "Skipped while offline: {}. Upgrade all again once they reconnect.",
+                            behind.offline.iter().map(|h| h.id.as_str()).collect::<Vec<_>>().join(", "),
+                        ) }</p>
+                    }
                 </Confirm>
             }
         </div>
@@ -263,7 +353,7 @@ fn row(
     let skew = h
         .agent_version
         .as_deref()
-        .filter(|v| expect.agent.is_some_and(|e| e != *v));
+        .filter(|v| expect.agent.is_some_and(|e| !same_version(e, v)));
     let onclick = {
         let (on_open, id) = (on_open.clone(), h.id.clone());
         Callback::from(move |e: MouseEvent| on_open.emit((e, id.clone())))
