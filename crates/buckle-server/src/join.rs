@@ -560,7 +560,7 @@ impl Joins {
             id.clone()
         };
         let outcome = match (code, error) {
-            (_, Some(e)) if e == "access_denied" => {
+            (_, Some("access_denied")) => {
                 Err("Tailscale access was denied, so no auth key was issued.".to_owned())
             }
             (_, Some(e)) => Err(format!("Tailscale refused to issue an auth key ({e}).")),
