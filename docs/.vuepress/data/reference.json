@@ -2550,6 +2550,101 @@
       "shape": null
     },
     {
+      "description": "Clone a git repository and keep it at a branch, tag or commit, never resetting local changes.",
+      "details": "Clones a git repository and keeps its working tree at a branch, tag or commit.\n\n```yaml\n- git.repository:\n    repo: https://github.com/geerlingguy/rpi-clone.git\n    path: /opt/rpi-clone\n    ref: master           # branch, tag or full commit id; default: the remote's default branch\n    owner: pi             # run git as this user and own the tree\n    group: pi\n    depth: 1              # shallow clone/fetch\n    recursive: true       # also init and update submodules\n    update: true          # false: clone once, never move HEAD afterwards\n  tags: [network]\n```\n\nThe plan compares the checkout's `HEAD` with what `git ls-remote` reports\nfor `ref` on `repo`, so planning contacts the remote (a full 40 or 64\ncharacter commit id is compared without it). A branch is checked out as a\nlocal branch tracking `origin/<ref>`; a tag or commit is checked out\ndetached. When `ref` names both a branch and a tag, the branch wins.\n\nA working tree with uncommitted changes to tracked files is never reset:\na plan that would move `HEAD` is blocked instead. A non-empty `path` that\nis not a git repository is blocked too. `owner` runs every git command as\nthat user (with `runuser`, so their SSH keys and git config apply) and\n`owner`/`group` are applied recursively after each change.\n\nRemoval deletes the clone only if Buckle created it, it has no local\nchanges (tracked or untracked), and `HEAD` is still the commit Buckle last\nchecked out. Otherwise it is left in place.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path of the working tree (created if missing).",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "The repository to clone: an https or ssh URL, or a path on the host.",
+          "options": [],
+          "path": "repo",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Fetch only this many commits of history.",
+          "options": [],
+          "path": "depth",
+          "required": false,
+          "secret": false,
+          "ty": "integer?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Group to own the working tree.",
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Run git as this user, and own the working tree.",
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Initialise and update submodules, recursively.",
+          "options": [],
+          "path": "recursive",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A branch, tag or full commit id. Defaults to the remote's default branch.",
+          "options": [],
+          "path": "ref",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "true",
+          "depth": 0,
+          "description": "Move `HEAD` when the remote ref changes. `false` clones once and then leaves it alone.",
+          "options": [],
+          "path": "update",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "git.repository",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
       "description": "Install a binary from a GitHub release, with arch mapping, version probe and checksum verification.",
       "details": "Installs a binary from a GitHub release, upgrading it when a newer one appears.\n\n```yaml\n- github.release:\n    repo: atuinsh/atuin\n    version: latest                       # or \"v18.3.0\" / \"18.3.0\"\n    asset: \"atuin-{arch}-unknown-linux-gnu.tar.gz\"   # {version} {arch} {os} {tag}\n    arch_map: { x86_64: x86_64, aarch64: aarch64 }   # host arch -> asset arch; armv7l is skipped\n    extract: atuin                        # file inside an archive asset\n    dest: /usr/local/bin/atuin\n    mode: \"0755\"\n    probe: [\"atuin\", \"--version\"]         # prints the installed version\n    probe_regex: 'atuin (\\S+)'            # optional; default is the first x.y.z found\n    checksum_asset: \"atuin-{arch}-unknown-linux-gnu.tar.gz.sha256\"\n    token_env: GITHUB_TOKEN               # optional; name of an environment variable\n```\n\nThe plan compares the version printed by `probe` with the wanted release\n(`1.2.3 → 1.2.4`). `arch_map` extends the defaults `x86_64: amd64` and\n`aarch64: arm64`; a host architecture with no mapping is reported as\nblocked rather than failing, so a fleet can include hosts a release does not\nsupport. `{os}` is `linux`, `darwin` or `windows`; `{version}` has no\nleading `v`.\n\n`version: latest` asks the GitHub API for the newest release on every plan,\nwhich is rate limited to 60 requests an hour without a token; set\n`token_env` to the name of an environment variable holding a token (the\nvalue is only ever sent as an `Authorization` header). A pinned version\nwhose `probe` already reports it needs no API call. Without `probe`, an\nexisting `dest` counts as installed and is never upgraded (unless\n`checksum_asset` is given for a plain binary asset).\n\nArchive assets (`.tar.gz`, `.tgz`, `.tar`, `.zip`) need `extract`: the\npath or file name of the binary inside. With `checksum_asset` (the name of a\n`.sha256` or `SHA256SUMS` asset) the downloaded asset is verified before\nanything is written. Removal deletes `dest` only if it still matches what\nBuckle installed.",
       "fields": [

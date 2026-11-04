@@ -889,6 +889,10 @@ mod registry_tests {
                 json!({"name": "j", "schedule": "@daily", "command": "x"}),
             ),
             ("docker.image", json!({"name": "i:1", "pull": "always"})),
+            (
+                "git.repository",
+                json!({"repo": "https://g.example/r.git", "path": "/r", "ref": "main", "owner": "u", "group": "g", "depth": 1, "recursive": true, "update": false}),
+            ),
         ]
     }
 
@@ -1002,6 +1006,7 @@ mod registry_tests {
     #[case("systemd.restart", json!({"name": "nomad"}))]
     #[case("systemd.reload", json!({"name": "nomad"}))]
     #[case("docker.image", json!({"name": "i:1"}))]
+    #[case("git.repository", json!({"repo": "https://g.example/r.git", "path": "/r"}))]
     #[case("hostname.set", json!({"name": "web-1"}))]
     #[case("swap.file", json!({"path": "/swapfile", "size_mb": 10}))]
     #[case("user.account", json!({"name": "u"}))]

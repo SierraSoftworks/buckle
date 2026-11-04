@@ -32,6 +32,7 @@ pub mod file_line;
 pub mod file_symlink;
 pub mod file_template;
 pub mod file_tree;
+pub mod git_repository;
 pub mod github_release;
 
 // Commands, users and host settings.
