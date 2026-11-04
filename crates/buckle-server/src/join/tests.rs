@@ -99,6 +99,18 @@ fn commands_install_join_and_enrol_in_one_paste(
     assert!(cmd.contains("'role=web server'"), "{cmd}");
     // Tailscale is joined before Buckle runs.
     assert!(cmd.find(ts_flag) < cmd.find(" up "), "{cmd}");
+    // Every line but the last continues the one command.
+    let cont = if platform == JoinPlatform::Windows {
+        '`'
+    } else {
+        '\\'
+    };
+    let lines: Vec<&str> = cmd.lines().collect();
+    assert!(
+        lines[..lines.len() - 1].iter().all(|l| l.ends_with(cont)),
+        "{cmd}"
+    );
+    assert!(!lines[lines.len() - 1].ends_with(cont), "{cmd}");
 }
 
 #[test]

@@ -1,6 +1,6 @@
-// Host management: the label editor previews where a host would land, and
+// Host management: the label editor previews where a host would land,
 // registration approval, agent upgrades and forgetting go through
-// confirmations.
+// confirmations, and Add an agent walks through to a join command.
 
 import { describe, test } from "node:test";
 import { assert, eventually, heading, open } from "./helpers.mjs";
@@ -98,6 +98,58 @@ describe("registration and forgetting", () => {
     assert.equal(await heading(page), "Hosts");
     await page.getByTestId("hosts-table").waitFor();
     assert.equal(await page.locator('tr[data-host="lab-4"]').count(), 0);
+    await close();
+  });
+});
+
+describe("add an agent", () => {
+  test("the wizard turns a platform, method and labels into a join command", async () => {
+    const { page, close } = await open("/hosts");
+    await page.getByRole("button", { name: "Add an agent…" }).click();
+    const wizard = page.getByRole("dialog", { name: "Add an agent" });
+    const next = wizard.getByRole("button", { name: "Next" });
+    assert.ok(await next.isDisabled(), "a platform is chosen first");
+    await wizard.getByRole("radio", { name: /Windows/ }).click();
+    await next.click();
+
+    await wizard.getByRole("radio", { name: /With a join token/ }).click();
+    await wizard.getByRole("textbox", { name: "Host name" }).fill("win 1");
+    await wizard.getByText("'win 1' is not a host name").waitFor();
+    await wizard.getByRole("textbox", { name: "Host name" }).fill("win-1");
+    await wizard.getByLabel("Label 1 key").fill("role");
+    await wizard.getByLabel("Label 1 value").fill("desktop");
+    await wizard.getByRole("button", { name: "Create command" }).click();
+
+    const command = await wizard.getByTestId("join-command").textContent();
+    for (const want of [/install\.ps1/, /--token/, /--host-id win-1/, /--label role=desktop/]) assert.match(command, want);
+    assert.match(await wizard.textContent(), /elevated PowerShell/);
+    assert.match(await wizard.getByTestId("join-arrival").textContent(), /Waiting for win-1/);
+    await wizard.getByRole("button", { name: "Done" }).click();
+    await eventually(async () => assert.equal(await wizard.count(), 0));
+    await close();
+  });
+
+  test("over Tailscale the command joins the tailnet with the chosen tags", async () => {
+    const { page, close } = await open("/hosts");
+    await page.getByRole("button", { name: "Add an agent…" }).click();
+    const wizard = page.getByRole("dialog", { name: "Add an agent" });
+    await wizard.getByRole("radio", { name: /Linux/ }).click();
+    await wizard.getByRole("button", { name: "Next" }).click();
+    await wizard.getByRole("button", { name: "tag:edge" }).click();
+    await wizard.getByRole("button", { name: "Continue in Tailscale" }).click();
+    // The demo's consent returns at once, as Tailscale would to /hosts?join=….
+    const command = await wizard.getByTestId("join-command").textContent();
+    for (const want of [/install\.sh \| sudo sh/, /--tailscale-auth-key/, /tag:buckle,tag:edge/]) assert.match(command, want);
+    assert.match(page.url(), /join=demo-linux/);
+    await wizard.getByRole("button", { name: "Done" }).click();
+    await eventually(async () => assert.doesNotMatch(page.url(), /join=/));
+    await close();
+  });
+
+  test("viewers are not offered the wizard", async () => {
+    const { page, close } = await open("/hosts", { flags: "role=viewer" });
+    await page.getByTestId("hosts-table").waitFor();
+    assert.equal(await page.getByRole("button", { name: "Add an agent…" }).count(), 0);
     await close();
   });
 });

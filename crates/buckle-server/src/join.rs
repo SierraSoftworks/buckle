@@ -265,10 +265,29 @@ pub fn render(
             " \\",
         )
     };
+    // One argument per line, so the command reads (and wraps) cleanly.
     let mut lines = vec![head];
-    lines.extend(installer.into_iter().map(|l| format!("  {l}{cont}")));
-    lines.push(format!("  {}", up.join(" ")));
-    lines.join("\n")
+    lines.extend(installer.iter().map(|l| format!("  {l}")));
+    lines.extend(up.iter().enumerate().map(|(i, l)| {
+        if i == 0 {
+            format!("  {l}")
+        } else {
+            format!("    {l}")
+        }
+    }));
+    let last = lines.len() - 1;
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if i == 0 || i == last {
+                l
+            } else {
+                format!("{l}{cont}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Single-quotes `s` for a POSIX shell unless it is plainly safe.

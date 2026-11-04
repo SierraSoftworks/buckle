@@ -1,5 +1,6 @@
 //! One module per page of design §12.
 
+pub mod add_agent;
 pub mod audit;
 pub mod host;
 pub mod hosts;

@@ -68,6 +68,43 @@ const SHOTS = [
     },
     target: (p) => panel(p, "Labels"),
   },
+  {
+    name: "add-agent-platform",
+    path: "/hosts",
+    setup: async (p) => {
+      await p.getByRole("button", { name: "Add an agent…" }).click();
+      await dialog(p).getByRole("radio", { name: /Linux/ }).click();
+    },
+    target: dialog,
+  },
+  {
+    name: "add-agent-details",
+    path: "/hosts",
+    setup: async (p) => {
+      await p.getByRole("button", { name: "Add an agent…" }).click();
+      await dialog(p).getByRole("radio", { name: /Linux/ }).click();
+      await dialog(p).getByRole("button", { name: "Next" }).click();
+      await dialog(p).getByRole("textbox", { name: "Host name" }).fill("web-3");
+      await dialog(p).getByLabel("Label 1 key").fill("role");
+      await dialog(p).getByLabel("Label 1 value").fill("web");
+    },
+    target: dialog,
+  },
+  {
+    name: "add-agent-command",
+    path: "/hosts",
+    setup: async (p) => {
+      await p.getByRole("button", { name: "Add an agent…" }).click();
+      await dialog(p).getByRole("radio", { name: /Linux/ }).click();
+      await dialog(p).getByRole("button", { name: "Next" }).click();
+      await dialog(p).getByRole("textbox", { name: "Host name" }).fill("web-3");
+      await dialog(p).getByLabel("Label 1 key").fill("role");
+      await dialog(p).getByLabel("Label 1 value").fill("web");
+      await dialog(p).getByRole("button", { name: "Continue in Tailscale" }).click();
+      await dialog(p).getByTestId("join-command").waitFor();
+    },
+    target: dialog,
+  },
   { name: "host-actions", path: "/hosts/lab-3", target: (p) => p.locator(".page-head"), pad: 14 },
   {
     name: "host-upgrade",

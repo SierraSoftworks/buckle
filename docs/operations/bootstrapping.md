@@ -5,10 +5,35 @@ The server setup itself is in [Server and agents](../guide/fleet.md).
 
 ## 1. Install the agent
 
-`buckle up` installs the agent pointing at the server. Labels set here are the agent's own; they
-decide which groups and which rollout phase the host lands in.
+### Add an agent
 
-The [one-line installer](../guide/installation.md#one-line-installer) installs Buckle and runs
+**Add an agent…** on the hosts page (admins only) builds the one command that installs Buckle on a
+new host, joins it to the tailnet when the server can provision it, and enrols the agent.
+
+1. **Platform.** Linux and macOS get a `curl … | sudo sh` line, Windows a PowerShell one.
+
+   <Screenshot name="add-agent-platform" alt="The Add an agent wizard's platform choice" />
+
+2. **Details.** Choose how the agent connects (over Tailscale, or with a join token), its name
+   (its tailnet node name over Tailscale), the tags it advertises, and its labels. Labels set here
+   are the agent's own; they decide which groups and which rollout phase the host lands in.
+
+   <Screenshot name="add-agent-details" alt="The Add an agent wizard's connection, name and labels" />
+
+3. **Command.** With [Tailscale provisioning](../agent/server.md#tailscale-provisioning), Tailscale
+   asks you to approve the node's auth key first and returns to the wizard. Paste the command on
+   the new host; the wizard says when it has enrolled.
+
+   <Screenshot name="add-agent-command" alt="The join command, its expiry and the wait for the host" />
+
+The command carries single-use keys that stop working after `agents.join.ttl` (an hour at most),
+so make a new one per host. A host enrolled with one is active at once, even with
+`registration: approve`: the admin who created the command approved it.
+
+### By hand
+
+`buckle up` installs the agent pointing at the server. The
+[one-line installer](../guide/installation.md#one-line-installer) installs Buckle and runs
 `buckle up` in one paste, and can join the tailnet first:
 
 ```sh

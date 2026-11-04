@@ -21,9 +21,9 @@ use std::cell::RefCell;
 
 use buckle_api::{
     ActionRequest, ApproveRequest, AuditEntry, ContinueRequest, CsrfToken, ErrorBody, Fleet,
-    HostDetail, HostPatch, HostPreview, HostSummary, Me, Page, PlanGroup, RejectRequest,
-    RevisionSummary, RolloutDetail, RolloutSummary, RunReport, RunSummary, StartRollout,
-    UpgradeRequest,
+    HostDetail, HostPatch, HostPreview, HostSummary, JoinOptions, JoinRequest, JoinTicket, Me,
+    Page, PlanGroup, RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, RunReport,
+    RunSummary, StartRollout, UpgradeRequest,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -328,6 +328,27 @@ pub async fn forget_host(id: &str) -> Result<(), ApiError> {
     send::<()>(Method::Delete, &format!("/hosts/{}", enc(id)), None)
         .await
         .map(|_| ())
+}
+
+// ------------------------------------------------------------------ joining hosts
+
+/// `GET /join`: what the Add an agent wizard can offer.
+pub async fn join_options() -> Result<JoinOptions, ApiError> {
+    demo!(demo_store::join_options());
+    get("/join").await
+}
+
+/// `POST /join`: a join command for one new host, ready or awaiting
+/// Tailscale's consent.
+pub async fn create_join(request: &JoinRequest) -> Result<JoinTicket, ApiError> {
+    demo!(demo_store::create_join(request));
+    write(Method::Post, "/join", Some(request)).await
+}
+
+/// `GET /join/{id}`: a join command this admin created.
+pub async fn join_ticket(id: &str) -> Result<JoinTicket, ApiError> {
+    demo!(demo_store::join_ticket(id));
+    get(&format!("/join/{}", enc(id))).await
 }
 
 /// Which groups and rollout phase a label set would give the host.
