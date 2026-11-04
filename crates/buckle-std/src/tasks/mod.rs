@@ -28,9 +28,11 @@ pub mod file_block;
 pub mod file_copy;
 pub mod file_directory;
 pub mod file_download;
+pub mod file_ini;
 pub mod file_line;
 pub mod file_symlink;
 pub mod file_template;
+pub mod file_tokens;
 pub mod github_release;
 
 // Commands, users and host settings.

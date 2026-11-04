@@ -885,6 +885,14 @@ mod registry_tests {
                 json!({"name": "j", "schedule": "@daily", "command": "x"}),
             ),
             ("docker.image", json!({"name": "i:1", "pull": "always"})),
+            (
+                "file.ini",
+                json!({"path": "/boot/config.txt", "section": "all", "settings": {"enable_uart": 1}}),
+            ),
+            (
+                "file.tokens",
+                json!({"path": "/boot/cmdline.txt", "present": ["quiet"]}),
+            ),
         ]
     }
 
