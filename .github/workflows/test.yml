@@ -32,7 +32,7 @@ jobs:
       docs: ${{ steps.docs.outputs.docs }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: rust
         with:
           predicate-quantifier: every
@@ -42,14 +42,14 @@ jobs:
               - '!ui/**'
               - '!docs/**'
               - '!**/*.md'
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: docs
         with:
           filters: |
             docs:
               - 'docs/**/*.md'
               - 'docs/.vuepress/data/**'
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: ui
         with:
           filters: |
