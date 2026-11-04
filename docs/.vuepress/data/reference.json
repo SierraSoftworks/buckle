@@ -717,7 +717,7 @@
       "shape": null
     },
     {
-      "description": "Architecture, CPU count, memory, swap and disks (with flat disk.<name> keys for selectors).",
+      "description": "Architecture, machine model (and Raspberry Pi generation), CPU count, memory, swap and disks (with flat disk.<name> keys for selectors).",
       "details": null,
       "fields": [],
       "kind": "hardware",
@@ -1570,7 +1570,7 @@
     },
     {
       "description": "Run a command, made idempotent with creates, unless, only_if and changed_when; secrets reach it through the environment.",
-      "details": "Runs a command, guarded so that it only runs when something needs doing.\n\n```yaml\n- command.run:\n    run: [\"nomad\", \"node\", \"eligibility\", \"-enable\", \"-self\"]   # argv, or a string run with `sh -c`\n    unless: \"nomad node status -self -json | grep -q '\\\"SchedulingEligibility\\\": \\\"eligible\\\"'\"\n    creates: /var/lib/app/initialised     # skip when this path exists\n    only_if: [\"test\", \"-d\", \"/srv/data\"]  # skip unless this exits 0\n    changed_when: \"output_contains:created\"   # always | never | output_contains:<text> | exit:<code>\n    env:\n      API_TOKEN: \"{{ secrets.api_token }}\"  # secrets go through the process-environment sink\n    cwd: /srv/app\n    timeout: 2m\n    remove: [\"rm\", \"-f\", \"/var/lib/app/initialised\"]   # cleanup when the task leaves the config\n    capture: redacted                      # redacted (default) | always | never\n```\n\n**Planning.** `creates` existing, `unless` exiting 0 or `only_if` exiting\nnon-zero all make the plan a no-op. The `unless` and `only_if` probes run in\nplan mode too, so they must be read-only. A command with none of `creates`,\n`unless` or `changed_when` is planned as `always runs: <command>` so the\nauthor sees the smell; the plan of such a task is never a no-op.\n\n**Applying.** The command runs and fails the task on a non-zero exit (except\nwhen `changed_when: exit:<code>` names that code). `changed_when` decides\nwhether the run counts as a change for handlers: `always` (the default),\n`never`, `output_contains:<text>` (stdout or stderr) or `exit:<code>`.\n\n**Secrets.** An `env` value that references `secrets.` is rendered with the\nreal value and handed to the process through the environment sink; it is\nnever rendered into the plan, the logs or the state. When any env value is\nsecret, the command's output is not captured (nor shown in errors) unless\n`capture: always` is set. By default (`capture: redacted`) stdout and stderr\nare recorded on the task's tracing span, truncated to 4 KiB each; `never`\nrecords nothing.\n\n**Removal.** With `remove`, the cleanup command runs when the task leaves\nthe configuration (in the same `cwd`, with the non-secret `env`). Without it\nthe removal is reported as \"no cleanup defined\".\n\n**Identity.** The resource is keyed by its rendered command, so editing the\ncommand or a var inside it re-keys it (a removal plus an addition). Give a\ntemplated command, or one with `remove`, a stable task `id`.",
+      "details": "Runs a command, guarded so that it only runs when something needs doing.\n\n```yaml\n- command.run:\n    run: [\"nomad\", \"node\", \"eligibility\", \"-enable\", \"-self\"]   # argv, or a string run with `sh -c`\n    unless: \"nomad node status -self -json | grep -q '\\\"SchedulingEligibility\\\": \\\"eligible\\\"'\"\n    creates: /var/lib/app/initialised     # skip when this path exists\n    only_if: [\"test\", \"-d\", \"/srv/data\"]  # skip unless this exits 0\n    changed_when: \"output_contains:created\"   # always | never | output_contains:<text> | exit:<code>\n    env:\n      API_TOKEN: \"{{ secrets.api_token }}\"  # secrets go through the process-environment sink\n    cwd: /srv/app\n    user: deploy                           # run as this account (runuser on Linux, sudo -u on macOS)\n    timeout: 2m\n    remove: [\"rm\", \"-f\", \"/var/lib/app/initialised\"]   # cleanup when the task leaves the config\n    capture: redacted                      # redacted (default) | always | never\n```\n\n**Planning.** `creates` existing, `unless` exiting 0 or `only_if` exiting\nnon-zero all make the plan a no-op. The `unless` and `only_if` probes run in\nplan mode too, so they must be read-only. A command with none of `creates`,\n`unless` or `changed_when` is planned as `always runs: <command>` so the\nauthor sees the smell; the plan of such a task is never a no-op.\n\n**Applying.** The command runs and fails the task on a non-zero exit (except\nwhen `changed_when: exit:<code>` names that code). `changed_when` decides\nwhether the run counts as a change for handlers: `always` (the default),\n`never`, `output_contains:<text>` (stdout or stderr) or `exit:<code>`.\n\n**Secrets.** An `env` value that references `secrets.` is rendered with the\nreal value and handed to the process through the environment sink; it is\nnever rendered into the plan, the logs or the state. When any env value is\nsecret, the command's output is not captured (nor shown in errors) unless\n`capture: always` is set. By default (`capture: redacted`) stdout and stderr\nare recorded on the task's tracing span, truncated to 4 KiB each; `never`\nrecords nothing.\n\n**Running as a user.** With `user`, the command, its probes and its cleanup\nrun as that account: through `runuser -u USER --` on Linux (util-linux; the\nstep is blocked while it is missing) and `sudo -u USER` on macOS. The\naccount's `HOME`, `USER` and `SHELL` are set as a login would set them; the\ntask's `env` is passed through. Windows does not support it.\n\n**Removal.** With `remove`, the cleanup command runs when the task leaves\nthe configuration (in the same `cwd`, as the same `user`, with the\nnon-secret `env`). Without it the removal is reported as \"no cleanup\ndefined\".\n\n**Identity.** The resource is keyed by its rendered command, so editing the\ncommand or a var inside it re-keys it (a removal plus an addition). Give a\ntemplated command, or one with `remove`, a stable task `id`.",
       "fields": [
         {
           "default": null,
@@ -1675,6 +1675,16 @@
           "required": false,
           "secret": false,
           "ty": "string | array of string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Run the command, its probes and its cleanup as this user instead of the agent's account.",
+          "options": [],
+          "path": "user",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
         }
       ],
       "kind": "command.run",

@@ -27,6 +27,7 @@ use tracing::instrument;
 ///     env:
 ///       API_TOKEN: "{{ secrets.api_token }}"  # secrets go through the process-environment sink
 ///     cwd: /srv/app
+///     user: deploy                           # run as this account (runuser on Linux, sudo -u on macOS)
 ///     timeout: 2m
 ///     remove: ["rm", "-f", "/var/lib/app/initialised"]   # cleanup when the task leaves the config
 ///     capture: redacted                      # redacted (default) | always | never
@@ -51,9 +52,16 @@ use tracing::instrument;
 /// are recorded on the task's tracing span, truncated to 4 KiB each; `never`
 /// records nothing.
 ///
+/// **Running as a user.** With `user`, the command, its probes and its cleanup
+/// run as that account: through `runuser -u USER --` on Linux (util-linux; the
+/// step is blocked while it is missing) and `sudo -u USER` on macOS. The
+/// account's `HOME`, `USER` and `SHELL` are set as a login would set them; the
+/// task's `env` is passed through. Windows does not support it.
+///
 /// **Removal.** With `remove`, the cleanup command runs when the task leaves
-/// the configuration (in the same `cwd`, with the non-secret `env`). Without it
-/// the removal is reported as "no cleanup defined".
+/// the configuration (in the same `cwd`, as the same `user`, with the
+/// non-secret `env`). Without it the removal is reported as "no cleanup
+/// defined".
 ///
 /// **Identity.** The resource is keyed by its rendered command, so editing the
 /// command or a var inside it re-keys it (a removal plus an addition). Give a
@@ -82,6 +90,9 @@ pub struct Spec {
     pub env: BTreeMap<String, SecretField>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Run the command, its probes and its cleanup as this user instead of the agent's account.
+    #[serde(default)]
+    pub user: Option<String>,
     /// How long the command may run, e.g. `30s` or `5m`.
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
@@ -174,12 +185,53 @@ buckle_core::register_task!(CommandRun);
 struct Cleanup {
     remove: StringOrArgv,
     cwd: Option<PathBuf>,
+    #[serde(default)]
+    user: Option<String>,
     /// Only the env values that were plain strings; secrets are never persisted.
     env: BTreeMap<String, String>,
 }
 
 const CLEANUP_PREFIX: &str = "command.run cleanup: ";
 const OUTPUT_CAPTURE_LIMIT: usize = 4096;
+const RUNUSER_HINT: &str =
+    "it is part of util-linux and is needed to run a command as another user";
+
+/// Wraps `command` so that it runs as `user`: `runuser -u USER -- …` on Linux,
+/// `sudo -u USER …` on macOS. The wrapper keeps the cwd, timeout and
+/// environment (secret-bearing values included) of the command it wraps.
+fn as_user(platform: buckle_core::Platform, user: &str, command: Command) -> Result<Command> {
+    super::user_group::valid_name(user)?;
+    let mut wrapper = match platform {
+        buckle_core::Platform::Linux => Command::new("runuser").args(["-u", user, "--"]),
+        buckle_core::Platform::MacOs => Command::new("sudo").args(["-u", user]),
+        buckle_core::Platform::Windows => {
+            return Err(error::user(
+                "`user` is not supported for command.run on Windows.",
+                &[
+                    "Remove the `user` field, or restrict the task with `when` to Linux and macOS hosts.",
+                ],
+            ));
+        }
+    };
+    wrapper.args.push(command.program);
+    wrapper.args.extend(command.args);
+    wrapper.env = command.env;
+    wrapper.clear_env = command.clear_env;
+    wrapper.cwd = command.cwd;
+    wrapper.stdin = command.stdin;
+    wrapper.timeout = command.timeout;
+    wrapper.sensitive_env = command.sensitive_env;
+    Ok(wrapper)
+}
+
+/// The program `as_user` needs on this platform, if any.
+fn user_wrapper_tool(platform: buckle_core::Platform) -> Option<&'static str> {
+    match platform {
+        buckle_core::Platform::Linux => Some("runuser"),
+        buckle_core::Platform::MacOs => Some("sudo"),
+        buckle_core::Platform::Windows => None,
+    }
+}
 
 /// Whether the plan of this task is "always runs": no guard says when it is done.
 pub fn always_runs(spec: &Spec) -> bool {
@@ -187,8 +239,9 @@ pub fn always_runs(spec: &Spec) -> bool {
 }
 
 impl CommandRun {
-    /// Builds the process for `argv` with the spec's cwd, timeout and environment.
-    /// Secret env values are rendered for real and injected through the sink.
+    /// Builds the process for `argv` with the spec's cwd, timeout and environment,
+    /// before any `user` wrapper. Secret env values are rendered for real and
+    /// injected through the sink.
     fn build(&self, cx: &Cx, spec: &Spec, argv: &StringOrArgv) -> Result<Command> {
         let mut command = argv.to_command(cx.platform())?;
         command.cwd = spec.cwd.clone();
@@ -199,6 +252,14 @@ impl CommandRun {
         Ok(command)
     }
 
+    /// Applies the spec's `user` to a built command.
+    fn wrap(&self, cx: &Cx, spec: &Spec, command: Command) -> Result<Command> {
+        match &spec.user {
+            Some(user) => as_user(cx.platform(), user, command),
+            None => Ok(command),
+        }
+    }
+
     /// Evaluates `creates`, `unless` and `only_if`; `Some(reason)` means skip.
     async fn skip_reason(&self, cx: &Cx, spec: &Spec) -> Result<Option<String>> {
         if let Some(path) = &spec.creates
@@ -207,13 +268,13 @@ impl CommandRun {
             return Ok(Some(format!("{} exists", path.display())));
         }
         if let Some(unless) = &spec.unless {
-            let out = self.probe(cx, self.build(cx, spec, unless)?).await?;
+            let out = self.probe(cx, spec, self.build(cx, spec, unless)?).await?;
             if out.success() {
                 return Ok(Some(format!("`{}` succeeded", unless.display())));
             }
         }
         if let Some(only_if) = &spec.only_if {
-            let out = self.probe(cx, self.build(cx, spec, only_if)?).await?;
+            let out = self.probe(cx, spec, self.build(cx, spec, only_if)?).await?;
             if !out.success() {
                 return Ok(Some(format!("`{}` did not succeed", only_if.display())));
             }
@@ -225,11 +286,12 @@ impl CommandRun {
     /// installed behaves as a shell would report it, exiting 127 ("command not
     /// found"), rather than failing the plan: `unless: [nomad, version]`
     /// before nomad is installed means "not installed yet, run".
-    async fn probe(&self, cx: &Cx, command: Command) -> Result<Output> {
-        let not_found = || Output {
+    async fn probe(&self, cx: &Cx, spec: &Spec, command: Command) -> Result<Output> {
+        let program = command.program.clone();
+        let not_found = move || Output {
             code: Some(127),
             stdout: Vec::new(),
-            stderr: format!("{}: command not found", command.program).into_bytes(),
+            stderr: format!("{program}: command not found").into_bytes(),
             timed_out: false,
         };
         let present = if command.program.contains('/') {
@@ -243,6 +305,7 @@ impl CommandRun {
         if !present {
             return Ok(not_found());
         }
+        let command = self.wrap(cx, spec, command)?;
         match cx.system.run(command.clone()).await {
             Ok(out) => Ok(out),
             // The program vanished between the lookup and the start.
@@ -319,8 +382,15 @@ impl Task for CommandRun {
 
     #[instrument(name = "task.command.run.plan", skip_all, fields(command = %hostkit::clip(&spec.run.display(), 200)))]
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
-        // Validate the command up front so a typo is a plan error, not an apply surprise.
-        self.build(cx, spec, &spec.run)?;
+        // Validate the command (and the user wrapper) up front so a typo is a
+        // plan error, not an apply surprise.
+        self.wrap(cx, spec, self.build(cx, spec, &spec.run)?)?;
+        if spec.user.is_some()
+            && let Some(tool) = user_wrapper_tool(cx.platform())
+            && let Some(blocked) = hostkit::missing_tool(cx, tool, RUNUSER_HINT).await?
+        {
+            return Ok(blocked);
+        }
         if self.skip_reason(cx, spec).await?.is_some() {
             return Ok(Planned::NoOp);
         }
@@ -343,10 +413,15 @@ impl Task for CommandRun {
         )
     )]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
+        if spec.user.is_some()
+            && let Some(tool) = user_wrapper_tool(cx.platform())
+        {
+            hostkit::require_tool(cx, tool, RUNUSER_HINT).await?;
+        }
         if let Some(reason) = self.skip_reason(cx, spec).await? {
             return Ok(Applied::unchanged(format!("skipped: {reason}")));
         }
-        let command = self.build(cx, spec, &spec.run)?;
+        let command = self.wrap(cx, spec, self.build(cx, spec, &spec.run)?)?;
         let line = command.display_line();
         let sensitive = command.sensitive_env;
         let out = cx.system.run(command.clone()).await?;
@@ -377,6 +452,7 @@ impl Task for CommandRun {
             let cleanup = Cleanup {
                 remove: remove.clone(),
                 cwd: spec.cwd.clone(),
+                user: spec.user.clone(),
                 env: spec
                     .env
                     .iter()
@@ -415,6 +491,12 @@ impl Task for CommandRun {
         let mut command = cleanup.remove.to_command(cx.platform())?;
         command.cwd = cleanup.cwd.clone();
         command.env.extend(cleanup.env.clone());
+        if let Some(user) = &cleanup.user {
+            if let Some(tool) = user_wrapper_tool(cx.platform()) {
+                hostkit::require_tool(cx, tool, RUNUSER_HINT).await?;
+            }
+            command = as_user(cx.platform(), user, command)?;
+        }
         let line = command.display_line();
         hostkit::run_checked(cx, command, "The cleanup command").await?;
         Ok(Applied::changed(format!(
@@ -724,6 +806,80 @@ mod tests {
                 .describe_removal(&rec)
                 .contains("no cleanup defined")
         );
+    }
+
+    #[tokio::test]
+    async fn user_wraps_the_command_its_probes_and_its_cleanup_on_linux() {
+        let sys = FakeSystem::new()
+            .with_program("runuser")
+            .with_program("probe")
+            .on_command("runuser", &["-u", "pi", "--", "probe"], fail(1))
+            .on_command_ok("runuser", &["-u", "pi", "--", "do-thing"], "")
+            .on_command_ok("runuser", &["-u", "pi", "--", "undo"], "");
+        let c = cx(&sys);
+        let spec = s(json!({
+            "user": "pi", "unless": ["probe"], "cwd": "/home/pi", "env": {"MODE": "fast"}, "remove": ["undo"]
+        }));
+        assert_eq!(plan_class(&CommandRun, &c, &spec).await, Class::Change);
+        let rec = record("command.run", "k", &apply(&CommandRun, &c, &spec).await);
+        CommandRun.remove(&c, &rec).await.unwrap();
+
+        let lines = sys.command_lines();
+        assert!(
+            lines.iter().all(|l| l.starts_with("runuser -u pi -- ")),
+            "every process is wrapped: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.ends_with("probe")));
+        assert!(lines.iter().any(|l| l.ends_with("do-thing --now")));
+        assert!(lines.iter().any(|l| l.ends_with("undo")));
+        let ran = sys
+            .commands_run()
+            .into_iter()
+            .find(|c| c.args.last().map(String::as_str) == Some("--now"))
+            .unwrap();
+        assert_eq!(ran.cwd.as_deref(), Some(std::path::Path::new("/home/pi")));
+        assert_eq!(ran.env.get("MODE").map(String::as_str), Some("fast"));
+    }
+
+    #[tokio::test]
+    async fn user_is_blocked_without_runuser_and_uses_sudo_on_macos() {
+        let sys = FakeSystem::new();
+        let spec = s(json!({"user": "pi"}));
+        assert_eq!(
+            plan_class(&CommandRun, &cx(&sys), &spec).await,
+            Class::Blocked
+        );
+        assert!(
+            CommandRun
+                .apply(&cx(&sys), &spec, &Planned::NoOp)
+                .await
+                .is_err()
+        );
+
+        let mac = FakeSystem::new()
+            .with_platform(buckle_core::Platform::MacOs)
+            .with_program("sudo")
+            .on_command_ok("sudo", &["-u", "pi", "do-thing"], "");
+        apply(&CommandRun, &cx(&mac), &spec).await;
+        assert_eq!(mac.command_lines(), vec!["sudo -u pi do-thing --now"]);
+    }
+
+    #[rstest]
+    #[case::windows(buckle_core::Platform::Windows, "pi")]
+    #[case::bad_name(buckle_core::Platform::Linux, "-rf")]
+    #[tokio::test]
+    async fn unusable_users_are_user_errors(
+        #[case] platform: buckle_core::Platform,
+        #[case] user: &str,
+    ) {
+        let sys = FakeSystem::new()
+            .with_platform(platform)
+            .with_program("runuser");
+        let err = CommandRun
+            .plan(&cx(&sys), &s(json!({"user": user})))
+            .await
+            .unwrap_err();
+        assert!(err.is(buckle_core::error::Kind::User), "{err:?}");
     }
 
     #[rstest]
