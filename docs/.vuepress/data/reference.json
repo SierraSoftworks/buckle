@@ -2444,6 +2444,112 @@
       "shape": null
     },
     {
+      "description": "Copy a directory of files (optionally templated) from the module's files/ directory to the host.",
+      "details": "Copies every file under a directory of the module's `files/` to `dest`.\n\n```yaml\n- file.tree:\n    src: compose                  # a directory under the module's files/\n    dest: /opt/compose\n    mode: \"0640\"                  # files; owner and group apply to directories too\n    dir_mode: \"0750\"\n    owner: root\n    group: docker\n    templates: true               # render `*.j2` files (secret-aware), dropping the suffix\n    exclude: [\"*.md\", \".git\"]     # globs over paths relative to `src` / `dest`\n    purge: false                  # also delete files under dest that are not in the tree\n```\n\nThe tree is one resource keyed by `dest`, and its plan shows a diff per\nfile. Buckle owns the files it writes: a file dropped from the module is\ndeleted on the next apply (or left in place, and reported, if it was\nedited by hand since), and a hand-edited file that is still in the module\nis reported as drift and overwritten. Directories Buckle created are\nremoved once empty. A file already on the host with the same content is\nadopted rather than owned, so neither of those ever deletes it.\n\nWith `templates: true`, files ending in `.j2` are rendered like\n`file.template` (secrets never reach the plan or state) and written without\nthe suffix; other files are copied byte for byte. With `purge: true`,\nanything else under `dest` (that `exclude` does not match) is deleted as\nwell, so `dest` holds exactly the tree.\n\nRemoval deletes the files Buckle wrote that are unchanged since, then the\ndirectories it created if they are empty.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute destination directory on the host (created if missing).",
+          "options": [],
+          "path": "dest",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Source directory, relative to the module's `files/` directory (`.` for all of it).",
+          "options": [],
+          "path": "src",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode for `dest` and the directories in the tree, such as `\"0755\"`.",
+          "options": [],
+          "path": "dir_mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Skip paths matching these globs (`*` and `?`), matched against the\nrelative path, its parent directories and its file name.",
+          "options": [],
+          "path": "exclude",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "group",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Octal mode such as `0644`, parsed from the string form in YAML.",
+          "options": [],
+          "path": "mode",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": null,
+          "options": [],
+          "path": "owner",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Also delete everything under `dest` that is not in the tree (and not excluded).",
+          "options": [],
+          "path": "purge",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Render files ending in `.j2` as templates and write them without the suffix.",
+          "options": [],
+          "path": "templates",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "file.tree",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
       "description": "Install a binary from a GitHub release, with arch mapping, version probe and checksum verification.",
       "details": "Installs a binary from a GitHub release, upgrading it when a newer one appears.\n\n```yaml\n- github.release:\n    repo: atuinsh/atuin\n    version: latest                       # or \"v18.3.0\" / \"18.3.0\"\n    asset: \"atuin-{arch}-unknown-linux-gnu.tar.gz\"   # {version} {arch} {os} {tag}\n    arch_map: { x86_64: x86_64, aarch64: aarch64 }   # host arch -> asset arch; armv7l is skipped\n    extract: atuin                        # file inside an archive asset\n    dest: /usr/local/bin/atuin\n    mode: \"0755\"\n    probe: [\"atuin\", \"--version\"]         # prints the installed version\n    probe_regex: 'atuin (\\S+)'            # optional; default is the first x.y.z found\n    checksum_asset: \"atuin-{arch}-unknown-linux-gnu.tar.gz.sha256\"\n    token_env: GITHUB_TOKEN               # optional; name of an environment variable\n```\n\nThe plan compares the version printed by `probe` with the wanted release\n(`1.2.3 → 1.2.4`). `arch_map` extends the defaults `x86_64: amd64` and\n`aarch64: arm64`; a host architecture with no mapping is reported as\nblocked rather than failing, so a fleet can include hosts a release does not\nsupport. `{os}` is `linux`, `darwin` or `windows`; `{version}` has no\nleading `v`.\n\n`version: latest` asks the GitHub API for the newest release on every plan,\nwhich is rate limited to 60 requests an hour without a token; set\n`token_env` to the name of an environment variable holding a token (the\nvalue is only ever sent as an `Authorization` header). A pinned version\nwhose `probe` already reports it needs no API call. Without `probe`, an\nexisting `dest` counts as installed and is never upgraded (unless\n`checksum_asset` is given for a plain binary asset).\n\nArchive assets (`.tar.gz`, `.tgz`, `.tar`, `.zip`) need `extract`: the\npath or file name of the binary inside. With `checksum_asset` (the name of a\n`.sha256` or `SHA256SUMS` asset) the downloaded asset is verified before\nanything is written. Removal deletes `dest` only if it still matches what\nBuckle installed.",
       "fields": [

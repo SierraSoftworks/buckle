@@ -23,6 +23,7 @@ same time, even in different modules), and what happens on removal.
 |---|---|
 | [`file.copy`](./files.md#file-copy) | Copy a file from the module's `files/`. |
 | [`file.template`](./files.md#file-template) | Render a `.j2` template (secret-aware). |
+| [`file.tree`](./files.md#file-tree) | Copy a directory of files (optionally templated) from the module. |
 | [`file.directory`](./files.md#file-directory) | Create a directory with an owner and mode. |
 | [`file.symlink`](./files.md#file-symlink) | Point a symlink at a target. |
 | [`file.line`](./files.md#file-line) | Ensure one line in a file someone else owns. |
