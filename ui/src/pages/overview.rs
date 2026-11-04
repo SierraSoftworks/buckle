@@ -2,13 +2,12 @@
 //! reading, the latest rollout with what each module changes and its
 //! decisions while it is live, the
 //! whole fleet laid out on that rollout's stages, the last five revisions
-//! with their rollout's outcome, and the agents needing attention.
+//! with their rollouts, and the agents needing attention.
 
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    Fleet, PhaseState, PlanGroup, RevisionStatus, RevisionSummary, RolloutDetail, RolloutState,
-    RolloutSummary,
+    Fleet, PhaseState, PlanGroup, RevisionSummary, RolloutDetail, RolloutState, RolloutSummary,
 };
 use yew::prelude::*;
 
@@ -16,12 +15,13 @@ use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
     Changes, Commit, CommitCard, Empty, ErrorState, HostLink, Loading, Meter, PageHead, Panel,
-    Pill, Pipeline, Refresh, RouteLink, Segment, meter::rollout_segments,
+    Pill, Pipeline, Refresh, RevisionLog, RouteLink, Segment, meter::rollout_segments,
+    use_revision_actions,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{Bucket, attention, rollup};
 use crate::logic::fleet_plan::{Tally, fleet_tally, hosts_changed, summarise};
-use crate::logic::format::{age, commit, count, relative, rollout_label};
+use crate::logic::format::{age, commit, relative, rollout_label};
 use crate::logic::live::{apply_fleet, apply_revisions, apply_rollout, apply_rollouts};
 use crate::logic::pipeline::{fleet_map, layout};
 use crate::logic::tone::{Tone, rollout_finished, rollout_state_label, rollout_state_tone};
@@ -69,6 +69,7 @@ pub fn overview() -> Html {
     );
     let revisions = use_fetch((), |_| async { api::revisions(0).await.map(|p| p.items) });
     let revisions_live = use_live_value(&revisions, apply_revisions);
+    let revision_actions = use_revision_actions();
 
     let content = match (&fleet_live, &fleet.error) {
         (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={fleet.reload.clone()} /> },
@@ -109,16 +110,20 @@ pub fn overview() -> Html {
                     <Panel title="Needs attention" subtitle="Registrations, offline agents, version skew and stale plans">
                         { attention_list(f, rollout_live.as_ref().filter(|d| !rollout_finished(d.summary.state)), now) }
                     </Panel>
-                    <Panel title="Recent revisions" actions={html! { <RouteLink to={Route::Revisions} classes="btn btn--small btn--subtle">{ "All revisions" }</RouteLink> }}>
+                    <Panel title="Rollouts" actions={html! { <RouteLink to={Route::Rollouts} classes="btn btn--small btn--subtle">{ "All rollouts" }</RouteLink> }}>
                         { match (&revisions_live, &revisions.error) {
                             (Some(list), _) if list.is_empty() => html! { <Empty title="No revisions yet" message="The server has not seen a commit of the configuration repository." /> },
-                            (Some(list), _) => recent(list, rollouts_live.as_deref().unwrap_or(&[]), now),
+                            (Some(list), _) => html! {
+                                <RevisionLog revisions={list.clone()} rollouts={rollouts_live.clone().unwrap_or_default()} {now}
+                                    open={revision_actions.open.clone()} limit={Some(5)} />
+                            },
                             (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={revisions.reload.clone()} /> },
                             (None, None) => html! { <Loading /> },
                         } }
                     </Panel>
                 </div>
                 { rollout_live.as_ref().map(|d| actions.dialog(d, &plan_groups)).unwrap_or_default() }
+                { revision_actions.dialog(rollouts_live.as_deref().unwrap_or(&[])) }
             </> }
         }
     };
@@ -160,7 +165,7 @@ fn latest(
 ) -> Html {
     let s = &d.summary;
     html! { <>
-        <CommitCard commit={Commit::of_rollout(s, revisions)} rollout={s.clone()} boxed=true {now} />
+        <CommitCard commit={Commit::of_rollout(s, revisions)} rollout={s.clone()} body=true boxed=true {now} />
         { rollout_head(s, d.fleet.as_ref().map(fleet_tally)) }
         { module_changes(d) }
         if let Some(reason) = &s.pause_reason {
@@ -328,27 +333,5 @@ fn attention_list(
                 }
             }) }
         </ul>
-    }
-}
-
-fn recent(
-    list: &[RevisionSummary],
-    rollouts: &[RolloutSummary],
-    now: chrono::DateTime<chrono::Utc>,
-) -> Html {
-    html! {
-        <ol class="gitlog gitlog--compact">
-            { for list.iter().take(5).map(|r| {
-                let rollout = r.rollout_id.as_ref().and_then(|id| rollouts.iter().find(|x| &x.id == id)).cloned();
-                html! {
-                    <li class={classes!("gitlog__item", (r.status == RevisionStatus::Rejected).then_some("gitlog__item--rejected"), r.is_stable.then_some("gitlog__item--stable"))}
-                        data-revision={r.id.clone()}>
-                        <span class="gitlog__dot" aria-hidden="true" />
-                        <CommitCard commit={Commit::from(r)} {rollout} {now} />
-                    </li>
-                }
-            }) }
-            if list.len() > 5 { <li class="gitlog__more muted">{ format!("and {}", count(list.len() - 5, "older revision", "older revisions")) }</li> }
-        </ol>
     }
 }

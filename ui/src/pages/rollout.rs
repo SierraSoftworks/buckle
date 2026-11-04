@@ -211,7 +211,7 @@ pub fn rollout_page(props: &Props) -> Html {
 
     let subtitle = html! { <>
         <CommitCard commit={Commit::of_rollout(s, revisions.value().map(|v| v.as_slice()).unwrap_or(&[]))}
-            link=false boxed=true {now} />
+            link=false body=true boxed=true {now} />
         <div class="rollout-meta">
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
             if let Some(f) = &d.fleet { <Changes tally={fleet_tally(f)} /> }

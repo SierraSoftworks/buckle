@@ -62,6 +62,7 @@ pub fn split_button(props: &SplitButtonProps) -> Html {
         Kind::Primary => Some("btn--primary"),
         Kind::Danger => Some("btn--danger"),
         Kind::Subtle => Some("btn--subtle"),
+        Kind::Caution => Some("btn--caution"),
         Kind::Default => None,
     };
     html! {

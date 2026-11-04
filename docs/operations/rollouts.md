@@ -11,11 +11,11 @@ commit ─▶ revision ─▶ plans ─▶ phase 1 ─gate─▶ phase 2 ─gate
 ## 1. Push a commit
 
 The server sees it within `source.git.poll`, or at once with a webhook to
-`/api/v1/webhooks/source`. **Revisions** lists every commit it has seen. A commit whose files do not
+`/api/v1/webhooks/source`. **Rollouts** lists every commit it has seen, each with how its rollout is going. A commit whose files do not
 parse, or whose modules, phases, secret references or templates do not check out, is **rejected**
 with the errors, and nothing rolls out.
 
-<Screenshot name="revisions-list" alt="Revisions: a rolling commit, a rejected commit with its validation errors, the stable revision and an older one" />
+<Screenshot name="rollouts-list" alt="Rollouts: a running commit, a rejected commit with its validation errors, the stable revision and an older one" />
 
 Run `buckle validate` in CI so that a rejection is a failed check on a pull request rather than a
 surprise after merging.
@@ -23,7 +23,7 @@ surprise after merging.
 ### Start a rollout by hand
 
 With `rollout.trigger: manual`, or to re-run a revision, use **Start rollout…** on its row in
-Revisions. A revision that arrives while another rollout is running waits for it or replaces it,
+Rollouts. A revision that arrives while another rollout is running waits for it or replaces it,
 according to `rollout.supersede`.
 
 ## 2. Watch the pipeline

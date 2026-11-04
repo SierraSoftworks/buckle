@@ -133,7 +133,7 @@ rollout:
 
 | Key | Default | Description |
 |---|---|---|
-| `trigger` | `auto` | `auto` starts a rollout for every valid revision; `manual` waits for an operator to start one from the Revisions page. |
+| `trigger` | `auto` | `auto` starts a rollout for every valid revision; `manual` waits for an operator to start one from the Rollouts page. |
 | `supersede` | `latest` | A revision that arrives mid-rollout waits for the current one. `latest` then rolls only the newest waiting revision, `sequential` rolls each in turn, and `replace` aborts the current rollout and starts the new one at once. |
 | `on_failure` | `pause` | When a phase exceeds its failure budget: `pause` for an operator, `rollback` automatically, or `continue`. |
 | `settle` | `2m` | A required check must fail continuously this long before it counts, so a restarting service is not blamed. |

@@ -67,6 +67,15 @@ async fn a_paused_host_stops_correcting_drift() {
         .api()
         .post_ok("/api/v1/hosts/drift-1/pause", serde_json::json!({}))
         .await;
+    // The pause reaches the agent as a HostUpdate after the API has answered;
+    // a drift pass before it arrives would still correct the edit.
+    eventually("the agent to learn it is paused", WAIT, async || {
+        let status = host.agent_state().status;
+        (status.as_deref() == Some("paused"))
+            .then_some(())
+            .ok_or(format!("{status:?}"))
+    })
+    .await;
     host.write_file(APP_CONF, "hand edit\n");
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(

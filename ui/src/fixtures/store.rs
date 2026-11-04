@@ -416,7 +416,7 @@ pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiEr
         let mut detail = data::active_rollout(Utc::now());
         detail.summary.id = id.clone();
         detail.summary.revision = rev.id.clone();
-        detail.summary.revision_message = crate::logic::format::first_line(&rev.message).into();
+        detail.summary.revision_message = rev.message.clone();
         detail.summary.state = if busy {
             RolloutState::Detected
         } else {

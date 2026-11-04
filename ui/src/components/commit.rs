@@ -1,7 +1,8 @@
 //! A commit of the configuration repository, the same wherever one is shown
 //! (Revisions, the Overview, a rollout's head): its subject with a check
 //! mark for a valid commit (a cross for a rejected one), who wrote it and
-//! when, and its rollout. The whole card opens that rollout.
+//! when, and its rollout. The whole card opens that rollout; `actions` are
+//! its rollout controls, at the right of the commit hash.
 
 use buckle_api::{RevisionStatus, RevisionSummary, RolloutSummary};
 use chrono::{DateTime, Utc};
@@ -26,7 +27,6 @@ pub struct Commit {
     pub at: Option<DateTime<Utc>>,
     pub status: Option<RevisionStatus>,
     pub errors: usize,
-    pub stable: bool,
     pub modules: Option<u32>,
 }
 
@@ -39,7 +39,6 @@ impl From<&RevisionSummary> for Commit {
             at: Some(r.created_at),
             status: Some(r.status),
             errors: r.validation_errors.len(),
-            stable: r.is_stable,
             modules: Some(r.module_count),
         }
     }
@@ -60,7 +59,6 @@ impl Commit {
                 // A rollout only starts from a valid revision.
                 status: Some(RevisionStatus::Valid),
                 errors: 0,
-                stable: false,
                 modules: None,
             })
     }
@@ -76,6 +74,10 @@ pub struct CommitCardProps {
     /// Whether the card opens the rollout (not on that rollout's own page).
     #[prop_or(true)]
     pub link: bool,
+    /// Whether the meta line names the rollout and its state (a log that
+    /// shows the rollout's progress itself turns it off).
+    #[prop_or(true)]
+    pub say_rollout: bool,
     /// The message's body under its subject.
     #[prop_or_default]
     pub body: bool,
@@ -124,20 +126,19 @@ pub fn commit_card(props: &CommitCardProps) -> Html {
                         None => html! { <span class="commit__subject">{ subject }</span> },
                     } }
                     { status.unwrap_or_default() }
-                    if c.stable { <span class="badge badge--ok">{ "stable" }</span> }
                 </div>
                 <div class="commit__meta muted">
                     if let Some(a) = &c.author { <span class="commit__author">{ a.split(" <").next().unwrap_or(a).to_string() }</span> }
                     if let Some(at) = c.at { <span title={timestamp(at)}>{ relative(at, props.now) }</span> }
                     if let Some(m) = c.modules { <span>{ count(m as usize, "module", "modules") }</span> }
                     // On its rollout's own page, the rollout goes without saying.
-                    { match props.rollout.as_ref().filter(|_| props.link) {
+                    { match props.rollout.as_ref().filter(|_| props.link && props.say_rollout) {
                         Some(r) => html! {
                             <span class={classes!("commit__rollout", rollout_state_tone(r.state).class())} title={rollout_note(r)}>
                                 { format!("rollout {} {}", rollout_label(&r.id), rollout_state_label(r.state)) }
                             </span>
                         },
-                        None if props.link && !rejected && c.at.is_some() => html! { <span>{ "not rolled out" }</span> },
+                        None if props.link && props.say_rollout && !rejected && c.at.is_some() => html! { <span>{ "not rolled out" }</span> },
                         None => html! {},
                     } }
                 </div>

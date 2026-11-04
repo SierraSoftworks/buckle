@@ -2,9 +2,57 @@
 //! the decision the rollout is waiting on (approve, else pause or resume) on
 //! its face, and the rest behind its menu.
 
-use buckle_api::RolloutState;
+use buckle_api::{RevisionStatus, RevisionSummary, RolloutState, RolloutSummary};
+use chrono::{DateTime, Utc};
 
-use super::tone::rollout_finished;
+use super::tone::{rollout_active, rollout_finished};
+
+/// Where a revision stands, as the one control (or marker) its card shows
+/// to the right of the commit hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stance {
+    /// Rejected by validation: it cannot be deployed.
+    Corrupt,
+    /// The release the fleet is on.
+    Stable,
+    /// Older than the stable release: roll the fleet back to it.
+    Rollback,
+    /// A proposed rollout waiting on a decision.
+    Review,
+    /// A rollout in progress that needs nothing from the operator.
+    Running,
+    /// Newer than the stable release and not rolled out (a manual trigger).
+    Start,
+}
+
+/// The stance of `rev` given its `rollout` and the creation time of the
+/// stable revision (`stable_at`).
+pub fn stance(
+    rev: &RevisionSummary,
+    rollout: Option<&RolloutSummary>,
+    stable_at: Option<DateTime<Utc>>,
+) -> Option<Stance> {
+    if rev.status == RevisionStatus::Rejected {
+        return Some(Stance::Corrupt);
+    }
+    if rev.is_stable {
+        return Some(Stance::Stable);
+    }
+    if let Some(r) = rollout.filter(|r| rollout_active(r.state)) {
+        return Some(if r.state == RolloutState::AwaitingApproval {
+            Stance::Review
+        } else {
+            Stance::Running
+        });
+    }
+    if stable_at.is_some_and(|s| rev.created_at < s) {
+        return Some(Stance::Rollback);
+    }
+    // A rollout queued behind the running one speaks for itself.
+    rollout
+        .is_none_or(|r| rollout_finished(r.state))
+        .then_some(Stance::Start)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -80,6 +128,80 @@ pub fn decisions(state: RolloutState, approve: Option<&str>) -> Option<Decisions
 mod tests {
     use super::*;
     use Decision::*;
+
+    fn revision(stable: bool, age_days: i64, status: RevisionStatus) -> RevisionSummary {
+        RevisionSummary {
+            id: "r".into(),
+            commit: "abc".into(),
+            author: "a".into(),
+            message: "m".into(),
+            created_at: Utc::now() - chrono::Duration::days(age_days),
+            status,
+            validation_errors: vec![],
+            is_stable: stable,
+            rollout_id: None,
+            module_count: 1,
+        }
+    }
+
+    fn rollout(state: RolloutState) -> RolloutSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": "1", "revision": "r", "revision_message": "m", "state": state,
+            "started_at": Utc::now(), "triggered_by": "t",
+            "hosts_total": 1, "hosts_done": 0, "hosts_failed": 0,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_revision_has_the_one_stance_that_fits() {
+        use RevisionStatus::{Rejected, Valid};
+        use RolloutState::*;
+        let stable_at = Some(Utc::now() - chrono::Duration::days(2));
+        let cases = [
+            (revision(true, 2, Valid), None, Some(Stance::Stable)),
+            (revision(false, 5, Valid), None, Some(Stance::Rollback)),
+            (
+                revision(false, 5, Valid),
+                Some(Aborted),
+                Some(Stance::Rollback),
+            ),
+            (
+                revision(false, 1, Valid),
+                Some(AwaitingApproval),
+                Some(Stance::Review),
+            ),
+            (
+                revision(false, 1, Valid),
+                Some(Rolling),
+                Some(Stance::Running),
+            ),
+            (
+                revision(false, 1, Valid),
+                Some(Baking),
+                Some(Stance::Running),
+            ),
+            // Rolling back to an older revision is a rollout in progress.
+            (
+                revision(false, 5, Valid),
+                Some(Rolling),
+                Some(Stance::Running),
+            ),
+            (revision(false, 1, Valid), None, Some(Stance::Start)),
+            (
+                revision(false, 1, Valid),
+                Some(Aborted),
+                Some(Stance::Start),
+            ),
+            (revision(false, 1, Valid), Some(Detected), None),
+            (revision(false, 1, Rejected), None, Some(Stance::Corrupt)),
+            (revision(false, 5, Rejected), None, Some(Stance::Corrupt)),
+        ];
+        for (rev, state, want) in cases {
+            let r = state.map(rollout);
+            assert_eq!(stance(&rev, r.as_ref(), stable_at), want, "{state:?}");
+        }
+    }
 
     #[test]
     fn the_face_is_what_the_rollout_waits_on() {

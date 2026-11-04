@@ -748,16 +748,55 @@
   }
 }
 
-// Destructive, rare and repeated on every older revision: quiet until the
-// row is the one being looked at.
-.gitlog .commit__actions {
-  opacity: 0.6;
-  transition: opacity 120ms ease;
+// A revision's rollout controls. A button is raised and solid; a marker
+// ([Stable], [Running], [Corrupt]) is flat, a tinted label with a dot, the
+// same size as the button so a card's right edge does not jump.
+.commit__aside .btn {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+
+  &:active:not(:disabled) {
+    box-shadow: none;
+    transform: translateY(1px);
+  }
 }
 
-.gitlog__item:hover .commit__actions,
-.gitlog .commit__actions:focus-within {
-  opacity: 1;
+.marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 26px;
+  padding: 0.15rem 0.55rem;
+  border-radius: var(--radius);
+  background: var(--tone-soft);
+  color: var(--tone);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: default;
+  user-select: none;
+
+  &::before {
+    content: "";
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: currentColor;
+  }
+}
+
+// How a revision's rollout is going, under its commit.
+.rollout-line {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+
+  &__meter {
+    width: 7rem;
+  }
 }
 
 // Hosts table

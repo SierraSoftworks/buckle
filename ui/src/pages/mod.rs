@@ -5,7 +5,6 @@ pub mod audit;
 pub mod host;
 pub mod hosts;
 pub mod overview;
-pub mod revisions;
 pub mod rollout;
 pub mod rollouts;
 
