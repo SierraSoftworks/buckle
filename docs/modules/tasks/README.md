@@ -28,6 +28,8 @@ same time, even in different modules), and what happens on removal.
 | [`file.symlink`](./files.md#file-symlink) | Point a symlink at a target. |
 | [`file.line`](./files.md#file-line) | Ensure one line in a file someone else owns. |
 | [`file.block`](./files.md#file-block) | Own a marked block of lines in a file. |
+| [`file.ini`](./files.md#file-ini) | Own settings in one section of an INI-style file (`config.txt`). |
+| [`file.tokens`](./files.md#file-tokens) | Ensure tokens on a one-line list (`cmdline.txt`, `GRUB_CMDLINE_LINUX`). |
 | [`file.absent`](./files.md#file-absent) | Make sure something is gone. |
 
 ## Downloads and releases

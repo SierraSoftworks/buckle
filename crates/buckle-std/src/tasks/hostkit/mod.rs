@@ -926,6 +926,14 @@ mod registry_tests {
             ),
             ("docker.image", json!({"name": "i:1", "pull": "always"})),
             (
+                "file.ini",
+                json!({"path": "/boot/config.txt", "section": "all", "settings": {"enable_uart": 1}}),
+            ),
+            (
+                "file.tokens",
+                json!({"path": "/boot/cmdline.txt", "present": ["quiet"]}),
+            ),
+            (
                 "git.repository",
                 json!({"repo": "https://g.example/r.git", "path": "/r", "ref": "main", "owner": "u", "group": "g", "depth": 1, "recursive": true, "update": false}),
             ),

@@ -2225,6 +2225,102 @@
       "shape": null
     },
     {
+      "description": "Own settings and lines in one section of an INI-style file (config.txt, php.ini, .conf).",
+      "details": "Owns settings and lines in one `[section]` of an INI-style file, leaving the rest of it alone.\n\n```yaml\n- file.ini:\n    path: /boot/firmware/config.txt\n    section: all\n    settings:                        # one value per key: replaced in place\n      enable_uart: 1\n      dtparam=poe_fan_temp0: 50000   # a key may itself hold `=`\n    lines:                           # repeatable keys, kept as written\n      - dtoverlay=rpi-poe-plus\n      - dtoverlay=pps-gpio,gpiopin=18\n    absent: [dtoverlay=vc4-kms-v3d]\n```\n\n`section` names the `[section]` header to edit (exactly as written, without\nbrackets); without it the task edits the lines before the first header.\nA missing section is appended to the end of the file.\n\nEach `settings` entry replaces the **last** line in the section that starts\nwith `key=` (whitespace around the separator is ignored), or adds\n`key=value` when there is none. Each of `lines` is added unless an\nidentical line is already in the section. Lines that are already right are\nadopted as they are. New lines are added together, settings first, after\nthe section's last line; later edits keep them where they are.\n\n`absent` deletes lines from the section: an entry matches a line equal to\nit, or one that starts with it followed by `=` or `,` (so `enable_uart`\nmatches `enable_uart=1` and `dtoverlay=vc4-kms-v3d` matches\n`dtoverlay=vc4-kms-v3d,cma-512`). Lines the task itself wants are kept.\nComments (`#`, `;`) are never matched.\n\nBuckle records what it changed. Dropping an entry from the task, or\nremoving the task, reverts it: added lines (and a section header Buckle\nadded) are deleted, replaced lines get their original text back and lines\ndeleted by `absent` are put back. Lines changed by hand since are left\nalone.\n\nThe file must exist unless `create: true`, so a task for a file that only\nsome hosts have plans as blocked on the others. Mode and ownership are\npreserved, and edits of one file are serialised across modules.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path of the file to edit.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Lines to delete: an entry matches a line equal to it or followed by `=` or `,`.",
+          "options": [],
+          "path": "absent",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Keep a timestamped `.bak` copy before editing.",
+          "options": [],
+          "path": "backup",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Create the file when it does not exist.",
+          "options": [],
+          "path": "create",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Lines to ensure as written, for keys that may repeat (`dtoverlay=rpi-poe-plus`).",
+          "options": [],
+          "path": "lines",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "The section to edit (`all` for `[all]`); omit for the lines before the first header.",
+          "options": [],
+          "path": "section",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "=",
+          "depth": 0,
+          "description": "What to write between a setting's key and value; `=` by default, ` = ` for spaced files.",
+          "options": [],
+          "path": "separator",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "{}",
+          "depth": 0,
+          "description": "Keys with a single value: `key: value` replaces the line starting with `key=` or adds one.",
+          "options": [],
+          "path": "settings",
+          "required": false,
+          "secret": false,
+          "ty": "map of string | integer | number | boolean"
+        }
+      ],
+      "kind": "file.ini",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
       "description": "Ensure a line is present in, replaced in or removed from a text file (lineinfile).",
       "details": "Ensures a line is present in (or absent from) a text file, like Ansible's `lineinfile`.\n\n```yaml\n- file.line:\n    path: /etc/ssh/sshd_config\n    line: \"PasswordAuthentication no\"\n    regex: '^#?PasswordAuthentication\\b'   # replace the last matching line\n\n- file.line:                      # without `regex`: append when missing\n    path: /etc/hosts\n    line: \"10.0.0.5 vault.internal\"\n\n- file.line:                      # remove every matching line\n    path: /etc/fstab\n    state: absent\n    regex: '\\sswap\\s'\n```\n\nWith `state: present` (the default): when `regex` matches, the **last**\nmatching line is replaced by `line`; when nothing matches, `line` is\ninserted unless it is already in the file. Insertion goes after the last\nline matching `insert_after` (or `EOF`), before the last line matching\n`insert_before` (or `BOF`), and otherwise at the end of the file.\n\nWith `state: absent`, every line matching `regex` (or, without `regex`,\nequal to `line`) is deleted.\n\nThe file must exist unless `create: true`. Mode and ownership are\npreserved. `backup: true` keeps a timestamped copy before each edit.\n\n`validate` is a command (argv) that checks the new content before it\nreplaces the file (and while planning); `{path}` stands for a private\ntemporary copy under `<state_dir>/tmp`, deleted afterwards. A non-zero\nexit fails the task and leaves the file untouched. Without `validate`,\n`/etc/sudoers`, `/etc/sudoers.d/*` and `sshd_config` files are checked with\n`visudo -cf {path}` and `sshd -t -f {path}` (when those tools are\ninstalled); `validate: []` turns that off.\n\nRemoval reverts the edit: a line Buckle added is deleted again (one\noccurrence only, so an identical line another task owns stays), a line it\nreplaced is restored to its original text, and a file it created is deleted\nwhen it ends up empty. Edits made by `state: absent` are not restored.\n\nThe resource is identified by `path` and `regex` when a `regex` is given\n(else by `path` and `line`), so changing the `line` of a regex task updates\nthe same line in place and removal still restores the text from before\nBuckle's first edit. Edits of one file are serialised across modules.",
       "fields": [
@@ -2454,6 +2550,72 @@
         }
       ],
       "kind": "file.template",
+      "locks": [],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "removal_caution": false,
+      "removal_default": "cleanup",
+      "shape": null
+    },
+    {
+      "description": "Ensure tokens in a space-separated list on one line (cmdline.txt, GRUB_CMDLINE_LINUX).",
+      "details": "Ensures tokens are present in (or absent from) a space-separated list on one line,\nsuch as a kernel command line.\n\n```yaml\n- file.tokens:\n    path: /boot/firmware/cmdline.txt\n    present: [cgroup_enable=cpuset, cgroup_enable=memory, cgroup_memory=1]\n    absent: [console=serial0]          # also matches console=serial0,115200\n\n- file.tokens:                         # the quoted value of one assignment\n    path: /etc/default/grub\n    key: GRUB_CMDLINE_LINUX_DEFAULT\n    present: [apparmor=1, security=apparmor]\n```\n\nWithout `key`, the whole file is the list and must hold a single line (a\ntrailing newline is kept). With `key`, the list is the value of the last\n`KEY=...` line (optionally `export`ed); its quotes are kept, and added when\nthe value grows past one token.\n\n`present` tokens missing from the list are appended in order; tokens that\nare already there stay where they are. `absent` deletes every token equal\nto an entry, or starting with it followed by `=` or `,` (so `quiet` matches\n`quiet`, `console` matches `console=tty1` and `console=serial0` matches\n`console=serial0,115200`), except tokens listed in `present`.\n\nBuckle records what it changed. Dropping a token from the task, or removing\nthe task, reverts it: appended tokens are deleted and deleted tokens are put\nback where they were. A missing file (or `key` line) plans as blocked, so\nthe task can run on every host and changes only those that have the file.\nEdits of one file are serialised across modules.",
+      "fields": [
+        {
+          "default": null,
+          "depth": 0,
+          "description": "Absolute path of the file to edit.",
+          "options": [],
+          "path": "path",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Tokens to delete: an entry matches a token equal to it or followed by `=` or `,`.",
+          "options": [],
+          "path": "absent",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        },
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Keep a timestamped `.bak` copy before editing.",
+          "options": [],
+          "path": "backup",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "Edit the value of this `KEY=\"...\"` assignment rather than the whole (single-line) file.",
+          "options": [],
+          "path": "key",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "[]",
+          "depth": 0,
+          "description": "Tokens to ensure, appended when missing.",
+          "options": [],
+          "path": "present",
+          "required": false,
+          "secret": false,
+          "ty": "array of string"
+        }
+      ],
+      "kind": "file.tokens",
       "locks": [],
       "platforms": [
         "linux",

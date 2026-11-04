@@ -184,6 +184,90 @@ Own a block of lines inside a file, between two marker lines.
 `{mark}` becomes `BEGIN` and `END`. Two blocks in one file need different markers. If a file
 already has a block with your marker (from another tool), Buckle takes it over.
 
+## file.ini
+
+Own settings and lines in one `[section]` of an INI-style file, such as a Raspberry Pi's
+`config.txt`, `php.ini` or a `.conf` with sections. Everything else in the file is left as it is.
+
+```yaml
+name: raspberry-pi
+tasks:
+  - file.ini:
+      path: /boot/firmware/config.txt
+      section: all
+      settings:                            # one value per key, replaced in place
+        enable_uart: 1
+        dtparam=poe_fan_temp0: 50000       # a key may hold `=` itself
+      lines:                               # repeatable keys, kept as written
+        - dtoverlay=rpi-poe-plus
+        - dtoverlay=pps-gpio,gpiopin=18
+      absent: [dtoverlay=vc4-kms-v3d]      # also matches dtoverlay=vc4-kms-v3d,cma-512
+    when: 'host.facts.hardware.raspberry_pi.version != null'
+    notify: [reboot]
+  - file.ini:
+      path: /boot/firmware/config.txt
+      section: pi5
+      settings: { pciex1_gen: 3 }
+    when: 'host.facts.hardware.raspberry_pi.version != null'
+    notify: [reboot]
+
+handlers:
+  reboot: { system.reboot: {} }
+```
+
+```yaml
+- file.ini:
+    path: /etc/php/8.3/fpm/php.ini
+    section: PHP
+    separator: " = "
+    settings: { memory_limit: 512M, upload_max_filesize: 64M }
+```
+
+<KindReference registry="tasks" kind="file.ini" />
+
+- **Matching.** A setting replaces the last line in the section that starts with `key=` (spacing
+  around the separator is ignored). A line already in the section is adopted, not duplicated.
+  New lines go after the section's last line, settings first; a missing section is appended.
+- **Reverting.** Buckle records what it added, replaced and deleted. Dropping an entry, or the
+  task, reverts just that: a replaced line gets its original text back, a deleted one is put
+  back. Lines changed by hand since are left alone.
+- **config.txt.** Firmware settings apply at boot, so notify a [`system.reboot`](./system.md#system-reboot)
+  handler. A `dtparam` that follows a `dtoverlay` sets that overlay's parameter: give overlay
+  parameters on the overlay line (`dtoverlay=pps-gpio,gpiopin=18`). Older images keep the file at
+  `/boot/config.txt`; a task for a missing file plans as blocked.
+
+## file.tokens
+
+Ensure tokens in a space-separated list on one line: a kernel command line in `cmdline.txt`, or
+the quoted value of an assignment such as `GRUB_CMDLINE_LINUX` in `/etc/default/grub`.
+
+```yaml
+- file.tokens:
+    path: /boot/firmware/cmdline.txt
+    present: [cgroup_enable=cpuset, cgroup_enable=memory, cgroup_memory=1]
+    absent: [console=serial0]              # also matches console=serial0,115200
+  when: 'host.facts.hardware.raspberry_pi.version != null'
+  notify: [reboot]
+```
+
+```yaml
+- file.tokens:
+    path: /etc/default/grub
+    key: GRUB_CMDLINE_LINUX_DEFAULT
+    present: [apparmor=1, security=apparmor]
+  notify: [update-grub]                    # a command.run handler running update-grub
+```
+
+<KindReference registry="tasks" kind="file.tokens" />
+
+- **Matching.** Missing `present` tokens are appended. An `absent` entry matches a token equal to
+  it or followed by `=` or `,`, so `console` drops every `console=...`; tokens in `present` are
+  never dropped.
+- **Shape.** Without `key` the file must be a single line. With `key` the value of the last
+  `KEY=...` line is edited and its quotes kept. A missing file or key plans as blocked.
+- **Reverting.** Dropping a token from the task, or the task, removes what Buckle appended and puts
+  back what it deleted, in place.
+
 ## file.absent
 
 Make sure a path does not exist: an old config file, a package's default site.
