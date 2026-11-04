@@ -30,7 +30,16 @@ if [ ! -x "$dir/nomad" ]; then
   (cd "$dir" && unzip -o -q "$zip" nomad)
 fi
 
+# The cloud fingerprinters probe instance metadata endpoints, and on a hosted
+# runner an unresponsive IMDS aborts agent startup ("ec2imds: GetMetadata,
+# context deadline exceeded"). A dev agent has no use for them.
 cat > "$dir/agent.hcl" <<EOF
+client {
+  options = {
+    "fingerprint.denylist" = "env_aws,env_gce,env_azure,env_digitalocean"
+  }
+}
+
 plugin "raw_exec" {
   config {
     enabled = true
