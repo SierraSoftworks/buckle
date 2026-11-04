@@ -94,6 +94,8 @@ struct Executor<'a> {
     /// Cross-module handlers waiting for their owner module to finish:
     /// owner → `(owner, handler)` pairs.
     pending_handlers: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// The reboot the run's steps and handlers asked for so far.
+    reboot: Mutex<Option<crate::reboot::RebootRequest>>,
 }
 
 /// `Engine::apply`.
@@ -139,6 +141,7 @@ pub(super) async fn apply(
         scheduled: Mutex::new(rich.order.iter().cloned().collect()),
         pending_handlers: Mutex::new(HashMap::new()),
         save_errors: Mutex::new(Vec::new()),
+        reboot: Mutex::new(None),
     };
     let outcome = executor.run(&planner, rich, started, started_at).await?;
     Ok(outcome)
@@ -182,6 +185,29 @@ impl<'a> Executor<'a> {
             providers: providers.to_vec(),
         })
         .await;
+    }
+
+    /// Folds a step's or handler's reboot request into the run's.
+    fn request_reboot(&self, applied: &Applied, by: String) {
+        let Some(request) = applied.reboot.clone() else {
+            return;
+        };
+        tracing::info!(by = %by, delay = ?request.delay, "a reboot was requested; the host reboots after the run");
+        let mut request = request;
+        request.requested_by = vec![by];
+        let mut slot = self.reboot.lock().unwrap_or_else(|p| p.into_inner());
+        match slot.as_mut() {
+            Some(existing) => existing.merge(request),
+            None => *slot = Some(request),
+        }
+    }
+
+    /// Whether anything in the run has asked for a reboot yet.
+    fn reboot_pending(&self) -> bool {
+        self.reboot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 
     fn with_state<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
@@ -333,6 +359,7 @@ impl<'a> Executor<'a> {
                 if applied.changed {
                     self.changed_so_far.fetch_add(1, Ordering::Relaxed);
                 }
+                self.request_reboot(&applied, format!("{module}/{id}"));
                 self.record_step(step, rs, Some(&applied), revision);
                 self.checkpoint();
                 self.emit(ApplyEvent::StepFinished {
@@ -483,6 +510,7 @@ impl<'a> Executor<'a> {
                     return outcome;
                 }
                 Ok(applied) => {
+                    self.request_reboot(&applied, id.clone());
                     let summary = self.scrub(&applied.summary);
                     outcome.state = if applied.changed {
                         StepState::Changed
@@ -805,7 +833,16 @@ impl<'a> Executor<'a> {
         {
             self.refresh_facts(planner, &config.facts.provides).await;
         }
+        // Once the run has asked for a reboot, checks would judge the host
+        // before the change takes effect (and a failure would roll the
+        // module back): they run after the reboot instead, in the bake.
+        let deferred_by_reboot =
+            run_health && config.is_some_and(|c| !c.health.is_empty()) && self.reboot_pending();
+        if deferred_by_reboot {
+            tracing::info!(module = %module, "health checks deferred until after the reboot");
+        }
         if run_health
+            && !deferred_by_reboot
             && let Some(config) = config
             && !config.health.is_empty()
         {
@@ -1598,6 +1635,7 @@ impl<'a> Executor<'a> {
             removals_run,
             started_at: Some(started_at),
             finished_at: Some(finished_at),
+            reboot: self.reboot.lock().unwrap_or_else(|p| p.into_inner()).take(),
         };
         // For `buckle status`; never fails the apply.
         if let Err(e) = self.inputs.state.save_last_run(&outcome) {

@@ -267,6 +267,42 @@ pub async fn missing_tool(cx: &Cx, tool: &str, hint: &str) -> Result<Option<Plan
     ))))
 }
 
+/// Runs a read-only guard probe (`unless`, `only_if`). A probe whose program
+/// is not installed behaves as a shell would report it, exiting 127 ("command
+/// not found"), rather than failing the plan: `unless: [nomad, version]`
+/// before nomad is installed means "not installed yet, run".
+pub async fn probe(cx: &Cx, command: Command) -> Result<Output> {
+    probe_with(cx, command, Ok).await
+}
+
+/// [`probe`], running the found program through `wrap` (to run it as another
+/// user, say).
+pub async fn probe_with(
+    cx: &Cx,
+    command: Command,
+    wrap: impl FnOnce(Command) -> Result<Command>,
+) -> Result<Output> {
+    let not_found = || Output {
+        code: Some(127),
+        stdout: Vec::new(),
+        stderr: format!("{}: command not found", command.program).into_bytes(),
+        timed_out: false,
+    };
+    let present = if command.program.contains('/') {
+        cx.system.stat(Path::new(&command.program)).await?.is_some()
+    } else {
+        cx.system.which(&command.program).await?.is_some()
+    };
+    if !present {
+        return Ok(not_found());
+    }
+    match cx.system.run(wrap(command.clone())?).await {
+        Ok(out) => Ok(out),
+        // The program vanished between the lookup and the start.
+        Err(_) => Ok(not_found()),
+    }
+}
+
 /// The user error raised in apply when a required tool is missing.
 pub async fn require_tool(cx: &Cx, tool: &str, hint: &str) -> Result<()> {
     if cx.system.which(tool).await?.is_some() {
@@ -932,6 +968,10 @@ mod registry_tests {
             (
                 "sysctl.param",
                 json!({"name": "vm.swappiness", "value": 10}),
+            ),
+            (
+                "system.reboot",
+                json!({"delay": "5s", "timeout": "5m", "only_if": "true"}),
             ),
             (
                 "ufw.default",

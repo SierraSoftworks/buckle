@@ -80,6 +80,7 @@ same time, even in different modules), and what happens on removal.
 | [`swap.file`](./system.md#swap-file) | Create and enable a swap file. |
 | [`hostname.set`](./system.md#hostname-set) | Set the hostname. |
 | [`cron.job`](./system.md#cron-job) | Schedule a command in `/etc/cron.d`. |
+| [`system.reboot`](./system.md#system-reboot) | Reboot the host after the run (a handler, or a guarded task). |
 
 ## Commands
 

@@ -241,6 +241,11 @@ pub struct Applied {
     /// Digest of the real content written, for drift detection without reading secrets back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<crate::Digest>,
+    /// The host must reboot for this change to take effect. The engine folds
+    /// the requests of a run into [`crate::engine::ApplyOutcome::reboot`]; the
+    /// task never reboots the host itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reboot: Option<crate::reboot::RebootRequest>,
 }
 
 impl Applied {
@@ -266,6 +271,12 @@ impl Applied {
 
     pub fn with_artefact(mut self, artefact: Artefact) -> Self {
         self.artefacts.push(artefact);
+        self
+    }
+
+    /// Asks for a reboot once the run has finished.
+    pub fn with_reboot(mut self, request: crate::reboot::RebootRequest) -> Self {
+        self.reboot = Some(request);
         self
     }
 

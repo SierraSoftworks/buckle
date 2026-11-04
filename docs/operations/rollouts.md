@@ -41,7 +41,8 @@ A host's way through a phase:
 | plan pending, planned | The agent has not yet sent its plan, or has. |
 | held | Unhealthy before its wave, with `health.baseline: hold`: waits for an operator to force or skip it. |
 | applying | Applying its plan now. |
-| baking | Applied; its health checks repeat for the phase's `bake`. |
+| rebooting | Applied, and rebooting for a [`system.reboot`](../modules/tasks/system.md#system-reboot); fails if not back within its `timeout`. |
+| baking | Applied (and back from any reboot); its health checks repeat for the phase's `bake`. |
 | healthy | Passed its bake. |
 | failed | The apply failed, or a required check failed for longer than `settle`. |
 | rolled back | Back on the stable revision. |

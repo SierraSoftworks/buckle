@@ -378,6 +378,7 @@ fn entry(
         error: None,
         updated_at: now - Duration::minutes(mins_ago),
         bake_until: None,
+        reboot: None,
         needs_approval: false,
         needs_attention: false,
         error_detail: None,

@@ -130,6 +130,9 @@ pub fn log_report(report: &Report) {
         Report::Upgrade { version, outcome } => {
             tracing::info!(%version, outcome = ?outcome, "upgrade")
         }
+        Report::RebootFailed { error, .. } => {
+            tracing::error!(%error, "the reboot could not be started")
+        }
         Report::LocalRollback(record) => tracing::warn!(
             from = %record.from.short(),
             to = %record.to.short(),

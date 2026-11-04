@@ -97,6 +97,9 @@ pub struct ApplyArgs {
     /// Waive these checks (module/check) for this run.
     #[arg(long = "waive")]
     pub waive_checks: Vec<String>,
+    /// Do not reboot when the run asks for it (`system.reboot`); say so instead.
+    #[arg(long)]
+    pub no_reboot: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -369,6 +372,18 @@ pub async fn apply(args: ApplyArgs) -> buckle_core::Result<i32> {
             "{}",
             render::render_health(report, &local.inputs.waived_checks)
         );
+    }
+    if let Some(reboot) = &outcome.reboot {
+        println!();
+        let by = reboot.requested_by.join(", ");
+        if args.no_reboot {
+            println!("a reboot is needed ({by}); not rebooting (--no-reboot)");
+        } else {
+            println!("rebooting in {}s ({by})", reboot.delay.as_secs());
+            let _ = std::io::stdout().flush();
+            tokio::time::sleep(reboot.delay).await;
+            buckle_core::reboot::reboot(local.inputs.system.as_ref()).await?;
+        }
     }
     Ok(if outcome.succeeded { 0 } else { 1 })
 }
@@ -975,6 +990,7 @@ mod tests {
                 removals_run: vec![],
                 started_at: None,
                 finished_at: None,
+                reboot: None,
             })
             .unwrap();
         let mut out = Vec::new();

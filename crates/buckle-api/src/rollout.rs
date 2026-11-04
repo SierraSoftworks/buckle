@@ -41,6 +41,9 @@ pub enum HostRolloutState {
     Planned,
     Held,
     Applying,
+    /// Applied; the run asked for a reboot and the rollout waits for the
+    /// agent to come back from a new boot before it bakes.
+    Rebooting,
     Baking,
     Healthy,
     Failed,
@@ -87,6 +90,24 @@ pub struct RolloutHost {
     /// The host's run for this rollout, for `GET /rollouts/{id}/hosts/{host}/report`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// The reboot the host's run asked for in this rollout, once it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reboot: Option<HostReboot>,
+}
+
+/// A reboot a rollout host's run asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostReboot {
+    /// What asked for it: `module/kind[key]` or `owner:handler`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_by: Vec<String>,
+    /// When the result announcing it arrived.
+    pub since: DateTime<Utc>,
+    /// When the host fails if it has not come back from a new boot.
+    pub until: DateTime<Utc>,
+    /// When the agent came back from the reboot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -193,7 +193,9 @@ fn counts(hosts: &[&RolloutHost]) -> StageCounts {
         match h.state {
             HostRolloutState::Healthy => c.healthy += 1,
             HostRolloutState::Failed => c.failed += 1,
-            HostRolloutState::Applying | HostRolloutState::Baking => c.active += 1,
+            HostRolloutState::Applying | HostRolloutState::Rebooting | HostRolloutState::Baking => {
+                c.active += 1
+            }
             HostRolloutState::Held => c.held += 1,
             HostRolloutState::PlanPending => c.plan_pending += 1,
             HostRolloutState::Skipped => c.skipped += 1,
@@ -324,6 +326,7 @@ pub fn fleet_map(detail: &RolloutDetail, fleet: &[HostSummary]) -> RolloutDetail
             error: None,
             updated_at: h.last_seen.unwrap_or(h.first_seen),
             bake_until: None,
+            reboot: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -431,6 +434,7 @@ mod tests {
             error: None,
             updated_at: Utc::now() - Duration::seconds(age_secs),
             bake_until: None,
+            reboot: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,

@@ -407,6 +407,7 @@ mod tests {
             error: None,
             updated_at: now,
             bake_until: None,
+            reboot: None,
             needs_approval: stale,
             needs_attention: false,
             error_detail: None,

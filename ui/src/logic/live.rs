@@ -349,6 +349,7 @@ mod tests {
             error: None,
             updated_at: Utc::now(),
             bake_until: None,
+            reboot: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,

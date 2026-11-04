@@ -67,3 +67,31 @@ dependencies, prefer a systemd timer (a `file.template` unit plus `systemd.unit`
 ```
 
 <KindReference registry="tasks" kind="cron.job" />
+
+## system.reboot
+
+Reboot the host once the run has finished: usually a handler that boot-time changes notify.
+
+```yaml
+tasks:
+  - file.line: { path: /boot/firmware/config.txt, line: dtoverlay=rpi-poe-plus }
+    notify: [reboot]
+handlers:
+  reboot: { system.reboot: { delay: 5s, timeout: 10m } }
+```
+
+```yaml
+- system.reboot: { only_if: test -f /run/reboot-required }   # after unattended upgrades
+```
+
+<KindReference registry="tasks" kind="system.reboot" />
+
+- **After the run, once.** The run finishes every module, handler and removal, then reports with
+  the reboot pending; the agent reboots after the server acknowledges it (or a 60s grace when
+  offline), plus `delay`. Health checks the run had not reached yet run in the bake instead.
+- **In a rollout.** The host shows as **rebooting**; it bakes once its agent reconnects from a new
+  boot (at least 60s, with a fresh report), and fails under the phase's `max_failures` if it is
+  not back within `timeout`.
+- **Never unattended.** A drift correction does not reboot, and `buckle apply` takes
+  `--no-reboot` to only print the reboot. Without `only_if`, a task (not a handler) reboots on
+  every apply.

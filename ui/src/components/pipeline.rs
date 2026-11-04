@@ -21,8 +21,8 @@ use crate::logic::pipeline::{
     Gate, GateKind, GateState, OUTSIDE_STAGE, Stage, gate_check_tone, layout,
 };
 use crate::logic::tone::{
-    LEGEND, Tone, block_look, host_error_headline, host_error_tone, host_state_class,
-    host_state_label, outside_block_look, phase_state_label, phase_state_tone,
+    LEGEND, Tone, awaited_reboot, block_look, host_error_headline, host_error_tone,
+    host_state_class, host_state_label, outside_block_look, phase_state_label, phase_state_tone,
 };
 
 #[derive(Properties, PartialEq)]
@@ -266,6 +266,16 @@ fn block(
     }
     if let Some(until) = entry.bake_until.filter(|u| *u > now) {
         detail.push(html! { <span>{ "baking, " }<Countdown {until} />{ " left" }</span> });
+    }
+    if let Some(reboot) = awaited_reboot(entry, now) {
+        let why = match reboot.requested_by.as_slice() {
+            [] => String::new(),
+            by => format!(" for {}", by.join(", ")),
+        };
+        let until = reboot.until;
+        detail.push(
+            html! { <span>{ format!("rebooting{why}, back within ") }<Countdown {until} /></span> },
+        );
     }
     if !entry.failed_checks.is_empty() {
         detail

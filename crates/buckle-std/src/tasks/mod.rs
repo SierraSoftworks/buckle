@@ -42,5 +42,6 @@ pub mod docker_image;
 pub mod hostname_set;
 pub mod ssh_authorized_key;
 pub mod swap_file;
+pub mod system_reboot;
 pub mod user_account;
 pub mod user_group;

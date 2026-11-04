@@ -61,6 +61,10 @@ struct Script {
     /// On the next Apply, leave these deferred modules alone: their real
     /// plan diverged from the approved preview.
     stale_deferred: Vec<String>,
+    /// The boot the agent says it runs in.
+    boot_id: Option<String>,
+    /// Applies ask for this reboot.
+    reboot: Option<pb::Reboot>,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -382,6 +386,7 @@ impl Harness {
                                 causes: vec![],
                                 advice: vec!["Look at web's health checks.".into()],
                             }),
+                            reboot: s.reboot.clone(),
                             ..Default::default()
                         }));
                     }
@@ -412,6 +417,7 @@ impl Harness {
             } else {
                 vec!["force_plan".into(), "approval_digest".into()]
             },
+            boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
         });
     }
 
@@ -3447,4 +3453,165 @@ async fn a_deferred_module_that_diverged_from_its_preview_replans_the_host() {
         .filter(|(_, _, m)| matches!(m, SMsg::Plan(_)))
         .count();
     assert_eq!(plans, 2, "the host was asked to plan again");
+}
+
+// ---------------------------------------------------------------- reboots
+
+fn reboot(timeout_secs: i64) -> pb::Reboot {
+    pb::Reboot {
+        delay: Some(prost_types::Duration {
+            seconds: 5,
+            nanos: 0,
+        }),
+        timeout: Some(prost_types::Duration {
+            seconds: timeout_secs,
+            nanos: 0,
+        }),
+        boot_id: "boot-1".into(),
+        requested_by: vec!["pi:reboot".into()],
+    }
+}
+
+/// A one-host rollout whose apply asks for a reboot; returns once the host
+/// is rebooting.
+async fn rebooting(h: &mut Harness, timeout_secs: i64) -> String {
+    h.revision("r1", "  phases:\n    - { name: web, select: 'true' }\n")
+        .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| {
+        s.boot_id = Some("boot-1".into());
+        s.reboot = Some(reboot(timeout_secs));
+    });
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "rebooting", |_, hs| {
+        host(hs, "a").state == HostPhase::Rebooting
+    })
+    .await;
+    id
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rebooting_host_is_waited_for_until_its_agent_is_back_from_a_new_boot() {
+    let mut h = Harness::new().await;
+    let id = rebooting(&mut h, 1800).await;
+    // Away for longer than the disconnect timeout: the reboot timeout governs.
+    h.disconnect("a");
+    h.idle(11 * 60).await;
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Rebooting);
+    // A session from the same boot (before the reboot happened) is not it.
+    h.connect("a", Some("r1"));
+    h.idle(5).await;
+    assert_eq!(h.snapshot(&id).await.1[0].state, HostPhase::Rebooting);
+    h.disconnect("a");
+    h.script("a", |s| s.boot_id = Some("boot-2".into()));
+    let back = h.clock.now();
+    h.connect("a", Some("r1"));
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.state, HostPhase::Healthy);
+    assert!(
+        a.runtime
+            .reboot
+            .as_ref()
+            .is_some_and(|w| w.back_at.is_some())
+    );
+    // Its deferred checks ran after the reboot, for at least a minute.
+    let bake: Vec<DateTime<Utc>> = h
+        .sent(|host, m| {
+            host == "a" && matches!(m, SMsg::Health(x) if x.scope == HealthScope::Bake as i32)
+        })
+        .into_iter()
+        .map(|(at, _, _)| at)
+        .collect();
+    assert!(!bake.is_empty() && bake.iter().all(|at| *at >= back));
+    assert!(r.finished_at.unwrap() - back >= chrono::Duration::seconds(60));
+    let actions = h.audit_actions(&id).await;
+    for action in ["rollout.host.rebooting", "rollout.host.rebooted"] {
+        assert!(
+            actions.iter().any(|a| a == action),
+            "{action} in {actions:?}"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NotBack {
+    Offline,
+    SameBoot,
+    RebootFailed,
+}
+
+#[rstest::rstest]
+#[case::offline(NotBack::Offline, "did not come back")]
+#[case::never_rebooted(NotBack::SameBoot, "still up on the same boot")]
+#[case::reboot_failed(NotBack::RebootFailed, "Access denied")]
+#[tokio::test(start_paused = true)]
+async fn a_host_that_does_not_come_back_from_its_reboot_fails(
+    #[case] how: NotBack,
+    #[case] reason: &str,
+) {
+    let mut h = Harness::new().await;
+    let id = rebooting(&mut h, 300).await;
+    match how {
+        NotBack::Offline => h.disconnect("a"),
+        NotBack::SameBoot => {}
+        NotBack::RebootFailed => h.handle.agent_message(
+            "a",
+            AMsg::RebootFailed(pb::RebootFailed {
+                boot_id: "boot-1".into(),
+                error: "`systemctl reboot` failed: Access denied".into(),
+            }),
+        ),
+    }
+    let (_, hosts) = h
+        .wait(&id, "failed", |_, hs| {
+            host(hs, "a").state == HostPhase::Failed
+        })
+        .await;
+    let error = host(&hosts, "a").runtime.error.clone().unwrap_or_default();
+    assert!(error.contains(reason), "{error}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_result_that_arrives_after_the_reboot_goes_straight_to_baking() {
+    let mut h = Harness::new().await;
+    h.revision("r1", "  phases:\n    - { name: web, select: 'true' }\n")
+        .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| {
+        s.boot_id = Some("boot-1".into());
+        s.silent_apply = true;
+    });
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    let apply = h.wait_apply(&id, "a").await;
+    // The agent rebooted before the server acknowledged the result: it comes
+    // back from another boot and re-sends it.
+    h.disconnect("a");
+    h.script("a", |s| s.boot_id = Some("boot-2".into()));
+    h.attach("a");
+    h.connect_with("a", Some("r1"), vec!["r1".into()]);
+    h.idle(5).await;
+    assert_eq!(h.snapshot(&id).await.1[0].state, HostPhase::Applying);
+    h.handle.agent_message(
+        "a",
+        AMsg::Result(ApplyResult {
+            revision: "r1".into(),
+            plan_digest: apply.plan_digest,
+            succeeded: true,
+            applied_revision: "r1".into(),
+            reboot: Some(reboot(300)),
+            ..Default::default()
+        }),
+    );
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Healthy);
+    assert!(
+        h.audit_actions(&id)
+            .await
+            .iter()
+            .any(|a| a == "rollout.host.rebooted")
+    );
 }

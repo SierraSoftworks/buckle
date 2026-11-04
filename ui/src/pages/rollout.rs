@@ -34,7 +34,7 @@ use crate::logic::plan::{ApprovalScope, approval_scope, host_tally};
 use crate::logic::run::RolloutActivity;
 use crate::logic::ticker::{Source, Ticker, ticker};
 use crate::logic::tone::{
-    Tone, host_error_headline, host_error_tone, host_state_label, host_state_tone,
+    Tone, awaited_reboot, host_error_headline, host_error_tone, host_state_label, host_state_tone,
     phase_state_label, phase_state_tone, rollout_finished, rollout_state_label, rollout_state_tone,
 };
 use crate::store::use_live;
@@ -757,6 +757,7 @@ fn updated(d: &RolloutDetail) -> usize {
                 h.state,
                 HostRolloutState::Healthy
                     | HostRolloutState::Baking
+                    | HostRolloutState::Rebooting
                     | HostRolloutState::Applying
                     | HostRolloutState::Failed
             )
@@ -807,7 +808,7 @@ fn tone_of_event(kind: &str) -> Tone {
 }
 
 /// A host's lifecycle ticker: its states as segments of a bar, a dashed
-/// remainder for a bake still under way, and its events as markers above
+/// remainder for a bake or reboot still under way, and its events as markers above
 /// the bar, each with the whole event in a popover.
 fn ticker_view(t: &Ticker<'_>, t0: DateTime<Utc>, now: DateTime<Utc>) -> Html {
     let segments = t.segments.iter().map(|seg| {
@@ -822,12 +823,16 @@ fn ticker_view(t: &Ticker<'_>, t0: DateTime<Utc>, now: DateTime<Utc>) -> Html {
             </span>
         }
     });
-    let planned = t.bake_until.map(|until| {
+    let planned = t.planned.map(|(state, until)| {
         let (left, right) = (t.pct(now), t.pct(until));
+        let title = match state {
+            HostRolloutState::Rebooting => format!("must be back by {}", since(until, t0)),
+            _ => format!("bake ends at {}", since(until, t0)),
+        };
         html! {
-            <span class="ticker__seg ticker__seg--planned tone-active"
+            <span class={classes!("ticker__seg", "ticker__seg--planned", host_state_tone(state).class())}
                 style={format!("left: {left:.2}%; width: {:.2}%", right - left)}
-                title={format!("bake ends at {}", since(until, t0))} />
+                {title} />
         }
     });
     let markers = t.markers.iter().map(|m| {
@@ -983,6 +988,9 @@ fn host_table(props: &HostTableProps) -> Html {
                                     if let Some(until) = h.bake_until.filter(|u| *u > props.now) {
                                         <span class="small muted">{ " " }<Countdown {until} /></span>
                                     }
+                                    if let Some(r) = awaited_reboot(h, props.now) {
+                                        <span class="small muted" title={format!("fails unless back by {}", timestamp(r.until))}>{ " back within " }<Countdown until={r.until} /></span>
+                                    }
                                     if let Some(now) = props.activity.get(&h.host).filter(|_| h.state == HostRolloutState::Applying) {
                                         <span class="cell-sub mono" data-testid="host-activity">{ now.clone() }</span>
                                     }
@@ -1047,6 +1055,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         || matches!(
             h.state,
             HostRolloutState::Applying
+                | HostRolloutState::Rebooting
                 | HostRolloutState::Baking
                 | HostRolloutState::Healthy
                 | HostRolloutState::Failed
@@ -1086,6 +1095,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         run_started: run.report.as_ref().and_then(|r| r.started_at),
         run_finished: run.report.as_ref().and_then(|r| r.finished_at),
         bake_until: h.bake_until,
+        reboot_until: h.reboot.as_ref().map(|r| r.until),
         now: props.now,
     });
     html! {

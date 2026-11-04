@@ -27,6 +27,7 @@ pub mod health;
 pub mod model;
 pub mod plan;
 pub mod platform;
+pub mod reboot;
 pub mod secrets;
 pub mod selectors;
 pub mod state;

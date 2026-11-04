@@ -83,6 +83,11 @@ pub fn host(
         needs_attention: h.runtime.needs_attention,
         error_detail: h.runtime.error_detail.clone(),
         run_id: None,
+        reboot: h
+            .runtime
+            .reboot
+            .as_ref()
+            .map(super::model::RebootWait::view),
     }
 }
 

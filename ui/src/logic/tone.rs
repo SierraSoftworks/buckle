@@ -5,9 +5,10 @@
 //! (`--ok`, `--danger`, …) and the stylesheet maps it onto the active theme.
 
 use buckle_api::{
-    Connection, ErrorKind, HealthSummary, HostRolloutState, HostStatus, HostSummary, PhaseState,
-    RevisionStatus, RolloutHost, RolloutState,
+    Connection, ErrorKind, HealthSummary, HostReboot, HostRolloutState, HostStatus, HostSummary,
+    PhaseState, RevisionStatus, RolloutHost, RolloutState,
 };
+use chrono::{DateTime, Utc};
 
 /// How much attention something asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub fn host_state_label(state: HostRolloutState) -> &'static str {
         HostRolloutState::Planned => "planned",
         HostRolloutState::Held => "held",
         HostRolloutState::Applying => "applying",
+        HostRolloutState::Rebooting => "rebooting",
         HostRolloutState::Baking => "baking",
         HostRolloutState::Healthy => "healthy",
         HostRolloutState::Failed => "failed",
@@ -62,7 +64,9 @@ pub fn host_state_tone(state: HostRolloutState) -> Tone {
         }
         HostRolloutState::Planned => Tone::Info,
         HostRolloutState::Held => Tone::Warn,
-        HostRolloutState::Applying | HostRolloutState::Baking => Tone::Active,
+        HostRolloutState::Applying | HostRolloutState::Rebooting | HostRolloutState::Baking => {
+            Tone::Active
+        }
         HostRolloutState::Healthy => Tone::Ok,
         HostRolloutState::Failed => Tone::Danger,
         HostRolloutState::RolledBack => Tone::Mute,
@@ -79,6 +83,7 @@ pub fn host_state_class(state: HostRolloutState) -> &'static str {
         HostRolloutState::Planned => "block--planned",
         HostRolloutState::Held => "block--held",
         HostRolloutState::Applying => "block--applying",
+        HostRolloutState::Rebooting => "block--rebooting",
         HostRolloutState::Baking => "block--baking",
         HostRolloutState::Healthy => "block--healthy",
         HostRolloutState::Failed => "block--failed",
@@ -94,6 +99,7 @@ pub const LEGEND: &[HostRolloutState] = &[
     HostRolloutState::Planned,
     HostRolloutState::Held,
     HostRolloutState::Applying,
+    HostRolloutState::Rebooting,
     HostRolloutState::Baking,
     HostRolloutState::Healthy,
     HostRolloutState::Failed,
@@ -141,7 +147,8 @@ pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook 
             classes.push("block--regressed");
             label.push_str(", health failing");
         }
-        if host.connection == Connection::Offline {
+        // A rebooting host is offline by design: the state says so already.
+        if host.connection == Connection::Offline && entry.state != HostRolloutState::Rebooting {
             classes.push("block--offline");
             label.push_str(", offline");
         }
@@ -365,10 +372,17 @@ pub fn host_error_headline(entry: &RolloutHost) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The reboot a rollout host is still being waited for: rebooting, not yet
+/// back, and not yet past its deadline.
+pub fn awaited_reboot(entry: &RolloutHost, now: DateTime<Utc>) -> Option<&HostReboot> {
+    entry.reboot.as_ref().filter(|r| {
+        entry.state == HostRolloutState::Rebooting && r.back_at.is_none() && r.until > now
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use std::collections::BTreeMap;
 
     fn entry(state: HostRolloutState) -> RolloutHost {
@@ -386,6 +400,7 @@ mod tests {
             error: None,
             updated_at: Utc::now(),
             bake_until: None,
+            reboot: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -479,6 +494,13 @@ mod tests {
             Some(&host(HealthSummary::Failing, Connection::Online)),
         );
         assert!(!pending.classes.contains(&"block--regressed"));
+
+        // Offline is what a reboot looks like, not news.
+        let rebooting = block_look(
+            &entry(HostRolloutState::Rebooting),
+            Some(&host(HealthSummary::Healthy, Connection::Offline)),
+        );
+        assert_eq!(rebooting.classes, vec!["block", "block--rebooting"]);
     }
 
     #[test]
