@@ -75,8 +75,12 @@ pub fn overview() -> Html {
         (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={fleet.reload.clone()} /> },
         (None, None) => html! { <Loading label="Reading the fleet…" /> },
         (Some(f), _) => {
-            let hosts: BTreeMap<String, _> =
-                f.hosts.iter().chain(&f.clusters).map(|h| (h.id.clone(), h.clone())).collect();
+            let hosts: BTreeMap<String, _> = f
+                .hosts
+                .iter()
+                .chain(&f.clusters)
+                .map(|h| (h.id.clone(), h.clone()))
+                .collect();
             let waiting = latest_id.is_some() && rollout_live.is_none();
             let plan_groups = rollout_live
                 .as_ref()
