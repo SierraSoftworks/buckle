@@ -20,10 +20,10 @@ pub mod sse;
 use std::cell::RefCell;
 
 use buckle_api::{
-    ActionRequest, ApproveRequest, AuditEntry, ContinueRequest, CsrfToken, ErrorBody, Fleet,
-    HostDetail, HostPatch, HostPreview, HostSummary, JoinOptions, JoinRequest, JoinTicket, Me,
-    Page, PlanGroup, RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary, RunReport,
-    RunSummary, StartRollout, UpgradeRequest,
+    ActionRequest, ApproveRequest, AuditEntry, ContinueRequest, CreateTarget, CsrfToken, ErrorBody,
+    ExecutorSpec, Fleet, HostDetail, HostPatch, HostPreview, HostSummary, JoinOptions, JoinRequest,
+    JoinTicket, Me, Page, PlanGroup, RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary,
+    RunReport, RunSummary, StartRollout, UpgradeRequest,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -328,6 +328,19 @@ pub async fn forget_host(id: &str) -> Result<(), ApiError> {
     send::<()>(Method::Delete, &format!("/hosts/{}", enc(id)), None)
         .await
         .map(|_| ())
+}
+
+// ------------------------------------------------------------------ cluster targets
+
+/// `POST /targets`: a cluster target buckle.yaml does not declare.
+pub async fn create_target(request: &CreateTarget) -> Result<HostSummary, ApiError> {
+    write(Method::Post, "/targets", Some(request)).await
+}
+
+/// `GET /targets/{id}/executor`: the job that runs a cluster's executor
+/// inside it.
+pub async fn target_executor(id: &str) -> Result<ExecutorSpec, ApiError> {
+    get(&format!("/targets/{}/executor", enc(id))).await
 }
 
 // ------------------------------------------------------------------ joining hosts

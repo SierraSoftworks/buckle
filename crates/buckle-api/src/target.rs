@@ -148,6 +148,30 @@ impl ClusterTrust {
     }
 }
 
+/// What an operator runs to put an executor inside a cluster
+/// (`GET /api/v1/targets/{id}/executor`): the job, the ACL policy it runs
+/// under, the commands that install both, and the `trust` the cluster
+/// needs so the server accepts the executor's workload identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorSpec {
+    pub target: String,
+    /// The executor's host id.
+    pub host_id: String,
+    /// The job file name and contents (`buckle-executor.nomad.hcl`).
+    pub job_file: String,
+    pub job: String,
+    /// The ACL policy file name and contents.
+    pub policy_file: String,
+    pub policy: String,
+    /// Shell commands, in order, run with a management token.
+    pub commands: Vec<String>,
+    /// The `trust` to give the cluster (merged into its spec by the UI).
+    pub trust: ClusterTrust,
+    /// What the operator should know first (server settings, gaps).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
 impl ClusterSpec {
     pub fn default_identity() -> String {
         "buckle_jwt".to_owned()

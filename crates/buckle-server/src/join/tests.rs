@@ -21,6 +21,7 @@ fn settings() -> JoinSettings {
         methods: vec![JoinMethod::Tailscale, JoinMethod::Token],
         approval_required: false,
         tailscale: None,
+        workload_identity: false,
     }
 }
 

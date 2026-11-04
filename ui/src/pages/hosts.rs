@@ -71,6 +71,7 @@ pub fn hosts() -> Html {
     let approving = use_state(|| None::<String>);
     let upgrading = use_state(|| false);
     let adding = use_state(|| false);
+    let adding_cluster = use_state(|| false);
     let busy = use_state(|| false);
     // Back from Tailscale with a ticket: the wizard stays open on it until closed.
     {
@@ -320,10 +321,17 @@ pub fn hosts() -> Html {
                         <Button onclick={{ let u = upgrading.clone(); Callback::from(move |_| u.set(true)) }}>{ "Upgrade all agents…" }</Button>
                     }
                     if auth.is_admin() {
+                        <Button onclick={{ let a = adding_cluster.clone(); Callback::from(move |_| a.set(true)) }}>{ "Add a cluster…" }</Button>
                         <Button kind={Kind::Primary} onclick={{ let a = adding.clone(); Callback::from(move |_| a.set(true)) }}>{ icons::plus() }{ "Add an agent…" }</Button>
                     }
                 </> }} />
             <Panel>{ body }</Panel>
+            if auth.is_admin() && *adding_cluster {
+                <super::add_cluster::AddCluster on_close={{
+                    let (a, reload) = (adding_cluster.clone(), fleet.reload.clone());
+                    Callback::from(move |_| { a.set(false); reload.emit(()); })
+                }} />
+            }
             if auth.is_admin() && *adding {
                 <super::add_agent::AddAgent
                     hosts={live.as_ref().map(|f| f.hosts.clone()).unwrap_or_default()}
