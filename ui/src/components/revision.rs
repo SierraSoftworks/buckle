@@ -6,6 +6,7 @@ use buckle_api::{RevisionStatus, RevisionSummary, RolloutSummary};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
+use crate::components::error_block::ErrorBlock;
 use crate::components::ui::Note;
 use yew_router::prelude::*;
 
@@ -268,10 +269,12 @@ pub fn revision_log(props: &RevisionLogProps) -> Html {
                         <CommitCard commit={Commit::from(r)} rollout={rollout.cloned()} say_rollout=false body=true now={props.now}
                             actions={html! { <RevisionControls revision={r.clone()} rollout={rollout.cloned()} {stable_at} open={props.open.clone()} /> }}>
                             if rejected {
-                                <ul class="errors" aria-label="Validation errors">
-                                    { for r.validation_errors.iter().map(|e| html! { <li class="mono">{ e.clone() }</li> }) }
-                                    if r.validation_errors.is_empty() { <li>{ "Rejected without a reason recorded." }</li> }
-                                </ul>
+                                <div class="errors" aria-label="Validation errors">
+                                    { for r.validation_errors.iter().map(|e| html! {
+                                        <ErrorBlock error={crate::logic::error_text::parse(e)} />
+                                    }) }
+                                    if r.validation_errors.is_empty() { <p class="muted">{ "Rejected without a reason recorded." }</p> }
+                                </div>
                             }
                             { match rollout {
                                 Some(x) => html! { <RolloutProgress rollout={x.clone()} now={props.now} /> },

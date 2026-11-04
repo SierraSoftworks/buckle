@@ -6,6 +6,7 @@
 pub mod blueprint;
 pub mod controls;
 pub mod diff;
+pub mod error_text;
 pub mod filter;
 pub mod fleet;
 pub mod fleet_plan;
