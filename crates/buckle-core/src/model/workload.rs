@@ -245,6 +245,10 @@ pub struct WorkloadConfig {
     /// allocations; a Deployment's rollout and pods).
     #[serde(default)]
     pub health: Vec<HealthDecl>,
+    /// How long a rollout watches the cluster after a run that changed this
+    /// workload; the phase's `bake` is the minimum.
+    #[serde(default, with = "humantime_serde")]
+    pub bake: Option<std::time::Duration>,
     /// Keys whose change restarts the job even when its spec did not change
     /// (`[variables]` for a job without a `template` stanza).
     #[serde(default)]

@@ -413,6 +413,11 @@ pub struct ModuleConfig {
     pub handlers: IndexMap<String, TaskDecl>,
     #[serde(default)]
     pub health: Vec<HealthDecl>,
+    /// How long a rollout watches a host after a run that changed this
+    /// module. The phase's `bake` is the minimum; a run that changed nothing
+    /// does not bake.
+    #[serde(default, with = "humantime_serde")]
+    pub bake: Option<Duration>,
     #[serde(default)]
     pub facts: ModuleFacts,
     #[serde(default)]

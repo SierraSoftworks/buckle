@@ -4,6 +4,7 @@
 //! audit rows, broadcast as live events, and only then are the resulting
 //! messages sent to hosts.
 
+use super::bake::{self, BakeWindow};
 use super::link::HostLink;
 use super::model::{
     GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, RebootWait, RolloutHostRecord,
@@ -604,6 +605,24 @@ fn awaits_reconnect(state: HostPhase) -> bool {
                 state,
                 HostPhase::RollingBack | HostPhase::PlanPending | HostPhase::Planned
             ))
+}
+
+/// The `bake` of row `h`'s phase, in seconds.
+fn phase_bake(phases: &[PhaseRuntime], h: &RolloutHostRecord) -> u64 {
+    h.runtime
+        .phase_index
+        .and_then(|i| phases.get(i))
+        .map(|p| p.bake_seconds)
+        .unwrap_or(0)
+}
+
+/// Row `h`'s bake window before any reboot: what its step resolved to,
+/// else its phase's.
+fn row_bake(phases: &[PhaseRuntime], h: &RolloutHostRecord) -> u64 {
+    h.runtime
+        .bake
+        .as_ref()
+        .map_or_else(|| phase_bake(phases, h), |b| b.seconds)
 }
 
 /// The shortest bake after a reboot, so that services coming up get checked.
@@ -1583,6 +1602,11 @@ impl Controller {
                     }
                     // The agent accepted and ran the approved plan.
                     self.live[ri].hosts[hi].runtime.stale_refusals = 0;
+                    if result.succeeded {
+                        let changed = self.result_changes(ri, hi, &result);
+                        self.live[ri].hosts[hi].runtime.bake =
+                            Some(self.bake_window(ri, hi, changed));
+                    }
                     if let Some(reboot) = &result.reboot {
                         self.await_reboot(ri, hi, reboot);
                     }
@@ -2419,6 +2443,7 @@ impl Controller {
                     h.runtime.failing_since.clear();
                     h.runtime.request_id = None;
                     h.runtime.bake_until = None;
+                    h.runtime.bake = None;
                     h.runtime.stale_refusals = 0;
                     if state != HostPhase::Held {
                         h.runtime.attempts += 1;
@@ -2962,6 +2987,7 @@ impl Controller {
             h.runtime.failing_since.clear();
             h.runtime.request_id = None;
             h.runtime.bake_until = None;
+            h.runtime.bake = None;
             h.runtime.attempts += 1;
             h.runtime.stale_refusals = 0;
             h.runtime.released = true;
@@ -3228,6 +3254,7 @@ impl Controller {
         h.runtime.apply_started_at = Some(now);
         h.runtime.apply_resends = 0;
         h.runtime.reboot = None;
+        h.runtime.bake = None;
         self.set_host_state(ri, hi, HostPhase::Applying, "apply sent");
         self.touch_host(ri, hi);
         self.send_to(ri, hi, server_message::Msg::Apply(apply));
@@ -3235,15 +3262,18 @@ impl Controller {
 
     fn start_bake(&mut self, ri: usize, hi: usize) {
         let now = self.now();
-        let pi = self.live[ri].hosts[hi].runtime.phase_index.unwrap_or(0);
-        let bake = self.live[ri]
-            .record
-            .runtime
-            .phases
-            .get(pi)
-            .map(|p| p.bake_seconds)
-            .unwrap_or(0);
-        let bake = self.reboot_bake(ri, hi, bake);
+        // Without the run's result (the host reconnected already on the
+        // target revision), its plan says what it changed.
+        if self.live[ri].hosts[hi].runtime.bake.is_none() {
+            let changed = self.plan_changes(ri, hi);
+            self.live[ri].hosts[hi].runtime.bake = Some(self.bake_window(ri, hi, changed));
+        }
+        let bake = self.bake_seconds(ri, hi);
+        let why = match &self.live[ri].hosts[hi].runtime.bake {
+            Some(w) if bake > w.seconds => "back from its reboot; baking".to_owned(),
+            Some(w) => bake::reason(w),
+            None => "applied; baking".to_owned(),
+        };
         let until = now + chrono::Duration::seconds(bake as i64);
         {
             let h = &mut self.live[ri].hosts[hi];
@@ -3252,21 +3282,69 @@ impl Controller {
             h.runtime.bake_reports = 0;
             h.runtime.bake_requests.clear();
         }
-        self.set_host_state(ri, hi, HostPhase::Baking, "applied; baking");
+        self.set_host_state(ri, hi, HostPhase::Baking, &why);
         if bake > 0 {
             self.send_bake_request(ri, hi, until);
         }
     }
 
-    /// The bake window of host `hi`'s phase, in seconds.
+    /// Row `hi`'s bake window in seconds: what its step resolved to (see
+    /// [`bake`]), else its phase's.
     fn bake_seconds(&self, ri: usize, hi: usize) -> u64 {
-        let bake = self.live[ri].hosts[hi]
-            .runtime
-            .phase_index
-            .and_then(|i| self.live[ri].record.runtime.phases.get(i))
-            .map(|p| p.bake_seconds)
-            .unwrap_or(0);
+        let live = &self.live[ri];
+        let bake = row_bake(&live.record.runtime.phases, &live.hosts[hi]);
         self.reboot_bake(ri, hi, bake)
+    }
+
+    /// The bake window for row `hi`'s step having changed `changed` (None:
+    /// unknown, so the phase's): the phase's `bake` raised by the changed
+    /// modules' (or a cluster's workloads') own.
+    fn bake_window(&self, ri: usize, hi: usize, changed: Option<BTreeSet<String>>) -> BakeWindow {
+        let live = &self.live[ri];
+        let min = phase_bake(&live.record.runtime.phases, &live.hosts[hi]);
+        let Some(changed) = changed else {
+            return BakeWindow {
+                seconds: min,
+                ..Default::default()
+            };
+        };
+        let revision = &live.revision;
+        let cluster = live.hosts[hi].runtime.kind == TargetKind::Cluster;
+        bake::window(min, &changed, |name| {
+            if cluster {
+                revision.workload(name).and_then(|w| w.config.bake)
+            } else {
+                revision.module(name).and_then(|m| m.config.bake)
+            }
+        })
+    }
+
+    /// The modules a successful run changed, from its outcome; from older
+    /// agents' results, nothing when it counted no changes, else what the
+    /// plan expected.
+    fn result_changes(
+        &self,
+        ri: usize,
+        hi: usize,
+        result: &ApplyResult,
+    ) -> Option<BTreeSet<String>> {
+        if let Ok(outcome) =
+            serde_json::from_slice::<buckle_core::engine::ApplyOutcome>(&result.outcome_json)
+        {
+            return Some(bake::changed(&outcome));
+        }
+        if result.changes == 0 && result.removals == 0 {
+            return Some(BTreeSet::new());
+        }
+        self.plan_changes(ri, hi)
+    }
+
+    /// The modules row `hi`'s plan expects to change, when it has one.
+    fn plan_changes(&self, ri: usize, hi: usize) -> Option<BTreeSet<String>> {
+        let plan = self.live[ri].hosts[hi].plan.as_ref()?;
+        serde_json::from_value::<buckle_core::plan::Plan>(plan.clone())
+            .ok()
+            .map(|p| bake::planned(&p))
     }
 
     /// A host back from a reboot bakes for at least `settle` (and a minute),
@@ -3464,6 +3542,7 @@ impl Controller {
             h.wave = None;
             h.runtime.request_id = None;
             h.runtime.bake_until = None;
+            h.runtime.bake = None;
             h.runtime.failing_since.clear();
             h.runtime.bake_reports = 0;
             h.runtime.bake_requests.clear();
@@ -3555,11 +3634,7 @@ impl Controller {
                     // complete the host now; while a check is followed through
                     // settle it would spin (settle is the deadline then), and
                     // a host that has not reported is waited for a grace.
-                    let window = h
-                        .runtime
-                        .phase_index
-                        .and_then(|i| l.record.runtime.phases.get(i))
-                        .is_some_and(|p| p.bake_seconds > 0)
+                    let window = row_bake(&l.record.runtime.phases, h) > 0
                         || h.runtime
                             .reboot
                             .as_ref()

@@ -73,6 +73,7 @@ health:
 | `tasks` | The ordered list of [tasks](./tasks/README.md). |
 | `handlers` | Named tasks run at the end of the module when a task notifies them. |
 | `health` | [Health checks](./health.md) for this module. |
+| `bake` | How long a rollout bakes a host whose run changed this module, when longer than the phase's `bake` (see [Bake and promote](../operations/rollouts.md#_4-bake-and-promote)). |
 | `facts.provides` | Fact providers to refresh after this module applies (for example `[tailscale]`), so dependants see the new values. |
 | `removal.policy` | `cleanup` or `leave`: the default [removal](#removal) for this module's tasks. |
 

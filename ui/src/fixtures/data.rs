@@ -384,6 +384,7 @@ fn entry(
         kind: Default::default(),
         stage: 0,
         executor: None,
+        bake: None,
         needs_approval: false,
         needs_attention: false,
         error_detail: None,
@@ -457,6 +458,11 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
 
     let mut pi3 = entry("pi-3", "home", 2, S::Baking, Some(PLAN_NOMAD), now, 2);
     pi3.bake_until = Some(now + Duration::seconds(200));
+    pi3.bake = Some(buckle_api::rollout::BakeWindow {
+        seconds: 900,
+        module: Some("nomad".into()),
+        unchanged: false,
+    });
     let mut pi5 = entry("pi-5", "home", 1, S::Failed, Some(PLAN_NOMAD), now, 4);
     pi5.failed_module = Some("nomad".into());
     pi5.failed_checks = vec!["nomad/api".into()];

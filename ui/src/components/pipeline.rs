@@ -170,7 +170,7 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
     let bake = match until {
         Some(until) if until > now => html! { <Countdown {until} prefix="bake" /> },
         _ if phase.bake_seconds > 0 => {
-            html! { <span>{ format!("bake {}", config_duration(phase.bake_seconds)) }</span> }
+            html! { <span title="the minimum: a changed module's own bake can be longer, and a host whose run changed nothing does not bake">{ format!("bake {}", config_duration(phase.bake_seconds)) }</span> }
         }
         _ => html! {},
     };
@@ -265,7 +265,13 @@ fn block(
         detail.push(html! { <span class="mono">{ format!("plan {}", short(digest)) }</span> });
     }
     if let Some(until) = entry.bake_until.filter(|u| *u > now) {
-        detail.push(html! { <span>{ "baking, " }<Countdown {until} />{ " left" }</span> });
+        let why = match entry.bake.as_ref().and_then(|b| b.module.as_deref()) {
+            Some(module) => format!("baking for {module}, "),
+            None => "baking, ".to_owned(),
+        };
+        detail.push(html! { <span>{ why }<Countdown {until} />{ " left" }</span> });
+    } else if entry.bake.as_ref().is_some_and(|b| b.unchanged) {
+        detail.push(html! { <span class="muted">{ "nothing changed, no bake" }</span> });
     }
     if let Some(reboot) = awaited_reboot(entry, now) {
         let why = match reboot.requested_by.as_slice() {

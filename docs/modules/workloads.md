@@ -54,6 +54,7 @@ removal: stop
 | `vars` | Defaults, overridden by the fleet's `vars` overlays; on Nomad, those the job declares a `variable` for become its HCL2 variables (fleet overlays reach every target, and Nomad refuses undeclared ones). |
 | `namespace` | The namespace the workload's entities live in, created if missing. Absent: the scheduler's default. |
 | `health` | Checks beside the implicit ones (the job's deployment and allocations; a Deployment's rollout). |
+| `bake` | How long a rollout bakes the cluster after a run that changed this workload, when longer than the phase's `bake`. |
 | `restart_on` | Keys whose change restarts the job even when the spec did not change. |
 | `removal` | What happens when the workload is dropped: `stop` (default), `purge` or `keep`. |
 

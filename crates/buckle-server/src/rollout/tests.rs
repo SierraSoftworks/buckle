@@ -72,6 +72,8 @@ struct Script {
     /// Never answer an Apply aimed at a cluster target (the agent's own
     /// applies are answered).
     silent_target_apply: bool,
+    /// The modules a successful apply changed; None: `web`.
+    changed: Option<Vec<String>>,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -421,6 +423,7 @@ impl Harness {
                             continue;
                         }
                         let failed = s.apply_fail.clone();
+                        let changed = s.changed.clone().unwrap_or_else(|| vec!["web".into()]);
                         reply(AMsg::Result(ApplyResult {
                             target: a.target.clone(),
                             revision: a.revision.clone(),
@@ -445,6 +448,8 @@ impl Harness {
                                 advice: vec!["Look at web's health checks.".into()],
                             }),
                             reboot: s.reboot.clone(),
+                            changes: changed.len() as u32,
+                            outcome_json: outcome_json(&changed),
                             ..Default::default()
                         }));
                     }
@@ -601,6 +606,21 @@ impl Harness {
     async fn command(&self, cmd: Command) -> Result<String, CommandError> {
         self.handle.command("alice", cmd).await
     }
+}
+
+/// An agent's `ApplyOutcome` JSON for a run that changed `changed`.
+fn outcome_json(changed: &[String]) -> Vec<u8> {
+    let modules: Vec<_> = changed
+        .iter()
+        .map(|m| serde_json::json!({"module": m, "status": "applied", "changes": 1, "duration_ms": 0}))
+        .collect();
+    let json = serde_json::json!({
+        "plan_digest": "d", "succeeded": true, "changes": changed.len(), "removals": 0,
+        "duration_ms": 0, "module_results": modules, "rolled_back_modules": [], "not_started": [],
+    });
+    serde_json::from_value::<buckle_core::engine::ApplyOutcome>(json.clone())
+        .expect("the outcome parses as an agent's");
+    serde_json::to_vec(&json).unwrap()
 }
 
 fn host<'a>(hosts: &'a [RolloutHostRecord], id: &str) -> &'a RolloutHostRecord {
@@ -834,6 +854,63 @@ async fn a_percentage_budget_pauses_on_the_right_count() {
         2,
         "10% of 10 tolerates one failure; the second pauses"
     );
+}
+
+/// A host bakes for its phase's `bake`, raised by the `bake` of each module
+/// its run changed; a host whose run changed nothing does not bake.
+#[tokio::test(start_paused = true)]
+async fn a_host_bakes_for_the_longest_bake_among_the_modules_it_changed() {
+    let mut h = Harness::new().await;
+    h.revision_with(
+        "r1",
+        "  health: { bake: 1m }\n  phases:\n    - { name: web, select: 'true', parallel: 3 }\n",
+        "",
+        &[
+            ("modules/web/module.yaml", "name: web\n"),
+            ("modules/nomad/module.yaml", "name: nomad\nbake: 10m\n"),
+            ("modules/shell/module.yaml", "name: shell\nbake: 5s\n"),
+        ],
+    )
+    .await;
+    for (host, changed) in [
+        ("a", vec!["nomad", "web"]),
+        ("b", vec!["shell", "web"]),
+        ("c", vec![]),
+    ] {
+        h.enrol(host, "web").await;
+        h.script(host, |s| {
+            s.changed = Some(changed.into_iter().map(String::from).collect())
+        });
+        h.connect(host, None);
+    }
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(
+            &id,
+            "the unchanged host done while the others bake",
+            |_, hs| {
+                host(hs, "c").state == HostPhase::Healthy
+                    && host(hs, "a").state == HostPhase::Baking
+                    && host(hs, "b").state == HostPhase::Baking
+            },
+        )
+        .await;
+    let window = |id: &str| host(&hosts, id).runtime.bake.clone().unwrap();
+    assert_eq!(window("a").seconds, 600);
+    assert_eq!(window("a").module.as_deref(), Some("nomad"));
+    assert_eq!(window("b").seconds, 60, "the phase's bake is the minimum");
+    assert!(window("c").unchanged);
+    let (_, hosts) = h
+        .wait(&id, "b baked", |_, hs| {
+            host(hs, "b").state == HostPhase::Healthy
+        })
+        .await;
+    assert_eq!(
+        host(&hosts, "a").state,
+        HostPhase::Baking,
+        "nomad's bake outlasts the phase's"
+    );
+    h.wait_state(&id, RolloutState::Completed).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -3281,6 +3358,8 @@ async fn a_durable_report_stored_before_a_crash_is_replayed_on_start_up() {
         succeeded: true,
         applied_revision: apply.revision.clone(),
         report_id: 42,
+        changes: 1,
+        outcome_json: outcome_json(&["web".into()]),
         ..Default::default()
     });
     // What the gRPC layer commits before handing the report over.
