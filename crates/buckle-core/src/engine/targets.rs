@@ -157,40 +157,77 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
             }
         }
 
+        if !cfg.legacy_keys.is_empty() {
+            report.warning(
+                Some(name),
+                &file,
+                format!(
+                    "uses the deprecated key{} {}; list the objects under `resources:` instead (they apply in list order)",
+                    if cfg.legacy_keys.len() == 1 { "" } else { "s" },
+                    cfg.legacy_keys
+                        .iter()
+                        .map(|k| format!("`{k}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+
         match (cfg.uses_nomad_keys(), cfg.uses_kubernetes_keys()) {
             (true, true) => report.error(
                 Some(name),
-                &file,
-                "mixes Nomad keys (job, files, volumes, variables, policies, namespaces, node_pools, resources) with Kubernetes keys (manifests, secrets); a workload runs on one kind of cluster",
+                format!("{file} resources"),
+                "mixes Nomad resources (jobs, volumes, policies, namespaces, node pools, quotas) with Kubernetes resources (manifests); a workload runs on one kind of cluster",
             ),
-            (false, false) => report.warning(
+            (false, false) if cfg.resources.is_empty() => report.warning(
                 Some(name),
                 &file,
-                "sets none of the keys that make up a workload (a Nomad job, volumes, variables, …; Kubernetes manifests and secrets), so nothing is applied for it",
+                "lists no resources (a Nomad job, volumes, secrets, …; Kubernetes manifests), so nothing is applied for it",
             ),
             _ => {}
         }
+        for duplicate in cfg.duplicates() {
+            report.error(
+                Some(name),
+                format!("{file} resources"),
+                format!("lists {duplicate} twice; each object may appear once per workload"),
+            );
+        }
+        if let Some(problem) = cfg.ordering_problem() {
+            report.warning(Some(name), format!("{file} resources"), problem);
+        }
 
         let present: BTreeSet<&Path> = w.files.iter().map(|p| p.as_path()).collect();
-        for (key, referenced) in cfg.referenced_files() {
+        for (kind, referenced) in cfg.referenced_files() {
             if !present.contains(Path::new(referenced)) {
                 report.error(
                     Some(name),
-                    format!("{file} {key}"),
+                    format!("{file} resources"),
                     format!(
-                        "names the file '{referenced}', which is not under workloads/{name}/files/"
+                        "the {kind} entry names the file '{referenced}', which is not under workloads/{name}/files/"
                     ),
                 );
             }
         }
 
-        let keys = cfg.keys();
+        for entry in &cfg.resources {
+            let location = format!("{file} resources ({})", entry.describe());
+            for path in &entry.ignore {
+                if let Err(e) = crate::fieldpath::FieldPath::parse(path) {
+                    report.error(Some(name), &location, format!("ignore: {}", e.message()));
+                }
+            }
+        }
+
+        let ids = cfg.resource_ids();
         for key in &cfg.restart_on {
-            if !keys.contains(&key.as_str()) {
+            if !ids.contains(&key.as_str()) {
                 report.error(
                     Some(name),
                     format!("{file} restart_on"),
-                    format!("names '{key}', which is not a key this workload sets"),
+                    format!(
+                        "names '{key}', which is not a resource of this workload (name an entry by its file or secret name)"
+                    ),
                 );
             }
         }
@@ -204,8 +241,9 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
                 check_template(&mut report, Some(name), &loc, s);
             }
         }
-        for (path, items) in cfg.variables.iter().chain(cfg.secrets.iter()) {
-            for (k, v) in items {
+        for entry in cfg.resources.iter().filter(|r| !r.kind.is_file()) {
+            let path = entry.id();
+            for (k, v) in &entry.items {
                 let loc = format!("{file} {path}.{k}");
                 check_secrets(&mut report, Some(name), &loc, v);
                 check_template(&mut report, Some(name), &loc, v);
@@ -223,12 +261,7 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
 
         // Specs the scheduler stores in clear must not carry secret values;
         // those travel through `variables` (Nomad) and `secrets` (Kubernetes).
-        let specs: BTreeSet<&str> = cfg
-            .job
-            .iter()
-            .map(|j| j.file.as_str())
-            .chain(cfg.manifests.iter().map(String::as_str))
-            .collect();
+        let specs: BTreeSet<&str> = cfg.spec_files().into_iter().collect();
         for (path, source) in &w.templates {
             let location = format!("workloads/{name}/files/{}", path.display());
             if let Err(e) = templater.check(source) {
@@ -447,47 +480,55 @@ secrets:
 
     #[rstest]
     #[case::host_namespace(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'host.labels.x == 1'\njob: a.hcl\n"), ("workloads/a/files/a.hcl", "job {}")],
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'host.labels.x == 1'\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
         "selects on `host.*`"
     )]
     #[case::missing_module(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nneeds: ['module:nope']\njob: a.hcl\n"), ("workloads/a/files/a.hcl", "job {}")],
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nneeds: ['module:nope']\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
         "needs the module 'nope'"
     )]
     #[case::missing_workload(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nneeds: [b]\njob: a.hcl\n"), ("workloads/a/files/a.hcl", "job {}")],
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nneeds: [b]\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
         "needs the workload 'b'"
     )]
     #[case::module_needs_missing_workload(
         &[("buckle.yaml", FLEET), ("modules/m/module.yaml", "name: m\nneeds: ['workload:nope']\n")],
         "needs the workload 'nope'"
     )]
-    #[case::mixed_keys(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\njob: a.hcl\nmanifests: [a.yaml]\n"), ("workloads/a/files/a.hcl", ""), ("workloads/a/files/a.yaml", "")],
-        "mixes Nomad keys"
+    #[case::mixed_kinds(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl, a.yaml]\n"), ("workloads/a/files/a.nomad.hcl", ""), ("workloads/a/files/a.yaml", "")],
+        "mixes Nomad resources"
     )]
     #[case::missing_file(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\njob: a.hcl\nvolumes: [data.hcl]\n"), ("workloads/a/files/a.hcl", "")],
-        "names the file 'data.hcl'"
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [data.volume.hcl, a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "names the file 'data.volume.hcl'"
+    )]
+    #[case::duplicate_entry(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl, a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "lists job a.nomad.hcl twice"
+    )]
+    #[case::bad_ignore_path(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [{ file: a.nomad.hcl, ignore: ['Meta['] }]\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "ignore: The field path"
     )]
     #[case::bad_template(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\njob: a.hcl.j2\n"), ("workloads/a/files/a.hcl.j2", "{% if %}")],
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl.j2]\n"), ("workloads/a/files/a.nomad.hcl.j2", "{% if %}")],
         "does not compile"
     )]
     #[case::secret_in_job_spec(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\njob: a.hcl.j2\n"), ("workloads/a/files/a.hcl.j2", "token = \"{{ secrets.TOKEN }}\"")],
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl.j2]\n"), ("workloads/a/files/a.nomad.hcl.j2", "token = \"{{ secrets.TOKEN }}\"")],
         "stored by the scheduler in clear"
     )]
     #[case::undeclared_secret(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\njob: a.hcl\nvariables:\n  nomad/jobs/a: { token: '{{ secrets.NOPE }}' }\n"), ("workloads/a/files/a.hcl", "")],
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources:\n  - { secret: nomad/jobs/a, items: { token: '{{ secrets.NOPE }}' } }\n  - a.nomad.hcl\n"), ("workloads/a/files/a.nomad.hcl", "")],
         "does not declare under `secrets`"
     )]
-    #[case::restart_on_unknown_key(
-        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\njob: a.hcl\nrestart_on: [variables]\n"), ("workloads/a/files/a.hcl", "")],
-        "not a key this workload sets"
+    #[case::restart_on_unknown_resource(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nrestart_on: [variables]\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "not a resource of this workload"
     )]
     #[case::cross_layer_cycle(
-        &[("buckle.yaml", FLEET), ("modules/m/module.yaml", "name: m\nneeds: ['workload:a']\n"), ("workloads/a/workload.yaml", "name: a\nneeds: ['module:m']\njob: a.hcl\n"), ("workloads/a/files/a.hcl", "")],
+        &[("buckle.yaml", FLEET), ("modules/m/module.yaml", "name: m\nneeds: ['workload:a']\n"), ("workloads/a/workload.yaml", "name: a\nneeds: ['module:m']\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "")],
         "form a cycle"
     )]
     #[case::identity_secret_undeclared(
@@ -565,11 +606,11 @@ secrets:
                 "name: paste
 when: 'cluster.groups contains \"home-cluster\"'
 needs: ['module:docker']
-job: paste.nomad.hcl.j2
-volumes: [paste.volume.hcl]
-variables:
-  nomad/jobs/paste: { db: '{{ secrets.DB }}' }
-restart_on: [variables]
+resources:
+  - paste.volume.hcl
+  - { secret: nomad/jobs/paste, items: { db: '{{ secrets.DB }}' } }
+  - { file: paste.nomad.hcl.j2, live_vars: [version], ignore: ['Meta[autoupdate.*]'] }
+restart_on: [nomad/jobs/paste]
 ",
             ),
             (
@@ -604,15 +645,52 @@ restart_on: [variables]
     }
 
     #[test]
+    fn the_first_schemas_keys_and_a_job_before_its_entities_warn() {
+        let rev = load(&[
+            ("buckle.yaml", FLEET),
+            (
+                "workloads/a/workload.yaml",
+                "name: a\njob: a.nomad.hcl\nvolumes: [a.volume.hcl]\n",
+            ),
+            ("workloads/a/files/a.nomad.hcl", ""),
+            ("workloads/a/files/a.volume.hcl", ""),
+            (
+                "workloads/b/workload.yaml",
+                "name: b\nresources: [b.nomad.hcl, b.volume.hcl]\n",
+            ),
+            ("workloads/b/files/b.nomad.hcl", ""),
+            ("workloads/b/files/b.volume.hcl", ""),
+        ]);
+        let report = validate_targets(&rev);
+        assert!(report.is_ok(), "{report}");
+        let warnings: Vec<String> = report.warnings.iter().map(|w| w.to_string()).collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("deprecated keys `volumes`, `job`")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("job b.nomad.hcl before volume b.volume.hcl")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
     fn workloads_select_clusters_by_their_context() {
         let rev = load(&[
             ("buckle.yaml", FLEET),
-            ("workloads/all/workload.yaml", "name: all\njob: a.hcl\n"),
+            (
+                "workloads/all/workload.yaml",
+                "name: all\nresources: [a.nomad.hcl]\n",
+            ),
             (
                 "workloads/k8s/workload.yaml",
-                "name: k8s\nwhen: 'cluster.kind == \"kubernetes\"'\nmanifests: [a.yaml]\n",
+                "name: k8s\nwhen: 'cluster.kind == \"kubernetes\"'\nresources: [a.yaml]\n",
             ),
-            ("workloads/all/files/a.hcl", ""),
+            ("workloads/all/files/a.nomad.hcl", ""),
             ("workloads/k8s/files/a.yaml", ""),
         ]);
         let ctx = crate::selectors::HostContext::for_cluster(

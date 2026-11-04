@@ -256,7 +256,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("workloads/paste/files")).unwrap();
         std::fs::write(
             dir.path().join("workloads/paste/workload.yaml"),
-            "name: paste\njob: paste.nomad.hcl\nvolumes: [paste.volume.hcl]\n",
+            "name: paste\nresources: [paste.volume.hcl, paste.nomad.hcl]\n",
         )
         .unwrap();
         std::fs::write(
@@ -272,7 +272,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("workloads/grafana/files")).unwrap();
         std::fs::write(
             dir.path().join("workloads/grafana/workload.yaml"),
-            "name: grafana\nmanifests: [grafana.yaml.j2]\n",
+            "name: grafana\nresources: [grafana.yaml.j2]\n",
         )
         .unwrap();
         std::fs::write(

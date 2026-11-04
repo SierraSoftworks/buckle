@@ -154,7 +154,7 @@ mod tests {
     #[case(&[("buckle.yaml", "version: 2\nrollout:\n  phases:\n    - { name: stragglers, select: 'true' }\n")], "reserved")]
     #[case(&[("buckle.yaml", "version: 2\n"), ("modules/a/module.yaml", "name: a\n"), ("modules/a/files/x.j2", "{{ secrets[\"nope\"] }}")], "does not declare")]
     #[case(&[("buckle.yaml", "version: 2\n"), ("modules/a/module.yaml", "name: a\nneeds: ['workload:nope']\n")], "needs the workload 'nope'")]
-    #[case(&[("buckle.yaml", "version: 2\n"), ("workloads/w/workload.yaml", "name: w\nwhen: 'host.labels.x == 1'\njob: w.hcl\n"), ("workloads/w/files/w.hcl", "")], "selects on `host.*`")]
+    #[case(&[("buckle.yaml", "version: 2\n"), ("workloads/w/workload.yaml", "name: w\nwhen: 'host.labels.x == 1'\nresources: [w.nomad.hcl]\n"), ("workloads/w/files/w.nomad.hcl", "")], "selects on `host.*`")]
     #[case(&[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    c:\n      kind: nomad\n      nodes: 'true'\n      identity: secret://NOPE\n")], "does not declare the secret 'NOPE'")]
     fn invalid_revisions_are_reported(#[case] files: &[(&str, &str)], #[case] needle: &str) {
         let errors = validate(&load(files));
@@ -176,9 +176,9 @@ mod tests {
             ("modules/a/files/x.j2", "{{ secrets.tok }}"),
             (
                 "workloads/w/workload.yaml",
-                "name: w\nneeds: ['module:b']\njob: w.hcl\n",
+                "name: w\nneeds: ['module:b']\nresources: [w.nomad.hcl]\n",
             ),
-            ("workloads/w/files/w.hcl", "job {}"),
+            ("workloads/w/files/w.nomad.hcl", "job {}"),
         ]);
         assert_eq!(validate(&rev), Vec::<String>::new());
     }

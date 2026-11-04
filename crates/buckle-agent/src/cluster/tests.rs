@@ -73,7 +73,7 @@ fn workload_files(name: &str, yaml: &str) -> Vec<(String, String)> {
     vec![
         (
             format!("workloads/{name}/workload.yaml"),
-            format!("name: {name}\njob: {name}.nomad.hcl\n{yaml}"),
+            format!("name: {name}\nresources: [{name}.nomad.hcl]\n{yaml}"),
         ),
         (
             format!("workloads/{name}/files/{name}.nomad.hcl"),
@@ -117,10 +117,9 @@ fn assignment(revision: Arc<Revision>, identity: ClusterIdentity, key: u8) -> As
 }
 
 fn paste() -> Vec<(String, String)> {
-    workload_files(
-        "paste",
-        "namespace: apps\nvariables:\n  nomad/jobs/paste:\n    DATABASE_URL: 'postgres://paste:{{ secrets.DB }}@db/paste'\n",
-    )
+    let mut files = workload_files("paste", "");
+    files[0].1 = "name: paste\nnamespace: apps\nresources:\n  - secret: nomad/jobs/paste\n    items:\n      DATABASE_URL: 'postgres://paste:{{ secrets.DB }}@db/paste'\n  - paste.nomad.hcl\n".to_owned();
+    files
 }
 
 async fn apply(ex: &Executor, a: &Assignment) -> ApplyOutcome {
@@ -394,6 +393,69 @@ async fn a_workload_needing_a_failed_one_does_not_start() {
     assert_eq!(outcome.failed_module.as_deref(), Some("z-db"));
     assert_eq!(outcome.not_started, vec!["a-web"]);
     assert!(fake.job("default", "a-web").is_none());
+}
+
+#[tokio::test]
+async fn resources_apply_in_list_order_and_every_job_is_health_checked() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let files = vec![
+        (
+            "workloads/shop/workload.yaml".to_owned(),
+            "name: shop\nresources:\n  - shop.volume.hcl\n  - shop-api.nomad.hcl\n  - { file: shop-worker.job.hcl, ignore: ['TaskGroups[*].Count'] }\n".to_owned(),
+        ),
+        (
+            "workloads/shop/files/shop.volume.hcl".to_owned(),
+            "name = \"shop\"\ntype = \"host\"\nplugin_id = \"mkdir\"\n".to_owned(),
+        ),
+        (
+            "workloads/shop/files/shop-api.nomad.hcl".to_owned(),
+            job_spec("shop-api"),
+        ),
+        (
+            "workloads/shop/files/shop-worker.job.hcl".to_owned(),
+            job_spec("shop-worker"),
+        ),
+    ];
+    let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
+    let planned = ex.plan(&a, None).await.unwrap();
+    let steps: Vec<String> = planned.plan.modules[0]
+        .steps
+        .iter()
+        .map(|s| s.resource.to_string())
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            "shop/nomad.volume[default/shop]",
+            "shop/nomad.job[default/shop-api]",
+            "shop/nomad.job[default/shop-worker]"
+        ]
+    );
+    let outcome = apply(&ex, &a).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+
+    // Both jobs run, so both report; a count another tool sets is not a change.
+    let report = ex.health(&a, HealthScope::Bake, None, None).await.unwrap();
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .filter(|r| r.module == "shop" && r.kind == "nomad.job")
+            .count(),
+        2 * report
+            .results
+            .iter()
+            .filter(|r| r.module == "shop" && r.kind == "nomad.job")
+            .map(|r| &r.check)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        "{report:?}"
+    );
+    fake.edit_job("default", "shop-worker", |j| {
+        j["TaskGroups"][0]["Count"] = 3.into()
+    });
+    assert_eq!(ex.plan(&a, None).await.unwrap().plan.changes(), 0);
 }
 
 #[tokio::test]
