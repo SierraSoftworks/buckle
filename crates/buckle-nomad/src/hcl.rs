@@ -30,6 +30,19 @@ pub fn var_file(vars: &IndexMap<String, Value>) -> Result<String> {
     Ok(out)
 }
 
+/// A value as a `-var` flag holds it (a job submission's `VariableFlags`):
+/// strings as they are, anything else as an HCL expression.
+pub fn flag(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => {
+            let mut out = String::new();
+            encode(other, &mut out);
+            out
+        }
+    }
+}
+
 fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
