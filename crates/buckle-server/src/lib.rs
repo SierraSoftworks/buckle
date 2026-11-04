@@ -16,6 +16,7 @@ pub mod config;
 pub mod events;
 pub mod fleet;
 pub mod grpc;
+pub mod identity;
 pub mod join;
 pub mod metrics;
 pub mod rollout;
@@ -179,6 +180,12 @@ pub async fn run_with(
                 config.agents.tailscale_socket.clone(),
             )) as Arc<dyn grpc::Whois>
         });
+    let issuer = Arc::new(identity::Issuer::load(
+        &config.data_dir.join("identity"),
+        &config.identity,
+        config.identity_issuer(),
+    )?);
+    tracing::info!(issuer = %issuer.issuer(), kid = %issuer.kid(), "issuing cluster identities");
     let guard = Arc::new(grpc::SessionGuard::default());
     let joins = Arc::new(join::Joins::new(join::JoinSettings::from_config(
         &config,
@@ -207,6 +214,7 @@ pub async fn run_with(
         guard: guard.clone(),
         upgrades: upgrades.clone(),
         joins: joins.clone(),
+        identity: issuer.clone(),
     };
     let grpc_listener = tokio::net::TcpListener::bind(&config.listen.grpc)
         .await
@@ -242,6 +250,7 @@ pub async fn run_with(
     state.upgrades = upgrades;
     state.joins = joins;
     state.trace_url_template = config.telemetry.trace_url_template.clone();
+    state.identity = Some(issuer);
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
 
     let mut failed = false;

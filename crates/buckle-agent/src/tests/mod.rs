@@ -5,7 +5,7 @@
 //! local rollback watchdog run in virtual time; enrolment runs over a real
 //! localhost TCP port.
 
-mod fake_server;
+pub(crate) mod fake_server;
 mod hardening;
 mod reboot;
 mod scenarios;

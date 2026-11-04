@@ -101,6 +101,37 @@ pub fn effective_phases(policy: &RolloutPolicy) -> Vec<PhasePolicy> {
     }
 }
 
+/// How the cluster target `name` grants identities: its `fleet.clusters`
+/// declaration in `fleet`, else the stored cluster record (one created
+/// through the API, or no longer declared). `None` when neither defines it.
+pub fn cluster_trust(
+    fleet: &FleetConfig,
+    stored: Option<&HostRecord>,
+    name: &str,
+) -> Option<crate::identity::ClusterTrust> {
+    use buckle_core::model::ClusterIdentity;
+    if let Some(decl) = fleet.fleet.clusters.get(name) {
+        return Some(crate::identity::ClusterTrust {
+            target: name.to_owned(),
+            cluster: decl.cluster.clone().unwrap_or_else(|| name.to_owned()),
+            nodes: decl.nodes.clone(),
+            executors: decl.executors().cloned(),
+            buckle_jwt: decl.identity == ClusterIdentity::BuckleJwt,
+        });
+    }
+    let record = stored.filter(|r| r.id == name && r.kind == TargetKind::Cluster)?;
+    let info = record.cluster.as_ref()?;
+    // An unparseable selector matches no one.
+    let filter = |s: Option<&str>| s.and_then(|s| buckle_core::Filter::new(s).ok());
+    Some(crate::identity::ClusterTrust {
+        target: name.to_owned(),
+        cluster: info.spec.cluster.clone().unwrap_or_else(|| name.to_owned()),
+        nodes: filter(info.spec.nodes.as_deref()),
+        executors: filter(info.spec.executors()),
+        buckle_jwt: ClusterIdentity::parse(&info.spec.identity) == Ok(ClusterIdentity::BuckleJwt),
+    })
+}
+
 /// The index of the first phase whose selector matches the host.
 pub fn phase_for(ctx: &HostContext, phases: &[PhasePolicy]) -> Option<usize> {
     phases.iter().position(|p| ctx.matches(&p.select))

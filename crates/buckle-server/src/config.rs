@@ -22,6 +22,8 @@ pub struct ServerConfig {
     pub secrets: SecretsConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub identity: IdentityConfig,
 }
 
 impl ServerConfig {
@@ -133,6 +135,29 @@ impl ServerConfig {
                 ],
             ));
         }
+        if self.identity.ttl < Duration::from_secs(60)
+            || self.identity.ttl > Duration::from_secs(3600)
+        {
+            return Err(buckle_core::error::user(
+                format!(
+                    "`identity.ttl` ({:?}) must be between 1m and 1h.",
+                    self.identity.ttl
+                ),
+                &[
+                    "Cluster credentials are fetched before each plan, apply or health pass, so 15m is plenty.",
+                ],
+            ));
+        }
+        if let Some(issuer) = &self.identity.issuer
+            && issuer.trim().is_empty()
+        {
+            return Err(buckle_core::error::user(
+                "`identity.issuer` is empty.",
+                &[
+                    "Set it to the URL clusters fetch /.well-known/openid-configuration from, or remove it.",
+                ],
+            ));
+        }
         if self.web.oidc.is_some() && self.web.base_url.is_none() {
             return Err(buckle_core::error::user(
                 "`web.base_url` is required when OIDC is configured, so the callback URL can be built.",
@@ -142,6 +167,54 @@ impl ServerConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// `identity`: Buckle as the issuer of short-lived cluster credentials.
+///
+/// ```yaml
+/// identity:
+///   issuer: https://buckle.example.ts.net
+///   ttl: 15m
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityConfig {
+    /// The `iss` of every token, and where clusters fetch the discovery
+    /// document and JWKS (`{issuer}/.well-known/...`). Absent:
+    /// `web.base_url`, or `buckle` when that is unset too (enough for Nomad
+    /// with static keys; Kubernetes needs an HTTPS URL).
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// How long an issued token lives (1m to 1h).
+    #[serde(default = "IdentityConfig::default_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+}
+
+impl IdentityConfig {
+    fn default_ttl() -> Duration {
+        Duration::from_secs(15 * 60)
+    }
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            issuer: None,
+            ttl: Self::default_ttl(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// The identity issuer's `iss`: `identity.issuer`, else `web.base_url`,
+    /// else `buckle`.
+    pub fn identity_issuer(&self) -> String {
+        self.identity
+            .issuer
+            .clone()
+            .or_else(|| self.web.base_url.clone())
+            .unwrap_or_else(|| "buckle".to_owned())
     }
 }
 
@@ -882,6 +955,18 @@ secrets:
         let cfg: ServerConfig = serde_yaml::from_value(value).to_human_error()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    #[rstest]
+    #[case::defaults_to_the_base_url("", Some("https://buckle.example.ts.net"))]
+    #[case::explicit_issuer("identity: { issuer: https://id.example }", Some("https://id.example"))]
+    #[case::longest_ttl("identity: { ttl: 1h }", Some("https://buckle.example.ts.net"))]
+    #[case::ttl_too_long("identity: { ttl: 2h }", None)]
+    #[case::ttl_too_short("identity: { ttl: 10s }", None)]
+    #[case::empty_issuer("identity: { issuer: '' }", None)]
+    fn identity_issuer_and_ttl(#[case] extra: &str, #[case] issuer: Option<&str>) {
+        let cfg = with_env(&format!("{EXAMPLE}{extra}\n"));
+        assert_eq!(cfg.ok().map(|c| c.identity_issuer()).as_deref(), issuer);
     }
 
     #[test]

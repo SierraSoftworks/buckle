@@ -9,6 +9,7 @@ pub mod oidc;
 mod routes;
 pub mod timeline;
 mod ui;
+mod wellknown;
 
 pub use error::ApiError;
 
@@ -53,6 +54,8 @@ pub struct AppState {
     pub sse_recheck: std::time::Duration,
     /// `telemetry.trace_url_template`: turns a trace id into a link.
     pub trace_url_template: Option<String>,
+    /// The identity issuer whose keys `/.well-known/` publishes.
+    pub identity: Option<Arc<crate::identity::Issuer>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -98,6 +101,7 @@ impl AppState {
             joins: Default::default(),
             sse_recheck: std::time::Duration::from_secs(30),
             trace_url_template: None,
+            identity: None,
         }
     }
 
@@ -158,6 +162,7 @@ pub fn app(
         .wrap(from_fn(auth::middleware))
         .wrap(from_fn(logger::middleware))
         .configure(routes::configure)
+        .configure(wellknown::configure)
         .configure(ui::configure)
 }
 

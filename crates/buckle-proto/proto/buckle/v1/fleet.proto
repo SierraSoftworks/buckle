@@ -22,6 +22,11 @@ service Fleet {
 
   // Secrets the host needs for modules it selected after its facts changed.
   rpc FetchSecrets(FetchSecretsRequest) returns (SecretBundle);
+
+  // A short-lived JWT the agent exchanges for a cluster credential (a Nomad
+  // ACL login, or a Kubernetes bearer token). Granted only for a cluster
+  // target the host may act for, and audited.
+  rpc IssueIdentity(IssueIdentityRequest) returns (IssuedIdentity);
 }
 
 // ---------------------------------------------------------------- agent → server
@@ -460,4 +465,38 @@ message SecretValue {
 
 message SecretBundle {
   repeated SecretValue secrets = 1;
+}
+
+// ---------------------------------------------------------------- identity
+
+enum IdentityPurpose {
+  IDENTITY_PURPOSE_UNSPECIFIED = 0;
+  // Facts, plans and health: reading the cluster.
+  IDENTITY_PURPOSE_READ = 1;
+  // Applying workloads.
+  IDENTITY_PURPOSE_DEPLOY = 2;
+  // Draining the requesting host's own node.
+  IDENTITY_PURPOSE_DRAIN = 3;
+}
+
+message IssueIdentityRequest {
+  // The cluster target the credential is for (the token's audience).
+  string target = 1;
+  IdentityPurpose purpose = 2;
+  // The revision whose fleet declares the target; one the host may fetch.
+  // Empty: the fleet's stable revision.
+  string revision = 3;
+  // The rollout the credential serves, recorded in its claims and the audit
+  // log. Empty outside a rollout.
+  string rollout_id = 4;
+}
+
+message IssuedIdentity {
+  // The signed JWT (compact JWS).
+  string token = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  // The token's `iss`, `aud` and `jti`.
+  string issuer = 3;
+  string audience = 4;
+  string id = 5;
 }

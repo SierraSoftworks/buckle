@@ -28,6 +28,7 @@ indexmap.workspace = true
 notify.workspace = true
 prost-types.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
