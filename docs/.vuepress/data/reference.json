@@ -1581,7 +1581,7 @@
     },
     {
       "description": "Run a command, made idempotent with creates, unless, only_if and changed_when; secrets reach it through the environment.",
-      "details": "Runs a command, guarded so that it only runs when something needs doing.\n\n```yaml\n- command.run:\n    run: [\"nomad\", \"node\", \"eligibility\", \"-enable\", \"-self\"]   # argv, or a string run with `sh -c`\n    unless: \"nomad node status -self -json | grep -q '\\\"SchedulingEligibility\\\": \\\"eligible\\\"'\"\n    creates: /var/lib/app/initialised     # skip when this path exists\n    only_if: [\"test\", \"-d\", \"/srv/data\"]  # skip unless this exits 0\n    changed_when: \"output_contains:created\"   # always | never | output_contains:<text> | exit:<code>\n    env:\n      API_TOKEN: \"{{ secrets.api_token }}\"  # secrets go through the process-environment sink\n    cwd: /srv/app\n    user: deploy                           # run as this account (runuser on Linux, sudo -u on macOS)\n    timeout: 2m\n    remove: [\"rm\", \"-f\", \"/var/lib/app/initialised\"]   # cleanup when the task leaves the config\n    capture: redacted                      # redacted (default) | always | never\n```\n\n**Planning.** `creates` existing, `unless` exiting 0 or `only_if` exiting\nnon-zero all make the plan a no-op. The `unless` and `only_if` probes run in\nplan mode too, so they must be read-only. A command with none of `creates`,\n`unless` or `changed_when` is planned as `always runs: <command>` so the\nauthor sees the smell; the plan of such a task is never a no-op.\n\n**Applying.** The command runs and fails the task on a non-zero exit (except\nwhen `changed_when: exit:<code>` names that code). `changed_when` decides\nwhether the run counts as a change for handlers: `always` (the default),\n`never`, `output_contains:<text>` (stdout or stderr) or `exit:<code>`.\n\n**Secrets.** An `env` value that references `secrets.` is rendered with the\nreal value and handed to the process through the environment sink; it is\nnever rendered into the plan, the logs or the state. When any env value is\nsecret, the command's output is not captured (nor shown in errors) unless\n`capture: always` is set. By default (`capture: redacted`) stdout and stderr\nare recorded on the task's tracing span, truncated to 4 KiB each; `never`\nrecords nothing.\n\n**Running as a user.** With `user`, the command, its probes and its cleanup\nrun as that account: through `runuser -u USER --` on Linux (util-linux; the\nstep is blocked while it is missing) and `sudo -u USER` on macOS. The\naccount's `HOME`, `USER` and `SHELL` are set as a login would set them; the\ntask's `env` is passed through. Windows does not support it.\n\n**Removal.** With `remove`, the cleanup command runs when the task leaves\nthe configuration (in the same `cwd`, as the same `user`, with the\nnon-secret `env`). Without it the removal is reported as \"no cleanup\ndefined\".\n\n**Identity.** The resource is keyed by its rendered command, so editing the\ncommand or a var inside it re-keys it (a removal plus an addition). Give a\ntemplated command, or one with `remove`, a stable task `id`.",
+      "details": "Runs a command, guarded so that it only runs when something needs doing.\n\n```yaml\n- command.run:\n    run: [\"nomad\", \"node\", \"eligibility\", \"-enable\", \"-self\"]   # argv, or a string run with `sh -c`\n    unless: \"nomad node status -self -json | grep -q '\\\"SchedulingEligibility\\\": \\\"eligible\\\"'\"\n    creates: /var/lib/app/initialised     # skip when this path exists\n    only_if: [\"test\", \"-d\", \"/srv/data\"]  # skip unless this exits 0\n    changed_when: \"output_contains:created\"   # always | never | output_contains:<text> | exit:<code>\n    env:\n      API_TOKEN: \"{{ secrets.api_token }}\"  # secrets go through the process-environment sink\n    cwd: /srv/app\n    user: deploy                           # run as this account (runuser on Linux, sudo -u on macOS)\n    timeout: 2m\n    remove: [\"rm\", \"-f\", \"/var/lib/app/initialised\"]   # cleanup when the task leaves the config\n    capture: redacted                      # redacted (default) | always | never\n    identity:                              # a cluster credential in the environment\n      cluster: home-nomad                  # a fleet.clusters target\n      purpose: drain                       # read | deploy | drain (default)\n      env: NOMAD_TOKEN                     # the variable it is passed in (default)\n```\n\n**Planning.** `creates` existing, `unless` exiting 0 or `only_if` exiting\nnon-zero all make the plan a no-op. The `unless` and `only_if` probes run in\nplan mode too, so they must be read-only. A command with none of `creates`,\n`unless` or `changed_when` is planned as `always runs: <command>` so the\nauthor sees the smell; the plan of such a task is never a no-op.\n\n**Applying.** The command runs and fails the task on a non-zero exit (except\nwhen `changed_when: exit:<code>` names that code). `changed_when` decides\nwhether the run counts as a change for handlers: `always` (the default),\n`never`, `output_contains:<text>` (stdout or stderr) or `exit:<code>`.\n\n**Secrets.** An `env` value that references `secrets.` is rendered with the\nreal value and handed to the process through the environment sink; it is\nnever rendered into the plan, the logs or the state. When any env value is\nsecret, the command's output is not captured (nor shown in errors) unless\n`capture: always` is set. By default (`capture: redacted`) stdout and stderr\nare recorded on the task's tracing span, truncated to 4 KiB each; `never`\nrecords nothing.\n\n**Running as a user.** With `user`, the command, its probes and its cleanup\nrun as that account: through `runuser -u USER --` on Linux (util-linux; the\nstep is blocked while it is missing) and `sudo -u USER` on macOS. The\naccount's `HOME`, `USER` and `SHELL` are set as a login would set them; the\ntask's `env` is passed through. Windows does not support it.\n\n**Removal.** With `remove`, the cleanup command runs when the task leaves\nthe configuration (in the same `cwd`, as the same `user`, with the\nnon-secret `env`). Without it the removal is reported as \"no cleanup\ndefined\".\n\n**Cluster identity.** With `identity`, the agent asks the server for a\nBuckle-issued identity for the cluster target and `purpose`, exchanges it\nthe way the cluster takes it (a Nomad ACL token through the `buckle` auth\nmethod at `api`, else `NOMAD_ADDR`, else `http://127.0.0.1:4646`; the JWT\nitself for Kubernetes) and passes it to the command and its probes in\n`env`. It is treated as a secret: never planned, logged or stored, and\noutput is not captured unless `capture: always`. `drain` is granted to the\ncluster's `nodes` only, `read` and `deploy` to its `executors`. The\ncleanup command does not receive it. Local runs have no server to ask, so\nthe task fails there.\n\n**Resource identity.** The resource is keyed by its rendered command, so editing the\ncommand or a var inside it re-keys it (a removal plus an addition). Give a\ntemplated command, or one with `remove`, a stable task `id`.",
       "fields": [
         {
           "default": null,
@@ -1646,6 +1646,70 @@
           "required": false,
           "secret": true,
           "ty": "map of secret string"
+        },
+        {
+          "default": "null",
+          "depth": 0,
+          "description": "A cluster credential passed to the command and its probes.",
+          "options": [],
+          "path": "identity",
+          "required": false,
+          "secret": false,
+          "ty": "object?"
+        },
+        {
+          "default": null,
+          "depth": 1,
+          "description": "The cluster target, as `fleet.clusters` names it.",
+          "options": [],
+          "path": "identity.cluster",
+          "required": true,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "null",
+          "depth": 1,
+          "description": "The cluster API the credential is exchanged at; the local default when unset.",
+          "options": [],
+          "path": "identity.api",
+          "required": false,
+          "secret": false,
+          "ty": "string?"
+        },
+        {
+          "default": "NOMAD_TOKEN",
+          "depth": 1,
+          "description": "The environment variable the credential is passed in.",
+          "options": [],
+          "path": "identity.env",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "nomad",
+          "depth": 1,
+          "description": "`nomad` (default) or `kubernetes`.",
+          "options": [],
+          "path": "identity.kind",
+          "required": false,
+          "secret": false,
+          "ty": "string"
+        },
+        {
+          "default": "drain",
+          "depth": 1,
+          "description": "What the credential may do; the cluster's binding rules map it to permissions.",
+          "options": [
+            "read",
+            "deploy",
+            "drain"
+          ],
+          "path": "identity.purpose",
+          "required": false,
+          "secret": false,
+          "ty": "enum"
         },
         {
           "default": "null",

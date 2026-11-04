@@ -3,12 +3,14 @@
 use super::hostkit::{self, StringOrArgv};
 use async_trait::async_trait;
 use buckle_core::plan::{Diff, Planned};
+use buckle_core::secrets::sinks::ProcessEnvSink;
 use buckle_core::secrets::{Rendered, SecretField};
 use buckle_core::state::ResourceRecord;
 use buckle_core::system::{Command, Output};
-use buckle_core::task::{Applied, Artefact, Cx, Task};
+use buckle_core::task::{Applied, Artefact, ClusterCredentials, CredentialRequest, Cx, Task};
 use buckle_core::{Platforms, Result, error};
 use schemars::JsonSchema;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -31,6 +33,10 @@ use tracing::instrument;
 ///     timeout: 2m
 ///     remove: ["rm", "-f", "/var/lib/app/initialised"]   # cleanup when the task leaves the config
 ///     capture: redacted                      # redacted (default) | always | never
+///     identity:                              # a cluster credential in the environment
+///       cluster: home-nomad                  # a fleet.clusters target
+///       purpose: drain                       # read | deploy | drain (default)
+///       env: NOMAD_TOKEN                     # the variable it is passed in (default)
 /// ```
 ///
 /// **Planning.** `creates` existing, `unless` exiting 0 or `only_if` exiting
@@ -63,7 +69,18 @@ use tracing::instrument;
 /// non-secret `env`). Without it the removal is reported as "no cleanup
 /// defined".
 ///
-/// **Identity.** The resource is keyed by its rendered command, so editing the
+/// **Cluster identity.** With `identity`, the agent asks the server for a
+/// Buckle-issued identity for the cluster target and `purpose`, exchanges it
+/// the way the cluster takes it (a Nomad ACL token through the `buckle` auth
+/// method at `api`, else `NOMAD_ADDR`, else `http://127.0.0.1:4646`; the JWT
+/// itself for Kubernetes) and passes it to the command and its probes in
+/// `env`. It is treated as a secret: never planned, logged or stored, and
+/// output is not captured unless `capture: always`. `drain` is granted to the
+/// cluster's `nodes` only, `read` and `deploy` to its `executors`. The
+/// cleanup command does not receive it. Local runs have no server to ask, so
+/// the task fails there.
+///
+/// **Resource identity.** The resource is keyed by its rendered command, so editing the
 /// command or a var inside it re-keys it (a removal plus an addition). Give a
 /// templated command, or one with `remove`, a stable task `id`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -103,6 +120,63 @@ pub struct Spec {
     /// Whether output is recorded on the task's span.
     #[serde(default)]
     pub capture: Capture,
+    /// A cluster credential passed to the command and its probes.
+    #[serde(default)]
+    pub identity: Option<Identity>,
+}
+
+/// A cluster credential for the command (`identity`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Identity {
+    /// The cluster target, as `fleet.clusters` names it.
+    pub cluster: String,
+    /// What the credential may do; the cluster's binding rules map it to permissions.
+    #[serde(default)]
+    pub purpose: Purpose,
+    /// The environment variable the credential is passed in.
+    #[serde(default = "Identity::default_env")]
+    pub env: String,
+    /// `nomad` (default) or `kubernetes`.
+    #[serde(default = "Identity::default_kind")]
+    #[schemars(with = "String")]
+    pub kind: buckle_core::model::ClusterKind,
+    /// The cluster API the credential is exchanged at; the local default when unset.
+    #[serde(default)]
+    pub api: Option<String>,
+}
+
+impl Identity {
+    fn default_env() -> String {
+        "NOMAD_TOKEN".into()
+    }
+
+    fn default_kind() -> buckle_core::model::ClusterKind {
+        buckle_core::model::ClusterKind::Nomad
+    }
+}
+
+/// What a cluster credential may be used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Purpose {
+    /// Reading the cluster.
+    Read,
+    /// Changing what runs in it.
+    Deploy,
+    /// Draining (and marking ineligible) this host's own node.
+    #[default]
+    Drain,
+}
+
+impl Purpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Purpose::Read => "read",
+            Purpose::Deploy => "deploy",
+            Purpose::Drain => "drain",
+        }
+    }
 }
 
 /// How stdout and stderr are recorded.
@@ -242,14 +316,56 @@ impl CommandRun {
     /// Builds the process for `argv` with the spec's cwd, timeout and environment,
     /// before any `user` wrapper. Secret env values are rendered for real and
     /// injected through the sink.
-    fn build(&self, cx: &Cx, spec: &Spec, argv: &StringOrArgv) -> Result<Command> {
+    fn build(
+        &self,
+        cx: &Cx,
+        spec: &Spec,
+        argv: &StringOrArgv,
+        credential: Option<&SecretString>,
+    ) -> Result<Command> {
         let mut command = argv.to_command(cx.platform())?;
         command.cwd = spec.cwd.clone();
         command.timeout = spec.timeout;
         for (name, field) in &spec.env {
             field.inject_env(&mut command, name.clone(), &cx.templater, &cx.host)?;
         }
+        if let (Some(identity), Some(credential)) = (&spec.identity, credential) {
+            ProcessEnvSink.inject_credential(&mut command, identity.env.clone(), credential);
+        }
         Ok(command)
+    }
+
+    /// Checks that the host can obtain the spec's `identity`.
+    fn credential_source<'a>(
+        cx: &'a Cx,
+        identity: &Identity,
+    ) -> Result<&'a std::sync::Arc<dyn ClusterCredentials>> {
+        cx.clusters.as_ref().ok_or_else(|| {
+            error::user(
+                format!(
+                    "command.run asks for a credential for {}, which only an enrolled agent can obtain.",
+                    identity.cluster
+                ),
+                &["Run it through the Buckle server, or remove `identity` for local runs."],
+            )
+        })
+    }
+
+    /// The spec's cluster credential, when it asks for one.
+    async fn credential(&self, cx: &Cx, spec: &Spec) -> Result<Option<SecretString>> {
+        let Some(identity) = &spec.identity else {
+            return Ok(None);
+        };
+        let request = CredentialRequest {
+            target: identity.cluster.clone(),
+            purpose: identity.purpose.as_str().to_owned(),
+            kind: identity.kind,
+            api: identity.api.clone(),
+        };
+        Self::credential_source(cx, identity)?
+            .credential(&request)
+            .await
+            .map(Some)
     }
 
     /// Applies the spec's `user` to a built command.
@@ -261,20 +377,29 @@ impl CommandRun {
     }
 
     /// Evaluates `creates`, `unless` and `only_if`; `Some(reason)` means skip.
-    async fn skip_reason(&self, cx: &Cx, spec: &Spec) -> Result<Option<String>> {
+    async fn skip_reason(
+        &self,
+        cx: &Cx,
+        spec: &Spec,
+        credential: Option<&SecretString>,
+    ) -> Result<Option<String>> {
         if let Some(path) = &spec.creates
             && cx.system.stat(path).await?.is_some()
         {
             return Ok(Some(format!("{} exists", path.display())));
         }
         if let Some(unless) = &spec.unless {
-            let out = self.probe(cx, spec, self.build(cx, spec, unless)?).await?;
+            let out = self
+                .probe(cx, spec, self.build(cx, spec, unless, credential)?)
+                .await?;
             if out.success() {
                 return Ok(Some(format!("`{}` succeeded", unless.display())));
             }
         }
         if let Some(only_if) = &spec.only_if {
-            let out = self.probe(cx, spec, self.build(cx, spec, only_if)?).await?;
+            let out = self
+                .probe(cx, spec, self.build(cx, spec, only_if, credential)?)
+                .await?;
             if !out.success() {
                 return Ok(Some(format!("`{}` did not succeed", only_if.display())));
             }
@@ -359,14 +484,27 @@ impl Task for CommandRun {
     async fn plan(&self, cx: &Cx, spec: &Spec) -> Result<Planned> {
         // Validate the command (and the user wrapper) up front so a typo is a
         // plan error, not an apply surprise.
-        self.wrap(cx, spec, self.build(cx, spec, &spec.run)?)?;
+        self.wrap(cx, spec, self.build(cx, spec, &spec.run, None)?)?;
+        if let Some(identity) = &spec.identity {
+            Self::credential_source(cx, identity)?;
+        }
         if spec.user.is_some()
             && let Some(tool) = user_wrapper_tool(cx.platform())
             && let Some(blocked) = hostkit::missing_tool(cx, tool, RUNUSER_HINT).await?
         {
             return Ok(blocked);
         }
-        if self.skip_reason(cx, spec).await?.is_some() {
+        // Only the probes need the credential while planning.
+        let credential = if spec.unless.is_some() || spec.only_if.is_some() {
+            self.credential(cx, spec).await?
+        } else {
+            None
+        };
+        if self
+            .skip_reason(cx, spec, credential.as_ref())
+            .await?
+            .is_some()
+        {
             return Ok(Planned::NoOp);
         }
         let summary = if always_runs(spec) {
@@ -393,10 +531,15 @@ impl Task for CommandRun {
         {
             hostkit::require_tool(cx, tool, RUNUSER_HINT).await?;
         }
-        if let Some(reason) = self.skip_reason(cx, spec).await? {
+        let credential = self.credential(cx, spec).await?;
+        if let Some(reason) = self.skip_reason(cx, spec, credential.as_ref()).await? {
             return Ok(Applied::unchanged(format!("skipped: {reason}")));
         }
-        let command = self.wrap(cx, spec, self.build(cx, spec, &spec.run)?)?;
+        let command = self.wrap(
+            cx,
+            spec,
+            self.build(cx, spec, &spec.run, credential.as_ref())?,
+        )?;
         let line = command.display_line();
         let sensitive = command.sensitive_env;
         let out = cx.system.run(command.clone()).await?;
@@ -861,6 +1004,8 @@ mod tests {
     #[case::bad_changed_when(json!({"run": ["x"], "changed_when": "sometimes"}))]
     #[case::bad_exit(json!({"run": ["x"], "changed_when": "exit:abc"}))]
     #[case::bad_timeout(json!({"run": ["x"], "timeout": "soon"}))]
+    #[case::bad_purpose(json!({"run": ["x"], "identity": {"cluster": "c", "purpose": "admin"}}))]
+    #[case::identity_without_cluster(json!({"run": ["x"], "identity": {}}))]
     fn invalid_specs_fail_to_parse(#[case] raw: serde_json::Value) {
         assert!(serde_json::from_value::<Spec>(raw).is_err());
     }
@@ -1008,5 +1153,126 @@ mod tests {
             Class::NoOp,
             "127 is not success"
         );
+    }
+
+    /// Issues `acl-secret` for every request, recording each, or refuses.
+    #[derive(Debug, Default)]
+    struct Clusters {
+        requests: Mutex<Vec<CredentialRequest>>,
+        refuse: bool,
+    }
+
+    #[async_trait]
+    impl ClusterCredentials for Clusters {
+        async fn credential(&self, request: &CredentialRequest) -> Result<SecretString> {
+            self.requests.lock().unwrap().push(request.clone());
+            if self.refuse {
+                return Err(error::user(
+                    "the server did not issue an identity for c",
+                    &[],
+                ));
+            }
+            Ok("acl-secret".into())
+        }
+    }
+
+    fn cluster_cx(sys: &FakeSystem, clusters: &Arc<Clusters>, mode: buckle_core::task::Mode) -> Cx {
+        buckle_core::testing::CxBuilder::new(sys.clone())
+            .mode(mode)
+            .clusters(clusters.clone())
+            .build()
+    }
+
+    fn drain(extra: serde_json::Value) -> Spec {
+        let mut raw = json!({
+            "run": ["nomad", "node", "drain", "-self", "-enable", "-yes"],
+            "identity": {"cluster": "home-nomad"},
+        });
+        raw.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        spec(raw)
+    }
+
+    #[tokio::test]
+    async fn a_cluster_identity_reaches_the_command_and_its_probes_but_never_the_plan() {
+        let sys = FakeSystem::new()
+            .on_command("probe", &[], fail(1))
+            .on_command_ok("nomad", &["node", "drain"], "");
+        let clusters = Arc::new(Clusters::default());
+        let spec = drain(json!({"unless": ["probe"]}));
+        let planned = CommandRun
+            .plan(
+                &cluster_cx(&sys, &clusters, buckle_core::task::Mode::Plan),
+                &spec,
+            )
+            .await
+            .unwrap();
+        let applied = CommandRun
+            .apply(
+                &cluster_cx(&sys, &clusters, buckle_core::task::Mode::Apply),
+                &spec,
+                &planned,
+            )
+            .await
+            .unwrap();
+
+        let ran = sys.commands_run();
+        assert_eq!(ran.len(), 3, "probe at plan, probe and drain at apply");
+        for c in &ran {
+            assert_eq!(
+                c.env.get("NOMAD_TOKEN").map(String::as_str),
+                Some("acl-secret")
+            );
+            assert!(c.sensitive_env && !c.display_line().contains("acl-secret"));
+        }
+        assert!(!serialised(&planned, &applied).contains("acl-secret"));
+        let requests = clusters.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one credential per pass");
+        assert_eq!(
+            (
+                requests[0].target.as_str(),
+                requests[0].purpose.as_str(),
+                requests[0].kind
+            ),
+            (
+                "home-nomad",
+                "drain",
+                buckle_core::model::ClusterKind::Nomad
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_without_probes_asks_for_no_credential() {
+        let clusters = Arc::new(Clusters::default());
+        let c = cluster_cx(&FakeSystem::new(), &clusters, buckle_core::task::Mode::Plan);
+        let spec = drain(
+            json!({"identity": {"cluster": "k", "kind": "kubernetes", "purpose": "read", "env": "KUBE_TOKEN"}}),
+        );
+        assert_eq!(plan_class(&CommandRun, &c, &spec).await, Class::Change);
+        assert!(clusters.requests.lock().unwrap().is_empty());
+    }
+
+    #[rstest]
+    #[case::local_run(None, "only an enrolled agent")]
+    #[case::refused(Some(Clusters { refuse: true, ..Default::default() }), "did not issue")]
+    #[tokio::test]
+    async fn a_credential_that_cannot_be_had_fails_the_task(
+        #[case] clusters: Option<Clusters>,
+        #[case] reason: &str,
+    ) {
+        let sys = FakeSystem::new();
+        let mut builder = buckle_core::testing::CxBuilder::new(sys.clone());
+        if let Some(c) = clusters {
+            builder = builder.clusters(Arc::new(c));
+        }
+        let err = CommandRun
+            .apply(&builder.build(), &drain(json!({})), &Planned::NoOp)
+            .await
+            .unwrap_err();
+        assert!(err.is(buckle_core::error::Kind::User), "{err:?}");
+        assert!(err.message().contains(reason), "{}", err.message());
+        assert!(sys.commands_run().is_empty(), "the command never runs");
     }
 }

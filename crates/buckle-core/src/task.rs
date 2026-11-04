@@ -123,6 +123,28 @@ impl Source for EmptySource {
     }
 }
 
+/// A credential for a cluster's API that a task asks for on the host's
+/// behalf: a Buckle-issued identity for `purpose`, exchanged the way the
+/// cluster takes it (a Nomad ACL token, a Kubernetes bearer token).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CredentialRequest {
+    /// The cluster target, as `fleet.clusters` names it.
+    pub target: String,
+    /// `read`, `deploy` or `drain`.
+    pub purpose: String,
+    pub kind: crate::model::ClusterKind,
+    /// The API the credential is exchanged at; `None`: the local default.
+    pub api: Option<String>,
+}
+
+/// Issues cluster credentials to tasks. The agent provides one; local runs
+/// have none.
+#[async_trait]
+pub trait ClusterCredentials: Send + Sync + std::fmt::Debug {
+    async fn credential(&self, request: &CredentialRequest)
+    -> crate::Result<secrecy::SecretString>;
+}
+
 /// Everything a task needs while planning or applying.
 #[derive(Clone)]
 pub struct Cx {
@@ -142,6 +164,8 @@ pub struct Cx {
     /// itself installed, enabled or wrote before (and can diff against the
     /// previous shadow). `None` when the resource is new, and for handlers.
     pub previous: Option<Arc<ResourceRecord>>,
+    /// Cluster credentials, when the host's agent can obtain them.
+    pub clusters: Option<Arc<dyn ClusterCredentials>>,
 }
 
 impl Cx {
