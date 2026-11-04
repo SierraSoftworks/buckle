@@ -314,11 +314,6 @@ impl Executor {
                                 .iter()
                                 .map(|m| format!("{name}: {}: {m}", step.key)),
                         );
-                        warnings.extend(
-                            step.preview
-                                .iter()
-                                .map(|m| format!("{name}: {}: {m}", step.key)),
-                        );
                     }
                     modules.push(module_plan(&name, &w.config.needs, &plan));
                     units.push(Unit { name, cx, plan });

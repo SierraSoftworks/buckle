@@ -274,7 +274,7 @@ impl FakeNomad {
                     json!({
                         "Diff": {"Type": ty, "ID": id, "Fields": [], "Objects": [], "TaskGroups": []},
                         "JobModifyIndex": modify,
-                        "Annotations": {"DesiredTGUpdates": {"api": {"Place": u64::from(ty == "Added")}}},
+                        "Annotations": {"DesiredTGUpdates": {"api": {"Place": u64::from(ty == "Added"), "Ignore": u64::from(ty == "None")}}},
                     }),
                 )
             }

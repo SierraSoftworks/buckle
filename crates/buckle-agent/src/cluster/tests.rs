@@ -162,6 +162,8 @@ async fn a_workload_plans_applies_and_then_plans_as_a_no_op() {
     let again = ex.plan(&a, None).await.unwrap().plan;
     assert_eq!(again.changes(), 0, "{again:#?}");
     assert!(again.removals.is_empty(), "{:?}", again.removals);
+    // Nomad reports the untouched allocation as `ignore`: not a warning.
+    assert!(again.warnings.is_empty(), "{:?}", again.warnings);
 }
 
 #[tokio::test]
