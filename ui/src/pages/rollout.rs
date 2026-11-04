@@ -553,12 +553,15 @@ fn can_force_apply(s: HostRolloutState) -> bool {
     )
 }
 
-/// Whether a host in this state can be re-planned: it failed, was held,
-/// skipped or missed its phase.
+/// Whether a host in this state can be re-planned: its plan is not applied
+/// yet (to plan, planned), or it failed, was held, skipped or missed its
+/// phase.
 fn can_replan(s: HostRolloutState) -> bool {
     matches!(
         s,
-        HostRolloutState::Failed
+        HostRolloutState::PlanPending
+            | HostRolloutState::Planned
+            | HostRolloutState::Failed
             | HostRolloutState::Held
             | HostRolloutState::Skipped
             | HostRolloutState::Pending
@@ -795,7 +798,7 @@ fn dialog(
                 "retry" => (
                     "Re-plan",
                     false,
-                    "Re-plans and re-applies the host as it stands; the same checks apply.",
+                    "Plans the host again as it stands. A host that failed, was held or skipped is then re-applied with the same checks; one still waiting to apply keeps its place and its plan asks for approval again if it changed.",
                 ),
                 "skip-bake" => (
                     "Skip the bake of",
@@ -1200,9 +1203,9 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         }),
         None,
     );
-    // A failed host is re-planned from its error: this one, or every failed
-    // host of the rollout at once.
-    let replan = (props.admin && h.state == HostRolloutState::Failed).then(|| {
+    // A host with an error is re-planned from it: this one, or (when it
+    // failed) every failed host of the rollout at once.
+    let replan = (props.admin && can_replan(h.state)).then(|| {
         let others = failed(&props.detail).len();
         let run = |a: Ask| {
             let on_run = props.on_run.clone();
@@ -1211,7 +1214,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         html! {
             <div class="error-block__actions" data-testid="host-replan">
                 <Button small=true kind={Kind::Primary} onclick={run(Ask::Host("retry", h.host.clone()))}>{ "Re-plan" }</Button>
-                if others > 1 {
+                if others > 1 && h.state == HostRolloutState::Failed {
                     <Button small=true onclick={run(Ask::Action("retry"))}>{ format!("Re-plan all {others} failed") }</Button>
                 }
             </div>

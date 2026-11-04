@@ -4249,3 +4249,36 @@ async fn a_bake_with_failing_checks_cannot_be_skipped() {
     let (_, hosts) = h.snapshot(&id).await;
     assert_eq!(host(&hosts, "a").state, HostPhase::Baking);
 }
+
+/// A host whose plan is not applied yet can be planned again: it gets a fresh
+/// plan and keeps waiting for its approval, nothing applies.
+#[tokio::test(start_paused = true)]
+async fn a_planned_host_can_be_planned_again_before_it_applies() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::AwaitingApproval).await;
+    let plans = || h.sent(|x, m| x == "a" && matches!(m, SMsg::Plan(_))).len();
+    let before = plans();
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: "a".into(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h
+        .wait(&id, "planned again", |_, hs| {
+            host(hs, "a").state == HostPhase::Planned
+        })
+        .await;
+    assert!(plans() > before, "a fresh plan is requested");
+    assert!(!host(&hosts, "a").runtime.released, "it keeps its place");
+    assert!(h.applies().is_empty(), "nothing applies without approval");
+}

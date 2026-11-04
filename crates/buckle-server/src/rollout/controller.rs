@@ -124,7 +124,8 @@ pub enum Command {
         rollout: String,
         note: String,
     },
-    /// Re-plan and re-apply a failed host.
+    /// Re-plan a host whose plan has not been applied yet (still to plan,
+    /// planned), and re-apply one that failed, was held, skipped or missed.
     Retry {
         rollout: String,
         host: String,
@@ -2258,13 +2259,18 @@ impl Controller {
                 let hi = self.find_host(ri, &host)?;
                 if !matches!(
                     self.live[ri].hosts[hi].state,
-                    HostPhase::Failed | HostPhase::Held | HostPhase::Skipped | HostPhase::Missed
+                    HostPhase::Failed
+                        | HostPhase::Held
+                        | HostPhase::Skipped
+                        | HostPhase::Missed
+                        | HostPhase::PlanPending
+                        | HostPhase::Planned
                 ) {
                     return Err(CommandError::conflict(
                         format!(
-                            "Host '{host}' is not failed, held or skipped, so there is nothing to retry."
+                            "Host '{host}' is past its plan (applying, baking or done), so it cannot be re-planned now."
                         ),
-                        &[],
+                        &["Wait for its apply and bake to finish; a failed host can be retried."],
                     ));
                 }
                 self.command_audit(
@@ -3121,9 +3127,13 @@ impl Controller {
         self.live[ri].hosts[hi].runtime.current_step().select()
     }
 
+    /// Plans row `hi` again. A row that failed, was held, skipped or missed
+    /// is also released to apply (a retry); one still waiting to start (to
+    /// plan, planned) only gets a fresh plan and keeps its place.
     fn replan(&mut self, ri: usize, hi: usize, actor: &str) {
         {
             let h = &mut self.live[ri].hosts[hi];
+            let retry = !matches!(h.state, HostPhase::PlanPending | HostPhase::Planned);
             h.runtime.failed_checks.clear();
             h.runtime.failed_module = None;
             h.runtime.error = None;
@@ -3133,9 +3143,11 @@ impl Controller {
             h.runtime.request_id = None;
             h.runtime.bake_until = None;
             h.runtime.bake = None;
-            h.runtime.attempts += 1;
+            if retry {
+                h.runtime.attempts += 1;
+                h.runtime.released = true;
+            }
             h.runtime.stale_refusals = 0;
-            h.runtime.released = true;
             h.runtime.force_plan = false;
             h.plan_digest = None;
         }

@@ -792,7 +792,9 @@ pub fn rollout_host_action(
             match (action, h.state) {
                 (
                     "retry",
-                    HostRolloutState::Failed
+                    HostRolloutState::PlanPending
+                    | HostRolloutState::Planned
+                    | HostRolloutState::Failed
                     | HostRolloutState::Held
                     | HostRolloutState::Skipped
                     | HostRolloutState::Pending,

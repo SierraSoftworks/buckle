@@ -24,7 +24,7 @@ Every host decision is also in the **⋮** menu on the host's row.
 
 | Action | What it does | Use it when |
 |---|---|---|
-| **Re-plan** | Re-plans and re-applies the host as it stands; the same checks apply. | You fixed the cause: a secret, a repository, an identity, the host itself. |
+| **Re-plan** | Plans the host again as it stands; a failed, held or skipped host is then re-applied with the same checks. Offered on any host whose plan is not applied yet. | You fixed the cause: a secret, a repository, an identity, the host itself. |
 | **Continue with checks waived…** | Retries with the named failing checks waived for this host in this rollout. They still run and report. | A check is wrong or flaky, not the change. |
 | **Skip bake period…** | Counts a baking host as baked now. Refused while one of its checks is failing. | The change is verified and the bake window only delays the rollout. |
 | **Force apply…** | Applies whatever the host plans now, without approval, digest check or a passing baseline. | A plan keeps changing between attempts, or a host held at baseline must go ahead. |
