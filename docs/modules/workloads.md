@@ -65,6 +65,12 @@ removal: stop
 items), `policies` (ACL policies, each optionally attached to a job, group or task),
 `namespaces`, `node_pools` and `resources` (`{ type, file }` for every other entity).
 
+A job is registered with its source and variable values (`/v1/job/:id/submission`), so tools that
+re-render it can. A variable the job's meta names as `autoupdate.<var>` belongs to
+[nomad-auto-update](https://github.com/SierraSoftworks/nomad-auto-update) once the job runs:
+plans keep the live version's value (a pinned digest or release tag) instead of resetting it to
+the workload's. Drop the meta key to set the value from the workload again.
+
 ### Kubernetes keys
 
 `manifests` (applied as they are, or rendered first when they end in `.j2`) and `secrets`

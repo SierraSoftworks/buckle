@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 struct State {
     index: u64,
     jobs: BTreeMap<(String, String), Value>,
+    /// Job submissions by (namespace, id, version).
+    submissions: BTreeMap<(String, String, u64), Value>,
     vars: BTreeMap<(String, String), (BTreeMap<String, String>, u64)>,
     policies: BTreeMap<String, Value>,
     namespaces: BTreeMap<String, Value>,
@@ -87,6 +89,33 @@ impl FakeNomad {
             job["JobModifyIndex"] = json!(index);
             job["Version"] = json!(job["Version"].as_u64().unwrap_or(0) + 1);
         }
+    }
+
+    /// The submission registered with a job's current version.
+    pub fn submission(&self, ns: &str, id: &str) -> Option<Value> {
+        let s = self.state.lock().unwrap();
+        let version = s.jobs.get(&(ns.into(), id.into()))?["Version"].as_u64()?;
+        s.submissions.get(&(ns.into(), id.into(), version)).cloned()
+    }
+
+    /// Registers a new version of a job out of band, with its submission
+    /// (nomad-auto-update re-rendering it with new variable values).
+    pub fn reregister(&self, ns: &str, id: &str, job: Value, submission: Value) {
+        let mut s = self.state.lock().unwrap();
+        s.index += 1;
+        let index = s.index;
+        let key = (ns.to_owned(), id.to_owned());
+        let version = s
+            .jobs
+            .get(&key)
+            .map_or(0, |j| j["Version"].as_u64().unwrap_or(0) + 1);
+        let mut stored = job;
+        stored["Version"] = json!(version);
+        stored["JobModifyIndex"] = json!(index);
+        stored["Stop"] = json!(false);
+        s.jobs.insert(key, stored);
+        s.submissions
+            .insert((ns.to_owned(), id.to_owned(), version), submission);
     }
 
     /// A stored variable's items.
@@ -192,9 +221,17 @@ impl FakeNomad {
 
         match (req.method, parts.as_slice()) {
             ("POST", ["jobs", "parse"]) => {
-                let Ok(mut job) =
-                    serde_json::from_str::<Value>(body["JobHCL"].as_str().unwrap_or(""))
-                else {
+                // The fake's "HCL" is JSON; `${var.name}` takes a string
+                // variable's value from the var file.
+                let mut hcl = body["JobHCL"].as_str().unwrap_or("").to_owned();
+                for line in body["Variables"].as_str().unwrap_or("").lines() {
+                    if let Some((name, value)) = line.split_once(" = ")
+                        && let Ok(Value::String(v)) = serde_json::from_str::<Value>(value)
+                    {
+                        hcl = hcl.replace(&format!("${{var.{name}}}"), &v.replace("$${", "${"));
+                    }
+                }
+                let Ok(mut job) = serde_json::from_str::<Value>(&hcl) else {
                     return (400, Value::String("error parsing job".into()));
                 };
                 if job["Namespace"].is_null() {
@@ -241,6 +278,12 @@ impl FakeNomad {
                 stored["Version"] = json!(version);
                 stored["JobModifyIndex"] = json!(index);
                 stored["Stop"] = json!(false);
+                if !body["Submission"].is_null() {
+                    s.submissions.insert(
+                        (key.0.clone(), key.1.clone(), version),
+                        body["Submission"].clone(),
+                    );
+                }
                 s.jobs.insert(key, stored);
                 (
                     200,
@@ -277,6 +320,15 @@ impl FakeNomad {
                         "Annotations": {"DesiredTGUpdates": {"api": {"Place": u64::from(ty == "Added"), "Ignore": u64::from(ty == "None")}}},
                     }),
                 )
+            }
+            ("GET", ["job", id, "submission"]) => {
+                let version = q("version")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                match s.submissions.get(&(ns.clone(), (*id).to_owned(), version)) {
+                    Some(sub) => (200, sub.clone()),
+                    None => not_found,
+                }
             }
             ("GET", ["job", id, "deployment"]) => match s.jobs.get(&(ns.clone(), (*id).to_owned()))
             {

@@ -525,3 +525,48 @@ async fn a_job_without_a_namespace_lands_in_the_workloads() {
         .unwrap();
     assert!(fake.job("team-a", "atuin").is_some());
 }
+
+/// atuin's job with its image tag from `var.version`, optionally declared to
+/// nomad-auto-update.
+fn versioned_job(autoupdate: bool) -> JobSpec {
+    let meta = if autoupdate {
+        serde_json::json!({"autoupdate.version": "docker:atuin:latest"})
+    } else {
+        serde_json::json!({})
+    };
+    let mut spec = job(serde_json::json!({
+        "ID": "atuin", "Type": "service", "Meta": meta,
+        "TaskGroups": [{"Name": "api", "Count": 1, "Tasks": [{"Name": "atuin", "Config": {"image": "atuin:${var.version}"}}]}],
+    }));
+    spec.vars
+        .insert("version".into(), serde_json::json!("latest"));
+    spec
+}
+
+#[rstest::rstest]
+#[case::declared_to_the_updater(true, 0)]
+#[case::not_declared(false, 1)]
+#[tokio::test]
+async fn an_updaters_pin_is_kept_only_for_variables_it_owns(
+    #[case] autoupdate: bool,
+    #[case] changes: usize,
+) {
+    let fake = FakeNomad::new();
+    let cx = cx(&fake, "r1");
+    let w = workload(Some(versioned_job(autoupdate)));
+    w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
+
+    // The source and values are kept for the updater to re-render.
+    let sub = fake.submission("default", "atuin").expect("a submission");
+    assert_eq!(sub["VariableFlags"]["version"], "latest");
+    assert!(sub["Source"].as_str().unwrap().contains("${var.version}"));
+
+    // nomad-auto-update pins the tag to its digest.
+    let mut pinned = fake.job("default", "atuin").unwrap();
+    pinned["TaskGroups"][0]["Tasks"][0]["Config"]["image"] = "atuin:latest@sha256:abc".into();
+    let mut pinned_sub = sub.clone();
+    pinned_sub["VariableFlags"]["version"] = "latest@sha256:abc".into();
+    fake.reregister("default", "atuin", pinned, pinned_sub);
+
+    assert_eq!(w.plan(&cx).await.unwrap().changes(), changes);
+}

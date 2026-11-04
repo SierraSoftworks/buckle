@@ -58,6 +58,9 @@ impl JobSpec {
 #[derive(Debug, Clone)]
 pub(crate) struct Pending {
     job: Value,
+    /// The source and variable values registered with the job, so that Nomad
+    /// keeps them (`/v1/job/:id/submission`) for tools that re-render it.
+    submission: Value,
     /// The job modify index the plan saw; 0 when the job must not exist.
     enforce_index: u64,
     /// The job's revision and digest, recorded in the index on apply.
@@ -71,14 +74,74 @@ const POLL: Duration = Duration::from_secs(2);
 /// makes no progress within its `progress_deadline` well before this.
 pub const DEPLOYMENT_TIMEOUT: Duration = Duration::from_secs(3600);
 
-async fn parse(cx: &Context, spec: &JobSpec) -> Result<Value> {
+/// The values the spec is rendered with: its declared vars, its files, and
+/// `pinned` over both.
+fn variables(spec: &JobSpec, pinned: &IndexMap<String, Value>) -> IndexMap<String, Value> {
     let mut vars = spec.declared_vars();
     for (name, content) in &spec.files {
         vars.insert(name.clone(), Value::String(content.clone()));
     }
+    for (name, value) in pinned {
+        vars.insert(name.clone(), value.clone());
+    }
+    vars
+}
+
+/// The job's submission for Nomad to keep: what `nomad job run -var` records.
+fn submission(spec: &JobSpec, vars: &IndexMap<String, Value>) -> Value {
+    let flags: serde_json::Map<String, Value> = vars
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(crate::hcl::flag(v))))
+        .collect();
+    json!({"Format": "hcl2", "Source": spec.hcl, "VariableFlags": flags})
+}
+
+/// The variables an updater owns once the job runs: those the job's meta
+/// names as `autoupdate.<var>` (nomad-auto-update), with the values of the
+/// live version's submission. Rendering with them keeps the updater's pins
+/// (an image digest, a release tag) instead of resetting them each plan.
+async fn pinned_by_updater(
+    cx: &Context,
+    spec: &JobSpec,
+    job: &Value,
+    live: &Value,
+    ns: &str,
+    id: &str,
+) -> Result<IndexMap<String, Value>> {
+    let declared = spec.declared_vars();
+    let owned: Vec<&str> = job["Meta"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys())
+        .filter_map(|k| k.strip_prefix("autoupdate."))
+        .filter(|v| declared.contains_key(*v))
+        .collect();
+    if owned.is_empty() {
+        return Ok(IndexMap::new());
+    }
+    let version = live["Version"].as_u64().unwrap_or(0).to_string();
+    let url = with_query(
+        &with_query(&format!("/v1/job/{}/submission", seg(id)), "namespace", ns),
+        "version",
+        &version,
+    );
+    let Some(live_sub) = cx.nomad.get::<Value>(&url).await? else {
+        return Ok(IndexMap::new());
+    };
+    Ok(owned
+        .into_iter()
+        .filter_map(|v| {
+            live_sub["VariableFlags"][v]
+                .as_str()
+                .map(|s| (v.to_owned(), Value::String(s.to_owned())))
+        })
+        .collect())
+}
+
+async fn parse(cx: &Context, spec: &JobSpec, vars: &IndexMap<String, Value>) -> Result<Value> {
     let body = json!({
         "JobHCL": spec.hcl,
-        "Variables": crate::hcl::var_file(&vars)?,
+        "Variables": crate::hcl::var_file(vars)?,
         "Canonicalize": true,
     });
     cx.nomad
@@ -93,7 +156,8 @@ async fn parse(cx: &Context, spec: &JobSpec) -> Result<Value> {
 }
 
 pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) -> Result<Step> {
-    let mut job = parse(cx, spec).await?;
+    let mut vars = variables(spec, &IndexMap::new());
+    let mut job = parse(cx, spec, &vars).await?;
     let id = job["ID"].as_str().unwrap_or_default().to_owned();
     if id.is_empty() {
         return Err(user(
@@ -120,6 +184,15 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
     if let Some(reason) = owner.conflict(&key.to_string()) {
         return Ok(Step::blocked(key, reason));
     }
+    if let Some(live) = &live {
+        let pinned = pinned_by_updater(cx, spec, &job, live, &ns, &id).await?;
+        if !pinned.is_empty() {
+            vars = variables(spec, &pinned);
+            job = parse(cx, spec, &vars).await?;
+            job["Namespace"] = Value::String(ns.clone());
+        }
+    }
+    let submission = submission(spec, &vars);
     // Only the owner stamps go in the job's meta: Nomad passes job meta to
     // every task, so a changing revision or digest there would turn every
     // change (a count bump included) into a destructive update. The revision
@@ -160,6 +233,7 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
             preview: Vec::new(),
             pending: StepPending::Job(Pending {
                 job,
+                submission,
                 enforce_index: 0,
                 entry,
             }),
@@ -213,6 +287,7 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
         preview,
         pending: StepPending::Job(Pending {
             job,
+            submission,
             enforce_index,
             entry,
         }),
@@ -223,6 +298,7 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
     let url = with_query("/v1/jobs", "namespace", &key.namespace);
     let body = json!({
         "Job": p.job,
+        "Submission": p.submission,
         "EnforceIndex": true,
         "JobModifyIndex": p.enforce_index,
     });
