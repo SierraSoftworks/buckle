@@ -11,6 +11,7 @@ use yew::prelude::*;
 use super::changes::Changes;
 use super::diff::{DiffView, secret_text};
 use super::icons;
+use super::ui::{Note, NoteKind};
 use crate::logic::fleet_plan::{Phases, Tally, scope_title};
 use crate::logic::format::{count, short};
 use crate::logic::plan::review;
@@ -167,12 +168,11 @@ pub fn note(n: &ModuleNote, glyph: &str, class: &str, scope: Html) -> Html {
 }
 
 fn body(plan: &PlanView) -> Html {
+    // Warnings are banners like every other note, above the modules.
     let warnings = (!plan.warnings.is_empty()).then(|| {
-        warnings_block(
-            plan.warnings.len(),
-            html! {},
-            html! { { for plan.warnings.iter().map(|w| warning(w, html! {})) } },
-        )
+        html! { { for plan.warnings.iter().map(|w| html! {
+            <Note kind={NoteKind::Warn} testid="plan-warning">{ secret_text(w) }</Note>
+        }) } }
     });
     // A module with nothing to apply is left out; the rest open to their
     // diffs from a heading that counts them.
@@ -257,29 +257,6 @@ pub fn module_head(
 
 /// The plan's warnings, as a block like a module's: counted in its heading,
 /// listed one per line when opened.
-pub fn warnings_block(n: usize, hosts: Html, items: Html) -> Html {
-    block(
-        "plan-module--warnings",
-        html! { <>
-            <span class="plan-module__icon">{ icons::alert() }</span>
-            <h4 class="plan-module__name">{ "Warnings" }</h4>
-            <span class="plan-module__aside"><span class="muted">{ count(n, "warning", "warnings") }</span>{ hosts }</span>
-        </> },
-        html! { <ul class="steps">{ items }</ul> },
-    )
-}
-
-/// One warning: its text flowing (and wrapping) as one run, placeholders
-/// inline, then the hosts it applies to.
-pub fn warning(text: &str, scope: Html) -> Html {
-    html! {
-        <li class="step step--warning">
-            <span class="step__text">{ secret_text(text) }</span>
-            { scope }
-        </li>
-    }
-}
-
 pub fn removals_block(n: usize, hosts: Html, items: Html) -> Html {
     block(
         "plan-module--removals",

@@ -82,6 +82,46 @@ pub fn pill(props: &PillProps) -> Html {
     }
 }
 
+/// How much a [`Note`] asks of its reader.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum NoteKind {
+    #[default]
+    Info,
+    Warn,
+    Danger,
+}
+
+#[derive(Properties, PartialEq)]
+pub struct NoteProps {
+    #[prop_or_default]
+    pub kind: NoteKind,
+    pub children: Html,
+    /// At the end of the line: the hosts or phases it concerns, say.
+    #[prop_or_default]
+    pub aside: Html,
+    #[prop_or_default]
+    pub testid: Option<AttrValue>,
+}
+
+/// A banner, so every note looks the same wherever it comes from: an icon
+/// by its kind, its text in the body colour, then its aside.
+#[function_component(Note)]
+pub fn note(props: &NoteProps) -> Html {
+    let (class, icon) = match props.kind {
+        NoteKind::Info => ("note--info", super::icons::info()),
+        NoteKind::Warn => ("note--warn", super::icons::alert()),
+        NoteKind::Danger => ("note--danger", super::icons::alert()),
+    };
+    html! {
+        <div class={classes!("note", class)} data-testid={props.testid.clone()}
+            role={(props.kind == NoteKind::Danger).then_some("alert")}>
+            <span class="note__icon">{ icon }</span>
+            <div class="note__text">{ props.children.clone() }</div>
+            { props.aside.clone() }
+        </div>
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct HoverTipProps {
     /// What is hovered or focused.

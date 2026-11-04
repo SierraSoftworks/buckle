@@ -150,6 +150,14 @@ pub fn alert() -> Html {
     </> })
 }
 
+pub fn info() -> Html {
+    icon(html! { <>
+        <circle cx="12" cy="12" r="9" />
+        <line x1="12" y1="11" x2="12" y2="16" />
+        <line x1="12" y1="8" x2="12.01" y2="8" />
+    </> })
+}
+
 pub fn refresh() -> Html {
     icon(html! { <>
         <path d="M20 11a8 8 0 0 0-14.9-3.9L4 9" />

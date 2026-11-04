@@ -8,6 +8,8 @@ use std::rc::Rc;
 use buckle_api::{FleetPlan, FleetStep, PlanGroup, Shared};
 use yew::prelude::*;
 
+use crate::components::ui::{Note, NoteKind};
+
 use super::diff::{FactExemplars, secret_text};
 use super::icons;
 use super::plan::{
@@ -152,7 +154,7 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
                     }
                 </p>
                 if !p.unplanned.is_empty() {
-                    <p class="note note--warn">{ format!("Not included, no plan of this revision yet: {}.", p.unplanned.join(", ")) }</p>
+                    <Note kind={NoteKind::Warn}>{ format!("Not included, no plan of this revision yet: {}.", p.unplanned.join(", ")) }</Note>
                 }
                 { for modules }
                 { removals.unwrap_or_default() }
@@ -237,11 +239,10 @@ fn fleet_warnings(props: &FleetPlanProps) -> Html {
     html! {
         <ContextProvider<FactExemplars> context={(*exemplars).clone()}>
         { for p.warnings.iter().map(|w| html! {
-            <div class="note note--warn plan-warning" data-testid="plan-warning">
-                <span class="plan-warning__icon">{ icons::alert() }</span>
-                <span class="step__text">{ secret_text(&w.value) }</span>
-                { scope_within(&p.hosts, &p.hosts, &w.hosts, &phases) }
-            </div>
+            <Note kind={NoteKind::Warn} testid="plan-warning"
+                aside={scope_within(&p.hosts, &p.hosts, &w.hosts, &phases)}>
+                { secret_text(&w.value) }
+            </Note>
         }) }
         </ContextProvider<FactExemplars>>
     }

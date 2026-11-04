@@ -5,6 +5,8 @@
 use buckle_api::{RevisionStatus, RevisionSummary, RolloutSummary};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
+
+use crate::components::ui::Note;
 use yew_router::prelude::*;
 
 use super::meter::rollout_segments;
@@ -128,7 +130,7 @@ impl RevisionActions {
                 <Confirm title={format!("Start a rollout of {}", commit(&r.commit))} confirm_label="Start rollout" note=true
                     busy={self.busy} error={self.error.clone()} on_confirm={self.run.clone()} on_cancel={cancel}>
                     <p>{ format!("“{}” moves through the phases as buckle.yaml describes: plans first, then every gate, wave and bake.", first_line(&r.message)) }</p>
-                    if let Some(q) = queued { <p class="note">{ q }</p> }
+                    if let Some(q) = queued { <Note>{ q }</Note> }
                 </Confirm>
             },
             RevisionAsk::RollBack(r) => html! {
@@ -137,7 +139,7 @@ impl RevisionActions {
                     busy={self.busy} error={self.error.clone()} on_confirm={self.run.clone()} on_cancel={cancel}>
                     <p>{ format!("Starts a rollout of the older revision “{}”. Rolling back is rolling forward to old content: resources added since are removed, and every phase gate, approval and bake still applies.", first_line(&r.message)) }</p>
                     <p class="muted">{ "An irreversible task (a package upgrade with a schema migration) only goes back as far as its kind can; the plans will show exactly what will happen." }</p>
-                    if let Some(q) = queued { <p class="note">{ q }</p> }
+                    if let Some(q) = queued { <Note>{ q }</Note> }
                 </Confirm>
             },
         }

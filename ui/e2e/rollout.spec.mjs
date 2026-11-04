@@ -171,7 +171,7 @@ describe("approving a phase", () => {
     assert.equal(await warnings.count(), 2, "a banner per warning");
     const banner = warnings.filter({ hasText: "released: left in place" });
     assert.match(await banner.locator(".scope").textContent(), /^4 of 12 in cloud$/);
-    const long = banner.locator(".step__text");
+    const long = banner.locator(".note__text");
     await long.waitFor();
     assert.equal(await long.locator(".fact").count(), 1, "the host's name reads as a placeholder");
     const box = await long.boundingBox();

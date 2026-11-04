@@ -13,6 +13,8 @@ use buckle_api::{
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
+use crate::components::ui::{Note, NoteKind};
+
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::icons;
@@ -731,28 +733,28 @@ fn approval(
     };
     let notes = html! { <>
         if !running.is_empty() {
-            <p class="note" data-testid="approval-waits">
+            <Note testid="approval-waits">
                 { format!("{} still running: {} can be approved once {} finished. Review its plans meanwhile.",
                     running.join(", "), phase.name, if running.len() == 1 { "it has" } else { "they have" }) }
-            </p>
+            </Note>
         }
         if scope.groups.is_empty() {
             if missing.is_empty() && !deferred.is_empty() {
-                <p class="note">{ format!("No plans for {} yet: {} plans when its stage opens; the phase can be approved once it has.", phase.name, names(&deferred)) }</p>
+                <Note>{ format!("No plans for {} yet: {} plans when its stage opens; the phase can be approved once it has.", phase.name, names(&deferred)) }</Note>
             } else {
-                <p class="note">{ format!("No plans for {} yet: plans arrive as the hosts answer; the phase can be approved once they have.", phase.name) }</p>
+                <Note>{ format!("No plans for {} yet: plans arrive as the hosts answer; the phase can be approved once they have.", phase.name) }</Note>
             }
         }
         if !missing.is_empty() {
-            <p class="note note--warn">
+            <Note kind={NoteKind::Warn}>
                 { format!("{} in {} {} no plan yet ({}): not covered by its approval. A host that misses its wave moves to the stragglers stage.",
                     count(missing.len(), "host", "hosts"), phase.name, if missing.len() == 1 { "has" } else { "have" }, names(&missing)) }
-            </p>
+            </Note>
         }
         if !deferred.is_empty() && !scope.groups.is_empty() {
-            <p class="note">
+            <Note>
                 { format!("Planned when its stage opens, so not covered by the approval of {}: {}.", phase.name, names(&deferred)) }
-            </p>
+            </Note>
         }
     </> };
     (button, notes)
