@@ -131,24 +131,37 @@ and the fleet stays on the last valid one.
 
 #### Tailscale provisioning
 
-With `tailscale.provisioning`, **Add an agent** asks the admin to consent in Tailscale and puts the
-single-use auth key Tailscale returns into the join command, so a new host joins the tailnet and
-enrols in one paste. It uses Tailscale's
-[device provisioning](https://tailscale.com/docs/features/oauth-apps/device-provisioning) flow.
+With `tailscale.provisioning`, **Add an agent** puts a single-use Tailscale auth key into the join
+command, so a new host joins the tailnet and enrols in one paste. The OAuth client secret never
+leaves the server; the key works once and expires within the hour. `flow` picks how the key is
+issued:
 
-1. Create an OAuth app (admin API token) with scope `auth_keys:create:once` and redirect URI
-   `{web.base_url}/api/v1/join/tailscale/callback`.
-2. Put its client id and secret in `server.yaml`, through the environment. The secret never leaves
-   the server; join commands carry only the key, which works once and expires within the hour.
-3. The node Tailscale adds is owned by the consenting admin, and then advertises one of
-   `provisioning.tags` (default: `allowed_tags`) so `allowed_tags` admits it. The admin must own
-   those tags in the tailnet policy's `tagOwners`.
+- **`app`** (default): Tailscale's [device provisioning](https://tailscale.com/docs/features/oauth-apps/device-provisioning)
+  flow. Each command asks the admin creating it to consent in Tailscale.
+  1. Create an OAuth app with scope `auth_keys:create:once` and redirect URI
+     `{web.base_url}/api/v1/join/tailscale/callback`.
+  2. The node is owned by the consenting admin and advertises one of `tags`, so `allowed_tags`
+     admits it. The admin must own those tags in the tailnet policy's `tagOwners`.
+- **`client`**: an [OAuth client](https://tailscale.com/kb/1215/oauth-clients) with the
+  `auth_keys` scope and the tags assigned. The server mints a tagged, pre-approved key itself,
+  with no consent step and no `web.base_url` needed.
+
+```yaml
+agents:
+  tailscale:
+    allowed_tags: ["tag:buckle"]
+    provisioning:
+      flow: client
+      client_id: "${{ env.TS_OAUTH_CLIENT_ID }}"
+      client_secret: "${{ env.TS_OAUTH_CLIENT_SECRET }}"
+```
 
 | Key | Default | Description |
 |---|---|---|
-| `client_id`, `client_secret` | | The OAuth app's credentials. |
-| `tags` | `allowed_tags` | The tags the wizard offers; the first is the default. |
-| `node_attributes` | `[]` | `custom:…` attributes stamped on the node; each must be on the app's `allowedNodeAttributes`. |
+| `flow` | `app` | `app` (admin consents per command) or `client` (server mints tagged keys). |
+| `client_id`, `client_secret` | | The OAuth app's or client's credentials. |
+| `tags` | `allowed_tags` | The tags the wizard offers; the first is the default. Required for `client`. |
+| `node_attributes` | `[]` | `custom:…` attributes stamped on the node (`app` only); each must be on the app's `allowedNodeAttributes`. |
 
 Per-host labels, pauses and notes are managed in the UI and stored in the database, not here.
 

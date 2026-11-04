@@ -8,13 +8,17 @@
 //! - a **join token**, when the agent enrols by token (or must skip
 //!   approval): exchanged once, by the host it names, for a per-host token;
 //! - a **Tailscale auth key**, when `agents.tailscale.provisioning` is set:
-//!   the admin consents in Tailscale (OAuth authorization code flow), and the
-//!   server trades the code for a key that adds one node, once, within the
-//!   hour. The OAuth client secret never leaves the server.
+//!   either the admin consents in Tailscale and the server trades the code
+//!   for a key (`flow: app`, authorization code flow), or the server mints a
+//!   tagged key itself (`flow: client`, client credentials). Either key adds
+//!   one node, once, within the hour. The OAuth client secret never leaves
+//!   the server.
 //!
 //! Only the admin who created a ticket may read it back.
 
-use crate::config::{AgentAuth, Registration, ServerConfig, TailscaleProvisioning, TlsMode};
+use crate::config::{
+    AgentAuth, ProvisioningFlow, Registration, ServerConfig, TailscaleProvisioning, TlsMode,
+};
 use buckle_api::{
     JoinMethod, JoinOptions, JoinPlatform, JoinRequest, JoinState, JoinTicket, TailscaleJoinOptions,
 };
@@ -26,7 +30,8 @@ use std::time::Duration;
 /// Tickets alive at once; more is someone scripting the endpoint.
 pub const MAX_TICKETS: usize = 64;
 
-/// The OAuth scope that lets Tailscale issue one auth key per consent.
+/// The OAuth scope that lets Tailscale issue one auth key per consent
+/// (`flow: app`).
 pub const TAILSCALE_SCOPE: &str = "auth_keys:create:once";
 
 /// Where Tailscale returns after consent, below `web.base_url`.
@@ -135,6 +140,7 @@ impl JoinSettings {
             server_url: self.server_url.clone(),
             tailscale: self.tailscale.as_ref().map(|p| TailscaleJoinOptions {
                 tags: p.tags.clone(),
+                consent: p.config.flow == ProvisioningFlow::App,
             }),
             ttl_seconds: self.ttl.as_secs(),
             approval_required: self.approval_required,
@@ -472,19 +478,31 @@ impl Joins {
         Ok(tags)
     }
 
-    /// Creates a ticket for `request` on behalf of `actor`.
-    pub fn create(
+    /// Creates a ticket for `request` on behalf of `actor`. With
+    /// `flow: client`, mints the node's Tailscale key first.
+    pub async fn create(
         &self,
         request: JoinRequest,
         actor: &str,
         now: DateTime<Utc>,
     ) -> Result<JoinTicket, JoinError> {
         let tags = self.validate(&request)?;
-        let mut map = self.lock();
-        map.retain(|_, e| e.ticket.expires_at > now);
-        if map.len() >= MAX_TICKETS {
-            return Err(JoinError::TooMany);
+        {
+            let mut map = self.lock();
+            map.retain(|_, e| e.ticket.expires_at > now);
+            if map.len() >= MAX_TICKETS {
+                return Err(JoinError::TooMany);
+            }
         }
+        let provisioning = self
+            .settings
+            .tailscale
+            .as_ref()
+            .filter(|_| request.method == JoinMethod::Tailscale);
+        let minted = match provisioning {
+            Some(p) if p.config.flow == ProvisioningFlow::Client => Some(self.mint(p, &tags).await),
+            _ => None,
+        };
         let id = random_hex(12);
         let join_token = self
             .settings
@@ -513,19 +531,38 @@ impl Joins {
             oauth_state: None,
             redeemed: false,
         };
-        match (&self.settings.tailscale, entry.request.method) {
-            (Some(p), JoinMethod::Tailscale) => {
+        match (minted, provisioning) {
+            (Some(outcome), _) => self.settle(&mut entry, outcome, now),
+            (None, Some(p)) => {
                 let state = random_hex(24);
                 entry.ticket.state = JoinState::Authorize {
                     authorize_url: authorize_url(p, &state),
                 };
                 entry.oauth_state = Some(state);
             }
-            _ => self.make_ready(&mut entry, None),
+            (None, None) => self.make_ready(&mut entry, None),
         }
         let ticket = entry.ticket.clone();
-        map.insert(id, entry);
+        self.lock().insert(id, entry);
         Ok(ticket)
+    }
+
+    /// Readies `entry` with the Tailscale key `outcome` brought, or fails it.
+    fn settle(&self, entry: &mut Entry, outcome: Result<Key, String>, now: DateTime<Utc>) {
+        match outcome {
+            Ok(Key { key, lifetime }) => {
+                if let Some(life) = lifetime {
+                    entry.ticket.expires_at = entry.ticket.expires_at.min(now + life);
+                }
+                self.make_ready(entry, Some(&key));
+            }
+            Err(reason) => {
+                tracing::warn!(%reason, "Tailscale provisioning failed");
+                entry.join_token = None;
+                entry.token_hash = None;
+                entry.ticket.state = JoinState::Failed { reason };
+            }
+        }
     }
 
     fn make_ready(&self, entry: &mut Entry, tailscale_key: Option<&str>) {
@@ -588,75 +625,89 @@ impl Joins {
         };
         let mut map = self.lock();
         let entry = map.get_mut(&id).ok_or(JoinError::NotFound)?;
-        match outcome {
-            Ok((key, lifetime)) => {
-                if let Some(life) = lifetime {
-                    entry.ticket.expires_at = entry.ticket.expires_at.min(now + life);
-                }
-                self.make_ready(entry, Some(&key));
-            }
-            Err(reason) => {
-                tracing::warn!(%reason, "Tailscale provisioning failed");
-                entry.join_token = None;
-                entry.token_hash = None;
-                entry.ticket.state = JoinState::Failed { reason };
-            }
-        }
+        self.settle(entry, outcome, now);
         Ok(id)
     }
 
-    /// The authorization code flow's token exchange: the access token is the
-    /// auth key.
-    async fn exchange(
-        &self,
-        p: &Provisioning,
-        code: &str,
-    ) -> Result<(String, Option<chrono::Duration>), String> {
-        #[derive(serde::Deserialize)]
-        struct Token {
-            access_token: String,
-            #[serde(default)]
-            expires_in: Option<i64>,
-        }
+    /// The authorization code flow's token exchange (`flow: app`): the
+    /// access token is the auth key.
+    async fn exchange(&self, p: &Provisioning, code: &str) -> Result<Key, String> {
         let mut form = vec![
             ("grant_type", "authorization_code".to_owned()),
             ("code", code.to_owned()),
-            ("client_id", p.config.client_id.clone()),
-            ("client_secret", p.config.client_secret.clone()),
             ("redirect_uri", p.redirect_uri.clone()),
         ];
         if !p.config.node_attributes.is_empty() {
             form.push(("node_attributes", p.config.node_attributes.join(",")));
         }
+        let token = self.token(p, form).await?;
+        Ok(Key {
+            key: token.access_token,
+            lifetime: token.expires_in.map(chrono::Duration::seconds),
+        })
+    }
+
+    /// Mints a single-use, pre-approved key carrying `tags` with the OAuth
+    /// client's own credentials (`flow: client`).
+    async fn mint(&self, p: &Provisioning, tags: &[String]) -> Result<Key, String> {
+        #[derive(serde::Deserialize)]
+        struct Created {
+            key: String,
+        }
+        let token = self
+            .token(p, vec![("grant_type", "client_credentials".to_owned())])
+            .await?;
+        let body = serde_json::json!({
+            "capabilities": { "devices": { "create": {
+                "reusable": false,
+                "ephemeral": false,
+                "preauthorized": true,
+                "tags": tags,
+            } } },
+            "expirySeconds": self.settings.ttl.as_secs(),
+            "description": "Buckle join command",
+        });
+        let response = self
+            .http
+            .post(format!(
+                "{}/api/v2/tailnet/-/keys",
+                p.config.api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&token.access_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Tailscale could not be reached ({e})."))?;
+        let created: Created = read(response, "the auth key").await?;
+        Ok(Key {
+            key: created.key,
+            lifetime: None,
+        })
+    }
+
+    /// An OAuth token from Tailscale for `form` plus the client credentials.
+    async fn token(
+        &self,
+        p: &Provisioning,
+        mut form: Vec<(&str, String)>,
+    ) -> Result<OAuthToken, String> {
+        form.push(("client_id", p.config.client_id.clone()));
+        form.push(("client_secret", p.config.client_secret.clone()));
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form.iter())
             .finish();
-        let url = format!(
-            "{}/api/v2/oauth/token",
-            p.config.api_url.trim_end_matches('/')
-        );
         let response = self
             .http
-            .post(&url)
+            .post(format!(
+                "{}/api/v2/oauth/token",
+                p.config.api_url.trim_end_matches('/')
+            ))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(body)
             .send()
             .await
             .map_err(|e| format!("Tailscale could not be reached ({e})."))?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let text: String = text.chars().take(200).collect();
-            return Err(format!("Tailscale refused the code ({status}): {text}"));
-        }
-        let token: Token = response
-            .json()
-            .await
-            .map_err(|e| format!("Tailscale's answer could not be read ({e})."))?;
-        Ok((
-            token.access_token,
-            token.expires_in.map(chrono::Duration::seconds),
-        ))
+        read(response, "a token").await
     }
 
     /// Claims the join token `token` for `host`: once, before it expires,
@@ -687,6 +738,41 @@ impl Joins {
             e.redeemed = false;
         }
     }
+}
+
+/// A Tailscale auth key, and how long Tailscale says it lasts.
+struct Key {
+    key: String,
+    lifetime: Option<chrono::Duration>,
+}
+
+#[derive(serde::Deserialize)]
+struct OAuthToken {
+    access_token: String,
+    #[serde(default)]
+    expires_in: Option<i64>,
+}
+
+/// Tailscale's JSON answer, or why there is none.
+async fn read<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    what: &str,
+) -> Result<T, String> {
+    let status = response.status();
+    if !status.is_success() {
+        let text: String = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        return Err(format!("Tailscale refused {what} ({status}): {text}"));
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| format!("Tailscale's answer could not be read ({e})."))
 }
 
 fn authorize_url(p: &Provisioning, state: &str) -> String {

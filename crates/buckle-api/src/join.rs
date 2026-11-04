@@ -60,8 +60,12 @@ pub struct JoinOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailscaleJoinOptions {
-    /// ACL tags the joined node may advertise; the first is the default.
+    /// ACL tags the joined node may carry; the first is the default.
     pub tags: Vec<String>,
+    /// Each command needs the admin's consent in Tailscale (an OAuth app);
+    /// otherwise the server mints a tagged key itself (an OAuth client).
+    #[serde(default)]
+    pub consent: bool,
 }
 
 /// `POST /api/v1/join`: a join command for one new host.

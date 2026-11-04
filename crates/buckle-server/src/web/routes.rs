@@ -894,6 +894,7 @@ async fn join_create(
     let ticket = state
         .joins
         .create(body.into_inner(), &actor, chrono::Utc::now())
+        .await
         .map_err(join_error)?;
     let host = ticket.host_id.as_deref().unwrap_or("a new host");
     tracing::info!(buckle.host = %host, method = ?ticket.method, "created a join command");

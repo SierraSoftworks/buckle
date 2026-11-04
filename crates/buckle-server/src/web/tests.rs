@@ -513,6 +513,7 @@ async fn admins_create_join_commands_through_tailscale_consent() {
             settings.methods = vec![buckle_api::JoinMethod::Tailscale];
             settings.tailscale = Some(crate::join::Provisioning {
                 config: crate::config::TailscaleProvisioning {
+                    flow: crate::config::ProvisioningFlow::App,
                     client_id: "c".into(),
                     client_secret: "s".into(),
                     tags: vec![],

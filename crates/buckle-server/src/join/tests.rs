@@ -27,6 +27,7 @@ fn settings() -> JoinSettings {
 fn provisioning(api: &str) -> Provisioning {
     Provisioning {
         config: TailscaleProvisioning {
+            flow: ProvisioningFlow::App,
             client_id: "client-1".into(),
             client_secret: "s3cret".into(),
             tags: vec![],
@@ -161,11 +162,12 @@ fn the_server_url_defaults_to_the_web_host_and_grpc_port(
     assert_eq!(derive_server_url(base, grpc, tls), expected);
 }
 
-#[test]
-fn a_join_token_enrols_one_host_once_before_it_expires() {
+#[tokio::test]
+async fn a_join_token_enrols_one_host_once_before_it_expires() {
     let joins = Joins::new(settings());
     let ticket = joins
         .create(request(JoinPlatform::Linux, JoinMethod::Token), ADA, now())
+        .await
         .unwrap();
     let token = value_after(command(&ticket), "--token").to_owned();
 
@@ -182,7 +184,8 @@ fn a_join_token_enrols_one_host_once_before_it_expires() {
 #[rstest]
 #[case::auto(false, None)]
 #[case::approve(true, Some(()))]
-fn tailnet_joins_carry_a_token_only_to_skip_approval(
+#[tokio::test]
+async fn tailnet_joins_carry_a_token_only_to_skip_approval(
     #[case] approval: bool,
     #[case] token: Option<()>,
 ) {
@@ -195,15 +198,17 @@ fn tailnet_joins_carry_a_token_only_to_skip_approval(
             ADA,
             now(),
         )
+        .await
         .unwrap();
     assert_eq!(command(&ticket).contains("--token").then_some(()), token);
 }
 
-#[test]
-fn tickets_are_private_to_their_creator() {
+#[tokio::test]
+async fn tickets_are_private_to_their_creator() {
     let joins = Joins::new(settings());
     let ticket = joins
         .create(request(JoinPlatform::Linux, JoinMethod::Token), ADA, now())
+        .await
         .unwrap();
     assert!(joins.get(&ticket.id, ADA, now()).is_ok());
     assert_eq!(
@@ -216,7 +221,8 @@ fn tickets_are_private_to_their_creator() {
 #[case::method(JoinMethod::Token, None, &[], vec![JoinMethod::Tailscale])]
 #[case::host(JoinMethod::Token, Some("web 1"), &[], vec![JoinMethod::Token])]
 #[case::tags_without_provisioning(JoinMethod::Tailscale, None, &["tag:packmule"], vec![JoinMethod::Tailscale])]
-fn invalid_requests_are_refused(
+#[tokio::test]
+async fn invalid_requests_are_refused(
     #[case] method: JoinMethod,
     #[case] host: Option<&str>,
     #[case] tags: &[&str],
@@ -229,24 +235,28 @@ fn invalid_requests_are_refused(
     r.host_id = host.map(str::to_owned);
     r.tailscale_tags = tags.iter().map(|t| t.to_string()).collect();
     assert!(matches!(
-        joins.create(r, ADA, now()),
+        joins.create(r, ADA, now()).await,
         Err(JoinError::Invalid(_))
     ));
 }
 
-#[test]
-fn live_tickets_are_capped() {
+#[tokio::test]
+async fn live_tickets_are_capped() {
     let joins = Joins::new(settings());
     for _ in 0..MAX_TICKETS {
         joins
             .create(request(JoinPlatform::Linux, JoinMethod::Token), ADA, now())
+            .await
             .unwrap();
     }
     let r = request(JoinPlatform::Linux, JoinMethod::Token);
-    assert_eq!(joins.create(r.clone(), ADA, now()), Err(JoinError::TooMany));
+    assert_eq!(
+        joins.create(r.clone(), ADA, now()).await,
+        Err(JoinError::TooMany)
+    );
     // Expired tickets make room.
     let later = now() + chrono::Duration::hours(2);
-    assert!(joins.create(r, ADA, later).is_ok());
+    assert!(joins.create(r, ADA, later).await.is_ok());
 }
 
 fn authorize_state(ticket: &JoinTicket) -> String {
@@ -289,7 +299,7 @@ async fn consent_trades_the_code_for_a_single_use_auth_key() {
     let joins = provisioned(&tailscale).await;
     let mut r = request(JoinPlatform::Linux, JoinMethod::Tailscale);
     r.tailscale_tags = vec!["trailhead".into()];
-    let ticket = joins.create(r, ADA, now()).unwrap();
+    let ticket = joins.create(r, ADA, now()).await.unwrap();
     let state = authorize_state(&ticket);
 
     // Only the admin who asked may complete it.
@@ -345,6 +355,7 @@ async fn failed_consent_leaves_a_failed_ticket(
             ADA,
             now(),
         )
+        .await
         .unwrap();
     let state = authorize_state(&ticket);
     let id = joins
@@ -364,7 +375,92 @@ async fn only_offered_tags_may_be_advertised() {
     let mut r = request(JoinPlatform::Linux, JoinMethod::Tailscale);
     r.tailscale_tags = vec!["tag:admin".into()];
     assert!(matches!(
-        joins.create(r, ADA, now()),
+        joins.create(r, ADA, now()).await,
         Err(JoinError::Invalid(_))
     ));
+}
+
+async fn minting(tailscale: &MockServer) -> Joins {
+    let mut s = settings();
+    let mut p = provisioning(&tailscale.uri());
+    p.config.flow = ProvisioningFlow::Client;
+    s.tailscale = Some(p);
+    Joins::new(s)
+}
+
+#[tokio::test]
+async fn the_client_flow_mints_a_tagged_key_without_consent() {
+    let tailscale = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/oauth/token"))
+        .and(body_string_contains("grant_type=client_credentials"))
+        .and(body_string_contains("client_secret=s3cret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "api-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })))
+        .expect(1)
+        .mount(&tailscale)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/tailnet/-/keys"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer api-token",
+        ))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "capabilities": { "devices": { "create": {
+                "reusable": false,
+                "preauthorized": true,
+                "tags": ["tag:trailhead"],
+            } } },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "k1",
+            "key": "tskey-auth-minted",
+        })))
+        .expect(1)
+        .mount(&tailscale)
+        .await;
+    let joins = minting(&tailscale).await;
+    assert_eq!(
+        joins.settings().options().tailscale.map(|t| t.consent),
+        Some(false)
+    );
+    let mut r = request(JoinPlatform::Linux, JoinMethod::Tailscale);
+    r.tailscale_tags = vec!["tag:trailhead".into()];
+    let ticket = joins.create(r, ADA, now()).await.unwrap();
+    let cmd = command(&ticket);
+    assert_eq!(
+        value_after(cmd, "--tailscale-auth-key"),
+        "tskey-auth-minted"
+    );
+    assert!(
+        !cmd.contains("s3cret") && !cmd.contains("api-token"),
+        "{cmd}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_mint_leaves_a_failed_ticket() {
+    let tailscale = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/oauth/token"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("invalid_client"))
+        .mount(&tailscale)
+        .await;
+    let joins = minting(&tailscale).await;
+    let ticket = joins
+        .create(
+            request(JoinPlatform::Linux, JoinMethod::Tailscale),
+            ADA,
+            now(),
+        )
+        .await
+        .unwrap();
+    match ticket.state {
+        JoinState::Failed { reason } => assert!(reason.contains("refused"), "{reason}"),
+        other => panic!("expected a failure, got {other:?}"),
+    }
 }

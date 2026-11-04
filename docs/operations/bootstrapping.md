@@ -20,8 +20,9 @@ new host, joins it to the tailnet when the server can provision it, and enrols t
 
    <Screenshot name="add-agent-details" alt="The Add an agent wizard's connection, name and labels" />
 
-3. **Command.** With [Tailscale provisioning](../agent/server.md#tailscale-provisioning), Tailscale
-   asks you to approve the node's auth key first and returns to the wizard. Paste the command on
+3. **Command.** With [Tailscale provisioning](../agent/server.md#tailscale-provisioning) through
+   an OAuth app (`flow: app`), Tailscale asks you to approve the node's auth key first and returns
+   to the wizard; through an OAuth client (`flow: client`) the key is minted straight away. Paste the command on
    the new host; the wizard says when it has enrolled.
 
    <Screenshot name="add-agent-command" alt="The join command, its expiry and the wait for the host" />

@@ -20,6 +20,11 @@ pub fn provisions_tailnet(options: &JoinOptions, method: JoinMethod) -> bool {
     method == JoinMethod::Tailscale && options.tailscale.is_some()
 }
 
+/// Whether the admin must consent in Tailscale before the command exists.
+pub fn needs_consent(options: &JoinOptions, method: JoinMethod) -> bool {
+    method == JoinMethod::Tailscale && options.tailscale.as_ref().is_some_and(|t| t.consent)
+}
+
 /// Whether `host` is a name the server accepts: 1–128 of `[A-Za-z0-9._-]`.
 pub fn valid_host(host: &str) -> bool {
     !host.is_empty()
@@ -135,6 +140,7 @@ mod tests {
             server_url: "http://buckle:7700".into(),
             tailscale: provisioning.then(|| TailscaleJoinOptions {
                 tags: vec!["tag:buckle".into()],
+                consent: true,
             }),
             ttl_seconds: 3600,
             approval_required: false,
@@ -174,6 +180,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("bad key"), "{e}");
+    }
+
+    #[test]
+    fn only_an_oauth_app_needs_consent() {
+        let mut client = options(true);
+        client.tailscale.as_mut().unwrap().consent = false;
+        for (o, method, expected) in [
+            (options(true), JoinMethod::Tailscale, true),
+            (options(true), JoinMethod::Token, false),
+            (client, JoinMethod::Tailscale, false),
+            (options(false), JoinMethod::Tailscale, false),
+        ] {
+            assert_eq!(needs_consent(&o, method), expected, "{method:?}");
+        }
     }
 
     #[test]

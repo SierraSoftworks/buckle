@@ -826,6 +826,7 @@ pub fn join_options() -> Result<JoinOptions, ApiError> {
         server_url: "http://buckle.example.ts.net:7700".into(),
         tailscale: Some(TailscaleJoinOptions {
             tags: vec!["tag:buckle".into(), "tag:edge".into()],
+            consent: true,
         }),
         ttl_seconds: 3600,
         approval_required: true,

@@ -2,9 +2,10 @@
 //! a connection method, a name and labels into the one command that
 //! bootstraps a new host (install Buckle, join the tailnet, enrol).
 //!
-//! With Tailscale provisioning the server first sends the admin to Tailscale
-//! to consent to the node's auth key; Tailscale returns to `/hosts?join=<id>`,
-//! which reopens the wizard on the finished command.
+//! With Tailscale provisioning through an OAuth app, the server first sends
+//! the admin to Tailscale to consent to the node's auth key; Tailscale
+//! returns to `/hosts?join=<id>`, which reopens the wizard on the finished
+//! command. Through an OAuth client the server mints the key itself.
 
 use buckle_api::{HostSummary, JoinMethod, JoinOptions, JoinPlatform, JoinState, JoinTicket};
 use yew::prelude::*;
@@ -15,7 +16,9 @@ use crate::app::Route;
 use crate::components::modal::Modal;
 use crate::components::{Button, Countdown, ErrorState, Kind, Loading, RouteLink, icons};
 use crate::hooks::use_fetch;
-use crate::logic::join::{default_method, enrolled, notes, provisions_tailnet, request};
+use crate::logic::join::{
+    default_method, enrolled, needs_consent, notes, provisions_tailnet, request,
+};
 use crate::logic::labels::Row;
 
 /// The ticket id Tailscale returns with when consent could not be finished.
@@ -107,6 +110,9 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
     let provisioning = opts
         .zip(method_now)
         .is_some_and(|(o, m)| provisions_tailnet(o, m));
+    let consent = opts
+        .zip(method_now)
+        .is_some_and(|(o, m)| needs_consent(o, m));
     let tags_now: Vec<String> = match (&*tags, opts.and_then(|o| o.tailscale.as_ref())) {
         (Some(t), _) => t.clone(),
         (None, Some(ts)) => ts.tags.first().cloned().into_iter().collect(),
@@ -263,9 +269,10 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
                         { for o.methods.iter().map(|m| {
                             let selected = method_now == Some(*m);
                             let onclick = { let method = method.clone(); let m = *m; Callback::from(move |_| method.set(Some(m))) };
-                            let (title, sub) = match (m, o.tailscale.is_some()) {
-                                (JoinMethod::Tailscale, true) => ("Over Tailscale", "Joins the tailnet with a single-use key you approve in Tailscale."),
-                                (JoinMethod::Tailscale, false) => ("Over Tailscale", "For a host already on the tailnet."),
+                            let (title, sub) = match (m, o.tailscale.as_ref().map(|t| t.consent)) {
+                                (JoinMethod::Tailscale, Some(true)) => ("Over Tailscale", "Joins the tailnet with a single-use key you approve in Tailscale."),
+                                (JoinMethod::Tailscale, Some(false)) => ("Over Tailscale", "Joins the tailnet with a single-use, tagged key."),
+                                (JoinMethod::Tailscale, None) => ("Over Tailscale", "For a host already on the tailnet."),
                                 (JoinMethod::Token, _) => ("With a join token", "For a host that reaches the server directly."),
                             };
                             html! {
@@ -299,7 +306,11 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
                             }
                         }) }
                     </div>
-                    <span class="field__hint">{ "The node advertises these, so the server admits it. You must own them in the tailnet policy." }</span>
+                    <span class="field__hint">{ if ts.consent {
+                        "The node advertises these, so the server admits it. You must own them in the tailnet policy."
+                    } else {
+                        "The node's key carries these, so the server admits it."
+                    } }</span>
                 </div>
             });
             let edit = |i: usize, key: bool| {
@@ -344,7 +355,7 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
                 Some(Err(e)) => Some(e.clone()),
                 _ => (*error).clone(),
             };
-            let primary = if provisioning {
+            let primary = if consent {
                 "Continue in Tailscale"
             } else {
                 "Create command"
@@ -387,7 +398,7 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
                     <Button kind={Kind::Subtle} onclick={go(Step::Platform)}>{ "Back" }</Button>
                     <Button kind={Kind::Primary} busy={*busy} disabled={!matches!(draft, Some(Ok(_)))} onclick={create.clone()}>
                         { primary }
-                        if provisioning { { icons::external() } }
+                        if consent { { icons::external() } }
                     </Button>
                 </> },
             )

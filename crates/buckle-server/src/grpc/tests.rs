@@ -289,7 +289,7 @@ async fn approve_registration_leaves_new_hosts_pending() {
 }
 
 /// A join token from a command for `host` (any host when `None`).
-fn join_token(s: &Server, method: buckle_api::JoinMethod, host: Option<&str>) -> String {
+async fn join_token(s: &Server, method: buckle_api::JoinMethod, host: Option<&str>) -> String {
     let ticket = s
         .joins
         .create(
@@ -303,6 +303,7 @@ fn join_token(s: &Server, method: buckle_api::JoinMethod, host: Option<&str>) ->
             "ada@example.com",
             chrono::Utc::now(),
         )
+        .await
         .unwrap();
     let buckle_api::JoinState::Ready { command } = ticket.state else {
         panic!("a token join is ready at once");
@@ -314,7 +315,7 @@ fn join_token(s: &Server, method: buckle_api::JoinMethod, host: Option<&str>) ->
 #[tokio::test]
 async fn a_join_token_enrols_its_host_once_without_approval() {
     let s = server(Registration::Approve, None, vec![AgentAuth::Token]).await;
-    let token = join_token(&s, buckle_api::JoinMethod::Token, Some("pi-3"));
+    let token = join_token(&s, buckle_api::JoinMethod::Token, Some("pi-3")).await;
     let (_tx, _stream, reply) = open(s.addr, hello("pi-9", &token, "2.0.0")).await;
     assert!(
         expect_rejected(reply).reason.contains("not recognised"),
@@ -339,7 +340,7 @@ async fn a_tailnet_node_with_a_join_token_skips_approval() {
         vec![AgentAuth::Tailscale],
     )
     .await;
-    let token = join_token(&s, buckle_api::JoinMethod::Token, None);
+    let token = join_token(&s, buckle_api::JoinMethod::Token, None).await;
     let (_tx, _stream, reply) = open(s.addr, hello("tail-1", &token, "2.0.0")).await;
     assert_eq!(expect_welcome(reply).status, "active");
 }

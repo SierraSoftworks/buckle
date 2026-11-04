@@ -85,8 +85,8 @@ impl ServerConfig {
                 ],
             ));
         }
-        if self.agents.tailscale.provisioning.is_some() {
-            if self.web.base_url.is_none() {
+        if let Some(p) = &self.agents.tailscale.provisioning {
+            if p.flow == ProvisioningFlow::App && self.web.base_url.is_none() {
                 return Err(buckle_core::error::user(
                     "`web.base_url` is required when `agents.tailscale.provisioning` is configured, so Tailscale can return to the server.",
                     &[
@@ -108,6 +108,17 @@ impl ServerConfig {
                 return Err(buckle_core::error::user(
                     "`agents.tailscale.provisioning` joins hosts to the tailnet, but `agents.auth` does not accept Tailscale.",
                     &["Add `tailscale` to agents.auth, or remove the provisioning section."],
+                ));
+            }
+            if p.flow == ProvisioningFlow::Client
+                && p.tags.is_empty()
+                && self.agents.tailscale.allowed_tags.is_empty()
+            {
+                return Err(buckle_core::error::user(
+                    "`agents.tailscale.provisioning.flow: client` mints tagged keys, but no tags are configured.",
+                    &[
+                        "Set provisioning.tags (or agents.tailscale.allowed_tags) to tags the OAuth client owns.",
+                    ],
                 ));
             }
         }
@@ -447,36 +458,33 @@ pub struct TailscaleConfig {
     pub provisioning: Option<TailscaleProvisioning>,
 }
 
-/// `agents.tailscale.provisioning`: a Tailscale OAuth app (device
-/// provisioning) that issues the single-use auth key a join command uses to
-/// put a new host on the tailnet.
+/// `agents.tailscale.provisioning`: Tailscale OAuth credentials the server
+/// uses to issue the single-use auth key a join command uses to put a new
+/// host on the tailnet. The client secret stays on the server: join commands
+/// carry only the key.
 ///
 /// ```yaml
 /// agents:
 ///   tailscale:
 ///     allowed_tags: ["tag:buckle"]
 ///     provisioning:
+///       flow: app
 ///       client_id: "${{ env.TS_OAUTH_CLIENT_ID }}"
 ///       client_secret: "${{ env.TS_OAUTH_CLIENT_SECRET }}"
 /// ```
-///
-/// The app needs the `auth_keys:create:once` scope and the redirect URI
-/// `{web.base_url}/api/v1/join/tailscale/callback`. Each join command asks
-/// the admin creating it to consent in Tailscale; the key Tailscale returns
-/// lasts an hour, works once, and makes a node owned by that admin, which
-/// then advertises one of `tags` (the admin must own it in `tagOwners`).
-/// The client secret stays on the server: join commands carry only the key.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TailscaleProvisioning {
+    #[serde(default)]
+    pub flow: ProvisioningFlow,
     pub client_id: String,
     pub client_secret: String,
-    /// The ACL tags a joined node may advertise (the wizard offers them,
-    /// first as the default). Absent: `allowed_tags`.
+    /// The ACL tags a joined node may carry (the wizard offers them, first
+    /// as the default). Absent: `allowed_tags`.
     #[serde(default)]
     pub tags: Vec<String>,
     /// Custom node attributes (`custom:…`) Tailscale stamps on the node;
-    /// each must be on the app's `allowedNodeAttributes`.
+    /// each must be on the app's `allowedNodeAttributes` (`app` flow only).
     #[serde(default)]
     pub node_attributes: Vec<String>,
     /// Tailscale's API and consent screen; overridden only by tests.
@@ -489,6 +497,7 @@ pub struct TailscaleProvisioning {
 impl std::fmt::Debug for TailscaleProvisioning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TailscaleProvisioning")
+            .field("flow", &self.flow)
             .field("client_id", &self.client_id)
             .field("client_secret", &"***")
             .field("tags", &self.tags)
@@ -497,6 +506,22 @@ impl std::fmt::Debug for TailscaleProvisioning {
             .field("login_url", &self.login_url)
             .finish()
     }
+}
+
+/// How the server gets a new host's Tailscale auth key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvisioningFlow {
+    /// An OAuth app (device provisioning, scope `auth_keys:create:once`,
+    /// redirect URI `{web.base_url}/api/v1/join/tailscale/callback`): the
+    /// admin creating each join command consents in Tailscale, and the node
+    /// is owned by them and advertises the chosen tags (which they must own
+    /// in `tagOwners`).
+    #[default]
+    App,
+    /// An OAuth client (scope `auth_keys`, owning the tags): the server mints
+    /// a tagged, pre-approved key itself, with no consent step.
+    Client,
 }
 
 impl TailscaleProvisioning {
@@ -966,6 +991,25 @@ secrets:
         assert_eq!(p.api_url, "https://api.tailscale.com");
         assert_eq!(cfg.agents.join.ttl, Duration::from_secs(3600));
         assert!(!format!("{cfg:?}").contains("shh"));
+    }
+
+    #[test]
+    fn the_client_flow_needs_no_callback_but_needs_tags() {
+        let client = PROVISIONING.replace("{ client_id", "{ flow: client, client_id");
+        let yaml = EXAMPLE
+            .replace(
+                "  tailscale:\n    allowed_tags: [\"tag:buckle\"]\n    allowed_users: [ops@example.com]\n",
+                &client,
+            )
+            .replace("  base_url: https://buckle.example.ts.net\n", "");
+        let yaml = yaml.split("  oidc:").next().unwrap().to_owned();
+        let cfg = with_env(&yaml).unwrap();
+        let p = cfg.agents.tailscale.provisioning.as_ref().unwrap();
+        assert_eq!(p.flow, ProvisioningFlow::Client);
+
+        let untagged = yaml.replace("    allowed_tags: [\"tag:buckle\"]\n", "");
+        let err = with_env(&untagged).unwrap_err();
+        assert!(err.description().contains("tags"), "{}", err.description());
     }
 
     #[rstest]
