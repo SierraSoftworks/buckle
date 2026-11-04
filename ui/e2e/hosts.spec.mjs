@@ -73,6 +73,19 @@ describe("registration and forgetting", () => {
     await close();
   });
 
+  test("every agent behind the server is upgraded from the hosts page", async () => {
+    const { page, close } = await open("/hosts");
+    await page.getByRole("button", { name: "Upgrade all agents…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Upgrade agents to 2.0.0-dev.5" });
+    assert.match(await dialog.getByTestId("upgrade-all-hosts").textContent(), /lab-3 from 2\.0\.0-dev\.3/);
+    await dialog.getByRole("button", { name: "Upgrade 1 agent", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "1 agent will upgrade to 2.0.0-dev.5" }).waitFor();
+    await page.locator('tr[data-host="lab-3"]').getByText("upgrading to 2.0.0-dev.5").waitFor();
+    // Nothing is left behind, so the action goes away.
+    await eventually(async () => assert.equal(await page.getByRole("button", { name: "Upgrade all agents…" }).count(), 0));
+    await close();
+  });
+
   test("forgetting a host needs its name typed", async () => {
     const { page, close } = await open("/hosts/lab-4");
     await page.getByRole("button", { name: "Forget…" }).click();

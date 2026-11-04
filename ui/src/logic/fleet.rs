@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use buckle_api::{
     Connection, HealthSummary, HostRolloutState, HostStatus, HostSummary, RolloutDetail,
+    UpgradeState,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -224,6 +225,45 @@ pub fn expected_version<'a>(
         .map(|(v, _)| v)
 }
 
+/// Whether `a` and `b` name the same release (`v2.3.0` is `2.3.0`), as the
+/// server compares them.
+pub fn same_version(a: &str, b: &str) -> bool {
+    a.trim().trim_start_matches('v') == b.trim().trim_start_matches('v')
+}
+
+/// The agents behind `target`, split by whether "Upgrade all" can reach them.
+#[derive(Debug, Default, PartialEq)]
+pub struct Behind<'a> {
+    /// Online and not already upgrading to `target`: asked to upgrade.
+    pub upgradable: Vec<&'a HostSummary>,
+    /// Offline: skipped until they reconnect.
+    pub offline: Vec<&'a HostSummary>,
+}
+
+/// The fleet's agents not running `target`. Registrations awaiting approval
+/// are not part of the fleet yet and are left out, as are agents already
+/// upgrading to `target` (a failed upgrade counts as behind, so it is retried).
+pub fn agents_behind<'a>(hosts: &'a [HostSummary], target: &str) -> Behind<'a> {
+    let mut out = Behind::default();
+    for h in hosts {
+        let current = h
+            .agent_version
+            .as_deref()
+            .is_some_and(|v| same_version(v, target));
+        let upgrading = h.upgrade.as_ref().is_some_and(|u| {
+            u.state == UpgradeState::Requested && same_version(&u.version, target)
+        });
+        if h.status == HostStatus::Pending || current || upgrading {
+            continue;
+        }
+        match h.connection {
+            Connection::Online => out.upgradable.push(h),
+            Connection::Offline => out.offline.push(h),
+        }
+    }
+    out
+}
+
 /// The agents needing attention, worst first: by their most severe concern,
 /// then by how many they have, then by name.
 pub fn attention(
@@ -377,6 +417,60 @@ mod tests {
         let hosts = vec![host("a"), host("c"), old];
         assert_eq!(expected_version(&hosts, Some("2.1.0")), Some("2.1.0"));
         assert_eq!(expected_version(&hosts, None), Some("2.0.0"));
+    }
+
+    #[test]
+    fn agents_behind_the_target_are_upgraded_when_reachable() {
+        use Connection::{Offline, Online};
+        use HostStatus::{Active, Paused, Pending};
+        // `Some(online)` when the host is behind, `None` when it is left out.
+        for (case, connection, status, running, upgrade, want) in [
+            ("behind", Online, Active, "1.9.0", None, Some(true)),
+            ("paused", Online, Paused, "1.9.0", None, Some(true)),
+            (
+                "failed upgrade",
+                Online,
+                Active,
+                "1.9.0",
+                Some(UpgradeState::Failed),
+                Some(true),
+            ),
+            ("offline", Offline, Active, "1.9.0", None, Some(false)),
+            ("current", Online, Active, "v2.1.0", None, None),
+            (
+                "upgrading",
+                Online,
+                Active,
+                "1.9.0",
+                Some(UpgradeState::Requested),
+                None,
+            ),
+            ("pending", Online, Pending, "1.9.0", None, None),
+        ] {
+            let mut h = host(case);
+            h.connection = connection;
+            h.status = status;
+            h.agent_version = Some(running.into());
+            h.upgrade = upgrade.map(|state| buckle_api::AgentUpgrade {
+                version: "2.1.0".into(),
+                state,
+                requested_at: Utc::now(),
+                requested_by: "ben".into(),
+                error: None,
+            });
+            let hosts = [h];
+            let behind = agents_behind(&hosts, "2.1.0");
+            assert_eq!(
+                behind.upgradable.len(),
+                usize::from(want == Some(true)),
+                "{case}"
+            );
+            assert_eq!(
+                behind.offline.len(),
+                usize::from(want == Some(false)),
+                "{case}"
+            );
+        }
     }
 
     #[test]
