@@ -1,7 +1,7 @@
 //! Certificate pinning for servers that generate their own certificate.
 //!
 //! `buckle server --print-fingerprint` prints the SHA-256 fingerprint of the server's
-//! certificate as `sha256:<hex>`; `buckle install agent --ca-fingerprint`
+//! certificate as `sha256:<hex>`; `buckle up --ca-fingerprint`
 //! pins it. The [`PinnedCertVerifier`] then accepts exactly that certificate
 //! (whatever names it carries, since a generated certificate rarely matches
 //! the address agents dial) and still checks the handshake signatures, so only

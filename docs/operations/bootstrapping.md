@@ -5,20 +5,30 @@ The server setup itself is in [Server and agents](../guide/fleet.md).
 
 ## 1. Install the agent
 
-Install Buckle on the host ([Installation](../guide/installation.md)), then install the agent
-pointing at the server. Labels set here are the agent's own; they decide which groups and which
-rollout phase the host lands in.
+`buckle up` installs the agent pointing at the server. Labels set here are the agent's own; they
+decide which groups and which rollout phase the host lands in.
+
+The [one-line installer](../guide/installation.md#one-line-installer) installs Buckle and runs
+`buckle up` in one paste, and can join the tailnet first:
+
+```sh
+curl -fsSL https://github.com/SierraSoftworks/buckle/releases/latest/download/install.sh | sudo sh -s -- \
+  --tailscale-auth-key "$TS_AUTHKEY" --tailscale-tags tag:buckle \
+  up --server http://buckle.example.ts.net:7700 --insecure-plaintext --label role=worker
+```
+
+With Buckle already installed:
 
 ```sh
 # With the bootstrap token
-sudo buckle install agent \
+sudo buckle up \
   --server https://buckle.example.com:7700 \
   --token "$BUCKLE_BOOTSTRAP_TOKEN" \
   --ca-fingerprint sha256:3f9a… \
   --label role=worker --label site=home
 
 # Or over Tailscale
-sudo buckle install agent \
+sudo buckle up \
   --server http://buckle.example.ts.net:7700 --insecure-plaintext \
   --label role=worker --label site=home
 ```
@@ -77,4 +87,4 @@ buckle health     # the applied modules' health checks, now
 
 A host keeps its per-host token in its state directory. A reinstalled host that lost it is refused
 with "already registered": [forget](./hosts.md#forgetting-a-host) the old record, then run
-`buckle install agent` on the host again to enrol it afresh (it waits for approval again).
+`buckle up` on the host again to enrol it afresh (it waits for approval again).

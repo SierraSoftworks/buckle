@@ -4,11 +4,11 @@ The agent is the long-running process on every host. It either connects to a ser
 `agent.yaml`) or watches a local directory (`source`), and in both cases applies what it is given,
 re-plans for drift and reports health.
 
-## install agent
+## up
 
-<CliCommand command="install agent" />
+<CliCommand command="up" />
 
-`install agent` writes `agent.yaml`, creates the state directory, and installs and starts a
+`up` bootstraps a host as an agent. It writes `agent.yaml`, creates the state directory, and installs and starts a
 `buckle-agent` service that runs `buckle agent --config <path>`:
 
 | Platform | Service |
@@ -20,18 +20,19 @@ re-plans for drift and reports health.
 
 Running it again rewrites the configuration and restarts the service, which is also how you move a
 host to a new server or binary. The service runs the binary you invoked, so install Buckle to a
-permanent path first.
+permanent path first (the [one-line installer](../guide/installation.md#one-line-installer) does
+both in one step). `buckle install agent`, its former name, still works.
 
 ```sh
 # A server reachable over a tailnet
-sudo buckle install agent --server http://buckle.example.ts.net:7700 --insecure-plaintext --label role=worker
+sudo buckle up --server http://buckle.example.ts.net:7700 --insecure-plaintext --label role=worker
 
 # A server elsewhere, enrolling with a bootstrap token and pinning its generated certificate
-sudo buckle install agent --server https://buckle.example.com:7700 \
+sudo buckle up --server https://buckle.example.com:7700 \
   --token "$BOOTSTRAP" --ca-fingerprint sha256:3f9a… --label role=worker --label canary=true
 
 # No server: apply a local directory on every change
-sudo buckle install agent --source /srv/buckle-config --label role=worker
+sudo buckle up --source /srv/buckle-config --label role=worker
 ```
 
 ## agent

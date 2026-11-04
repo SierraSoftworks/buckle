@@ -30,6 +30,7 @@ jobs:
       rust: ${{ steps.rust.outputs.rust }}
       ui: ${{ steps.ui.outputs.ui }}
       docs: ${{ steps.docs.outputs.docs }}
+      install: ${{ steps.install.outputs.install }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -49,6 +50,13 @@ jobs:
             docs:
               - 'docs/**/*.md'
               - 'docs/.vuepress/data/**'
+      - uses: dorny/paths-filter@v4
+        id: install
+        with:
+          filters: |
+            install:
+              - 'docs/.vuepress/public/install.*'
+              - '.github/workflows/test.yml'
       - uses: dorny/paths-filter@v4
         id: ui
         with:
@@ -171,11 +179,39 @@ jobs:
           docker run --rm -v "$PWD:/src:ro" ubuntu:24.04 /src/scripts/container-test.sh
           scripts/container-apply.sh ubuntu:24.04 target/x86_64-unknown-linux-musl/release/buckle
 
+  # The one-line installers, against the latest published release: the
+  # platform detection, digest check and hand-off to the installed binary.
+  install-scripts:
+    name: Install script (${{ matrix.os }})
+    needs: [changes]
+    if: needs.changes.outputs.install == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - if: runner.os != 'Windows'
+        run: |
+          if command -v shellcheck >/dev/null; then shellcheck -s sh docs/.vuepress/public/install.sh; fi
+          sudo -E sh -s -- --install-dir "$RUNNER_TEMP/bin" catalog --json \
+            < docs/.vuepress/public/install.sh > catalog.json
+          grep -q '"tasks"' catalog.json
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sb = [scriptblock]::Create((Get-Content -Raw docs/.vuepress/public/install.ps1))
+          & $sb -InstallDir "$env:RUNNER_TEMP\bin" catalog --json > catalog.json
+          if (-not (Select-String -Quiet '"tasks"' catalog.json)) { throw 'buckle catalog did not run' }
+
   # The required status check on main: one stable name that goes green once
   # every job the change needs has passed (a skipped suite counts as passed).
   test-done:
     name: Tests Complete
-    needs: [changes, test, ui, containers]
+    needs: [changes, test, ui, containers, install-scripts]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

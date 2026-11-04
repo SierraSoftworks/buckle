@@ -175,6 +175,13 @@ jobs:
           pattern: binary-*
           path: dist
           merge-multiple: true
+      # The one-line installers, so a release's own copy can be fetched from
+      # releases/download/<tag>/install.{sh,ps1}.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: docs/.vuepress/public
+          path: src
+      - run: cp src/docs/.vuepress/public/install.sh src/docs/.vuepress/public/install.ps1 dist/
       # Creates a draft (or reuses one left by a failed run), uploads every
       # binary to it and only then publishes it, creating the tag.
       - uses: SierraSoftworks/gh-releases@v1.1.0
@@ -191,6 +198,8 @@ jobs:
             dist/buckle-darwin-amd64
             dist/buckle-darwin-arm64
             dist/buckle-windows-amd64.exe
+            dist/install.sh
+            dist/install.ps1
       - run: echo "Published [${{ steps.release.outputs.tag }}](${{ steps.release.outputs.url }})" >> "$GITHUB_STEP_SUMMARY"
 
   docker:

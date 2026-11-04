@@ -455,7 +455,7 @@
             "default": null,
             "env": null,
             "flag": "--print-fingerprint",
-            "help": "Print the SHA-256 fingerprint of the gRPC TLS certificate (generating it in `auto` mode) for `buckle install agent --ca-fingerprint`, then exit",
+            "help": "Print the SHA-256 fingerprint of the gRPC TLS certificate (generating it in `auto` mode) for `buckle up --ca-fingerprint`, then exit",
             "options": [],
             "repeatable": false,
             "required": false,
@@ -467,7 +467,7 @@
         "usage": "buckle server [OPTIONS]"
       },
       {
-        "about": "Install the agent: write agent.yaml and a service unit, then start it",
+        "about": "Bootstrap this host as an agent: write agent.yaml, then install and start the agent service",
         "args": [
           {
             "default": null,
@@ -493,9 +493,9 @@
           },
           {
             "default": null,
-            "env": null,
+            "env": "BUCKLE_TOKEN",
             "flag": "--token",
-            "help": "Bootstrap token for enrolment (not needed over Tailscale)",
+            "help": "Bootstrap or join token for enrolment (not needed over Tailscale)",
             "options": [],
             "repeatable": false,
             "required": false,
@@ -591,8 +591,8 @@
             "value": null
           }
         ],
-        "path": "install agent",
-        "usage": "buckle install agent [OPTIONS]"
+        "path": "up",
+        "usage": "buckle up [OPTIONS]"
       },
       {
         "about": "List the task kinds, fact providers and health checks built into this binary",

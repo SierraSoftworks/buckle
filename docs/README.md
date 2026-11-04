@@ -12,7 +12,7 @@ features:
     - title: One Binary
       details: |
         The planner, the agent, the server and its web UI ship as one static binary. No interpreter, no SSH:
-        bootstrapping a host is `buckle install agent`.
+        bootstrapping a host is `buckle up`.
 
     - title: Safe to Converge
       details: |

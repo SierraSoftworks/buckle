@@ -48,7 +48,11 @@ pub enum Command {
     Agent(agent::AgentArgs),
     /// Run the fleet server.
     Server(server::ServerArgs),
-    /// Install Buckle as a service on this host.
+    /// Bootstrap this host as an agent: write agent.yaml, then install and
+    /// start the agent service.
+    Up(install::InstallAgentArgs),
+    /// The former spelling of `up` (`install agent`), kept for existing scripts.
+    #[command(hide = true)]
     Install(install::InstallArgs),
     /// List the task kinds, fact providers and health checks built into this binary.
     Catalog(catalog::CatalogArgs),
@@ -88,6 +92,7 @@ pub async fn run(cli: Cli) -> buckle_core::Result<i32> {
         Command::Validate(args) => local::validate(args).await,
         Command::Agent(args) => agent::run(args).await,
         Command::Server(args) => server::run(args).await,
+        Command::Up(args) => install::up(args).await,
         Command::Install(args) => install::run(args).await,
         Command::Catalog(args) => catalog::run(args),
         Command::Update(args) => update::run(args).await,
@@ -153,17 +158,30 @@ mod tests {
         }
         let cli = Cli::parse_from(["buckle", "agent", "--config", "/etc/buckle/agent.yaml"]);
         assert!(matches!(cli.command, Command::Agent(_)));
-        let cli = Cli::parse_from([
-            "buckle",
-            "install",
-            "agent",
+        let args = [
             "--server",
             "https://b:7700",
             "--token",
             "t",
             "--label",
             "role=worker",
-        ]);
-        assert!(matches!(cli.command, Command::Install(_)));
+        ];
+        let up = Cli::parse_from(["buckle", "up"].into_iter().chain(args));
+        let Command::Up(up) = up.command else {
+            panic!("`up` parses as Up");
+        };
+        // `install agent` is the old spelling of `up`, with the same flags.
+        let legacy = Cli::parse_from(["buckle", "install", "agent"].into_iter().chain(args));
+        let Command::Install(install::InstallArgs {
+            what: install::InstallWhat::Agent(legacy),
+        }) = legacy.command
+        else {
+            panic!("`install agent` still parses");
+        };
+        for a in [&up, &legacy] {
+            assert_eq!(a.server.as_deref(), Some("https://b:7700"));
+            assert_eq!(a.token.as_deref(), Some("t"));
+            assert_eq!(a.labels, vec![("role".into(), "worker".into())]);
+        }
     }
 }
