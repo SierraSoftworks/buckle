@@ -3,6 +3,7 @@
 //! baseline health, bake windows and pre-phase checks, with a virtual
 //! stragglers stage after promotion.
 
+pub mod bake;
 mod controller;
 pub mod link;
 pub mod model;

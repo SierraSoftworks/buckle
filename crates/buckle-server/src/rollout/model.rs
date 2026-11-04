@@ -271,6 +271,10 @@ pub struct HostRuntime {
     pub request_id: Option<String>,
     #[serde(default)]
     pub bake_until: Option<DateTime<Utc>>,
+    /// The bake window the current step resolved to from what its run
+    /// changed; absent until then (the phase's `bake` applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bake: Option<super::bake::BakeWindow>,
     /// Required checks currently failing during bake, since when.
     #[serde(default)]
     pub failing_since: BTreeMap<String, DateTime<Utc>>,

@@ -507,6 +507,7 @@ mod tests {
             kind: Default::default(),
             stage: 0,
             executor: None,
+            bake: None,
             needs_approval: stale,
             needs_attention: false,
             error_detail: None,

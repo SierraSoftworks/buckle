@@ -42,7 +42,7 @@ A host's way through a phase:
 | held | Unhealthy before its wave, with `health.baseline: hold`: waits for an operator to force or skip it. |
 | applying | Applying its plan now. |
 | rebooting | Applied, and rebooting for a [`system.reboot`](../modules/tasks/system.md#system-reboot); fails if not back within its `timeout`. |
-| baking | Applied (and back from any reboot); its health checks repeat for the phase's `bake`. |
+| baking | Applied (and back from any reboot); its health checks repeat for its bake (see below). |
 | healthy | Passed its bake. |
 | failed | The apply failed, or a required check failed for longer than `settle`. |
 | rolled back | Back on the stable revision. |
@@ -100,7 +100,21 @@ earlier phases keep the new revision.
 ## 4. Bake and promote
 
 After each host applies, its checks repeat for the phase's `bake`; the next phase starts once every
-updated host passes the health gate. Expand a host's row under **Hosts** for its timeline through
+updated host passes the health gate. The bake follows what the run changed:
+
+```yaml
+# modules/nomad/module.yaml
+bake: 15m   # a run that changed nomad bakes for 15m, even in a 1m phase
+```
+
+| The run changed | The host bakes for |
+|---|---|
+| nothing | no time: it is healthy as soon as its result arrives |
+| modules without their own `bake` | the phase's `bake` |
+| a module with a longer `bake` | the longest such `bake` (the host's row names the module) |
+
+So a phase whose hosts all come out unchanged moves on at once, and a short phase `bake` lets
+low-risk changes through quickly while risky modules hold the rollout as long as they need. Expand a host's row under **Hosts** for its timeline through
 the rollout and its run report.
 
 When the last phase completes, the revision is **promoted** to stable: it is what new hosts get and

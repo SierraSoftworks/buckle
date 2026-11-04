@@ -187,7 +187,7 @@ rollout:
 | `supersede` | `latest` | A revision that arrives mid-rollout waits for the current one. `latest` then rolls only the newest waiting revision, `sequential` rolls each in turn, and `replace` aborts the current rollout and starts the new one at once. |
 | `on_failure` | `pause` | When a phase exceeds its failure budget: `pause` for an operator, `rollback` automatically, or `continue`. |
 | `settle` | `2m` | A required check must fail continuously this long before it counts, so a restarting service is not blamed. |
-| `health.bake` | `5m` | How long each host's checks repeat after it applies, unless a phase sets its own `bake`. |
+| `health.bake` | `5m` | The minimum time each host's checks repeat after it applies, unless a phase sets its own `bake`. A module's own `bake` lengthens it for runs that changed that module; a run that changed nothing does not bake. |
 | `health.baseline` | `hold` | A host already unhealthy before its wave: `hold` waits for an operator to force or skip it, `skip` leaves it out, `ignore` applies anyway. |
 | `local_rollback.enabled` | `true` | Let an agent that loses the server after an apply roll itself back. |
 | `local_rollback.after` | `5m` | How long without a session before it does. |
@@ -203,7 +203,7 @@ Each phase:
 | `select` | **required** | A selector. A host belongs to the **first** phase whose selector matches it, and only that one. |
 | `parallel` | `1` | Hosts applied at once: a count, or a percentage of the phase's hosts (rounded up). |
 | `approval` | `auto` | `required` stops for an operator to approve the phase's plans; `if_destructive` only when a plan removes or deletes something. |
-| `bake` | `health.bake` | How long to watch health after each host applies. |
+| `bake` | `health.bake` | The minimum time to watch health after each host applies. |
 | `max_failures` | `0` | Failed hosts tolerated (a count or a percentage) before the phase pauses. |
 
 Without `phases`, one implicit phase selects every host, one at a time. Hosts that no phase

@@ -91,6 +91,7 @@ pub fn host(
         kind: h.runtime.kind,
         stage: h.runtime.stage,
         executor: h.runtime.executor.clone(),
+        bake: h.runtime.bake.clone(),
     }
 }
 

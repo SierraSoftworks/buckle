@@ -51,6 +51,21 @@ pub enum HostRolloutState {
     Skipped,
 }
 
+/// How long a target's step bakes: its phase's `bake`, raised by the `bake`
+/// of each module (or workload) its run changed, or not at all when the run
+/// changed nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BakeWindow {
+    pub seconds: u64,
+    /// The changed module (or workload) whose own `bake` set the window,
+    /// when it is longer than the phase's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    /// The run changed nothing, so the step does not bake.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutHost {
     pub host: String,
@@ -105,6 +120,10 @@ pub struct RolloutHost {
     /// one is picked (`None` reads "awaiting executor").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    /// The bake window the current step resolved to from what its run
+    /// changed, once its result arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bake: Option<BakeWindow>,
 }
 
 /// A reboot a rollout host's run asked for.
