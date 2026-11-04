@@ -106,9 +106,10 @@ async fn a_job_registers_follows_its_deployment_and_then_plans_as_a_no_op() {
     let live = fake.job("default", "atuin").unwrap();
     let s = stamps::Stamps::from_meta(live.get("Meta")).unwrap();
     assert_eq!(
-        (s.target.as_str(), s.module.as_str(), s.revision.as_str()),
-        ("home-nomad", "atuin", "r1")
+        (s.target.as_str(), s.module.as_str()),
+        ("home-nomad", "atuin")
     );
+    assert_eq!(job_revision(&fake).await, "r1");
     assert_eq!(w.plan(&cx).await.unwrap().changes(), 0);
 
     let checks = health::job(&fake.client(), "default", "atuin")
@@ -139,8 +140,51 @@ async fn a_revision_that_does_not_touch_a_job_leaves_its_stamps_alone() {
         }
     ));
     plan.apply(&cx(&fake, "r3")).await.unwrap();
-    let meta = fake.job("default", "atuin").unwrap()["Meta"].clone();
-    assert_eq!(meta[stamps::REVISION], "r3");
+    assert_eq!(job_revision(&fake).await, "r3");
+}
+
+async fn job_revision(fake: &FakeNomad) -> String {
+    index::read(&fake.client(), "home-nomad")
+        .await
+        .unwrap()
+        .find(Kind::Job, "default", "atuin")
+        .expect("the job is listed in the index")
+        .revision
+        .clone()
+}
+
+#[tokio::test]
+async fn a_count_change_leaves_the_jobs_meta_untouched() {
+    let fake = FakeNomad::new();
+    let scaled = |count: u64| {
+        job(serde_json::json!({
+            "ID": "atuin", "Type": "service",
+            "TaskGroups": [{"Name": "api", "Count": count}],
+        }))
+    };
+    let cx1 = cx(&fake, "r1");
+    workload(Some(scaled(1)))
+        .plan(&cx1)
+        .await
+        .unwrap()
+        .apply(&cx1)
+        .await
+        .unwrap();
+    let before = fake.job("default", "atuin").unwrap()["Meta"].clone();
+
+    let cx2 = cx(&fake, "r2");
+    workload(Some(scaled(2)))
+        .plan(&cx2)
+        .await
+        .unwrap()
+        .apply(&cx2)
+        .await
+        .unwrap();
+    let after = fake.job("default", "atuin").unwrap();
+    assert_eq!(after["TaskGroups"][0]["Count"], 2);
+    assert_eq!(after["Meta"], before);
+    assert!(after["Meta"].get(stamps::REVISION).is_none());
+    assert_eq!(job_revision(&fake).await, "r2");
 }
 
 #[tokio::test]

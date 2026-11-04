@@ -3,14 +3,17 @@
 //! Executors keep no state for a cluster, so every object carries who
 //! applied it and from what: `buckle.target`, `buckle.module`,
 //! `buckle.revision` and `buckle.digest`, in the object's `Meta` where it has
-//! one (jobs, namespaces, node pools) and as a suffix of its description
-//! where it does not (ACL policies, quotas). Variables and host volumes have
-//! neither and are listed in the target's index variable ([`crate::index`]).
+//! one (namespaces, node pools) and as a suffix of its description where it
+//! does not (ACL policies, quotas). Variables and host volumes have neither
+//! and are listed in the target's index variable ([`crate::index`]).
+//!
+//! Jobs carry only `buckle.target` and `buckle.module` in their meta, which
+//! never change after the first registration: Nomad passes job meta to every
+//! task, so a meta change is a destructive update. Their revision and digest
+//! are in the index.
 //!
 //! The revision is the one that last *changed* the object: when the intent's
-//! digest matches the live stamp, the live revision is kept, so a revision
-//! that does not touch a job never rewrites its meta (which Nomad would roll
-//! out as a destructive update).
+//! digest matches the recorded one, the recorded revision is kept.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -103,18 +106,19 @@ impl Stamps {
         }
     }
 
+    /// Sets only the owner stamps (`buckle.target`, `buckle.module`) on
+    /// `object`'s `Meta`: what a job carries.
+    pub fn stamp_owner(target: &str, module: &str, object: &mut Value) {
+        if let Some(meta) = meta_of(object) {
+            meta.insert(TARGET.to_owned(), Value::String(target.to_owned()));
+            meta.insert(MODULE.to_owned(), Value::String(module.to_owned()));
+        }
+    }
+
     /// Sets the stamps on `object`'s `Meta` field, creating it if needed.
     pub fn stamp_meta(&self, object: &mut Value) {
-        if let Some(map) = object.as_object_mut() {
-            let meta = map
-                .entry("Meta")
-                .or_insert_with(|| Value::Object(Map::new()));
-            if !meta.is_object() {
-                *meta = Value::Object(Map::new());
-            }
-            if let Some(meta) = meta.as_object_mut() {
-                self.into_meta(meta);
-            }
+        if let Some(meta) = meta_of(object) {
+            self.into_meta(meta);
         }
     }
 
@@ -160,6 +164,17 @@ impl Stamps {
         };
         (description[..start].trim_end().to_owned(), Some(stamps))
     }
+}
+
+fn meta_of(object: &mut Value) -> Option<&mut Map<String, Value>> {
+    let map = object.as_object_mut()?;
+    let meta = map
+        .entry("Meta")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !meta.is_object() {
+        *meta = Value::Object(Map::new());
+    }
+    meta.as_object_mut()
 }
 
 /// A short digest for stamps: the first 16 hex characters of the intent's SHA-256.
