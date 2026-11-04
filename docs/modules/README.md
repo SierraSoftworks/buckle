@@ -67,7 +67,7 @@ health:
 | `name` | **Required.** Must equal the directory name. |
 | `description` | Shown in plans and the UI. |
 | `when` | A [selector](./expressions.md) choosing the hosts this module applies to. Absent means every host. |
-| `needs` | Modules that must apply first. They must form a graph without cycles, and must be selected on every host this module is. |
+| `needs` | Modules that must apply first. They must form a graph without cycles, and must be selected on every host this module is. `workload:NAME` orders the module after a [workload](./workloads.md) on the cluster the host belongs to. |
 | `tags` | Labels for `--select 'module.tags contains "network"'`. |
 | `vars` | Default [variables](./fleet.md#vars); every fleet overlay overrides them. |
 | `tasks` | The ordered list of [tasks](./tasks/README.md). |

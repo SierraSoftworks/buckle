@@ -1,6 +1,10 @@
-//! Evaluating the fleet configuration against hosts: labels, groups, phases.
+//! Evaluating the fleet configuration against targets: labels, groups,
+//! phases. A host's context reads as `host.*`, a cluster target's as
+//! `cluster.*`; the same groups and phase selectors are evaluated against
+//! both, each matching only the kind it is written for.
 
 use crate::store::HostRecord;
+use buckle_api::TargetKind;
 use buckle_core::model::{FleetConfig, PhasePolicy, RolloutPolicy};
 use buckle_core::selectors::{HostContext, HostIdentity, Labels};
 use std::collections::BTreeMap;
@@ -22,11 +26,35 @@ pub fn host_context(
     facts: &serde_json::Value,
     fleet: &FleetConfig,
 ) -> HostContext {
-    let mut ctx = HostContext::new(HostIdentity {
+    let ctx = HostContext::new(HostIdentity {
         id: id.to_owned(),
         labels: labels_to_core(labels),
     })
     .with_facts(facts.clone());
+    with_groups(ctx, fleet)
+}
+
+/// The selector context of a cluster target: `cluster.id`, `cluster.kind`,
+/// `cluster.labels.*` and the groups written over `cluster.*`.
+pub fn cluster_context(
+    id: &str,
+    kind: buckle_api::ClusterKind,
+    labels: &BTreeMap<String, String>,
+    fleet: &FleetConfig,
+) -> HostContext {
+    let ctx = HostContext::for_cluster(
+        HostIdentity {
+            id: id.to_owned(),
+            labels: labels_to_core(labels),
+        },
+        crate::targets::core_kind(kind),
+    );
+    with_groups(ctx, fleet)
+}
+
+/// `ctx` with the fleet's groups evaluated in declaration order, so a group
+/// may refer to earlier ones.
+fn with_groups(mut ctx: HostContext, fleet: &FleetConfig) -> HostContext {
     let mut groups = Vec::new();
     for (name, filter) in &fleet.fleet.groups {
         if ctx.matches(filter) {
@@ -38,13 +66,20 @@ pub fn host_context(
     ctx
 }
 
-/// [`host_context`] for a stored host.
+/// The selector context of a stored target: [`host_context`] for a host,
+/// [`cluster_context`] for a cluster, so groups and `phase_for` work for
+/// either.
 pub fn record_context(
     host: &HostRecord,
     facts: &serde_json::Value,
     fleet: &FleetConfig,
 ) -> HostContext {
-    host_context(&host.id, &host.effective_labels(), facts, fleet)
+    match (&host.kind, &host.cluster) {
+        (TargetKind::Cluster, Some(c)) => {
+            cluster_context(&host.id, c.spec.kind, &host.effective_labels(), fleet)
+        }
+        _ => host_context(&host.id, &host.effective_labels(), facts, fleet),
+    }
 }
 
 /// The phases a rollout runs: the configured ones, or a single implicit

@@ -283,6 +283,7 @@ impl Harness {
                             continue;
                         }
                         reply(AMsg::Health(HealthReport {
+                            target: String::new(),
                             scope: h.scope,
                             request_id: h.request_id,
                             revision: String::new(),
@@ -836,6 +837,7 @@ async fn a_flap_inside_settle_is_not_a_failure() {
     h.handle.agent_message(
         "a",
         AMsg::Health(HealthReport {
+            target: String::new(),
             scope: HealthScope::Bake as i32,
             request_id: String::new(),
             revision: String::new(),
@@ -1451,6 +1453,7 @@ fn answer_baseline(h: &Harness, host: &str) {
     h.handle.agent_message(
         host,
         AMsg::Health(HealthReport {
+            target: String::new(),
             scope: HealthScope::Baseline as i32,
             request_id,
             revision: String::new(),
@@ -2337,6 +2340,7 @@ async fn a_failed_checkpoint_keeps_its_audit_outbox_and_finished_rollout() {
 
 fn bake_report(passed: bool) -> AMsg {
     AMsg::Health(HealthReport {
+        target: String::new(),
         scope: HealthScope::Bake as i32,
         request_id: String::new(),
         revision: String::new(),
@@ -2546,6 +2550,7 @@ async fn a_bake_report_for_another_revision_or_request_is_not_this_bake() {
     .await;
     let failing = |revision: &str, request: &str| {
         AMsg::Health(HealthReport {
+            target: String::new(),
             scope: HealthScope::Bake as i32,
             request_id: request.into(),
             revision: revision.into(),

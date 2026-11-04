@@ -40,9 +40,18 @@ double quotes inside them survive.
 | `host.labels.*` | Effective labels: the agent's seed labels, overridden by labels set in the UI. Typed like YAML scalars. |
 | `host.groups` | The groups the host belongs to (a list, for `contains`). |
 | `host.facts.*` | [Facts](../agent/facts.md), flattened to dotted keys. Lists can be tested with `contains` but not indexed. |
+| `cluster.id`, `cluster.kind`, `cluster.labels.*`, `cluster.groups` | The [cluster target](./fleet.md#clusters) being evaluated (`kind` is `nomad` or `kubernetes`), in a [workload](./workloads.md)'s `when` and in groups and phases written for clusters. |
 | `vars.*` | The host's variables (scalars and lists). |
 | `secrets.NAME` | A secret, comparable but never printable; `secrets.NAME.present` and `secrets.NAME.fingerprint` for "is it set" and "did it rotate". |
 | `task.kind`, `task.id`, `task.tags`, `module.name`, `module.tags` | The task being evaluated, for `--select`. |
+
+### Cluster selectors
+
+A selector is evaluated against one kind of target at a time, and the namespace it names says
+which: a selector over `host.*` is simply false for a cluster, and one over `cluster.*` is false
+for a host. A selector that names neither (`true`, `vars.x == 1`) applies to both. So a module's
+`when` must not read `cluster.*` and a workload's must not read `host.*`; `buckle validate`
+rejects either, and warns about a group that mixes the two.
 
 ## Templates
 

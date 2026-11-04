@@ -121,10 +121,12 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             stable: a.stable,
             secrets: secrets_from_proto(a.secrets),
             tree_digest: non_empty(a.tree_digest),
+            target: non_empty(a.target),
         },
         Msg::Plan(p) => Instruction::RequestPlan {
             revision: RevisionId(p.revision),
             select: non_empty(p.select),
+            target: non_empty(p.target),
         },
         // The server always binds a digest: an empty one never matches a plan
         // and is refused as stale, rather than meaning "apply anything".
@@ -141,12 +143,14 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             select: non_empty(a.select),
             rollout_id: non_empty(a.rollout_id),
             phase: non_empty(a.phase),
+            target: non_empty(a.target),
         },
         Msg::Rollback(r) => Instruction::Rollback {
             revision: RevisionId(r.revision),
             reason: r.reason,
             rollout_id: non_empty(r.rollout_id),
             traceparent: non_empty(r.traceparent),
+            target: non_empty(r.target),
         },
         Msg::Health(h) => {
             let scope = pb::HealthScope::try_from(h.scope)
@@ -160,6 +164,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
                 modules: h.modules,
                 until: h.until.as_ref().and_then(from_timestamp),
                 traceparent: non_empty(h.traceparent),
+                target: non_empty(h.target),
             }
         }
         Msg::Ping(_) => Instruction::Ping,
@@ -238,6 +243,7 @@ pub fn health_report_to_proto(
     report: &HealthReport,
 ) -> pb::HealthReport {
     pb::HealthReport {
+        target: String::new(),
         scope: scope_to_proto(report.scope) as i32,
         request_id: request_id.unwrap_or_default().to_owned(),
         revision: revision.map(|r| r.0.clone()).unwrap_or_default(),
@@ -307,6 +313,7 @@ pub fn apply_event_to_proto(
         })
         .unwrap_or_default();
     pb::ApplyEvent {
+        target: String::new(),
         revision: revision.0.clone(),
         plan_digest: plan_digest.to_owned(),
         at: Some(timestamp(at)),
@@ -334,6 +341,7 @@ pub fn apply_event_to_proto(
 
 fn plan_result(plan: &buckle_core::plan::Plan, error: String) -> pb::PlanResult {
     pb::PlanResult {
+        target: String::new(),
         module_errors: plan
             .indeterminate
             .iter()
@@ -377,6 +385,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
     use pb::agent_message::Msg;
     let msg = match report {
         Report::Facts(facts) => Msg::Facts(pb::Facts {
+            target: String::new(),
             json: json_bytes(&facts.tree),
             collected_at: Some(timestamp(chrono::Utc::now())),
         }),
@@ -392,9 +401,14 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             busy: *busy,
         }),
         Report::Plan(plan) => Msg::Plan(plan_result(plan, String::new())),
-        Report::PlanFailed { revision, error } => Msg::Plan(pb::PlanResult {
+        Report::PlanFailed {
+            revision,
+            error,
+            target,
+        } => Msg::Plan(pb::PlanResult {
             revision: revision.0.clone(),
             error: error.clone(),
+            target: target.clone().unwrap_or_default(),
             ..Default::default()
         }),
         Report::StalePlan {
@@ -419,6 +433,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             outcome,
             applied_revision,
         } => Msg::Result(pb::ApplyResult {
+            target: String::new(),
             report_id: *report_id,
             needs_attention: needs_attention(outcome),
             revision: revision.0.clone(),
@@ -471,6 +486,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             plan,
             corrected,
         } => Msg::Drift(pb::Drift {
+            target: String::new(),
             revision: revision.0.clone(),
             plan_digest: plan
                 .as_ref()

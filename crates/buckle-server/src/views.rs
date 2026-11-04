@@ -41,6 +41,25 @@ pub async fn reference_revision(store: &Store, revisions: &RevisionCache) -> Opt
     revisions.load(&valid.id).await.ok()
 }
 
+/// [`reference_revision`], with the cluster targets it declares brought in
+/// line first (see [`crate::targets::sync_declared`]), so a listing made
+/// right after reads the repository's clusters.
+pub async fn reference_revision_synced(
+    store: &Store,
+    revisions: &RevisionCache,
+) -> Option<Arc<Revision>> {
+    let rev = reference_revision(store, revisions).await?;
+    let r = rev.clone();
+    let now = chrono::Utc::now();
+    if let Err(e) = store
+        .call(move |db| crate::targets::sync_declared(db, &r, now))
+        .await
+    {
+        tracing::warn!(error = %e, "the declared cluster targets could not be synced");
+    }
+    Some(rev)
+}
+
 /// The summary row of a host, with groups evaluated against `fleet`.
 pub fn host_summary(
     host: &HostRecord,
@@ -52,6 +71,8 @@ pub fn host_summary(
         .unwrap_or_default();
     HostSummary {
         id: host.id.clone(),
+        kind: host.kind,
+        cluster: host.cluster.clone(),
         status: host.status,
         connection: host.connection,
         agent_labels: host.agent_labels.clone(),
@@ -296,10 +317,11 @@ pub async fn load_summary(
     revisions: &RevisionCache,
     id: &str,
 ) -> Option<HostSummary> {
+    let fleet = reference_revision_synced(store, revisions).await;
     let id = id.to_owned();
     let (host, facts) = store
         .call(move |db| {
-            let Some(h) = db.hosts().get(&id)? else {
+            let Some(h) = db.hosts().target(&id)? else {
                 return Ok(None);
             };
             let facts = db.hosts().latest_facts(&id)?.map(|(f, _)| f);
@@ -308,7 +330,6 @@ pub async fn load_summary(
         .await
         .ok()
         .flatten()?;
-    let fleet = reference_revision(store, revisions).await;
     Some(host_summary(&host, &facts, fleet.as_deref()))
 }
 

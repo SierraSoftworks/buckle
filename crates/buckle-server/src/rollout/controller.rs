@@ -451,7 +451,8 @@ impl Live {
 }
 
 enum Out {
-    Msg(String, ServerMessage),
+    /// Boxed: a `ServerMessage` is large next to the other variant.
+    Msg(String, Box<ServerMessage>),
     AssignAndPlan {
         host: String,
         revision: String,
@@ -964,7 +965,8 @@ impl Controller {
     }
 
     fn send(&mut self, host: &str, m: server_message::Msg) {
-        self.outbox.push(Out::Msg(host.to_owned(), msg(m)));
+        self.outbox
+            .push(Out::Msg(host.to_owned(), Box::new(msg(m))));
     }
 
     // ------------------------------------------------------------ inputs
@@ -1157,6 +1159,7 @@ impl Controller {
                 self.send(
                     &c.host,
                     server_message::Msg::Health(RunHealth {
+                        target: String::new(),
                         request_id,
                         scope: HealthScope::Rollout as i32,
                         modules: vec![],
@@ -1672,7 +1675,7 @@ impl Controller {
         let h = host.to_owned();
         let Some(record) = self
             .store
-            .call(move |db| db.hosts().get(&h))
+            .call(move |db| db.hosts().target(&h))
             .await
             .ok()
             .flatten()
@@ -1692,7 +1695,7 @@ impl Controller {
         let h = host.to_owned();
         let record = self
             .store
-            .call(move |db| db.hosts().get(&h))
+            .call(move |db| db.hosts().target(&h))
             .await
             .ok()
             .flatten();
@@ -1707,6 +1710,16 @@ impl Controller {
         if record.is_none() {
             self.host_seen.remove(host);
             self.forget_host(host);
+            return;
+        }
+        // A cluster target has no agent to push to and, until the
+        // controller schedules workloads, no rollout work to re-send.
+        if record.as_ref().is_some_and(crate::targets::is_cluster) {
+            let seen = record
+                .as_ref()
+                .map(|r| (r.status, r.effective_labels()))
+                .expect("checked above");
+            self.host_seen.insert(host.to_owned(), seen);
             return;
         }
         // Only a change the agent and the rollout care about (status or
@@ -2721,6 +2734,7 @@ impl Controller {
         self.send(
             &host,
             server_message::Msg::Health(RunHealth {
+                target: String::new(),
                 request_id,
                 scope: HealthScope::Baseline as i32,
                 modules: vec![],
@@ -2740,6 +2754,7 @@ impl Controller {
         let phase = h.phase.clone();
         let rollout = live.record.id.clone();
         Apply {
+            target: String::new(),
             revision: h.runtime.revision.clone(),
             plan_digest: digest.clone(),
             approval_token: approval_token(&self.key, &rollout, &phase, &digest),
@@ -2977,6 +2992,7 @@ impl Controller {
         self.send(
             &host,
             server_message::Msg::Health(RunHealth {
+                target: String::new(),
                 request_id,
                 scope: HealthScope::Bake as i32,
                 modules: vec![],
@@ -2996,6 +3012,7 @@ impl Controller {
         self.send(
             &host,
             server_message::Msg::Rollback(pb::Rollback {
+                target: String::new(),
                 revision: prev,
                 reason: format!("rollout {rollout} is being rolled back"),
                 rollout_id: rollout,
@@ -3545,6 +3562,7 @@ impl Controller {
                 self.send(
                     &host,
                     server_message::Msg::Health(RunHealth {
+                        target: String::new(),
                         request_id: rid,
                         scope: HealthScope::Rollout as i32,
                         modules: vec![],
@@ -4098,7 +4116,7 @@ impl Controller {
         for out in outbox {
             match out {
                 Out::Msg(host, m) => {
-                    if !self.link.send(&host, m) {
+                    if !self.link.send(&host, *m) {
                         undeliverable.insert(host);
                     }
                 }
@@ -4163,6 +4181,7 @@ impl Controller {
         let assigned = self.link.send(
             host,
             msg(server_message::Msg::Assign(Assign {
+                target: String::new(),
                 revision: revision.to_owned(),
                 stable,
                 secrets: Some(secrets),
@@ -4172,6 +4191,7 @@ impl Controller {
         let planned = self.link.send(
             host,
             msg(server_message::Msg::Plan(RequestPlan {
+                target: String::new(),
                 revision: revision.to_owned(),
                 select: PLAN_SELECT.to_owned(),
             })),

@@ -304,6 +304,9 @@ pub fn hosts() -> Html {
                         </table>
                     </div>
                 }
+                if !f.clusters.is_empty() {
+                    { clusters_table(&f.clusters, &query.q, &on_open) }
+                }
             </> }
         }
     };
@@ -363,6 +366,72 @@ pub fn hosts() -> Html {
                 </Confirm>
             }
         </div>
+    }
+}
+
+/// Cluster targets: what `buckle.yaml` declares under `fleet.clusters` and
+/// what operators created through the API. Workloads run on these; the
+/// hosts they are made of are in the table above.
+fn clusters_table(
+    clusters: &[HostSummary],
+    q: &str,
+    on_open: &Callback<(MouseEvent, String)>,
+) -> Html {
+    let rows: Vec<&HostSummary> = clusters.iter().filter(|c| search_matches(c, q)).collect();
+    html! {
+        <section class="section" data-testid="clusters">
+            <h2 class="section__title">{ format!("Clusters ({})", clusters.len()) }</h2>
+            if rows.is_empty() {
+                <p class="muted">{ "No clusters match the search." }</p>
+            } else {
+                <div class="table-wrap">
+                    <table class="table" data-testid="clusters-table">
+                        <thead><tr>
+                            <th scope="col">{ "Cluster" }</th>
+                            <th scope="col">{ "State" }</th>
+                            <th scope="col">{ "Labels" }</th>
+                            <th scope="col">{ "Members" }</th>
+                        </tr></thead>
+                        <tbody>{ for rows.into_iter().map(|c| {
+                            let onclick = {
+                                let (on_open, id) = (on_open.clone(), c.id.clone());
+                                Callback::from(move |e: MouseEvent| on_open.emit((e, id.clone())))
+                            };
+                            let spec = c.cluster.as_ref().map(|i| &i.spec);
+                            html! {
+                                <tr data-host={c.id.clone()} class="row-click" {onclick}>
+                                    <td class="nowrap">
+                                        <RouteLink to={Route::Host { id: c.id.clone() }} classes="mono strong">{ c.id.clone() }</RouteLink>
+                                        if let Some(api) = spec.and_then(|s| s.api.as_deref()) {
+                                            <span class="cell-sub mono">{ api.to_owned() }</span>
+                                        }
+                                    </td>
+                                    <td class="cell-state nowrap">{ host_state_pills(c) }</td>
+                                    <td class="cell-labels">
+                                        { for c.effective_labels.iter().map(|(k, v)| html! {
+                                            <span class={classes!("label", c.labels.contains_key(k).then_some("label--server"))}>{ format!("{k}={v}") }</span>
+                                        }) }
+                                        if !c.groups.is_empty() { <span class="cell-sub">{ format!("groups {}", c.groups.join(", ")) }</span> }
+                                    </td>
+                                    <td>
+                                        if let Some(nodes) = spec.and_then(|s| s.nodes.as_deref()) {
+                                            <code class="mono small">{ nodes.to_owned() }</code>
+                                        } else if let Some(parent) = spec.and_then(|s| s.cluster.as_deref()) {
+                                            <span class="muted">{ format!("part of {parent}") }</span>
+                                        } else {
+                                            <span class="muted">{ "no nodes selected" }</span>
+                                        }
+                                        if let Some(executors) = spec.and_then(|s| s.executors.as_deref()) {
+                                            <span class="cell-sub">{ "executors " }<code class="mono small">{ executors.to_owned() }</code></span>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        }) }</tbody>
+                    </table>
+                </div>
+            }
+        </section>
     }
 }
 

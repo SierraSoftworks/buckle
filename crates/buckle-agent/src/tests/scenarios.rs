@@ -341,6 +341,7 @@ async fn bake_health_repeats_until_the_deadline_then_stops() {
     let until = chrono::Utc::now() + chrono::Duration::seconds(120);
     session
         .send(pb::server_message::Msg::Health(pb::RunHealth {
+            target: String::new(),
             request_id: "bake-1".into(),
             scope: pb::HealthScope::Bake as i32,
             modules: vec!["m".into()],
