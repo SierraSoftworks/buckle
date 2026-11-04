@@ -17,11 +17,11 @@ mod windows_service;
 #[derive(Parser, Debug)]
 #[command(name = "buckle", version = crate::telemetry::version(), about, long_about = None, propagate_version = true)]
 pub struct Cli {
-    /// OpenTelemetry OTLP endpoint for traces and metrics.
+    /// OpenTelemetry OTLP endpoint for traces, metrics and logs.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT", global = true)]
     pub otel_endpoint: Option<String>,
 
-    /// Also write spans and logs to stdout.
+    /// Also write logs to stdout (always on for `server` and `agent`).
     #[arg(short, long, global = true)]
     pub verbose: bool,
 

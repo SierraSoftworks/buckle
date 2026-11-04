@@ -32,5 +32,10 @@ pub async fn run(args: ServerArgs) -> buckle_core::Result<i32> {
             )),
         };
     }
+    tracing::info!(
+        version = crate::telemetry::version(),
+        config = %args.config.display(),
+        "starting the Buckle server"
+    );
     buckle_server::run(config, super::shutdown_token()).await
 }

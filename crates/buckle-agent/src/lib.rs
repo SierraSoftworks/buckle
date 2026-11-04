@@ -70,6 +70,14 @@ pub async fn run_with_system(
     shutdown: tokio_util::sync::CancellationToken,
 ) -> buckle_core::Result<i32> {
     config.validate()?;
+    tracing::info!(
+        version = agent_version,
+        server = config.server.as_deref(),
+        source = config.source.as_ref().map(|p| p.display().to_string()),
+        host = config.host_id.as_deref(),
+        state_dir = %config.state_dir.display(),
+        "starting the Buckle agent"
+    );
     let transport: Arc<dyn transport::Transport> = match &config.source {
         Some(source) => {
             let store = store::Store::new(&config.state_dir);
