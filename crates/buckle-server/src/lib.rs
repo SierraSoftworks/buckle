@@ -16,6 +16,7 @@ pub mod config;
 pub mod events;
 pub mod fleet;
 pub mod grpc;
+pub mod join;
 pub mod metrics;
 pub mod rollout;
 pub mod secrets;
@@ -178,6 +179,11 @@ pub async fn run_with(
             )) as Arc<dyn grpc::Whois>
         });
     let guard = Arc::new(grpc::SessionGuard::default());
+    let joins = Arc::new(join::Joins::new(join::JoinSettings::from_config(
+        &config,
+        identity.as_ref().map(|i| i.fingerprint.as_str()),
+        VERSION,
+    )));
     let upgrades = Arc::new(upgrades::AgentUpgrades::new(
         sessions.clone(),
         config
@@ -199,6 +205,7 @@ pub async fn run_with(
         server_version: VERSION.to_owned(),
         guard: guard.clone(),
         upgrades: upgrades.clone(),
+        joins: joins.clone(),
     };
     let grpc_listener = tokio::net::TcpListener::bind(&config.listen.grpc)
         .await
@@ -232,6 +239,7 @@ pub async fn run_with(
     );
     state.agent_sessions = guard.sessions.clone();
     state.upgrades = upgrades;
+    state.joins = joins;
     state.trace_url_template = config.telemetry.trace_url_template.clone();
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
 

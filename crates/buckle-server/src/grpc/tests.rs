@@ -62,6 +62,7 @@ fn trusting(tags: &[&str], users: &[&str]) -> crate::config::TailscaleConfig {
     crate::config::TailscaleConfig {
         allowed_tags: tags.iter().map(|s| s.to_string()).collect(),
         allowed_users: users.iter().map(|s| s.to_string()).collect(),
+        provisioning: None,
     }
 }
 
@@ -73,6 +74,7 @@ struct Server {
     revisions: Arc<RevisionCache>,
     guard: Arc<SessionGuard>,
     upgrades: Arc<crate::upgrades::AgentUpgrades>,
+    joins: Arc<crate::join::Joins>,
     cancel: CancellationToken,
 }
 
@@ -137,6 +139,7 @@ async fn server_full(
     )
     .await
     .unwrap();
+    let joins = Arc::new(crate::join::Joins::default());
     let upgrades = Arc::new(crate::upgrades::AgentUpgrades::new(
         sessions.clone(),
         "2.3.0",
@@ -161,6 +164,7 @@ async fn server_full(
         server_version: "2.0.0-test".into(),
         guard: guard.clone(),
         upgrades: upgrades.clone(),
+        joins: joins.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -173,6 +177,7 @@ async fn server_full(
         revisions,
         guard,
         upgrades,
+        joins,
         cancel,
     }
 }
@@ -281,6 +286,62 @@ async fn approve_registration_leaves_new_hosts_pending() {
     let s = server(Registration::Approve, None, vec![AgentAuth::Token]).await;
     let (_tx, _stream, reply) = open(s.addr, hello("pi-2", "boot", "2.0.0")).await;
     assert_eq!(expect_welcome(reply).status, "pending");
+}
+
+/// A join token from a command for `host` (any host when `None`).
+fn join_token(s: &Server, method: buckle_api::JoinMethod, host: Option<&str>) -> String {
+    let ticket = s
+        .joins
+        .create(
+            buckle_api::JoinRequest {
+                platform: buckle_api::JoinPlatform::Linux,
+                method,
+                host_id: host.map(str::to_owned),
+                labels: Default::default(),
+                tailscale_tags: vec![],
+            },
+            "ada@example.com",
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    let buckle_api::JoinState::Ready { command } = ticket.state else {
+        panic!("a token join is ready at once");
+    };
+    let rest = command.split("--token ").nth(1).unwrap();
+    rest.split_whitespace().next().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn a_join_token_enrols_its_host_once_without_approval() {
+    let s = server(Registration::Approve, None, vec![AgentAuth::Token]).await;
+    let token = join_token(&s, buckle_api::JoinMethod::Token, Some("pi-3"));
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-9", &token, "2.0.0")).await;
+    assert!(
+        expect_rejected(reply).reason.contains("not recognised"),
+        "another host"
+    );
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-3", &token, "2.0.0")).await;
+    let welcome = expect_welcome(reply);
+    assert_eq!(
+        welcome.status, "active",
+        "the admin who made the command approved it"
+    );
+    assert_eq!(welcome.issued_token.len(), 64);
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-4", &token, "2.0.0")).await;
+    assert!(!expect_rejected(reply).retry, "used once");
+}
+
+#[tokio::test]
+async fn a_tailnet_node_with_a_join_token_skips_approval() {
+    let s = server(
+        Registration::Approve,
+        Some(FakeWhois::tagged("tag:buckle")),
+        vec![AgentAuth::Tailscale],
+    )
+    .await;
+    let token = join_token(&s, buckle_api::JoinMethod::Token, None);
+    let (_tx, _stream, reply) = open(s.addr, hello("tail-1", &token, "2.0.0")).await;
+    assert_eq!(expect_welcome(reply).status, "active");
 }
 
 #[tokio::test]

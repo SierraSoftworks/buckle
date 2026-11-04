@@ -83,6 +83,11 @@ impl ApiError {
         )
     }
 
+    /// 429 with its reason.
+    pub fn too_many_because(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, msg, &[])
+    }
+
     /// The JSON response.
     pub fn response(&self) -> HttpResponse {
         HttpResponse::build(self.status).json(&self.body)

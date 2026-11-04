@@ -160,6 +160,10 @@ sudo buckle up \
   --label role=worker
 ```
 
+To have the server put new hosts on the tailnet too, configure
+[Tailscale provisioning](../agent/server.md#tailscale-provisioning) and use **Add an agent** on the
+hosts page.
+
 The agent's host id must equal its tailnet node name. It defaults to the system hostname, so set
 `--host-id` when the two differ. With neither `allowed_tags` nor `allowed_users` set, every new
 tailnet node waits for approval.

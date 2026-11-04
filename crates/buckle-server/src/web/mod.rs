@@ -47,6 +47,8 @@ pub struct AppState {
     pub agent_sessions: Arc<crate::grpc::LiveSessions>,
     /// Agent upgrades requested here, sent on the hosts' sessions.
     pub upgrades: Arc<crate::upgrades::AgentUpgrades>,
+    /// Join commands for new hosts, shared with the gRPC enrolment.
+    pub joins: Arc<crate::join::Joins>,
     /// How often an event stream re-checks the session it was opened with.
     pub sse_recheck: std::time::Duration,
     /// `telemetry.trace_url_template`: turns a trace id into a link.
@@ -93,6 +95,7 @@ impl AppState {
             server_version,
             agent_sessions: Default::default(),
             upgrades: Default::default(),
+            joins: Default::default(),
             sse_recheck: std::time::Duration::from_secs(30),
             trace_url_template: None,
         }

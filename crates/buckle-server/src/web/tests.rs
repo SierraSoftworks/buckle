@@ -493,6 +493,123 @@ async fn admins_can_ask_a_connected_agent_to_upgrade() {
 }
 
 #[actix_web::test]
+async fn admins_create_join_commands_through_tailscale_consent() {
+    let tailscale = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "tskey-auth-1",
+            "expires_in": 3600,
+        })))
+        .mount(&tailscale)
+        .await;
+    let e = env_with(
+        WebConfig {
+            admin_acl: acl("true"),
+            ..Default::default()
+        },
+        |s| {
+            let mut settings = crate::join::Joins::default().settings().clone();
+            settings.methods = vec![buckle_api::JoinMethod::Tailscale];
+            settings.tailscale = Some(crate::join::Provisioning {
+                config: crate::config::TailscaleProvisioning {
+                    client_id: "c".into(),
+                    client_secret: "s".into(),
+                    tags: vec![],
+                    node_attributes: vec![],
+                    api_url: tailscale.uri(),
+                    login_url: "https://login.example.com".into(),
+                },
+                tags: vec!["tag:buckle".into()],
+                redirect_uri: "http://localhost/api/v1/join/tailscale/callback".into(),
+            });
+            s.joins = Arc::new(crate::join::Joins::new(settings));
+        },
+    )
+    .await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+
+    let options = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/join").to_request(),
+    )
+    .await;
+    let options: buckle_api::JoinOptions = test::read_body_json(options).await;
+    assert_eq!(options.tailscale.unwrap().tags, vec!["tag:buckle"]);
+
+    let create = |method: buckle_api::JoinMethod| {
+        test::TestRequest::post()
+            .uri("/api/v1/join")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(buckle_api::JoinRequest {
+                platform: buckle_api::JoinPlatform::Linux,
+                method,
+                host_id: Some("web-1".into()),
+                labels: Default::default(),
+                tailscale_tags: vec![],
+            })
+            .to_request()
+    };
+    let refused = test::call_service(&app, create(buckle_api::JoinMethod::Token)).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "token auth is off"
+    );
+    let resp = test::call_service(&app, create(buckle_api::JoinMethod::Tailscale)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let ticket: buckle_api::JoinTicket = test::read_body_json(resp).await;
+    let buckle_api::JoinState::Authorize { authorize_url } = &ticket.state else {
+        panic!("expected consent first, got {:?}", ticket.state);
+    };
+    let state = url::Url::parse(authorize_url)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
+
+    let callback = |state: &str| {
+        test::TestRequest::get()
+            .uri(&format!(
+                "/api/v1/join/tailscale/callback?state={state}&code=abc"
+            ))
+            .to_request()
+    };
+    let back = test::call_service(&app, callback(&state)).await;
+    assert_eq!(back.status(), StatusCode::SEE_OTHER);
+    let location = |r: &actix_web::dev::ServiceResponse<_>| {
+        r.headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(location(&back), format!("/hosts?join={}", ticket.id));
+    let again = test::call_service(&app, callback(&state)).await;
+    assert_eq!(location(&again), "/hosts?join=expired");
+
+    let ready = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/join/{}", ticket.id))
+            .to_request(),
+    )
+    .await;
+    let ready: buckle_api::JoinTicket = test::read_body_json(ready).await;
+    match ready.state {
+        buckle_api::JoinState::Ready { command } => {
+            assert!(command.contains("tskey-auth-1"), "{command}")
+        }
+        other => panic!("expected a command, got {other:?}"),
+    }
+}
+
+#[actix_web::test]
 async fn forgetting_a_host_closes_its_agent_session() {
     let e = env(WebConfig {
         admin_acl: acl("true"),
