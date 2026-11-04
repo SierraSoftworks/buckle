@@ -42,7 +42,9 @@ impl FilePerms {
     }
 }
 
-mod mode_serde {
+/// Serde for an optional octal mode (`"0644"`, or a bare YAML `0644`), for
+/// mode fields outside [`FilePerms`]: `#[serde(default, with = "mode_serde")]`.
+pub mod mode_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(mode: &Option<u32>, s: S) -> Result<S::Ok, S::Error> {

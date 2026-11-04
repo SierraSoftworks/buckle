@@ -1,4 +1,4 @@
-//! The `hardware` fact: architecture, CPUs, memory, swap and disks.
+//! The `hardware` fact: architecture, model, CPUs, memory, swap and disks.
 
 use super::{opt_str, probe, read_text};
 use async_trait::async_trait;
@@ -10,7 +10,11 @@ use std::time::Duration;
 
 /// Describes the machine's resources.
 ///
-/// Keys: `arch` (`uname -m`: `x86_64`, `aarch64`), `cpus`, `mem.total_mb`,
+/// Keys: `arch` (`uname -m`: `x86_64`, `aarch64`), `model` and `vendor` (the
+/// device tree's `model` on ARM boards, else DMI `product_name` /
+/// `sys_vendor`; `null` where neither exists), `raspberry_pi` (`{version,
+/// model, compute_module, revision}` parsed from a Raspberry Pi model string,
+/// `null` on anything else), `cpus`, `mem.total_mb`,
 /// `swap.total_mb` and `disks`, a list of `{mount, fstype, total_mb, free_mb,
 /// free_percent}` for the real filesystems from `df -P -k -T` (tmpfs and other
 /// pseudo filesystems are left out). Selectors cannot index into lists, so
@@ -139,6 +143,58 @@ pub(crate) fn parse_meminfo(text: &str) -> (Option<u64>, Option<u64>) {
     (field("MemTotal"), field("SwapTotal"))
 }
 
+/// The device-tree `model` string, which is NUL-terminated on disk.
+pub(crate) fn clean_model(raw: &str) -> Option<String> {
+    let text = raw.trim_matches(['\0', '\n', ' ', '\t']).trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Parses a Raspberry Pi model string such as `Raspberry Pi 4 Model B Rev 1.4`,
+/// `Raspberry Pi Compute Module 4 Rev 1.1` or `Raspberry Pi Zero 2 W Rev 1.0`
+/// into `{version, model, compute_module, revision}`. `None` for anything else.
+///
+/// `version` is the board generation (`4`, `5`; `0` for the Zero family and `1`
+/// for the original boards, which carry no number), `model` is the rest of the
+/// name (`Model B Plus`, `Compute Module 4`, `Zero 2 W`, `400`) and `revision`
+/// is the text after `Rev`, when present.
+pub(crate) fn parse_raspberry_pi(model: &str) -> Option<Value> {
+    let rest = model.trim().strip_prefix("Raspberry Pi")?.trim();
+    let (name, revision) = match rest.split_once(" Rev ") {
+        Some((n, r)) => (n.trim(), Some(r.trim().to_owned())),
+        None => (rest, None),
+    };
+    let leading_number = |text: &str| -> Option<u64> {
+        let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    };
+    let (version, compute_module) = if let Some(after) = name.strip_prefix("Compute Module") {
+        (leading_number(after.trim()).unwrap_or(1), true)
+    } else if name.starts_with("Zero") {
+        (0, false)
+    } else {
+        (leading_number(name).unwrap_or(1), false)
+    };
+    // "4 Model B" -> "Model B"; "400" -> "400"; "Compute Module 4" stays whole.
+    let model_name = if compute_module || name.starts_with("Zero") {
+        name.to_owned()
+    } else {
+        match name.split_once(' ') {
+            Some((first, tail))
+                if first.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() =>
+            {
+                tail.to_owned()
+            }
+            _ => name.to_owned(),
+        }
+    };
+    Some(json!({
+        "version": version,
+        "model": model_name,
+        "compute_module": compute_module,
+        "revision": opt_str(revision),
+    }))
+}
+
 /// The number of `processor` entries in `/proc/cpuinfo`.
 pub(crate) fn count_cpus(cpuinfo: &str) -> usize {
     cpuinfo
@@ -152,7 +208,7 @@ impl FactProvider for HardwareFacts {
     const NAME: &'static str = "hardware";
     const TTL: Duration = Duration::from_secs(300);
     const PLATFORMS: Platforms = Platforms::LINUX;
-    const DESCRIPTION: &'static str = "Architecture, CPU count, memory, swap and disks (with flat disk.<name> keys for selectors).";
+    const DESCRIPTION: &'static str = "Architecture, machine model (and Raspberry Pi generation), CPU count, memory, swap and disks (with flat disk.<name> keys for selectors).";
 
     #[tracing::instrument(name = "facts.hardware", skip_all)]
     async fn collect(&self, cx: &Cx) -> Result<Value> {
@@ -161,6 +217,31 @@ impl FactProvider for HardwareFacts {
             .map(|a| a.trim().to_owned())
             .filter(|a| !a.is_empty())
             .unwrap_or_else(|| std::env::consts::ARCH.to_owned());
+
+        // ARM boards describe themselves in the device tree; PCs and VMs in DMI.
+        let (model, vendor) = match read_text(cx, "/proc/device-tree/model")
+            .await
+            .and_then(|t| clean_model(&t))
+        {
+            Some(model) => {
+                let vendor = model
+                    .starts_with("Raspberry Pi")
+                    .then(|| "Raspberry Pi".to_owned());
+                (Some(model), vendor)
+            }
+            None => (
+                read_text(cx, "/sys/devices/virtual/dmi/id/product_name")
+                    .await
+                    .and_then(|t| clean_model(&t)),
+                read_text(cx, "/sys/devices/virtual/dmi/id/sys_vendor")
+                    .await
+                    .and_then(|t| clean_model(&t)),
+            ),
+        };
+        let raspberry_pi = model
+            .as_deref()
+            .and_then(parse_raspberry_pi)
+            .unwrap_or(Value::Null);
 
         let cpus = match read_text(cx, "/proc/cpuinfo").await.map(|t| count_cpus(&t)) {
             Some(n) if n > 0 => Some(n as u64),
@@ -187,6 +268,9 @@ impl FactProvider for HardwareFacts {
 
         Ok(json!({
             "arch": arch,
+            "model": opt_str(model),
+            "vendor": opt_str(vendor),
+            "raspberry_pi": raspberry_pi,
             "cpus": cpus,
             "mem": {"total_mb": mb(mem)},
             "swap": {"total_mb": mb(swap)},
@@ -305,6 +389,95 @@ shm                  65536        0     65536       0% /dev/shm
         assert_eq!(count_cpus(""), 0);
     }
 
+    #[rstest::rstest]
+    #[case::pi5("Raspberry Pi 5 Model B Rev 1.0", 5, "Model B", false, Some("1.0"))]
+    #[case::pi4("Raspberry Pi 4 Model B Rev 1.4", 4, "Model B", false, Some("1.4"))]
+    #[case::pi3_plus(
+        "Raspberry Pi 3 Model B Plus Rev 1.3",
+        3,
+        "Model B Plus",
+        false,
+        Some("1.3")
+    )]
+    #[case::pi400("Raspberry Pi 400 Rev 1.0", 400, "400", false, Some("1.0"))]
+    #[case::cm4(
+        "Raspberry Pi Compute Module 4 Rev 1.1",
+        4,
+        "Compute Module 4",
+        true,
+        Some("1.1")
+    )]
+    #[case::zero2("Raspberry Pi Zero 2 W Rev 1.0", 0, "Zero 2 W", false, Some("1.0"))]
+    #[case::original("Raspberry Pi Model B Rev 2", 1, "Model B", false, Some("2"))]
+    #[case::no_revision("Raspberry Pi 5 Model B", 5, "Model B", false, None)]
+    fn raspberry_pi_models_parse(
+        #[case] text: &str,
+        #[case] version: u64,
+        #[case] model: &str,
+        #[case] compute_module: bool,
+        #[case] revision: Option<&str>,
+    ) {
+        let pi = parse_raspberry_pi(text).unwrap();
+        assert_eq!(pi["version"], version);
+        assert_eq!(pi["model"], model);
+        assert_eq!(pi["compute_module"], compute_module);
+        assert_eq!(
+            pi["revision"],
+            revision.map(Value::from).unwrap_or(Value::Null)
+        );
+    }
+
+    #[test]
+    fn other_machines_are_not_raspberry_pis() {
+        assert!(parse_raspberry_pi("NUC8i5BEH").is_none());
+        assert!(parse_raspberry_pi("Standard PC (Q35 + ICH9, 2009)").is_none());
+        assert!(parse_raspberry_pi("").is_none());
+        assert_eq!(
+            clean_model("Raspberry Pi 5 Model B Rev 1.0\0").as_deref(),
+            Some("Raspberry Pi 5 Model B Rev 1.0")
+        );
+        assert_eq!(clean_model("\n"), None);
+    }
+
+    #[tokio::test]
+    async fn device_tree_model_wins_and_identifies_a_pi() {
+        let sys = FakeSystem::new()
+            .with_file(
+                "/proc/device-tree/model",
+                "Raspberry Pi 4 Model B Rev 1.4\0",
+                FilePerms::default(),
+            )
+            .with_file(
+                "/sys/devices/virtual/dmi/id/product_name",
+                "ignored\n",
+                FilePerms::default(),
+            );
+        let f = HardwareFacts.collect(&cx(&sys)).await.unwrap();
+        assert_eq!(f["model"], "Raspberry Pi 4 Model B Rev 1.4");
+        assert_eq!(f["vendor"], "Raspberry Pi");
+        assert_eq!(f["raspberry_pi"]["version"], 4);
+        assert_eq!(f["raspberry_pi"]["compute_module"], false);
+    }
+
+    #[tokio::test]
+    async fn dmi_describes_pcs_and_vms() {
+        let sys = FakeSystem::new()
+            .with_file(
+                "/sys/devices/virtual/dmi/id/product_name",
+                "NUC8i5BEH\n",
+                FilePerms::default(),
+            )
+            .with_file(
+                "/sys/devices/virtual/dmi/id/sys_vendor",
+                "Intel(R) Client Systems\n",
+                FilePerms::default(),
+            );
+        let f = HardwareFacts.collect(&cx(&sys)).await.unwrap();
+        assert_eq!(f["model"], "NUC8i5BEH");
+        assert_eq!(f["vendor"], "Intel(R) Client Systems");
+        assert!(f["raspberry_pi"].is_null());
+    }
+
     #[tokio::test]
     async fn collects_the_documented_shape() {
         let sys = FakeSystem::new()
@@ -314,6 +487,7 @@ shm                  65536        0     65536       0% /dev/shm
             .on_command_ok("df", &["-P", "-k", "-T"], DF_T);
         let f = HardwareFacts.collect(&cx(&sys)).await.unwrap();
         assert_eq!(f["arch"], "x86_64");
+        assert!(f["model"].is_null() && f["vendor"].is_null() && f["raspberry_pi"].is_null());
         assert_eq!(f["cpus"], 4);
         assert_eq!(f["mem"]["total_mb"], 3931);
         assert_eq!(f["swap"]["total_mb"], 1023);

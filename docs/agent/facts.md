@@ -47,6 +47,10 @@ cloud, no Tailscale) is a normal value: `host.facts.cloud.provider == "oci"` is 
 | Key | Example | Notes |
 |---|---|---|
 | `arch` | `aarch64` | As `uname -m` reports it: `x86_64`, `aarch64`, `armv7l`. |
+| `model` | `Raspberry Pi 5 Model B Rev 1.0` | The device tree's `model` on ARM boards, else DMI `product_name` (`NUC8i5BEH`, `Virtual Machine`); `null` where neither exists. |
+| `vendor` | `Raspberry Pi` | DMI `sys_vendor`, or `Raspberry Pi` when the model says so. |
+| `raspberry_pi.version` | `5` | The board generation parsed from `model`: `4`, `5`, `400`, `0` for the Zero family. `raspberry_pi` is `null` on anything that is not a Pi, so `host.facts.hardware.raspberry_pi.version != null` selects every Pi. |
+| `raspberry_pi.model`, `.compute_module`, `.revision` | `Model B`, `false`, `1.0` | The rest of the name, whether it is a Compute Module, and the board revision. |
 | `cpus` | `4` | |
 | `mem.total_mb` | `8192` | |
 | `swap.total_mb` | `0` | |

@@ -64,6 +64,35 @@ Templates can read `host`, `vars` and `secrets`; a new file whose render used a 
 
 <KindReference registry="tasks" kind="file.template" />
 
+## file.tree
+
+Copy a directory of files from the module's `files/`, as one resource with a diff per file. Files
+Buckle wrote are its own: one dropped from the module is deleted on the next apply (or left, and
+reported, if it was edited by hand since), and directories it created go once they are empty.
+
+```yaml
+- file.tree:
+    src: compose                 # files/compose/** → /opt/compose/**
+    dest: /opt/compose
+    mode: "0640"
+    dir_mode: "0750"
+    group: docker
+    templates: true              # *.j2 files are rendered (secret-aware) and lose the suffix
+    exclude: ["*.md"]
+  notify: [compose-up]
+```
+
+```yaml
+# Own the whole directory: anything else in it (except `exclude` matches) is deleted.
+- file.tree: { src: dashboards, dest: /var/lib/grafana/dashboards, purge: true }
+```
+
+<KindReference registry="tasks" kind="file.tree" />
+
+A file already on the host with the same content is adopted, not owned, so it is never deleted.
+Deletions show in the plan's diff but do not make the plan destructive for `approval:
+if_destructive`.
+
 ## file.directory
 
 Ensure a directory exists, creating missing parents.
@@ -173,13 +202,13 @@ tasks:
         - dtoverlay=rpi-poe-plus
         - dtoverlay=pps-gpio,gpiopin=18
       absent: [dtoverlay=vc4-kms-v3d]      # also matches dtoverlay=vc4-kms-v3d,cma-512
-    when: 'host.groups contains "raspberry-pi"'
+    when: 'host.facts.hardware.raspberry_pi.version != null'
     notify: [reboot]
   - file.ini:
       path: /boot/firmware/config.txt
       section: pi5
       settings: { pciex1_gen: 3 }
-    when: 'host.groups contains "raspberry-pi"'
+    when: 'host.facts.hardware.raspberry_pi.version != null'
     notify: [reboot]
 
 handlers:
@@ -217,7 +246,7 @@ the quoted value of an assignment such as `GRUB_CMDLINE_LINUX` in `/etc/default/
     path: /boot/firmware/cmdline.txt
     present: [cgroup_enable=cpuset, cgroup_enable=memory, cgroup_memory=1]
     absent: [console=serial0]              # also matches console=serial0,115200
-  when: 'host.groups contains "raspberry-pi"'
+  when: 'host.facts.hardware.raspberry_pi.version != null'
   notify: [reboot]
 ```
 

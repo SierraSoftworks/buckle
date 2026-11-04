@@ -48,6 +48,18 @@ counts as a change, which is what fires handlers. `unless` and `only_if` also ru
 ```
 
 ```yaml
+# Run as another account: a dotfiles installer that writes into the login user's home.
+# `runuser` (util-linux) does the switch on Linux, `sudo -u` on macOS; HOME, USER and
+# SHELL are the account's own, and `env` is passed through.
+- command.run:
+    run: ["bash", "install.sh", "--yes"]
+    cwd: '/home/{{ vars.login_user }}/.dotfiles'
+    user: '{{ vars.login_user }}'
+    changed_when: "output_contains:Installed"
+  id: dotfiles-install
+```
+
+```yaml
 # Something with an inverse: give it an explicit id and a `remove` command.
 - command.run:
     run: ["docker", "network", "create", "edge"]
@@ -59,7 +71,8 @@ counts as a change, which is what fires handlers. `unless` and `only_if` also ru
 <KindReference registry="tasks" kind="command.run" />
 
 `run`, `unless`, `only_if` and `remove` are an argv list (run directly) or a string (run with
-`sh -c`). Use a string for a probe whose tool may not be installed yet, so a missing program is a
+`sh -c`). With `user`, all four run as that account; the step is blocked while `runuser` is
+missing. Use a string for a probe whose tool may not be installed yet, so a missing program is a
 non-zero exit rather than an error.
 
 A `command.run` is identified by its rendered command, so changing a variable inside `run` looks
