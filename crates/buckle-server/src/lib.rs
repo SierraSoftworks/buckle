@@ -69,6 +69,16 @@ pub struct Hooks {
     /// holds it for writing changes the directory without a scan seeing the
     /// change half done.
     pub source_lock: Option<std::sync::Arc<tokio::sync::RwLock<()>>>,
+    /// Told the addresses the listeners bound, so `listen` may name port 0
+    /// and nobody has to pick a free port and race others for it.
+    pub listening: Option<Arc<tokio::sync::watch::Sender<Option<Listening>>>>,
+}
+
+/// The addresses the server's listeners are bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listening {
+    pub grpc: std::net::SocketAddr,
+    pub http: std::net::SocketAddr,
 }
 
 /// [`run`] with `hooks`.
@@ -225,7 +235,8 @@ pub async fn run_with(
                 &["Check listen.grpc in server.yaml; another process may hold the port."],
             )
         })?;
-    tracing::info!(address = %config.listen.grpc, "listening for agents");
+    let grpc_addr = grpc_listener.local_addr().to_human_error()?;
+    tracing::info!(address = %grpc_addr, "listening for agents");
     let grpc_task = tokio::spawn(grpc::serve(fleet, grpc_listener, identity, cancel.clone()));
 
     let http_listener = std::net::TcpListener::bind(&config.listen.http).map_err(|e| {
@@ -235,7 +246,8 @@ pub async fn run_with(
             &["Check listen.http in server.yaml; another process may hold the port."],
         )
     })?;
-    tracing::info!(address = %config.listen.http, "serving the API and UI");
+    let http_addr = http_listener.local_addr().to_human_error()?;
+    tracing::info!(address = %http_addr, "serving the API and UI");
     let mut state = web::AppState::new(
         store,
         revisions,
@@ -252,6 +264,12 @@ pub async fn run_with(
     state.trace_url_template = config.telemetry.trace_url_template.clone();
     state.identity = Some(issuer);
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
+    if let Some(listening) = &hooks.listening {
+        listening.send_replace(Some(Listening {
+            grpc: grpc_addr,
+            http: http_addr,
+        }));
+    }
 
     let mut failed = false;
     tokio::select! {
@@ -284,16 +302,10 @@ mod tests {
         let source = dir.path().join("cfg");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("buckle.yaml"), "version: 2\n").unwrap();
-        let grpc = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let http = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        // Port 0: the server reports what it bound, so no other test can
+        // take a port between it being picked and the server binding it.
         let yaml = format!(
-            "listen: {{ grpc: \"{grpc}\", http: \"{http}\", tls: {{ mode: auto }} }}\ndata_dir: {}\nsource: {{ path: {} }}\nagents: {{ auth: [token], bootstrap_token: boot }}\n",
+            "listen: {{ grpc: \"127.0.0.1:0\", http: \"127.0.0.1:0\", tls: {{ mode: auto }} }}\ndata_dir: {}\nsource: {{ path: {} }}\nagents: {{ auth: [token], bootstrap_token: boot }}\n",
             dir.path().join("data").display(),
             source.display()
         );
@@ -302,7 +314,21 @@ mod tests {
             .unwrap()
             .expect("auto TLS has a fingerprint");
         let shutdown = CancellationToken::new();
-        let server = tokio::spawn(run(config.clone(), shutdown.clone()));
+        let (listening, mut bound) = tokio::sync::watch::channel(None);
+        let hooks = Hooks {
+            listening: Some(Arc::new(listening)),
+            ..Default::default()
+        };
+        let server = tokio::spawn(run_with(config.clone(), shutdown.clone(), hooks));
+        let http = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            bound.wait_for(Option::is_some),
+        )
+        .await
+        .expect("the server binds its listeners")
+        .expect("the server is running")
+        .expect("addresses are sent")
+        .http;
         let url = format!("http://{http}/robots.txt");
         let mut ok = false;
         for _ in 0..100 {
