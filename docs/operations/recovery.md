@@ -60,7 +60,7 @@ A revision that completed is stable, so there is no rollout left to roll back. E
 
 - **Push a revert** (preferred). The fix goes through the same phases, approvals and bakes, and Git
   stays the record of what the fleet should be.
-- **Roll the fleet back** from **Rollouts**: **Rollback** on an older valid
+- **Roll the fleet back** from **Rollouts**: **Rollback…** on an older valid
   revision starts a rollout of it, typed confirmation first. Every gate, approval and bake still
   applies.
 

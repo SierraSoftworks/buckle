@@ -180,7 +180,7 @@ const SHOTS = [
   {
     name: "rollouts-rollback",
     path: "/rollouts",
-    setup: (p) => p.getByRole("button", { name: "Rollback", exact: true }).first().click(),
+    setup: (p) => p.getByRole("button", { name: "Rollback…", exact: true }).first().click(),
     target: dialog,
   },
   {

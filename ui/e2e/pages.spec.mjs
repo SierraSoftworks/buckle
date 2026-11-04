@@ -70,13 +70,15 @@ describe("every page renders in demo mode", () => {
     assert.match(await items.first().textContent(), /support bundle/);
     // One control per card: [Running] for the rollout in progress, [Stable] for
     // the release the fleet is on, an orange Rollback for every older one, and
-    // nothing for a rejected commit.
+    // [Corrupt] for a rejected commit, which cannot be deployed.
     assert.equal(await items.first().locator(".marker", { hasText: "Running" }).count(), 1);
     assert.equal(await page.locator(".marker", { hasText: "Stable" }).count(), 1);
     const stable = page.locator(".gitlog__item--stable");
     assert.equal(await stable.locator(".marker", { hasText: "Stable" }).count(), 1);
-    assert.equal(await page.getByRole("button", { name: "Rollback", exact: true }).count(), 5);
-    assert.equal(await page.locator(".gitlog__item--rejected .commit__aside .btn, .gitlog__item--rejected .marker").count(), 0);
+    assert.equal(await page.getByRole("button", { name: "Rollback…", exact: true }).count(), 5);
+    const rejected = page.locator(".gitlog__item--rejected");
+    assert.equal(await rejected.locator(".marker", { hasText: "Corrupt" }).count(), 1);
+    assert.equal(await rejected.locator(".commit__aside .btn").count(), 0);
     // A skipped rollout links to the newer one that superseded it.
     const skipped = items.filter({ hasText: "superseded by" });
     assert.match(await skipped.textContent(), /skipped/);
@@ -93,7 +95,7 @@ describe("every page renders in demo mode", () => {
 
   test("a proposed rollout that needs approval offers Review", async () => {
     const { page, close } = await open("/rollouts", { flags: "awaiting" });
-    const review = page.locator(".gitlog__item").first().getByRole("link", { name: "Review" });
+    const review = page.locator(".gitlog__item").first().getByRole("link", { name: "Review…" });
     await review.waitFor();
     assert.equal(await page.locator(".marker", { hasText: "Running" }).count(), 0);
     await review.click();
@@ -153,7 +155,7 @@ describe("every page renders in demo mode", () => {
     await rejected.waitFor();
     assert.match(await rejected.textContent(), /unknown field `tag`/);
     // A rejected commit offers nothing to do; an older valid one offers a rollback.
-    await page.getByRole("button", { name: "Rollback", exact: true }).first().waitFor();
+    await page.getByRole("button", { name: "Rollback…", exact: true }).first().waitFor();
     // A valid commit carries a check; the commit card itself opens its rollout.
     const rolled = page.locator(".gitlog__item", { has: page.locator(".commit--link") }).first();
     await rolled.locator('.commit__status[aria-label="valid"]').waitFor();
@@ -165,7 +167,7 @@ describe("every page renders in demo mode", () => {
 
   test("the overview keeps the running rollout while a newer one waits behind it", async () => {
     const { page, close } = await open("/rollouts");
-    await page.getByRole("button", { name: "Rollback", exact: true }).first().click();
+    await page.getByRole("button", { name: "Rollback…", exact: true }).first().click();
     const dialog = page.getByRole("dialog", { name: /Roll the fleet back/ });
     const typed = (await dialog.getByRole("button", { name: /Roll back to/ }).textContent()).replace("Roll back to", "").trim();
     await dialog.getByRole("textbox", { name: /Type/ }).fill(typed);

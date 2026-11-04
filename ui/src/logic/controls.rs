@@ -11,6 +11,8 @@ use super::tone::{rollout_active, rollout_finished};
 /// to the right of the commit hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stance {
+    /// Rejected by validation: it cannot be deployed.
+    Corrupt,
     /// The release the fleet is on.
     Stable,
     /// Older than the stable release: roll the fleet back to it.
@@ -24,14 +26,14 @@ pub enum Stance {
 }
 
 /// The stance of `rev` given its `rollout` and the creation time of the
-/// stable revision (`stable_at`). A rejected revision has none.
+/// stable revision (`stable_at`).
 pub fn stance(
     rev: &RevisionSummary,
     rollout: Option<&RolloutSummary>,
     stable_at: Option<DateTime<Utc>>,
 ) -> Option<Stance> {
     if rev.status == RevisionStatus::Rejected {
-        return None;
+        return Some(Stance::Corrupt);
     }
     if rev.is_stable {
         return Some(Stance::Stable);
@@ -192,8 +194,8 @@ mod tests {
                 Some(Stance::Start),
             ),
             (revision(false, 1, Valid), Some(Detected), None),
-            (revision(false, 1, Rejected), None, None),
-            (revision(false, 5, Rejected), None, None),
+            (revision(false, 1, Rejected), None, Some(Stance::Corrupt)),
+            (revision(false, 5, Rejected), None, Some(Stance::Corrupt)),
         ];
         for (rev, state, want) in cases {
             let r = state.map(rollout);

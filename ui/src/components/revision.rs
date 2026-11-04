@@ -153,7 +153,8 @@ pub struct RevisionControlsProps {
 }
 
 /// The rollout controls of a revision card: [Stable] for the current stable
-/// release, an orange Rollback for an older one, a blue Review for a
+/// release, a red [Corrupt] for a revision that failed validation, an orange
+/// Rollback for an older one, a blue Review for a
 /// proposed rollout awaiting approval, and a blue [Running] marker for a
 /// rollout in progress that needs nothing. A newer revision nobody has
 /// rolled out gets a Start button.
@@ -168,6 +169,9 @@ pub fn revision_controls(props: &RevisionControlsProps) -> Html {
     };
     match stance(rev, props.rollout.as_ref(), props.stable_at) {
         None => html! {},
+        Some(Stance::Corrupt) => html! {
+            <span class="marker tone-danger" title="Rejected by validation: this revision cannot be deployed">{ "Corrupt" }</span>
+        },
         Some(Stance::Stable) => html! {
             <span class="marker tone-ok" title="The release the fleet is on">{ "Stable" }</span>
         },
@@ -177,13 +181,13 @@ pub fn revision_controls(props: &RevisionControlsProps) -> Html {
         Some(Stance::Review) => match &props.rollout {
             Some(r) => html! {
                 <RouteLink to={Route::rollout(&r.id)} classes="btn btn--small btn--info"
-                    title="This rollout is waiting for an approval">{ "Review" }</RouteLink>
+                    title="This rollout is waiting for an approval">{ "Review…" }</RouteLink>
             },
             None => html! {},
         },
         Some(Stance::Rollback) if admin => html! {
             <Button small=true kind={Kind::Caution} title="Roll the fleet back to this revision"
-                onclick={ask(RevisionAsk::RollBack(rev.clone()))}>{ "Rollback" }</Button>
+                onclick={ask(RevisionAsk::RollBack(rev.clone()))}>{ "Rollback…" }</Button>
         },
         Some(Stance::Start) if admin => html! {
             <Button small=true onclick={ask(RevisionAsk::Start(rev.clone()))}>{ "Start rollout…" }</Button>
