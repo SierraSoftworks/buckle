@@ -28,6 +28,9 @@ pub struct ErrorBlockProps {
     /// Tighter, for a table cell.
     #[prop_or_default]
     pub compact: bool,
+    /// What can be done about it (buttons), at the foot of the block.
+    #[prop_or_default]
+    pub children: Html,
 }
 
 #[function_component(ErrorBlock)]
@@ -66,12 +69,14 @@ pub fn error_block(props: &ErrorBlockProps) -> Html {
                         </ul>
                     </div>
                 }
+                { props.children.clone() }
             </div>
         },
         (None, Some(raw)) if !raw.trim().is_empty() => html! {
             <div class={classes!(base, "error-block--raw")} data-testid="error-block">
                 { context.unwrap_or_default() }
                 <pre class="error-block__raw">{ secret_text(raw) }</pre>
+                { props.children.clone() }
             </div>
         },
         _ => html! {},

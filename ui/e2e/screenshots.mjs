@@ -140,8 +140,8 @@ const SHOTS = [
     },
     target: (p) => [
       p.locator("tr", { has: p.getByRole("link", { name: "pi-5", exact: true }) }),
-      // Down to its recovery actions, above the run report.
-      p.getByRole("button", { name: "Skip…" }),
+      // Down to its error and the re-plan on it, above the run report.
+      p.getByTestId("host-replan"),
     ],
     pad: 8,
   },
@@ -149,8 +149,8 @@ const SHOTS = [
     name: "rollout-waive",
     path: "/rollouts/42",
     setup: async (p) => {
-      await p.getByRole("button", { name: "Details for pi-5" }).click();
-      await p.getByRole("button", { name: "Continue with checks waived…" }).click();
+      await p.getByRole("button", { name: "Actions for pi-5" }).click();
+      await p.getByRole("menuitem", { name: "Continue with checks waived…" }).click();
       await dialog(p).getByRole("checkbox").check();
     },
     target: dialog,

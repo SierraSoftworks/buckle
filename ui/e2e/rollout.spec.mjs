@@ -223,16 +223,47 @@ describe("approving a phase", () => {
     const { face, menu } = await decisions(page);
     assert.equal(face, "Approve cloud…", "the approval waited on is the face");
     assert.ok(!menu.includes("Reject…"));
-    for (const want of ["Pause", "Roll back…", "Abort…"]) assert.ok(menu.includes(want), want);
+    for (const want of ["Pause", "Retry", "Skip bake period…", "Roll back…", "Abort…"]) assert.ok(menu.includes(want), want);
+    await close();
+  });
+
+  test("a failed host is re-planned from its error", async () => {
+    const { page, close } = await open("/rollouts/42");
+    await page.getByRole("button", { name: "Details for pi-5" }).click();
+    await page.getByTestId("host-replan").getByRole("button", { name: "Re-plan", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "pi-5: retry sent." }).waitFor();
+    assert.equal(await page.getByTestId("host-replan").count(), 0, "a re-planned host has no error to act on");
+    await close();
+  });
+
+  test("a baking host's bake can be skipped from its row's menu", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-3", exact: true }) });
+    await row.getByRole("button", { name: "Actions for pi-3" }).click();
+    await row.getByRole("menuitem", { name: "Skip bake period…" }).click();
+    await page.getByRole("dialog", { name: "Skip the bake of pi-3" }).getByRole("button", { name: "Skip bake period" }).click();
+    await page.getByRole("status").filter({ hasText: "pi-3: skip-bake sent." }).waitFor();
+    await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-3"]').getAttribute("data-state"), "healthy"));
+    await close();
+  });
+
+  test("retrying a paused rollout re-plans its failed hosts", async () => {
+    const { page, close } = await open("/rollouts/42");
+    await decide(page, "Pause");
+    await page.getByRole("dialog", { name: "Pause rollout #42" }).getByRole("button", { name: "Pause rollout" }).click();
+    await decide(page, "Retry");
+    const dialog = page.getByRole("dialog", { name: "Retry rollout #42" });
+    assert.match(await dialog.textContent(), /pi-5/);
+    await dialog.getByRole("button", { name: "Retry" }).click();
+    await page.locator(".page-head .pill", { hasText: "rolling" }).waitFor();
     await close();
   });
 
   test("a failed host can continue with its failing checks waived", async () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });
-    await row.getByRole("button", { name: "Details for pi-5" }).click();
-    await page.getByTestId("host-ticker").waitFor();
-    await page.getByRole("button", { name: "Continue with checks waived…" }).click();
+    await row.getByRole("button", { name: "Actions for pi-5" }).click();
+    await row.getByRole("menuitem", { name: "Continue with checks waived…" }).click();
     const dialog = page.getByRole("dialog", { name: "Continue pi-5 with checks waived" });
     await dialog.getByRole("checkbox").check();
     await dialog.getByRole("button", { name: "Waive 1 check and continue" }).click();

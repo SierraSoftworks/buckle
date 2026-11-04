@@ -42,9 +42,12 @@ describe("every page renders in demo mode", () => {
     await page.getByRole("status").filter({ hasText: "Approved cloud: 2 plans bound." }).waitFor();
     await decide(page, "Pause");
     await page.getByRole("dialog", { name: "Pause rollout #42" }).getByRole("button", { name: "Pause rollout" }).click();
+    // Paused with a failed host: retrying it is the face, resuming past
+    // it is skipping the phase.
     await eventually(async () => {
       const { face, menu } = await decisions(page);
-      assert.ok([face, ...menu].includes("Resume"));
+      assert.equal(face, "Retry");
+      assert.ok(menu.includes("Skip this phase…"));
     });
     await close();
   });

@@ -130,6 +130,18 @@ pub enum Command {
         host: String,
         note: String,
     },
+    /// Re-plan and re-apply every failed host of the rollout.
+    RetryFailed {
+        rollout: String,
+        note: String,
+    },
+    /// End the bake of a baking host (`host`), or of every baking host,
+    /// now: it counts as baked.
+    SkipBake {
+        rollout: String,
+        host: Option<String>,
+        note: String,
+    },
     /// Exclude a host from the rollout.
     Skip {
         rollout: String,
@@ -167,6 +179,9 @@ impl Command {
             Command::Rollback { .. } => "rollout.rollback",
             Command::Abort { .. } => "rollout.abort",
             Command::Retry { .. } => "rollout.host.retry",
+            Command::RetryFailed { .. } => "rollout.retry",
+            Command::SkipBake { host: None, .. } => "rollout.skip_bake",
+            Command::SkipBake { host: Some(_), .. } => "rollout.host.skip_bake",
             Command::Skip { .. } => "rollout.host.skip",
             Command::Continue { .. } => "rollout.host.continue",
             Command::Force { .. } => "rollout.host.force",
@@ -2262,6 +2277,51 @@ impl Controller {
                 self.replan(ri, hi, actor);
                 Ok(rollout)
             }
+            Command::RetryFailed { rollout, note } => {
+                let ri = self.find_rollout(&rollout)?;
+                let record = &self.live[ri].record;
+                if (record.is_terminal() && !record.runtime.stragglers_open)
+                    || record.state == RolloutState::RollingBack
+                {
+                    return Err(CommandError::conflict(
+                        "This rollout cannot retry its hosts in its current state.",
+                        &["Only a running or paused rollout retries its failed hosts."],
+                    ));
+                }
+                let failed: Vec<usize> = (0..self.live[ri].hosts.len())
+                    .filter(|&i| self.live[ri].hosts[i].state == HostPhase::Failed)
+                    .collect();
+                if failed.is_empty() {
+                    return Err(CommandError::conflict(
+                        "No host in this rollout has failed, so there is nothing to retry.",
+                        &[],
+                    ));
+                }
+                let names: Vec<String> = failed
+                    .iter()
+                    .map(|&i| self.live[ri].hosts[i].host.clone())
+                    .collect();
+                self.command_audit(
+                    actor,
+                    "rollout.retry",
+                    ri,
+                    format!(
+                        "{actor} retried {} failed host(s): {}. {note}",
+                        names.len(),
+                        names.join(", ")
+                    ),
+                    serde_json::json!({"hosts": names, "note": note}),
+                );
+                for hi in failed {
+                    self.replan(ri, hi, actor);
+                }
+                Ok(rollout)
+            }
+            Command::SkipBake {
+                rollout,
+                host,
+                note,
+            } => self.skip_bake(actor, rollout, host, note),
             Command::Continue {
                 rollout,
                 host,
@@ -2454,6 +2514,91 @@ impl Controller {
                 Ok(rollout)
             }
         }
+    }
+
+    /// Ends the bake of `host` (or of every baking row) now, as if its
+    /// window had passed: a row whose checks are failing keeps baking, so
+    /// that skipping a bake never passes a regression.
+    fn skip_bake(
+        &mut self,
+        actor: &str,
+        rollout: String,
+        host: Option<String>,
+        note: String,
+    ) -> Result<String, CommandError> {
+        let ri = self.find_rollout(&rollout)?;
+        let record = &self.live[ri].record;
+        if (record.is_terminal() && !record.runtime.stragglers_open)
+            || record.state == RolloutState::RollingBack
+        {
+            return Err(CommandError::conflict(
+                "This rollout cannot skip a bake in its current state.",
+                &[],
+            ));
+        }
+        let rows: Vec<usize> = match &host {
+            Some(name) => {
+                let hi = self.find_host(ri, name)?;
+                if self.live[ri].hosts[hi].state != HostPhase::Baking {
+                    return Err(CommandError::conflict(
+                        format!("Host '{name}' is not baking, so there is no bake to skip."),
+                        &[],
+                    ));
+                }
+                vec![hi]
+            }
+            None => (0..self.live[ri].hosts.len())
+                .filter(|&i| self.live[ri].hosts[i].state == HostPhase::Baking)
+                .collect(),
+        };
+        if rows.is_empty() {
+            return Err(CommandError::conflict(
+                "No host in this rollout is baking, so there is no bake to skip.",
+                &[],
+            ));
+        }
+        let (failing, clear): (Vec<usize>, Vec<usize>) = rows
+            .into_iter()
+            .partition(|&i| !self.live[ri].hosts[i].runtime.failing_since.is_empty());
+        let names = |rows: &[usize]| -> Vec<String> {
+            rows.iter()
+                .map(|&i| self.live[ri].hosts[i].host.clone())
+                .collect()
+        };
+        let (skipped, kept) = (names(&clear), names(&failing));
+        if skipped.is_empty() {
+            return Err(CommandError::conflict(
+                format!(
+                    "{} {} failing checks, so the bake cannot be skipped.",
+                    kept.join(", "),
+                    if kept.len() == 1 { "has" } else { "have" }
+                ),
+                &["Wait for the checks to pass, or retry or skip the host."],
+            ));
+        }
+        let (action, subject) = match &host {
+            Some(h) => ("rollout.host.skip_bake", h.clone()),
+            None => (
+                "rollout.skip_bake",
+                format!("{} host(s): {}", skipped.len(), skipped.join(", ")),
+            ),
+        };
+        let kept_note = if kept.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} still baking: failing checks)", kept.join(", "))
+        };
+        self.command_audit(
+            actor,
+            action,
+            ri,
+            format!("{actor} skipped the bake of {subject}{kept_note}. {note}"),
+            serde_json::json!({"hosts": skipped, "failing": kept, "note": note}),
+        );
+        for hi in clear {
+            self.finish_step(ri, hi);
+        }
+        Ok(rollout)
     }
 
     async fn approve(

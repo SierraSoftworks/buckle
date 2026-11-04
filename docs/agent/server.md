@@ -315,7 +315,8 @@ session cookie or behind the same ACLs. Useful endpoints:
 |---|---|
 | `GET /api/v1/fleet` | Every host with its status, health and applied revision. |
 | `GET /api/v1/rollouts`, `GET /api/v1/rollouts/{id}` | Rollouts with their phases, hosts and timeline. |
-| `POST /api/v1/rollouts/{id}/approve` and `…/pause`, `…/resume`, `…/rollback`, `…/abort` | Rollout decisions (admin, CSRF-protected, audited). |
+| `POST /api/v1/rollouts/{id}/approve` and `…/pause`, `…/resume`, `…/retry`, `…/skip-bake`, `…/rollback`, `…/abort` | Rollout decisions (admin, CSRF-protected, audited). |
+| `POST /api/v1/rollouts/{id}/hosts/{host}/retry`, `…/skip-bake`, `…/force`, `…/skip`, `…/continue` | Host decisions within a rollout (admin, CSRF-protected, audited). |
 | `GET /api/v1/catalog` | The task kinds, fact providers and health checks this server knows, with their JSON schemas. |
 | `GET /api/v1/events` | Server-sent events for live updates. |
 | `POST /api/v1/webhooks/source` | Git push notifications. |

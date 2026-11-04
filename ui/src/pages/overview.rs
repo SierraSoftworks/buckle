@@ -88,7 +88,7 @@ pub fn overview() -> Html {
                     subtitle={rollout_live.as_ref().map(|d| AttrValue::from(format!("Rollout {} · {} · started {}",
                         rollout_label(&d.summary.id), d.summary.triggered_by, relative(d.summary.started_at, now))))}
                     actions={rollout_live.as_ref().filter(|_| auth.is_admin())
-                        .map(|d| controls(&d.summary, approvable(d, &plan_groups).as_deref(), &actions.open))
+                        .map(|d| controls(d, approvable(d, &plan_groups).as_deref(), &actions.open))
                         .unwrap_or_default()}>
                     { match (&rollout_live, &rollout.error) {
                         (Some(d), _) => latest(d, revisions_live.as_deref().unwrap_or(&[]), now),

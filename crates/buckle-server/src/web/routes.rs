@@ -1604,6 +1604,12 @@ async fn rollout_action(
     let command = match action.as_str() {
         "pause" => Command::Pause { rollout, note },
         "resume" => Command::Resume { rollout, note },
+        "retry" => Command::RetryFailed { rollout, note },
+        "skip-bake" => Command::SkipBake {
+            rollout,
+            host: None,
+            note,
+        },
         "rollback" => Command::Rollback { rollout, note },
         "abort" => Command::Abort { rollout, note },
         _ => {
@@ -1640,6 +1646,11 @@ async fn rollout_host_action(
         "force" => Command::Force {
             rollout,
             host,
+            note,
+        },
+        "skip-bake" => Command::SkipBake {
+            rollout,
+            host: Some(host),
             note,
         },
         _ => return Err(ApiError::not_found(format!("No host action '{action}'."))),

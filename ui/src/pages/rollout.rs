@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use buckle_api::{
     ApproveRequest, ContinueRequest, FleetPlan, HostRolloutState, HostSummary, LiveEvent,
     PlanGroup, RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
-    RolloutSummary,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -20,12 +19,12 @@ use crate::components::icons;
 use crate::components::meter::stage_segments;
 use crate::components::ui::Copyable;
 use crate::components::{
-    Button, Changes, Commit, CommitCard, Confirm, Countdown, Empty, ErrorBlock, ErrorState,
-    HostLink, HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill, Pipeline, PlanViews,
-    Refresh, RouteLink, RunReportView, SplitButton, TraceLink, use_toast,
+    ActionMenu, Button, Changes, Commit, CommitCard, Confirm, Countdown, Empty, ErrorBlock,
+    ErrorState, HostLink, HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill,
+    Pipeline, PlanViews, Refresh, RouteLink, RunReportView, SplitButton, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
-use crate::logic::controls::{Decision, decisions};
+use crate::logic::controls::{Decision, Standing, decisions};
 use crate::logic::fleet_plan::fleet_tally;
 use crate::logic::format::{count, relative, rollout_label, short, since, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
@@ -56,6 +55,7 @@ pub(crate) enum Ask {
     /// Confirmed: the phase and exactly the digests the dialog showed.
     Bind(String, Vec<String>),
     Reject,
+    /// A rollout action (the API's), or `skip-phase`: resuming past failures.
     Action(&'static str),
     Host(&'static str, String),
     Continue(String, Vec<String>),
@@ -237,7 +237,7 @@ pub fn rollout_page(props: &Props) -> Html {
 
     let head_actions = html! { <>
         <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
-        if admin { { controls(s, focused.filter(|p| !scope_of(p, &plan_groups).digests.is_empty()).map(|p| p.name.as_str()), &open) } }
+        if admin { { controls(&d, focused.filter(|p| !scope_of(p, &plan_groups).digests.is_empty()).map(|p| p.name.as_str()), &open) } }
     </> };
 
     let approval = match focused {
@@ -256,7 +256,11 @@ pub fn rollout_page(props: &Props) -> Html {
                 <div class={classes!("banner", if s.state == RolloutState::Paused { "banner--warn" } else { "banner--info" })} role="status">
                     <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
                     if admin && s.state == RolloutState::Paused {
-                        <span class="muted">{ " Retry, continue or skip the failed host below, or resume, roll back or abort the rollout." }</span>
+                        <span class="muted">{ if failed(&d).is_empty() {
+                            " Resume, roll back or abort the rollout."
+                        } else {
+                            " Retry the failed hosts once their cause is fixed, act on each from its row's menu, or skip this phase, roll back or abort the rollout."
+                        } }</span>
                     }
                 </div>
             }
@@ -271,7 +275,7 @@ pub fn rollout_page(props: &Props) -> Html {
             </Panel>
             { approval }
             <Panel title="Hosts" subtitle="By stage. Click a row for the host's way through this rollout and its run report; hover a name for the host">
-                <HostTable detail={d.clone()} plans={plan_groups.clone()} admin={admin && !finished} on_ask={open.clone()} {activity} {hosts} {now} />
+                <HostTable detail={d.clone()} plans={plan_groups.clone()} admin={admin && !finished} on_ask={open.clone()} on_run={actions.now.clone()} {activity} {hosts} {now} />
             </Panel>
             <Panel title="Timeline" subtitle="Rollout and phase transitions">
                 { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), s.started_at) }
@@ -289,6 +293,8 @@ pub(crate) struct RolloutActions {
     busy: bool,
     error: Option<String>,
     pub open: Callback<Ask>,
+    /// Runs a decision at once, without a dialog (a re-plan from an error).
+    pub now: Callback<Ask>,
     close: Callback<()>,
     run: Callback<(Ask, String)>,
 }
@@ -333,7 +339,9 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
         let ask = ask.clone();
         Callback::from(move |_| ask.set(None))
     };
-    let run = {
+    // `in_dialog`: the decision was confirmed in a dialog, which shows how
+    // it failed; otherwise a toast does.
+    let send = {
         let (busy, error, ask, set, toast) = (
             busy.clone(),
             error.clone(),
@@ -342,7 +350,7 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
             toast.clone(),
         );
         let id = id.clone();
-        Callback::from(move |(what, note): (Ask, String)| {
+        Callback::from(move |(what, note, in_dialog): (Ask, String, bool)| {
             let (busy, error, ask, set, toast, id) = (
                 busy.clone(),
                 error.clone(),
@@ -376,7 +384,16 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
                         format!("Rollout {label} rejected."),
                     ),
                     Ask::Action(action) => (
-                        api::rollout_action(&id, action, &note).await,
+                        api::rollout_action(
+                            &id,
+                            if *action == "skip-phase" {
+                                "resume"
+                            } else {
+                                action
+                            },
+                            &note,
+                        )
+                        .await,
                         format!("Rollout {label}: {action} sent."),
                     ),
                     Ask::Host(action, host) => (
@@ -407,6 +424,8 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
                         let message = e.to_string();
                         if e.is_forbidden() {
                             toast.error(format!("Not permitted: {message}"));
+                        } else if !in_dialog {
+                            toast.error(message.clone());
                         }
                         error.set(Some(message));
                     }
@@ -415,11 +434,14 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
         })
     };
 
+    let run = send.reform(|(a, note): (Ask, String)| (a, note, true));
+    let now = send.reform(|a: Ask| (a, String::new(), false));
     RolloutActions {
         ask: (*ask).clone(),
         busy: *busy,
         error: (*error).clone(),
         open,
+        now,
         close,
         run,
     }
@@ -427,10 +449,18 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
 
 /// The rollout-wide decisions for its state as one split button: approve
 /// the phase waiting for it (`approve`, once it has plans to bind), else
-/// pause or resume, with reject, roll back and abort behind its menu.
-/// Nothing once it has finished.
-pub(crate) fn controls(s: &RolloutSummary, approve: Option<&str>, open: &Callback<Ask>) -> Html {
-    let Some(d) = decisions(s.state, approve) else {
+/// pause, retry or resume, with the rest behind its menu. Nothing once it
+/// has finished.
+pub(crate) fn controls(
+    detail: &RolloutDetail,
+    approve: Option<&str>,
+    open: &Callback<Ask>,
+) -> Html {
+    let standing = Standing {
+        failed: failed(detail).len(),
+        baking: baking(detail).len(),
+    };
+    let Some(d) = decisions(detail.summary.state, approve, standing) else {
         return html! {};
     };
     let ask = |d: &Decision| {
@@ -438,7 +468,7 @@ pub(crate) fn controls(s: &RolloutSummary, approve: Option<&str>, open: &Callbac
         Callback::from(move |_: MouseEvent| o.emit(a.clone()))
     };
     let kind = match &d.primary {
-        Decision::Approve(_) | Decision::Resume => Kind::Primary,
+        Decision::Approve(_) | Decision::Resume | Decision::Retry => Kind::Primary,
         p if p.destructive() => Kind::Danger,
         _ => Kind::Default,
     };
@@ -463,9 +493,31 @@ fn ask_for(d: &Decision) -> Ask {
         Decision::Reject => Ask::Reject,
         Decision::Pause => Ask::Action("pause"),
         Decision::Resume => Ask::Action("resume"),
+        Decision::Retry => Ask::Action("retry"),
+        Decision::SkipPhase => Ask::Action("skip-phase"),
+        Decision::SkipBake => Ask::Action("skip-bake"),
         Decision::Rollback => Ask::Action("rollback"),
         Decision::Abort => Ask::Action("abort"),
     }
+}
+
+/// The rollout's hosts in `state`, by name.
+fn hosts_in(d: &RolloutDetail, state: HostRolloutState) -> Vec<&str> {
+    d.phases
+        .iter()
+        .flat_map(|p| &p.hosts)
+        .filter(|h| h.state == state)
+        .map(|h| h.host.as_str())
+        .collect()
+}
+
+/// The failed hosts a rollout-wide retry re-plans.
+pub(crate) fn failed(d: &RolloutDetail) -> Vec<&str> {
+    hosts_in(d, HostRolloutState::Failed)
+}
+
+fn baking(d: &RolloutDetail) -> Vec<&str> {
+    hosts_in(d, HostRolloutState::Baking)
 }
 
 /// Phases an approval is wanted for: reached and waiting, or gated and not
@@ -496,6 +548,18 @@ fn can_force_apply(s: HostRolloutState) -> bool {
             | HostRolloutState::Planned
             | HostRolloutState::Failed
             | HostRolloutState::Healthy
+            | HostRolloutState::Skipped
+            | HostRolloutState::Pending
+    )
+}
+
+/// Whether a host in this state can be re-planned: it failed, was held,
+/// skipped or missed its phase.
+fn can_replan(s: HostRolloutState) -> bool {
+    matches!(
+        s,
+        HostRolloutState::Failed
+            | HostRolloutState::Held
             | HostRolloutState::Skipped
             | HostRolloutState::Pending
     )
@@ -696,9 +760,24 @@ fn dialog(
             </Confirm>
         },
         Ask::Action(action) => {
+            let (failed, baking) = (failed(d), baking(d));
+            let phase = d
+                .summary
+                .current_phase
+                .clone()
+                .unwrap_or_else(|| "the phase".into());
             let (title, label, danger, body, typed) = match *action {
                 "pause" => ("Pause", "Pause rollout", false, "Nothing new starts while paused; hosts mid-apply finish their apply.".to_string(), None),
                 "resume" => ("Resume", "Resume rollout", false, "The rollout carries on from where it paused.".to_string(), None),
+                "retry" => ("Retry", "Retry", false, format!(
+                    "Re-plans and re-applies {} ({}); the same checks apply, and a host whose plan changed asks for approval again. A rollout paused on these failures carries on once they are cleared.",
+                    count(failed.len(), "failed host", "failed hosts"), failed.join(", ")), None),
+                "skip-phase" => ("Skip this phase of", "Skip this phase", true, format!(
+                    "Accepts {} in {phase} as failures and carries on to the next phase without them. They stay failed in this rollout until retried from their rows.",
+                    count(failed.len(), "failed host", "failed hosts")), None),
+                "skip-bake" => ("Skip the bake of", "Skip bake period", true, format!(
+                    "Counts {} ({}) as baked now, without waiting out the rest of the bake window. A host whose checks are failing keeps baking.",
+                    count(baking.len(), "baking host", "baking hosts"), baking.join(", ")), None),
                 "rollback" => ("Roll back", "Roll back", true, format!(
                     "Applies the previous stable revision to every host this rollout updated ({}), newest phase first. Rolling back is applying, including removal of what this revision added; an irreversible task rolls back only as far as its kind can.",
                     count(updated(d), "host", "hosts")), Some(name.clone())),
@@ -714,9 +793,14 @@ fn dialog(
         Ask::Host(action, host) => {
             let (label, danger, body) = match *action {
                 "retry" => (
-                    "Retry",
+                    "Re-plan",
                     false,
                     "Re-plans and re-applies the host as it stands; the same checks apply.",
+                ),
+                "skip-bake" => (
+                    "Skip the bake of",
+                    true,
+                    "Counts the host as baked now, without waiting out the rest of its bake window. Refused while one of its checks is failing.",
                 ),
                 "force" => (
                     "Force apply",
@@ -729,8 +813,12 @@ fn dialog(
                     "Excludes the host from this rollout; it converges later as a straggler or with the next rollout.",
                 ),
             };
+            let confirm_label = match *action {
+                "skip-bake" => "Skip bake period".to_string(),
+                _ => format!("{label} {host}"),
+            };
             html! {
-                <Confirm title={format!("{label} {host}")} confirm_label={format!("{label} {host}")} {danger} note=true
+                <Confirm title={format!("{label} {host}")} {confirm_label} {danger} note=true
                     note_placeholder={if *action == "skip" { "Reason (recorded with the skip)" } else { "" }}
                     {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
                     <p>{ body }</p>
@@ -905,6 +993,8 @@ struct HostTableProps {
     plans: Vec<PlanGroup>,
     admin: bool,
     on_ask: Callback<Ask>,
+    /// Runs a decision without a dialog.
+    on_run: Callback<Ask>,
     /// The module and step each applying host is on.
     activity: BTreeMap<String, String>,
     /// The fleet's hosts, for each name's hover card.
@@ -1006,7 +1096,10 @@ fn host_table(props: &HostTableProps) -> Html {
                                     { for h.waived_checks.iter().map(|c| html! { <span class="badge mono" title="waived for this rollout">{ format!("waived {c}") }</span> }) }
                                 </td>
                                 <td title={timestamp(h.updated_at)}>{ relative(h.updated_at, props.now) }</td>
-                                <td>
+                                <td class="row-controls">
+                                    if props.admin {
+                                        <ActionMenu items={host_menu(h, &props.on_ask)} label={format!("Actions for {}", h.host)} testid="host-actions" />
+                                    }
                                     <button type="button" class="icon-btn row-toggle" onclick={toggle}
                                         aria-expanded={open.to_string()} aria-label={format!("Details for {}", h.host)}
                                         title={if open { "Hide details" } else { "Show details" }}>
@@ -1017,7 +1110,7 @@ fn host_table(props: &HostTableProps) -> Html {
                             if open {
                                 <tr class="table__detail" key={format!("{}-detail", h.host)}>
                                     <td colspan="7">
-                                        <HostDetailRow detail={props.detail.clone()} host={h.clone()} admin={props.admin} on_ask={props.on_ask.clone()} now={props.now} />
+                                        <HostDetailRow detail={props.detail.clone()} host={h.clone()} admin={props.admin} on_run={props.on_run.clone()} now={props.now} />
                                     </td>
                                 </tr>
                             }
@@ -1030,12 +1123,50 @@ fn host_table(props: &HostTableProps) -> Html {
     }
 }
 
+/// A host's own decisions, for the menu on its row.
+fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
+    let item = |label: &str, danger: bool, a: Ask| {
+        let on_ask = on_ask.clone();
+        MenuItem {
+            label: AttrValue::from(label.to_string()),
+            danger,
+            onclick: Callback::from(move |_: MouseEvent| on_ask.emit(a.clone())),
+        }
+    };
+    let host = || h.host.clone();
+    let mut items = Vec::new();
+    if can_replan(h.state) {
+        items.push(item("Re-plan…", false, Ask::Host("retry", host())));
+    }
+    if h.state == HostRolloutState::Failed && !h.failed_checks.is_empty() {
+        items.push(item(
+            "Continue with checks waived…",
+            false,
+            Ask::Continue(host(), h.failed_checks.clone()),
+        ));
+    }
+    if h.state == HostRolloutState::Baking {
+        items.push(item(
+            "Skip bake period…",
+            false,
+            Ask::Host("skip-bake", host()),
+        ));
+    }
+    if can_force_apply(h.state) {
+        items.push(item("Force apply…", true, Ask::Host("force", host())));
+    }
+    if !finished_state(h.state) {
+        items.push(item("Skip…", true, Ask::Host("skip", host())));
+    }
+    items
+}
+
 #[derive(Properties, PartialEq)]
 struct HostDetailRowProps {
     detail: RolloutDetail,
     host: RolloutHost,
     admin: bool,
-    on_ask: Callback<Ask>,
+    on_run: Callback<Ask>,
     now: DateTime<Utc>,
 }
 
@@ -1069,25 +1200,22 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         }),
         None,
     );
-    let ask = |a: Ask| {
-        let on_ask = props.on_ask.clone();
-        Callback::from(move |_: MouseEvent| on_ask.emit(a.clone()))
-    };
-    let actions = props.admin.then(|| html! {
-        <div class="row-actions">
-            if matches!(h.state, HostRolloutState::Failed | HostRolloutState::RolledBack) {
-                <Button small=true onclick={ask(Ask::Host("retry", h.host.clone()))}>{ "Retry" }</Button>
-            }
-            if h.state == HostRolloutState::Failed && !h.failed_checks.is_empty() {
-                <Button small=true onclick={ask(Ask::Continue(h.host.clone(), h.failed_checks.clone()))}>{ "Continue with checks waived…" }</Button>
-            }
-            if can_force_apply(h.state) {
-                <Button small=true kind={Kind::Danger} onclick={ask(Ask::Host("force", h.host.clone()))}>{ "Force apply…" }</Button>
-            }
-            if !finished_state(h.state) {
-                <Button small=true kind={Kind::Danger} onclick={ask(Ask::Host("skip", h.host.clone()))}>{ "Skip…" }</Button>
-            }
-        </div>
+    // A failed host is re-planned from its error: this one, or every failed
+    // host of the rollout at once.
+    let replan = (props.admin && h.state == HostRolloutState::Failed).then(|| {
+        let others = failed(&props.detail).len();
+        let run = |a: Ask| {
+            let on_run = props.on_run.clone();
+            Callback::from(move |_: MouseEvent| on_run.emit(a.clone()))
+        };
+        html! {
+            <div class="error-block__actions" data-testid="host-replan">
+                <Button small=true kind={Kind::Primary} onclick={run(Ask::Host("retry", h.host.clone()))}>{ "Re-plan" }</Button>
+                if others > 1 {
+                    <Button small=true onclick={run(Ask::Action("retry"))}>{ format!("Re-plan all {others} failed") }</Button>
+                }
+            </div>
+        }
     });
     let lifecycle = ticker(Source {
         events,
@@ -1100,8 +1228,9 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
     });
     html! {
         <div class="host-row">
-            <ErrorBlock error={h.error_detail.clone()} raw={h.error.clone().map(AttrValue::from)} tone={host_error_tone(h)} />
-            { actions.unwrap_or_default() }
+            <ErrorBlock error={h.error_detail.clone()} raw={h.error.clone().map(AttrValue::from)} tone={host_error_tone(h)}>
+                { replan.unwrap_or_default() }
+            </ErrorBlock>
             <div class="host-row__ticker">
                 <h4 class="subhead">{ "Through this rollout" }</h4>
                 { match &lifecycle {
