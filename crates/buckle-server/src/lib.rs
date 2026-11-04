@@ -56,6 +56,24 @@ pub fn fingerprint(config: &ServerConfig) -> buckle_core::Result<Option<String>>
 
 /// Runs the server until shutdown is requested. Returns the process exit code.
 pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_core::Result<i32> {
+    run_with(config, shutdown, Hooks::default()).await
+}
+
+/// Seams for a process that embeds the server (the integration tests).
+#[derive(Debug, Clone, Default)]
+pub struct Hooks {
+    /// Held for reading by every scan of the path source: a writer that
+    /// holds it for writing changes the directory without a scan seeing the
+    /// change half done.
+    pub source_lock: Option<std::sync::Arc<tokio::sync::RwLock<()>>>,
+}
+
+/// [`run`] with `hooks`.
+pub async fn run_with(
+    config: ServerConfig,
+    shutdown: CancellationToken,
+    hooks: Hooks,
+) -> buckle_core::Result<i32> {
     // Several TLS stacks are linked (tonic, reqwest); pin the process-wide
     // rustls provider so neither has to guess. Already installed is fine.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -119,7 +137,8 @@ pub async fn run(config: ServerConfig, shutdown: CancellationToken) -> buckle_co
         tasks.push(tokio::spawn(watcher.run(cancel.clone())));
     } else if let Some(path) = &config.source.path {
         tracing::info!(path = %path.display(), "watching the source directory");
-        let watcher = source::path::PathWatcher::new(path.clone(), builder.clone());
+        let watcher = source::path::PathWatcher::new(path.clone(), builder.clone())
+            .with_lock(hooks.source_lock.clone());
         tasks.push(tokio::spawn(watcher.run(cancel.clone())));
     } else {
         return Err(buckle_core::error::user(

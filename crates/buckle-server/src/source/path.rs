@@ -7,51 +7,88 @@ use buckle_core::Result;
 use chrono::Utc;
 use notify::Watcher as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+/// The tree digest of the directory at `root`, as a revision id.
+async fn digest_of(root: PathBuf) -> Result<String> {
+    blocking("Scanning the source directory", move || {
+        super::tarball::build(&root).map(|b| buckle_core::Digest::of(&b).to_string())
+    })
+    .await
+}
+
+/// Runs `f` on the blocking pool; `what` names it if it panics.
+async fn blocking<T: Send + 'static>(
+    what: &'static str,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        buckle_core::error::wrap_system(e, format!("{what} panicked."), &["Report this issue."])
+    })?
+}
 
 /// Watches a configuration directory.
 #[derive(Debug)]
 pub struct PathWatcher {
     root: PathBuf,
     builder: RevisionBuilder,
+    lock: Option<Arc<RwLock<()>>>,
 }
 
 impl PathWatcher {
     /// Watches `root`.
     pub fn new(root: PathBuf, builder: RevisionBuilder) -> Self {
-        Self { root, builder }
+        Self {
+            root,
+            builder,
+            lock: None,
+        }
+    }
+
+    /// Holds `lock` for reading during every scan (see
+    /// [`crate::Hooks::source_lock`]).
+    pub fn with_lock(mut self, lock: Option<Arc<RwLock<()>>>) -> Self {
+        self.lock = lock;
+        self
     }
 
     /// Builds a revision from the directory if its content is new.
+    ///
+    /// The revision is the copy taken into the cache, and its id is that
+    /// copy's digest: a directory edited during the scan never yields a
+    /// revision whose id names other content than it holds.
     pub async fn scan(&self) -> Result<Option<RevisionRecord>> {
-        let root = self.root.clone();
-        let digest = tokio::task::spawn_blocking(move || {
-            super::tarball::build(&root).map(|b| buckle_core::Digest::of(&b))
-        })
-        .await
-        .map_err(|e| {
-            buckle_core::error::wrap_system(
-                e,
-                "Scanning the source directory panicked.",
-                &["Report this issue."],
-            )
-        })??;
-        let id = digest.to_string();
-        if self.builder.exists(&id).await? {
+        let _reading = match &self.lock {
+            Some(lock) => Some(lock.read().await),
+            None => None,
+        };
+        if self
+            .builder
+            .exists(&digest_of(self.root.clone()).await?)
+            .await?
+        {
             return Ok(None);
         }
-        let scratch = scratch_dir(self.builder.cache(), &id);
+        let scratch = scratch_dir(self.builder.cache(), "scan");
         let (from, to) = (self.root.clone(), scratch.clone());
-        tokio::task::spawn_blocking(move || copy_tree(&from, &to))
-            .await
-            .map_err(|e| {
-                buckle_core::error::wrap_system(
-                    e,
-                    "Copying the source directory panicked.",
-                    &["Report this issue."],
-                )
-            })??;
+        blocking("Copying the source directory", move || {
+            copy_tree(&from, &to)
+        })
+        .await?;
+        let id = match digest_of(scratch.clone()).await {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return Err(e);
+            }
+        };
+        if self.builder.exists(&id).await? {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Ok(None);
+        }
         let info = CommitInfo {
             id,
             author: "local".into(),
