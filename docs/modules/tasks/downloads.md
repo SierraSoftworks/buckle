@@ -105,3 +105,40 @@ Pull a container image (a systemd unit or Nomad job then runs it).
 ```
 
 <KindReference registry="tasks" kind="docker.image" />
+
+## git.repository
+
+Clone a git repository onto the host and keep its working tree at a branch, tag or commit. Plans
+ask the remote (`git ls-remote`) where `ref` points, so tag the task `network`; a full commit id
+plans offline.
+
+```yaml
+# Track a branch: each apply fast-forwards to the remote's tip.
+- git.repository:
+    repo: https://github.com/geerlingguy/rpi-clone.git
+    path: /opt/rpi-clone
+    ref: master
+    depth: 1
+  tags: [network]
+```
+
+```yaml
+# A user's dotfiles: cloned as that user (their SSH keys apply), then left alone.
+- git.repository:
+    repo: git@github.com:example/dotfiles.git
+    path: /home/pi/.dotfiles
+    owner: pi
+    group: pi
+    recursive: true
+    update: false
+  tags: [network]
+```
+
+<KindReference registry="tasks" kind="git.repository" />
+
+- **Local changes are never discarded.** Uncommitted edits to tracked files block a plan that
+  would move `HEAD`; local commits on a tracked branch fail the apply (it only fast-forwards).
+- **Branch, tag or commit.** A branch is checked out tracking `origin/<ref>`; tags and commits
+  are checked out detached. A name that is both a branch and a tag resolves to the branch.
+- **Removal** deletes the clone only if Buckle created it, it has no tracked or untracked
+  changes, and `HEAD` is the commit Buckle last checked out.

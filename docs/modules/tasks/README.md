@@ -37,6 +37,7 @@ same time, even in different modules), and what happens on removal.
 | [`archive.extract`](./downloads.md#archive-extract) | Unpack a tar or zip from a URL, the host or the module. |
 | [`github.release`](./downloads.md#github-release) | Install a binary from a GitHub release, by version and architecture. |
 | [`docker.image`](./downloads.md#docker-image) | Pull a container image. |
+| [`git.repository`](./downloads.md#git-repository) | Clone a git repository and keep it at a branch, tag or commit. |
 
 ## Packages
 
