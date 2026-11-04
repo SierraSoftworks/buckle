@@ -385,6 +385,8 @@ fn entry(
         stage: 0,
         executor: None,
         bake: None,
+        preview: false,
+        drifted_from: None,
         needs_approval: false,
         needs_attention: false,
         error_detail: None,
