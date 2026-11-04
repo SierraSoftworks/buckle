@@ -73,20 +73,23 @@ appears. A phase without cross-layer `needs` is one stage, as before.
 ## 3. Review and approve
 
 A phase with `approval: required` (or `if_destructive`, when a plan removes or deletes something)
-waits at its gate. Its **Approve phase** panel shows what the phase will do:
+waits at its gate. The rollout's **Plans** panel shows what every phase will do in one view, headed
+by an **Approve phase** block for each phase that wants an approval:
 
-- **Across the fleet**: one entry per module, with what it changes on how many hosts. Values that
-  differ per host read as placeholders such as `«fact:host.id»`; hover one for examples.
-- **By distinct plan**: hosts with identical plans grouped together, destructive steps flagged.
-- **Health gate**: the checks that must hold on every updated host before the next phase starts.
+- **Approve phase**: the hosts and distinct plans the approval binds, hosts it leaves out, and the
+  health gate that must hold on every updated host before the next phase starts.
+- **Across the fleet**: one entry per module, with the phases (or hosts) it changes; hover for the
+  hosts by phase. Values that differ per host read as placeholders such as `«fact:host.id»`.
+- **By distinct plan**: hosts with identical plans grouped together by phase, destructive steps
+  flagged.
 
-<Screenshot name="rollout-approval" alt="The Approve phase panel: the fleet-wide plan by module, and the health gate" />
+<Screenshot name="rollout-approval" alt="The Plans panel: an Approve phase block, then the plan across every phase by module" />
 
 Secrets never appear in a plan: a rotated secret shows as a token such as
 `«secret:nomad_server@3f9a»`, and a template that uses it as the lines it changes.
 
-Approve from the split button at the top right of the rollout (or of the overview's latest rollout
-card). The dialog names the hosts, the destructive steps and the plan digests it binds; destructive
+Approve from the phase's **Approve…** button, or the split button at the top right of the rollout
+(or of the overview's latest rollout card) for the phase the rollout waits on. The dialog names the hosts, the destructive steps and the plan digests it binds; destructive
 steps must be acknowledged first, and the note goes into the audit log.
 
 <Screenshot name="rollout-approve" alt="The approval dialog with its summary, destructive-step acknowledgement and audit note" />
