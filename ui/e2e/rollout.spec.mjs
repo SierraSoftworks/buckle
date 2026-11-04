@@ -350,4 +350,13 @@ describe("the hosts list", () => {
     assert.match(await pill.textContent(), /^\+\d+~\d+-\d+/);
     await close();
   });
+
+  test("a plan made before its stage opened reads as a preview, one that changed since says so", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const row = (host) => page.locator("tr", { has: page.getByRole("link", { name: host, exact: true }) });
+    await row("lab-1").getByTestId("plan-preview").waitFor();
+    assert.equal(await row("pi-1").getByTestId("plan-preview").count(), 0, "an open stage's plan is no preview");
+    await row("hz-3").getByTestId("plan-drifted").waitFor();
+    await close();
+  });
 });

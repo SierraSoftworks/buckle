@@ -124,6 +124,14 @@ pub struct RolloutHost {
     /// changed, once its result arrived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bake: Option<BakeWindow>,
+    /// The plan was made before the target's stage opened (at the rollout's
+    /// start): an estimate, planned again when the stage opens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
+    /// The digest of the preview the current plan differs from: what will
+    /// apply changed between the rollout's start and the stage opening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drifted_from: Option<String>,
 }
 
 /// A reboot a rollout host's run asked for.

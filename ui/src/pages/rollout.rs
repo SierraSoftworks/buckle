@@ -1160,6 +1160,14 @@ fn host_table(props: &HostTableProps) -> Html {
                                     { h.plan_digest.as_deref().map(|d| html! {
                                         <span class="mono muted small plan-digest" title={format!("plan {d}")}>{ short(d) }</span>
                                     }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
+                                    if h.preview {
+                                        <span class="badge" data-testid="plan-preview"
+                                            title="Planned at the rollout's start; planned again when its stage opens">{ "preview" }</span>
+                                    }
+                                    if let Some(from) = &h.drifted_from {
+                                        <span class="badge badge--warn" data-testid="plan-drifted"
+                                            title={format!("The plan changed since its preview ({})", short(from))}>{ "changed since preview" }</span>
+                                    }
                                 </td>
                                 <td>
                                     { for h.failed_checks.iter().map(|c| html! { <span class="badge badge--danger mono">{ c.clone() }</span> }) }

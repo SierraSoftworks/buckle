@@ -74,6 +74,10 @@ struct Script {
     silent_target_apply: bool,
     /// The modules a successful apply changed; None: `web`.
     changed: Option<Vec<String>>,
+    /// The digest of plans for a cluster target; None: `digest`.
+    target_digest: Option<String>,
+    /// Planning a cluster target fails with this error.
+    target_plan_error: Option<String>,
 }
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
@@ -288,16 +292,28 @@ impl Harness {
                 let s = script.lock().unwrap().clone();
                 let reply = |msg: AMsg| handle.agent_message(&name, msg);
                 match m {
-                    SMsg::Plan(p) if s.plan_error.is_some() => reply(AMsg::Plan(PlanResult {
-                        target: p.target.clone(),
-                        revision: p.revision,
-                        error: s.plan_error.clone().unwrap_or_default(),
-                        ..Default::default()
-                    })),
+                    SMsg::Plan(p)
+                        if s.plan_error.is_some()
+                            || (!p.target.is_empty() && s.target_plan_error.is_some()) =>
+                    {
+                        reply(AMsg::Plan(PlanResult {
+                            target: p.target.clone(),
+                            revision: p.revision,
+                            error: s
+                                .plan_error
+                                .clone()
+                                .or(s.target_plan_error.clone())
+                                .unwrap_or_default(),
+                            ..Default::default()
+                        }))
+                    }
                     SMsg::Plan(p) => reply(AMsg::Plan(PlanResult {
+                        digest: match &s.target_digest {
+                            Some(d) if !p.target.is_empty() => d.clone(),
+                            _ => s.digest.clone(),
+                        },
                         target: p.target.clone(),
                         revision: p.revision,
-                        digest: s.digest.clone(),
                         changes: 1,
                         destructive: s.destructive,
                         removals: u32::from(s.destructive),
@@ -3926,9 +3942,7 @@ async fn a_cluster_is_staged_between_its_nodes_modules_and_applied_through_an_ex
     assert_eq!(r.runtime.phases[0].stages, 3);
     let cluster = host(&hosts, CLUSTER);
     assert_eq!(cluster.runtime.kind, TargetKind::Cluster);
-    assert_eq!(cluster.state, HostPhase::PlanPending);
     assert_eq!(cluster.runtime.stage, 1);
-    assert_eq!(cluster.runtime.executor, None);
     for n in ["n1", "n2"] {
         let steps: Vec<(u32, bool)> = host(&hosts, n)
             .runtime
@@ -3938,9 +3952,14 @@ async fn a_cluster_is_staged_between_its_nodes_modules_and_applied_through_an_ex
             .collect();
         assert_eq!(steps, [(0, true), (2, false)], "{n}");
     }
+    let (_, hosts) = h
+        .wait(&id, "the cluster's preview", |_, hs| {
+            host(hs, CLUSTER).state == HostPhase::Planned
+        })
+        .await;
     assert!(
-        h.sent(|_, m| targeted(m).is_some()).is_empty(),
-        "a cluster plans when its stage opens, not at the freeze"
+        host(&hosts, CLUSTER).runtime.preview,
+        "a cluster is previewed at the freeze, before its stage opens"
     );
 
     let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
@@ -4315,4 +4334,166 @@ async fn a_planned_host_can_be_planned_again_before_it_applies() {
     assert!(plans() > before, "a fresh plan is requested");
     assert!(!host(&hosts, "a").runtime.released, "it keeps its place");
     assert!(h.applies().is_empty(), "nothing applies without approval");
+}
+
+// ---------------------------------------------------------------- previews
+
+const TWO_AUTO_PHASES: &str = "  health: { bake: 30s }\n  phases:\n    - { name: canary, select: 'host.groups contains \"canary\"' }\n    - { name: web, select: 'host.groups contains \"web\"' }\n";
+
+fn plans_to(h: &Harness, to: &str, target: &str) -> usize {
+    h.sent(|x, m| x == to && matches!(m, SMsg::Plan(p) if p.target == target))
+        .len()
+}
+
+/// A host of a later phase is planned at the freeze as a preview and again
+/// when its phase starts; what applies is the fresh plan, and a plan that
+/// changed in between is recorded as drift (an auto phase applies it).
+#[tokio::test(start_paused = true)]
+async fn a_later_phase_is_planned_again_when_it_starts() {
+    for drift in [false, true] {
+        let mut h = Harness::new().await;
+        h.revision("r1", TWO_AUTO_PHASES).await;
+        h.enrol("c", "canary").await;
+        h.enrol("w", "web").await;
+        h.connect("c", None);
+        h.connect("w", None);
+        let id = h.start("r1").await;
+        let (_, hosts) = h
+            .wait(&id, "w previewed", |_, hs| {
+                host(hs, "w").state == HostPhase::Planned
+            })
+            .await;
+        assert!(host(&hosts, "w").runtime.preview, "drift={drift}");
+        assert!(
+            !host(&hosts, "c").runtime.preview,
+            "the open phase is no preview"
+        );
+        if drift {
+            h.script("w", |s| s.digest = "plan-b".into());
+        }
+
+        let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+        let w = host(&hosts, "w");
+        assert_eq!(w.state, HostPhase::Healthy, "drift={drift}");
+        assert_eq!(
+            plans_to(&h, "w", ""),
+            2,
+            "previewed, then planned at its phase"
+        );
+        assert_eq!(plans_to(&h, "c", ""), 1, "the first phase is planned once");
+        let applied = h.applies().into_iter().find(|a| a.1 == "w").unwrap().2;
+        let expected = if drift { "plan-b" } else { "plan-a" };
+        assert_eq!(applied.plan_digest, expected, "the fresh plan applies");
+        assert_eq!(w.runtime.drifted_from.is_some(), drift);
+        let drifted = h
+            .audit_actions(&id)
+            .await
+            .iter()
+            .any(|a| a == "rollout.target.plan_drifted");
+        assert_eq!(drifted, drift);
+    }
+}
+
+/// A cluster previewed at the freeze is covered by its phase's approval:
+/// planned again when its stage opens, it applies under that approval when
+/// its plan is unchanged and waits for a new one when it drifted.
+#[tokio::test(start_paused = true)]
+async fn a_previewed_cluster_needs_approval_again_only_when_its_plan_drifted() {
+    let gated = "  health: { bake: 30s }\n  phases:\n    - { name: all, select: 'true', parallel: 4, approval: required }\n";
+    for drift in [false, true] {
+        let mut h = Harness::new().await;
+        h.revision_with("r1", gated, NOMAD_CLUSTER, LAYERED).await;
+        for n in ["n1", "n2"] {
+            h.enrol(n, "nomad").await;
+            h.connect(n, None);
+        }
+        let id = h.start("r1").await;
+        let (_, hosts) = h
+            .wait(&id, "every plan in", |_, hs| {
+                hs.iter().all(|x| x.state == HostPhase::Planned)
+            })
+            .await;
+        assert!(host(&hosts, CLUSTER).runtime.preview);
+        h.command(Command::Approve {
+            rollout: id.clone(),
+            phase: "all".into(),
+            digests: vec!["plan-a".into()],
+            note: String::new(),
+        })
+        .await
+        .unwrap();
+        if drift {
+            for n in ["n1", "n2"] {
+                h.script(n, |s| s.target_digest = Some("plan-b".into()));
+            }
+        }
+
+        if !drift {
+            let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+            assert_eq!(host(&hosts, CLUSTER).state, HostPhase::Healthy);
+            assert!(host(&hosts, CLUSTER).runtime.drifted_from.is_none());
+            continue;
+        }
+        let (_, hosts) = h
+            .wait(&id, "the cluster re-planned", |_, hs| {
+                host(hs, CLUSTER).plan_digest.as_deref() == Some("plan-b")
+            })
+            .await;
+        let cluster = host(&hosts, CLUSTER);
+        assert_eq!(cluster.runtime.drifted_from.as_deref(), Some("plan-a"));
+        assert!(!cluster.runtime.preview);
+        h.idle(120).await;
+        let (_, hosts) = h.snapshot(&id).await;
+        assert_eq!(
+            host(&hosts, CLUSTER).state,
+            HostPhase::Planned,
+            "it waits for approval"
+        );
+        assert!(h.applies().iter().all(|a| a.2.target != CLUSTER));
+        assert!(
+            h.audit_actions(&id)
+                .await
+                .iter()
+                .any(|a| a == "rollout.target.plan_drifted")
+        );
+        h.command(Command::Approve {
+            rollout: id.clone(),
+            phase: "all".into(),
+            digests: vec!["plan-b".into()],
+            note: String::new(),
+        })
+        .await
+        .unwrap();
+        let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+        assert_eq!(host(&hosts, CLUSTER).state, HostPhase::Healthy);
+    }
+}
+
+/// A cluster whose preview cannot be planned (an earlier stage provides what
+/// it needs) is not failed: it stays unplanned and plans when its stage
+/// opens.
+#[tokio::test(start_paused = true)]
+async fn a_cluster_whose_preview_fails_plans_when_its_stage_opens() {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, LAYERED)
+        .await;
+    for n in ["n1", "n2"] {
+        h.enrol(n, "nomad").await;
+        h.script(n, |s| {
+            s.target_plan_error = Some("namespace missing".into())
+        });
+        h.connect(n, None);
+    }
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "the preview failed", |_, hs| {
+            host(hs, CLUSTER).runtime.error.is_some()
+        })
+        .await;
+    assert_eq!(host(&hosts, CLUSTER).state, HostPhase::PlanPending);
+    for n in ["n1", "n2"] {
+        h.script(n, |s| s.target_plan_error = None);
+    }
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, CLUSTER).state, HostPhase::Healthy);
 }

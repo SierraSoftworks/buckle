@@ -370,6 +370,18 @@ pub struct HostRuntime {
     /// For a cluster: the host agent its messages travel through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    /// The latest plan request went out before the target's stage opened:
+    /// its plan is a preview, planned again when the stage opens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
+    /// The intent (else full) digest of the preview being re-planned, until
+    /// the fresh plan arrives and is compared with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previewed: Option<String>,
+    /// The preview digest the current plan drifted from: the plan changed
+    /// between the rollout's start and its stage opening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drifted_from: Option<String>,
 }
 
 impl HostRuntime {

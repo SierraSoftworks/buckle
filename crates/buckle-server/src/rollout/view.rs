@@ -92,6 +92,8 @@ pub fn host(
         stage: h.runtime.stage,
         executor: h.runtime.executor.clone(),
         bake: h.runtime.bake.clone(),
+        preview: h.runtime.preview && h.plan_digest.is_some(),
+        drifted_from: h.runtime.drifted_from.clone(),
     }
 }
 

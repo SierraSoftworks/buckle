@@ -385,6 +385,8 @@ fn entry(
         stage: 0,
         executor: None,
         bake: None,
+        preview: false,
+        drifted_from: None,
         needs_approval: false,
         needs_attention: false,
         error_detail: None,
@@ -522,6 +524,10 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
     for h in &mut cloud_hosts {
         h.needs_approval = true;
     }
+    // Its plan changed between the rollout's start and the phase opening.
+    if let Some(hz) = cloud_hosts.iter_mut().find(|h| h.host == "hz-3") {
+        hz.drifted_from = Some(PLAN_NOMAD.into());
+    }
     let mut az = entry("az-1", "cloud", 2, S::PlanPending, None, now, 25);
     az.error =
         Some("No plan yet: the agent has been offline since before the rollout started.".into());
@@ -536,7 +542,7 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
         cloud_hosts,
     );
 
-    let rest = phase(
+    let mut rest = phase(
         "everything-else",
         PhaseState::Pending,
         "2",
@@ -565,6 +571,10 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
             entry("lab-3", "everything-else", 1, S::Pending, None, now, 30),
         ],
     );
+    // Planned at the rollout's start; planned again when the phase opens.
+    for h in rest.hosts.iter_mut().filter(|h| h.plan_digest.is_some()) {
+        h.preview = true;
+    }
     let stragglers = phase(
         "stragglers",
         PhaseState::Pending,

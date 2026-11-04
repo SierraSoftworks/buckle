@@ -1515,6 +1515,19 @@ impl Controller {
             } else if !matches!(h.state, HostPhase::PlanPending | HostPhase::Planned) {
                 continue;
             }
+            if !plan.error.is_empty() && !stale && self.live[ri].hosts[hi].runtime.preview {
+                // A cluster's preview may fail on what an earlier stage
+                // provides: it waits for its stage to plan for real.
+                let h = &mut self.live[ri].hosts[hi];
+                if h.runtime.kind == TargetKind::Cluster {
+                    h.runtime.error = Some(format!(
+                        "the preview could not be planned: {}; plans again when its stage opens",
+                        plan.error
+                    ));
+                    self.touch_host(ri, hi);
+                    continue;
+                }
+            }
             if !plan.error.is_empty() && !stale {
                 let error = format!("planning failed: {}", plan.error);
                 self.live[ri].hosts[hi].runtime.error = Some(error.clone());
@@ -1554,6 +1567,7 @@ impl Controller {
                 }
                 h.runtime.error = (!notes.is_empty()).then(|| notes.join("; "));
             }
+            self.record_drift(ri, hi);
             self.touch_host(ri, hi);
             let why = if stale_error.is_some() {
                 "plan received; the approved plan was stale"
@@ -2966,7 +2980,72 @@ impl Controller {
         for hi in 0..n {
             self.request_plan(ri, hi);
         }
+        self.preview_clusters(ri).await;
         Ok(())
+    }
+
+    /// Plans the clusters whose stage has not opened yet as previews, through
+    /// an executor free now. One without a free executor stays unplanned
+    /// until its stage opens, as does one whose preview fails.
+    async fn preview_clusters(&mut self, ri: usize) {
+        let rows: Vec<usize> = (0..self.live[ri].hosts.len())
+            .filter(|&hi| {
+                let h = &self.live[ri].hosts[hi];
+                h.runtime.kind == TargetKind::Cluster
+                    && h.state == HostPhase::PlanPending
+                    && !self.stage_open(ri, hi)
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        self.assign_executors(ri, &rows, false).await;
+        for hi in rows {
+            if self.live[ri].hosts[hi].runtime.executor.is_some() {
+                self.request_preview(ri, hi);
+            }
+        }
+    }
+
+    /// Plans again the rows of phase `p` whose stage is open but whose plan
+    /// is a preview (made before it opened): the fresh plan is what applies,
+    /// and needs approval again only where the approval does not cover it
+    /// (see [`Controller::on_plan`] for the drift it records).
+    fn refresh_previews(&mut self, ri: usize, p: usize) -> bool {
+        let rows: Vec<usize> = self.live[ri]
+            .phase_hosts(p)
+            .into_iter()
+            .filter(|&hi| {
+                let h = &self.live[ri].hosts[hi];
+                h.runtime.preview
+                    && matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
+                    && self.stage_open(ri, hi)
+            })
+            .collect();
+        for &hi in &rows {
+            {
+                let h = &mut self.live[ri].hosts[hi];
+                h.runtime.preview = false;
+                if let Some(binding) = h
+                    .runtime
+                    .approval_digest
+                    .clone()
+                    .or_else(|| h.plan_digest.clone())
+                {
+                    h.runtime.previewed = Some(binding);
+                }
+                h.plan_digest = None;
+                h.runtime.approval_digest = None;
+            }
+            self.set_host_state(
+                ri,
+                hi,
+                HostPhase::PlanPending,
+                "its stage opened; planning again",
+            );
+            self.request_plan(ri, hi);
+        }
+        !rows.is_empty()
     }
 
     /// Lays phase `pi`'s targets out in dependency stages (see
@@ -3115,12 +3194,61 @@ impl Controller {
         })
     }
 
+    /// Compares row `hi`'s fresh plan with the preview it replaced, if any:
+    /// a changed plan is recorded (audit `rollout.target.plan_drifted`) and
+    /// shown on the row. Whether it needs approval again follows from the
+    /// phase's policy and what its approvals cover, as for any plan.
+    fn record_drift(&mut self, ri: usize, hi: usize) {
+        let (target, from, to, phase) = {
+            let h = &mut self.live[ri].hosts[hi];
+            let Some(from) = h.runtime.previewed.take() else {
+                return;
+            };
+            let to = h
+                .runtime
+                .approval_digest
+                .clone()
+                .or_else(|| h.plan_digest.clone())
+                .unwrap_or_default();
+            if from == to {
+                h.runtime.drifted_from = None;
+                return;
+            }
+            h.runtime.drifted_from = Some(from.clone());
+            (h.host.clone(), from, to, h.phase.clone())
+        };
+        self.command_audit(
+            "controller",
+            "rollout.target.plan_drifted",
+            ri,
+            format!(
+                "{target}: the plan changed since its preview ({} → {})",
+                short(&from),
+                short(&to)
+            ),
+            serde_json::json!({"host": target, "phase": phase, "previewed": from, "planned": to}),
+        );
+    }
+
     /// Asks for row `hi`'s plan: the whole revision, or the modules of its
     /// current step. A cluster's plan, and any later step's, waits for its
     /// stage to open (it depends on what the stages before it do), so the
     /// request is a no-op until then and is made when the stage opens.
     fn request_plan(&mut self, ri: usize, hi: usize) {
-        if self.live[ri].hosts[hi].runtime.plan_deferred() && !self.stage_open(ri, hi) {
+        self.send_plan_request(ri, hi, false);
+    }
+
+    /// Asks for a cluster row's plan before its stage opens: a preview,
+    /// planned again when the stage opens (see
+    /// [`Controller::refresh_previews`]).
+    fn request_preview(&mut self, ri: usize, hi: usize) {
+        self.send_plan_request(ri, hi, true);
+    }
+
+    /// A plan requested before the row's stage opens is a preview.
+    fn send_plan_request(&mut self, ri: usize, hi: usize, early: bool) {
+        let open = self.stage_open(ri, hi);
+        if self.live[ri].hosts[hi].runtime.plan_deferred() && !open && !early {
             return;
         }
         if !self.row_eligible(ri, hi) {
@@ -3129,6 +3257,10 @@ impl Controller {
         let Some(session) = self.row_session(ri, hi) else {
             return;
         };
+        if self.live[ri].hosts[hi].runtime.preview != !open {
+            self.live[ri].hosts[hi].runtime.preview = !open;
+            self.live[ri].dirty_hosts.insert(hi);
+        }
         let target = self.row_target(ri, hi);
         let revision = self.live[ri].hosts[hi].runtime.revision.clone();
         let stable = self.stable.as_deref() == Some(revision.as_str());
@@ -3731,6 +3863,9 @@ impl Controller {
             h.runtime.reboot = None;
             h.runtime.stale_refusals = 0;
             h.runtime.apply_resends = 0;
+            h.runtime.preview = false;
+            h.runtime.previewed = None;
+            h.runtime.drifted_from = None;
             (h.host.clone(), from)
         };
         let (id, phase, trace) = {
@@ -4132,6 +4267,9 @@ impl Controller {
                 changed = true;
             }
             if self.serve_waiting_executors(ri, p, true).await {
+                changed = true;
+            }
+            if self.refresh_previews(ri, p) {
                 changed = true;
             }
             let hosts = self.live[ri].phase_hosts(p);
