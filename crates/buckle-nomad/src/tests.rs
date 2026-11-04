@@ -465,3 +465,19 @@ async fn orphans_are_found_from_stamps_and_the_index_and_removed_by_policy(
         assert_eq!(orphans(&cx, &[]).await.unwrap(), vec![]);
     }
 }
+
+#[tokio::test]
+async fn a_job_without_a_namespace_lands_in_the_workloads() {
+    let fake = FakeNomad::new();
+    let cx = cx(&fake, "r1");
+    let mut spec = atuin_job("atuin:1");
+    spec.namespace = Some("team-a".into());
+    workload(Some(spec))
+        .plan(&cx)
+        .await
+        .unwrap()
+        .apply(&cx)
+        .await
+        .unwrap();
+    assert!(fake.job("team-a", "atuin").is_some());
+}

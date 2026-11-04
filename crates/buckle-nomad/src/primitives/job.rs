@@ -26,6 +26,10 @@ pub struct JobSpec {
     pub vars: IndexMap<String, Value>,
     /// Files passed as string variables (`files: { app_config: config.yaml }`).
     pub files: IndexMap<String, String>,
+    /// The workload's `namespace`, used when the spec names none. Nomad
+    /// canonicalises a missing namespace to `default`, so a spec that names
+    /// `default` explicitly also lands here.
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +76,12 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
             &["A job spec holds exactly one `job \"name\" { … }` block."],
         ));
     }
-    let ns = namespace_or_default(job["Namespace"].as_str());
+    let ns = match (job["Namespace"].as_str(), spec.namespace.as_deref()) {
+        (None | Some("") | Some("default"), Some(workload)) if !workload.is_empty() => {
+            workload.to_owned()
+        }
+        (named, _) => namespace_or_default(named),
+    };
     job["Namespace"] = Value::String(ns.clone());
     let key = ObjectKey::new(Kind::Job, &ns, &id);
 
