@@ -330,6 +330,9 @@ pub async fn orphans(cx: &Context, declared: &[ObjectKey]) -> Result<Vec<Orphan>
         });
     }
     found.retain(|o| !declared.contains(&o.key));
+    // Jobs are found by their meta and listed in the index: keep one of each.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|o| seen.insert(o.key.clone()));
     found.sort_by(|a, b| b.key.kind.cmp(&a.key.kind).then(a.key.cmp(&b.key)));
     Ok(found)
 }

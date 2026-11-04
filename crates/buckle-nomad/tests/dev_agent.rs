@@ -50,6 +50,11 @@ variable "sleep" {
   type = string
 }
 
+variable "count" {
+  type    = number
+  default = 1
+}
+
 job "JOB_ID" {
   datacenters = ["*"]
   type        = "service"
@@ -61,6 +66,8 @@ job "JOB_ID" {
   }
 
   group "api" {
+    count = var.count
+
     task "sleep" {
       driver = "raw_exec"
       config {
@@ -143,8 +150,35 @@ async fn a_job_deploys_converges_updates_and_stops() {
     };
     assert!(text.get().contains("3601"), "{}", text.get());
     update.apply(&cx(&nomad, target, "r3")).await.unwrap();
+    let idx = index::read(&nomad, target).await.unwrap();
+    assert_eq!(
+        idx.find(Kind::Job, "default", "buckle-it-job")
+            .unwrap()
+            .revision,
+        "r3"
+    );
     let live: serde_json::Value = nomad.get("/v1/job/buckle-it-job").await.unwrap().unwrap();
-    assert_eq!(live["Meta"][stamps::REVISION], "r3");
+    assert!(
+        live["Meta"].get(stamps::REVISION).is_none(),
+        "{}",
+        live["Meta"]
+    );
+
+    // A count change places one allocation and leaves the running one alone.
+    let mut scaled = w("3601");
+    scaled
+        .job
+        .as_mut()
+        .unwrap()
+        .vars
+        .insert("count".into(), serde_json::json!(2));
+    let plan = scaled.plan(&cx(&nomad, target, "r4")).await.unwrap();
+    let preview = plan.steps[0].preview.join("; ");
+    assert!(
+        preview.contains("1 create") && !preview.contains("create/destroy"),
+        "{preview}"
+    );
+    plan.apply(&cx(&nomad, target, "r4")).await.unwrap();
 
     let found = orphans(&cx(&nomad, target, "r4"), &[]).await.unwrap();
     assert_eq!(found.len(), 1, "{found:?}");

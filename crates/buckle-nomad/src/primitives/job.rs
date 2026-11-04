@@ -5,6 +5,7 @@
 use super::{Context, Kind, ObjectKey, Orphan, Pending as StepPending, Step, namespace_or_default};
 use crate::client::{seg, with_query};
 use crate::diff;
+use crate::index::{self, Entry};
 use crate::stamps::{self, Owner, Stamps};
 use buckle_core::Result;
 use buckle_core::error::{system, user};
@@ -37,6 +38,8 @@ pub(crate) struct Pending {
     job: Value,
     /// The job modify index the plan saw; 0 when the job must not exist.
     enforce_index: u64,
+    /// The job's revision and digest, recorded in the index on apply.
+    entry: Entry,
 }
 
 /// How often an apply polls the evaluation and the deployment.
@@ -95,10 +98,26 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
     if let Some(reason) = owner.conflict(&key.to_string()) {
         return Ok(Step::blocked(key, reason));
     }
+    // Only the owner stamps go in the job's meta: Nomad passes job meta to
+    // every task, so a changing revision or digest there would turn every
+    // change (a count bump included) into a destructive update. The revision
+    // and digest live in the target's index instead.
+    Stamps::stamp_owner(&cx.target, &cx.module, &mut job);
     let digest = stamps::short_digest(&(&spec.hcl, &spec.vars, &spec.files));
-    owner
-        .next(&cx.target, &cx.module, &cx.revision, &digest)
-        .stamp_meta(&mut job);
+    let idx = index::read(&cx.nomad, &cx.target).await?;
+    let entry = Entry {
+        kind: Kind::Job,
+        namespace: ns.clone(),
+        name: id.clone(),
+        module: cx.module.clone(),
+        revision: match idx.find(Kind::Job, &ns, &id) {
+            Some(p) if p.digest == digest && p.module == cx.module => p.revision.clone(),
+            _ => cx.revision.clone(),
+        },
+        digest,
+        items: Vec::new(),
+        id: None,
+    };
 
     let mut warnings = Vec::new();
     if owner == Owner::Unmanaged {
@@ -120,6 +139,7 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
             pending: StepPending::Job(Pending {
                 job,
                 enforce_index: 0,
+                entry,
             }),
             key,
         });
@@ -162,7 +182,11 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
         planned,
         warnings,
         preview,
-        pending: StepPending::Job(Pending { job, enforce_index }),
+        pending: StepPending::Job(Pending {
+            job,
+            enforce_index,
+            entry,
+        }),
     })
 }
 
@@ -192,6 +216,8 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
     let eval = registered["EvalID"].as_str().unwrap_or_default().to_owned();
     let modify = registered["JobModifyIndex"].as_u64().unwrap_or(0);
     (cx.progress)(&format!("registered {key}"));
+    let entry = p.entry.clone();
+    index::update(&cx.nomad, &cx.target, |e| index::upsert(e, entry.clone())).await?;
     let outcome = follow_deployment(cx, key, &eval, modify, DEPLOYMENT_TIMEOUT).await?;
     Ok(Applied::changed(format!("registered {key}; {outcome}")))
 }
@@ -336,6 +362,10 @@ pub(crate) async fn remove(cx: &Context, key: &ObjectKey, purge: bool) -> Result
         url = with_query(&url, "purge", "true");
     }
     cx.nomad.delete(&url).await?;
+    index::update(&cx.nomad, &cx.target, |e| {
+        index::forget(e, Kind::Job, &key.namespace, &key.name)
+    })
+    .await?;
     Ok(Applied::changed(if purge {
         format!("stopped and purged {key}")
     } else {
