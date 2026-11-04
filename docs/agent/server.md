@@ -269,7 +269,18 @@ signs); delete `retired.key` and restart again once a TTL has passed.
 **Nomad trust.** A `jwt` auth method holding Buckle's public keys (Nomad needs no URL) and a
 binding rule per purpose; the agent logs in at `/v1/acl/login` with auth method `buckle`. Created
 once with a management token, alongside the `buckle-read`, `buckle-deploy` and `buckle-drain`
-ACL policies the rules bind to:
+ACL policies the rules bind to. Planning reads Nomad variables (Buckle's index and the
+workloads' own), which a namespace `read` policy does not grant, so `buckle-read` needs them:
+
+```hcl
+namespace "*" {
+  policy = "read"
+  variables {
+    path "*" { capabilities = ["read", "list"] }
+  }
+}
+node { policy = "read" }
+```
 
 ```json
 {

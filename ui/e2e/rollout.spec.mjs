@@ -97,6 +97,9 @@ describe("approving a phase", () => {
     assert.match(await pane.textContent(), /Rotates nomad_server/);
     assert.ok((await pane.locator(".step--destructive").count()) >= 4);
     assert.match(await pane.textContent(), /1 host has no plan yet \(az-1\)/);
+    // Plans outside the phase being approved stay listed beneath it.
+    const other = page.locator("section.panel", { has: page.getByRole("heading", { name: "Other plans" }) });
+    assert.ok((await other.locator("details.plan").count()) >= 1, "earlier phases' plans stay visible");
 
     await page.getByRole("button", { name: "Approve cloud…" }).click();
     const dialog = page.getByRole("dialog", { name: "Approve cloud of rollout #42" });
