@@ -223,18 +223,13 @@ pub fn rollout_page(props: &Props) -> Html {
 
     let pipeline = layout(&d);
     let wanting = wanting_approval(&pipeline);
-    // The head's approval is for the phase the rollout waits on, else the
-    // first that wants one; every phase wanting one is approved on its own
-    // from the plans panel.
-    let focused = wanting
-        .iter()
-        .find(|p| p.state == buckle_api::PhaseState::AwaitingApproval)
-        .or(wanting.first())
-        .copied();
+    // The head's approval is for the next phase wanting one, once the
+    // phases before it have finished.
+    let focused = next_approval(&wanting).filter(|p| phase_approvable(&d, p, &plan_groups));
 
     let head_actions = html! { <>
         <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
-        if admin { { controls(&d, focused.filter(|p| !scope_of(p, &plan_groups).digests.is_empty()).map(|p| p.name.as_str()), &open) } }
+        if admin { { controls(&d, focused.map(|p| p.name.as_str()), &open) } }
     </> };
 
     let approving: &[&RolloutPhase] = if finished { &[] } else { &wanting };
@@ -585,9 +580,51 @@ pub(crate) fn scope_of(phase: &RolloutPhase, plans: &[PlanGroup]) -> ApprovalSco
     approval_scope(&approval_hosts(phase), plans)
 }
 
-/// The rollout's plans as one view across every phase, headed by an
-/// approval for each phase that wants one: the plans are reviewed together,
-/// approved phase by phase.
+/// The phases before `phase` that have not finished: an approval gate keeps
+/// a change from rolling out blind, so a phase is approved only once these
+/// are done (the server refuses it until then).
+pub(crate) fn earlier_running<'a>(d: &'a RolloutDetail, phase: &RolloutPhase) -> Vec<&'a str> {
+    let index = d
+        .phases
+        .iter()
+        .position(|p| p.name == phase.name)
+        .unwrap_or(0);
+    d.phases[..index]
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.state,
+                buckle_api::PhaseState::Done | buckle_api::PhaseState::Skipped
+            )
+        })
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
+/// The phase an approval is for next: the one the rollout waits on, else
+/// the first that wants one.
+pub(crate) fn next_approval<'a>(wanting: &[&'a RolloutPhase]) -> Option<&'a RolloutPhase> {
+    wanting
+        .iter()
+        .find(|p| p.state == buckle_api::PhaseState::AwaitingApproval)
+        .or(wanting.first())
+        .copied()
+}
+
+/// Whether `phase` can be approved now: the phases before it have finished
+/// and it has plans to bind.
+pub(crate) fn phase_approvable(
+    d: &RolloutDetail,
+    phase: &RolloutPhase,
+    plans: &[PlanGroup],
+) -> bool {
+    earlier_running(d, phase).is_empty() && !scope_of(phase, plans).digests.is_empty()
+}
+
+/// The rollout's plans as one view across every phase. The next phase
+/// wanting an approval puts its Approve button in the panel's head and its
+/// notes above the plans; the plans are reviewed together, approved phase by
+/// phase.
 fn plans_panel(
     wanting: &[&RolloutPhase],
     d: &RolloutDetail,
@@ -619,14 +656,13 @@ fn plans_panel(
         let names: Vec<&str> = wanting.iter().map(|p| p.name.as_str()).collect();
         subtitle.push_str(&format!(" · approval wanted: {}", names.join(", ")));
     }
+    let (actions, notes) = next_approval(wanting)
+        .map(|p| approval(p, d, plans, admin, open))
+        .unwrap_or_default();
     html! {
-        <Panel title="Plans" id="plans" {subtitle}
+        <Panel title="Plans" id="plans" {subtitle} {actions}
             class={classes!((!wanting.is_empty()).then_some("panel--approval"))}>
-            if !wanting.is_empty() {
-                <div class="approvals" data-testid="approvals">
-                    { for wanting.iter().map(|p| approval(p, d, plans, admin, open)) }
-                </div>
-            }
+            { notes }
             if !plans.is_empty() {
                 <PlanViews fleet={d.fleet.clone()} groups={plans.to_vec()} {phases}
                     open_destructive={!wanting.is_empty()} />
@@ -635,31 +671,18 @@ fn plans_panel(
     }
 }
 
-/// One phase's approval: what it binds, what it leaves out, its health
-/// gate, and (for an administrator) a button to approve it.
+/// One phase's approval: its button (for the panel's head, disabled until
+/// the phases before it finish) and its notes, on what it binds and leaves
+/// out, and its health gate.
 fn approval(
     phase: &RolloutPhase,
     d: &RolloutDetail,
     plans: &[PlanGroup],
     admin: bool,
     open: &Callback<Ask>,
-) -> Html {
+) -> (Html, Html) {
     let scope = scope_of(phase, plans);
-    let index = d
-        .phases
-        .iter()
-        .position(|p| p.name == phase.name)
-        .unwrap_or(0);
-    let earlier_running: Vec<&str> = d.phases[..index]
-        .iter()
-        .filter(|p| {
-            !matches!(
-                p.state,
-                buckle_api::PhaseState::Done | buckle_api::PhaseState::Skipped
-            )
-        })
-        .map(|p| p.name.as_str())
-        .collect();
+    let running = earlier_running(d, phase);
     // A cluster, or a step after one, is planned once its stage opens, so it
     // has no plan before then by design.
     let (deferred, missing): (Vec<&String>, Vec<&String>) =
@@ -670,65 +693,76 @@ fn approval(
         });
     let names = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
     let policy = if phase.approval == "if_destructive" {
-        "approval: if_destructive, and a plan here is destructive"
+        "if_destructive, and a plan here is destructive"
     } else {
-        "approval: required"
+        "required"
     };
-    let approve = (admin && !scope.digests.is_empty()).then(|| {
+    let why_not = if !running.is_empty() {
+        Some(format!(
+            "{} can be approved once {} {} finished.",
+            phase.name,
+            running.join(", "),
+            if running.len() == 1 { "has" } else { "have" }
+        ))
+    } else if scope.digests.is_empty() {
+        Some("No plans to approve yet.".to_string())
+    } else {
+        None
+    };
+    let title = why_not.clone().unwrap_or_else(|| {
+        format!(
+            "Binds {} for {} (approval: {policy}). A host whose plan changes after approval asks again.",
+            count(scope.digests.len(), "plan digest", "plan digests"),
+            count(scope.hosts.len(), "host", "hosts")
+        )
+    });
+    let button = if !admin {
+        html! { <span class="muted small">{ "Approving needs an administrator (admin_acl)." }</span> }
+    } else {
         let (open, name) = (open.clone(), phase.name.clone());
         html! {
-            <Button kind={Kind::Primary} small=true label={format!("Approve phase {}…", phase.name)}
-                onclick={Callback::from(move |_: MouseEvent| open.emit(Ask::Approve(name.clone())))}>
-                { "Approve…" }
-            </Button>
+            <span class="approval__button" title={title} data-testid="approve-phase">
+                <Button kind={Kind::Primary} disabled={why_not.is_some()} label={format!("Approve phase {}…", phase.name)}
+                    onclick={Callback::from(move |_: MouseEvent| open.emit(Ask::Approve(name.clone())))}>
+                    { format!("Approve {}…", phase.name) }
+                </Button>
+            </span>
         }
-    });
-    html! {
-        <section class="approval" data-phase={phase.name.clone()} aria-label={format!("Approve phase: {}", phase.name)}>
-            <div class="approval__head">
-                <h4 class="subhead">{ format!("Approve phase: {}", phase.name) }</h4>
-                <span class="muted small">{ format!("{} · {} · {policy}",
-                    count(scope.hosts.len() + scope.without_plan.len(), "host", "hosts"),
-                    count(scope.digests.len(), "distinct plan", "distinct plans")) }</span>
-                { approve.unwrap_or_default() }
-            </div>
-            if !earlier_running.is_empty() {
-                <p class="note">{ format!("{} still running; an approval given now is held until {} is reached.", earlier_running.join(", "), phase.name) }</p>
-            }
-            if scope.groups.is_empty() {
-                if missing.is_empty() && !deferred.is_empty() {
-                    <p class="muted">{ format!("No plans yet: {} plans when its stage opens; this phase can be approved once it has.", names(&deferred)) }</p>
-                } else {
-                    <p class="muted">{ "No plans yet: plans arrive as the hosts answer; this phase can be approved once they have." }</p>
-                }
-            }
-            if !missing.is_empty() {
-                <p class="note note--warn">
-                    { format!("{} no plan yet ({}): not covered by this approval. A host that misses its wave moves to the stragglers stage.",
-                        count(missing.len(), "host has", "hosts have"), names(&missing)) }
-                </p>
-            }
-            if !deferred.is_empty() && !scope.groups.is_empty() {
-                <p class="note">
-                    { format!("Planned when its stage opens, so not covered by this approval: {}.", names(&deferred)) }
-                </p>
-            }
-            if !phase.health_checks.is_empty() {
-                <div class="approval__gate" data-testid="health-gate">
-                    <span class="muted small">{ "Health gate, checked on each host before it applies, through its bake, and on every updated host again before the next phase starts:" }</span>
-                    { crate::components::pipeline::health_gate(phase) }
-                </div>
-            }
-            if admin {
-                if !scope.digests.is_empty() {
-                    <p class="muted small">{ format!("Approving {} binds {} for {}. A host whose plan changes after approval asks again.",
-                        phase.name, count(scope.digests.len(), "plan digest", "plan digests"), count(scope.hosts.len(), "host", "hosts")) }</p>
-                }
+    };
+    let notes = html! { <>
+        if !running.is_empty() {
+            <p class="note" data-testid="approval-waits">
+                { format!("{} still running: {} can be approved once {} finished. Review its plans meanwhile.",
+                    running.join(", "), phase.name, if running.len() == 1 { "it has" } else { "they have" }) }
+            </p>
+        }
+        if scope.groups.is_empty() {
+            if missing.is_empty() && !deferred.is_empty() {
+                <p class="note">{ format!("No plans for {} yet: {} plans when its stage opens; the phase can be approved once it has.", phase.name, names(&deferred)) }</p>
             } else {
-                <p class="muted small">{ "Approving needs an administrator (admin_acl)." }</p>
+                <p class="note">{ format!("No plans for {} yet: plans arrive as the hosts answer; the phase can be approved once they have.", phase.name) }</p>
             }
-        </section>
-    }
+        }
+        if !missing.is_empty() {
+            <p class="note note--warn">
+                { format!("{} in {} {} no plan yet ({}): not covered by its approval. A host that misses its wave moves to the stragglers stage.",
+                    count(missing.len(), "host", "hosts"), phase.name, if missing.len() == 1 { "has" } else { "have" }, names(&missing)) }
+            </p>
+        }
+        if !deferred.is_empty() && !scope.groups.is_empty() {
+            <p class="note">
+                { format!("Planned when its stage opens, so not covered by the approval of {}: {}.", phase.name, names(&deferred)) }
+            </p>
+        }
+        if !phase.health_checks.is_empty() {
+            <div class="approval__gate" data-testid="health-gate"
+                title="Checked on each host before it applies, through its bake, and on every updated host again before the next phase starts.">
+                <span class="muted small">{ format!("Health gate of {}:", phase.name) }</span>
+                { crate::components::pipeline::health_gate(phase) }
+            </div>
+        }
+    </> };
+    (button, notes)
 }
 
 fn dialog(

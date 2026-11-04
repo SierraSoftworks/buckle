@@ -118,6 +118,7 @@ const SHOTS = [
   {
     name: "rollout-approve",
     path: "/rollouts/42",
+    flags: "awaiting",
     setup: async (p) => {
       await p.getByRole("button", { name: "Approve cloud…" }).click();
       await dialog(p).getByRole("checkbox", { name: /I have reviewed/ }).check();

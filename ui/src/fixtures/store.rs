@@ -518,11 +518,25 @@ pub fn approve(id: &str, request: &ApproveRequest) -> Result<RolloutDetail, ApiE
     with(|s| {
         let detail = s.rollout_mut(id)?;
         let before = detail.events.len();
-        let phase = detail
+        let index = detail
             .phases
-            .iter_mut()
-            .find(|p| p.name == request.phase)
+            .iter()
+            .position(|p| p.name == request.phase)
             .ok_or_else(|| ApiError::NotFound(format!("No phase '{}'.", request.phase)))?;
+        // As the server: a phase is approved once the phases before it finish.
+        let running: Vec<&str> = detail.phases[..index]
+            .iter()
+            .filter(|p| !matches!(p.state, PhaseState::Done | PhaseState::Skipped))
+            .map(|p| p.name.as_str())
+            .collect();
+        if !running.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "Phase '{}' can be approved once {} finished.",
+                request.phase,
+                running.join(", ")
+            )));
+        }
+        let phase = &mut detail.phases[index];
         if phase.approved_by.is_some() && phase.hosts.iter().all(|h| !h.needs_approval) {
             return Err(ApiError::Conflict(format!(
                 "Phase {} is already approved.",

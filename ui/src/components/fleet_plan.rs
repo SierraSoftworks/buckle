@@ -13,7 +13,6 @@ use super::icons;
 use super::plan::{
     DEFERRED_NOTE, HELD_NOTE, INDETERMINATE_NOTE, block, handler, module_head, note, notes_head,
     rehome, rehomed_block, removal, removals_block, step_class, step_detail, step_line, warning,
-    warnings_block,
 };
 use crate::logic::fleet_plan::{
     Phases, hosts_changed, phase_label, scope_label, scope_title, summarise,
@@ -81,15 +80,6 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
             facts: f.clone(),
             ..Default::default()
         }))
-    });
-    // A warning names its hosts only where they differ from the block's.
-    let warnings = (!p.warnings.is_empty()).then(|| {
-        let warned = union(&p.warnings);
-        warnings_block(
-            p.warnings.len(),
-            scope(all, &warned, ph),
-            html! { { for p.warnings.iter().map(|w| warning(&w.value, scope_within(all, &warned, &w.hosts, ph))) } },
-        )
     });
     // Modules that change nothing anywhere are left out; the rest are
     // headed by what they change on how many hosts, a line within naming
@@ -164,7 +154,6 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
                 if !p.unplanned.is_empty() {
                     <p class="note note--warn">{ format!("Not included, no plan of this revision yet: {}.", p.unplanned.join(", ")) }</p>
                 }
-                { warnings.unwrap_or_default() }
                 { for modules }
                 { removals.unwrap_or_default() }
                 { rehomed.unwrap_or_default() }
@@ -230,6 +219,33 @@ fn fleet_step_view(props: &FleetStepProps) -> Html {
     }
 }
 
+/// The plan's warnings as one banner beside the rollout's other notes, each
+/// naming its phases or hosts where it does not concern every host.
+#[function_component(FleetWarnings)]
+fn fleet_warnings(props: &FleetPlanProps) -> Html {
+    let p = &props.plan;
+    let phases = use_context::<Phases>().unwrap_or_default();
+    let exemplars = use_memo(p.facts.clone(), |f| {
+        FactExemplars(Rc::new(FleetPlan {
+            facts: f.clone(),
+            ..Default::default()
+        }))
+    });
+    if p.warnings.is_empty() {
+        return html! {};
+    }
+    html! {
+        <ContextProvider<FactExemplars> context={(*exemplars).clone()}>
+        <div class="note note--warn plan-warnings" data-testid="plan-warnings">
+            <strong class="plan-warnings__head">{ icons::alert() }{ count(p.warnings.len(), "warning", "warnings") }</strong>
+            <ul class="steps">
+                { for p.warnings.iter().map(|w| warning(&w.value, scope_within(&p.hosts, &p.hosts, &w.hosts, &phases))) }
+            </ul>
+        </div>
+        </ContextProvider<FactExemplars>>
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct PlanViewsProps {
     /// The union of the hosts' plans, when the server sends one.
@@ -274,6 +290,7 @@ pub fn plan_views(props: &PlanViewsProps) -> Html {
     };
     html! {
         <ContextProvider<Phases> context={props.phases.clone()}>
+            <FleetWarnings plan={fleet.clone()} />
             <div class="tabs tabs--small" role="tablist" aria-label="Plan view">
                 { tab("Across the fleet", !*by_plan, false) }
                 { tab("By distinct plan", *by_plan, true) }

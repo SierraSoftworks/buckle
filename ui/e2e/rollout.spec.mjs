@@ -84,13 +84,19 @@ describe("the rollout pipeline", () => {
 });
 
 describe("approving a phase", () => {
-  test("reviews every phase's plans in one view and approves a phase from it", async () => {
+  test("reviews every phase's plans in one view, approving a phase only once the phases before it finish", async () => {
     const { page, close } = await open("/rollouts/42");
     const pane = page.locator("#plans");
-    const approval = pane.locator('section.approval[data-phase="cloud"]');
-    await approval.getByRole("heading", { name: "Approve phase: cloud" }).waitFor();
+    // home is still running, so cloud's plans can be reviewed but not approved.
+    const approve = pane.locator(".panel__head").getByRole("button", { name: "Approve phase cloud…" });
+    await approve.waitFor();
+    assert.ok(await approve.isDisabled(), "cloud waits for home");
+    assert.match(await pane.getByTestId("approval-waits").textContent(), /home still running: cloud can be approved once it has finished/);
+    assert.equal(await page.getByTestId("rollout-controls").getByRole("button", { name: "Approve cloud…" }).count(), 0, "nor from the head");
     assert.equal(await pane.getByRole("tab", { name: /canary|home|cloud/ }).count(), 0, "no tab per phase");
-    assert.match(await approval.textContent(), /1 host has no plan yet \(az-1\)/);
+    assert.match(await pane.textContent(), /1 host in cloud has no plan yet \(az-1\)/);
+    // The plan's warnings sit beside the approval's notes.
+    assert.match(await pane.getByTestId("plan-warnings").textContent(), /2 warnings/);
     await pane.getByRole("tab", { name: "By distinct plan" }).click();
     // Every distinct plan of the rollout, whatever its phase, the
     // destructive one flagged, the secret rotation shown only as tokens.
@@ -102,8 +108,14 @@ describe("approving a phase", () => {
     assert.match(await pane.textContent(), /«secret:nomad_server@3f9a»/);
     assert.match(await pane.textContent(), /Rotates nomad_server/);
     assert.ok((await pane.locator(".step--destructive").count()) >= 4);
+    await close();
+  });
 
-    await approval.getByRole("button", { name: "Approve phase cloud…" }).click();
+  test("approves a phase from the plans panel once the phases before it finish", async () => {
+    const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
+    const pane = page.locator("#plans");
+    assert.equal(await pane.getByTestId("approval-waits").count(), 0);
+    await pane.locator(".panel__head").getByRole("button", { name: "Approve phase cloud…" }).click();
     const dialog = page.getByRole("dialog", { name: "Approve cloud of rollout #42" });
     await dialog.waitFor();
     const summary = await dialog.getByTestId("approval-summary").textContent();
@@ -155,16 +167,16 @@ describe("approving a phase", () => {
     await removals.locator("> summary").click();
     assert.match(await removals.locator(".plan-module__body .scope").first().textContent(), /^4 of 12 in cloud$/);
 
-    // Warnings are one block too, each a single wrapping line of text.
-    const warnings = fleet.locator("details.plan-module--warnings");
-    assert.match(await warnings.locator("> summary").textContent(), /2 warnings/);
-    await warnings.locator("> summary").click();
+    // Warnings are a banner above the plan, each a single wrapping line of text.
+    const warnings = page.locator("#plans").getByTestId("plan-warnings");
+    assert.equal(await fleet.locator("details.plan-module--warnings").count(), 0, "not a block of the plan");
+    assert.match(await warnings.textContent(), /2 warnings/);
     const long = warnings.locator(".step__text", { hasText: "released: left in place" });
     await long.waitFor();
     assert.equal(await long.locator(".fact").count(), 1, "the host's name reads as a placeholder");
     const box = await long.boundingBox();
-    const pane = await fleet.boundingBox();
-    assert.ok(box.x + box.width <= pane.x + pane.width + 1, "a long warning wraps inside the plan");
+    const pane = await warnings.boundingBox();
+    assert.ok(box.x + box.width <= pane.x + pane.width + 1, "a long warning wraps inside the banner");
 
     // Opening a module shows its diffs, host values as placeholders.
     await nomadHead.click();
@@ -188,7 +200,7 @@ describe("approving a phase", () => {
   });
 
   test("dialogs keep the keyboard and close on Escape", async () => {
-    const { page, close } = await open("/rollouts/42");
+    const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
     await page.getByRole("button", { name: "Approve cloud…" }).click();
     const dialog = page.getByRole("dialog");
     await dialog.waitFor();
@@ -232,11 +244,12 @@ describe("approving a phase", () => {
 
   test("a running rollout offers no reject, only abort", async () => {
     const { page, close } = await open("/rollouts/42");
-    await page.getByRole("button", { name: "Approve cloud…" }).waitFor();
+    await page.getByTestId("rollout-controls").waitFor();
     const { face, menu } = await decisions(page);
-    assert.equal(face, "Approve cloud…", "the approval waited on is the face");
+    assert.equal(face, "Pause", "no approval while an earlier phase runs");
+    assert.ok(!menu.some((m) => m.startsWith("Approve")));
     assert.ok(!menu.includes("Reject…"));
-    for (const want of ["Pause", "Retry", "Skip bake period…", "Roll back…", "Abort…"]) assert.ok(menu.includes(want), want);
+    for (const want of ["Retry", "Skip bake period…", "Roll back…", "Abort…"]) assert.ok(menu.includes(want), want);
     await close();
   });
 

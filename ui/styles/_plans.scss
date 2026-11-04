@@ -452,35 +452,26 @@
   }
 }
 
-// Each phase wanting an approval, above the plans they share: a left rule
-// in the approval colour, the phase's button at the end of its head.
-.approvals {
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-  margin-bottom: 0.9rem;
+// The approve button in the plans panel's head keeps its tooltip while
+// disabled (a disabled button gets no pointer events).
+.approval__button {
+  display: inline-flex;
 }
 
-.approval {
-  padding: 0.5rem 0 0.5rem 0.75rem;
-  border-left: 3px solid var(--info);
-
-  > p {
-    margin: 0.35rem 0 0;
-  }
-}
-
-.approval__head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.35rem 0.75rem;
-
-  .subhead {
-    margin: 0;
+// The plan's warnings, raised to a banner beside the approval notes.
+.plan-warnings {
+  .plan-warnings__head {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
   }
 
-  .btn {
-    margin-left: auto;
+  .steps {
+    margin: 0.3rem 0 0;
+  }
+
+  .step--warning {
+    padding-left: 0;
+    background: none;
   }
 }

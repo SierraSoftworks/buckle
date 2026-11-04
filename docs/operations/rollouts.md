@@ -73,30 +73,32 @@ appears. A phase without cross-layer `needs` is one stage, as before.
 ## 3. Review and approve
 
 A phase with `approval: required` (or `if_destructive`, when a plan removes or deletes something)
-waits at its gate. The rollout's **Plans** panel shows what every phase will do in one view, headed
-by an **Approve phase** block for each phase that wants an approval:
+waits at its gate. The rollout's **Plans** panel shows what every phase will do in one view, with
+an **Approve** button for the next phase that wants an approval in its head:
 
-- **Approve phase**: the hosts and distinct plans the approval binds, hosts it leaves out, and the
-  health gate that must hold on every updated host before the next phase starts.
+- **Notes**: what that approval leaves out (hosts without a plan yet), the plan's warnings, and the
+  phase's health gate. A phase is approved only once every phase before it has finished, so an
+  approval is never given blind; until then its button is disabled and a note says what it waits on.
 - **Across the fleet**: one entry per module, with the phases (or hosts) it changes; hover for the
   hosts by phase. Values that differ per host read as placeholders such as `«fact:host.id»`.
 - **By distinct plan**: hosts with identical plans grouped together by phase, destructive steps
   flagged.
 
-<Screenshot name="rollout-approval" alt="The Plans panel: an Approve phase block, then the plan across every phase by module" />
+<Screenshot name="rollout-approval" alt="The Plans panel: its Approve button, the approval's notes and warnings, then the plan across every phase by module" />
 
 Secrets never appear in a plan: a rotated secret shows as a token such as
 `«secret:nomad_server@3f9a»`, and a template that uses it as the lines it changes.
 
-Approve from the phase's **Approve…** button, or the split button at the top right of the rollout
-(or of the overview's latest rollout card) for the phase the rollout waits on. The dialog names the hosts, the destructive steps and the plan digests it binds; destructive
-steps must be acknowledged first, and the note goes into the audit log.
+Approve from the Plans panel's **Approve…** button, or the split button at the top right of the
+rollout (or of the overview's latest rollout card). The dialog names the hosts, the destructive
+steps and the plan digests it binds; destructive steps must be acknowledged first, and the note goes
+into the audit log.
 
 <Screenshot name="rollout-approve" alt="The approval dialog with its summary, destructive-step acknowledgement and audit note" />
 
 An approval binds the plans' digests: an agent refuses to apply any other plan, and a host whose
-plan changes after approval (its facts changed, say) asks again. An approval given while an earlier
-phase is still running is held until the rollout reaches the phase.
+plan changes after approval (its facts changed, say) asks again. The server refuses an approval
+while an earlier phase is still running.
 
 To refuse the plans instead, **Reject…** ends the rollout with your reason. Hosts updated in
 earlier phases keep the new revision.
