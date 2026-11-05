@@ -637,3 +637,31 @@ async fn ignored_fields_take_the_live_value_in_plans_and_applies() {
         "atuin:1@sha256:abc"
     );
 }
+
+#[tokio::test]
+async fn concurrent_index_writes_through_one_client_all_land() {
+    let fake = FakeNomad::new();
+    let nomad = fake.client();
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 0..16 {
+        let nomad = nomad.clone();
+        writes.spawn(async move {
+            let entry = index::Entry {
+                kind: Kind::Variable,
+                namespace: "default".into(),
+                name: format!("v{i}"),
+                module: format!("w{i}"),
+                revision: "r1".into(),
+                digest: String::new(),
+                items: Vec::new(),
+                id: None,
+                live_vars: Default::default(),
+            };
+            index::update(&nomad, "home", |e| index::upsert(e, entry.clone())).await
+        });
+    }
+    while let Some(result) = writes.join_next().await {
+        result.unwrap().unwrap();
+    }
+    assert_eq!(index::read(&nomad, "home").await.unwrap().entries.len(), 16);
+}

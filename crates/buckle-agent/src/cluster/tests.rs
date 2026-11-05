@@ -378,6 +378,29 @@ async fn workloads_deploy_concurrently_unless_one_waits_for_another(
     );
 }
 
+#[tokio::test]
+async fn concurrent_workloads_share_the_index_variable() {
+    // Each workload's variable writes an index entry.
+    let fake = FakeNomad::new();
+    let files: Vec<(String, String)> = (0..12)
+        .flat_map(|i| {
+            workload_files(
+                &format!("w{i}"),
+                &format!("variables:\n  nomad/jobs/w{i}:\n    A: '{i}'\n"),
+            )
+        })
+        .collect();
+    let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
+    let outcome = apply(&executor(&fake), &a).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    for i in 0..12 {
+        assert!(
+            fake.variable("default", &format!("nomad/jobs/w{i}"))
+                .is_some()
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_workload_needing_a_failed_one_does_not_start() {
     let fake = FakeNomad::new();

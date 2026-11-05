@@ -509,6 +509,8 @@ impl FakeNomad {
 #[async_trait]
 impl Transport for FakeNomad {
     async fn send(&self, request: Request) -> buckle_core::Result<Response> {
+        // Let concurrent callers interleave, as they would over a network.
+        tokio::task::yield_now().await;
         let (status, body) = self.handle(&request);
         Ok(Response {
             status,
