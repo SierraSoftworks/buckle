@@ -18,8 +18,8 @@ use super::modules_card::ModulesPanel;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    ActionsButton, Button, Confirm, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh,
-    RouteLink, icons, use_target_actions, use_toast,
+    Button, Confirm, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh, RouteLink, icons,
+    use_target_actions, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::format::{commit, relative_opt, timestamp};
@@ -182,9 +182,7 @@ pub fn cluster_page(props: &Props) -> Html {
 
     let actions = html! { <>
         <Refresh loading={detail.loading} reload={detail.reload.clone()} />
-        if let Some(on_run) = &on_action {
-            <ActionsButton actions={d.actions.clone()} on_run={on_run.clone()} testid="cluster-actions" />
-        }
+        // No head menu of actions: each is its workload's own, on its row.
         if admin {
             if c.status == HostStatus::Paused {
                 <Button onclick={open(Ask::Resume)}>{ "Resume" }</Button>

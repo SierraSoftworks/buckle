@@ -168,6 +168,8 @@ describe("every page renders in demo mode", () => {
     for (const panel of ["Health", "Latest run", "Notes"]) {
       assert.equal(await page.locator(".panel__title", { hasText: new RegExp(`^${panel}$`) }).count(), 0, panel);
     }
+    // Actions are each workload's own, on its row, not in the page's head.
+    assert.equal(await page.locator(".page-head").getByRole("button", { name: /Restart/ }).count(), 0);
     // Notes sit under the summary.
     const summary = page.locator(".panel", { has: page.getByRole("heading", { name: "Summary", exact: true }) });
     await summary.getByRole("textbox", { name: "Notes" }).waitFor();
@@ -232,6 +234,8 @@ describe("every page renders in demo mode", () => {
     for (const panel of ["Summary", "Labels", "Modules", "Drift", "Recent runs", "Facts"]) {
       await page.getByRole("heading", { name: panel, exact: true }).waitFor();
     }
+    const titles = await page.locator(".panel__title").allTextContents();
+    assert.ok(titles.indexOf("Drift") < titles.indexOf("Modules"), "drift reads before the modules");
     // A module with drift starts open, tagging each resource for cleanup or not.
     const swappiness = page.locator("#modules .run-step[data-resource='sysctl.param[vm.swappiness]']");
     await swappiness.waitFor();

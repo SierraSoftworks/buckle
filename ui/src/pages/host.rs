@@ -312,8 +312,6 @@ pub fn host_page(props: &Props) -> Html {
                 </Panel>
                 <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
             </div>
-            <ModulesPanel detail={d.clone()} on_action={module_actions.clone()} newest={newest.clone()} picked={(*picked).clone()}
-                on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             if !d.drift.is_empty() || h.drifted {
                 <Panel title="Drift" subtitle="What the latest drift check found different from the applied revision">
                     if d.drift.is_empty() {
@@ -331,6 +329,8 @@ pub fn host_page(props: &Props) -> Html {
                     }) }
                 </Panel>
             }
+            <ModulesPanel detail={d.clone()} on_action={module_actions.clone()} newest={newest.clone()} picked={(*picked).clone()}
+                on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             <Panel title="Recent runs">{ runs(&d, now, shown, &{
                 let picked = picked.clone();
                 let newest = newest.clone();
@@ -713,18 +713,20 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                         <Note>{ "A rollout is in progress: the change applies to the next rollout's selection and does not move this host between phases mid-flight." }</Note>
                     }
                     if let Some(e) = &*save_error { <Note kind={NoteKind::Danger}>{ e.clone() }</Note> }
-                    // Beside an aside, offered once there is something to save.
-                    if props.admin && (props.aside.is_none() || !changed.is_empty()) {
-                        <div class="row-actions">
-                            <Button kind={Kind::Primary} onclick={save} busy={*saving} disabled={changed.is_empty() || wanted.is_none()}>{ "Save labels" }</Button>
-                            <Button kind={Kind::Subtle} onclick={reset} disabled={changed.is_empty()}>{ "Discard" }</Button>
-                        </div>
-                    }
                 </div>
             </div>
     };
+    // In the card's head like every other control, once there is something to save.
+    let actions = if props.admin && (!changed.is_empty() || wanted.is_none()) {
+        html! { <>
+            <Button small=true kind={Kind::Subtle} onclick={reset}>{ "Discard" }</Button>
+            <Button small=true kind={Kind::Primary} onclick={save} busy={*saving} disabled={wanted.is_none()}>{ "Save labels" }</Button>
+        </> }
+    } else {
+        html! {}
+    };
     html! {
-        <Panel title="Labels" subtitle="Operator labels win over the agent's own">
+        <Panel title="Labels" subtitle="Operator labels win over the agent's own" {actions}>
             { labels }
         </Panel>
     }
@@ -741,68 +743,132 @@ pub(super) struct NotesProps {
     pub embedded: bool,
 }
 
+/// How long typing pauses before notes save themselves.
+const NOTES_SAVE_AFTER_MS: u32 = 800;
+
+/// Where the notes stand against the server, said beside the box.
+#[derive(Clone, PartialEq)]
+enum NotesStatus {
+    Idle,
+    Saving,
+    Saved,
+    Failed(String),
+}
+
+/// Notes that save themselves: shortly after typing pauses, when the box
+/// loses focus, or when the page goes, and only when they changed. A reload
+/// never overwrites what is still being typed.
 #[function_component(NotesEditor)]
 pub(super) fn notes_editor(props: &NotesProps) -> Html {
-    let toast = use_toast();
     let draft = use_state(|| props.notes.clone());
-    let saving = use_state(|| false);
-    {
-        let draft = draft.clone();
-        use_effect_with(props.notes.clone(), move |n| {
-            draft.set(n.clone());
-            || ()
-        });
-    }
-    let oninput = {
-        let draft = draft.clone();
-        Callback::from(move |e: InputEvent| {
-            draft.set(e.target_unchecked_into::<HtmlTextAreaElement>().value())
-        })
-    };
-    let save = {
-        let (draft, saving, toast, on_saved, id) = (
-            draft.clone(),
-            saving.clone(),
-            toast.clone(),
+    let status = use_state(|| NotesStatus::Idle);
+    // The box's text, what the server holds, whose notes they are and the
+    // pending save, read by callbacks that outlive a render.
+    let typed = use_mut_ref(|| props.notes.clone());
+    let synced = use_mut_ref(|| props.notes.clone());
+    let owner = use_mut_ref(|| props.id.clone());
+    let timer = use_mut_ref(|| None::<gloo_timers::callback::Timeout>);
+
+    let flush = {
+        let (typed, synced, owner, timer, status, on_saved) = (
+            typed.clone(),
+            synced.clone(),
+            owner.clone(),
+            timer.clone(),
+            status.clone(),
             props.on_saved.clone(),
-            props.id.clone(),
         );
-        Callback::from(move |_: MouseEvent| {
-            let (notes, saving, toast, on_saved, id) = (
-                (*draft).clone(),
-                saving.clone(),
-                toast.clone(),
+        Callback::from(move |()| {
+            timer.borrow_mut().take();
+            let notes = typed.borrow().clone();
+            if notes == *synced.borrow() {
+                return;
+            }
+            let (synced, status, on_saved, id) = (
+                synced.clone(),
+                status.clone(),
                 on_saved.clone(),
-                id.clone(),
+                owner.borrow().clone(),
             );
-            saving.set(true);
+            status.set(NotesStatus::Saving);
             wasm_bindgen_futures::spawn_local(async move {
-                match api::patch_host(
-                    &id,
-                    &HostPatch {
-                        notes: Some(notes),
-                        ..Default::default()
-                    },
-                )
-                .await
-                {
+                let patch = HostPatch {
+                    notes: Some(notes.clone()),
+                    ..Default::default()
+                };
+                match api::patch_host(&id, &patch).await {
                     Ok(_) => {
-                        toast.ok("Notes saved.");
+                        *synced.borrow_mut() = notes;
+                        status.set(NotesStatus::Saved);
                         on_saved.emit(());
                     }
-                    Err(e) => toast.error(format!("Notes not saved: {e}")),
+                    Err(e) => status.set(NotesStatus::Failed(e.to_string())),
                 }
-                saving.set(false);
             });
         })
     };
+    // Another target starts afresh; the server's notes replace the box's
+    // only while nothing unsaved is in it.
+    {
+        let (draft, typed, synced, owner, status) = (
+            draft.clone(),
+            typed.clone(),
+            synced.clone(),
+            owner.clone(),
+            status.clone(),
+        );
+        use_effect_with(
+            (props.id.clone(), props.notes.clone()),
+            move |(id, notes)| {
+                let moved = *owner.borrow() != *id;
+                if moved || *typed.borrow() == *synced.borrow() {
+                    *owner.borrow_mut() = id.clone();
+                    *typed.borrow_mut() = notes.clone();
+                    *synced.borrow_mut() = notes.clone();
+                    draft.set(notes.clone());
+                    if moved {
+                        status.set(NotesStatus::Idle);
+                    }
+                }
+                || ()
+            },
+        );
+    }
+    // What is still unsaved is saved on the way out.
+    {
+        let flush = flush.clone();
+        use_effect_with((), move |_| move || flush.emit(()));
+    }
+    let oninput = {
+        let (draft, typed, timer, flush) =
+            (draft.clone(), typed.clone(), timer.clone(), flush.clone());
+        Callback::from(move |e: InputEvent| {
+            let text = e.target_unchecked_into::<HtmlTextAreaElement>().value();
+            *typed.borrow_mut() = text.clone();
+            draft.set(text);
+            let flush = flush.clone();
+            *timer.borrow_mut() = Some(gloo_timers::callback::Timeout::new(
+                NOTES_SAVE_AFTER_MS,
+                move || flush.emit(()),
+            ));
+        })
+    };
+    let onblur = flush.reform(|_: FocusEvent| ());
+    let unsaved = *draft != *synced.borrow();
+    let note = match (&*status, unsaved) {
+        (NotesStatus::Saving, _) => html! { <span class="muted small">{ "Saving…" }</span> },
+        (NotesStatus::Failed(e), _) => {
+            html! { <span class="text-danger small">{ format!("Not saved: {e}") }</span> }
+        }
+        (_, true) => html! { <span class="muted small">{ "Unsaved" }</span> },
+        (NotesStatus::Saved, false) => html! { <span class="muted small">{ "Saved" }</span> },
+        (NotesStatus::Idle, false) => html! {},
+    };
     let body = html! { <>
             if props.admin {
-                <textarea class="input notes" rows="4" value={(*draft).clone()} {oninput} aria-label="Notes"
-                    placeholder="Anything the next operator should know." />
-                <div class="row-actions">
-                    <Button small=true onclick={save} busy={*saving} disabled={*draft == props.notes}>{ "Save notes" }</Button>
-                </div>
+                <textarea class="input notes" rows="4" value={(*draft).clone()} {oninput} {onblur} aria-label="Notes"
+                    placeholder="Anything the next operator should know; saved as you type." />
+                <p class="notes-status" data-testid="notes-status" aria-live="polite">{ note }</p>
             } else if props.notes.is_empty() {
                 <p class="muted">{ "No notes." }</p>
             } else {
