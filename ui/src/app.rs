@@ -24,6 +24,10 @@ pub enum Route {
     Hosts,
     #[at("/hosts/:id")]
     Host { id: String },
+    #[at("/workloads")]
+    Workloads,
+    #[at("/workloads/:name")]
+    Workload { name: String },
     #[at("/clusters")]
     Clusters,
     #[at("/clusters/:id")]
@@ -45,6 +49,15 @@ impl Route {
                 Route::Cluster { id: id.to_owned() }
             }
             buckle_api::TargetKind::Host => Route::Host { id: id.to_owned() },
+        }
+    }
+
+    /// A rollout unit's page: a placement opens its workload, else the
+    /// target's own page.
+    pub fn unit(entry: &buckle_api::RolloutHost) -> Route {
+        match &entry.workload {
+            Some(name) => Route::Workload { name: name.clone() },
+            None => Route::target(&entry.host, entry.kind),
         }
     }
 
@@ -175,6 +188,8 @@ fn switch(route: Route) -> Html {
         Route::Rollout { id } => html! { <pages::rollout::RolloutPage {id} /> },
         Route::Hosts => html! { <pages::hosts::Hosts /> },
         Route::Host { id } => html! { <pages::host::HostPage {id} /> },
+        Route::Workloads => html! { <pages::workloads::Workloads /> },
+        Route::Workload { name } => html! { <pages::workload::WorkloadPage {name} /> },
         Route::Clusters => html! { <pages::clusters::Clusters /> },
         Route::Cluster { id } => html! { <pages::cluster::ClusterPage {id} /> },
         // Revisions and rollouts are one history now.

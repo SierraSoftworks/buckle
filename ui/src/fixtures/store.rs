@@ -237,12 +237,12 @@ pub fn rollout_host_report(id: &str, host: &str) -> Result<RunReport, ApiError> 
             r.phases
                 .iter()
                 .flat_map(|p| &p.hosts)
-                .find(|h| h.host == host)
+                .find(|h| crate::logic::units::key(h) == host)
                 .and_then(|h| h.run_id.clone())
         })
     })?
     .ok_or_else(|| ApiError::NotFound(format!("{host} has no run in rollout {id}.")))?;
-    host_run(host, &run)
+    host_run(buckle_api::split_placement_key(host).0, &run)
 }
 
 pub fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> {
@@ -695,8 +695,9 @@ fn event(kind: &str, message: String, host: Option<&str>, phase: Option<&str>) -
         at: Utc::now(),
         kind: kind.into(),
         message,
-        host: host.map(Into::into),
-        workload: None,
+        // A placement's `cluster/workload` key names both, as the server does.
+        host: host.map(|h| buckle_api::split_placement_key(h).0.into()),
+        workload: host.and_then(|h| buckle_api::split_placement_key(h).1.map(Into::into)),
         phase: phase.map(Into::into),
         actor: Some(actor()),
     }
@@ -961,7 +962,7 @@ fn host_entry(
         .phases
         .iter_mut()
         .flat_map(|p| p.hosts.iter_mut())
-        .find(|h| h.host == host)
+        .find(|h| crate::logic::units::key(h) == host)
         .ok_or_else(|| ApiError::NotFound(format!("Host '{host}' is not in rollout {id}.")))?;
     let message = f(entry)?;
     entry.updated_at = Utc::now();

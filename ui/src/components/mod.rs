@@ -21,6 +21,7 @@ pub mod plan;
 pub mod revision;
 pub mod run_action;
 pub mod run_report;
+pub mod segmented;
 pub mod shell;
 pub mod split_button;
 pub mod theme;
@@ -44,6 +45,7 @@ pub use plan::PlanGroupView;
 pub use revision::{RevisionLog, use_revision_actions};
 pub use run_action::RunAction;
 pub use run_report::RunReportView;
+pub use segmented::Segmented;
 pub use split_button::{MenuItem, SplitButton};
 pub use toast::{ToastHost, use_toast};
 pub use ui::{

@@ -114,14 +114,14 @@ pub fn approval_scope(phase_hosts: &[&RolloutHost], plans: &[PlanGroup]) -> Appr
     for host in phase_hosts {
         let group = plans.iter().position(|g| {
             host.plan_digest.as_deref() == Some(g.digest.as_str())
-                || (host.plan_digest.is_none() && g.hosts.contains(&host.host))
+                || (host.plan_digest.is_none() && g.hosts.contains(&super::units::key(host)))
         });
         match group {
             Some(i) => {
                 used.insert(i);
-                scope.hosts.push(host.host.clone());
+                scope.hosts.push(super::units::key(host));
             }
-            None => scope.without_plan.push(host.host.clone()),
+            None => scope.without_plan.push(super::units::key(host)),
         }
     }
     for i in used {

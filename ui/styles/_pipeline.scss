@@ -76,10 +76,33 @@
     margin: 0.25rem 0 0.1rem;
   }
 
+  // Blocks wrap inside the column: never wider than --per-row blocks, and
+  // sooner when the column is narrower than that.
   &__blocks {
-    display: grid;
-    grid-template-columns: repeat(var(--per-row, 4), var(--block));
+    display: flex;
+    flex-wrap: wrap;
     gap: var(--block-gap);
+    max-width: calc(var(--per-row, 4) * (var(--block) + var(--block-gap)));
+  }
+
+  // A cluster's workloads, below the stage's hosts.
+  &__cluster {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+
+  &__cluster-label {
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--fg-3);
+    text-decoration: none;
+
+    &:hover {
+      color: var(--fg-2);
+    }
   }
 
   &__empty {
@@ -292,6 +315,13 @@
   &--waiting {
     background: transparent;
     border: 1px dashed var(--info);
+  }
+
+  // Its plan changes nothing: solid grey whatever its state, so the eye
+  // lands on what moves.
+  &--unchanged {
+    background: var(--unchanged);
+    border-color: transparent;
   }
 
   &--waived::after {

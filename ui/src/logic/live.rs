@@ -137,7 +137,7 @@ pub fn apply_rollout(detail: &mut RolloutDetail, event: &LiveEvent) {
             let current = detail.phases.iter().enumerate().find_map(|(i, p)| {
                 p.hosts
                     .iter()
-                    .position(|h| h.host == host.host)
+                    .position(|h| super::units::same(h, host))
                     .map(|j| (i, j))
             });
             match (current, target) {

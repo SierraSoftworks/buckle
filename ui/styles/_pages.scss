@@ -901,3 +901,37 @@
     gap: 0.4rem;
   }
 }
+
+// Workloads: a placement chip per cluster, its dot in the placement's tone.
+.dot {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tone, var(--neutral));
+}
+
+.placement-chip {
+  text-decoration: none;
+}
+
+.workloads__health .meter {
+  width: 120px;
+}
+
+.workload-summary {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.4rem 1rem;
+  margin: 0;
+  font-size: 0.85rem;
+
+  dt {
+    color: var(--fg-2);
+  }
+
+  dd {
+    margin: 0;
+  }
+}

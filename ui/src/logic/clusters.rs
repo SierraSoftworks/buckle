@@ -239,9 +239,9 @@ pub fn track_deploying(status: &mut ClusterStatus, p: &RunProgress) {
 /// What a target in a rollout waits for before it is planned and applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waiting {
-    /// The targets of an earlier dependency stage of its phase that have
-    /// not finished (a cluster waits for the hosts its workloads need).
-    Stage { stage: u32, on: Vec<String> },
+    /// The units of an earlier dependency step of its stage that have not
+    /// finished (a workload waits for the hosts or workloads it needs).
+    Step { step: u32, on: Vec<String> },
     /// Its stage is open, but no connected host can speak for the cluster.
     Executor,
 }
@@ -249,7 +249,7 @@ pub enum Waiting {
 impl Waiting {
     pub fn describe(&self) -> String {
         match self {
-            Waiting::Stage { on, .. } => {
+            Waiting::Step { on, .. } => {
                 const SHOWN: usize = 3;
                 let mut names: Vec<&str> = on.iter().take(SHOWN).map(String::as_str).collect();
                 let more = on.len().saturating_sub(SHOWN);
@@ -280,16 +280,17 @@ pub fn waiting(phase: &RolloutPhase, entry: &RolloutHost) -> Option<Waiting> {
     let on: Vec<String> = phase
         .hosts
         .iter()
-        .filter(|h| h.step < entry.step && !through(h.state))
-        .map(|h| h.host.clone())
+        // A unit that changes nothing holds nobody up.
+        .filter(|h| h.step < entry.step && !through(h.state) && !super::units::unchanged(h))
+        .map(|h| super::units::name(h).to_owned())
         .collect();
     if !on.is_empty() {
-        return Some(Waiting::Stage {
-            stage: entry.step,
+        return Some(Waiting::Step {
+            step: entry.step,
             on,
         });
     }
-    (entry.kind == TargetKind::Cluster && entry.executor.is_none()).then_some(Waiting::Executor)
+    (entry.kind != TargetKind::Host && entry.executor.is_none()).then_some(Waiting::Executor)
 }
 
 #[cfg(test)]
@@ -511,12 +512,12 @@ mod tests {
         assert!(s.deploying.is_empty(), "a finished run deploys nothing");
     }
 
-    fn entry(host: &str, stage: u32, state: HostRolloutState, kind: TargetKind) -> RolloutHost {
+    fn entry(host: &str, step: u32, state: HostRolloutState, kind: TargetKind) -> RolloutHost {
         let mut e: RolloutHost = serde_json::from_value(serde_json::json!({
             "host": host, "phase": "home", "state": state, "updated_at": t(0),
         }))
         .unwrap();
-        e.step = stage;
+        e.step = step;
         e.kind = kind;
         e
     }
@@ -528,8 +529,8 @@ mod tests {
             (
                 HostRolloutState::Applying,
                 None,
-                Some(Waiting::Stage {
-                    stage: 1,
+                Some(Waiting::Step {
+                    step: 1,
                     on: vec!["pi-1".into()],
                 }),
             ),
@@ -570,8 +571,8 @@ mod tests {
 
     #[test]
     fn a_long_wait_names_a_few_and_counts_the_rest() {
-        let w = Waiting::Stage {
-            stage: 1,
+        let w = Waiting::Step {
+            step: 1,
             on: (1..=5).map(|i| format!("pi-{i}")).collect(),
         };
         assert_eq!(w.describe(), "waits for pi-1, pi-2, pi-3, 2 more");

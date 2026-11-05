@@ -28,10 +28,10 @@ describe("every page renders in demo mode", () => {
     const drawn = await page.locator(".overview__fleet a.block").count();
     const hosts = Number((await bar.locator(".fleet-bar__total").first().textContent()).match(/\d+/)[0]);
     const pending = Number((legend.match(/(\d+) awaiting approval/) ?? [0, 0])[1]);
-    // Cluster targets are drawn beside the hosts but are not counted with them.
-    const clusters = await page.locator('.overview__fleet a.block').filter({ has: page.locator(".block__name", { hasText: /-nomad$/ }) }).count();
-    assert.equal(drawn - clusters, hosts + pending, "every host in the fleet is on the map");
-    assert.ok(clusters >= 1, "clusters are on the map");
+    // Workloads are drawn beside the hosts but are not counted with them.
+    const workloads = await page.locator(".overview__fleet a.block.block--cluster").count();
+    assert.equal(drawn - workloads, hosts + pending, "every host in the fleet is on the map");
+    assert.ok(workloads >= 1, "workloads are on the map");
     assert.equal(await page.locator(".gitlog__item").count(), 5);
     await close();
   });
@@ -158,12 +158,37 @@ describe("every page renders in demo mode", () => {
     await close();
   });
 
+  test("workloads list each workload once across its clusters, opening its page", async () => {
+    const { page, close } = await open("/workloads");
+    assert.equal(await heading(page), "Workloads");
+    await page.getByRole("navigation").getByRole("link", { name: "Workloads" }).waitFor();
+    const rows = page.getByTestId("workloads-table").locator("tbody tr");
+    await rows.first().waitFor();
+    // The worst first: atuin is deploying.
+    assert.equal(await rows.first().getAttribute("data-workload"), "atuin");
+    const paste = page.locator('tr[data-workload="paste"]');
+    const chips = await paste.locator(".placement-chip").evaluateAll((els) => els.map((e) => e.dataset.host));
+    assert.deepEqual(chips, ["home-nomad", "lab-nomad"], "one chip per cluster it runs on");
+    await page.getByRole("searchbox", { name: "Search workloads" }).fill("lab");
+    await eventually(async () => assert.equal(await rows.count(), 2));
+    await paste.locator(".placement-chip", { hasText: "lab-nomad" }).click();
+    assert.equal(await heading(page), "paste");
+    assert.match(page.url(), /\/workloads\/paste\?cluster=lab-nomad/);
+    // One card per cluster, each the cluster's row for it, opened.
+    for (const c of ["home-nomad", "lab-nomad"]) {
+      await page.locator(`#on-${c} tr[data-workload="paste"]`).waitFor();
+      await page.locator(`#on-${c} tr[data-detail-of="paste"]`).waitFor();
+    }
+    assert.match(await page.getByTestId("workload-rollout").textContent(), /home-nomad: unchanged/);
+    await close();
+  });
+
   test("clusters list their workloads and executor, those needing a look first", async () => {
     const { page, close } = await open("/clusters");
     assert.equal(await heading(page), "Clusters");
     const rows = page.getByTestId("clusters-table").locator("tbody tr");
     await rows.first().waitFor();
-    assert.match(await page.locator(".page-head").textContent(), /2 clusters · 4 workloads · 1 needs attention/);
+    assert.match(await page.locator(".page-head").textContent(), /2 clusters · 5 workloads · 1 needs attention/);
     // lab-nomad has a workload and no host to speak for it.
     assert.equal(await rows.first().getAttribute("data-host"), "lab-nomad");
     assert.match(await rows.first().textContent(), /added through the API/);

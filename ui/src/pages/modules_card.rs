@@ -12,6 +12,8 @@ use yew::prelude::*;
 
 use super::host::check_row;
 use crate::api;
+use crate::app::Route;
+use crate::components::RouteLink;
 use crate::components::blueprint::resource_steps;
 use crate::components::changes::Took;
 use crate::components::run_report::{health_bar, module_steps, removal_steps, run_summary};
@@ -43,6 +45,9 @@ pub(super) struct ModulesProps {
     pub newest: Option<String>,
     /// The run the reader picked; `None` follows the newest.
     pub picked: Option<String>,
+    /// Only this workload's row, opened (a workload page's placement card).
+    #[prop_or_default]
+    pub only: Option<String>,
     pub on_pick: Callback<Option<String>>,
 }
 
@@ -82,11 +87,14 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
             || ()
         });
     }
-    let rows = if cluster {
+    let mut rows = if cluster {
         workload_rows(d, d.latest_run.as_ref())
     } else {
         module_rows(d, run.or(d.latest_run.as_ref()))
     };
+    if let Some(only) = &props.only {
+        rows.retain(|r| r.name == *only);
+    }
     let failing = rows
         .iter()
         .filter(|r| r.state == WorkloadState::Failing)
@@ -113,6 +121,16 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
             " · {deploying} {}",
             if cluster { "deploying" } else { "applying" }
         ));
+    }
+    if props.only.is_some() {
+        subtitle = format!(
+            "How it reads on this cluster and what {} did",
+            if older {
+                "the run shown"
+            } else {
+                "the cluster's latest run"
+            }
+        );
     }
     let head = match (&shown, run, &feed.error) {
         (None, _, _) => html! {},
@@ -162,7 +180,8 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
                                 .find(|(n, _)| *n == r.name)
                                 .map(|(_, o)| *o)
                                 .unwrap_or_else(|| {
-                                    r.state == WorkloadState::Failing
+                                    props.only.is_some()
+                                        || r.state == WorkloadState::Failing
                                         || module.is_some_and(expanded_by_default)
                                         || d.drift.iter().any(|x| x.module == r.name)
                                 });
@@ -206,7 +225,12 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
         }
     };
     html! {
-        <Panel title={if cluster { "Workloads" } else { "Modules" }} id={many} {subtitle} actions={html! { <>{ back.unwrap_or_default() }{ picker }</> }}>
+        <Panel title={match &props.only {
+                Some(_) => format!("On {}", d.summary.id),
+                None => (if cluster { "Workloads" } else { "Modules" }).to_owned(),
+            }}
+            id={match &props.only { Some(_) => format!("on-{}", d.summary.id), None => many.to_owned() }}
+            {subtitle} actions={html! { <>{ back.unwrap_or_default() }{ picker }</> }}>
             { head }
             { body }
         </Panel>
@@ -286,7 +310,7 @@ fn workload_detail(
     }
 }
 
-fn state_pill(r: &WorkloadRow, cluster: bool) -> Html {
+pub(super) fn state_pill(r: &WorkloadRow, cluster: bool) -> Html {
     match r.state {
         WorkloadState::Failing => {
             html! { <Pill tone={Tone::Danger} label="failing" title={r.reason.clone()} /> }
@@ -321,7 +345,12 @@ fn workload_row(
             data-workload={cluster.then(|| r.name.clone())} data-module={(!cluster).then(|| r.name.clone())}
             data-state={r.state.label().replace(' ', "-")} onclick={toggle.clone()}>
             <td>
-                <span class="mono strong">{ r.name.clone() }</span>
+                if cluster {
+                    <RouteLink to={Route::Workload { name: r.name.clone() }} query={vec![("cluster".to_owned(), d.summary.id.clone())]}
+                        classes={classes!("mono", "strong")}>{ r.name.clone() }</RouteLink>
+                } else {
+                    <span class="mono strong">{ r.name.clone() }</span>
+                }
                 if !r.description.is_empty() { <span class="cell-sub">{ r.description.clone() }</span> }
                 if !r.needs.is_empty() { <span class="cell-sub">{ format!("needs {}", r.needs.join(", ")) }</span> }
             </td>

@@ -5,8 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::units;
 use buckle_api::{
     HostRolloutState, HostSummary, PhaseState, PlanGroup, RolloutDetail, RolloutHost, RolloutPhase,
+    TargetKind,
 };
 
 /// The fewest blocks a row holds: a stage column is never narrower than its
@@ -81,21 +83,39 @@ pub struct StageCounts {
     pub needs_approval: usize,
     pub skipped: usize,
     pub rolled_back: usize,
+    /// Units whose plan changes nothing (drawn grey).
+    pub unchanged: usize,
+}
+
+/// A cluster's units within a stage: its placements (or its one cluster
+/// row, from a rollout before placements), drawn under the cluster's name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterSection<'a> {
+    pub cluster: &'a str,
+    pub units: Vec<&'a RolloutHost>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stage<'a> {
     pub phase: &'a RolloutPhase,
-    /// The blocks, row by row.
-    pub rows: Vec<Vec<&'a RolloutHost>>,
+    /// The stage's hosts, drawn first.
+    pub targets: Vec<&'a RolloutHost>,
+    /// Then one section per cluster, by name.
+    pub clusters: Vec<ClusterSection<'a>>,
+    /// How many blocks a row holds before wrapping (the widest the column
+    /// grows to; a narrower column wraps sooner).
     pub per_row: usize,
     pub counts: StageCounts,
     pub gate: Gate,
 }
 
 impl Stage<'_> {
+    /// Every unit of the stage: its hosts, then each cluster's.
     pub fn hosts(&self) -> impl Iterator<Item = &RolloutHost> {
-        self.rows.iter().flatten().copied()
+        self.targets
+            .iter()
+            .copied()
+            .chain(self.clusters.iter().flat_map(|c| c.units.iter().copied()))
     }
 }
 
@@ -124,12 +144,12 @@ pub fn per_row(n: usize) -> usize {
 pub fn layout<'a>(detail: &'a RolloutDetail) -> Pipeline<'a> {
     let names: BTreeSet<&str> = detail.phases.iter().map(|p| p.name.as_str()).collect();
 
-    // host → (stage index, entry)
-    let mut chosen: BTreeMap<&str, (usize, &RolloutHost)> = BTreeMap::new();
-    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    // unit → (stage index, entry)
+    let mut chosen: BTreeMap<String, (usize, &RolloutHost)> = BTreeMap::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for (index, phase) in detail.phases.iter().enumerate() {
         for entry in &phase.hosts {
-            *seen.entry(entry.host.as_str()).or_default() += 1;
+            *seen.entry(units::key(entry)).or_default() += 1;
             let stage = if names.contains(entry.phase.as_str()) {
                 detail
                     .phases
@@ -139,10 +159,10 @@ pub fn layout<'a>(detail: &'a RolloutDetail) -> Pipeline<'a> {
             } else {
                 index
             };
-            match chosen.get(entry.host.as_str()) {
+            match chosen.get(&units::key(entry)) {
                 Some((_, current)) if current.updated_at >= entry.updated_at => {}
                 _ => {
-                    chosen.insert(entry.host.as_str(), (stage, entry));
+                    chosen.insert(units::key(entry), (stage, entry));
                 }
             }
         }
@@ -159,16 +179,41 @@ pub fn layout<'a>(detail: &'a RolloutDetail) -> Pipeline<'a> {
         .zip(members)
         .map(|(phase, mut hosts)| {
             hosts.sort_by(|a, b| {
-                (a.wave.unwrap_or(u32::MAX), &a.host).cmp(&(b.wave.unwrap_or(u32::MAX), &b.host))
+                (a.wave.unwrap_or(u32::MAX), &a.host, &a.workload).cmp(&(
+                    b.wave.unwrap_or(u32::MAX),
+                    &b.host,
+                    &b.workload,
+                ))
             });
-            let per_row = per_row(hosts.len());
             let counts = counts(&hosts);
             let gate = gate(phase, &hosts, &detail.plans);
-            let rows = hosts.chunks(per_row).map(<[_]>::to_vec).collect();
+            let (targets, rest): (Vec<_>, Vec<_>) =
+                hosts.into_iter().partition(|h| h.kind == TargetKind::Host);
+            let mut clusters: Vec<ClusterSection> = Vec::new();
+            for unit in rest {
+                match clusters.iter_mut().find(|c| c.cluster == unit.host) {
+                    Some(c) => c.units.push(unit),
+                    None => clusters.push(ClusterSection {
+                        cluster: &unit.host,
+                        units: vec![unit],
+                    }),
+                }
+            }
+            clusters.sort_by_key(|c| c.cluster);
+            for c in &mut clusters {
+                c.units.sort_by_key(|u| units::name(u));
+            }
+            let widest = clusters
+                .iter()
+                .map(|c| c.units.len())
+                .chain([targets.len()])
+                .max()
+                .unwrap_or(0);
             Stage {
                 phase,
-                rows,
-                per_row,
+                targets,
+                clusters,
+                per_row: per_row(widest),
                 counts,
                 gate,
             }
@@ -178,7 +223,7 @@ pub fn layout<'a>(detail: &'a RolloutDetail) -> Pipeline<'a> {
     let duplicates = seen
         .into_iter()
         .filter(|(_, n)| *n > 1)
-        .map(|(host, _)| host.to_string())
+        .map(|(host, _)| host)
         .collect();
 
     Pipeline { stages, duplicates }
@@ -205,19 +250,18 @@ fn counts(hosts: &[&RolloutHost]) -> StageCounts {
         if h.needs_approval {
             c.needs_approval += 1;
         }
+        if units::unchanged(h) {
+            c.unchanged += 1;
+        }
     }
     c
 }
 
 /// Whether any distinct plan used by these hosts is destructive.
 pub fn destructive_in(hosts: &[&RolloutHost], plans: &[PlanGroup]) -> bool {
-    hosts.iter().any(|h| {
-        plans.iter().any(|g| {
-            g.destructive
-                && (h.plan_digest.as_deref() == Some(g.digest.as_str())
-                    || g.hosts.contains(&h.host))
-        })
-    })
+    hosts
+        .iter()
+        .any(|h| plans.iter().any(|g| g.destructive && units::in_group(g, h)))
 }
 
 /// Whether any distinct plan used by these hosts has a deferred module, whose
@@ -226,9 +270,7 @@ pub fn destructive_in(hosts: &[&RolloutHost], plans: &[PlanGroup]) -> bool {
 fn deferred_in(hosts: &[&RolloutHost], plans: &[PlanGroup]) -> bool {
     hosts.iter().any(|h| {
         plans.iter().any(|g| {
-            g.plan.as_ref().is_some_and(|p| !p.deferred.is_empty())
-                && (h.plan_digest.as_deref() == Some(g.digest.as_str())
-                    || g.hosts.contains(&h.host))
+            g.plan.as_ref().is_some_and(|p| !p.deferred.is_empty()) && units::in_group(g, h)
         })
     })
 }
@@ -574,9 +616,51 @@ mod tests {
             vec![phase("cloud", PhaseState::Pending, "auto", hosts)],
             vec![],
         );
+        assert_eq!(layout(&d).stages[0].per_row, 5);
+    }
+
+    fn placement(cluster: &str, workload: &str, changes: u32) -> RolloutHost {
+        let mut p = host(cluster, "apps", HostRolloutState::Planned, 1);
+        p.kind = TargetKind::Workload;
+        p.workload = Some(workload.into());
+        p.plan_changes = Some(changes);
+        p.plan_removals = Some(0);
+        p
+    }
+
+    #[test]
+    fn hosts_come_first_then_a_section_per_cluster() {
+        let d = detail(
+            vec![phase(
+                "apps",
+                PhaseState::Running,
+                "auto",
+                vec![
+                    placement("nomad", "loki", 1),
+                    placement("k3s", "paste", 0),
+                    host("pi-1", "apps", HostRolloutState::Pending, 1),
+                    placement("nomad", "grafana", 0),
+                ],
+            )],
+            vec![],
+        );
         let p = layout(&d);
-        let rows: Vec<usize> = p.stages[0].rows.iter().map(Vec::len).collect();
-        assert_eq!(rows, vec![5, 5, 3]);
+        let st = &p.stages[0];
+        assert_eq!(names(st)[0], "pi-1", "hosts lead the stage");
+        let sections: Vec<(&str, Vec<&str>)> = st
+            .clusters
+            .iter()
+            .map(|c| (c.cluster, c.units.iter().map(|u| units::name(u)).collect()))
+            .collect();
+        assert_eq!(
+            sections,
+            vec![("k3s", vec!["paste"]), ("nomad", vec!["grafana", "loki"])]
+        );
+        assert_eq!((st.counts.total, st.counts.unchanged), (4, 2));
+        assert!(
+            p.duplicates.is_empty(),
+            "placements of one cluster are distinct"
+        );
     }
 
     #[test]

@@ -27,6 +27,10 @@ cluster's spec and secrets before each request, and ownership is read back from 
 `health` checks, `restart_on` and cluster `scope` are not yet applied by executors.
 :::
 
+In the UI, **Workloads** lists every workload across the fleet with how it reads on each
+cluster that runs it; a workload's page has one card per cluster with its checks, its latest run,
+its resources and its actions. A rollout draws each workload on each cluster as a unit of its own.
+
 ## workload.yaml
 
 ```yaml

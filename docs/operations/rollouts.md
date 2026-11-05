@@ -29,9 +29,12 @@ according to `rollout.supersede`.
 ## 2. Watch the pipeline
 
 Every targeted agent sends a plan, then each phase applies in waves of `parallel` hosts. The
-pipeline shows each phase as a stage, its hosts as blocks, and an approval gate before each stage
-that needs one: approved, needs approval, or waiting. The health check between stages is drawn only
-when it holds the rollout (paused).
+pipeline shows each phase as a stage: its hosts first as square blocks, then a section per cluster
+(headed by the cluster's name) with each workload as a round block, wrapping inside the stage. A
+unit whose plan changes nothing is solid grey; one waiting for an earlier step, a need or its
+cluster's steward is hollow and says what it waits for on hover. An approval gate sits before each
+stage that needs one: approved, needs approval, or waiting. The health check between stages is
+drawn only when it holds the rollout (paused).
 
 <Screenshot name="rollout-pipeline" alt="The rollout pipeline: stages with a block per host, and the gates between them" />
 
@@ -107,11 +110,13 @@ an **Approve** button for the next phase that wants an approval in its head:
 - **Notes**: what that approval leaves out (hosts without a plan yet) and each of the plan's
   warnings. A phase is approved only once every phase before it has finished, so an approval is
   never given blind; until then its button is disabled and a note says what it waits on.
-- **Across the fleet**: one entry per module, with the phases (or hosts) it changes; hover for the
-  hosts by phase. Where a template put a host value that differs per host, it reads as a
-  placeholder such as `«fact:host.id»`; hover it for the hosts' values.
-- **By distinct plan**: hosts with identical plans grouped together by phase, destructive steps
+- **Combined** (the default): one entry per module or workload, with the phases (or hosts) it
+  changes; hover for the hosts by phase. Where a template put a host value that differs per host,
+  it reads as a placeholder such as `«fact:host.id»`; hover it for the hosts' values.
+- **By target**: targets with identical plans grouped together by phase, destructive steps
   flagged.
+
+The toggle between the two sits in the panel's head.
 
 <Screenshot name="rollout-approval" alt="The Plans panel: its Approve button, the approval's notes and a banner per warning, then the plan across every phase by module" />
 
@@ -149,8 +154,9 @@ bake: 15m   # a run that changed nomad bakes for 15m, even in a 1m phase
 | a module with a longer `bake` | the longest such `bake` (the host's row names the module) |
 
 So a phase whose hosts all come out unchanged moves on at once, and a short phase `bake` lets
-low-risk changes through quickly while risky modules hold the rollout as long as they need. Expand a host's row under **Hosts** for its timeline through
-the rollout and its run report.
+low-risk changes through quickly while risky modules hold the rollout as long as they need. Expand a row under **Targets** for its timeline through
+the rollout and its run report. **Targets** lists what changes by default; **All** in its head adds
+the unchanged hosts and workloads (`?targets=all` in the link keeps that view).
 
 When the last phase completes, the revision is **promoted** to stable: it is what new hosts get and
 what a rollback returns to. Hosts that missed their phase (offline, held or skipped) converge in the

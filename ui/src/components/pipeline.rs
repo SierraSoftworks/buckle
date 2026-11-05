@@ -2,9 +2,10 @@
 //! rounded block coloured by its rollout state and health, the gate before
 //! each stage drawn as a barrier, and the bake countdown on the stage header.
 //! Hover or focus a block for the host's name and detail; follow it to open
-//! the host. A cluster is a round block (a virtual node): applied through
-//! the host speaking for it, hollow while it waits for an earlier stage or
-//! an executor, and saying which.
+//! the host. A stage's hosts come first; each cluster's workloads follow
+//! in a section under the cluster's name, as round blocks: hollow while a
+//! workload waits for an earlier step, a need or its cluster's steward,
+//! and saying which. A unit whose plan changes nothing is solid grey.
 
 use std::collections::BTreeMap;
 
@@ -25,6 +26,7 @@ use crate::logic::tone::{
     LEGEND, Tone, awaited_reboot, block_look, host_error_headline, host_error_tone,
     host_state_class, host_state_label, outside_block_look, phase_state_label, phase_state_tone,
 };
+use crate::logic::units;
 
 #[derive(Properties, PartialEq)]
 pub struct PipelineProps {
@@ -45,12 +47,9 @@ pub struct PipelineProps {
 #[function_component(Pipeline)]
 pub fn pipeline(props: &PipelineProps) -> Html {
     let p = layout(&props.detail);
-    let has_cluster = props
-        .detail
-        .phases
-        .iter()
-        .flat_map(|ph| &ph.hosts)
-        .any(|h| h.kind == TargetKind::Cluster);
+    let units = || props.detail.phases.iter().flat_map(|ph| &ph.hosts);
+    let has_cluster = units().any(|h| h.kind != TargetKind::Host);
+    let has_unchanged = units().any(units::unchanged);
     let stages = p.stages.iter().enumerate().map(|(i, stage)| {
         html! {
             <div class="pipeline__step" role="listitem">
@@ -87,11 +86,17 @@ pub fn pipeline(props: &PipelineProps) -> Html {
                     if has_cluster {
                         <li class="legend__item">
                             <span class="block block--legend block--healthy block--cluster" aria-hidden="true" />
-                            { "cluster" }
+                            { "workload" }
                         </li>
                         <li class="legend__item">
                             <span class="block block--legend block--planned block--cluster block--waiting" aria-hidden="true" />
-                            { "waiting for its stage" }
+                            { "waiting (earlier step, need, steward)" }
+                        </li>
+                    }
+                    if has_unchanged {
+                        <li class="legend__item">
+                            <span class="block block--legend block--unchanged" aria-hidden="true" />
+                            { "unchanged" }
                         </li>
                     }
                 </ul>
@@ -170,6 +175,9 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
     if c.plan_pending > 0 {
         tally.push(format!("{} plan pending", c.plan_pending));
     }
+    if c.unchanged > 0 {
+        tally.push(format!("{} unchanged", c.unchanged));
+    }
     // The phase's own deadline, or while it has none, the latest of its
     // baking hosts': the stage is baked when its last host is.
     let until = phase
@@ -206,12 +214,23 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
                 </div>
             </header>
             if stage.counts.total == 0 {
-                <p class="stage__empty muted">{ "No hosts" }</p>
-            } else {
-                <div class="stage__blocks" {style} role="list">
-                    { for stage.hosts().map(|h| block(h, props.hosts.get(&h.host), props.activity.get(&h.host), waiting(phase, h), now)) }
+                <p class="stage__empty muted">{ "Nothing to roll" }</p>
+            }
+            if !stage.targets.is_empty() {
+                <div class="stage__blocks" style={style.clone()} role="list">
+                    { for stage.targets.iter().map(|h| block(h, props.hosts.get(&h.host), props.activity.get(&h.host), waiting(phase, h), now)) }
                 </div>
             }
+            { for stage.clusters.iter().map(|c| html! {
+                <div class="stage__cluster" data-cluster={c.cluster.to_owned()}>
+                    <RouteLink to={Route::Cluster { id: c.cluster.to_owned() }} classes={classes!("stage__cluster-label")}>
+                        { c.cluster.to_owned() }
+                    </RouteLink>
+                    <div class="stage__blocks" style={style.clone()} role="list" aria-label={format!("Workloads on {}", c.cluster)}>
+                        { for c.units.iter().map(|h| block(h, props.hosts.get(&h.host), props.activity.get(&units::key(h)), waiting(phase, h), now)) }
+                    </div>
+                </div>
+            }) }
         </section>
     }
 }
@@ -264,9 +283,15 @@ fn block(
     let mut look = block_look(entry, host);
     let activity = activity.filter(|_| entry.state == HostRolloutState::Applying);
     let mut detail: Vec<Html> = Vec::new();
-    // A cluster names who speaks for it and how its workloads stand; a
-    // target held for an earlier stage (or an executor) says what for.
-    if entry.kind == TargetKind::Cluster {
+    // A workload names its cluster and who speaks for it; a cluster row how
+    // its workloads stand; a unit held for an earlier step (or a steward)
+    // says what for.
+    if let Some(c) = units::cluster(entry) {
+        detail.push(html! { <span>{ "on " }<span class="mono">{ c.to_owned() }</span></span> });
+        if let Some(e) = &entry.executor {
+            detail.push(html! { <span>{ "via " }<span class="mono">{ e.clone() }</span></span> });
+        }
+    } else if entry.kind == TargetKind::Cluster {
         if let Some(e) = &entry.executor {
             detail.push(html! { <span>{ "via " }<span class="mono">{ e.clone() }</span></span> });
         }
@@ -285,7 +310,9 @@ fn block(
     if let Some(wave) = entry.wave {
         detail.push(html! { <span>{ format!("wave {wave}") }</span> });
     }
-    if let Some(digest) = &entry.plan_digest {
+    if units::unchanged(entry) {
+        detail.push(html! { <span class="muted">{ "plan changes nothing" }</span> });
+    } else if let Some(digest) = &entry.plan_digest {
         detail.push(html! { <span class="mono">{ format!("plan {}", short(digest)) }</span> });
     }
     if let Some(until) = entry.bake_until.filter(|u| *u > now) {
@@ -330,20 +357,30 @@ fn block(
     }
     detail.push(html! { <span class="muted">{ format!("updated {}", relative(entry.updated_at, now)) }</span> });
 
+    let name = units::name(entry).to_owned();
     html! {
-        <RouteLink to={Route::target(&entry.host, entry.kind)}
+        <RouteLink to={Route::unit(entry)}
+            query={unit_query(entry)}
             classes={classes!(look.classes.clone())}
             label={match activity {
-                Some(now) => format!("{}: {}, running {now}", entry.host, look.label),
-                None => format!("{}: {}", entry.host, look.label),
+                Some(now) => format!("{name}: {}, running {now}", look.label),
+                None => format!("{name}: {}", look.label),
             }}
             data_host={entry.host.clone()}
+            data_workload={entry.workload.clone()}
             data_state={host_state_label(entry.state).replace(' ', "-")}>
             <span class="block__tip" aria-hidden="true">
-                <strong class="block__name">{ entry.host.clone() }</strong>
+                <strong class="block__name">{ name }</strong>
                 <span class="block__state">{ look.label.clone() }</span>
                 { for detail }
             </span>
         </RouteLink>
     }
+}
+
+/// A placement's link opens its workload at the cluster it runs on.
+pub(crate) fn unit_query(entry: &RolloutHost) -> Vec<(String, String)> {
+    units::cluster(entry)
+        .map(|c| vec![("cluster".to_owned(), c.to_owned())])
+        .unwrap_or_default()
 }

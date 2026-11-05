@@ -155,11 +155,17 @@ impl RunSource {
                 rollout: None,
                 follow: false,
             },
-            RunSource::Rollout { rollout, host, .. } => Watch {
-                host: host.clone(),
-                rollout: Some(rollout.clone()),
-                follow: true,
-            },
+            // A placement (`cluster/workload`) shares its cluster's updates
+            // with the cluster's other placements, so another run there is
+            // no reason to fetch again: a retry changes `run` instead.
+            RunSource::Rollout { rollout, host, .. } => {
+                let (target, workload) = buckle_api::split_placement_key(host);
+                Watch {
+                    host: target.to_owned(),
+                    rollout: Some(rollout.clone()),
+                    follow: workload.is_none(),
+                }
+            }
         }
     }
 }

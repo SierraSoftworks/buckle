@@ -28,6 +28,7 @@ pub const OLDEST_REV: &str = "0aa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9";
 pub const PLAN_NOMAD: &str = "5b1c9e0244f1a7c3e9b2d8f6a0c4e2b7d9f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9";
 pub const PLAN_GREY: &str = "e07aa3419c2b8d4f6a1e3c5b7d9f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f";
 pub const PLAN_LAB: &str = "a91f3c7e5b2d8f4a6c1e3b5d7f9a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a";
+pub const PLAN_NOOP: &str = "0e5d3c1b9a7f5e3d1c9b7a5f3e1d9c7b5a3f1e9d7c5b3a1f9e7d5c3b1a9f7e5d";
 pub const PLAN_WORKLOADS: &str = "c3d9e1f5a7b2c4d6e8f0a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3";
 
 pub const TRACE: &str = "00af7651c3e94b1a8f0e2d9c4b7a6e15";
@@ -397,6 +398,29 @@ fn entry(
     }
 }
 
+/// One workload on one cluster.
+fn placement(
+    cluster: &str,
+    workload: &str,
+    phase: &str,
+    state: S,
+    digest: Option<&str>,
+    now: DateTime<Utc>,
+    mins_ago: i64,
+) -> RolloutHost {
+    let mut p = entry(cluster, phase, 1, state, digest, now, mins_ago);
+    p.kind = buckle_api::TargetKind::Workload;
+    p.workload = Some(workload.into());
+    p
+}
+
+/// A unit whose plan changes nothing.
+fn unchanged(mut h: RolloutHost) -> RolloutHost {
+    h.plan_changes = Some(0);
+    h.plan_removals = Some(0);
+    h
+}
+
 fn phase(
     name: &str,
     state: PhaseState,
@@ -499,19 +523,37 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
             pi7,
             nas,
             {
-                let mut c = entry(
+                let mut c = placement(
                     "home-nomad",
+                    "atuin",
                     "home",
-                    1,
                     S::Applying,
                     Some(PLAN_WORKLOADS),
                     now,
                     3,
                 );
-                c.kind = buckle_api::TargetKind::Cluster;
                 c.executor = Some("pi-1".into());
                 c
             },
+            // Nothing changes for these two: grey, and done at once.
+            unchanged(placement(
+                "home-nomad",
+                "postgresql",
+                "home",
+                S::Healthy,
+                Some(PLAN_NOOP),
+                now,
+                30,
+            )),
+            unchanged(placement(
+                "home-nomad",
+                "paste",
+                "home",
+                S::Healthy,
+                Some(PLAN_NOOP),
+                now,
+                30,
+            )),
         ],
     );
 
@@ -577,26 +619,47 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
                 now,
                 30,
             ),
-            entry(
+            unchanged(entry(
                 "lab-2",
                 "everything-else",
                 1,
                 S::Planned,
-                Some(PLAN_LAB),
+                Some(PLAN_NOOP),
                 now,
                 30,
-            ),
+            )),
             entry("lab-3", "everything-else", 1, S::Pending, None, now, 30),
-            // Added through the API, after the lab hosts it runs on.
+            // On the API-added lab cluster, after the lab hosts it runs on.
             {
-                let mut c = entry("lab-nomad", "everything-else", 1, S::Pending, None, now, 30);
-                c.kind = buckle_api::TargetKind::Cluster;
+                let mut c = placement(
+                    "lab-nomad",
+                    "grafana",
+                    "everything-else",
+                    S::Pending,
+                    None,
+                    now,
+                    30,
+                );
+                c.step = 1;
+                c
+            },
+            {
+                let mut c = unchanged(placement(
+                    "lab-nomad",
+                    "paste",
+                    "everything-else",
+                    S::Pending,
+                    Some(PLAN_NOOP),
+                    now,
+                    30,
+                ));
                 c.step = 1;
                 c
             },
         ],
     );
     rest.stages = 2;
+    rest.unchanged = 2;
     // Planned at the rollout's start; planned again when the phase opens.
     for h in rest.hosts.iter_mut().filter(|h| h.plan_digest.is_some()) {
         h.preview = true;
@@ -1242,7 +1305,7 @@ pub fn plans() -> Vec<PlanGroup> {
         },
         PlanGroup {
             digest: PLAN_LAB.into(),
-            hosts: vec!["lab-1".into(), "lab-2".into()],
+            hosts: vec!["lab-1".into()],
             changes: 2,
             removals: 0,
             destructive: false,
@@ -1250,7 +1313,7 @@ pub fn plans() -> Vec<PlanGroup> {
         },
         PlanGroup {
             digest: PLAN_WORKLOADS.into(),
-            hosts: vec!["home-nomad".into()],
+            hosts: vec![buckle_api::placement_key("home-nomad", Some("atuin"))],
             changes: 2,
             removals: 0,
             destructive: false,
@@ -2074,7 +2137,7 @@ pub fn clusters(now: DateTime<Utc>) -> Vec<HostSummary> {
     );
     lab.first_seen = now - Duration::days(2);
     lab.cluster_status = Some(buckle_api::ClusterStatus {
-        workloads: 1,
+        workloads: 2,
         ..Default::default()
     });
     vec![home, lab]
@@ -2109,12 +2172,10 @@ fn cluster_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
             workload("paste", "Pastebin.", &[], &["job"]),
         ]
     } else {
-        vec![workload(
-            "grafana",
-            "Dashboards for the lab.",
-            &[],
-            &["job"],
-        )]
+        vec![
+            workload("grafana", "Dashboards for the lab.", &[], &["job"]),
+            workload("paste", "Pastebin.", &[], &["job"]),
+        ]
     };
     let resources = if home {
         [

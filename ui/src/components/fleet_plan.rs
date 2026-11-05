@@ -294,16 +294,19 @@ pub struct PlanViewsProps {
     /// Open any destructive plan in the per-plan view.
     #[prop_or_default]
     pub open_destructive: bool,
-    /// The cluster targets among the hosts.
+    /// The cluster targets (and placements) among the hosts.
     #[prop_or_default]
     pub clusters: Vec<String>,
+    /// Show the distinct plans (By target) instead of the union (Combined);
+    /// the card's head holds the toggle.
+    #[prop_or_default]
+    pub by_plan: bool,
 }
 
 /// A rollout's plans across all its phases, as one fleet-wide union (the
 /// default) or as the distinct plans that approval binds.
 #[function_component(PlanViews)]
 pub fn plan_views(props: &PlanViewsProps) -> Html {
-    let by_plan = use_state(|| false);
     let by_plan_view = html! {
         <div class="plans">
             { for props.groups.iter().map(|g| html! {
@@ -316,24 +319,10 @@ pub fn plan_views(props: &PlanViewsProps) -> Html {
             <ContextProvider<Phases> context={props.phases.clone()}>{ by_plan_view }</ContextProvider<Phases>>
         };
     };
-    let tab = |label: &'static str, selected: bool, value: bool| {
-        let by_plan = by_plan.clone();
-        html! {
-            <button type="button" role="tab" aria-selected={selected.to_string()}
-                class={classes!("tabs__tab", selected.then_some("tabs__tab--active"))}
-                onclick={Callback::from(move |_| by_plan.set(value))}>
-                { label }
-            </button>
-        }
-    };
     html! {
         <ContextProvider<Phases> context={props.phases.clone()}>
             <FleetWarnings plan={fleet.clone()} />
-            <div class="tabs tabs--small" role="tablist" aria-label="Plan view">
-                { tab("Across the fleet", !*by_plan, false) }
-                { tab("By distinct plan", *by_plan, true) }
-            </div>
-            if *by_plan { { by_plan_view } }
+            if props.by_plan { { by_plan_view } }
             else { <FleetPlanView plan={fleet.clone()} clusters={props.clusters.clone()} /> }
         </ContextProvider<Phases>>
     }

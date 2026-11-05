@@ -13,7 +13,7 @@ decision below takes a note, which is kept in the audit log.
 
 ## A failed host
 
-A failed host is red in the pipeline. Expand its row under **Hosts** for what failed, why, and what
+A failed host is red in the pipeline. Expand its row under **Targets** for what failed, why, and what
 to do about it, followed by its timeline and run report. The button at the top right of the error acts at
 once: **Retry** when the host failed past its plan (it plans and applies again), **Re-plan** when its
 planning failed; **Retry all** retries every failed host of the rollout. A host whose own rollback also

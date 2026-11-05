@@ -586,6 +586,37 @@ textarea.input {
   }
 }
 
+// Two or three views of one card, in its head (Changed / All).
+.segmented {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+
+  &__option {
+    padding: 0.2rem 0.65rem;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--fg-2);
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--fg);
+    }
+
+    &--on {
+      background: var(--surface);
+      color: var(--fg);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+    }
+  }
+}
+
 .tabs--small {
   margin-bottom: 0.5rem;
 
