@@ -6,7 +6,7 @@
 use super::graph::Graph;
 use super::validate::{ValidationReport, secret_references, yaml_strings};
 use super::{LoadedWorkload, Revision};
-use crate::model::{ClusterDecl, Need};
+use crate::model::{ClusterDecl, Need, ResourceKind};
 use crate::selectors::{Namespaces, selector_namespaces};
 use crate::template::Templater;
 use std::collections::{BTreeSet, HashMap};
@@ -193,6 +193,9 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
                 format!("lists {duplicate} twice; each object may appear once per workload"),
             );
         }
+        for collision in cfg.item_collisions() {
+            report.error(Some(name), format!("{file} resources"), collision);
+        }
         if let Some(problem) = cfg.ordering_problem() {
             report.warning(Some(name), format!("{file} resources"), problem);
         }
@@ -241,12 +244,45 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
                 check_template(&mut report, Some(name), &loc, s);
             }
         }
-        for entry in cfg.resources.iter().filter(|r| !r.kind.is_file()) {
+        for entry in cfg.resources.iter().filter(|r| r.kind.is_items()) {
             let path = entry.id();
             for (k, v) in &entry.items {
                 let loc = format!("{file} {path}.{k}");
                 check_secrets(&mut report, Some(name), &loc, v);
                 check_template(&mut report, Some(name), &loc, v);
+            }
+        }
+        // A config is stored in clear (a plain variable, a ConfigMap), so its
+        // items and files hold no secret values.
+        for entry in cfg.of_kind(ResourceKind::Config) {
+            let referenced: Vec<String> = entry
+                .items
+                .values()
+                .map(String::as_str)
+                .chain(entry.files.values().filter_map(|f| {
+                    w.templates
+                        .iter()
+                        .find(|(p, _)| p.to_str() == Some(f.as_str()))
+                        .map(|(_, s)| s.as_str())
+                }))
+                .flat_map(secret_references)
+                .collect();
+            if !referenced.is_empty() {
+                report.error(
+                    Some(name),
+                    format!("{file} resources ({})", entry.describe()),
+                    format!(
+                        "references the secret{} {}; a config is stored in clear, so put secret values in a `secret` entry instead",
+                        if referenced.len() == 1 { "" } else { "s" },
+                        referenced
+                            .iter()
+                            .collect::<BTreeSet<_>>()
+                            .iter()
+                            .map(|s| format!("'{s}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
             }
         }
         for (i, h) in cfg.health.iter().enumerate() {
@@ -522,6 +558,18 @@ secrets:
     #[case::undeclared_secret(
         &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources:\n  - { secret: nomad/jobs/a, items: { token: '{{ secrets.NOPE }}' } }\n  - a.nomad.hcl\n"), ("workloads/a/files/a.nomad.hcl", "")],
         "does not declare under `secrets`"
+    )]
+    #[case::config_holding_a_secret(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources:\n  - { config: nomad/jobs/a, items: { token: '{{ secrets.TOKEN }}' } }\n  - a.nomad.hcl\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "a config is stored in clear"
+    )]
+    #[case::config_file_holding_a_secret(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources:\n  - { config: nomad/jobs/a, files: [c.toml.j2] }\n  - a.nomad.hcl\n"), ("workloads/a/files/a.nomad.hcl", ""), ("workloads/a/files/c.toml.j2", "token = \"{{ secrets.TOKEN }}\"")],
+        "a config is stored in clear"
+    )]
+    #[case::config_item_twice(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources:\n  - { config: c, files: [c.toml] }\n  - { config: c, items: { c.toml: x } }\n  - a.nomad.hcl\n"), ("workloads/a/files/a.nomad.hcl", ""), ("workloads/a/files/c.toml", "")],
+        "sets the item 'c.toml' of config c twice"
     )]
     #[case::restart_on_unknown_resource(
         &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nrestart_on: [variables]\n"), ("workloads/a/files/a.nomad.hcl", "")],

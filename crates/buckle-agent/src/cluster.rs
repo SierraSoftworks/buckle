@@ -29,7 +29,7 @@ use buckle_core::plan::{
     Indeterminate, ModulePlan, Plan, Removal, ResourceKey, RevisionId, Step, TaskRef,
 };
 use buckle_core::secrets::sinks::ApiSink;
-use buckle_core::secrets::{InstallKey, SecretStore};
+use buckle_core::secrets::{InstallKey, Rendered, SecretStore};
 use buckle_core::selectors::{HostContext, HostIdentity};
 use buckle_core::template::Templater;
 use buckle_nomad::primitives::{
@@ -1026,29 +1026,60 @@ async fn compile(
                     ..EntitySpec::new(kind, file.clone(), read(file).await?)
                 })
             }
-            ResourceKind::Secret => {
+            ResourceKind::Secret | ResourceKind::Config => {
                 let path = entry.name.clone().unwrap_or_default();
-                let mut rendered = IndexMap::new();
-                for (key, value) in &entry.items {
-                    let item_ctx = ctx.in_task("nomad.variable", &path, &[]);
-                    rendered.insert(
-                        key.clone(),
-                        templater.render_sensitive(value, &item_ctx).map_err(|e| {
-                            buckle_core::error::wrap_user(
-                                e,
+                let items: IndexMap<String, Rendered> = if entry.kind == ResourceKind::Config {
+                    config_items(&cfg.name, entry, &read, &templater, &ctx)
+                        .await?
+                        .into_iter()
+                        .map(|(k, v)| (k, Rendered::Plain(v)))
+                        .collect()
+                } else {
+                    let mut rendered = IndexMap::new();
+                    for (key, value) in &entry.items {
+                        let item_ctx = ctx.in_task("nomad.variable", &path, &[]);
+                        rendered.insert(
+                            key.clone(),
+                            templater.render_sensitive(value, &item_ctx).map_err(|e| {
+                                buckle_core::error::wrap_user(
+                                    e,
+                                    format!(
+                                        "The item {key} of variable {path} (workload {}) could not be rendered.",
+                                        cfg.name
+                                    ),
+                                    &["Check the template and that the secrets it reads are declared."],
+                                )
+                            })?,
+                        );
+                    }
+                    rendered
+                };
+                // A secret and a config at one path are one Nomad variable,
+                // written together where the first of them is listed.
+                let shared = primitives.iter_mut().find_map(|p| match p {
+                    Primitive::Variable(v) if v.namespace == namespace && v.path == path => Some(v),
+                    _ => None,
+                });
+                if let Some(variable) = shared {
+                    for (key, value) in items {
+                        if variable.items.insert(key.clone(), value).is_some() {
+                            return Err(buckle_core::error::user(
                                 format!(
-                                    "The item {key} of variable {path} (workload {}) could not be rendered.",
+                                    "The workload {} sets the item {key} of variable {path} twice, in a secret and a config entry.",
                                     cfg.name
                                 ),
-                                &["Check the template and that the secrets it reads are declared."],
-                            )
-                        })?,
-                    );
+                                &[
+                                    "Keep each item in one entry; both entries write the same Nomad variable.",
+                                ],
+                            ));
+                        }
+                    }
+                    continue;
                 }
                 Primitive::Variable(VariableSpec {
                     namespace: namespace.clone(),
                     path,
-                    items: rendered,
+                    items,
                 })
             }
             ResourceKind::Manifest => {
@@ -1069,6 +1100,41 @@ async fn compile(
         primitives,
         removal: nomad_removal(cfg.removal),
     })
+}
+
+/// A `config` entry's items as the executor writes them, on either scheduler:
+/// the inline `items`, then each of `files` read through `read` (which
+/// renders `.j2` files), rendered plain, so that a secret value is refused
+/// rather than stored in clear.
+pub(crate) async fn config_items<F>(
+    workload: &str,
+    entry: &ResourceEntry,
+    read: impl Fn(String) -> F,
+    templater: &Templater,
+    ctx: &HostContext,
+) -> buckle_core::Result<IndexMap<String, String>>
+where
+    F: std::future::Future<Output = buckle_core::Result<String>>,
+{
+    let name = entry.name.clone().unwrap_or_default();
+    let item_ctx = ctx.in_task("config", &name, &[]);
+    let mut out = IndexMap::new();
+    for (key, value) in &entry.items {
+        let rendered = templater.render_plain(value, &item_ctx).map_err(|e| {
+            buckle_core::error::wrap_user(
+                e,
+                format!(
+                    "The item {key} of config {name} (workload {workload}) could not be rendered."
+                ),
+                &["A config is stored in clear; put secret values in a `secret` entry."],
+            )
+        })?;
+        out.insert(key.clone(), rendered);
+    }
+    for (key, file) in &entry.files {
+        out.insert(key.clone(), read(file.clone()).await?);
+    }
+    Ok(out)
 }
 
 fn nomad_removal(removal: WorkloadRemoval) -> buckle_nomad::Removal {

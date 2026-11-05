@@ -459,6 +459,60 @@ async fn resources_apply_in_list_order_and_every_job_is_health_checked() {
 }
 
 #[tokio::test]
+async fn a_config_writes_its_files_as_plain_items_of_the_variable_a_secret_shares() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let files = vec![
+        (
+            "workloads/app/workload.yaml".to_owned(),
+            "name: app\nvars: { level: debug }\nresources:\n  - { secret: nomad/jobs/app, items: { token: '{{ secrets.DB }}' } }\n  - { config: nomad/jobs/app, files: [config.yaml, extra.toml.j2], items: { mode: fast } }\n  - app.nomad.hcl\n".to_owned(),
+        ),
+        (
+            "workloads/app/files/config.yaml".to_owned(),
+            "port: 8080\ntemplate: '{{ not rendered }}'\n".to_owned(),
+        ),
+        (
+            "workloads/app/files/extra.toml.j2".to_owned(),
+            "level = \"{{ vars.level }}\"\n".to_owned(),
+        ),
+        ("workloads/app/files/app.nomad.hcl".to_owned(), job_spec("app")),
+    ];
+    let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
+    let planned = ex.plan(&a, None).await.unwrap();
+    let steps: Vec<String> = planned.plan.modules[0]
+        .steps
+        .iter()
+        .map(|s| s.resource.to_string())
+        .collect();
+    // One variable for both entries, where the first of them is listed.
+    assert_eq!(
+        steps,
+        vec![
+            "app/nomad.variable[default/nomad/jobs/app]",
+            "app/nomad.job[default/app]"
+        ]
+    );
+    let json = serde_json::to_string(&planned.plan).unwrap();
+    assert!(
+        json.contains("port: 8080"),
+        "config values are shown in the plan"
+    );
+    assert!(!json.contains(SECRET), "the secret leaked into the plan");
+
+    let outcome = apply(&ex, &a).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    let items = fake.variable("default", "nomad/jobs/app").unwrap();
+    assert_eq!(
+        items["config.yaml"],
+        "port: 8080\ntemplate: '{{ not rendered }}'\n"
+    );
+    assert_eq!(items["extra.toml"], "level = \"debug\"\n");
+    assert_eq!(items["mode"], "fast");
+    assert_eq!(items["token"], SECRET);
+    assert_eq!(ex.plan(&a, None).await.unwrap().plan.changes(), 0);
+}
+
+#[tokio::test]
 async fn health_checks_the_jobs_of_the_selected_workloads() {
     let fake = FakeNomad::new();
     let ex = executor(&fake);

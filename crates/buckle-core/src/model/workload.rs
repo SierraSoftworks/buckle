@@ -126,6 +126,10 @@ pub enum ResourceKind {
     /// Inline items the executor writes to the cluster's own secret store:
     /// a Nomad variable at the path, or a Kubernetes Secret with the name.
     Secret,
+    /// Plain items, inline or read from files under `files/`, written to a
+    /// Nomad variable at the path or a Kubernetes ConfigMap with the name;
+    /// jobs read them at run time (`nomadVar`, a mounted ConfigMap).
+    Config,
 }
 
 impl ResourceKind {
@@ -138,6 +142,7 @@ impl ResourceKind {
         ResourceKind::Quota,
         ResourceKind::Manifest,
         ResourceKind::Secret,
+        ResourceKind::Config,
     ];
 
     /// The file suffixes that imply each kind (after a trailing `.j2` is
@@ -176,6 +181,7 @@ impl ResourceKind {
             ResourceKind::Quota => "quota",
             ResourceKind::Manifest => "manifest",
             ResourceKind::Secret => "secret",
+            ResourceKind::Config => "config",
         }
     }
 
@@ -192,11 +198,11 @@ impl ResourceKind {
     }
 
     /// Which scheduler applies this kind of object; `None` for a kind both
-    /// have (a secret).
+    /// have (a secret, a config).
     pub fn scheduler(self) -> Option<ClusterKind> {
         match self {
             ResourceKind::Manifest => Some(ClusterKind::Kubernetes),
-            ResourceKind::Secret => None,
+            ResourceKind::Secret | ResourceKind::Config => None,
             _ => Some(ClusterKind::Nomad),
         }
     }
@@ -204,7 +210,13 @@ impl ResourceKind {
     /// Whether the entry names a file under `files/` (as against inline
     /// items).
     pub fn is_file(self) -> bool {
-        self != ResourceKind::Secret
+        !self.is_items()
+    }
+
+    /// Whether the entry is a named set of items (a secret, a config): on
+    /// Nomad both are variables, and two entries may share one path.
+    pub fn is_items(self) -> bool {
+        matches!(self, ResourceKind::Secret | ResourceKind::Config)
     }
 
     /// Whether the executor diffs this object field by field, so that
@@ -235,17 +247,18 @@ impl std::fmt::Display for ResourceKind {
 }
 
 /// One entry of `resources`, written as a bare file name, as
-/// `{ file, kind?, … }`, or inline as `{ secret: NAME, items }`. Applied in
-/// list order.
+/// `{ file, kind?, … }`, or inline as `{ secret: NAME, items }` or
+/// `{ config: NAME, items, files }`. Applied in list order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceEntry {
     pub kind: ResourceKind,
     /// The spec under `files/` for file-backed kinds.
     pub file: Option<String>,
-    /// A secret's name (a Nomad variable path, a Kubernetes Secret name), or
-    /// a policy's name (defaults to the file stem).
+    /// A secret's or config's name (a Nomad variable path, a Kubernetes
+    /// Secret or ConfigMap name), or a policy's name (defaults to the file
+    /// stem).
     pub name: Option<String>,
-    /// The items of a secret.
+    /// The inline items of a secret or config.
     pub items: Items,
     /// Field paths of the live object that may differ from the spec without
     /// counting as a change or drift; the live value is kept when applying
@@ -257,7 +270,8 @@ pub struct ResourceEntry {
     /// it.
     pub live_vars: Vec<String>,
     /// Jobs: files passed to this job as string variables, by variable name,
-    /// over the workload's `files`.
+    /// over the workload's `files`. Configs: items read from files, by item
+    /// name (a bare list names each item after its file, less `.j2`).
     pub files: IndexMap<String, String>,
     /// Policies: the job, group or task the policy attaches to.
     pub attach: Option<PolicyAttach>,
@@ -307,13 +321,32 @@ impl ResourceEntry {
         }
     }
 
+    /// A config called `name`: a Nomad variable at that path, a Kubernetes
+    /// ConfigMap with that name, holding `items` and the contents of `files`.
+    pub fn config(name: impl Into<String>, items: Items, files: IndexMap<String, String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            items,
+            files,
+            ..Self::new(ResourceKind::Config)
+        }
+    }
+
     /// What identifies the entry in the workload: its file, or the secret's
-    /// name. `restart_on` names entries by this.
+    /// or config's name. `restart_on` names entries by this.
     pub fn id(&self) -> &str {
         self.file
             .as_deref()
             .or(self.name.as_deref())
             .unwrap_or_default()
+    }
+
+    /// Every item name the entry holds: inline items, then file items.
+    pub fn item_names(&self) -> impl Iterator<Item = &str> {
+        self.items
+            .keys()
+            .chain(self.files.keys())
+            .map(String::as_str)
     }
 
     /// `job paste.nomad.hcl`, `secret nomad/jobs/paste`.
@@ -357,6 +390,10 @@ struct RawEntryMap {
     /// variable path, a Kubernetes Secret name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     secret: Option<String>,
+    /// `config: NAME`: plain items and files (a Nomad variable path, a
+    /// Kubernetes ConfigMap name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -365,8 +402,8 @@ struct RawEntryMap {
     ignore: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     live_vars: Vec<String>,
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-    files: IndexMap<String, String>,
+    #[serde(default, skip_serializing_if = "RawFiles::is_empty")]
+    files: RawFiles,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attach: Option<PolicyAttach>,
     /// A Secret's type; on a file entry without `kind`, the entity type of
@@ -375,9 +412,40 @@ struct RawEntryMap {
     ty: Option<String>,
 }
 
+/// `files` as written: `{ name: file }`, or a bare list of files.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum RawFiles {
+    Map(IndexMap<String, String>),
+    List(Vec<String>),
+}
+
+impl Default for RawFiles {
+    fn default() -> Self {
+        RawFiles::Map(IndexMap::new())
+    }
+}
+
+impl RawFiles {
+    fn is_empty(&self) -> bool {
+        match self {
+            RawFiles::Map(m) => m.is_empty(),
+            RawFiles::List(l) => l.is_empty(),
+        }
+    }
+}
+
 impl RawEntryMap {
     fn resolve(self) -> Result<ResourceEntry, String> {
-        let kind = match (&self.kind, &self.secret, &self.file) {
+        let named = match (&self.secret, &self.config) {
+            (Some(_), Some(_)) => {
+                return Err("a resource entry is a `secret` or a `config`, not both".to_owned());
+            }
+            (Some(_), None) => Some(ResourceKind::Secret),
+            (None, Some(_)) => Some(ResourceKind::Config),
+            (None, None) => None,
+        };
+        let kind = match (&self.kind, named, &self.file) {
             (Some(k), ..) => ResourceKind::parse(k).ok_or_else(|| {
                 format!(
                     "'{k}' is not a resource kind; use one of {}",
@@ -388,7 +456,7 @@ impl RawEntryMap {
                         .join(", ")
                 )
             })?,
-            (None, Some(_), None) => ResourceKind::Secret,
+            (None, Some(kind), None) => kind,
             (None, None, Some(file)) => match (&self.ty, ResourceKind::from_file(file)) {
                 (Some(ty), _) => ResourceKind::parse(ty)
                     .filter(|k| k.is_file())
@@ -397,10 +465,13 @@ impl RawEntryMap {
                 (None, None) => return Err(unknown_kind(file)),
             },
             (None, None, None) => {
-                return Err("a resource entry names a `file` or a `secret`".to_owned());
+                return Err("a resource entry names a `file`, a `secret` or a `config`".to_owned());
             }
             (None, Some(_), Some(_)) => {
-                return Err("a resource entry is a `file` or a `secret`, not both".to_owned());
+                return Err(
+                    "a resource entry is a `file`, a `secret` or a `config`, not one and another"
+                        .to_owned(),
+                );
             }
         };
         let mut entry = ResourceEntry::new(kind);
@@ -413,6 +484,9 @@ impl RawEntryMap {
             if self.secret.is_some() {
                 return Err(fail("secret"));
             }
+            if self.config.is_some() {
+                return Err(fail("config"));
+            }
             if !self.items.is_empty() {
                 return Err(fail("items"));
             }
@@ -420,8 +494,16 @@ impl RawEntryMap {
             if self.file.is_some() {
                 return Err(fail("file"));
             }
-            entry.name = Some(self.secret.or(self.name.clone()).ok_or_else(|| {
-                "a secret entry names its secret: `secret: nomad/jobs/NAME` (a Nomad variable path) or `secret: NAME` (a Kubernetes Secret)".to_owned()
+            let written = match kind {
+                ResourceKind::Secret => self.secret,
+                _ => self.config,
+            };
+            entry.name = Some(written.or(self.name.clone()).ok_or_else(|| {
+                format!(
+                    "a {k} entry names its {k}: `{k}: nomad/jobs/NAME` (a Nomad variable path) or `{k}: NAME` (a Kubernetes {})",
+                    if kind == ResourceKind::Secret { "Secret" } else { "ConfigMap" },
+                    k = kind.as_str(),
+                )
             })?);
             entry.items = self.items;
         }
@@ -446,10 +528,25 @@ impl RawEntryMap {
             entry.live_vars = self.live_vars;
         }
         if !self.files.is_empty() {
-            if kind != ResourceKind::Job {
-                return Err(fail("files"));
+            entry.files = match (kind, self.files) {
+                (ResourceKind::Job | ResourceKind::Config, RawFiles::Map(map)) => map,
+                (ResourceKind::Config, RawFiles::List(list)) => list
+                    .into_iter()
+                    .map(|file| {
+                        let name = file.strip_suffix(".j2").unwrap_or(&file).to_owned();
+                        (name, file)
+                    })
+                    .collect(),
+                (ResourceKind::Job, RawFiles::List(_)) => {
+                    return Err("a job's `files` map variable names to files: `files: { app_config: config.yaml }`, read as `var.app_config`".to_owned());
+                }
+                _ => return Err(fail("files")),
+            };
+            if let Some(name) = entry.files.keys().find(|k| entry.items.contains_key(*k)) {
+                return Err(format!(
+                    "the item '{name}' is both in `items` and in `files`"
+                ));
             }
-            entry.files = self.files;
         }
         if self.attach.is_some() {
             if kind != ResourceKind::Policy {
@@ -482,13 +579,14 @@ impl Serialize for ResourceEntry {
             items: self.items.clone(),
             ignore: self.ignore.clone(),
             live_vars: self.live_vars.clone(),
-            files: self.files.clone(),
+            files: RawFiles::Map(self.files.clone()),
             attach: self.attach.clone(),
             ty: self.secret_type.clone(),
             ..RawEntryMap::default()
         };
         match self.kind {
             ResourceKind::Secret => raw.secret = self.name.clone(),
+            ResourceKind::Config => raw.config = self.name.clone(),
             _ => raw.name = self.name.clone(),
         }
         raw.serialize(s)
@@ -770,7 +868,7 @@ impl WorkloadConfig {
             if let Some(file) = &r.file {
                 out.push((r.kind, file.as_str()));
             }
-            out.extend(r.files.values().map(|f| (ResourceKind::Job, f.as_str())));
+            out.extend(r.files.values().map(|f| (r.kind, f.as_str())));
         }
         out.extend(self.files.values().map(|f| (ResourceKind::Job, f.as_str())));
         out
@@ -793,6 +891,24 @@ impl WorkloadConfig {
         for r in &self.resources {
             if !seen.insert((r.kind, r.id().to_owned())) {
                 out.push(r.describe());
+            }
+        }
+        out
+    }
+
+    /// Items set twice within the entries of one kind and name (two
+    /// `config` entries for one ConfigMap, say). A `secret` and a `config`
+    /// of the same name are different objects on Kubernetes and one Nomad
+    /// variable, so the Nomad executor checks their items against each other
+    /// when it merges them.
+    pub fn item_collisions(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for r in self.resources.iter().filter(|r| r.kind.is_items()) {
+            for item in r.item_names() {
+                if !seen.insert((r.kind, r.id(), item)) {
+                    out.push(format!("sets the item '{item}' of {} twice", r.describe()));
+                }
             }
         }
         out
@@ -988,6 +1104,48 @@ removal: purge
     }
 
     #[test]
+    fn a_config_lists_its_files_as_items_and_may_share_a_secrets_name() {
+        let w = WorkloadConfig::parse(
+            "name: x\nresources:\n  - { secret: nomad/jobs/x, items: { token: '{{ secrets.T }}' } }\n  - { config: nomad/jobs/x, files: [config.yaml, extra.toml.j2], items: { mode: fast } }\n  - { config: other, files: { app.conf: app.conf.j2 } }\n  - x.nomad.hcl\n",
+        )
+        .unwrap();
+        let config = &w.resources[1];
+        assert_eq!(config.kind, ResourceKind::Config);
+        assert_eq!(config.id(), "nomad/jobs/x");
+        assert_eq!(config.describe(), "config nomad/jobs/x");
+        assert_eq!(
+            config.item_names().collect::<Vec<_>>(),
+            vec!["mode", "config.yaml", "extra.toml"]
+        );
+        assert_eq!(config.files["extra.toml"], "extra.toml.j2");
+        assert_eq!(w.resources[2].files["app.conf"], "app.conf.j2");
+        assert!(w.duplicates().is_empty());
+        assert!(w.item_collisions().is_empty());
+        assert_eq!(w.cluster_kind(), Some(ClusterKind::Nomad));
+        let files: Vec<(ResourceKind, &str)> = w.referenced_files();
+        assert!(files.contains(&(ResourceKind::Config, "config.yaml")));
+        assert!(files.contains(&(ResourceKind::Config, "app.conf.j2")));
+        assert!(w.resource_ids().contains(&"other"));
+        // Serialising keeps the entry a config.
+        let yaml = serde_yaml::to_string(&w).unwrap();
+        assert!(yaml.contains("config: nomad/jobs/x"), "{yaml}");
+        let again = WorkloadConfig::parse(&yaml).unwrap();
+        assert_eq!(again.resources, w.resources);
+    }
+
+    #[test]
+    fn an_item_set_twice_within_one_config_is_a_collision() {
+        let w = WorkloadConfig::parse(
+            "name: x\nresources:\n  - { config: c, files: [a.yaml] }\n  - { config: c, items: { a.yaml: text } }\n  - { secret: c, items: { a.yaml: 's' } }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            w.item_collisions(),
+            vec!["sets the item 'a.yaml' of config c twice"]
+        );
+    }
+
+    #[test]
     fn ordering_and_duplicates_are_pointed_out() {
         let w =
             WorkloadConfig::parse("name: x\nresources: [x.nomad.hcl, x.volume.hcl, x.nomad.hcl]\n")
@@ -1017,6 +1175,23 @@ removal: purge
         "name: x\nresources: [{ file: x.nomad.hcl, attach: { job: a } }]\n",
         "does not apply to a job"
     )]
+    #[case::job_files_as_a_list(
+        "name: x\nresources: [{ file: x.nomad.hcl, files: [config.yaml] }]\n",
+        "map variable names to files"
+    )]
+    #[case::config_and_secret("name: x\nresources: [{ config: c, secret: s }]\n", "not both")]
+    #[case::config_item_twice(
+        "name: x\nresources: [{ config: c, files: [a.yaml], items: { a.yaml: x } }]\n",
+        "both in `items` and in `files`"
+    )]
+    #[case::config_with_a_file(
+        "name: x\nresources: [{ config: c, file: a.yaml }]\n",
+        "not one and another"
+    )]
+    #[case::files_on_a_volume(
+        "name: x\nresources: [{ file: x.volume.hcl, files: { a: a.yaml } }]\n",
+        "does not apply to a volume"
+    )]
     #[case::live_vars_on_a_volume(
         "name: x\nresources: [{ file: x.volume.hcl, live_vars: [v] }]\n",
         "does not apply to a volume"
@@ -1030,10 +1205,13 @@ removal: purge
         "does not apply to a job"
     )]
     #[case::nothing_named("name: x\nresources: [{ kind: job }]\n", "names its `file`")]
-    #[case::two_things("name: x\nresources: [{ file: x.nomad.hcl, secret: p }]\n", "not both")]
+    #[case::two_things(
+        "name: x\nresources: [{ file: x.nomad.hcl, secret: p }]\n",
+        "not one and another"
+    )]
     #[case::empty_map(
         "name: x\nresources: [{ ignore: [a] }]\n",
-        "names a `file` or a `secret`"
+        "names a `file`, a `secret` or a `config`"
     )]
     #[case::legacy_policy_without_file("name: x\npolicies: [{ attach: { job: a } }]\n", "")]
     fn bad_workloads_are_rejected(#[case] yaml: &str, #[case] needle: &str) {
