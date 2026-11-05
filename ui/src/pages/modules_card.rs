@@ -406,9 +406,9 @@ fn workload_row(
             <td>
                 if placement {
                     <RouteLink to={Route::Cluster { id: d.summary.id.clone() }} classes={classes!("mono", "strong")}>{ d.summary.id.clone() }</RouteLink>
-                    { match d.summary.cluster_status.as_ref().and_then(|s| s.executor.clone()) {
-                        Some(e) => html! { <span class="cell-sub muted">{ format!("via {e}") }</span> },
-                        None => html! { <span class="cell-sub muted">{ "no executor yet" }</span> },
+                    { match d.summary.cluster_status.as_ref().and_then(|s| s.steward.clone()) {
+                        Some(e) => html! { <span class="cell-sub muted" title="its steward: the agent holding the cluster's lease">{ format!("via {e}") }</span> },
+                        None => html! { <span class="cell-sub muted">{ "no steward yet" }</span> },
                     } }
                 } else if cluster {
                     <RouteLink to={Route::Workload { name: r.name.clone() }} query={vec![("cluster".to_owned(), d.summary.id.clone())]}

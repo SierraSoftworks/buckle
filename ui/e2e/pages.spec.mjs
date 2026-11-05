@@ -227,10 +227,11 @@ describe("every page renders in demo mode", () => {
     // Notes sit under the summary.
     const summary = page.locator(".panel", { has: page.getByRole("heading", { name: "Summary", exact: true }) });
     await summary.getByRole("textbox", { name: "Notes" }).waitFor();
-    // The agents its executors selector matches, the last one marked.
+    // The agents its executors selector matches, the steward marked.
     const executors = page.getByTestId("cluster-executors");
     assert.equal(await executors.locator("li").count(), 4);
-    assert.match(await executors.locator('li[data-host="pi-1"]').textContent(), /last executor/);
+    assert.match(await executors.locator('li[data-host="pi-1"]').textContent(), /steward/);
+    assert.match(await page.getByTestId("cluster-steward").textContent(), /pi-1.*reaches the cluster · watched \d+m ago/s);
     assert.equal(await page.getByText("Would land in").count(), 0);
 
     const workloads = page.getByTestId("workloads");
@@ -268,6 +269,21 @@ describe("every page renders in demo mode", () => {
     // A host address lands on the cluster's own page, and the reverse.
     await page.goto(page.url().replace("/clusters/home-nomad", "/hosts/home-nomad"));
     await page.waitForURL(/\/clusters\/home-nomad/);
+    await close();
+  });
+
+  test("a cluster's lease moves to another agent, and the host holding it says so", async () => {
+    const { page, close } = await open("/hosts/pi-1");
+    await page.locator(".page-head").getByRole("link", { name: "stewards home-nomad" }).click();
+    assert.equal(await heading(page), "home-nomad");
+    await page.getByRole("button", { name: "Move stewardship…" }).click();
+    const dialog = page.getByRole("dialog");
+    const to = dialog.getByTestId("steward-to");
+    const target = await to.locator("option").nth(1).getAttribute("value");
+    await to.selectOption(target);
+    await dialog.getByRole("button", { name: "Move stewardship" }).click();
+    await eventually(async () => assert.match(await page.getByTestId("cluster-steward").textContent(), new RegExp(target)));
+    assert.match(await page.getByTestId("cluster-executors").locator(`li[data-host="${target}"]`).textContent(), /steward/);
     await close();
   });
 

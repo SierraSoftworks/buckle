@@ -271,6 +271,39 @@ pub fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> 
     })
 }
 
+pub fn move_steward(id: &str, host: &str, note: &str) -> Result<HostSummary, ApiError> {
+    admin()?;
+    with(|s| {
+        let cluster = s
+            .clusters
+            .iter_mut()
+            .find(|h| h.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("No target '{id}'.")))?;
+        let status = cluster.cluster_status.get_or_insert_with(Default::default);
+        status.steward = Some(host.to_owned());
+        status.executor = Some(host.to_owned());
+        let cluster = cluster.clone();
+        if let Some(d) = s.details.iter_mut().find(|d| d.summary.id == id) {
+            d.summary = cluster.clone();
+        }
+        let why = if note.is_empty() {
+            String::new()
+        } else {
+            format!(": {note}")
+        };
+        s.record(
+            &actor(),
+            "target.steward",
+            id,
+            format!("{} moved {id}'s lease to {host}{why}", actor()),
+        );
+        s.outbox.push(LiveEvent::HostChanged {
+            host: cluster.clone(),
+        });
+        Ok(cluster)
+    })
+}
+
 pub fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError> {
     admin()?;
     with(|s| {

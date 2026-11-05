@@ -302,6 +302,20 @@ pub async fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiE
 }
 
 /// `approve` (a pending registration), `pause` or `resume`.
+/// Moves a cluster's lease to `host`, noting `note` in the audit log.
+pub async fn move_steward(id: &str, host: &str, note: String) -> Result<HostSummary, ApiError> {
+    demo!(demo_store::move_steward(id, host, &note));
+    write(
+        Method::Post,
+        &format!("/targets/{}/steward", enc(id)),
+        Some(&buckle_api::StewardRequest {
+            host: host.to_owned(),
+            note,
+        }),
+    )
+    .await
+}
+
 pub async fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError> {
     demo!(demo_store::host_action(id, action));
     write::<(), _>(

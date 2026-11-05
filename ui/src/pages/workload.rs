@@ -204,7 +204,7 @@ fn placements(props: &PlacementsProps) -> Html {
             && d.summary
                 .cluster_status
                 .as_ref()
-                .and_then(|s| s.executor.as_deref())
+                .and_then(|s| s.steward.as_deref())
                 .and_then(|e| props.hosts.get(e))
                 .is_some_and(|h| h.connection == Connection::Online)
     };

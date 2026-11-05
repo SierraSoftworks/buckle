@@ -1,6 +1,7 @@
 //! A cluster's page: what the host page is for a host, with workloads in
-//! place of modules. Its summary (scheduler, API, nodes, the host speaking
-//! for it); notes and labels beside the agents able to run its operations;
+//! place of modules. Its summary (scheduler, API, nodes, its steward: the
+//! agent holding its lease, and whether it reaches the cluster); notes and
+//! labels beside the agents able to hold the lease, where it can be moved;
 //! one Workloads card (how each reads, what the latest run did to it, a
 //! link into the cluster's own UI per job, and opened: its checks, that
 //! run's steps and its resources); recent runs; and its audit trail.
@@ -12,18 +13,18 @@ use buckle_api::{Connection, HostStatus, HostSummary};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
-use super::clusters::{cluster_state_pills, executor_cell};
+use super::clusters::{cluster_state_pills, steward_cell};
 use super::host::{LabelsEditor, NotesEditor, runs};
 use super::modules_card::ModulesPanel;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Confirm, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink, SplitButton, icons,
-    target_items, use_target_actions, use_toast,
+    Button, Confirm, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh, RouteLink,
+    SplitButton, icons, target_items, use_target_actions, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::controls::{TargetAction, TargetStanding, head_actions};
-use crate::logic::format::{commit, relative_opt, timestamp};
+use crate::logic::format::{commit, relative, relative_opt, timestamp};
 use crate::logic::live::{apply_fleet, apply_host_detail};
 use crate::logic::run::newest_run;
 use crate::logic::tone::Tone;
@@ -39,6 +40,7 @@ enum Ask {
     Pause,
     Resume,
     Forget,
+    MoveSteward,
 }
 
 #[function_component(ClusterPage)]
@@ -59,6 +61,8 @@ pub fn cluster_page(props: &Props) -> Html {
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
     let picked = use_state_eq(|| None::<String>);
+    // The host "Move stewardship…" moves the lease to.
+    let steward_to = use_state_eq(|| None::<String>);
     {
         let picked = picked.clone();
         use_effect_with(props.id.clone(), move |_| {
@@ -114,15 +118,28 @@ pub fn cluster_page(props: &Props) -> Html {
     let hosts: Vec<HostSummary> = fleet.as_ref().map(|f| f.hosts.clone()).unwrap_or_default();
     let by_id: BTreeMap<&str, &HostSummary> = hosts.iter().map(|h| (h.id.as_str(), h)).collect();
     let active = fleet.as_ref().and_then(|f| f.active_rollout.clone());
-    // Actions run on an active cluster through its connected executor, and
-    // only for admins.
+    // Actions run on an active cluster through its steward, while it is
+    // connected, and only for admins.
     let can_act = admin
         && c.status == HostStatus::Active
         && status
-            .executor
+            .steward
             .as_deref()
             .and_then(|e| by_id.get(e))
             .is_some_and(|h| h.connection == Connection::Online);
+    // Where the lease may move: a connected agent able to hold it, other
+    // than the steward.
+    let candidates: Vec<String> = d
+        .executors
+        .iter()
+        .filter(|e| status.steward.as_deref() != Some(e.as_str()))
+        .filter(|e| {
+            by_id
+                .get(e.as_str())
+                .is_some_and(|h| h.connection == Connection::Online)
+        })
+        .cloned()
+        .collect();
     let on_action = can_act.then(|| target_actions.on_action.clone());
 
     let open = |a: Ask| {
@@ -142,8 +159,12 @@ pub fn cluster_page(props: &Props) -> Html {
             c.id.clone(),
         );
         let navigator = navigator.clone();
-        Callback::from(move |_note: String| {
+        let to = (*steward_to)
+            .clone()
+            .or_else(|| candidates.first().cloned());
+        Callback::from(move |note: String| {
             let Some(what) = *ask else { return };
+            let to = to.clone().unwrap_or_default();
             let (ask, busy, error, toast, reload, id, navigator) = (
                 ask.clone(),
                 busy.clone(),
@@ -165,6 +186,9 @@ pub fn cluster_page(props: &Props) -> Html {
                     Ask::Forget => api::forget_host(&id)
                         .await
                         .map(|_| format!("{id} forgotten.")),
+                    Ask::MoveSteward => api::move_steward(&id, &to, note)
+                        .await
+                        .map(|_| format!("{to} now holds {id}'s lease.")),
                 };
                 busy.set(false);
                 match result {
@@ -226,9 +250,9 @@ pub fn cluster_page(props: &Props) -> Html {
                 title={if declared { "declared in buckle.yaml" } else { "created through the API" }} />
             { cluster_state_pills(c) }
             <span class="muted">
-                { match &status.executor {
-                    Some(e) => html! { <>{ "executor " }<span class="mono">{ e.clone() }</span></> },
-                    None => html! { "no executor yet" },
+                { match &status.steward {
+                    Some(e) => html! { <>{ "steward " }<span class="mono">{ e.clone() }</span></> },
+                    None => html! { "no steward yet" },
                 } }
                 { format!(" · health read {}", relative_opt(c.health_at, now)) }
             </span>
@@ -246,6 +270,24 @@ pub fn cluster_page(props: &Props) -> Html {
             Ask::Forget => (format!("Forget {}", c.id), html! { <>
                 <p>{ "Forgetting removes the cluster target and its history from the server: runs and health. Nothing in the cluster changes; its workloads keep running." }</p>
             </> }, true, Some(AttrValue::from(c.id.clone()))),
+            Ask::MoveSteward => {
+                let chosen = (*steward_to).clone().or_else(|| candidates.first().cloned()).unwrap_or_default();
+                let onchange = {
+                    let steward_to = steward_to.clone();
+                    Callback::from(move |e: Event| {
+                        steward_to.set(Some(e.target_unchecked_into::<web_sys::HtmlSelectElement>().value()));
+                    })
+                };
+                ("Move stewardship".to_owned(), html! { <>
+                    <p>{ format!("The agent holding {}'s lease watches it and runs its workloads and actions. Moving it lets the current steward finish what it is applying first.", c.id) }</p>
+                    <label class="field">
+                        <span class="field__label">{ "Move the lease to" }</span>
+                        <select class="input" aria-label="Move the lease to" data-testid="steward-to" {onchange}>
+                            { for candidates.iter().map(|h| html! { <option value={h.clone()} selected={*h == chosen}>{ h.clone() }</option> }) }
+                        </select>
+                    </label>
+                </> }, false, None)
+            }
         };
         html! {
             <Confirm title={title.clone()} confirm_label={title} {danger} type_to_confirm={typed} note=true busy={*busy}
@@ -286,13 +328,29 @@ pub fn cluster_page(props: &Props) -> Html {
             },
         ),
         (
-            "Executor",
-            html! { <>
-                { executor_cell(status.executor.as_deref(), &by_id, now) }
+            "Steward",
+            html! { <span data-testid="cluster-steward">
+                { steward_cell(&status, &by_id, now) }
+                { match (status.steward.is_some(), status.reachable) {
+                    (true, Some(true)) => html! {
+                        <span class="cell-sub muted" title={status.watched_at.map(timestamp)}>
+                            { match status.watched_at {
+                                Some(at) => format!("reaches the cluster · watched {}", relative(at, now)),
+                                None => "reaches the cluster".to_owned(),
+                            } }
+                        </span>
+                    },
+                    // The cell says so already.
+                    (true, Some(false)) => html! {
+                        if let Some(e) = &status.reachable_error { <span class="cell-sub muted">{ e.clone() }</span> }
+                    },
+                    (true, None) => html! { <span class="cell-sub muted">{ "has not reported the cluster yet" }</span> },
+                    (false, _) => html! {},
+                } }
                 if let Some(sel) = spec.as_ref().and_then(|s| s.executors.clone()) {
                     <span class="cell-sub">{ "chosen from " }<code class="mono small">{ sel }</code></span>
                 }
-            </> },
+            </span> },
         ),
         (
             "Applied",
@@ -330,21 +388,24 @@ pub fn cluster_page(props: &Props) -> Html {
                     None => html! { "It declares no executors selector: nothing can apply its workloads or run its actions." },
                 } }</p>
             } else {
-                <p class="muted small">{ "The agents its executors selector matches; a connected one is picked for each rollout or action." }</p>
+                <p class="muted small">{ "The agents its executors selector matches. One holds its lease at a time: it watches the cluster and runs its workloads and actions." }</p>
                 <ul class="cluster-executors__list">
                     { for d.executors.iter().map(|e| {
                         let host = by_id.get(e.as_str()).copied();
                         let online = host.is_some_and(|h| h.connection == Connection::Online);
-                        let current = status.executor.as_deref() == Some(e.as_str());
+                        let current = status.steward.as_deref() == Some(e.as_str());
                         html! {
                             <li data-host={e.clone()} data-online={online.to_string()}>
                                 <crate::components::HostLink id={e.clone()} host={host.cloned()} {now} classes={classes!("mono")} />
-                                if current { <Pill tone={Tone::Info} label="last executor" /> }
+                                if current { <Pill tone={Tone::Info} label="steward" /> }
                                 if !online { <span class="muted small">{ "offline" }</span> }
                             </li>
                         }
                     }) }
                 </ul>
+                if admin && !candidates.is_empty() {
+                    <Button small=true kind={Kind::Subtle} onclick={open(Ask::MoveSteward)}>{ "Move stewardship…" }</Button>
+                }
             }
         </div>
     };
