@@ -215,6 +215,37 @@ pub struct RolloutSummary {
     /// server knows one (otherwise the UI shows the id as text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_url: Option<String>,
+    /// An action rollout: the action each target runs in place of an apply
+    /// of `revision` (whose phases it follows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<RolloutActionInfo>,
+}
+
+/// The action an action rollout runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutActionInfo {
+    /// The module (a cluster's: the workload) declaring it.
+    pub module: String,
+    pub action: String,
+    pub label: String,
+    /// The selector the targets were picked by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+}
+
+/// `POST /api/v1/rollouts`: run an action on every target offering it (that
+/// `selector` matches) through the stable revision's phases.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartActionRollout {
+    pub module: String,
+    pub action: String,
+    /// A filter over the targets' context (`labels.role == "web"`); absent
+    /// for every target offering the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    /// Required when the action asks for confirmation.
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

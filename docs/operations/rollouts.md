@@ -147,3 +147,21 @@ apply. The rollout's face then offers **Resume**.
 
 Pause before investigating anything surprising: it costs nothing, and every other decision is still
 available from a paused rollout.
+
+## Action rollouts
+
+**Run action…** on the Hosts and Clusters pages runs one [action](../modules/README.md#actions)
+across the fleet as a rollout: pick the action, and optionally narrow its targets with a selector
+(`host.labels.role == "web"`). The rollout follows the stable revision's phases as a revision's
+would, with the same approvals, waves of `parallel`, baseline and bake checks, failure budgets,
+pause and abort, and reboots.
+
+- **Targets**: every active target whose applied revision offers the action and that the selector
+  matches, frozen when the rollout starts. Each runs the action from the revision it runs.
+- **Approval**: every target has the same plan (the action), so one approval covers a phase. An
+  `if_destructive` phase asks for one when the action is declared with `confirm: true`.
+- **Ending**: the rollout completes without promoting anything, and has no stragglers stage. It
+  cannot be rolled back; a failed target is retried, skipped or left, and the rollout aborted.
+
+An action rollout starts only while no other rollout is under way. A revision rollout started
+during one waits for it (or replaces it, under `supersede: replace`).

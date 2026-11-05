@@ -21,7 +21,8 @@ notes, labels, health checks, drift and its latest run. Its actions are at the t
 An action runs at once, or asks for a reason first when it is declared with `confirm: true`. It
 is refused while the host applies in a rollout, while it is paused or offline, and while another
 action runs there. Its run appears under **Recent runs**, marked as an action, and the audit log
-records who ran it and why.
+records who ran it and why. To run an action on many hosts at once, through the rollout phases, use
+[Run action…](rollouts.md#action-rollouts) on the Hosts page.
 
 Pause a host before maintenance that Buckle would otherwise undo, such as a manual hotfix you are
 testing, and resume it afterwards.

@@ -211,8 +211,20 @@ pub fn rollout_page(props: &Props) -> Html {
     let finished = rollout_finished(s.state);
 
     let subtitle = html! { <>
-        <CommitCard commit={Commit::of_rollout(s, revisions.value().map(|v| v.as_slice()).unwrap_or(&[]))}
-            link=false body=true boxed=true {now} />
+        if let Some(a) = &s.action {
+            <p class="rollout-action" data-testid="rollout-action">
+                <Pill tone={Tone::Info} label="action" />{ " " }
+                <span class="strong">{ a.label.clone() }</span>{ " " }
+                <span class="badge mono">{ format!("{}/{}", a.module, a.action) }</span>
+                <span class="muted">{ match &a.selector {
+                    Some(sel) => format!(" on the targets {sel} matches, through the phases of {}", short(&s.revision)),
+                    None => format!(" on every target offering it, through the phases of {}", short(&s.revision)),
+                } }</span>
+            </p>
+        } else {
+            <CommitCard commit={Commit::of_rollout(s, revisions.value().map(|v| v.as_slice()).unwrap_or(&[]))}
+                link=false body=true boxed=true {now} />
+        }
         <div class="rollout-meta">
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
             if let Some(f) = &d.fleet { <Changes tally={fleet_tally(f)} /> }
@@ -457,6 +469,7 @@ pub(crate) fn controls(
     let standing = Standing {
         failed: failed(detail).len(),
         baking: baking(detail).len(),
+        action: detail.summary.action.is_some(),
     };
     let Some(d) = decisions(detail.summary.state, approve, standing) else {
         return html! {};

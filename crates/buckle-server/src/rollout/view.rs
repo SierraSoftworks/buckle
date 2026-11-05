@@ -129,6 +129,16 @@ pub fn summary(record: &RolloutRecord, hosts: &[RolloutHostRecord]) -> RolloutSu
         superseded_by: record.runtime.superseded_by.clone(),
         trace_id: record.runtime.trace_id.clone(),
         trace_url: None,
+        action: record
+            .runtime
+            .action
+            .as_ref()
+            .map(|a| buckle_api::RolloutActionInfo {
+                module: a.module.clone(),
+                action: a.action.clone(),
+                label: a.label.clone(),
+                selector: a.selector.clone(),
+            }),
     }
 }
 

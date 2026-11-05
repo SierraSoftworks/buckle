@@ -16,7 +16,7 @@ use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
     Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, PageHead, Panel, Refresh,
-    RouteLink, host_state_pills, icons, use_toast,
+    RouteLink, RunAction, host_state_pills, icons, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{agents_behind, expected_version, matches_filter, same_version};
@@ -71,6 +71,7 @@ pub fn hosts() -> Html {
     let approving = use_state(|| None::<String>);
     let upgrading = use_state(|| false);
     let adding = use_state(|| false);
+    let running = use_state(|| false);
     let busy = use_state(|| false);
     // Back from Tailscale with a ticket: the wizard stays open on it until closed.
     {
@@ -317,10 +318,16 @@ pub fn hosts() -> Html {
                         <Button onclick={{ let u = upgrading.clone(); Callback::from(move |_| u.set(true)) }}>{ "Upgrade all agents…" }</Button>
                     }
                     if auth.is_admin() {
+                        <Button onclick={{ let r = running.clone(); Callback::from(move |_| r.set(true)) }}>{ "Run action…" }</Button>
+                    }
+                    if auth.is_admin() {
                         <Button kind={Kind::Primary} onclick={{ let a = adding.clone(); Callback::from(move |_| a.set(true)) }}>{ icons::plus() }{ "Add an agent…" }</Button>
                     }
                 </> }} />
             <Panel>{ body }</Panel>
+            if auth.is_admin() && *running {
+                <RunAction on_close={{ let r = running.clone(); Callback::from(move |_| r.set(false)) }} />
+            }
             if auth.is_admin() && *adding {
                 <super::add_agent::AddAgent
                     hosts={live.as_ref().map(|f| f.hosts.clone()).unwrap_or_default()}

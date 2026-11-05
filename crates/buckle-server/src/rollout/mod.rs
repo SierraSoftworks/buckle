@@ -15,6 +15,7 @@ pub use controller::{
     ControllerOptions, approval_token, encode_pending_report, pending_report_key, spawn,
 };
 pub use link::{HostLink, Sessions};
+pub use model::RolloutAction;
 
 #[cfg(test)]
 mod tests;

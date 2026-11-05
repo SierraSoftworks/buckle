@@ -209,6 +209,40 @@ pub struct RolloutRuntime {
     /// Hosts the target-set freeze matched to no phase.
     #[serde(default)]
     pub untargeted: Vec<String>,
+    /// An action rollout: what each target runs in place of an apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<RolloutAction>,
+}
+
+/// The action an action rollout runs on each of its targets, from the
+/// revision each runs (in place of a plan and an apply of the rollout's).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutAction {
+    /// The module (a cluster's: the workload) declaring it.
+    pub module: String,
+    pub action: String,
+    pub label: String,
+    /// It asks for confirmation: an `if_destructive` phase needs approval.
+    #[serde(default)]
+    pub confirm: bool,
+    /// The selector the targets were picked by, as the operator wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+}
+
+impl RolloutAction {
+    /// `module/action`, as runs name it.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.module, self.action)
+    }
+
+    /// What every target's "plan" is: one digest, so one approval covers
+    /// the phase.
+    pub fn digest(&self) -> String {
+        buckle_core::Digest::of(format!("action:{}", self.key()).as_bytes())
+            .as_str()
+            .to_owned()
+    }
 }
 
 /// One rollout row.
@@ -382,6 +416,10 @@ pub struct HostRuntime {
     /// between the rollout's start and its stage opening.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drifted_from: Option<String>,
+    /// In an action rollout: the run of the action sent (its result's
+    /// `action_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_run: Option<String>,
 }
 
 impl HostRuntime {

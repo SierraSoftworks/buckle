@@ -7,8 +7,8 @@
 use super::bake::{self, BakeWindow};
 use super::link::HostLink;
 use super::model::{
-    GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, RebootWait, RolloutHostRecord,
-    RolloutRecord, RolloutRuntime, STRAGGLERS,
+    GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, RebootWait, RolloutAction,
+    RolloutHostRecord, RolloutRecord, RolloutRuntime, STRAGGLERS,
 };
 use super::stages;
 use super::view;
@@ -168,6 +168,14 @@ pub enum Command {
         rollout: String,
         reason: String,
     },
+    /// Start an action rollout: run `action` on each of `targets` (target →
+    /// the revision it runs, which declares the action) through the stable
+    /// revision's phases; replies with the rollout's id.
+    StartAction {
+        action: RolloutAction,
+        targets: BTreeMap<String, String>,
+        note: String,
+    },
     /// Run an action of `module` (a cluster's: a workload) on `target`
     /// from `revision`, its applied revision; replies with the run's id.
     RunAction {
@@ -197,6 +205,7 @@ impl Command {
             Command::Force { .. } => "rollout.host.force",
             Command::Reject { .. } => "rollout.reject",
             Command::RunAction { .. } => "host.action.run",
+            Command::StartAction { .. } => "rollout.action.start",
         }
     }
 }
@@ -536,6 +545,9 @@ struct Controller {
     live: Vec<Live>,
     outbox: Vec<Out>,
     audits: Vec<NewAudit>,
+    /// Action runs to store with the next checkpoint, before the messages
+    /// that start them are sent.
+    new_runs: Vec<crate::store::RunRecord>,
     stable: Option<String>,
     stable_dirty: bool,
     excluded: HashSet<String>,
@@ -828,6 +840,7 @@ impl Controller {
             options: deps.options,
             live,
             outbox: Vec::new(),
+            new_runs: Vec::new(),
             audits: Vec::new(),
             stable,
             stable_dirty: false,
@@ -1199,6 +1212,7 @@ impl Controller {
                     match msg {
                         agent_message::Msg::Result(r) => self.on_apply_result(&host, r),
                         agent_message::Msg::Rollback(r) => self.on_local_rollback(&host, r),
+                        agent_message::Msg::Action(a) => self.on_action_result(&host, a),
                         _ => {}
                     }
                 }
@@ -1294,6 +1308,12 @@ impl Controller {
                 HostPhase::Baseline if self.may_apply(ri, hi) => self.send_baseline(ri, hi),
                 HostPhase::Baseline => {
                     self.defer_host(ri, hi, "reconnected while the rollout is not running")
+                }
+                // An action is not idempotent and is never re-sent: its
+                // result is durable (the agent re-sends it), and one that
+                // never ran fails by the apply timeout.
+                HostPhase::Applying if self.live[ri].record.runtime.action.is_some() => {
+                    tracing::debug!(host = %c.host, target = %self.live[ri].hosts[hi].host, "reconnected while running an action; waiting for its result");
                 }
                 HostPhase::Applying if !own => {
                     tracing::debug!(host = %c.host, target = %self.live[ri].hosts[hi].host, "the executor is back; waiting for the cluster's result");
@@ -1426,6 +1446,11 @@ impl Controller {
     fn on_plan(&mut self, host: &str, plan: PlanResult) {
         let target = plan.target.clone();
         for ri in 0..self.live.len() {
+            // An action rollout plans nothing: a plan (a drift check's) is
+            // not its.
+            if self.live[ri].record.runtime.action.is_some() {
+                continue;
+            }
             let Some(hi) = self.live[ri].find_target(host, &target) else {
                 continue;
             };
@@ -1592,6 +1617,9 @@ impl Controller {
     fn on_apply_result(&mut self, host: &str, result: ApplyResult) {
         let target = result.target.clone();
         for ri in 0..self.live.len() {
+            if self.live[ri].record.runtime.action.is_some() {
+                continue;
+            }
             let Some(hi) = self.live[ri].find_target(host, &target) else {
                 continue;
             };
@@ -1834,6 +1862,9 @@ impl Controller {
 
     fn on_local_rollback(&mut self, host: &str, lr: LocalRollback) {
         for ri in 0..self.live.len() {
+            if self.live[ri].record.runtime.action.is_some() {
+                continue;
+            }
             let Some(hi) = self.live[ri].find(host) else {
                 continue;
             };
@@ -2258,6 +2289,258 @@ impl Controller {
         Ok(run_id)
     }
 
+    /// Starts an action rollout (see [`Command::StartAction`]): refused
+    /// while another rollout is under way or queued, and without a stable
+    /// revision (whose phases it follows).
+    async fn start_action(
+        &mut self,
+        actor: &str,
+        action: RolloutAction,
+        targets: BTreeMap<String, String>,
+        note: &str,
+    ) -> Result<String, CommandError> {
+        if let Some(l) = self
+            .live
+            .iter()
+            .find(|l| l.record.is_active() || l.record.state == RolloutState::Detected)
+        {
+            return Err(CommandError::conflict(
+                format!(
+                    "Rollout {} is under way.",
+                    buckle_api::rollout_name(&l.record.id).unwrap_or_else(|| l.record.id.clone())
+                ),
+                &["Run the action once it has finished, or abort it."],
+            ));
+        }
+        if targets.is_empty() {
+            return Err(CommandError::invalid(
+                format!("No target offers {}.", action.label),
+                &["Check the selector, and that the targets run a revision declaring the action."],
+            ));
+        }
+        let stable = self.stable.clone().ok_or_else(|| {
+            CommandError::conflict(
+                "There is no stable revision yet: an action rollout follows its phases.",
+                &["Roll out a revision first."],
+            )
+        })?;
+        let rev = self
+            .revisions
+            .load(&stable)
+            .await
+            .map_err(CommandError::internal)?;
+        let now = self.now();
+        let id = self.new_rollout_id().await?;
+        let n = targets.len();
+        let record = RolloutRecord {
+            id: id.clone(),
+            revision: stable.clone(),
+            state: RolloutState::Detected,
+            policy: rev.fleet.rollout.clone(),
+            started_at: now,
+            finished_at: None,
+            triggered_by: actor.to_owned(),
+            runtime: RolloutRuntime {
+                note: note.to_owned(),
+                revision_message: format!("{} ({})", action.label, action.key()),
+                action: Some(action.clone()),
+                ..Default::default()
+            },
+        };
+        let span = run_span(&id, &stable, None);
+        self.live.push(Live {
+            record,
+            hosts: Vec::new(),
+            approvals: Vec::new(),
+            revision: rev,
+            span,
+            phase_spans: HashMap::new(),
+            host_spans: HashMap::new(),
+            dirty: true,
+            dirty_hosts: BTreeSet::new(),
+        });
+        let ri = self.live.len() - 1;
+        {
+            let trace = trace_id_of(&self.live[ri].span);
+            let tp = traceparent_of(&self.live[ri].span);
+            self.live[ri].record.runtime.trace_id = trace;
+            self.live[ri].record.runtime.traceparent = tp;
+        }
+        let message = if note.is_empty() {
+            format!(
+                "rollout of {} on {n} targets created by {actor}",
+                action.key()
+            )
+        } else {
+            format!(
+                "rollout of {} on {n} targets created by {actor}: {note}",
+                action.key()
+            )
+        };
+        self.command_audit(
+            actor,
+            "rollout.detected",
+            ri,
+            message,
+            serde_json::json!({
+                "module": action.module,
+                "action": action.key(),
+                "selector": action.selector,
+                "targets": targets.keys().collect::<Vec<_>>(),
+                "note": note,
+            }),
+        );
+        self.freeze(ri, Some(targets))
+            .await
+            .map_err(CommandError::internal)?;
+        Ok(id)
+    }
+
+    /// An action rollout's row is ready as soon as it is frozen (or
+    /// re-planned): its "plan" is the action, one digest for every target.
+    fn action_planned(&mut self, ri: usize, hi: usize) {
+        let Some(action) = self.live[ri].record.runtime.action.clone() else {
+            return;
+        };
+        if !matches!(
+            self.live[ri].hosts[hi].state,
+            HostPhase::PlanPending | HostPhase::Planned
+        ) {
+            return;
+        }
+        {
+            let h = &mut self.live[ri].hosts[hi];
+            h.plan_digest = Some(action.digest());
+            h.plan = None;
+            h.runtime.plan_changes = Some(1);
+            h.runtime.plan_removals = Some(0);
+            h.runtime.destructive = action.confirm;
+            h.runtime.preview = false;
+        }
+        self.touch_host(ri, hi);
+        self.set_host_state(ri, hi, HostPhase::Planned, "ready to run the action");
+    }
+
+    /// Sends row `hi` its action, its run stored (running) with the
+    /// checkpoint before the message goes.
+    fn send_action(&mut self, ri: usize, hi: usize, action: &RolloutAction) {
+        let now = self.now();
+        let span = self.host_span(ri, hi);
+        let run_id = crate::store::RunRecord::new_id();
+        let (target, revision, rollout) = {
+            let live = &self.live[ri];
+            let h = &live.hosts[hi];
+            (
+                h.host.clone(),
+                h.runtime.revision.clone(),
+                live.record.id.clone(),
+            )
+        };
+        self.new_runs.push(crate::store::RunRecord {
+            id: run_id.clone(),
+            host: target,
+            rollout: Some(rollout),
+            revision: revision.clone(),
+            plan_digest: action.digest(),
+            started_at: now,
+            finished_at: now,
+            outcome: crate::store::RUNNING.to_owned(),
+            changes: 0,
+            removals: 0,
+            error: None,
+            trace_id: trace_id_of(&span),
+            outcome_json: None,
+            action: Some(action.key()),
+        });
+        {
+            let h = &mut self.live[ri].hosts[hi];
+            h.runtime.applied = true;
+            h.runtime.apply_started_at = Some(now);
+            h.runtime.apply_resends = 0;
+            h.runtime.reboot = None;
+            h.runtime.bake = None;
+            h.runtime.action_run = Some(run_id.clone());
+        }
+        self.set_host_state(ri, hi, HostPhase::Applying, "action sent");
+        self.touch_host(ri, hi);
+        self.send_to(
+            ri,
+            hi,
+            server_message::Msg::Action(pb::RunAction {
+                action_id: run_id,
+                module: action.module.clone(),
+                action: action.action.clone(),
+                revision,
+                traceparent: traceparent_of(&span).unwrap_or_default(),
+                target: String::new(),
+            }),
+        );
+    }
+
+    /// The result of an action an action rollout sent: on success the row
+    /// bakes (after its reboot, when the action asked for one), else it
+    /// fails against its phase's budget.
+    fn on_action_result(&mut self, host: &str, a: pb::ActionResult) {
+        for ri in 0..self.live.len() {
+            if self.live[ri].record.runtime.action.is_none() {
+                continue;
+            }
+            let Some(hi) = self.live[ri].find_target(host, &a.target) else {
+                continue;
+            };
+            let h = &self.live[ri].hosts[hi];
+            if h.state != HostPhase::Applying
+                || h.runtime.action_run.as_deref() != Some(a.action_id.as_str())
+            {
+                continue;
+            }
+            let outcome: Option<serde_json::Value> = serde_json::from_slice(&a.outcome_json).ok();
+            self.live[ri].hosts[hi].result = serde_json::to_value(ResultView {
+                revision: a.revision.clone(),
+                plan_digest: a.plan_digest.clone(),
+                succeeded: a.succeeded,
+                changes: a.changes,
+                removals: 0,
+                applied_revision: String::new(),
+                failed_module: if a.succeeded {
+                    String::new()
+                } else {
+                    a.module.clone()
+                },
+                rolled_back_modules: Vec::new(),
+                not_started_modules: Vec::new(),
+                error: a.error.clone(),
+                failed_checks: Vec::new(),
+                outcome,
+            })
+            .ok();
+            if a.succeeded {
+                self.live[ri].hosts[hi].runtime.bake = Some(self.bake_window(ri, hi, None));
+                if let Some(reboot) = &a.reboot {
+                    self.await_reboot(ri, hi, reboot);
+                }
+                if self.live[ri].hosts[hi].runtime.reboot.is_some() {
+                    self.on_reboot_announced(ri, hi);
+                } else {
+                    self.start_bake(ri, hi);
+                }
+                continue;
+            }
+            let why = if a.error.is_empty() {
+                "the action failed".to_owned()
+            } else {
+                a.error.clone()
+            };
+            {
+                let h = &mut self.live[ri].hosts[hi];
+                h.runtime.failed_module = Some(a.module.clone());
+                h.runtime.error_detail = a.error_detail.as_ref().map(error_view);
+                h.runtime.error = Some(why.clone());
+            }
+            self.fail_host(ri, hi, &why);
+        }
+    }
+
     async fn on_command(&mut self, actor: &str, command: Command) -> Result<String, CommandError> {
         match command {
             Command::RunAction {
@@ -2271,6 +2554,11 @@ impl Controller {
                     .await
             }
             Command::Start { revision, note } => self.start(&revision, actor, &note).await,
+            Command::StartAction {
+                action,
+                targets,
+                note,
+            } => self.start_action(actor, action, targets, &note).await,
             Command::Approve {
                 rollout,
                 phase,
@@ -2330,6 +2618,12 @@ impl Controller {
             }
             Command::Rollback { rollout, note } => {
                 let ri = self.find_rollout(&rollout)?;
+                if self.live[ri].record.runtime.action.is_some() {
+                    return Err(CommandError::conflict(
+                        "An action rollout cannot be rolled back.",
+                        &["Pause or abort it; run another action to undo what it did."],
+                    ));
+                }
                 if !self.live[ri].record.is_active()
                     || self.live[ri].record.state == RolloutState::RollingBack
                 {
@@ -3026,7 +3320,9 @@ impl Controller {
                 }
             }
         }
-        self.freeze(ri).await.map_err(CommandError::internal)?;
+        self.freeze(ri, None)
+            .await
+            .map_err(CommandError::internal)?;
         Ok(id)
     }
 
@@ -3060,8 +3356,14 @@ impl Controller {
         Ok(targets)
     }
 
-    /// Freezes the target set and requests plans everywhere.
-    async fn freeze(&mut self, ri: usize) -> buckle_core::Result<()> {
+    /// Freezes the target set and requests plans everywhere. An action
+    /// rollout freezes `only` (target → the revision it runs the action
+    /// from), each laid out as one step, and plans nothing.
+    async fn freeze(
+        &mut self,
+        ri: usize,
+        only: Option<BTreeMap<String, String>>,
+    ) -> buckle_core::Result<()> {
         let revision = self.live[ri].revision.clone();
         let hosts = self.load_targets(Some(revision)).await?;
         let now = self.now();
@@ -3087,7 +3389,11 @@ impl Controller {
                 open_stage: 0,
             })
             .collect();
-        live.record.runtime.previous_stable = self.stable.clone();
+        // An action rollout has nothing to roll back to.
+        live.record.runtime.previous_stable = match &only {
+            Some(_) => None,
+            None => self.stable.clone(),
+        };
         live.record.started_at = now;
         let mut untargeted = Vec::new();
         for (host, facts) in &hosts {
@@ -3097,6 +3403,13 @@ impl Controller {
             if host.status != HostStatus::Active || host.executor_of().is_some() {
                 continue;
             }
+            let revision = match &only {
+                Some(only) => match only.get(&host.id) {
+                    Some(r) => r.clone(),
+                    None => continue,
+                },
+                None => live.record.revision.clone(),
+            };
             let ctx = crate::fleet::record_context(host, facts, fleet);
             match crate::fleet::phase_for(&ctx, &phases) {
                 Some(pi) => live.hosts.push(RolloutHostRecord {
@@ -3112,7 +3425,7 @@ impl Controller {
                     created_at: now,
                     updated_at: now,
                     runtime: HostRuntime {
-                        revision: live.record.revision.clone(),
+                        revision,
                         phase_index: Some(pi),
                         kind: host.kind,
                         ..Default::default()
@@ -3126,14 +3439,19 @@ impl Controller {
         live.dirty_hosts = (0..live.hosts.len()).collect();
         let n = live.hosts.len();
         let count = format!("{n} hosts frozen into {} phases", phases.len());
-        for pi in 0..phases.len() {
-            self.compute_stages(ri, pi, &hosts);
+        // An action runs on each target as one step: no dependency stages.
+        if only.is_none() {
+            for pi in 0..phases.len() {
+                self.compute_stages(ri, pi, &hosts);
+            }
         }
         self.set_rollout_state(ri, RolloutState::Planning, "controller", &count);
         for hi in 0..n {
             self.request_plan(ri, hi);
         }
-        self.preview_clusters(ri).await;
+        if only.is_none() {
+            self.preview_clusters(ri).await;
+        }
         Ok(())
     }
 
@@ -3400,6 +3718,10 @@ impl Controller {
 
     /// A plan requested before the row's stage opens is a preview.
     fn send_plan_request(&mut self, ri: usize, hi: usize, early: bool) {
+        if self.live[ri].record.runtime.action.is_some() {
+            self.action_planned(ri, hi);
+            return;
+        }
         let open = self.stage_open(ri, hi);
         if self.live[ri].hosts[hi].runtime.plan_deferred() && !open && !early {
             return;
@@ -3705,6 +4027,10 @@ impl Controller {
                 hi,
                 "the rollout is not running; the apply waits for it to resume",
             );
+            return;
+        }
+        if let Some(action) = self.live[ri].record.runtime.action.clone() {
+            self.send_action(ri, hi, &action);
             return;
         }
         let now = self.now();
@@ -4350,7 +4676,7 @@ impl Controller {
             }
         };
         let next_id = self.live[next].record.id.clone();
-        if let Err(e) = self.freeze(next).await {
+        if let Err(e) = self.freeze(next, None).await {
             tracing::error!(rollout = %next_id, error = %e, "a queued rollout could not start");
             self.finish(
                 next,
@@ -4705,6 +5031,17 @@ impl Controller {
     }
 
     async fn complete(&mut self, ri: usize) {
+        // An action rollout promotes nothing and has no stragglers.
+        if self.live[ri].record.runtime.action.is_some() {
+            self.finish(
+                ri,
+                RolloutState::Completed,
+                "controller",
+                "every phase ran the action, baked and passed its gate",
+            );
+            self.live[ri].record.runtime.end_reason = None;
+            return;
+        }
         let revision = self.live[ri].record.revision.clone();
         let id = self.live[ri].record.id.clone();
         self.finish(
@@ -5384,7 +5721,8 @@ impl Controller {
     /// Called when a host connects (its Hello labels are stored by then),
     /// when a host's status or labels change, and when a phase ends.
     async fn admit_late_targets(&mut self, ri: usize, only: Option<&str>) {
-        if !self.live[ri].record.is_running() {
+        // An action rollout runs on the targets it was started for.
+        if !self.live[ri].record.is_running() || self.live[ri].record.runtime.action.is_some() {
             return;
         }
         let current = self.live[ri].record.runtime.current_phase;
@@ -5524,6 +5862,7 @@ impl Controller {
             }
         }
         let audits = std::mem::take(&mut self.audits);
+        let runs = std::mem::take(&mut self.new_runs);
         let stable = self.stable_dirty.then(|| self.stable.clone()).flatten();
         let cleared = self.pending_clear.clone();
         let executors: Vec<(String, String)> = self
@@ -5534,11 +5873,17 @@ impl Controller {
         if !(rollouts.is_empty()
             && hosts.is_empty()
             && audits.is_empty()
+            && runs.is_empty()
             && stable.is_none()
             && cleared.is_empty()
             && executors.is_empty())
         {
-            let (r2, h2, a2) = (rollouts.clone(), hosts.clone(), audits.clone());
+            let (r2, h2, a2, n2) = (
+                rollouts.clone(),
+                hosts.clone(),
+                audits.clone(),
+                runs.clone(),
+            );
             let result = self
                 .store
                 .transaction(move |db| {
@@ -5547,6 +5892,9 @@ impl Controller {
                     }
                     for h in &h2 {
                         db.rollouts().save_host(h)?;
+                    }
+                    for run in &n2 {
+                        db.runs().add(run)?;
                     }
                     if let Some(s) = &stable {
                         db.kv().set(keys::STABLE_REVISION, s)?;
@@ -5622,6 +5970,9 @@ impl Controller {
                     let mut kept = audits;
                     kept.append(&mut self.audits);
                     self.audits = kept;
+                    let mut kept = runs;
+                    kept.append(&mut self.new_runs);
+                    self.new_runs = kept;
                     self.flush_failures = self.flush_failures.saturating_add(1);
                     let backoff = 1i64 << self.flush_failures.min(5);
                     self.flush_retry = Some(self.now() + chrono::Duration::seconds(backoff));
@@ -5862,18 +6213,22 @@ struct ResultView {
 /// The structured error of a failed ApplyResult: the agent's run-level
 /// `error_detail`, else (an agent that sends none) the first failing
 /// module's from the outcome, parsed this once.
+fn error_view(e: &pb::ErrorDetail) -> buckle_api::ErrorView {
+    buckle_api::ErrorView {
+        kind: if e.kind == "system" {
+            buckle_api::ErrorKind::System
+        } else {
+            buckle_api::ErrorKind::User
+        },
+        message: e.message.clone(),
+        causes: e.causes.clone(),
+        advice: e.advice.clone(),
+    }
+}
+
 fn result_error_detail(result: &ApplyResult) -> Option<buckle_api::ErrorView> {
     if let Some(e) = &result.error_detail {
-        return Some(buckle_api::ErrorView {
-            kind: if e.kind == "system" {
-                buckle_api::ErrorKind::System
-            } else {
-                buckle_api::ErrorKind::User
-            },
-            message: e.message.clone(),
-            causes: e.causes.clone(),
-            advice: e.advice.clone(),
-        });
+        return Some(error_view(e));
     }
     serde_json::from_slice::<buckle_core::engine::ApplyOutcome>(&result.outcome_json)
         .ok()

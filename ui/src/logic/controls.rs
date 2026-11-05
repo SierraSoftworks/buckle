@@ -108,6 +108,8 @@ pub struct Decisions {
 pub struct Standing {
     pub failed: usize,
     pub baking: usize,
+    /// An action rollout: there is nothing to roll back to.
+    pub action: bool,
 }
 
 /// What an operator can decide for a rollout in `state`, with `approve` the
@@ -137,10 +139,12 @@ pub fn decisions(state: RolloutState, approve: Option<&str>, hosts: Standing) ->
     if state == RolloutState::AwaitingApproval {
         all.push(Decision::Reject);
     }
-    if matches!(
-        state,
-        RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking
-    ) {
+    if !hosts.action
+        && matches!(
+            state,
+            RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking
+        )
+    {
         all.push(Decision::Rollback);
     }
     all.push(Decision::Abort);
@@ -277,6 +281,16 @@ mod tests {
         assert!(menu(RolloutState::Rolling, None).contains(&Abort));
         assert!(menu(RolloutState::Paused, None).contains(&Rollback));
         assert!(!menu(RolloutState::Planning, None).contains(&Rollback));
+        let action = Standing {
+            action: true,
+            ..Default::default()
+        };
+        let paused = decisions(RolloutState::Paused, None, action).unwrap().menu;
+        assert!(
+            !paused.contains(&Rollback),
+            "an action rollout has nothing to roll back to"
+        );
+        assert!(paused.contains(&Abort));
         assert!(menu(RolloutState::AwaitingApproval, Some("canary")).contains(&Reject));
         // Approving does not take pausing away.
         assert!(menu(RolloutState::Rolling, Some("web")).contains(&Pause));
@@ -298,7 +312,7 @@ mod tests {
     fn failed_hosts_put_retry_first_and_resume_becomes_skipping_the_phase() {
         let failed = Standing {
             failed: 2,
-            baking: 0,
+            ..Default::default()
         };
         let d = decisions(RolloutState::Paused, None, failed).unwrap();
         assert_eq!(d.primary, Retry);
@@ -314,8 +328,8 @@ mod tests {
     #[test]
     fn baking_hosts_offer_skipping_the_bake() {
         let baking = Standing {
-            failed: 0,
             baking: 1,
+            ..Default::default()
         };
         for (state, offered) in [
             (RolloutState::Baking, true),

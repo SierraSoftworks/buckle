@@ -385,7 +385,7 @@ impl<'c> Runs<'c> {
     pub fn latest_for_rollout_host(&self, rollout: &str, host: &str) -> Result<Option<RunRecord>> {
         Ok(self
             .query(
-                &format!("SELECT {COLUMNS} FROM runs WHERE rollout = ?1 AND host = ?2 AND action IS NULL ORDER BY id DESC LIMIT 1"),
+                &format!("SELECT {COLUMNS} FROM runs WHERE rollout = ?1 AND host = ?2 ORDER BY id DESC LIMIT 1"),
                 params![rollout, host],
             )?
             .into_iter()
@@ -399,7 +399,7 @@ impl<'c> Runs<'c> {
     ) -> Result<std::collections::BTreeMap<String, String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT host, run_id FROM runs WHERE rollout = ?1 AND action IS NULL ORDER BY id ASC")
+            .prepare("SELECT host, run_id FROM runs WHERE rollout = ?1 ORDER BY id ASC")
             .map_err(db_error)?;
         let rows = stmt
             .query_map(params![rollout], |r| {

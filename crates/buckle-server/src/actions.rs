@@ -65,3 +65,63 @@ pub fn list(
         }
     }
 }
+
+/// Every action the fleet's active targets offer now (each from the
+/// revision it runs), with the targets offering it that `selector` matches.
+/// The selector sees a target as the stable revision's phases do.
+pub async fn fleet(
+    store: &crate::store::Store,
+    revisions: &crate::source::cache::RevisionCache,
+    selector: Option<&buckle_core::Filter>,
+) -> buckle_core::Result<Vec<buckle_api::FleetAction>> {
+    let targets = store
+        .call(|db| {
+            let mut out = Vec::new();
+            for h in db.hosts().targets()? {
+                let facts = db.hosts().latest_facts(&h.id)?.map(|(f, _)| f);
+                out.push((h, facts.unwrap_or(serde_json::Value::Null)));
+            }
+            Ok(out)
+        })
+        .await?;
+    let stable = crate::views::stable_revision(store, revisions).await;
+    let mut loaded: std::collections::HashMap<String, Option<std::sync::Arc<Revision>>> =
+        std::collections::HashMap::new();
+    let mut out: Vec<buckle_api::FleetAction> = Vec::new();
+    for (record, facts) in &targets {
+        // An in-cluster executor runs no modules of its own.
+        if record.status != buckle_api::HostStatus::Active || record.executor_of().is_some() {
+            continue;
+        }
+        let Some(applied) = record.applied_revision.clone() else {
+            continue;
+        };
+        if !loaded.contains_key(&applied) {
+            let rev = revisions.load(&applied).await.ok();
+            loaded.insert(applied.clone(), rev);
+        }
+        let Some(rev) = loaded.get(&applied).cloned().flatten() else {
+            continue;
+        };
+        if let Some(selector) = selector {
+            let fleet = &stable.as_deref().unwrap_or(&rev).fleet;
+            if !crate::fleet::record_context(record, facts, fleet).matches(selector) {
+                continue;
+            }
+        }
+        for a in list(&rev, record, facts) {
+            match out
+                .iter_mut()
+                .find(|f| f.action.module == a.module && f.action.name == a.name)
+            {
+                Some(f) => f.targets.push(record.id.clone()),
+                None => out.push(buckle_api::FleetAction {
+                    action: a,
+                    targets: vec![record.id.clone()],
+                }),
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.action.module, &a.action.name).cmp(&(&b.action.module, &b.action.name)));
+    Ok(out)
+}

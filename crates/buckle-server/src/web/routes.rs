@@ -70,6 +70,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/revisions/{id}/rollout", web::post().to(start_rollout))
             .route("/revisions/{id}/validate", web::post().to(revalidate))
             .route("/rollouts", web::get().to(rollouts))
+            .route("/rollouts", web::post().to(start_action_rollout))
+            .route("/actions", web::get().to(fleet_actions))
             .route("/rollouts/{id}", web::get().to(rollout))
             .route("/rollouts/{id}/plans", web::get().to(rollout_plans))
             .route(
@@ -127,6 +129,8 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/revisions/r/rollout"),
     ("POST", "/api/v1/revisions/r/validate"),
     ("GET", "/api/v1/rollouts"),
+    ("POST", "/api/v1/rollouts"),
+    ("GET", "/api/v1/actions"),
     ("GET", "/api/v1/rollouts/r"),
     ("GET", "/api/v1/rollouts/r/plans"),
     ("POST", "/api/v1/rollouts/r/approve"),
@@ -1120,6 +1124,101 @@ async fn run_action(
             .publish(LiveEvent::HostChanged { host: summary });
     }
     Ok(HttpResponse::Accepted().json(buckle_api::ActionStarted { run_id }))
+}
+
+#[derive(Deserialize)]
+struct ActionsQuery {
+    #[serde(default)]
+    selector: Option<String>,
+}
+
+/// A selector as the operator typed it: absent when blank.
+fn parse_selector(raw: Option<&str>) -> Result<Option<buckle_core::Filter>, ApiError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(expr) => buckle_core::Filter::new(expr)
+            .map(Some)
+            .map_err(|e| ApiError::bad_request(format!("The selector is not valid: {e}"))),
+        None => Ok(None),
+    }
+}
+
+/// `GET /actions`: every action the fleet offers now, with the targets
+/// offering it (that `selector` matches).
+async fn fleet_actions(state: Data, _: Authenticated, q: web::Query<ActionsQuery>) -> ApiResult {
+    let selector = parse_selector(q.selector.as_deref())?;
+    let actions = crate::actions::fleet(&state.store, &state.revisions, selector.as_ref()).await?;
+    Ok(HttpResponse::Ok().json(actions))
+}
+
+/// `POST /rollouts`: an action rollout over the targets offering the action
+/// that the selector matches, each running it from its own revision.
+async fn start_action_rollout(
+    state: Data,
+    admin: Administrative,
+    body: web::Json<buckle_api::StartActionRollout>,
+) -> ApiResult {
+    let body = body.into_inner();
+    let raw = body
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let selector = parse_selector(raw.as_deref())?;
+    let offered = crate::actions::fleet(&state.store, &state.revisions, selector.as_ref()).await?;
+    let found = offered
+        .into_iter()
+        .find(|f| f.action.module == body.module && f.action.name == body.action)
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "No target{} offers the action '{}' of '{}'.",
+                if raw.is_some() {
+                    " the selector matches"
+                } else {
+                    ""
+                },
+                body.action,
+                body.module
+            ))
+        })?;
+    if found.action.confirm && body.note.trim().is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "The action '{}' asks for confirmation: send a note for the audit log.",
+            found.action.label
+        )));
+    }
+    let names = found.targets.clone();
+    let targets: std::collections::BTreeMap<String, String> = state
+        .store
+        .call(move |db| {
+            let mut out = std::collections::BTreeMap::new();
+            for t in &names {
+                if let Some(rev) = db.hosts().target(t)?.and_then(|r| r.applied_revision) {
+                    out.insert(t.clone(), rev);
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+    let id = state
+        .controller
+        .command(
+            &admin.0.actor(),
+            Command::StartAction {
+                action: crate::rollout::RolloutAction {
+                    module: found.action.module.clone(),
+                    action: found.action.name.clone(),
+                    label: found.action.label.clone(),
+                    confirm: found.action.confirm,
+                    selector: raw,
+                },
+                targets,
+                note: body.note,
+            },
+        )
+        .await?;
+    let detail = rollout_detail(&state, &id).await?;
+    Ok(HttpResponse::build(StatusCode::CREATED).json(detail.summary))
 }
 
 /// Asks the host's agent to install a release once idle and restart into it.
