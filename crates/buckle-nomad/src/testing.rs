@@ -24,6 +24,9 @@ struct State {
     pools: BTreeMap<String, Value>,
     volumes: Vec<Value>,
     outcome: String,
+    /// Reads of the blocked evaluation left before it completes, after a
+    /// registration whose placement fails (`usize::MAX`: never).
+    blocked_polls: Option<usize>,
     /// Jobs whose deployments stay `running` until released.
     held: std::collections::BTreeSet<(String, String)>,
     requests: Vec<(String, String)>,
@@ -69,6 +72,13 @@ impl FakeNomad {
     /// How the next deployments end: `successful`, `failed`, `cancelled`.
     pub fn deployment_outcome(&self, outcome: &str) {
         self.state.lock().unwrap().outcome = outcome.into();
+    }
+
+    /// Fails the placement of the next registrations: their evaluation
+    /// completes with a port collision and a blocked evaluation, which stays
+    /// `blocked` for `polls` reads and then completes (it placed).
+    pub fn block_placement(&self, polls: usize) {
+        self.state.lock().unwrap().blocked_polls = Some(polls);
     }
 
     /// Keeps the deployment of `ns`/`id` running until [`Self::release`].
@@ -310,6 +320,24 @@ impl FakeNomad {
                     json!({"EvalID": format!("eval-{index}"), "JobModifyIndex": index}),
                 )
             }
+            ("GET", ["evaluation", "eval-blocked"]) => match s.blocked_polls {
+                Some(n) if n > 0 => {
+                    s.blocked_polls = Some(n.saturating_sub(usize::from(n != usize::MAX)));
+                    (200, json!({"Status": "blocked"}))
+                }
+                _ => {
+                    s.blocked_polls = None;
+                    (200, json!({"Status": "complete"}))
+                }
+            },
+            ("GET", ["evaluation", _]) if s.blocked_polls.is_some() => (
+                200,
+                json!({
+                    "Status": "complete",
+                    "BlockedEval": "eval-blocked",
+                    "FailedTGAllocs": {"api": {"NodesEvaluated": 1, "DimensionExhausted": {"network: port collision": 1}}},
+                }),
+            ),
             ("GET", ["evaluation", _]) => (200, json!({"Status": "complete"})),
             ("POST", ["job", id, "plan"]) => {
                 let live = s.jobs.get(&(ns.clone(), (*id).to_owned()));

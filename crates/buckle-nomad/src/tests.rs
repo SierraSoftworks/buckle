@@ -665,3 +665,26 @@ async fn concurrent_index_writes_through_one_client_all_land() {
     }
     assert_eq!(index::read(&nomad, "home").await.unwrap().entries.len(), 16);
 }
+
+#[rstest::rstest]
+#[case::placed_once_the_port_frees(3, None)]
+#[case::never_placed(usize::MAX, Some("could not be placed: api: cannot place"))]
+#[tokio::test(start_paused = true)]
+async fn a_blocked_placement_is_waited_for(#[case] polls: usize, #[case] error: Option<&str>) {
+    let fake = FakeNomad::new();
+    fake.block_placement(polls);
+    let cx = cx(&fake, "r1");
+    let applied = workload(Some(atuin_job("atuin:1")))
+        .plan(&cx)
+        .await
+        .unwrap()
+        .apply(&cx)
+        .await;
+    match error {
+        None => assert!(applied.is_ok(), "{:?}", applied.err().map(|e| e.message())),
+        Some(text) => {
+            let message = applied.unwrap_err().message();
+            assert!(message.contains(text), "{message}");
+        }
+    }
+}

@@ -39,4 +39,5 @@ buckle-core = { workspace = true, features = ["testing"] }
 pretty_assertions.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
