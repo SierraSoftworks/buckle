@@ -103,10 +103,11 @@ impl Executor {
         &self,
         a: &Assignment,
         rollout: Option<&str>,
+        scope: Option<&str>,
     ) -> buckle_core::Result<ClusterPlan> {
         let kube = self.kube_client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
-        let workloads = a.workloads(&ctx);
+        let workloads = super::scoped(a.workloads(&ctx), scope);
         let base = buckle_kube::Context::new(
             kube.clone(),
             &a.target,
@@ -238,7 +239,8 @@ impl Executor {
         let mut removals = Vec::new();
         let mut steps = Vec::new();
         for orphan in buckle_kube::primitives::orphans(&base, &declared).await? {
-            if undecided.contains(&orphan.module) {
+            // A placement removes only what its own workload owned.
+            if undecided.contains(&orphan.module) || scope.is_some_and(|s| s != orphan.module) {
                 continue;
             }
             let removal = a

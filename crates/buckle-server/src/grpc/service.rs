@@ -1012,8 +1012,12 @@ impl FleetService {
                         .then(|| String::from_utf8_lossy(&r.outcome_json).into_owned()),
                     action: None,
                 };
-                let applied = (r.succeeded && !r.applied_revision.is_empty())
-                    .then(|| r.applied_revision.clone());
+                // A placement's result speaks for one workload: the cluster
+                // is on the revision once every placement is (the
+                // controller records that).
+                let applied =
+                    (r.succeeded && !r.applied_revision.is_empty() && r.workload.is_empty())
+                        .then(|| r.applied_revision.clone());
                 let pending = durable_id.map(|id| {
                     (
                         crate::rollout::pending_report_key(host, id),

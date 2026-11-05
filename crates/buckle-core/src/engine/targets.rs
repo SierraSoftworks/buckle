@@ -701,6 +701,14 @@ fleet:
         &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'host.labels.x == 1'\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
         "selects on `host.*`"
     )]
+    #[case::workload_namespace(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'workload.name == \"a\"'\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
+        "selects on `workload.*`"
+    )]
+    #[case::label_not_scalar(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nlabels: { tier: [canary] }\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
+        "labels.tier"
+    )]
     #[case::missing_module(
         &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nneeds: ['module:nope']\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
         "needs the module 'nope'"
@@ -979,5 +987,46 @@ actions:
         assert!(mixed_namespaces("host.labels.a == 1 && cluster.kind == \"nomad\"").is_some());
         assert!(mixed_namespaces("host.labels.a == 1").is_none());
         assert!(mixed_namespaces("true").is_none());
+    }
+
+    /// A placement needing a workload its cluster rolls out in a later phase
+    /// is a warning (it waits for the need to be running) or, under
+    /// `dependencies.across_phases: refuse`, an error.
+    #[rstest]
+    #[case::warn("", false)]
+    #[case::refuse("  dependencies: { across_phases: refuse }\n", true)]
+    fn a_need_on_a_later_phase_warns_or_is_refused(#[case] policy: &str, #[case] refused: bool) {
+        let fleet = format!(
+            "version: 2\nfleet:\n  clusters:\n    home-nomad: {{ kind: nomad }}\nrollout:\n  phases:\n    - {{ name: canary, select: 'workload.labels.tier == \"canary\"' }}\n    - {{ name: all, select: 'true' }}\n{policy}"
+        );
+        let rev = load(&[
+            ("buckle.yaml", fleet.as_str()),
+            (
+                "workloads/app/workload.yaml",
+                "name: app\nlabels: { tier: canary }\nneeds: [postgres]\nresources: [app.nomad.hcl]\n",
+            ),
+            ("workloads/app/files/app.nomad.hcl", "job {}"),
+            (
+                "workloads/postgres/workload.yaml",
+                "name: postgres\nresources: [postgres.nomad.hcl]\n",
+            ),
+            ("workloads/postgres/files/postgres.nomad.hcl", "job {}"),
+        ]);
+        let report = validate_targets(&rev);
+        let (found, other) = if refused {
+            (&report.errors, &report.warnings)
+        } else {
+            (&report.warnings, &report.errors)
+        };
+        assert!(
+            found
+                .iter()
+                .any(|i| i.to_string().contains("later phase 'all'")),
+            "{report}"
+        );
+        assert!(
+            !other.iter().any(|i| i.to_string().contains("later phase")),
+            "{report}"
+        );
     }
 }

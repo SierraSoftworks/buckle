@@ -2,18 +2,24 @@
 //!
 //! A phase's targets apply in waves, but `needs` may cross the layers: a
 //! workload on a cluster may need a module on the cluster's nodes
-//! (`module:nomad`), and a module on a host may need a workload on the
-//! cluster the host is a node of (`workload:postgresql`). Those edges are
-//! resolved here into **stages**: everything with no cross-layer dependency
-//! first, then what depends on it, and so on. Inside a stage the phase's
-//! `parallel` applies as before.
+//! (`module:nomad`), a module on a host may need a workload on the cluster
+//! the host is a node of (`workload:postgresql`), and a workload may need
+//! another on the same cluster. Those edges are resolved here into
+//! **stages**: everything with no such dependency first, then what depends
+//! on it, and so on. Inside a stage the phase's `parallel` applies as before.
 //!
 //! A host whose modules sit on both sides of a cluster gets one **step** per
 //! stage it appears in: the earlier steps name the modules that must go
 //! first (a module-scoped plan, `module.name == …`), and the last step is
 //! the whole revision, so that anything the server did not foresee is still
 //! applied. Ordinary `needs` between two modules of one host never make a
-//! stage on their own: only an edge that crosses a cluster boundary does.
+//! stage on their own: only an edge that leaves the host does.
+//!
+//! A cluster rolled by **placements** has one unit per workload (the row of
+//! that workload on the cluster, keyed `cluster/workload`), so a workload
+//! needing another is staged after it; a cluster applied as one unit (an
+//! executor that predates placements) is one unit with the cluster's key,
+//! and needs between its workloads order the apply inside it instead.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -72,7 +78,9 @@ pub struct HostInput {
     pub modules: Vec<ModuleUnit>,
 }
 
-/// A workload as selected on one cluster of the phase.
+/// A workload as selected on one cluster of the phase. For a removal
+/// placement, `needs` names the placements that needed the workload: it
+/// goes after them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadUnit {
     pub name: String,
@@ -86,6 +94,9 @@ pub struct ClusterInput {
     pub id: String,
     pub nodes: Vec<String>,
     pub workloads: Vec<WorkloadUnit>,
+    /// Each workload is a placement with a row of its own (keyed
+    /// `cluster/workload`); otherwise the cluster applies as one unit.
+    pub placements: bool,
 }
 
 /// One step of a target: the stage it runs in and the modules it applies
@@ -115,7 +126,8 @@ impl Step {
 /// The stages of one phase.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
-    /// Each target's steps, in stage order (at least one per target).
+    /// Each target's steps, in stage order (at least one per target), keyed
+    /// by host, cluster, or `cluster/workload` for a placement.
     pub steps: BTreeMap<String, Vec<Step>>,
     /// How many stages the phase has (at least one).
     pub stages: u32,
@@ -124,21 +136,24 @@ pub struct Staged {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Unit {
     Module(String, String),
+    Workload(String, String),
     Cluster(String),
 }
 
 impl Unit {
-    fn target(&self) -> &str {
+    /// The row the unit belongs to.
+    fn key(&self) -> String {
         match self {
-            Unit::Module(h, _) | Unit::Cluster(h) => h,
+            Unit::Module(h, _) | Unit::Cluster(h) => h.clone(),
+            Unit::Workload(c, w) => buckle_api::placement_key(c, Some(w)),
         }
     }
 
+    /// Whether an edge from `self` to `other` opens a stage: every edge
+    /// does, except one between two modules of a host (the engine orders
+    /// those inside the one apply).
     fn crosses(&self, other: &Unit) -> bool {
-        matches!(
-            (self, other),
-            (Unit::Module(..), Unit::Cluster(_)) | (Unit::Cluster(_), Unit::Module(..))
-        )
+        !matches!((self, other), (Unit::Module(..), Unit::Module(..)))
     }
 }
 
@@ -160,6 +175,17 @@ pub fn layer(hosts: &[HostInput], clusters: &[ClusterInput]) -> Staged {
             )
         })
         .collect();
+    // The unit a workload of a cluster is applied by: its own placement, or
+    // the whole cluster.
+    let workload_unit = |c: &ClusterInput, w: &str| -> Option<Unit> {
+        c.workloads.iter().any(|x| x.name == w).then(|| {
+            if c.placements {
+                Unit::Workload(c.id.clone(), w.to_owned())
+            } else {
+                Unit::Cluster(c.id.clone())
+            }
+        })
+    };
     for h in hosts {
         for m in &h.modules {
             let unit = Unit::Module(h.id.clone(), m.name.clone());
@@ -172,11 +198,12 @@ pub fn layer(hosts: &[HostInput], clusters: &[ClusterInput]) -> Staged {
                         }
                     }
                     Need::Workload(w) => {
-                        for c in clusters {
-                            if c.nodes.iter().any(|n| n == &h.id)
-                                && c.workloads.iter().any(|x| &x.name == w)
-                            {
-                                edge(Unit::Cluster(c.id.clone()), unit.clone());
+                        for c in clusters
+                            .iter()
+                            .filter(|c| c.nodes.iter().any(|n| n == &h.id))
+                        {
+                            if let Some(from) = workload_unit(c, w) {
+                                edge(from, unit.clone());
                             }
                         }
                     }
@@ -185,26 +212,42 @@ pub fn layer(hosts: &[HostInput], clusters: &[ClusterInput]) -> Staged {
         }
     }
     for c in clusters {
-        let unit = Unit::Cluster(c.id.clone());
-        units.insert(unit.clone());
+        if !c.placements {
+            units.insert(Unit::Cluster(c.id.clone()));
+        }
         for w in &c.workloads {
+            let unit = match c.placements {
+                true => Unit::Workload(c.id.clone(), w.name.clone()),
+                false => Unit::Cluster(c.id.clone()),
+            };
+            units.insert(unit.clone());
             for need in &w.needs {
-                if let Need::Module(m) = need {
-                    for node in &c.nodes {
-                        if host_modules
-                            .get(node.as_str())
-                            .is_some_and(|ms| ms.contains(m.as_str()))
-                        {
-                            edge(Unit::Module(node.clone(), m.clone()), unit.clone());
+                match need {
+                    Need::Module(m) => {
+                        for node in &c.nodes {
+                            if host_modules
+                                .get(node.as_str())
+                                .is_some_and(|ms| ms.contains(m.as_str()))
+                            {
+                                edge(Unit::Module(node.clone(), m.clone()), unit.clone());
+                            }
                         }
                     }
+                    // Between two placements of the cluster; inside one
+                    // cluster unit the apply orders them itself.
+                    Need::Workload(x) if c.placements && x != &w.name => {
+                        if let Some(from) = workload_unit(c, x) {
+                            edge(from, unit.clone());
+                        }
+                    }
+                    Need::Workload(_) => {}
                 }
             }
         }
     }
-    // Longest path over the units, counting only the edges that cross a
-    // cluster boundary (Kahn's algorithm; units on a cycle are left out of
-    // the ordering and keep stage 0).
+    // Longest path over the units, counting only the edges that open a
+    // stage (Kahn's algorithm; units on a cycle are left out of the
+    // ordering and keep stage 0).
     let mut indegree: HashMap<&Unit, usize> = units.iter().map(|u| (u, 0)).collect();
     let mut successors: HashMap<&Unit, Vec<&Unit>> = HashMap::new();
     for (to, froms) in &preds {
@@ -242,13 +285,9 @@ pub fn layer(hosts: &[HostInput], clusters: &[ClusterInput]) -> Staged {
     }
 
     let mut steps: BTreeMap<String, Vec<Step>> = BTreeMap::new();
-    let mut by_target: BTreeMap<&str, BTreeMap<u32, Vec<String>>> = BTreeMap::new();
+    let mut by_target: BTreeMap<String, BTreeMap<u32, Vec<String>>> = BTreeMap::new();
     for (u, s) in &stage {
-        let slot = by_target
-            .entry(u.target())
-            .or_default()
-            .entry(*s)
-            .or_default();
+        let slot = by_target.entry(u.key()).or_default().entry(*s).or_default();
         if let Unit::Module(_, m) = u {
             slot.push(m.clone());
         }
@@ -268,13 +307,13 @@ pub fn layer(hosts: &[HostInput], clusters: &[ClusterInput]) -> Staged {
             })
             .collect();
         stages = stages.max(list.last().map_or(0, |s| s.stage) + 1);
-        steps.insert(target.to_owned(), list);
+        steps.insert(target, list);
     }
     // Targets with nothing selected still have one whole step.
     for h in hosts {
         steps.entry(h.id.clone()).or_insert_with(|| vec![whole()]);
     }
-    for c in clusters {
+    for c in clusters.iter().filter(|c| !c.placements) {
         steps.entry(c.id.clone()).or_insert_with(|| vec![whole()]);
     }
     Staged { steps, stages }
@@ -313,12 +352,29 @@ mod tests {
         }
     }
 
+    /// A cluster applied as one unit.
     fn cluster(id: &str, nodes: &[&str], workloads: Vec<WorkloadUnit>) -> ClusterInput {
         ClusterInput {
             id: id.into(),
             nodes: nodes.iter().map(|n| (*n).to_owned()).collect(),
             workloads,
+            placements: false,
         }
+    }
+
+    /// A cluster rolled by placements.
+    fn placed(id: &str, nodes: &[&str], workloads: Vec<WorkloadUnit>) -> ClusterInput {
+        ClusterInput {
+            placements: true,
+            ..cluster(id, nodes, workloads)
+        }
+    }
+
+    fn at(stage: u32) -> Vec<Step> {
+        vec![Step {
+            stage,
+            modules: None,
+        }]
     }
 
     #[test]
@@ -351,13 +407,7 @@ mod tests {
         );
         assert_eq!(staged.stages, 2);
         assert_eq!(staged.steps["pi-1"][0].stage, 0);
-        assert_eq!(
-            staged.steps["home"],
-            vec![Step {
-                stage: 1,
-                modules: None
-            }]
-        );
+        assert_eq!(staged.steps["home"], at(1));
         assert_eq!(staged.steps["laptop"], vec![whole()]);
     }
 
@@ -420,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_between_workloads_do_not_stage() {
+    fn needs_between_workloads_of_one_cluster_unit_do_not_stage() {
         let staged = layer(
             &[host("pi-1", vec![module("nomad", &[])])],
             &[cluster(
@@ -433,7 +483,55 @@ mod tests {
             )],
         );
         assert_eq!(staged.stages, 2);
-        assert_eq!(staged.steps["home"].len(), 1);
+        assert_eq!(staged.steps["home"], at(1));
+    }
+
+    /// Placements are units of their own: a workload needing another on the
+    /// cluster goes a stage after it, and a module needing a workload waits
+    /// for that placement alone.
+    #[test]
+    fn placements_stage_on_every_needs_edge() {
+        let staged = layer(
+            &[host(
+                "pi-1",
+                vec![module("nomad", &[]), module("backup", &["workload:paste"])],
+            )],
+            &[placed(
+                "home",
+                &["pi-1"],
+                vec![
+                    workload("platform", &["module:nomad"]),
+                    workload("paste", &["platform"]),
+                    workload("monitoring", &[]),
+                ],
+            )],
+        );
+        assert_eq!(staged.stages, 4);
+        assert_eq!(staged.steps["home/platform"], at(1));
+        assert_eq!(staged.steps["home/paste"], at(2));
+        assert_eq!(staged.steps["home/monitoring"], at(0));
+        assert!(!staged.steps.contains_key("home"), "{:?}", staged.steps);
+        let steps = &staged.steps["pi-1"];
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].modules.as_deref(), Some(&["nomad".to_owned()][..]));
+        assert_eq!(steps[1].stage, 3);
+    }
+
+    /// A removal placement names the placements that needed its workload as
+    /// its needs, so it goes after them.
+    #[test]
+    fn a_removal_goes_after_the_placements_that_needed_it() {
+        let staged = layer(
+            &[],
+            &[placed(
+                "home",
+                &[],
+                vec![workload("paste", &[]), workload("platform", &["paste"])],
+            )],
+        );
+        assert_eq!(staged.stages, 2);
+        assert_eq!(staged.steps["home/paste"], at(0));
+        assert_eq!(staged.steps["home/platform"], at(1));
     }
 
     #[test]

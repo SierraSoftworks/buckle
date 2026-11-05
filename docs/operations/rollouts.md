@@ -52,20 +52,43 @@ A host's way through a phase:
 A phase that exceeds `max_failures` stops according to `rollout.on_failure`; see
 [Recovering from failures](./recovery.md).
 
+### Placements
+
+A cluster is rolled out one **placement** at a time: each workload the revision selects on it is a
+row of its own (`cluster/workload`), planned, applied and baked on its own through the cluster's
+executor, and placed in the first phase whose selector matches its workload's `labels`
+(`workload.labels.*`, `workload.name`, `workload.tags`) and its cluster (`cluster.*`). A phase
+selecting `'true'` takes the placements no earlier phase named. A workload the cluster's applied
+revision ran that the new revision no longer selects there is a **removal** placement: it removes
+what the workload owned, after the placements that needed it (by the applied revision's `needs`),
+in the latest of their phases. The cluster is on the revision once every placement is
+(`rollout.target.converged`).
+
+While a connected host that could execute for a cluster runs an agent that predates placements,
+the cluster is rolled as one row, as before: one plan covering every workload, one apply.
+
 ### Stages inside a phase
 
 Within a phase, order comes from `needs`. Between the modules of one host that is the agent's
-business and makes no difference to the pipeline; an edge that crosses a cluster boundary does. A
-workload that needs `module:nomad` waits for that module on the cluster's nodes, and a module that
-needs `workload:postgresql` waits for the workload on the cluster its host is a node of. The
-controller resolves those edges into **stages**: everything with no cross-layer dependency first,
-then what depends on it, and so on, each stage applying `parallel` targets at a time. A host whose
-modules sit on both sides of a workload is applied in two steps, its dependent modules after the
-cluster, and shows as pending with the stage it waits for in between.
+business and makes no difference to the pipeline; an edge that leaves the host does. A workload
+that needs `module:nomad` waits for that module on the cluster's nodes, a module that needs
+`workload:postgresql` waits for that placement on the cluster its host is a node of, and a
+workload that needs another waits for that placement. The controller resolves those edges into
+**stages**: everything with no such dependency first, then what depends on it, and so on, each
+stage applying `parallel` targets at a time. A host whose modules sit on both sides of a workload
+is applied in two steps, its dependent modules after the placement, and shows as pending with the
+stage it waits for in between.
+
+A placement whose workload needs one in a **later phase** (or one no phase selects) cannot wait
+for it inside its own phase. `buckle validate` warns about such a `needs`; the placement starts
+only when the needed workload is already running on the cluster (applied and healthy), and
+otherwise misses its phase and converges in the stragglers stage once the need is healthy. Under
+`rollout.dependencies.across_phases: refuse` the revision is rejected instead, and a placement
+whose need turns out not to be running fails.
 
 Every target is planned when the rollout starts, as a **preview** where its stage has not opened
-yet (later phases, clusters after their nodes), and planned again when its stage opens, since it
-depends on what came before. The fresh plan is what applies: one matching what the phase's
+yet (later phases, placements after the nodes or the workloads they need), and planned again when
+its stage opens, since it depends on what came before. The fresh plan is what applies: one matching what the phase's
 approval covered goes ahead, one that changed is marked *changed since preview* (audit
 `rollout.target.plan_drifted`) and needs approval again under `approval: required` (or
 `if_destructive` when destructive); auto phases apply it. A cluster with no free executor at the
@@ -73,7 +96,7 @@ start, or whose preview fails (an earlier stage provides what it needs), stays u
 stage opens. A host's later steps are planned when their stage opens. A cluster with no
 connected host matching its `executors` selector reads *awaiting executor*; it misses its phase
 after the disconnect grace, like an offline host, and converges in the stragglers stage once one
-appears. A phase without cross-layer `needs` is one stage, as before.
+appears. A phase whose `needs` all stay inside one host is one stage, as before.
 
 ## 3. Review and approve
 

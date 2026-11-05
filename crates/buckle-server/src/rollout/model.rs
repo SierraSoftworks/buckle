@@ -423,6 +423,15 @@ pub struct HostRuntime {
     /// `action_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_run: Option<String>,
+    /// A placement whose workload left the configuration: its plan removes
+    /// what the workload owned on the cluster, once the placements that
+    /// needed it (`after`) are done.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removal: bool,
+    /// Placements of the same cluster that must finish before this one
+    /// starts (a removal's dependents, by the applied revision's `needs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
 }
 
 impl HostRuntime {
@@ -440,9 +449,10 @@ impl HostRuntime {
     }
 
     /// Whether the plan of the current step waits for its stage to open: a
-    /// cluster's (it depends on the stages before it), or any later step.
+    /// cluster's or a placement's (it depends on the stages before it), or
+    /// any later step.
     pub fn plan_deferred(&self) -> bool {
-        self.kind == TargetKind::Cluster || self.step > 0
+        self.kind.on_cluster() || self.step > 0
     }
 
     /// Lays the target out as `steps` and points it at the first.

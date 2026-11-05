@@ -74,20 +74,43 @@ pub async fn forward(
     plan_digest: String,
     spacing: Duration,
 ) -> (usize, usize) {
-    forward_for(events, sink, revision, plan_digest, spacing, None, None).await
+    forward_for(
+        events,
+        sink,
+        revision,
+        plan_digest,
+        spacing,
+        EventScope::default(),
+    )
+    .await
 }
 
-/// [`forward`] for the cluster `target` (`None`: the host itself), tagging
-/// each event with `action_id` when the run is an action's.
+/// What forwarded events are about beyond the host itself.
+#[derive(Debug, Clone, Default)]
+pub struct EventScope {
+    /// The cluster target the apply is for; `None` for the host.
+    pub target: Option<String>,
+    /// The workload placement the apply was scoped to, if any.
+    pub workload: Option<String>,
+    /// The RunAction the events belong to, when they are not an apply's.
+    pub action_id: Option<String>,
+}
+
+/// [`forward`] with the events' `scope`: the cluster target (and placement)
+/// they are for, and the action they belong to when the run is an action's.
 pub async fn forward_for(
     mut events: mpsc::Receiver<ApplyEvent>,
     sink: ReportSink,
     revision: RevisionId,
     plan_digest: String,
     spacing: Duration,
-    target: Option<String>,
-    action_id: Option<String>,
+    scope: EventScope,
 ) -> (usize, usize) {
+    let EventScope {
+        target,
+        workload,
+        action_id,
+    } = scope;
     let mut pending: IndexMap<String, (chrono::DateTime<chrono::Utc>, ApplyEvent)> =
         IndexMap::new();
     let mut last_sent: Option<Instant> = None;
@@ -104,7 +127,7 @@ pub async fn forward_for(
             event,
             action_id: action_id.clone(),
         }
-        .about(target.as_deref());
+        .about_placement(target.as_deref(), workload.as_deref());
         async move { sink.send(report).await }
     };
 

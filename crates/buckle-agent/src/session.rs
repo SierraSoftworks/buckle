@@ -1710,8 +1710,10 @@ impl Shared {
                     rev.id.clone(),
                     plan.digest.to_string(),
                     self.options.event_spacing,
-                    None,
-                    Some(action_id.clone()),
+                    coalesce::EventScope {
+                        action_id: Some(action_id.clone()),
+                        ..Default::default()
+                    },
                 ));
                 let result = self
                     .runner

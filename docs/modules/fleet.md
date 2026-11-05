@@ -169,9 +169,11 @@ rollout:
   stragglers:
     parallel: 1
     approval: auto
+  dependencies:
+    across_phases: warn    # warn | refuse
   phases:
     - name: canary
-      select: 'host.labels.canary == true'
+      select: 'host.labels.canary == true || workload.labels.tier == "canary"'
       parallel: 1
       approval: required   # auto | required | if_destructive
       bake: 10m
@@ -196,24 +198,25 @@ rollout:
 | `local_rollback.on_health` | `true` | Also require failing health checks (so a server outage alone never triggers it). |
 | `stragglers.parallel` | `1` | Hosts that missed their phase converge in a final stage after promotion, this many at a time. |
 | `stragglers.approval` | `auto` | Approval policy for that stage. |
+| `dependencies.across_phases` | `warn` | A workload needing one its cluster rolls out in a later phase: `warn` accepts the revision (the placement waits for the need to be running, else finishes in the stragglers stage); `refuse` rejects it. |
 
 Each phase:
 
 | Key | Default | Description |
 |---|---|---|
 | `name` | **required** | Unique; `stragglers` is reserved. |
-| `select` | **required** | A selector. A host belongs to the **first** phase whose selector matches it, and only that one. |
-| `parallel` | `1` | Hosts applied at once: a count, or a percentage of the phase's hosts (rounded up). Targets whose plan changes nothing run alongside, outside the count. |
+| `select` | **required** | A selector over `host.*` for hosts and over `workload.*` and `cluster.*` for [placements](../operations/rollouts.md#placements) (a workload on a cluster). A target belongs to the **first** phase whose selector matches it, and only that one. |
+| `parallel` | `1` | Targets applied at once: a count, or a percentage of the phase's targets (rounded up). Targets whose plan changes nothing run alongside, outside the count. |
 | `approval` | `auto` | `required` stops for an operator to approve the phase's plans; `if_destructive` only when a plan removes or deletes something. |
 | `bake` | `health.bake` | The minimum time to watch health after each host applies. |
 | `max_failures` | `0` | Failed hosts tolerated (a count or a percentage) before the phase pauses. |
 
-Without `phases`, one implicit phase selects every host, one at a time. Hosts that no phase
-selects are reported on the rollout and left on their current revision, so end with a
-`select: 'true'` phase if every host should follow.
+Without `phases`, one implicit phase selects every target, one at a time. Hosts and placements
+that no phase selects are reported on the rollout and left on their current revision, so end with
+a `select: 'true'` phase if everything should follow.
 
-Inside a phase, `needs` that cross a cluster boundary (`module:` on a workload, `workload:` on a
-module) order its targets into stages; see
+Inside a phase, `needs` that leave a host (`module:` on a workload, `workload:` on a module, one
+workload on another) order its targets into stages; see
 [Stages inside a phase](../operations/rollouts.md#stages-inside-a-phase).
 
 See [Rolling out changes](../operations/rollouts.md) for what each phase does, step by step.

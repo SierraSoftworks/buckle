@@ -346,19 +346,25 @@ impl Executor {
     /// cannot be planned is indeterminate (its objects are never orphans);
     /// one that is unreachable fails the plan.
     ///
+    /// With a `scope`, plans that one workload placement: the workload named
+    /// (nothing, when the revision no longer selects it on the cluster) and
+    /// the removal of what that workload owns beyond its plan; other
+    /// workloads' objects are not its orphans.
+    ///
     /// Plans with a `deploy` credential: Nomad's job plan needs `submit-job`
     /// (it has no plan-only capability), which leaves `read` read-only.
     pub async fn plan(
         &self,
         a: &Assignment,
         rollout: Option<&str>,
+        scope: Option<&str>,
     ) -> buckle_core::Result<ClusterPlan> {
         if a.spec.kind == ClusterKind::Kubernetes {
-            return self.plan_kubernetes(a, rollout).await;
+            return self.plan_kubernetes(a, rollout, scope).await;
         }
         let nomad = self.client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
-        let workloads = a.workloads(&ctx);
+        let workloads = scoped(a.workloads(&ctx), scope);
         // ACL policies need a management token, which only workloads that
         // list one ask for; the cluster binds `acl` to it.
         let acl = if workloads
@@ -484,8 +490,9 @@ impl Executor {
         let mut removals = Vec::new();
         let mut planned_removals = Vec::new();
         for orphan in buckle_nomad::primitives::orphans(&cx, &declared).await? {
-            // A workload whose plan failed declares nothing we know of.
-            if undecided.contains(&orphan.module) {
+            // A workload whose plan failed declares nothing we know of, and
+            // a placement removes only what its own workload owned.
+            if undecided.contains(&orphan.module) || scope.is_some_and(|s| s != orphan.module) {
                 continue;
             }
             let removal = a
@@ -1622,6 +1629,20 @@ fn finish(
         plan,
         units,
         removals: steps,
+    }
+}
+
+/// `workloads` narrowed to the placement `scope` names, when it names one.
+pub(crate) fn scoped<'a>(
+    workloads: Vec<&'a LoadedWorkload>,
+    scope: Option<&str>,
+) -> Vec<&'a LoadedWorkload> {
+    match scope {
+        None => workloads,
+        Some(s) => workloads
+            .into_iter()
+            .filter(|w| w.config.name == s)
+            .collect(),
     }
 }
 

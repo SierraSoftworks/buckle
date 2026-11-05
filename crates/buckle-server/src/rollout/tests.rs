@@ -1,6 +1,6 @@
 //! Controller scenarios driven by scripted fake hosts on tokio's paused clock.
 
-use super::controller::TARGETS_CAPABILITY;
+use super::controller::{TARGETS_CAPABILITY, WORKLOADS_CAPABILITY};
 use super::model::{HostPhase, RolloutHostRecord, RolloutRecord, STRAGGLERS};
 use super::*;
 use crate::clock::{Clock, TokioClock};
@@ -71,6 +71,10 @@ struct Script {
     /// The agent does not announce the `targets` capability (it runs no
     /// pipeline per target), so it is never picked as an executor.
     no_targets: bool,
+    /// The agent does not announce the `workloads` capability (it plans a
+    /// cluster whole), so clusters it could execute for are rolled as one
+    /// row.
+    no_workloads: bool,
     /// Never answer an Apply aimed at a cluster target (the agent's own
     /// applies are answered).
     silent_target_apply: bool,
@@ -313,6 +317,7 @@ impl Harness {
                     {
                         reply(AMsg::Plan(PlanResult {
                             target: p.target.clone(),
+                            workload: p.workload.clone(),
                             revision: p.revision,
                             error: s
                                 .plan_error
@@ -336,6 +341,7 @@ impl Harness {
                             _ => b"{}".to_vec(),
                         },
                         target: p.target.clone(),
+                        workload: p.workload.clone(),
                         revision: p.revision,
                         destructive: s.destructive,
                         removals: u32::from(s.destructive),
@@ -394,7 +400,7 @@ impl Harness {
                         }
                         reply(AMsg::Health(HealthReport {
                             target: h.target.clone(),
-                            workload: String::new(),
+                            workload: h.workload.clone(),
                             scope: h.scope,
                             request_id: h.request_id,
                             revision: String::new(),
@@ -413,6 +419,7 @@ impl Harness {
                         if a.force_plan || (bound_intent && a.plan_digest != s.digest) {
                             reply(AMsg::Plan(PlanResult {
                                 target: a.target.clone(),
+                                workload: a.workload.clone(),
                                 revision: a.revision.clone(),
                                 digest: s.digest.clone(),
                                 changes: 1,
@@ -435,6 +442,7 @@ impl Harness {
                             }
                             reply(AMsg::Plan(PlanResult {
                                 target: a.target.clone(),
+                                workload: a.workload.clone(),
                                 revision: a.revision,
                                 digest: fresh.clone(),
                                 changes: 3,
@@ -450,6 +458,7 @@ impl Harness {
                             script.lock().unwrap().stale_deferred.clear();
                             reply(AMsg::Result(ApplyResult {
                                 target: a.target.clone(),
+                                workload: a.workload.clone(),
                                 revision: a.revision.clone(),
                                 plan_digest: a.plan_digest,
                                 succeeded: false,
@@ -462,6 +471,7 @@ impl Harness {
                         if s.apply_blocked {
                             reply(AMsg::Result(ApplyResult {
                                 target: a.target.clone(),
+                                workload: a.workload.clone(),
                                 revision: a.revision.clone(),
                                 plan_digest: a.plan_digest,
                                 succeeded: false,
@@ -479,6 +489,7 @@ impl Harness {
                         };
                         reply(AMsg::Result(ApplyResult {
                             target: a.target.clone(),
+                            workload: a.workload.clone(),
                             revision: a.revision.clone(),
                             plan_digest: a.plan_digest,
                             succeeded: failed.is_none(),
@@ -520,6 +531,7 @@ impl Harness {
                                 action: a.action,
                                 revision: a.revision,
                                 target: a.target,
+                                workload: a.workload,
                                 report_id: id,
                                 succeeded: !failed,
                                 error: if failed {
@@ -536,6 +548,7 @@ impl Harness {
                     SMsg::Rollback(_) if s.silent_rollback => {}
                     SMsg::Rollback(r) => reply(AMsg::Result(ApplyResult {
                         target: r.target.clone(),
+                        workload: r.workload.clone(),
                         revision: r.revision.clone(),
                         succeeded: true,
                         applied_revision: r.revision,
@@ -549,9 +562,9 @@ impl Harness {
 
     /// Connects `host` with a Hello naming `unreported` apply revisions.
     fn connect_with(&mut self, host: &str, applied: Option<&str>, unreported: Vec<String>) {
-        let (legacy, no_targets) = {
+        let (legacy, no_targets, no_workloads) = {
             let s = self.scripts[host].lock().unwrap();
-            (s.legacy_agent, s.no_targets)
+            (s.legacy_agent, s.no_targets, s.no_workloads)
         };
         self.handle.connected(Connected {
             host: host.to_owned(),
@@ -563,11 +576,18 @@ impl Harness {
                 vec![]
             } else if no_targets {
                 vec!["force_plan".into(), "approval_digest".into()]
+            } else if no_workloads {
+                vec![
+                    "force_plan".into(),
+                    "approval_digest".into(),
+                    TARGETS_CAPABILITY.into(),
+                ]
             } else {
                 vec![
                     "force_plan".into(),
                     "approval_digest".into(),
                     TARGETS_CAPABILITY.into(),
+                    WORKLOADS_CAPABILITY.into(),
                 ]
             },
             boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
@@ -4099,7 +4119,11 @@ async fn a_cluster_is_staged_between_its_nodes_modules_and_applied_through_an_ex
         .await;
     assert_eq!(r.runtime.phases[0].stages, 3);
     let cluster = host(&hosts, CLUSTER);
-    assert_eq!(cluster.runtime.kind, TargetKind::Cluster);
+    assert_eq!(cluster.runtime.kind, TargetKind::Workload);
+    assert_eq!(
+        cluster.workload, "postgres",
+        "one placement row per workload"
+    );
     assert_eq!(cluster.runtime.stage, 1);
     for n in ["n1", "n2"] {
         let steps: Vec<(u32, bool)> = host(&hosts, n)
@@ -4140,7 +4164,7 @@ async fn a_cluster_is_staged_between_its_nodes_modules_and_applied_through_an_ex
             .collect()
     };
     let module_step = index(&|a| a.target.is_empty() && a.select.contains("nomad"));
-    let cluster_apply = index(&|a| a.target == CLUSTER);
+    let cluster_apply = index(&|a| a.target == CLUSTER && a.workload == "postgres");
     let whole = index(&|a| a.target.is_empty() && a.select.is_empty());
     assert_eq!(
         (module_step.len(), cluster_apply.len(), whole.len()),
@@ -5042,4 +5066,310 @@ async fn a_cluster_is_gated_on_the_workloads_it_changes(
     } else {
         assert_eq!(state, HostPhase::Healthy);
     }
+}
+
+// ---------------------------------------------------------------- placements
+
+/// `postgres` and `app`, which needs it: two placements on the cluster.
+const TWO_WORKLOADS: &[(&str, &str)] = &[
+    (
+        "workloads/postgres/workload.yaml",
+        "name: postgres\nresources: [postgres.nomad.hcl]\n",
+    ),
+    (
+        "workloads/postgres/files/postgres.nomad.hcl",
+        "job \"postgres\" {}\n",
+    ),
+    (
+        "workloads/app/workload.yaml",
+        "name: app\nneeds: [postgres]\nresources: [app.nomad.hcl]\n",
+    ),
+    ("workloads/app/files/app.nomad.hcl", "job \"app\" {}\n"),
+];
+
+/// `app` labelled `tier: canary`, with or without a need on `postgres`.
+fn labelled(needs_postgres: bool) -> Vec<(&'static str, String)> {
+    let needs = if needs_postgres {
+        "needs: [postgres]\n"
+    } else {
+        ""
+    };
+    vec![
+        (
+            "workloads/postgres/workload.yaml",
+            "name: postgres\nresources: [postgres.nomad.hcl]\n".to_owned(),
+        ),
+        (
+            "workloads/postgres/files/postgres.nomad.hcl",
+            "job \"postgres\" {}\n".to_owned(),
+        ),
+        (
+            "workloads/app/workload.yaml",
+            format!("name: app\nlabels: {{ tier: canary }}\n{needs}resources: [app.nomad.hcl]\n"),
+        ),
+        (
+            "workloads/app/files/app.nomad.hcl",
+            "job \"app\" {}\n".to_owned(),
+        ),
+    ]
+}
+
+/// A canary phase of the placements labelled `tier: canary`, then everything.
+const CANARY_WORKLOADS: &str = "  health: { bake: 30s }\n  phases:\n    - { name: canary, select: 'workload.labels.tier == \"canary\"', parallel: 4 }\n    - { name: all, select: 'true', parallel: 4 }\n";
+
+fn placement<'a>(
+    hosts: &'a [RolloutHostRecord],
+    cluster: &str,
+    workload: &str,
+) -> &'a RolloutHostRecord {
+    hosts
+        .iter()
+        .find(|h| h.host == cluster && h.workload == workload)
+        .unwrap_or_else(|| panic!("placement {cluster}/{workload} in rollout: {hosts:#?}"))
+}
+
+/// The applies aimed at `cluster`, in order, as (executor, workload).
+fn cluster_applies(h: &Harness, cluster: &str) -> Vec<(String, String)> {
+    h.applies()
+        .into_iter()
+        .filter(|a| a.2.target == cluster)
+        .map(|a| (a.1, a.2.workload))
+        .collect()
+}
+
+async fn applied_revision(h: &Harness, target: &str) -> Option<String> {
+    let t = target.to_owned();
+    h.store
+        .call(move |db| Ok(db.hosts().target(&t)?.and_then(|r| r.applied_revision)))
+        .await
+        .unwrap()
+}
+
+/// A cluster is rolled one workload placement at a time: a row per workload
+/// (`cluster/workload`), staged by the `needs` between them, each planned,
+/// applied and baked on its own through the cluster's executor. The cluster
+/// is on the revision once every placement is.
+#[tokio::test(start_paused = true)]
+async fn a_cluster_is_rolled_by_placements_staged_by_their_needs() {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, TWO_WORKLOADS)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let (r, hosts) = h
+        .wait(&id, "the freeze", |_, hs| {
+            hs.iter().filter(|x| x.host == CLUSTER).count() == 2
+        })
+        .await;
+    assert_eq!(r.runtime.phases[0].stages, 2);
+    let postgres = placement(&hosts, CLUSTER, "postgres");
+    let app = placement(&hosts, CLUSTER, "app");
+    assert_eq!(postgres.runtime.kind, TargetKind::Workload);
+    assert_eq!((postgres.runtime.stage, app.runtime.stage), (0, 1));
+    assert!(!app.runtime.removal);
+
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    for w in ["postgres", "app"] {
+        let p = placement(&hosts, CLUSTER, w);
+        assert_eq!(p.state, HostPhase::Healthy, "{w}");
+        assert_eq!(p.runtime.executor.as_deref(), Some("n1"), "{w}");
+        assert!(p.plan_digest.is_some(), "{w} has a plan of its own");
+    }
+    assert_eq!(
+        cluster_applies(&h, CLUSTER),
+        vec![
+            ("n1".to_owned(), "postgres".to_owned()),
+            ("n1".to_owned(), "app".to_owned()),
+        ],
+        "one apply per placement, the needed one first"
+    );
+    // Every request for a placement names its workload (health included).
+    let unscoped = h.sent(|_, m| {
+        targeted(m) == Some(CLUSTER)
+            && match m {
+                SMsg::Plan(p) => p.workload.is_empty(),
+                SMsg::Apply(a) => a.workload.is_empty(),
+                SMsg::Health(x) => x.workload.is_empty(),
+                _ => false,
+            }
+    });
+    assert!(unscoped.is_empty(), "{unscoped:?}");
+    assert_eq!(applied_revision(&h, CLUSTER).await.as_deref(), Some("r1"));
+    let actions = h.audit_actions(&id).await;
+    assert!(
+        actions.iter().any(|a| a == "rollout.target.converged"),
+        "{actions:?}"
+    );
+}
+
+/// A placement belongs to the first phase whose selector matches its
+/// workload's labels (`workload.*`) and its cluster's; the hosts and the
+/// cluster's other workloads take their own phases.
+#[tokio::test(start_paused = true)]
+async fn placements_join_the_phase_their_labels_select() {
+    let mut h = Harness::new().await;
+    let files = labelled(false);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    h.revision_with("r1", CANARY_WORKLOADS, NOMAD_CLUSTER, &files)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(placement(&hosts, CLUSTER, "app").phase, "canary");
+    assert_eq!(placement(&hosts, CLUSTER, "postgres").phase, "all");
+    assert_eq!(host(&hosts, "n1").phase, "all");
+    let applies = cluster_applies(&h, CLUSTER);
+    assert_eq!(applies.len(), 2, "{applies:?}");
+    assert_eq!(applies[0].1, "app", "the canary phase goes first");
+    assert_eq!(applied_revision(&h, CLUSTER).await.as_deref(), Some("r1"));
+}
+
+/// A placement whose workload needs one that is neither applied by this
+/// rollout yet nor running on the cluster waits: under `warn` it misses its
+/// phase and converges in the stragglers stage once the need is healthy;
+/// under `refuse` it fails.
+#[rstest::rstest]
+#[case::warn(false)]
+#[case::refuse(true)]
+#[tokio::test(start_paused = true)]
+async fn a_placement_waits_for_a_need_the_cluster_is_not_running_yet(#[case] refuse: bool) {
+    let mut h = Harness::new().await;
+    let policy = if refuse {
+        format!("{CANARY_WORKLOADS}  dependencies: {{ across_phases: refuse }}\n")
+    } else {
+        CANARY_WORKLOADS.to_owned()
+    };
+    let files = labelled(true);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    h.revision_with("r1", &policy, NOMAD_CLUSTER, &files).await;
+    h.enrol("n1", "nomad").await;
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let waited = if refuse {
+        HostPhase::Failed
+    } else {
+        HostPhase::Missed
+    };
+    let (_, hosts) = h
+        .wait(&id, "app waits for postgres", |_, hs| {
+            placement(hs, CLUSTER, "app").state == waited
+        })
+        .await;
+    let app = placement(&hosts, CLUSTER, "app");
+    assert!(
+        app.runtime
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("postgres")),
+        "{:?}",
+        app.runtime.error
+    );
+    assert!(
+        cluster_applies(&h, CLUSTER).iter().all(|a| a.1 != "app"),
+        "app is not applied before the need"
+    );
+    if refuse {
+        let (r, _) = h.wait_state(&id, RolloutState::Paused).await;
+        assert_eq!(
+            r.runtime.pause.as_ref().map(|p| p.kind.as_str()),
+            Some("failure_budget")
+        );
+        return;
+    }
+    let (r, hosts) = h
+        .wait(&id, "app healthy in the stragglers stage", |_, hs| {
+            placement(hs, CLUSTER, "app").state == HostPhase::Healthy
+        })
+        .await;
+    assert_eq!(r.state, RolloutState::Completed);
+    assert_eq!(placement(&hosts, CLUSTER, "app").phase, STRAGGLERS);
+    assert_eq!(
+        placement(&hosts, CLUSTER, "postgres").state,
+        HostPhase::Healthy
+    );
+    let applies = cluster_applies(&h, CLUSTER);
+    assert_eq!(
+        applies.iter().map(|a| a.1.as_str()).collect::<Vec<_>>(),
+        ["postgres", "app"],
+        "{applies:?}"
+    );
+    assert_eq!(applied_revision(&h, CLUSTER).await.as_deref(), Some("r1"));
+}
+
+/// A workload the cluster's applied revision ran that the new one no longer
+/// selects is a removal placement: it is planned (its objects' removal) after
+/// the placements that needed it, by the applied revision's `needs`.
+#[tokio::test(start_paused = true)]
+async fn a_removed_workload_is_a_placement_after_the_ones_that_needed_it() {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, TWO_WORKLOADS)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.connect("n1", None);
+    let first = h.start("r1").await;
+    h.wait_state(&first, RolloutState::Completed).await;
+    assert_eq!(applied_revision(&h, CLUSTER).await.as_deref(), Some("r1"));
+
+    // r2 drops both workloads.
+    h.revision_with("r2", ONE_PHASE_ALL, NOMAD_CLUSTER, &[])
+        .await;
+    let id = h.start("r2").await;
+    let (r, hosts) = h
+        .wait(&id, "the freeze", |_, hs| {
+            hs.iter().filter(|x| x.host == CLUSTER).count() == 2
+        })
+        .await;
+    assert_eq!(r.runtime.phases[0].stages, 2);
+    let postgres = placement(&hosts, CLUSTER, "postgres");
+    let app = placement(&hosts, CLUSTER, "app");
+    assert!(postgres.runtime.removal && app.runtime.removal);
+    assert_eq!(postgres.runtime.after, vec!["app".to_owned()]);
+    assert!(app.runtime.after.is_empty());
+    assert_eq!((app.runtime.stage, postgres.runtime.stage), (0, 1));
+
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(placement(&hosts, CLUSTER, "app").state, HostPhase::Healthy);
+    assert_eq!(
+        placement(&hosts, CLUSTER, "postgres").state,
+        HostPhase::Healthy
+    );
+    let applies: Vec<(String, String)> = h
+        .applies()
+        .into_iter()
+        .filter(|a| a.2.target == CLUSTER && a.2.revision == "r2")
+        .map(|a| (a.1, a.2.workload))
+        .collect();
+    assert_eq!(
+        applies.iter().map(|a| a.1.as_str()).collect::<Vec<_>>(),
+        ["app", "postgres"],
+        "the dependent is removed first: {applies:?}"
+    );
+    assert_eq!(applied_revision(&h, CLUSTER).await.as_deref(), Some("r2"));
+}
+
+/// While an executor that predates placements (no `workloads` capability)
+/// is connected for a cluster, the cluster is rolled as one row, as before.
+#[tokio::test(start_paused = true)]
+async fn an_older_executor_rolls_the_cluster_as_one_row() {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, TWO_WORKLOADS)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.script("n1", |s| s.no_workloads = true);
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let rows: Vec<&RolloutHostRecord> = hosts.iter().filter(|x| x.host == CLUSTER).collect();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0].runtime.kind, TargetKind::Cluster);
+    assert_eq!(rows[0].workload, "");
+    assert_eq!(rows[0].state, HostPhase::Healthy);
+    assert_eq!(
+        cluster_applies(&h, CLUSTER),
+        vec![("n1".to_owned(), String::new())]
+    );
+    // The whole cluster's result names the applied revision itself (the
+    // server records it on arrival, outside this harness).
 }
