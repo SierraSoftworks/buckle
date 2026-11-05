@@ -174,11 +174,18 @@ describe("every page renders in demo mode", () => {
     await paste.locator(".placement-chip", { hasText: "lab-nomad" }).click();
     assert.equal(await heading(page), "paste");
     assert.match(page.url(), /\/workloads\/paste\?cluster=lab-nomad/);
-    // One card per cluster, each the cluster's row for it, opened.
-    for (const c of ["home-nomad", "lab-nomad"]) {
-      await page.locator(`#on-${c} tr[data-workload="paste"]`).waitFor();
-      await page.locator(`#on-${c} tr[data-detail-of="paste"]`).waitFor();
-    }
+    // One table, a row per cluster it runs on; the cluster it was opened for is open.
+    const placements = page.getByTestId("placements");
+    await eventually(async () => {
+      const hosts = await placements.locator("tbody tr[data-workload]").evaluateAll((els) => els.map((e) => e.dataset.host));
+      assert.deepEqual(hosts.sort(), ["home-nomad", "lab-nomad"]);
+    });
+    await placements.locator('tr[data-detail-of="paste"][data-host="lab-nomad"]').waitFor();
+    // A row opens and closes like the cluster page's.
+    const home = placements.locator('tr[data-detail-of="paste"][data-host="home-nomad"]');
+    const wasOpen = await home.count();
+    await placements.locator('tr[data-workload="paste"][data-host="home-nomad"]').click();
+    await eventually(async () => assert.equal(await home.count(), 1 - wasOpen));
     assert.match(await page.getByTestId("workload-rollout").textContent(), /home-nomad: unchanged/);
     await close();
   });

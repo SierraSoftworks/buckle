@@ -1,9 +1,9 @@
 //! A workload's page: what it is (its needs, the workloads that need it,
 //! its resources and removal policy), where the active rollout has it, and
-//! one card per cluster it runs on, the cluster page's Workloads row for
-//! it opened (checks, the run's steps, resources linked into the
-//! scheduler's UI) with that placement's actions. `?cluster=` scrolls to
-//! that cluster's card.
+//! a Placements table with a row per cluster it runs on, the cluster page's
+//! Workloads row for it (opening to checks, the run's steps, resources
+//! linked into the scheduler's UI) with that placement's actions.
+//! `?cluster=` opens and scrolls to that cluster's row.
 
 use std::collections::BTreeMap;
 
@@ -11,12 +11,12 @@ use buckle_api::{Connection, HostDetail, HostRolloutState, HostStatus, HostSumma
 use yew::prelude::*;
 use yew_router::prelude::*;
 
-use super::modules_card::ModulesPanel;
+use super::modules_card::PlacementRow;
 use super::workloads::{cluster_details, placement_chip};
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink, use_target_actions,
+    Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink, use_actions,
 };
 use crate::hooks::{use_fetch, use_live_value};
 use crate::logic::format::{count, rollout_label};
@@ -59,7 +59,7 @@ pub fn workload_page(props: &Props) -> Html {
     })
     .flatten();
     // Opened from a cluster, a pipeline block or a Targets row: land on
-    // that cluster's card once the cards are drawn.
+    // that cluster's row once the table is drawn.
     {
         let loaded = data.value().is_some();
         use_effect_with((focus.clone(), loaded), move |(focus, loaded)| {
@@ -165,10 +165,8 @@ pub fn workload_page(props: &Props) -> Html {
                     }
                 </dl>
             </Panel>
-            { for details.iter().filter(|d| w.placements.iter().any(|p| p.cluster == d.summary.id)).map(|d| html! {
-                <PlacementCard key={d.summary.id.clone()} detail={d.clone()} workload={w.name.clone()}
-                    admin={auth.is_admin()} hosts={hosts.clone()} reload={data.reload.clone()} />
-            }) }
+            <Placements details={details.iter().filter(|d| w.placements.iter().any(|p| p.cluster == d.summary.id)).cloned().collect::<Vec<_>>()}
+                workload={w.name.clone()} focus={focus.clone()} admin={auth.is_admin()} {hosts} reload={data.reload.clone()} />
         </div>
     }
 }
@@ -180,43 +178,61 @@ fn gloo_utils_document() -> web_sys::Document {
 }
 
 #[derive(Properties, PartialEq)]
-struct CardProps {
-    detail: HostDetail,
+struct PlacementsProps {
+    /// The clusters it runs on.
+    details: Vec<HostDetail>,
     workload: String,
+    focus: Option<String>,
     admin: bool,
     hosts: BTreeMap<String, HostSummary>,
     reload: Callback<()>,
 }
 
-/// The workload on one cluster: the cluster page's row for it, opened,
-/// with that placement's actions.
-#[function_component(PlacementCard)]
-fn placement_card(props: &CardProps) -> Html {
-    let d = &props.detail;
-    let picked = use_state_eq(|| None::<String>);
+/// The workload on each cluster it runs on: a row per placement, each the
+/// cluster's Workloads row for it on that cluster's newest run, with its
+/// actions where the cluster's executor is online.
+#[function_component(Placements)]
+fn placements(props: &PlacementsProps) -> Html {
     let actions = {
-        let (picked, reload) = (picked.clone(), props.reload.clone());
-        use_target_actions(
-            d.summary.id.clone(),
-            Callback::from(move |_| {
-                picked.set(None);
-                reload.emit(());
-            }),
-        )
+        let reload = props.reload.clone();
+        use_actions(Callback::from(move |_| reload.emit(())))
     };
-    let status = d.summary.cluster_status.clone().unwrap_or_default();
-    let can_act = props.admin
-        && d.summary.status == HostStatus::Active
-        && status
-            .executor
-            .as_deref()
-            .and_then(|e| props.hosts.get(e))
-            .is_some_and(|h| h.connection == Connection::Online);
-    html! { <>
-        <ModulesPanel detail={d.clone()} cluster=true only={props.workload.clone()}
-            on_action={can_act.then(|| actions.on_action.clone())}
-            newest={d.latest_run.as_ref().map(|r| r.id.clone())} picked={(*picked).clone()}
-            on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
-        { actions.dialog }
-    </> }
+    let can_act = |d: &HostDetail| {
+        props.admin
+            && d.summary.status == HostStatus::Active
+            && d.summary
+                .cluster_status
+                .as_ref()
+                .and_then(|s| s.executor.as_deref())
+                .and_then(|e| props.hosts.get(e))
+                .is_some_and(|h| h.connection == Connection::Online)
+    };
+    html! {
+        <Panel title="Placements" id="placements"
+            subtitle={format!("How it reads on {} and what each one's latest run did", count(props.details.len(), "cluster", "clusters"))}>
+            <div class="table-wrap">
+                <table class="table table--workloads" data-testid="placements">
+                    <thead><tr>
+                        <th scope="col">{ "Cluster" }</th>
+                        <th scope="col">{ "Health" }</th>
+                        <th scope="col">{ "Latest run" }</th>
+                        <th scope="col">{ "Resources" }</th>
+                        <th scope="col">{ "Applied" }</th>
+                        <th scope="col"><span class="visually-hidden">{ "Details" }</span></th>
+                    </tr></thead>
+                    <tbody>
+                        { for props.details.iter().map(|d| {
+                            let id = d.summary.id.clone();
+                            let on_action = can_act(d).then(|| actions.on_action.reform(move |a| (id.clone(), a)));
+                            html! {
+                                <PlacementRow key={d.summary.id.clone()} detail={d.clone()} workload={props.workload.clone()}
+                                    {on_action} focus={props.details.len() == 1 || props.focus.as_deref() == Some(d.summary.id.as_str())} />
+                            }
+                        }) }
+                    </tbody>
+                </table>
+            </div>
+            { actions.dialog.clone() }
+        </Panel>
+    }
 }

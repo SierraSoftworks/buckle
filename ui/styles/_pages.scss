@@ -922,8 +922,9 @@
   margin-block: calc((1lh - 6px) / 2) 0.35rem;
 }
 
-// A card scrolled to by its anchor clears the sticky app bar.
-.panel[id] {
+// A card or row scrolled to by its anchor clears the sticky app bar.
+.panel[id],
+tr[id] {
   scroll-margin-top: calc(var(--bar-h) + 1rem);
 }
 

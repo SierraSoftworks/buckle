@@ -100,22 +100,38 @@ pub struct TargetActions {
 /// confirmation; `on_started` follows once one has started (to show its run).
 #[hook]
 pub fn use_target_actions(id: String, on_started: Callback<()>) -> TargetActions {
+    let any = use_actions(on_started);
+    TargetActions {
+        on_action: any.on_action.reform(move |a| (id.clone(), a)),
+        dialog: any.dialog,
+    }
+}
+
+/// Several targets' actions from one page: a click names the target.
+pub struct AnyTargetActions {
+    pub on_action: Callback<(String, ActionInfo)>,
+    pub dialog: Html,
+}
+
+/// [`use_target_actions`] for a page acting on more than one target (a
+/// workload's placements, each on its cluster).
+#[hook]
+pub fn use_actions(on_started: Callback<()>) -> AnyTargetActions {
     let toast = use_toast();
-    let ask = use_state(|| None::<ActionInfo>);
+    let ask = use_state(|| None::<(String, ActionInfo)>);
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
 
     // Runs an action with the note given (empty when it asks no confirmation).
     let start = {
-        let (ask, busy, error, id) = (ask.clone(), busy.clone(), error.clone(), id.clone());
-        Callback::from(move |(a, note): (ActionInfo, String)| {
-            let (ask, busy, error, toast, on_started, id) = (
+        let (ask, busy, error) = (ask.clone(), busy.clone(), error.clone());
+        Callback::from(move |(id, a, note): (String, ActionInfo, String)| {
+            let (ask, busy, error, toast, on_started) = (
                 ask.clone(),
                 busy.clone(),
                 error.clone(),
                 toast.clone(),
                 on_started.clone(),
-                id.clone(),
             );
             busy.set(true);
             wasm_bindgen_futures::spawn_local(async move {
@@ -135,18 +151,18 @@ pub fn use_target_actions(id: String, on_started: Callback<()>) -> TargetActions
     };
     let on_action = {
         let (ask, error, start) = (ask.clone(), error.clone(), start.clone());
-        Callback::from(move |a: ActionInfo| match click(&a) {
+        Callback::from(move |(id, a): (String, ActionInfo)| match click(&a) {
             Click::Confirm => {
                 error.set(None);
-                ask.set(Some(a));
+                ask.set(Some((id, a)));
             }
-            Click::Run => start.emit((a, String::new())),
+            Click::Run => start.emit((id, a, String::new())),
         })
     };
-    let dialog = (*ask).as_ref().map(|a| {
+    let dialog = (*ask).as_ref().map(|(id, a)| {
         let confirm = {
-            let (start, a) = (start.clone(), a.clone());
-            Callback::from(move |note: String| start.emit((a.clone(), note)))
+            let (start, id, a) = (start.clone(), id.clone(), a.clone());
+            Callback::from(move |note: String| start.emit((id.clone(), a.clone(), note)))
         };
         let cancel = {
             let ask = ask.clone();
@@ -165,7 +181,7 @@ pub fn use_target_actions(id: String, on_started: Callback<()>) -> TargetActions
             </Confirm>
         }
     });
-    TargetActions {
+    AnyTargetActions {
         on_action,
         dialog: dialog.unwrap_or_default(),
     }
