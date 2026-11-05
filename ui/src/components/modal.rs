@@ -4,9 +4,11 @@
 //!
 //! The confirmation names what is about to happen to what, can require a
 //! checkbox ("I have reviewed the 4 destructive steps") or the name of the
-//! thing typed out, and labels its button with the action rather than "Yes",
+//! thing typed out (a click on the name copies it, so it can be pasted but
+//! never skipped), and labels its button with the action rather than "Yes",
 //! so the two buttons cannot be told apart only by position.
 
+use gloo_timers::callback::Timeout;
 use wasm_bindgen::JsCast;
 use web_sys::{HtmlElement, HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
@@ -181,6 +183,14 @@ pub fn confirm(props: &ConfirmProps) -> Html {
     let acked = use_state(|| false);
     let typed = use_state(String::new);
     let note = use_state(String::new);
+    let input = use_node_ref();
+    let copied = use_state(|| false);
+    let reset = use_mut_ref(|| None::<Timeout>);
+    // An explicit `for`: the label holds the copy button, which would
+    // otherwise be the control it labels.
+    let input_id = use_memo((), |_| {
+        format!("confirm-{}", (crate::util::random() * 1e9) as u64)
+    });
 
     let ready = (props.acknowledge.is_none() || *acked)
         && props
@@ -199,6 +209,21 @@ pub fn confirm(props: &ConfirmProps) -> Html {
         let typed = typed.clone();
         Callback::from(move |e: InputEvent| {
             typed.set(e.target_unchecked_into::<HtmlInputElement>().value());
+        })
+    };
+    // Copies the word and moves focus to the box, ready for a paste.
+    let on_copy = {
+        let (word, input, copied) = (props.type_to_confirm.clone(), input.clone(), copied.clone());
+        Callback::from(move |e: MouseEvent| {
+            e.prevent_default();
+            let Some(word) = &word else { return };
+            crate::util::copy(word);
+            if let Some(el) = input.cast::<HtmlElement>() {
+                let _ = el.focus();
+            }
+            copied.set(true);
+            let copied = copied.clone();
+            *reset.borrow_mut() = Some(Timeout::new(1_500, move || copied.set(false)));
         })
     };
     let on_note = {
@@ -239,11 +264,22 @@ pub fn confirm(props: &ConfirmProps) -> Html {
                     </label>
                 }
                 if let Some(word) = &props.type_to_confirm {
-                    <label class="field">
-                        <span class="field__label">{ "Type " }<code class="mono">{ word.clone() }</code>{ " to confirm" }</span>
-                        <input class="input mono" type="text" value={(*typed).clone()} oninput={on_type}
+                    <div class="field">
+                        <label class="field__label" for={(*input_id).clone()}>
+                            { "Type " }
+                            <button type="button" class="confirm__word mono" onclick={on_copy}
+                                title={if *copied { "Copied" } else { "Copy to clipboard" }}>
+                                { word.clone() }
+                                <span class="confirm__word-icon" aria-hidden="true">
+                                    { if *copied { super::icons::check() } else { super::icons::copy() } }
+                                </span>
+                            </button>
+                            { " to confirm" }
+                        </label>
+                        <input ref={input} id={(*input_id).clone()} class="input mono" type="text"
+                            value={(*typed).clone()} oninput={on_type}
                             autocomplete="off" spellcheck="false" data-autofocus="" />
-                    </label>
+                    </div>
                 }
                 if props.note || props.note_required {
                     <label class="field">
