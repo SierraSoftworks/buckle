@@ -10,6 +10,7 @@ members = [
     "crates/buckle-server",
     "crates/buckle-integration",
     "crates/buckle-nomad",
+    "crates/buckle-kube",
 ]
 # The `ui` crate is compiled to WebAssembly with `trunk` and embedded into the
 # server at build time; it is excluded so that `cargo build` of the workspace
@@ -32,6 +33,7 @@ buckle-api = { path = "crates/buckle-api" }
 buckle-agent = { path = "crates/buckle-agent" }
 buckle-server = { path = "crates/buckle-server" }
 buckle-nomad = { path = "crates/buckle-nomad" }
+buckle-kube = { path = "crates/buckle-kube" }
 
 # Core
 aho-corasick = "1.1.5"

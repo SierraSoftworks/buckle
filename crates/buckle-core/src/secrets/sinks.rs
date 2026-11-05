@@ -284,6 +284,30 @@ impl ApiSink {
         Sensitive::new(serde_json::to_vec(&envelope).unwrap_or_default())
     }
 
+    /// [`ApiSink::json_body`] with each value passed through `encode` (a
+    /// Kubernetes Secret's base64 `data`).
+    pub fn json_body_encoded<'a>(
+        &self,
+        mut envelope: serde_json::Value,
+        field: &str,
+        items: impl IntoIterator<Item = (&'a str, &'a Rendered)>,
+        encode: impl Fn(&str) -> String,
+    ) -> Sensitive<Vec<u8>> {
+        let object: serde_json::Map<String, serde_json::Value> = items
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_owned(),
+                    serde_json::Value::String(encode(self.text(v))),
+                )
+            })
+            .collect();
+        if let Some(map) = envelope.as_object_mut() {
+            map.insert(field.to_owned(), serde_json::Value::Object(object));
+        }
+        Sensitive::new(serde_json::to_vec(&envelope).unwrap_or_default())
+    }
+
     /// A secret used as the API's credential (a `secret://` cluster
     /// identity), for the client that sends it as a header.
     pub fn credential(&self, secret: &Secret) -> secrecy::SecretString {

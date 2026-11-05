@@ -1,6 +1,7 @@
 //! The in-cluster executor for a cluster Buckle has no host near: a Nomad
-//! job running the agent with `identity: workload`, enrolled by its workload
-//! identity (`agents.auth: workload_identity`). Rendered for the operator by
+//! job, or a Kubernetes Deployment, running the agent with
+//! `identity: workload`, enrolled by its workload identity
+//! (`agents.auth: workload_identity`). Rendered for the operator by
 //! `GET /api/v1/targets/{id}/executor`; upgraded by re-running it with a new
 //! image tag.
 
@@ -32,10 +33,8 @@ pub fn render(
             "{target} is a scoped target; its cluster's executor serves it."
         ));
     }
-    if spec.kind != ClusterKind::Nomad {
-        return Err(
-            "An in-cluster executor for Kubernetes arrives with the Kubernetes executor.".into(),
-        );
+    if spec.kind == ClusterKind::Kubernetes {
+        return Ok(kubernetes(target, spec, settings, server_version));
     }
     let mut trust = spec.trust.as_deref().cloned().unwrap_or_default();
     let subject = trust
@@ -96,14 +95,183 @@ pub fn render(
     })
 }
 
+/// The Kubernetes executor: a Deployment in the trusted subject's namespace
+/// running as its ServiceAccount, with a projected token for enrolment.
+fn kubernetes(
+    target: &str,
+    spec: &ClusterSpec,
+    settings: &JoinSettings,
+    server_version: &str,
+) -> ExecutorSpec {
+    let mut trust = spec.trust.as_deref().cloned().unwrap_or_default();
+    let subject = trust
+        .subjects(spec.kind)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let (namespace, account) = subject
+        .strip_prefix("system:serviceaccount:")
+        .and_then(|s| s.split_once(':'))
+        .map(|(n, a)| (n.to_owned(), a.to_owned()))
+        .unwrap_or_else(|| ("buckle-system".to_owned(), "buckle-executor".to_owned()));
+    if trust.jwks_url.is_none() && trust.keys.is_none() {
+        trust.jwks_url = spec
+            .api
+            .as_deref()
+            .map(|api| format!("{}/openid/v1/jwks", api.trim_end_matches('/')));
+    }
+    let host_id = format!("{target}-executor");
+    let agent = agent_config(target, &host_id, settings, "/var/lib/buckle", K8S_TOKEN);
+    let job = kubernetes_manifest(
+        &namespace,
+        &account,
+        &image(settings, server_version),
+        &agent,
+    );
+    let policy = format!(
+        r#"# Lets the executor apply every workload. Narrow it (a Role per namespace)
+# once the workloads settle.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {account}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: {account}
+    namespace: {namespace}
+"#
+    );
+    let policy_file = format!("{account}-rbac.yaml");
+    let job_file = format!("{account}.yaml");
+    let commands = vec![
+        format!("kubectl apply -f {job_file}"),
+        format!("kubectl apply -f {policy_file}"),
+    ];
+    let mut notes = Vec::new();
+    if !settings.workload_identity {
+        notes.push("This server does not accept workload identities yet: add `workload_identity` to agents.auth in server.yaml and restart it.".to_owned());
+    }
+    if trust.keys.is_none() {
+        notes.push("The server reads the cluster's ServiceAccount keys from /openid/v1/jwks, which needs `kubectl create clusterrolebinding service-account-issuer-discovery --clusterrole=system:service-account-issuer-discovery --group=system:unauthenticated`; or pin them as trust.keys (`kubectl get --raw /openid/v1/jwks`).".to_owned());
+    }
+    if spec.identity != "workload" {
+        notes.push(format!(
+            "The cluster's identity is `{}`; set it to `workload` so the executor uses its ServiceAccount.",
+            spec.identity
+        ));
+    }
+    notes.push("The executor must reach the Buckle server: over the tailnet from a node with hostNetwork, through a Tailscale sidecar, or an egress proxy.".to_owned());
+    ExecutorSpec {
+        target: target.to_owned(),
+        host_id,
+        job_file,
+        job,
+        policy_file,
+        policy,
+        commands,
+        trust,
+        notes,
+    }
+}
+
+/// Where the Deployment mounts the projected token the agent enrols with.
+const K8S_TOKEN: &str = "/var/run/secrets/buckle/token";
+
+fn kubernetes_manifest(namespace: &str, account: &str, image: &str, agent: &str) -> String {
+    let agent = agent
+        .lines()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"apiVersion: v1
+kind: Namespace
+metadata:
+  name: {namespace}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {account}
+  namespace: {namespace}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {account}
+  namespace: {namespace}
+data:
+  agent.yaml: |
+{agent}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {account}
+  namespace: {namespace}
+spec:
+  replicas: 1
+  strategy: {{ type: Recreate }}
+  selector:
+    matchLabels: {{ app: {account} }}
+  template:
+    metadata:
+      labels: {{ app: {account} }}
+    spec:
+      serviceAccountName: {account}
+      containers:
+        - name: agent
+          image: {image}
+          args: ["agent", "--config", "/etc/buckle/agent.yaml"]
+          resources:
+            requests: {{ cpu: 50m, memory: 64Mi }}
+            limits: {{ memory: 256Mi }}
+          volumeMounts:
+            - {{ name: config, mountPath: /etc/buckle }}
+            - {{ name: identity, mountPath: /var/run/secrets/buckle }}
+            - {{ name: state, mountPath: /var/lib/buckle }}
+      volumes:
+        - name: config
+          configMap: {{ name: {account} }}
+        # The token the agent enrols with (agents.auth: workload_identity).
+        - name: identity
+          projected:
+            sources:
+              - serviceAccountToken: {{ audience: buckle, expirationSeconds: 3600, path: token }}
+        - name: state
+          emptyDir: {{}}
+"#
+    )
+}
+
 fn agent_yaml(target: &str, host_id: &str, settings: &JoinSettings) -> String {
+    agent_config(
+        target,
+        host_id,
+        settings,
+        "/alloc/data/buckle",
+        "/secrets/nomad_buckle.jwt",
+    )
+}
+
+fn agent_config(
+    target: &str,
+    host_id: &str,
+    settings: &JoinSettings,
+    state_dir: &str,
+    token_file: &str,
+) -> String {
     let tls = match (&settings.ca_fingerprint, settings.insecure_plaintext) {
         (Some(fp), _) => format!("tls: {{ ca_fingerprint: \"{fp}\" }}\n"),
         (None, true) => "tls: { insecure_plaintext: true }\n".to_owned(),
         (None, false) => String::new(),
     };
     format!(
-        "server: {server}\nhost_id: {host_id}\nstate_dir: /alloc/data/buckle\n{tls}labels: {{ executor: \"{target}\" }}\nworkload_identity:\n  token_file: /secrets/nomad_buckle.jwt\n",
+        "server: {server}\nhost_id: {host_id}\nstate_dir: {state_dir}\n{tls}labels: {{ executor: \"{target}\" }}\nworkload_identity:\n  token_file: {token_file}\n",
         server = settings.server_url,
     )
 }
@@ -295,8 +463,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_kubernetes_executor_runs_as_the_trusted_service_account() {
+        let mut s = spec(Some("https://10.0.0.1:6443"), None);
+        s.kind = ClusterKind::Kubernetes;
+        let out = render("lab-k3s", &s, &settings(Some("sha256:abcd"), true), "2.4.1").unwrap();
+        for needle in [
+            "namespace: buckle-system",
+            "serviceAccountName: buckle-executor",
+            "audience: buckle",
+            "token_file: /var/run/secrets/buckle/token",
+            "host_id: lab-k3s-executor",
+            "ghcr.io/sierrasoftworks/buckle:2",
+        ] {
+            assert!(out.job.contains(needle), "{needle} in\n{}", out.job);
+        }
+        assert!(out.policy.contains("name: cluster-admin"));
+        assert_eq!(
+            out.trust.jwks_url.as_deref(),
+            Some("https://10.0.0.1:6443/openid/v1/jwks")
+        );
+        assert!(
+            out.commands
+                .iter()
+                .all(|c| c.starts_with("kubectl apply -f"))
+        );
+        let manifests: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(&out.job)
+            .map(|d| serde::Deserialize::deserialize(d).unwrap())
+            .collect();
+        assert_eq!(manifests.len(), 4, "the manifest is valid YAML");
+    }
+
     #[rstest]
-    #[case::kubernetes(ClusterKind::Kubernetes, None, "Kubernetes")]
     #[case::scoped(ClusterKind::Nomad, Some("parent"), "scoped")]
     fn other_targets_have_no_executor_job(
         #[case] kind: ClusterKind,

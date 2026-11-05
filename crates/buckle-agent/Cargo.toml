@@ -16,6 +16,7 @@ testing = []
 [dependencies]
 buckle-core.workspace = true
 buckle-nomad.workspace = true
+buckle-kube.workspace = true
 buckle-proto.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -51,6 +52,7 @@ zeroize = "1.9"
 [dev-dependencies]
 buckle-core = { workspace = true, features = ["testing"] }
 buckle-nomad = { workspace = true, features = ["testing"] }
+buckle-kube = { workspace = true, features = ["testing"] }
 hyper-util.workspace = true
 pretty_assertions.workspace = true
 rstest.workspace = true

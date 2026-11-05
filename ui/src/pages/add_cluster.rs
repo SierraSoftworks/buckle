@@ -29,6 +29,7 @@ enum Executor {
 /// The request the form describes, or why it cannot be sent.
 fn request(
     id: &str,
+    kind: ClusterKind,
     api: &str,
     executor: Executor,
     selector: &str,
@@ -63,7 +64,7 @@ fn request(
         id: id.to_owned(),
         kind: TargetKind::Cluster,
         cluster: Some(ClusterSpec {
-            kind: ClusterKind::Nomad,
+            kind,
             description: String::new(),
             api: (!api.is_empty()).then(|| api.to_owned()),
             nodes: None,
@@ -106,9 +107,28 @@ fn file_block(name: &str, contents: &str) -> Html {
     }
 }
 
-fn executor_view(spec: &ExecutorSpec) -> Html {
+/// Where the scheduler serves the keys it signs workload identities with.
+fn jwks_url(kind: ClusterKind, api: &str) -> String {
+    let api = api.trim().trim_end_matches('/');
+    match kind {
+        ClusterKind::Nomad => format!("{api}/.well-known/jwks.json"),
+        ClusterKind::Kubernetes => format!("{api}/openid/v1/jwks"),
+    }
+}
+
+fn executor_view(kind: ClusterKind, spec: &ExecutorSpec) -> Html {
+    let intro = match kind {
+        ClusterKind::Nomad => format!(
+            "Run these with a Nomad management token. The executor enrols as {} once the job starts.",
+            spec.host_id
+        ),
+        ClusterKind::Kubernetes => format!(
+            "Run these with cluster-admin credentials. The executor enrols as {} once its pod starts.",
+            spec.host_id
+        ),
+    };
     html! { <>
-        <p>{ format!("Run these with a Nomad management token. The executor enrols as {} once the job starts.", spec.host_id) }</p>
+        <p>{ intro }</p>
         { file_block(&spec.policy_file, &spec.policy) }
         { file_block(&spec.job_file, &spec.job) }
         { file_block("commands", &spec.commands.join("\n")) }
@@ -121,6 +141,7 @@ fn executor_view(spec: &ExecutorSpec) -> Html {
 #[function_component(AddCluster)]
 pub fn add_cluster(props: &AddClusterProps) -> Html {
     let id = use_state(String::new);
+    let kind = use_state(|| ClusterKind::Nomad);
     let api_url = use_state(String::new);
     let executor = use_state(|| Executor::Hosts);
     let selector = use_state(String::new);
@@ -134,7 +155,7 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
         Callback::from(move |_: MouseEvent| on_close.emit(()))
     };
 
-    let draft = request(&id, &api_url, *executor, &selector, &jwks);
+    let draft = request(&id, *kind, &api_url, *executor, &selector, &jwks);
     let create = {
         let (draft, busy, error, created, spec, executor) = (
             draft.clone(),
@@ -170,16 +191,40 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
     };
 
     let choose = |e: Executor| {
-        let (executor, jwks, api_url) = (executor.clone(), jwks.clone(), api_url.clone());
+        let (executor, jwks, api_url, kind) = (
+            executor.clone(),
+            jwks.clone(),
+            api_url.clone(),
+            kind.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             if e == Executor::Inside && jwks.is_empty() && !api_url.trim().is_empty() {
-                jwks.set(format!(
-                    "{}/.well-known/jwks.json",
-                    api_url.trim().trim_end_matches('/')
-                ));
+                jwks.set(jwks_url(*kind, &api_url));
             }
             executor.set(e);
         })
+    };
+    let choose_kind = |k: ClusterKind| {
+        let (kind, jwks, api_url) = (kind.clone(), jwks.clone(), api_url.clone());
+        Callback::from(move |_: MouseEvent| {
+            // A key URL derived for the other scheduler follows the switch.
+            if !api_url.trim().is_empty() && *jwks == jwks_url(*kind, &api_url) {
+                jwks.set(jwks_url(k, &api_url));
+            }
+            kind.set(k);
+        })
+    };
+    let (name_hint, api_hint, executors_hint) = match *kind {
+        ClusterKind::Nomad => (
+            "home-nomad",
+            "http://10.0.0.1:4646",
+            r#"host.groups contains "nomad-servers""#,
+        ),
+        ClusterKind::Kubernetes => (
+            "lab-k3s",
+            "https://10.0.0.1:6443",
+            r#"host.labels.role == "k3s-server""#,
+        ),
     };
 
     let (body, footer) = match &*created {
@@ -194,6 +239,15 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
                     </button>
                 }
             };
+            let kind_choice = |k: ClusterKind, title: &'static str| {
+                let selected = *kind == k;
+                html! {
+                    <button type="button" role="radio" aria-checked={selected.to_string()}
+                        class={classes!("choice", selected.then_some("choice--selected"))} onclick={choose_kind(k)}>
+                        <span class="choice__title">{ title }</span>
+                    </button>
+                }
+            };
             let problem = (*error)
                 .clone()
                 .or_else(|| (!id.is_empty()).then(|| draft.clone().err()).flatten());
@@ -201,13 +255,20 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
                 html! { <>
                     <label class="field">
                         <span class="field__label">{ "Name" }</span>
-                        <input class="input mono" type="text" placeholder="home-nomad" spellcheck="false"
+                        <input class="input mono" type="text" placeholder={name_hint} spellcheck="false"
                             value={(*id).clone()} oninput={text(&id)} />
-                        <span class="field__hint">{ "A Nomad cluster buckle.yaml does not declare. Declared clusters appear here on their own." }</span>
+                        <span class="field__hint">{ "A cluster buckle.yaml does not declare. Declared clusters appear here on their own." }</span>
                     </label>
+                    <div class="field">
+                        <span class="field__label">{ "Scheduler" }</span>
+                        <div class="wizard__choices wizard__choices--two" role="radiogroup" aria-label="Scheduler">
+                            { kind_choice(ClusterKind::Nomad, "Nomad") }
+                            { kind_choice(ClusterKind::Kubernetes, "Kubernetes") }
+                        </div>
+                    </div>
                     <label class="field">
                         <span class="field__label">{ "API" }</span>
-                        <input class="input mono" type="text" placeholder="http://10.0.0.1:4646" spellcheck="false"
+                        <input class="input mono" type="text" placeholder={api_hint} spellcheck="false"
                             value={(*api_url).clone()} oninput={text(&api_url)} />
                         <span class="field__hint">{ "As its executor reaches it. Leave blank for the executor's local default." }</span>
                     </label>
@@ -215,20 +276,20 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
                         <span class="field__label">{ "Executor" }</span>
                         <div class="wizard__choices wizard__choices--two" role="radiogroup" aria-label="Executor">
                             { choice(Executor::Hosts, "Hosts of the fleet", "Hosts near the cluster apply its workloads with a token Buckle issues.") }
-                            { choice(Executor::Inside, "Inside the cluster", "A job in the cluster applies them with its workload identity.") }
+                            { choice(Executor::Inside, "Inside the cluster", "A job or pod in the cluster applies them with its workload identity.") }
                         </div>
                     </div>
                     if *executor == Executor::Hosts {
                         <label class="field">
                             <span class="field__label">{ "Executors" }</span>
-                            <input class="input mono" type="text" placeholder={r#"host.groups contains "nomad-servers""#} spellcheck="false"
+                            <input class="input mono" type="text" placeholder={executors_hint} spellcheck="false"
                                 value={(*selector).clone()} oninput={text(&selector)} />
                             <span class="field__hint">{ "A selector over host.* choosing the hosts that may speak for it." }</span>
                         </label>
                     } else {
                         <label class="field">
                             <span class="field__label">{ "Signing keys" }</span>
-                            <input class="input mono" type="text" placeholder="http://10.0.0.1:4646/.well-known/jwks.json" spellcheck="false"
+                            <input class="input mono" type="text" placeholder={jwks_url(*kind, api_hint)} spellcheck="false"
                                 value={(*jwks).clone()} oninput={text(&jwks)} />
                             <span class="field__hint">{ "Where the server reads the keys the cluster signs workload identities with." }</span>
                         </label>
@@ -252,7 +313,7 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
                 (Executor::Inside, Some(Err(e))) => {
                     html! { <Note kind={NoteKind::Danger}>{ e.clone() }</Note> }
                 }
-                (Executor::Inside, Some(Ok(s))) => executor_view(s),
+                (Executor::Inside, Some(Ok(s))) => executor_view(*kind, s),
             };
             (
                 body,
@@ -276,6 +337,7 @@ mod tests {
     fn a_cluster_with_an_executor_inside_trusts_its_keys() {
         let r = request(
             "home-nomad",
+            ClusterKind::Nomad,
             "http://n:4646",
             Executor::Inside,
             "",
@@ -291,11 +353,27 @@ mod tests {
     }
 
     #[test]
+    fn a_kubernetes_cluster_reads_its_service_account_keys() {
+        let jwks = jwks_url(ClusterKind::Kubernetes, "https://k:6443/");
+        assert_eq!(jwks, "https://k:6443/openid/v1/jwks");
+        let r = request(
+            "lab",
+            ClusterKind::Kubernetes,
+            "https://k:6443",
+            Executor::Inside,
+            "",
+            &jwks,
+        )
+        .unwrap();
+        assert_eq!(r.cluster.unwrap().kind, ClusterKind::Kubernetes);
+    }
+
+    #[test]
     fn incomplete_forms_say_what_is_missing() {
-        assert!(request("", "", Executor::Hosts, "true", "").is_err());
-        assert!(request("a b", "", Executor::Hosts, "true", "").is_err());
-        assert!(request("c", "", Executor::Hosts, " ", "").is_err());
-        assert!(request("c", "", Executor::Inside, "", "").is_err());
-        assert!(request("c", "", Executor::Hosts, "true", "").is_ok());
+        assert!(request("", ClusterKind::Nomad, "", Executor::Hosts, "true", "").is_err());
+        assert!(request("a b", ClusterKind::Nomad, "", Executor::Hosts, "true", "").is_err());
+        assert!(request("c", ClusterKind::Nomad, "", Executor::Hosts, " ", "").is_err());
+        assert!(request("c", ClusterKind::Nomad, "", Executor::Inside, "", "").is_err());
+        assert!(request("c", ClusterKind::Nomad, "", Executor::Hosts, "true", "").is_ok());
     }
 }

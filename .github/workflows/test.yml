@@ -99,10 +99,18 @@ jobs:
       - if: matrix.os == 'ubuntu-latest'
         name: Start a Nomad dev agent
         run: scripts/nomad-dev-agent.sh
+      # The Kubernetes executor's integration tests (crates/buckle-kube/tests)
+      # run against a single-node k3s, likewise only here.
+      - if: matrix.os == 'ubuntu-latest'
+        name: Start a k3s server
+        run: sudo --preserve-env=GITHUB_ENV,RUNNER_TEMP scripts/k3s-dev-server.sh
       - run: cargo test --workspace --no-fail-fast
       - if: failure() && matrix.os == 'ubuntu-latest'
         name: Nomad agent log
         run: cat "$RUNNER_TEMP/nomad-dev/agent.log" || true
+      - if: failure() && matrix.os == 'ubuntu-latest'
+        name: k3s server log
+        run: sudo tail -n 200 "$RUNNER_TEMP/k3s-dev/server.log" || true
 
   ui:
     name: UI

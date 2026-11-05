@@ -21,9 +21,9 @@ The directory name must equal the workload's `name`. `files/` holds the specs th
 list names; files ending in `.j2` are rendered as [templates](./expressions.md#templates) first.
 
 ::: tip Status
-Nomad workloads are planned, applied and health checked through one of the cluster's executors,
-which needs no cluster state of its own: the server sends the cluster's spec and secrets before
-each request, and ownership is read back from the cluster. Kubernetes clusters, a workload's extra
+Nomad and Kubernetes workloads are planned, applied and health checked through one of the
+cluster's executors, which needs no cluster state of its own: the server sends the cluster's spec
+and secrets before each request, and ownership is read back from the cluster. A workload's extra
 `health` checks, `restart_on` and cluster `scope` are not yet applied by executors.
 :::
 
@@ -142,6 +142,50 @@ Two fields keep Buckle from fighting a tool that changes the live object:
 
 A job is registered with its source and variable values (`/v1/job/:id/submission`), so tools that
 re-render it can.
+
+## Kubernetes
+
+The same `workload.yaml`, with manifests where a Nomad workload has HCL:
+
+```yaml
+name: grafana
+when: 'cluster.kind == "kubernetes"'
+namespace: monitoring
+vars: { version: "11.4.0" }
+resources:
+  - secret: grafana
+    items: { GF_DATABASE_PASSWORD: '{{ secrets.GRAFANA_DB }}' }
+  - { config: grafana, files: [grafana.ini] }
+  - { file: grafana.yaml.j2, ignore: [spec.replicas] }
+```
+
+A manifest file may hold several documents (`---`) or a `kind: List`; each object is a step of its
+own, applied in file order. Objects without a namespace land in the workload's `namespace`
+(created when the cluster lacks it), else `default`. Helm or Kustomize output is committed as
+plain YAML; Buckle runs neither.
+
+- **Apply.** Server-side apply under the field manager `buckle`, forcing ownership of the fields
+  the manifest sets: fields other controllers or operators set stay theirs, and a field dropped
+  from the manifest is removed (unless another manager also owns it). An `ignore` path keeps the
+  live value, as on Nomad.
+- **Plan.** A dry-run apply, diffed over the fields Buckle owns before and after it, so server
+  defaults and other managers' fields never show; the API server's validation and admission run
+  at plan time. The apply carries the live `resourceVersion`, so an object that changed after the
+  plan is refused. Objects whose namespace or CustomResourceDefinition the same apply creates
+  plan without a dry run (a warning says so); the apply waits for a CRD to be established.
+- **Rollouts.** A Deployment, StatefulSet or DaemonSet step lasts until the controller observed
+  it and every replica is updated and available; a passed progress deadline fails it, and so does
+  the rollout still running after 10 minutes.
+- **Ownership.** Each object is labelled `buckle.sierrasoftworks.com/target` and `…/workload`; an
+  object labelled by another target blocks the plan, an unlabelled one is adopted (with a
+  warning). The ConfigMap `default/buckle-index-<target>` lists what was applied, so objects of a
+  removed workload or document are found and planned as removals: `stop` deletes everything but
+  Namespaces, PersistentVolumeClaims, Secrets, ConfigMaps and CRDs; `purge` deletes those too;
+  `keep` leaves all.
+- **Secrets.** A `secret` entry is a Secret whose keys Buckle owns; keys an operator added stay.
+  Plans show values as keyed fingerprints. A `config` entry is a ConfigMap with plain values.
+- **Health.** Each controller's rollout, its pods (one stuck in `CrashLoopBackOff` or
+  `ImagePullBackOff` fails the check), failed Jobs and lost volume claims.
 
 ::: details The first schema's keys
 Before `resources`, a workload named each kind under its own key: `job`, `volumes`, `variables`,

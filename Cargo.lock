@@ -582,6 +582,7 @@ version = "2.0.0-dev"
 dependencies = [
  "async-trait",
  "buckle-core",
+ "buckle-kube",
  "buckle-nomad",
  "buckle-proto",
  "chrono",
@@ -698,6 +699,29 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "buckle-kube"
+version = "2.0.0-dev"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "buckle-core",
+ "chrono",
+ "human-errors",
+ "indexmap",
+ "percent-encoding",
+ "pretty_assertions",
+ "reqwest 0.13.5",
+ "rstest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
