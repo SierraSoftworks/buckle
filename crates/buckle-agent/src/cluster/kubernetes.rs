@@ -178,7 +178,10 @@ impl Executor {
                             )),
                         );
                     }
-                    let cx = base.clone().with_namespace(w.config.namespace.as_deref());
+                    let cx = base
+                        .clone()
+                        .with_namespace(w.config.namespace.as_deref())
+                        .with_timeouts(w.config.timeouts.placement, w.config.timeouts.rollout);
                     let cx = buckle_kube::Context {
                         module: name.clone(),
                         ..cx

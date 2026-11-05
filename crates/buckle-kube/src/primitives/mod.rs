@@ -42,9 +42,19 @@ pub struct Context {
     pub progress: Progress,
     /// How often a rollout is polled while an apply waits for it.
     pub poll: Duration,
-    /// The longest an apply waits for a rollout to finish.
+    /// The longest an apply waits for a rollout to finish (the workload's
+    /// `timeouts.rollout`).
     pub rollout_timeout: Duration,
+    /// The longest a controller's pods may stay unschedulable during an
+    /// apply (the workload's `timeouts.placement`).
+    pub placement_timeout: Duration,
 }
+
+/// The default `timeouts.placement`, as on Nomad.
+pub const PLACEMENT_TIMEOUT: Duration = Duration::from_secs(300);
+/// The default `timeouts.rollout`, as on Nomad; a Deployment's own
+/// `progressDeadlineSeconds` usually ends it first.
+pub const ROLLOUT_TIMEOUT: Duration = Duration::from_secs(3600);
 
 impl Context {
     pub fn new(
@@ -63,8 +73,16 @@ impl Context {
             fingerprints,
             progress: Arc::new(|_| {}),
             poll: Duration::from_secs(2),
-            rollout_timeout: Duration::from_secs(600),
+            rollout_timeout: ROLLOUT_TIMEOUT,
+            placement_timeout: PLACEMENT_TIMEOUT,
         }
+    }
+
+    /// The workload's `timeouts`, each defaulting when absent.
+    pub fn with_timeouts(mut self, placement: Option<Duration>, rollout: Option<Duration>) -> Self {
+        self.placement_timeout = placement.unwrap_or(PLACEMENT_TIMEOUT);
+        self.rollout_timeout = rollout.unwrap_or(ROLLOUT_TIMEOUT);
+        self
     }
 
     pub fn with_namespace(mut self, namespace: Option<&str>) -> Self {

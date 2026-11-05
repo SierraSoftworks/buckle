@@ -28,6 +28,7 @@ fn cx(fake: &FakeKube, module: &str) -> Context {
     .with_namespace(Some("monitoring"));
     cx.poll = Duration::from_millis(1);
     cx.rollout_timeout = Duration::from_millis(50);
+    cx.placement_timeout = Duration::from_millis(10);
     cx
 }
 
@@ -407,6 +408,7 @@ async fn removed_objects_are_orphans_removed_by_policy(
 #[rstest]
 #[case::stuck("stuck", Some("did not roll out"))]
 #[case::pending("pending", Some("still rolling out"))]
+#[case::unschedulable("unschedulable", Some("could not be placed"))]
 #[case::complete("complete", None)]
 #[tokio::test]
 async fn an_apply_waits_for_the_rollout(#[case] outcome: &str, #[case] error: Option<&str>) {

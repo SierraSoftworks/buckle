@@ -208,6 +208,46 @@ pub fn stuck_pods(pods: &Value) -> Vec<String> {
     out
 }
 
+/// The pods of a controller the scheduler cannot place, as `pod: reason`
+/// lines (`PodScheduled` false: no node fits, a volume is bound elsewhere).
+pub fn unplaced_pods(pods: &Value) -> Vec<String> {
+    pods["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|pod| {
+            let c = condition(pod, "PodScheduled")?;
+            (c["status"].as_str() == Some("False")).then(|| {
+                format!(
+                    "{}: {}",
+                    pod["metadata"]["name"].as_str().unwrap_or("pod"),
+                    c["message"]
+                        .as_str()
+                        .or(c["reason"].as_str())
+                        .unwrap_or("unschedulable")
+                )
+            })
+        })
+        .collect()
+}
+
+/// The pods a controller selects (`spec.selector.matchLabels`), or `None`
+/// when it has no selector.
+pub async fn pods(kube: &Kube, key: &ObjectKey, obj: &Value) -> Result<Option<Value>> {
+    let Some(selector) = match_labels(obj) else {
+        return Ok(None);
+    };
+    let path = with_query(
+        &format!(
+            "/api/v1/namespaces/{}/pods",
+            crate::client::seg(&key.namespace)
+        ),
+        "labelSelector",
+        &selector,
+    );
+    Ok(Some(kube.get(&path).await?.unwrap_or(Value::Null)))
+}
+
 /// The implicit checks of one object: its own status and, for a
 /// controller, its pods.
 pub async fn object(kube: &Kube, key: &ObjectKey) -> Result<Vec<Check>> {
@@ -225,17 +265,8 @@ pub async fn object(kube: &Kube, key: &ObjectKey) -> Result<Vec<Check>> {
         status: status(key, live.as_ref()),
     }];
     if let Some(obj) = live.as_ref().filter(|_| is_rollout(key))
-        && let Some(selector) = match_labels(obj)
+        && let Some(pods) = pods(kube, key, obj).await?
     {
-        let path = with_query(
-            &format!(
-                "/api/v1/namespaces/{}/pods",
-                crate::client::seg(&key.namespace)
-            ),
-            "labelSelector",
-            &selector,
-        );
-        let pods = kube.get(&path).await?.unwrap_or(Value::Null);
         let stuck = stuck_pods(&pods);
         out.push(Check {
             name: format!("{} pods", key.key()),
@@ -296,6 +327,15 @@ mod tests {
             {"metadata": {"name": "g-2"}, "status": {"containerStatuses": [{"name": "grafana", "state": {"waiting": {"reason": "ContainerCreating"}}}]}},
         ]});
         assert_eq!(stuck_pods(&pods), vec!["g-1/grafana: CrashLoopBackOff"]);
+    }
+
+    #[test]
+    fn unplaced_pods_are_named() {
+        let pods = json!({"items": [
+            {"metadata": {"name": "g-1"}, "status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "0/3 nodes are available"}]}},
+            {"metadata": {"name": "g-2"}, "status": {"phase": "Running", "conditions": [{"type": "PodScheduled", "status": "True"}]}},
+        ]});
+        assert_eq!(unplaced_pods(&pods), vec!["g-1: 0/3 nodes are available"]);
     }
 
     #[rstest]
