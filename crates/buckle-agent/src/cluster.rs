@@ -5,14 +5,17 @@
 //!   Assign ([`Assignment`]) ahead of every plan, apply, rollback and health
 //!   request for it, so nothing about the cluster is kept between them.
 //! * [`Executor`] compiles the revision's selected workloads into
-//!   [`buckle_nomad`] primitives, plans them into an ordinary
+//!   [`buckle_nomad`] or [`buckle_kube`] primitives, plans them into an ordinary
 //!   [`Plan`] (one module per workload), applies them concurrently as
 //!   `needs` allow and runs their implicit health checks. Ownership lives in the cluster
 //!   (stamps and the index variable); objects of workloads that went away
 //!   are planned as removals.
 //! * Credentials come from Buckle-issued identities ([`crate::identity`]),
-//!   the host's own Nomad token (`local`, `workload`) or a `secret://`
-//!   secret.
+//!   the host's own credential (`local`: `NOMAD_TOKEN` or a kubeconfig;
+//!   `workload`: the task's token or the pod's ServiceAccount) or a
+//!   `secret://` secret.
+
+mod kubernetes;
 
 use crate::identity::{Credential, Credentials, IdentityRequest, Login, Purpose};
 use crate::transport::Transport;
@@ -109,6 +112,16 @@ impl Assignment {
 /// in-memory Nomad.
 pub trait Connect: Send + Sync + 'static {
     fn nomad(&self, target: &str, spec: &TargetSpec) -> buckle_core::Result<Nomad>;
+
+    /// A Kubernetes client carrying the host's own credential where the
+    /// identity uses one (`local`, `workload`), else only the address and CA.
+    fn kubernetes(
+        &self,
+        _target: &str,
+        spec: &TargetSpec,
+    ) -> buckle_core::Result<buckle_kube::Kube> {
+        buckle_kube::Kube::connect(kubernetes::endpoint(spec)?)
+    }
 }
 
 /// Connects over the network (or a Unix socket) to the cluster's `api`.
@@ -157,8 +170,7 @@ const PARALLEL_WORKLOADS: usize = 8;
 /// One workload's part of a plan.
 struct Unit {
     name: String,
-    cx: Context,
-    plan: WorkloadPlan,
+    plan: UnitPlan,
     /// The workloads that must apply first: the selected ones it `needs`
     /// (planned or not) and earlier ones creating a namespace, node pool or
     /// resource, which it may land in.
@@ -170,7 +182,83 @@ struct Unit {
 pub struct ClusterPlan {
     pub plan: Plan,
     units: Vec<Unit>,
-    removals: Vec<(Orphan, buckle_nomad::Removal, Context)>,
+    removals: Vec<RemovalStep>,
+}
+
+/// A workload's plan on its scheduler, with the context its apply uses.
+enum UnitPlan {
+    Nomad(Context, WorkloadPlan),
+    Kube(buckle_kube::Context, buckle_kube::WorkloadPlan),
+}
+
+/// What the plan shows of one step: its resource key, kind and whether it
+/// changes anything.
+struct StepView {
+    key: String,
+    kind: &'static str,
+    change: bool,
+}
+
+impl UnitPlan {
+    fn steps(&self) -> Vec<StepView> {
+        match self {
+            UnitPlan::Nomad(_, p) => p
+                .steps
+                .iter()
+                .map(|s| StepView {
+                    key: s.key.key(),
+                    kind: s.key.kind.task_kind(),
+                    change: s.is_change(),
+                })
+                .collect(),
+            UnitPlan::Kube(_, p) => p
+                .steps
+                .iter()
+                .map(|s| StepView {
+                    key: s.key.key(),
+                    kind: s.task_kind(),
+                    change: s.is_change(),
+                })
+                .collect(),
+        }
+    }
+
+    fn blocked(&self) -> Option<String> {
+        match self {
+            UnitPlan::Nomad(_, p) => p
+                .blocked()
+                .map(|(k, r)| format!("{k} cannot be applied: {r}")),
+            UnitPlan::Kube(_, p) => p
+                .blocked()
+                .map(|(k, r)| format!("{k} cannot be applied: {r}")),
+        }
+    }
+
+    async fn apply(&self, i: usize) -> buckle_core::Result<buckle_core::task::Applied> {
+        match self {
+            UnitPlan::Nomad(cx, p) => p.steps[i].apply(cx).await,
+            UnitPlan::Kube(cx, p) => p.steps[i].apply(cx).await,
+        }
+    }
+}
+
+/// An orphan to remove, on its scheduler.
+enum RemovalStep {
+    Nomad(Orphan, buckle_nomad::Removal, Context),
+    Kube(
+        buckle_kube::Orphan,
+        buckle_kube::Removal,
+        buckle_kube::Context,
+    ),
+}
+
+impl RemovalStep {
+    async fn remove(&self) -> buckle_core::Result<buckle_core::task::Applied> {
+        match self {
+            RemovalStep::Nomad(o, r, cx) => o.remove(cx, *r).await,
+            RemovalStep::Kube(o, r, cx) => o.remove(cx, *r).await,
+        }
+    }
 }
 
 impl std::fmt::Debug for ClusterPlan {
@@ -189,22 +277,13 @@ impl Executor {
         }
     }
 
-    /// A client for `a`'s cluster carrying a credential for `purpose`.
+    /// A Nomad client for `a`'s cluster carrying a credential for `purpose`.
     async fn client(
         &self,
         a: &Assignment,
         purpose: Purpose,
         rollout: Option<&str>,
     ) -> buckle_core::Result<Nomad> {
-        if a.spec.kind != ClusterKind::Nomad {
-            return Err(buckle_core::error::user(
-                format!(
-                    "{} is a {} cluster; this agent executes Nomad clusters only.",
-                    a.target, a.spec.kind
-                ),
-                &["Kubernetes executors arrive in a later Buckle release."],
-            ));
-        }
         let nomad = self.connect.nomad(&a.target, &a.spec)?;
         match &a.spec.identity {
             ClusterIdentity::BuckleJwt => {
@@ -268,6 +347,9 @@ impl Executor {
         a: &Assignment,
         rollout: Option<&str>,
     ) -> buckle_core::Result<ClusterPlan> {
+        if a.spec.kind == ClusterKind::Kubernetes {
+            return self.plan_kubernetes(a, rollout).await;
+        }
         let nomad = self.client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
         let workloads = a.workloads(&ctx);
@@ -349,11 +431,16 @@ impl Executor {
                                 .map(|m| format!("{name}: {}: {m}", step.key)),
                         );
                     }
-                    modules.push(module_plan(&name, &w.config.needs, &plan));
+                    modules.push(module_plan(
+                        &name,
+                        &w.config.needs,
+                        plan.steps
+                            .iter()
+                            .map(|s| (s.key.key(), s.key.kind.task_kind(), s.planned.clone())),
+                    ));
                     units.push(Unit {
                         name,
-                        cx,
-                        plan,
+                        plan: UnitPlan::Nomad(cx, plan),
                         after,
                     });
                 }
@@ -392,7 +479,11 @@ impl Executor {
                 .describe(removal)
                 .unwrap_or_else(|| format!("keep {} in the cluster", orphan.key));
             planned_removals.push(Removal {
-                resource: resource_key(&orphan.module, &orphan.key),
+                resource: resource_key(
+                    &orphan.module,
+                    orphan.key.kind.task_kind(),
+                    &orphan.key.key(),
+                ),
                 policy: if orphan.describe(removal).is_some() {
                     RemovalPolicy::Cleanup
                 } else {
@@ -404,23 +495,18 @@ impl Executor {
             });
             let mut ocx = cx.clone();
             ocx.module = orphan.module.clone();
-            removals.push((orphan, removal, ocx));
+            removals.push(RemovalStep::Nomad(orphan, removal, ocx));
         }
 
-        let mut plan = Plan::new(
-            a.revision.id.clone(),
-            &a.target,
+        Ok(finish(
+            a,
             modules,
             planned_removals,
-            Vec::new(),
-        )
-        .with_indeterminate(indeterminate);
-        plan.warnings = warnings;
-        Ok(ClusterPlan {
-            plan,
+            indeterminate,
+            warnings,
             units,
             removals,
-        })
+        ))
     }
 
     /// Applies `planned`'s workloads as their `needs` allow, several at once
@@ -497,9 +583,7 @@ impl Executor {
 
         let mut removals_run = Vec::new();
         let mut removal_error: Option<buckle_core::Error> = None;
-        for ((orphan, removal, cx), planned_removal) in
-            planned.removals.iter().zip(&planned.plan.removals)
-        {
+        for (step, planned_removal) in planned.removals.iter().zip(&planned.plan.removals) {
             let resource = planned_removal.resource.to_string();
             let mut outcome = RemovalOutcome {
                 resource: resource.clone(),
@@ -510,7 +594,7 @@ impl Executor {
                 error_detail: None,
             };
             if failure.is_none() && removal_error.is_none() {
-                match orphan.remove(cx, *removal).await {
+                match step.remove().await {
                     Ok(applied) => {
                         outcome.state = if applied.changed {
                             StepState::Changed
@@ -585,6 +669,9 @@ impl Executor {
         modules: Option<&[String]>,
         rollout: Option<&str>,
     ) -> buckle_core::Result<HealthReport> {
+        if a.spec.kind == ClusterKind::Kubernetes {
+            return self.health_kubernetes(a, scope, modules, rollout).await;
+        }
         let nomad = self.client(a, Purpose::Read, rollout).await?;
         let ctx = a.context();
         let cx = Context::new(
@@ -681,29 +768,29 @@ async fn apply_unit(
     let mut module_changes = 0;
     let mut module_error: Option<buckle_core::Error> = None;
 
-    if let Some((key, reason)) = unit.plan.blocked() {
+    if let Some(reason) = unit.plan.blocked() {
         module_error = Some(buckle_core::error::user(
-            format!("{key} cannot be applied: {reason}"),
+            reason,
             &["Resolve the conflict and plan again."],
         ));
     }
-    for (i, step) in unit.plan.steps.iter().enumerate() {
-        if module_error.is_some() || !step.is_change() {
+    for (i, step) in unit.plan.steps().into_iter().enumerate() {
+        if module_error.is_some() || !step.change {
             continue;
         }
-        let resource = resource_key(&module, &step.key);
+        let resource = resource_key(&module, step.kind, &step.key);
         let id = buckle_core::engine::step_id(&resource);
-        let kind = step.key.kind.task_kind().to_owned();
+        let kind = step.kind.to_owned();
         emit(ApplyEvent::StepStarted {
             module: module.clone(),
-            task_id: step.key.key(),
+            task_id: step.key.clone(),
             id: id.clone(),
             kind: kind.clone(),
         })
         .await;
         let step_started = Utc::now();
         let clock = tokio::time::Instant::now();
-        let applied = step.apply(&unit.cx).await;
+        let applied = unit.plan.apply(i).await;
         let outcome = steps.get_mut(i);
         match applied {
             Ok(applied) => {
@@ -712,7 +799,7 @@ async fn apply_unit(
                 }
                 emit(ApplyEvent::StepFinished {
                     module: module.clone(),
-                    task_id: step.key.key(),
+                    task_id: step.key.clone(),
                     id,
                     kind,
                     changed: applied.changed,
@@ -735,7 +822,7 @@ async fn apply_unit(
                 let report = ErrorReport::of(&e);
                 emit(ApplyEvent::StepFailed {
                     module: module.clone(),
-                    task_id: step.key.key(),
+                    task_id: step.key.clone(),
                     id,
                     kind,
                     error: report.one_line(),
@@ -1146,27 +1233,55 @@ fn nomad_removal(removal: WorkloadRemoval) -> buckle_nomad::Removal {
 }
 
 /// The plan's resource key of a cluster object: `paste/nomad.job[default/paste]`.
-fn resource_key(module: &str, key: &ObjectKey) -> ResourceKey {
-    ResourceKey::new(module, key.kind.task_kind(), key.key())
+fn resource_key(module: &str, kind: &str, key: &str) -> ResourceKey {
+    ResourceKey::new(module, kind, key)
 }
 
-/// A workload's steps as a module plan.
-fn module_plan(name: &str, needs: &[String], plan: &WorkloadPlan) -> ModulePlan {
+/// The plan of a cluster target, from its parts.
+fn finish(
+    a: &Assignment,
+    modules: Vec<ModulePlan>,
+    removals: Vec<Removal>,
+    indeterminate: Vec<Indeterminate>,
+    warnings: Vec<String>,
+    units: Vec<Unit>,
+    steps: Vec<RemovalStep>,
+) -> ClusterPlan {
+    let mut plan = Plan::new(
+        a.revision.id.clone(),
+        &a.target,
+        modules,
+        removals,
+        Vec::new(),
+    )
+    .with_indeterminate(indeterminate);
+    plan.warnings = warnings;
+    ClusterPlan {
+        plan,
+        units,
+        removals: steps,
+    }
+}
+
+/// A workload's steps (resource key, kind, plan) as a module plan.
+fn module_plan(
+    name: &str,
+    needs: &[String],
+    steps: impl Iterator<Item = (String, &'static str, buckle_core::plan::Planned)>,
+) -> ModulePlan {
     ModulePlan {
         module: name.to_owned(),
         needs: needs.to_vec(),
-        steps: plan
-            .steps
-            .iter()
-            .map(|s| Step {
+        steps: steps
+            .map(|(key, kind, planned)| Step {
                 task: TaskRef {
                     module: name.to_owned(),
-                    id: s.key.key(),
-                    kind: s.key.kind.task_kind().to_owned(),
+                    id: key.clone(),
+                    kind: kind.to_owned(),
                     name: None,
                 },
-                resource: resource_key(name, &s.key),
-                planned: s.planned.clone(),
+                resource: resource_key(name, kind, &key),
+                planned,
                 locks: Vec::new(),
                 notifies: Vec::new(),
                 always_runs: false,

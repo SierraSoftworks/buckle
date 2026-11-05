@@ -158,7 +158,11 @@ executor: a `buckle-executor` job running `ghcr.io/sierrasoftworks/buckle` with 
 workload identity and the Task API, the ACL policy attached to the job, the two commands that
 install them (`nomad acl policy apply -job …`, `nomad job run …`), and the cluster's `trust`.
 Re-run the job with a newer image tag to upgrade it. Workloads declaring `namespaces` or
-`policies` need a management token, which the executor's policy does not grant.
+`policies` need a management token, which the executor's policy does not grant. For a Kubernetes
+cluster it renders a `buckle-system` namespace with a `buckle-executor` ServiceAccount and
+Deployment (the agent config in a ConfigMap, a projected token with audience `buckle`), a
+ClusterRoleBinding to `cluster-admin`, and the `kubectl apply` commands; the server reads the
+ServiceAccount keys from the API server's `/openid/v1/jwks`.
 
 #### Tailscale provisioning
 
@@ -318,6 +322,18 @@ jwt:
       username: { claim: sub, prefix: "buckle:" }
       groups: { expression: '["buckle:" + claims.purpose]' }
 ```
+
+Executors plan and apply as `buckle:deploy` (a dry-run apply needs the same rights as the apply)
+and run health checks as `buckle:read`, which reads the objects and the index ConfigMap:
+
+```sh
+kubectl create clusterrolebinding buckle-deploy --clusterrole=cluster-admin --group=buckle:deploy
+kubectl create clusterrolebinding buckle-read --clusterrole=view --group=buckle:read
+```
+
+An executor on a cluster node finds the API server and its CA in the node's kubeconfig
+(`KUBECONFIG`, `/etc/rancher/k3s/k3s.yaml`, `~/.kube/config`), so `api` may be left out; with
+`identity: local` it uses that kubeconfig's own credentials instead (root's on a k3s server).
 
 ## API
 

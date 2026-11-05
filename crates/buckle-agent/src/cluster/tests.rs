@@ -576,18 +576,200 @@ async fn health_checks_the_jobs_of_the_selected_workloads() {
     assert!(only.results.iter().all(|r| r.module == "paste"));
 }
 
-#[tokio::test]
-async fn kubernetes_clusters_are_refused_with_a_reason() {
-    let fake = FakeNomad::new();
-    let mut a = assignment(revision("r1", &paste()), ClusterIdentity::Local, 7);
+struct KubeFake(buckle_kube::testing::FakeKube);
+
+impl Connect for KubeFake {
+    fn nomad(&self, _target: &str, _spec: &TargetSpec) -> buckle_core::Result<Nomad> {
+        unreachable!("a Kubernetes target never asks for Nomad")
+    }
+    fn kubernetes(
+        &self,
+        _target: &str,
+        _spec: &TargetSpec,
+    ) -> buckle_core::Result<buckle_kube::Kube> {
+        Ok(self.0.client())
+    }
+}
+
+fn kube_assignment(revision: Arc<Revision>, identity: ClusterIdentity) -> Assignment {
+    let mut a = assignment(revision, identity, 7);
     let mut spec = (*a.spec).clone();
     spec.kind = ClusterKind::Kubernetes;
     a.spec = Arc::new(spec);
-    let err = executor(&fake).plan(&a, None).await.unwrap_err();
+    a
+}
+
+const GRAFANA: &str = r#"apiVersion: apps/v1
+kind: Deployment
+metadata: { name: grafana }
+spec:
+  selector: { matchLabels: { app: grafana } }
+  template:
+    metadata: { labels: { app: grafana } }
+    spec:
+      containers:
+        - { name: grafana, image: "grafana:{{ vars.version }}" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: grafana }
+spec:
+  selector: { app: grafana }
+  ports: [{ name: http, port: 3000 }]
+"#;
+
+/// A Kubernetes workload: a namespace, a secret, a config and a two-object
+/// manifest rendered with `version`.
+fn grafana(version: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "workloads/grafana/workload.yaml".into(),
+            format!(
+                "name: grafana\nnamespace: monitoring\nvars: {{ version: \"{version}\" }}\nresources:\n  - secret: grafana\n    items:\n      GF_DATABASE_PASSWORD: '{{{{ secrets.DB }}}}'\n  - {{ config: grafana, files: [grafana.ini] }}\n  - grafana.yaml.j2\n"
+            ),
+        ),
+        (
+            "workloads/grafana/files/grafana.yaml.j2".into(),
+            GRAFANA.into(),
+        ),
+        (
+            "workloads/grafana/files/grafana.ini".into(),
+            "[server]\nhttp_port = 3000\n".into(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_kubernetes_workload_plans_applies_and_then_plans_as_a_no_op() {
+    let fake = buckle_kube::testing::FakeKube::new();
+    let ex = Executor::new(Arc::new(Issuing), Arc::new(KubeFake(fake.clone())));
+    let a = kube_assignment(
+        revision("r1", &grafana("11.3.1")),
+        ClusterIdentity::BuckleJwt,
+    );
+
+    let planned = ex.plan(&a, None).await.unwrap();
+    let resources: Vec<String> = planned.plan.modules[0]
+        .steps
+        .iter()
+        .map(|s| s.resource.to_string())
+        .collect();
+    assert_eq!(
+        resources,
+        vec![
+            "grafana/kubernetes.manifest[Namespace/monitoring]",
+            "grafana/kubernetes.secret[monitoring/Secret/grafana]",
+            "grafana/kubernetes.manifest[monitoring/ConfigMap/grafana]",
+            "grafana/kubernetes.manifest[monitoring/Deployment/grafana]",
+            "grafana/kubernetes.manifest[monitoring/Service/grafana]",
+        ]
+    );
+    let json = serde_json::to_string(&planned.plan).unwrap();
+    assert!(!json.contains(SECRET), "the secret leaked into the plan");
+
+    let outcome = apply(&ex, &a).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    let d = fake
+        .object("apps/v1", "Deployment", "monitoring", "grafana")
+        .unwrap();
+    assert_eq!(
+        d["spec"]["template"]["spec"]["containers"][0]["image"],
+        "grafana:11.3.1"
+    );
+    let cm = fake
+        .object("v1", "ConfigMap", "monitoring", "grafana")
+        .unwrap();
     assert!(
-        err.description().contains("Nomad clusters only"),
+        cm["data"]["grafana.ini"]
+            .as_str()
+            .unwrap()
+            .contains("http_port")
+    );
+    let auth = fake.authorizations();
+    assert!(
+        auth.iter()
+            .all(|t| t == &format!("Bearer jwt:{TARGET}:Deploy")),
+        "{auth:?}"
+    );
+
+    let again = ex.plan(&a, None).await.unwrap().plan;
+    assert_eq!(again.changes(), 0, "{again:#?}");
+    assert!(again.removals.is_empty(), "{:?}", again.removals);
+
+    let next = kube_assignment(
+        revision("r2", &grafana("11.4.0")),
+        ClusterIdentity::BuckleJwt,
+    );
+    let changed = ex.plan(&next, None).await.unwrap().plan;
+    assert_eq!(changed.changes(), 1, "only the Deployment's image changes");
+
+    let health = ex.health(&a, HealthScope::Bake, None, None).await.unwrap();
+    assert!(health.healthy(&[]), "{:?}", health.results);
+    assert!(
+        health
+            .results
+            .iter()
+            .any(|r| r.check.ends_with("Deployment/grafana pods"))
+    );
+    assert!(fake.authorizations().iter().any(|t| t.ends_with(":Read")));
+}
+
+#[tokio::test]
+async fn a_removed_kubernetes_workload_is_planned_as_a_removal() {
+    let fake = buckle_kube::testing::FakeKube::new();
+    let ex = Executor::new(Arc::new(Issuing), Arc::new(KubeFake(fake.clone())));
+    apply(
+        &ex,
+        &kube_assignment(revision("r1", &grafana("1")), ClusterIdentity::Local),
+    )
+    .await;
+
+    let empty = kube_assignment(revision("r2", &[]), ClusterIdentity::Local);
+    let plan = ex.plan(&empty, None).await.unwrap();
+    let summaries: Vec<&str> = plan
+        .plan
+        .removals
+        .iter()
+        .map(|r| r.summary.as_str())
+        .collect();
+    assert!(
+        summaries.contains(&"delete Deployment monitoring/grafana"),
+        "{summaries:?}"
+    );
+    let outcome = ex.apply(&plan, mpsc::channel(256).0).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    assert!(
+        fake.object("apps/v1", "Deployment", "monitoring", "grafana")
+            .is_none()
+    );
+    assert!(
+        fake.object("v1", "Secret", "monitoring", "grafana")
+            .is_some(),
+        "data stays"
+    );
+    assert!(
+        fake.authorizations().iter().all(String::is_empty),
+        "local uses the host's own credential"
+    );
+}
+
+#[tokio::test]
+async fn a_nomad_workload_on_a_kubernetes_cluster_is_indeterminate() {
+    let fake = buckle_kube::testing::FakeKube::new();
+    let ex = Executor::new(Arc::new(Issuing), Arc::new(KubeFake(fake)));
+    let plan = ex
+        .plan(
+            &kube_assignment(revision("r1", &paste()), ClusterIdentity::Local),
+            None,
+        )
+        .await
+        .unwrap()
+        .plan;
+    assert_eq!(plan.indeterminate.len(), 1);
+    assert!(
+        plan.indeterminate[0].reason.contains("Nomad resources"),
         "{}",
-        err.description()
+        plan.indeterminate[0].reason
     );
 }
 
