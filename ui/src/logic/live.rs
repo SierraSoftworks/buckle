@@ -130,7 +130,7 @@ pub fn apply_rollout(detail: &mut RolloutDetail, event: &LiveEvent) {
             }
         }
         LiveEvent::RolloutChanged { rollout } if rollout.id == detail.summary.id => {
-            detail.summary = rollout.clone();
+            detail.summary = keep_changes(&detail.summary, rollout);
         }
         LiveEvent::RolloutHostChanged { rollout_id, host } if *rollout_id == detail.summary.id => {
             let target = detail.phases.iter().position(|p| p.name == host.phase);
@@ -158,9 +158,18 @@ pub fn apply_rollout(detail: &mut RolloutDetail, event: &LiveEvent) {
 pub fn apply_rollouts(list: &mut Vec<RolloutSummary>, event: &LiveEvent) {
     if let LiveEvent::RolloutChanged { rollout } = event {
         match list.iter_mut().find(|r| r.id == rollout.id) {
-            Some(existing) => *existing = rollout.clone(),
+            Some(existing) => *existing = keep_changes(existing, rollout),
             None => list.insert(0, rollout.clone()),
         }
+    }
+}
+
+/// A rollout's update, keeping what it changes: live updates leave the
+/// tally out (it takes every host's plan to work out).
+fn keep_changes(old: &RolloutSummary, new: &RolloutSummary) -> RolloutSummary {
+    RolloutSummary {
+        changes: new.changes.or(old.changes),
+        ..new.clone()
     }
 }
 
@@ -368,6 +377,7 @@ mod tests {
             trace_id: None,
             trace_url: None,
             action: None,
+            changes: None,
         }
     }
 
@@ -620,6 +630,7 @@ mod tests {
             is_stable: false,
             rollout_id: None,
             module_count: 1,
+            workload_count: 0,
         };
         let mut revisions = vec![revision("rev")];
         apply_revisions(

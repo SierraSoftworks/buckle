@@ -208,6 +208,7 @@ impl Harness {
             module_count: 0,
             source: "path".into(),
             validated_by: None,
+            workload_count: None,
         };
         self.store
             .call(move |db| db.revisions().upsert(&rec))

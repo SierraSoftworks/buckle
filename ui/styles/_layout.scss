@@ -151,11 +151,6 @@
   gap: 1rem;
   margin-top: 1rem;
 
-  &--overview {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    margin-top: 0;
-  }
-
   &--host {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     margin: 0 0 1rem;
@@ -202,7 +197,6 @@
     padding: 1rem 1rem 3rem;
   }
 
-  .grid--overview,
   .grid--host {
     grid-template-columns: minmax(0, 1fr);
   }

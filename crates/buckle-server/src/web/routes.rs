@@ -1623,7 +1623,9 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
             .filter(|h| h.plan_digest.as_deref() == Some(g.digest.as_str()))
             .find_map(|h| crate::views::stored_plan_view(h.plan.as_ref()));
     }
-    detail.fleet = Some(fleet_plan(state, &r.revision, &hosts).await?);
+    let fleet = fleet_plan(state, &r.revision, &hosts).await?;
+    detail.summary.changes = plan_changes(&fleet);
+    detail.fleet = Some(fleet);
     fill_health_checks(state, &r.revision, &hosts, &mut detail).await?;
     Ok(detail)
 }
@@ -1636,8 +1638,17 @@ async fn fleet_plan(
     revision: &str,
     hosts: &[crate::store::RolloutHostRecord],
 ) -> Result<buckle_api::FleetPlan, ApiError> {
-    let ids: Vec<String> = hosts.iter().map(|h| h.host.clone()).collect();
-    let contexts = state
+    let contexts = host_contexts(state, hosts.iter().map(|h| h.host.clone())).await?;
+    Ok(union_plan(revision, hosts, &contexts))
+}
+
+/// Each host's `{id, labels, facts}`, as fact placeholders read them.
+async fn host_contexts(
+    state: &AppState,
+    ids: impl IntoIterator<Item = String>,
+) -> Result<HashMap<String, serde_json::Value>, ApiError> {
+    let ids: std::collections::BTreeSet<String> = ids.into_iter().collect();
+    Ok(state
         .store
         .call(move |db| {
             let mut out = HashMap::new();
@@ -1655,7 +1666,14 @@ async fn fleet_plan(
             }
             Ok(out)
         })
-        .await?;
+        .await?)
+}
+
+fn union_plan(
+    revision: &str,
+    hosts: &[crate::store::RolloutHostRecord],
+    contexts: &HashMap<String, serde_json::Value>,
+) -> buckle_api::FleetPlan {
     let input: Vec<buckle_api::FleetHost> = hosts
         .iter()
         .map(|h| buckle_api::FleetHost {
@@ -1665,7 +1683,12 @@ async fn fleet_plan(
             context: contexts.get(&h.host).cloned().unwrap_or_default(),
         })
         .collect();
-    Ok(buckle_api::FleetPlan::build(&input))
+    buckle_api::FleetPlan::build(&input)
+}
+
+/// What a rollout changes: `None` until a host has planned.
+fn plan_changes(f: &buckle_api::FleetPlan) -> Option<buckle_api::ChangeCounts> {
+    (!f.hosts.is_empty()).then(|| f.changes())
 }
 
 /// Fills each phase's health gate: the required checks of the modules its
@@ -1756,15 +1779,64 @@ async fn rollouts(state: Data, _: Authenticated, q: web::Query<PageQuery>) -> Ap
             let mut out = Vec::new();
             for r in db.rollouts().list(limit, offset)? {
                 let hosts = db.rollouts().hosts(&r.id)?;
-                out.push(view::summary(&r, &hosts));
+                out.push((view::summary(&r, &hosts), hosts));
             }
             Ok((out, db.rollouts().count()?))
         })
         .await?;
+    let items = with_changes(&state, items).await?;
     let items: Vec<_> = items.into_iter().map(|r| state.link_rollout(r)).collect();
     let next = ((offset as u64 + items.len() as u64) < total)
         .then(|| (offset + items.len() as u32).to_string());
     Ok(HttpResponse::Ok().json(Page { items, next, total }))
+}
+
+/// Fills in what each rollout changes. A finished rollout's tally is kept,
+/// since its plans no longer change; facts are read once for all of them.
+async fn with_changes(
+    state: &AppState,
+    items: Vec<(
+        buckle_api::RolloutSummary,
+        Vec<crate::store::RolloutHostRecord>,
+    )>,
+) -> Result<Vec<buckle_api::RolloutSummary>, ApiError> {
+    let known = |id: &str| {
+        state
+            .rollout_changes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .copied()
+    };
+    let wanted = items
+        .iter()
+        .filter(|(s, _)| known(&s.id).is_none())
+        .flat_map(|(_, hosts)| hosts.iter().map(|h| h.host.clone()));
+    let contexts = host_contexts(state, wanted).await?;
+    Ok(items
+        .into_iter()
+        .map(|(mut s, hosts)| {
+            s.changes = known(&s.id).or_else(|| {
+                let changes = plan_changes(&union_plan(&s.revision, &hosts, &contexts))?;
+                let ended = matches!(
+                    s.state,
+                    RolloutState::Completed
+                        | RolloutState::RolledBack
+                        | RolloutState::Aborted
+                        | RolloutState::Skipped
+                );
+                if ended {
+                    state
+                        .rollout_changes
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(s.id.clone(), changes);
+                }
+                Some(changes)
+            });
+            s
+        })
+        .collect())
 }
 
 async fn rollout(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {

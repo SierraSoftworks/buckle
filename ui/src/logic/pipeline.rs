@@ -480,6 +480,7 @@ mod tests {
                 trace_id: None,
                 trace_url: None,
                 action: None,
+                changes: None,
             },
             phases,
             plans,

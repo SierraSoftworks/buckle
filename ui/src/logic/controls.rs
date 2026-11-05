@@ -251,6 +251,7 @@ mod tests {
             is_stable: stable,
             rollout_id: None,
             module_count: 1,
+            workload_count: 0,
         }
     }
 

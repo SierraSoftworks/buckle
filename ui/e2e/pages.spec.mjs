@@ -5,32 +5,50 @@ import { describe, test } from "node:test";
 import { assert, decide, decisions, eventually, heading, offered, open } from "./helpers.mjs";
 
 describe("every page renders in demo mode", () => {
-  test("overview rolls the fleet up with reading ages", async () => {
+  test("overview shows the fleet in one bar and the latest rollout's card", async () => {
     const { page, close } = await open("/");
     assert.equal(await heading(page), "Overview");
-    const tiles = page.locator(".tile[data-state]");
-    await tiles.first().waitFor();
-    const labels = await page.locator(".tile .tile__label").allTextContents();
-    for (const want of ["Healthy", "Failing", "Held", "Offline", "Drifted"]) assert.ok(labels.includes(want), want);
-    assert.match(await page.locator('.tile[data-state="healthy"] .tile__age').textContent(), /old/);
-    // The latest rollout with its controls, the fleet on its stages (hosts
-    // outside it last), the attention list, recent revisions.
-    // The controls sit at the top right of the card they act on.
+    // Every host and workload by its state now, in one bar; drift on top.
+    const bar = page.getByTestId("fleet-bar");
+    await bar.waitFor();
+    const legend = await bar.locator(".fleet-bar__legend").textContent();
+    for (const want of [/\d+ healthy/, /\d+ failing/, /\d+ held/, /\d+ offline/, /\d+ drifted/]) assert.match(legend, want);
+    assert.match(await bar.textContent(), /\d+ hosts.*\d+ workloads/);
+    // The latest rollout: its name leads the subject, and the card carries
+    // its state, what it changes and its progress. Its controls sit at the
+    // top right of the card they act on.
     await page.locator(".overview__rollout .panel__actions").getByTestId("rollout-controls").getByRole("button", { name: "Pause" }).waitFor();
-    // What each module of the latest rollout changes, in the shared pill.
-    const nomad = page.locator('.overview__rollout .module-changes__item[data-module="nomad"]');
-    await nomad.waitFor();
-    assert.match(await nomad.getByTestId("tally").textContent(), /~\d+/);
+    const card = page.locator(".overview__rollout .commit");
+    assert.equal((await card.locator(".commit__rollout").textContent()).trim(), "#42");
+    assert.match(await card.locator(".commit__meta").textContent(), /\d+ modules.*\d+ workloads/);
+    const line = card.locator(".rollout-line");
+    assert.match(await line.textContent(), /rolling.*in home.*\d+\/\d+ done/);
+    assert.match(await line.getByTestId("tally").textContent(), /~\d+/);
     await page.locator('.overview__fleet .stage[data-stage="not in this rollout"] a.block').first().waitFor();
     const drawn = await page.locator(".overview__fleet a.block").count();
-    const total = Number(await page.locator(".tile--plain .tile__value").textContent());
-    // Cluster targets are drawn beside the hosts but are not counted in the total.
+    const hosts = Number((await bar.locator(".fleet-bar__total").first().textContent()).match(/\d+/)[0]);
+    const pending = Number((legend.match(/(\d+) awaiting approval/) ?? [0, 0])[1]);
+    // Cluster targets are drawn beside the hosts but are not counted with them.
     const clusters = await page.locator('.overview__fleet a.block').filter({ has: page.locator(".block__name", { hasText: /-nomad$/ }) }).count();
-    assert.equal(drawn - clusters, total, "every host in the fleet is on the map");
+    assert.equal(drawn - clusters, hosts + pending, "every host in the fleet is on the map");
     assert.ok(clusters >= 1, "clusters are on the map");
-    assert.match(await page.locator(".attention").textContent(), /awaiting registration approval/);
-    assert.match(await page.locator(".attention").textContent(), /expected 2\.0\.0-dev\.5/);
-    assert.equal(await page.locator(".grid--overview .gitlog__item").count(), 5);
+    assert.equal(await page.locator(".gitlog__item").count(), 5);
+    await close();
+  });
+
+  test("the bell lists what needs attention", async () => {
+    const { page, close } = await open("/rollouts");
+    const bell = page.getByTestId("attention-bell");
+    const button = bell.getByRole("button", { name: /agents? needs? attention/ });
+    assert.match(await button.textContent(), /\d+/);
+    assert.equal(await bell.locator(".attention").count(), 0, "the list is only in the page while open");
+    await button.click();
+    const list = bell.locator(".attention");
+    assert.match(await list.textContent(), /awaiting registration approval/);
+    assert.match(await list.textContent(), /expected 2\.0\.0-dev\.5/);
+    assert.match(await list.textContent(), /failed in home/);
+    await page.keyboard.press("Escape");
+    await eventually(async () => assert.equal(await list.count(), 0));
     await close();
   });
 
@@ -72,6 +90,8 @@ describe("every page renders in demo mode", () => {
     const text = await page.locator(".gitlog").textContent();
     for (const s of ["rolling", "completed", "rolled back", "aborted", "skipped"]) assert.ok(text.includes(s), s);
     assert.match(await items.first().locator(".rollout-line").textContent(), /\d+\/\d+ done/);
+    // The same card as the Overview's: the rollout's name leads the subject.
+    assert.equal((await items.first().locator(".commit__rollout").textContent()).trim(), "#42");
     // The message body is part of the card.
     assert.match(await items.first().textContent(), /support bundle/);
     // One control per card: [Running] for the rollout in progress, [Stable] for
@@ -283,7 +303,7 @@ describe("every page renders in demo mode", () => {
     await page.locator(".page-head .pill", { hasText: "detected" }).waitFor();
     await page.getByRole("link", { name: "Overview" }).first().click();
     const card = page.locator(".overview__rollout");
-    await card.locator(".panel__subtitle", { hasText: "Rollout #42" }).waitFor();
+    await eventually(async () => assert.equal((await card.locator(".commit__rollout").textContent()).trim(), "#42"));
     await close();
   });
 

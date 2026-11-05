@@ -647,6 +647,7 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
             trace_id: Some(TRACE.into()),
             trace_url: Some(trace_url(TRACE)),
             action: None,
+            changes: None,
         },
         phases,
         plans: plans(),
@@ -1514,6 +1515,7 @@ fn finished(
             trace_id: Some(fake_trace(id.parse().unwrap_or(0))),
             trace_url: Some(trace_url(&fake_trace(id.parse().unwrap_or(0)))),
             action: None,
+            changes: None,
         },
         phases,
         fleet: None,
@@ -1552,6 +1554,7 @@ fn skipped(id: &str, rev: &str, message: &str, by: &str, at: DateTime<Utc>) -> R
             trace_id: None,
             trace_url: None,
             action: None,
+            changes: None,
         },
         phases: vec![],
         fleet: None,
@@ -1632,6 +1635,7 @@ pub fn revisions(now: DateTime<Utc>) -> Vec<RevisionSummary> {
         is_stable: stable,
         rollout_id: rollout.map(Into::into),
         module_count: 10,
+        workload_count: 4,
     };
     let mut rejected = r(
         REJECTED_REV,

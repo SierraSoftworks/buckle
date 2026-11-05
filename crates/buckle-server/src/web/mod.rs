@@ -58,6 +58,10 @@ pub struct AppState {
     pub identity: Option<Arc<crate::identity::Issuer>>,
     /// Builds revisions, so a rejected one can be validated again.
     pub builder: Option<crate::source::RevisionBuilder>,
+    /// What each finished rollout changed, once worked out (the rollout
+    /// list would otherwise union every listed rollout's plans each time).
+    pub rollout_changes:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, buckle_api::ChangeCounts>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -105,6 +109,7 @@ impl AppState {
             trace_url_template: None,
             identity: None,
             builder: None,
+            rollout_changes: Default::default(),
         }
     }
 

@@ -897,6 +897,109 @@ textarea.input {
   }
 }
 
+// A person's round avatar: their initials, under their Gravatar once it loads.
+.avatar {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-right: 0.35rem;
+  border-radius: 50%;
+  background: var(--surface-3);
+  color: var(--fg-2);
+  font-size: 0.55rem;
+  font-weight: 700;
+  line-height: 1;
+  overflow: hidden;
+  // A card's link covers it: a click on the avatar is a click on the card.
+  pointer-events: none;
+
+  &__img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+}
+
+// The app bar's bell: what needs attention, in a dropdown.
+.bell {
+  position: relative;
+
+  &__button {
+    position: relative;
+  }
+
+  &__count {
+    position: absolute;
+    top: -2px;
+    right: -3px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: var(--tone);
+    color: var(--on-brand);
+    font-size: 0.65rem;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  &--open &__button {
+    background: var(--surface-2);
+    color: var(--fg);
+  }
+
+  &__panel {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 30;
+    width: min(28rem, calc(100vw - 2rem));
+    max-height: min(70vh, 32rem);
+    overflow: auto;
+    padding: 0.6rem 0.85rem 0.4rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  &__head {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    padding-bottom: 0.45rem;
+    border-bottom: 1px solid var(--line);
+  }
+
+  &__title {
+    font-weight: 650;
+  }
+
+  &__empty {
+    margin: 0.6rem 0;
+    font-size: 0.85rem;
+  }
+
+  // On a narrow screen the bell is far from the right edge: the list spans
+  // the screen under the app bar instead.
+  @media (max-width: $narrow) {
+    &__panel {
+      position: fixed;
+      top: calc(var(--bar-h) + 4px);
+      left: 0.5rem;
+      right: 0.5rem;
+      width: auto;
+    }
+  }
+}
+
 .user {
   display: flex;
   align-items: center;

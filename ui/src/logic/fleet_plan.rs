@@ -16,6 +16,17 @@ pub struct Tally {
     pub blocked: usize,
 }
 
+impl From<buckle_api::ChangeCounts> for Tally {
+    fn from(c: buckle_api::ChangeCounts) -> Self {
+        Tally {
+            create: c.create as usize,
+            modify: c.modify as usize,
+            remove: c.remove as usize,
+            blocked: c.blocked as usize,
+        }
+    }
+}
+
 impl Tally {
     pub fn is_empty(&self) -> bool {
         *self == Tally::default()
@@ -99,25 +110,15 @@ pub fn summarise(m: &FleetModule) -> ModuleSummary {
     }
 }
 
-/// What a rollout changes across its fleet: each module's tally and the
-/// removals that run, each resource counted once however many hosts it is on.
+/// What a rollout changes across its fleet: each resource counted once
+/// however many hosts it is on ([`FleetPlan::changes`]).
 pub fn fleet_tally(f: &FleetPlan) -> Tally {
-    f.modules.iter().map(|m| summarise(m).tally).fold(
-        Tally {
-            remove: f.removals.iter().filter(|r| r.value.cleanup).count(),
-            ..Tally::default()
-        },
-        Tally::sum,
-    )
+    f.changes().into()
 }
 
-/// How many of the `total` hosts under review a block changes:
-/// `all 12 hosts changed`, or `4 changed · 8 unchanged`.
-pub fn hosts_changed(total: usize, changed: usize) -> String {
-    targets_changed(total, changed, ("host", "hosts"))
-}
-
-/// [`hosts_changed`] for targets named `noun` (`("cluster", "clusters")`).
+/// How many of the `total` targets under review a block changes, for
+/// targets named `noun` (`("host", "hosts")`): `all 12 hosts changed`, or
+/// `4 changed · 8 unchanged`.
 pub fn targets_changed(total: usize, changed: usize, (one, many): (&str, &str)) -> String {
     match (total, changed) {
         (1, 1) => format!("1 {one} changed"),
@@ -360,10 +361,11 @@ mod tests {
     }
 
     #[test]
-    fn hosts_changed_reads_as_all_or_changed_against_unchanged() {
-        assert_eq!(hosts_changed(5, 5), "all 5 hosts changed");
-        assert_eq!(hosts_changed(5, 2), "2 changed · 3 unchanged");
-        assert_eq!(hosts_changed(1, 1), "1 host changed");
+    fn targets_changed_reads_as_all_or_changed_against_unchanged() {
+        let hosts = ("host", "hosts");
+        assert_eq!(targets_changed(5, 5, hosts), "all 5 hosts changed");
+        assert_eq!(targets_changed(5, 2, hosts), "2 changed · 3 unchanged");
+        assert_eq!(targets_changed(1, 1, hosts), "1 host changed");
     }
 
     #[test]

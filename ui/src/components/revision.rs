@@ -1,6 +1,7 @@
 //! The revision log shared by Rollouts and the Overview: each commit as a
-//! [`CommitCard`] with its rollout's progress under it and, at the right of
-//! the commit hash, the one control (or marker) that fits where it stands.
+//! [`CommitCard`] with its rollout's progress ([`RolloutProgress`]) inside
+//! it and, at the right of the commit hash, the one control (or marker)
+//! that fits where it stands.
 
 use buckle_api::{RevisionStatus, RevisionSummary, RolloutSummary};
 use chrono::{DateTime, Utc};
@@ -10,11 +11,15 @@ use crate::components::error_block::ErrorBlock;
 use crate::components::ui::Note;
 use yew_router::prelude::*;
 
+use super::changes::Took;
 use super::meter::rollout_segments;
-use super::{Button, Commit, CommitCard, Confirm, Kind, Meter, Pill, RouteLink, use_toast};
+use super::{
+    Button, Changes, Commit, CommitCard, Confirm, Kind, Meter, Pill, RouteLink, use_toast,
+};
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::logic::controls::{Stance, stance};
+use crate::logic::fleet_plan::Tally;
 use crate::logic::format::{
     commit, count, first_line, relative, rollout_label, rollout_note, short_duration, timestamp,
 };
@@ -249,8 +254,9 @@ pub struct RolloutProgressProps {
     pub now: DateTime<Utc>,
 }
 
-/// How a revision's rollout is going: its state, the phase it is in, how
-/// many hosts are done and how long it took.
+/// How a rollout is going, the same line on the Overview and Rollouts: its
+/// state, what it changes, the stage it is in and how many of its targets
+/// are done, then how long it took.
 #[function_component(RolloutProgress)]
 pub fn rollout_progress(props: &RolloutProgressProps) -> Html {
     let r = &props.rollout;
@@ -261,20 +267,31 @@ pub fn rollout_progress(props: &RolloutProgressProps) -> Html {
     let took = r
         .finished_at
         .map(|f| short_duration(f.signed_duration_since(r.started_at).num_seconds()));
+    let started = format!(
+        "Started by {} {} ({})",
+        r.triggered_by,
+        relative(r.started_at, props.now),
+        timestamp(r.started_at)
+    );
+    let title = match rollout_note(r) {
+        Some(note) => format!("{note}\n{started}"),
+        None => started,
+    };
     html! {
         <div class="rollout-line" data-rollout={r.id.clone()}>
-            <Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} title={rollout_note(r)} />
-            <span class="rollout-line__name muted" title={format!("Rollout {}", rollout_label(&r.id))}>{ rollout_label(&r.id) }</span>
+            <Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} {title} />
+            if let Some(c) = r.changes { <Changes tally={Tally::from(c)} /> }
             if let Some(p) = phase { <span class="muted">{ format!("in {p}") }</span> }
             if r.hosts_total > 0 {
-                <Meter segments={rollout_segments(r)} total={r.hosts_total as usize} class="rollout-line__meter" />
-                <span class="muted">
-                    { format!("{}/{} done", r.hosts_done, r.hosts_total) }
-                    if r.hosts_failed > 0 { <span class="text-danger">{ format!(" · {} failed", r.hosts_failed) }</span> }
+                <span class="rollout-line__progress">
+                    <Meter segments={rollout_segments(r)} total={r.hosts_total as usize} class="rollout-line__meter" />
+                    <span class="muted">
+                        { format!("{}/{} done", r.hosts_done, r.hosts_total) }
+                        if r.hosts_failed > 0 { <span class="text-danger">{ format!(" · {} failed", r.hosts_failed) }</span> }
+                    </span>
                 </span>
             }
-            <span class="muted" title={timestamp(r.started_at)}>{ format!("{} · started {}", r.triggered_by, relative(r.started_at, props.now)) }</span>
-            if let Some(t) = took { <span class="muted">{ format!("took {t}") }</span> }
+            if let Some(t) = took { <Took label={t} /> }
             if let Some(by) = &r.superseded_by {
                 <span class="muted">{ "superseded by " }<RouteLink to={Route::rollout(by)}>{ rollout_label(by) }</RouteLink></span>
             }
@@ -310,7 +327,7 @@ pub fn revision_log(props: &RevisionLogProps) -> Html {
                 html! {
                     <li class={classes!("gitlog__item", rejected.then_some("gitlog__item--rejected"), r.is_stable.then_some("gitlog__item--stable"))} data-revision={r.id.clone()}>
                         <span class="gitlog__dot" aria-hidden="true" />
-                        <CommitCard commit={Commit::from(r)} rollout={rollout.cloned()} say_rollout=false body=true now={props.now}
+                        <CommitCard commit={Commit::from(r)} rollout={rollout.cloned()} body=true now={props.now}
                             actions={html! { <RevisionControls revision={r.clone()} rollout={rollout.cloned()} {stable_at} open={props.open.clone()} /> }}>
                             if rejected {
                                 <div class="errors" aria-label="Validation errors">

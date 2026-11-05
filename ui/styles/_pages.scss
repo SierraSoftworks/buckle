@@ -1,75 +1,78 @@
 // Page-specific arrangements.
 @use 'tokens' as *;
 
-// Overview
-.tiles {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 0.75rem;
+// Overview: every host and workload by its state now, in one bar.
+.fleet-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.8rem 0.9rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+
+  &__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.3rem 1rem;
+  }
+
+  &__total {
+    color: var(--fg);
+    font-size: 1.05rem;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    text-decoration: none;
+
+    &:hover {
+      color: var(--brand);
+    }
+  }
+
+  &__legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.2rem 0.9rem;
+    margin-left: auto;
+    font-size: 0.8rem;
+  }
+
+  &__part {
+    color: var(--fg-2);
+    text-decoration: none;
+    font-variant-numeric: tabular-nums;
+
+    &::before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      margin-right: 0.35rem;
+      border-radius: 2px;
+      background: var(--tone, var(--neutral));
+      vertical-align: 0;
+    }
+
+    &:hover {
+      color: var(--fg);
+    }
+
+    // Drift is counted on top of the states, not as a part of the bar.
+    &--aside::before {
+      background: transparent;
+      box-shadow: inset 0 0 0 1.5px var(--tone);
+    }
+  }
+
+  &__meter {
+    height: 10px;
+    border-radius: 5px;
+  }
 }
 
 .overview__rollout {
   margin-top: 1rem;
-}
-
-.tile {
-  display: flex;
-  flex-direction: column;
-  gap: 0.15rem;
-  padding: 0.8rem 0.9rem;
-  border: 1px solid var(--line);
-  border-top: 3px solid var(--tone, var(--line-strong));
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  color: var(--fg);
-  text-decoration: none;
-
-  &:hover {
-    border-color: var(--line-strong);
-    border-top-color: var(--tone, var(--line-strong));
-    color: var(--fg);
-  }
-
-  &__label {
-    color: var(--fg-2);
-    font-size: 0.78rem;
-    font-weight: 600;
-  }
-
-  &__value {
-    font-size: 1.7rem;
-    font-weight: 650;
-    font-variant-numeric: tabular-nums;
-    line-height: 1.2;
-  }
-
-  &__age {
-    color: var(--fg-3);
-    font-size: 0.75rem;
-  }
-
-  &--plain {
-    border-top-color: var(--line-strong);
-  }
-
-  &--fleet .meter {
-    margin: 0.3rem 0 0.15rem;
-  }
-
-  // Not a health bucket of its own: drawn apart from the ones that add up.
-  &--aside {
-    border-style: dashed;
-    border-top-style: solid;
-    background: transparent;
-  }
-
-  &--zero {
-    border-top-color: var(--line-strong);
-
-    .tile__value {
-      color: var(--fg-3);
-    }
-  }
 }
 
 .attention {
@@ -264,13 +267,22 @@
   &__meta {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 0.2rem 0.75rem;
     margin-top: 0.15rem;
     font-size: 0.8rem;
   }
 
+  &__author {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  // The rollout's name, leading the subject in the rollout's colour.
   &__rollout {
+    margin-right: 0.45rem;
     color: var(--tone);
+    font-weight: 650;
   }
 
   &__body {
@@ -300,10 +312,6 @@
     position: relative;
     z-index: 1;
   }
-}
-
-.overview__rollout .commit + .rollout-head {
-  margin-top: 0.75rem;
 }
 
 .page-head__subtitle .commit {
@@ -738,25 +746,6 @@
   }
 }
 
-// The latest rollout's changes on the Overview, one module a line.
-.module-changes {
-  display: grid;
-  grid-template-columns: minmax(0, max-content) auto 1fr;
-  align-items: center;
-  gap: 0.3rem 0.8rem;
-  margin: 0.6rem 0 0.2rem;
-  list-style: none;
-  font-size: 0.84rem;
-
-  &__item {
-    display: contents;
-  }
-
-  &__name {
-    overflow-wrap: anywhere;
-  }
-}
-
 // A revision's rollout controls. A button is raised and solid; a marker
 // ([Stable], [Running], [Corrupt]) is flat, a tinted label with a dot, the
 // same size as the button so a card's right edge does not jump.
@@ -802,6 +791,12 @@
   gap: 0.25rem 0.75rem;
   margin-top: 0.4rem;
   font-size: 0.8rem;
+
+  &__progress {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
 
   &__meter {
     width: 7rem;

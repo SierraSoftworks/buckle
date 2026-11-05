@@ -1,6 +1,8 @@
 //! The shared, presentational components.
 
 pub mod actions;
+pub mod attention;
+pub mod avatar;
 pub mod blueprint;
 pub mod changes;
 pub mod commit;

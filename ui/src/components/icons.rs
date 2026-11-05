@@ -145,6 +145,13 @@ pub fn heart() -> Html {
     icon(html! { <path d="M3 12h4l2-5 4 10 2-5h6" /> })
 }
 
+pub fn bell() -> Html {
+    icon(html! { <>
+        <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+        <path d="M13.7 21a2 2 0 0 1-3.4 0" />
+    </> })
+}
+
 pub fn alert() -> Html {
     icon(html! { <>
         <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />

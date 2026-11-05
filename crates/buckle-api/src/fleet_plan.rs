@@ -142,6 +142,54 @@ pub struct FactSample {
     pub value: String,
 }
 
+/// What a rollout changes across its fleet, each resource counted once
+/// however many hosts it is on: `+create ~modify -remove` and blocked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeCounts {
+    pub create: u32,
+    pub modify: u32,
+    pub remove: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub blocked: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl ChangeCounts {
+    /// One host's version of a step; a step already in place counts for nothing.
+    fn of_step(s: &StepView) -> Self {
+        let mut c = ChangeCounts::default();
+        match (s.outcome, s.diff) {
+            (crate::StepOutcome::NoOp, _) => {}
+            (crate::StepOutcome::Blocked, _) => c.blocked = 1,
+            (_, Some(crate::DiffKind::Create)) => c.create = 1,
+            (_, Some(crate::DiffKind::Delete)) => c.remove = 1,
+            _ => c.modify = 1,
+        }
+        c
+    }
+
+    fn max(self, o: Self) -> Self {
+        ChangeCounts {
+            create: self.create.max(o.create),
+            modify: self.modify.max(o.modify),
+            remove: self.remove.max(o.remove),
+            blocked: self.blocked.max(o.blocked),
+        }
+    }
+
+    fn sum(self, o: Self) -> Self {
+        ChangeCounts {
+            create: self.create + o.create,
+            modify: self.modify + o.modify,
+            remove: self.remove + o.remove,
+            blocked: self.blocked + o.blocked,
+        }
+    }
+}
+
 impl FleetPlan {
     /// Unions `hosts`' plans (in the given order), tokenising the facts
     /// that vary between them.
@@ -195,6 +243,26 @@ impl FleetPlan {
             .map(|path| samples(&path, hosts, &leaves))
             .collect();
         out
+    }
+
+    /// What the plan changes: each step once for each kind of change its
+    /// variants make (created on some hosts and modified on others is
+    /// both), plus the removals whose cleanup runs.
+    pub fn changes(&self) -> ChangeCounts {
+        let removals = ChangeCounts {
+            remove: self.removals.iter().filter(|r| r.value.cleanup).count() as u32,
+            ..Default::default()
+        };
+        self.modules
+            .iter()
+            .flat_map(|m| &m.steps)
+            .map(|s| {
+                s.variants
+                    .iter()
+                    .map(|v| ChangeCounts::of_step(&v.value))
+                    .fold(ChangeCounts::default(), ChangeCounts::max)
+            })
+            .fold(removals, ChangeCounts::sum)
     }
 
     fn add(&mut self, host: &str, plan: &PlanView) {
@@ -743,6 +811,40 @@ mod tests {
         assert_eq!(step.unchanged, ["rpi5"]);
         assert!(!plan.is_fleet_wide(&step.changed_hosts().cloned().collect::<Vec<_>>()));
         assert_eq!(plan.modules[0].hosts.len(), 3);
+    }
+
+    #[test]
+    fn changes_count_each_resource_once_by_the_kinds_its_variants_make() {
+        let create = |key: &str| StepView {
+            diff: Some(DiffKind::Create),
+            ..change("new", key, "+x\n")
+        };
+        let plan = FleetPlan::build(&[
+            host(
+                "seer",
+                "10.0.0.1",
+                vec![change("hcl", "/etc/a", "+x = 1\n"), create("/etc/n")],
+            ),
+            host(
+                "prophet",
+                "10.0.0.2",
+                vec![change("hcl", "/etc/a", "+x = 2\n"), create("/etc/n")],
+            ),
+            host(
+                "rpi5",
+                "10.0.0.3",
+                vec![noop("hcl", "/etc/a"), noop("b", "/etc/b")],
+            ),
+        ]);
+        assert_eq!(
+            plan.changes(),
+            ChangeCounts {
+                create: 1,
+                modify: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(FleetPlan::default().changes(), ChangeCounts::default());
     }
 
     #[test]
