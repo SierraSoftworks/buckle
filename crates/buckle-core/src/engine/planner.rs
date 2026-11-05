@@ -641,7 +641,11 @@ impl<'a> Planner<'a> {
             // `when` that reads `task.id` of a task without an explicit `id`
             // is decided after rendering, once the id (its key) is known.
             let provisional = decl.id.clone().unwrap_or_default();
-            let render_ctx = ctx.in_task(&decl.kind, &provisional, &decl.tags);
+            // One trace per task: its fields here, its content when planned.
+            let emitted = Arc::new(crate::template::Emitted::default());
+            let render_ctx = ctx
+                .in_task(&decl.kind, &provisional, &decl.tags)
+                .with_emitted(emitted.clone());
             let decide = |task_ctx: &HostContext| -> Option<Result<bool, String>> {
                 let when = decl.when.as_ref()?;
                 Some(
@@ -679,7 +683,9 @@ impl<'a> Planner<'a> {
                 )
             })?;
             let key = crate::task::resource_key(name, task, &spec, decl.id.as_deref());
-            let task_ctx = ctx.in_task(&decl.kind, &key.key, &decl.tags);
+            let task_ctx = ctx
+                .in_task(&decl.kind, &key.key, &decl.tags)
+                .with_emitted(emitted);
             // A `when` that cannot be decided keeps the resource (it stays in
             // the desired set) without planning it.
             let mut undecided = false;
@@ -781,6 +787,7 @@ impl<'a> Planner<'a> {
                 notifies: pt.decl.notify.clone(),
                 always_runs: pt.task.always_runs(&pt.spec),
                 removal: removal_policy(pt.decl.removal, prepared.removal, pt.task),
+                facts: pt.cx.host.emitted_paths(),
             });
             rich.push(RichStep {
                 task: pt.task,

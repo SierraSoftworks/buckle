@@ -794,6 +794,34 @@ fn revision_with_vars(
     })
 }
 
+#[tokio::test]
+async fn steps_list_the_host_values_their_templates_emitted() {
+    // `bookworm` is literal text that equals a fact; only the expressions'
+    // values (in a field and in the content) are the host's.
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module_with_files(
+            "name: m\ntasks:\n  - test.render: { src: conf.j2, dest: '/out/{{ host.facts.arch }}' }\n",
+            &[(
+                "conf.j2",
+                "codename=bookworm\nfamily={{ host.facts.os.family }}\n",
+            )],
+        )],
+    );
+    let sys = FakeSystem::new();
+    let plan = plan(&inputs(rev, &sys)).await;
+    assert_eq!(
+        step(&plan, "m", "/out/aarch64").facts.as_deref(),
+        Some(
+            &[
+                "host.facts.arch".to_owned(),
+                "host.facts.os.family".to_owned()
+            ][..]
+        )
+    );
+}
+
 fn facts(tree: serde_json::Value) -> Facts {
     Facts {
         tree,

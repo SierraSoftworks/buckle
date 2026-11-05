@@ -4,7 +4,11 @@
 //! * Facts as placeholders: before hosts' plans are compared, host-specific
 //!   values (`host.id`, `host.labels.*`, `host.facts.*`) that differ across
 //!   the fleet are replaced by `«fact:PATH»` tokens, so a change that only
-//!   differs by a host's name or address reads as one change.
+//!   differs by a host's name or address reads as one change. Only values a
+//!   step's templates emitted through `{{ … }}` expressions are candidates
+//!   ([`StepView::facts`]), so literal text that happens to equal a fact
+//!   (`[global]`, `/backup`) stays text; plans from agents that do not trace
+//!   their renders fall back to every varying value.
 //! * Variants: a step whose tokenised plan still differs between hosts keeps
 //!   one variant per distinct plan, each with its hosts.
 //! * Exemplars: every fact path used in a token comes with a sample of its
@@ -541,7 +545,8 @@ fn exemplars<'a>(path: &str, all: impl Iterator<Item = (&'a str, &'a str)>) -> F
 /// Replaces one host's fact values with tokens.
 struct Tokeniser {
     /// `(value, path)`, longest value first; among equal values, the
-    /// shortest path (`host.id` over `host.facts.os.hostname`).
+    /// shortest path first (`host.id` over `host.facts.os.hostname`), so the
+    /// first one a step allows is the one its text is given.
     facts: Vec<(String, String)>,
     used: std::cell::RefCell<BTreeSet<String>>,
 }
@@ -556,7 +561,6 @@ impl Tokeniser {
                 .then(a.1.len().cmp(&b.1.len()))
                 .then(a.1.cmp(&b.1))
         });
-        facts.dedup_by(|a, b| a.0 == b.0);
         Self {
             facts,
             used: Default::default(),
@@ -566,7 +570,18 @@ impl Tokeniser {
     /// `text` with every fact value that stands as a word of its own (not
     /// inside a longer word or an existing `«…»` token) replaced.
     fn text(&self, text: &str) -> String {
-        if self.facts.is_empty() {
+        self.text_of(text, None)
+    }
+
+    /// [`Tokeniser::text`] replacing only the facts at `paths` (those a
+    /// step's templates emitted), or any fact when `None`.
+    fn text_of(&self, text: &str, paths: Option<&[String]>) -> String {
+        let facts: Vec<&(String, String)> = self
+            .facts
+            .iter()
+            .filter(|(_, p)| paths.is_none_or(|ps| ps.contains(p)))
+            .collect();
+        if facts.is_empty() {
             return text.to_owned();
         }
         let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
@@ -585,7 +600,7 @@ impl Tokeniser {
                 continue;
             }
             if !word(prev) {
-                for (value, path) in &self.facts {
+                for (value, path) in &facts {
                     if rest.starts_with(value.as_str()) && !word(rest[value.len()..].chars().next())
                     {
                         out.push_str(FACT_TOKEN_PREFIX);
@@ -606,10 +621,6 @@ impl Tokeniser {
         out
     }
 
-    fn opt(&self, text: &Option<String>) -> Option<String> {
-        text.as_deref().map(|t| self.text(t))
-    }
-
     fn plan(&self, plan: &PlanView) -> PlanView {
         let note = |n: &ModuleNote| ModuleNote {
             reason: self.text(&n.reason),
@@ -618,12 +629,16 @@ impl Tokeniser {
         let mut p = plan.clone();
         for m in &mut p.modules {
             for s in &mut m.steps {
+                // Which values a host's templates emitted is not part of
+                // the change: hosts sharing a change share a variant.
+                let paths = s.facts.take();
+                let t = |text: &str| self.text_of(text, paths.as_deref());
                 *s = StepView {
-                    key: self.text(&s.key),
-                    name: self.opt(&s.name),
-                    summary: self.text(&s.summary),
-                    unified: self.opt(&s.unified),
-                    preview: self.opt(&s.preview),
+                    key: t(&s.key),
+                    name: s.name.as_deref().map(t),
+                    summary: t(&s.summary),
+                    unified: s.unified.as_deref().map(t),
+                    preview: s.preview.as_deref().map(t),
                     ..s.clone()
                 };
             }
@@ -895,6 +910,44 @@ mod tests {
             ("host.facts.fqdn".to_owned(), "seer.lan".to_owned()),
         ];
         assert_eq!(Tokeniser::new(leaves.iter()).text(text), expected);
+    }
+
+    /// A rustic config whose literal `[global]` and `/backup` equal facts
+    /// of one host only; `host` is the one value a template put there.
+    fn rustic(name: &str, scope: &str, mount: &str, facts: Option<Vec<String>>) -> FleetHost {
+        let text = format!("+[global]\n+repository = \"/backup\"\n+host = \"{name}\"\n");
+        let mut h = host(
+            name,
+            "10.0.0.1",
+            vec![StepView {
+                facts,
+                ..change("rustic", "/etc/rustic/rustic.toml", &text)
+            }],
+        );
+        h.context["facts"] = json!({"scope": scope, "disks": [{"mount": mount}]});
+        h
+    }
+
+    #[rstest]
+    #[case::traced(Some(vec!["host.id".to_owned()]), 1)]
+    #[case::untraced_agent(None, 2)]
+    fn only_values_a_template_emitted_become_tokens(
+        #[case] facts: Option<Vec<String>>,
+        #[case] variants: usize,
+    ) {
+        let plan = FleetPlan::build(&[
+            rustic("seer", "global", "/backup", facts.clone()),
+            rustic("prophet", "link", "/boot/efi", facts),
+        ]);
+        let step = &plan.modules[0].steps[0];
+        assert_eq!(step.variants.len(), variants, "{step:#?}");
+        if variants == 1 {
+            let unified = step.variants[0].value.unified.as_deref().unwrap();
+            assert!(unified.contains("[global]"), "{unified}");
+            assert!(unified.contains("\"/backup\""), "{unified}");
+            assert!(unified.contains("\u{ab}fact:host.id\u{bb}"), "{unified}");
+            assert_eq!(step.variants[0].value.facts, None);
+        }
     }
 
     #[test]

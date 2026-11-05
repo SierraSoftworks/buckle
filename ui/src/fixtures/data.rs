@@ -971,6 +971,7 @@ fn step(module: &str, kind: &str, key: &str, diff: Option<(DiffKind, &str)>) -> 
             vec![]
         },
         always_runs: false,
+        facts: None,
     }
 }
 

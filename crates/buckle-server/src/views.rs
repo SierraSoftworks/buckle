@@ -225,6 +225,7 @@ pub fn plan_view(plan: &Plan) -> PlanView {
                         locks: s.locks.clone(),
                         notifies: s.notifies.clone(),
                         always_runs: s.always_runs,
+                        facts: s.facts.clone(),
                         ..Default::default()
                     };
                     match &s.planned {
@@ -468,6 +469,7 @@ pub(crate) mod tests {
             notifies: vec![],
             always_runs: false,
             removal: RemovalPolicy::Cleanup,
+            facts: None,
         }
     }
 

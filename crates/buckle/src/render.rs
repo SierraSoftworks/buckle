@@ -703,6 +703,7 @@ mod tests {
             notifies: vec!["restart".into()],
             always_runs: false,
             removal: RemovalPolicy::Cleanup,
+            facts: None,
         }
     }
 

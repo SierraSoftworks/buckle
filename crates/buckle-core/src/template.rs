@@ -50,6 +50,21 @@ impl Templater {
                 .expect("default syntax with trailing newlines kept is valid"),
         );
         register_filters(&mut env);
+        env.set_formatter(|out, state, value| {
+            EMITTED.with(|e| {
+                if let Some(emitted) = e.borrow_mut().as_mut() {
+                    // A value that refuses to display (a secret in a plain
+                    // field) fails in the formatter below, not here.
+                    let mut text = String::new();
+                    if fmt::Write::write_fmt(&mut text, format_args!("{value}")).is_ok()
+                        && text.len() >= MIN_EMITTED_LEN
+                    {
+                        emitted.push(text);
+                    }
+                }
+            });
+            minijinja::escape_formatter(out, state, value)
+        });
         Self { env }
     }
 
@@ -134,6 +149,10 @@ impl Templater {
         view: SecretsView,
     ) -> crate::Result<String> {
         let mode = view.mode;
+        // Expression output is traced for display only; a render that
+        // reveals secrets is never traced.
+        let trace = ctx.emitted.as_ref().filter(|_| mode != RenderMode::Real);
+        let scope = trace.map(|_| EmitScope::open());
         let touched = view.touched.clone();
         let missing = view.missing.clone();
         // The JSON context (host, vars, module, task) plus the secrets object.
@@ -145,9 +164,13 @@ impl Templater {
             _ => Default::default(),
         };
         map.insert("secrets".into(), Value::from_object(view));
-        self.env
-            .render_str(source, Value::from(minijinja::value::Serde(map)))
-            .map_err(|e| {
+        let rendered = self
+            .env
+            .render_str(source, Value::from(minijinja::value::Serde(map)));
+        if let (Some(trace), Some(scope)) = (trace, scope) {
+            trace.extend(scope.close());
+        }
+        rendered.map_err(|e| {
                 // minijinja's error Debug dumps the referenced variables, which
                 // would include secret values: scrub through the secrets module.
                 let err = crate::secrets::redact::template_error(e, &ctx.secrets);
@@ -187,6 +210,75 @@ impl Templater {
                     err
                 }
             })
+    }
+}
+
+/// What templates rendered with a traced context ([`HostContext::traced`])
+/// emitted through `{{ … }}` expressions, as opposed to their literal text.
+/// It tells which host values a plan's text actually came from, so the
+/// fleet view only shows a fact placeholder where a template put the fact.
+#[derive(Debug, Default)]
+pub struct Emitted(std::sync::Mutex<Vec<String>>);
+
+impl Emitted {
+    fn extend(&self, texts: Vec<String>) {
+        if let Ok(mut e) = self.0.lock() {
+            e.extend(texts);
+        }
+    }
+
+    /// The paths (`host.facts.net.fqdn`) of `ctx`'s host values that some
+    /// emitted text contains, in path order.
+    pub fn paths(&self, ctx: &HostContext) -> Vec<String> {
+        let Ok(emitted) = self.0.lock() else {
+            return Vec::new();
+        };
+        if emitted.is_empty() {
+            return Vec::new();
+        }
+        let mut paths: Vec<String> = ctx
+            .host_leaves()
+            .into_iter()
+            .filter(|(_, v)| v.len() >= MIN_EMITTED_LEN && emitted.iter().any(|e| e.contains(v)))
+            .map(|(p, _)| p)
+            .collect();
+        paths.sort();
+        paths
+    }
+}
+
+/// Emitted text shorter than this cannot hold a value worth a placeholder.
+const MIN_EMITTED_LEN: usize = 3;
+
+thread_local! {
+    /// The expression output of the traced render running on this thread.
+    static EMITTED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Traces expression output for one render, restoring the enclosing
+/// render's trace (if any) when closed or dropped.
+struct EmitScope {
+    outer: Option<Option<Vec<String>>>,
+}
+
+impl EmitScope {
+    fn open() -> Self {
+        Self {
+            outer: Some(EMITTED.with(|e| e.replace(Some(Vec::new())))),
+        }
+    }
+
+    fn close(mut self) -> Vec<String> {
+        let outer = self.outer.take().flatten();
+        EMITTED.with(|e| e.replace(outer)).unwrap_or_default()
+    }
+}
+
+impl Drop for EmitScope {
+    fn drop(&mut self) {
+        if let Some(outer) = self.outer.take() {
+            EMITTED.with(|e| e.replace(outer));
+        }
     }
 }
 
@@ -522,5 +614,63 @@ mod tests {
             .render_plain("{% include 'nomad/partial.j2' %}!", &ctx())
             .unwrap();
         assert_eq!(out, "part=nomad!");
+    }
+
+    /// A host whose facts hold values that also appear as literal text in
+    /// a rustic-style config (`global`, `/backup`).
+    fn traced() -> (HostContext, Arc<Emitted>) {
+        let emitted = Arc::new(Emitted::default());
+        let ctx = HostContext::new(HostIdentity {
+            id: "seer".into(),
+            ..Default::default()
+        })
+        .with_facts(serde_json::json!({
+            "net": {"fqdn": "seer.lan", "interfaces": [{"scope": "global"}]},
+            "disks": [{"mount": "/backup"}],
+        }))
+        .with_emitted(emitted.clone());
+        (ctx, emitted)
+    }
+
+    #[rstest]
+    #[case::literal_text_is_not_traced("[global]\nrepo = \"/backup\"\n", &[])]
+    #[case::expressions_are(
+        "[global]\nrepo = \"/backup\"\nhost = \"{{ host.facts.net.fqdn }}\"\n",
+        // `seer.lan` holds the host's id too.
+        &["host.facts.net.fqdn", "host.id"]
+    )]
+    #[case::through_variables(
+        "{% set d = host.id ~ '-data' %}path = {{ d }}",
+        &["host.id"]
+    )]
+    #[case::through_includes("{% include 'part.j2' %}", &["host.facts.disks[0].mount"])]
+    fn traced_renders_record_the_host_values_expressions_emit(
+        #[case] source: &str,
+        #[case] expected: &[&str],
+    ) {
+        let mut t = Templater::new();
+        t.add_template("part.j2", "mount {{ host.facts.disks[0].mount }}")
+            .unwrap();
+        let (ctx, _) = traced();
+        t.render_plain(source, &ctx).unwrap();
+        assert_eq!(ctx.emitted_paths().unwrap(), expected);
+    }
+
+    #[test]
+    fn renders_that_reveal_secrets_or_are_untraced_record_nothing() {
+        let t = Templater::new();
+        let (ctx, emitted) = traced();
+        t.render_sensitive("{{ host.facts.net.fqdn }}", &ctx)
+            .unwrap();
+        assert!(emitted.paths(&ctx).is_empty());
+
+        let untraced = HostContext {
+            emitted: None,
+            ..ctx
+        };
+        t.render_plain("{{ host.facts.net.fqdn }}", &untraced)
+            .unwrap();
+        assert_eq!(untraced.emitted_paths(), None);
+        assert!(emitted.paths(&untraced).is_empty());
     }
 }
