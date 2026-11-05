@@ -312,11 +312,10 @@
 }
 
 .errors {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
   margin: 0.4rem 0 0;
-  padding: 0.45rem 0.6rem 0.45rem 1.4rem;
-  border-left: 3px solid var(--danger);
-  border-radius: var(--radius-sm);
-  background: var(--danger-soft);
   font-size: 0.8rem;
 }
 
