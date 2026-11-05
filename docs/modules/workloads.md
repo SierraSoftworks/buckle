@@ -54,7 +54,7 @@ removal: stop
 
 | Key | Meaning |
 |---|---|
-| `when` | Selects the clusters the workload runs on, over [`cluster.*`](./expressions.md#cluster-selectors). Absent: every cluster. |
+| `when` | Selects the clusters the workload runs on, over [`cluster.*`](./expressions.md#cluster-selectors). Absent: every cluster. `buckle validate` rejects a `when` that selects a declared cluster of the other scheduler (a job on a Kubernetes cluster). |
 | `needs` | Order within the layer (a bare name is another workload) and across it (`module:NAME` waits for a module on the cluster's hosts; a module's `needs: ['workload:NAME']` waits for a workload). Cycles are rejected. A cluster's workloads apply concurrently unless one needs another, or an earlier workload creates the namespace or node pool it uses. |
 | `vars` | Defaults, overridden by the fleet's `vars` overlays; on Nomad, those a job declares a `variable` for become its HCL2 variables (fleet overlays reach every target, and Nomad refuses undeclared ones). |
 | `files` | Files passed to every job as string variables, by variable name (`files: { app_config: config.yaml }`, read as `var.app_config`); see [config files](#config-files). |
