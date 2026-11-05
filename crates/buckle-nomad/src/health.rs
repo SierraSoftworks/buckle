@@ -72,12 +72,15 @@ pub async fn job(nomad: &Nomad, ns: &str, id: &str) -> Result<Vec<Check>> {
 /// The `job` check over already-fetched state.
 pub fn job_status(job: &Value, allocs: &[Value], deployment: &Value) -> HealthStatus {
     let version = job["Version"].as_u64().unwrap_or(0);
-    let current: Vec<&Value> = allocs
+    let ty = job["Type"].as_str().unwrap_or("service");
+    let mut current: Vec<&Value> = allocs
         .iter()
         .filter(|a| a["JobVersion"].as_u64() == Some(version))
         .filter(|a| a["DesiredStatus"].as_str() == Some("run"))
         .collect();
-    let ty = job["Type"].as_str().unwrap_or("service");
+    if ty == "system" {
+        current = latest_per_node(current);
+    }
     let failed: Vec<&str> = current
         .iter()
         .filter(|a| a["ClientStatus"].as_str() == Some("failed"))
@@ -145,6 +148,32 @@ pub fn job_status(job: &Value, allocs: &[Value], deployment: &Value) -> HealthSt
     } else {
         HealthStatus::fail(problems.join("; "))
     }
+}
+
+/// A system job's allocation on a node is replaced in place: a failed one
+/// keeps `DesiredStatus: run` beside its running successor, so only the
+/// newest allocation of each group on each node speaks for that node.
+fn latest_per_node(allocs: Vec<&Value>) -> Vec<&Value> {
+    let mut latest: BTreeMap<(&str, &str), &Value> = BTreeMap::new();
+    let mut unplaced = Vec::new();
+    for a in allocs {
+        let (Some(group), Some(node)) = (a["TaskGroup"].as_str(), a["NodeID"].as_str()) else {
+            unplaced.push(a);
+            continue;
+        };
+        let newer = |old: &Value| {
+            a["CreateIndex"].as_u64().unwrap_or(0) > old["CreateIndex"].as_u64().unwrap_or(0)
+        };
+        latest
+            .entry((group, node))
+            .and_modify(|old| {
+                if newer(old) {
+                    *old = a;
+                }
+            })
+            .or_insert(a);
+    }
+    latest.into_values().chain(unplaced).collect()
 }
 
 /// The allocations whose service checks speak for the job: running and
@@ -221,6 +250,14 @@ mod tests {
         json!({"TaskGroup": group, "JobVersion": version, "DesiredStatus": "run", "ClientStatus": status})
     }
 
+    fn node_alloc(node: &str, create_index: u64, status: &str) -> Value {
+        json!({"TaskGroup": "agent", "JobVersion": 0, "DesiredStatus": "run", "ClientStatus": status, "NodeID": node, "CreateIndex": create_index})
+    }
+
+    fn system_job() -> Value {
+        json!({"Type": "system", "Version": 0, "TaskGroups": [{"Name": "agent"}]})
+    }
+
     fn service_job(count: u64) -> Value {
         json!({"Type": "service", "Version": 3, "TaskGroups": [{"Name": "api", "Count": count}]})
     }
@@ -233,6 +270,8 @@ mod tests {
     #[case::older_failed_deployment_ignored(service_job(1), vec![alloc("api", 3, "running")], json!({"JobVersion": 2, "Status": "failed"}), true)]
     #[case::batch_ok(json!({"Type": "batch", "Version": 0}), vec![alloc("run", 0, "complete")], json!(null), true)]
     #[case::batch_failed(json!({"Type": "batch", "Version": 0}), vec![alloc("run", 0, "failed")], json!(null), false)]
+    #[case::system_replaced_failure(system_job(), vec![node_alloc("a", 1, "failed"), node_alloc("a", 2, "running"), node_alloc("b", 3, "running")], json!(null), true)]
+    #[case::system_latest_failed(system_job(), vec![node_alloc("a", 1, "running"), node_alloc("a", 2, "failed"), node_alloc("b", 3, "running")], json!(null), false)]
     #[case::system_unplaced(json!({"Type": "system", "Version": 0, "TaskGroups": [{"Name": "agent"}]}), vec![], json!(null), false)]
     fn job_health_follows_allocations_and_deployment(
         #[case] job: Value,
