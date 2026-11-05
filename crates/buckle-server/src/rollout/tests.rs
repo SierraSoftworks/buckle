@@ -4169,43 +4169,57 @@ async fn an_in_cluster_executor_serves_only_its_cluster() {
     assert!(untargeted.is_empty(), "{untargeted:?}");
 }
 
-/// Between rollouts an applied cluster's health is read every interval
-/// through its last executor (at the applied revision), and not while that
-/// executor is away.
+/// Between rollouts an applied cluster's health is read every interval (at
+/// the applied revision) through its last executor, or another capable one
+/// while that one is away; with none online, it is not read.
 #[rstest::rstest]
-#[case::executor_connected(true)]
-#[case::executor_away(false)]
+#[case::last_executor(2, false)]
+#[case::another_while_the_last_is_away(2, true)]
+#[case::none_online(1, true)]
 #[tokio::test(start_paused = true)]
-async fn an_applied_clusters_health_is_read_between_rollouts(#[case] connected: bool) {
+async fn an_applied_clusters_health_is_read_between_rollouts(
+    #[case] nodes: usize,
+    #[case] last_away: bool,
+) {
     let mut h = Harness::new().await;
     h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, FLAT)
         .await;
-    h.enrol("n1", "nomad").await;
-    h.connect("n1", None);
+    let names: Vec<String> = (1..=nodes).map(|i| format!("n{i}")).collect();
+    for n in &names {
+        h.enrol(n, "nomad").await;
+        h.connect(n, None);
+    }
     let id = h.start("r1").await;
-    h.wait_state(&id, RolloutState::Completed).await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let last = host(&hosts, CLUSTER).runtime.executor.clone().unwrap();
     h.store
         .call(|db| db.hosts().set_applied_revision(CLUSTER, "r1"))
         .await
         .unwrap();
-    if !connected {
-        h.disconnect("n1");
+    if last_away {
+        h.disconnect(&last);
     }
     h.idle(11 * 60).await;
-    let reads = h.sent(|x, m| {
-        x == "n1"
-            && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Drift as i32 && r.target == CLUSTER)
+    let reads = h.sent(|_, m| {
+        matches!(m, SMsg::Health(r) if r.scope == HealthScope::Drift as i32 && r.target == CLUSTER)
     });
-    if connected {
-        assert!(reads.len() >= 2, "read every interval: {reads:?}");
-        assert!(
-            reads
-                .iter()
-                .all(|(_, _, m)| matches!(m, SMsg::Health(r) if r.revision == "r1")),
-            "{reads:?}"
-        );
+    let expected = if last_away {
+        names.iter().find(|n| **n != last)
     } else {
-        assert!(reads.is_empty(), "{reads:?}");
+        Some(&last)
+    };
+    match expected {
+        Some(expected) => {
+            assert!(reads.len() >= 2, "read every interval: {reads:?}");
+            assert!(
+                reads
+                    .iter()
+                    .all(|(_, x, m)| x == expected
+                        && matches!(m, SMsg::Health(r) if r.revision == "r1")),
+                "through {expected}: {reads:?}"
+            );
+        }
+        None => assert!(reads.is_empty(), "{reads:?}"),
     }
 }
 

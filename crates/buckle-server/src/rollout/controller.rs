@@ -5551,9 +5551,9 @@ impl Controller {
     /// own wave is picked up at once.
     /// Outside rollouts nothing reads a cluster's health: its executors are
     /// stateless and run no drift pass. Every `cluster_health_interval`, each
-    /// applied cluster no rollout is working on is checked through its last
-    /// executor, while that one is connected and idle (as a host's agent
-    /// checks itself with each drift pass).
+    /// applied cluster no rollout is working on is checked through an idle
+    /// executor, its last one first (as a host's agent checks itself with
+    /// each drift pass).
     async fn read_cluster_health(&mut self) {
         let now = self.now();
         if now < self.cluster_health_due {
@@ -5563,32 +5563,34 @@ impl Controller {
             + chrono::Duration::from_std(self.options.cluster_health_interval)
                 .unwrap_or_default()
                 .max(chrono::Duration::seconds(1));
-        let clusters = match self.store.call(|db| db.hosts().clusters()).await {
-            Ok(c) => c,
+        let targets = match self.load_targets(None).await {
+            Ok(t) => t,
             Err(e) => {
                 tracing::warn!(error = %e, "the clusters could not be listed for their health");
                 return;
             }
         };
-        let busy = self.busy_elsewhere(usize::MAX);
-        for c in clusters {
-            if c.status != HostStatus::Active
-                || c.applied_revision.is_none()
-                || self.excluded.contains(&c.id)
-                || self.spoken_for_elsewhere(usize::MAX, &c.id)
-            {
-                continue;
-            }
-            let Some(executor) = self.executors.get(&c.id).cloned() else {
+        let clusters: Vec<(String, String)> = targets
+            .iter()
+            .filter(|(c, _)| c.kind == TargetKind::Cluster && c.status == HostStatus::Active)
+            .filter(|(c, _)| !self.excluded.contains(&c.id))
+            .filter(|(c, _)| !self.spoken_for_elsewhere(usize::MAX, &c.id))
+            .filter_map(|(c, _)| Some((c.id.clone(), c.applied_revision.clone()?)))
+            .collect();
+        for (cluster, revision) in clusters {
+            let fleet = match self.revisions.load(&revision).await {
+                Ok(rev) => rev.fleet.clone(),
+                Err(e) => {
+                    tracing::warn!(%cluster, %revision, error = %e, "the applied revision could not be loaded to read the cluster's health");
+                    continue;
+                }
+            };
+            // The last executor while it qualifies, else any other that
+            // does: one away does not leave the cluster's health stale.
+            let Pick::Executor(executor) = self.pick_executor_for(&cluster, &fleet, &targets)
+            else {
                 continue;
             };
-            let capable = self
-                .capabilities
-                .get(&executor)
-                .is_some_and(|caps| caps.iter().any(|c| c == TARGETS_CAPABILITY));
-            if !capable || !self.eligible(&executor) || busy.contains(&executor) {
-                continue;
-            }
             let m = msg(server_message::Msg::Health(RunHealth {
                 target: String::new(),
                 revision: String::new(),
@@ -5600,8 +5602,8 @@ impl Controller {
             }));
             self.outbox.push(Out::Targeted {
                 session: executor,
-                msg: Box::new(stamp_target(m, &c.id)),
-                target: c.id,
+                msg: Box::new(stamp_target(m, &cluster)),
+                target: cluster,
             });
         }
     }
@@ -5640,10 +5642,23 @@ impl Controller {
         hi: usize,
         targets: &[(crate::store::HostRecord, serde_json::Value)],
     ) -> Pick {
-        let executors = self.cluster_executors(ri, hi);
-        let target = self.live[ri].hosts[hi].host.as_str();
+        let live = &self.live[ri];
+        self.pick_executor_for(&live.hosts[hi].host, &live.revision.fleet, targets)
+    }
+
+    /// [`Self::pick_executor`] for cluster `target`, its selectors read
+    /// against `fleet`.
+    fn pick_executor_for(
+        &self,
+        target: &str,
+        fleet: &buckle_core::model::FleetConfig,
+        targets: &[(crate::store::HostRecord, serde_json::Value)],
+    ) -> Pick {
+        let executors = self
+            .clusters
+            .get(target)
+            .and_then(|spec| buckle_core::Filter::new(spec.executors()?).ok());
         let parent = self.clusters.get(target).and_then(|s| s.cluster.as_deref());
-        let fleet = &self.live[ri].revision.fleet;
         let busy = self.busy_elsewhere(usize::MAX);
         let inflight: HashSet<&str> = self
             .live
@@ -5682,8 +5697,7 @@ impl Controller {
             return Pick::Busy;
         }
         candidates.sort();
-        let cluster = self.live[ri].hosts[hi].host.clone();
-        let last = self.executors.get(&cluster).cloned();
+        let last = self.executors.get(target).cloned();
         candidates
             .iter()
             .find(|c| Some(**c) == last.as_deref())
@@ -5795,14 +5809,6 @@ impl Controller {
                 }
             }
         }
-    }
-
-    /// The selector choosing the hosts that may speak for cluster row `hi`
-    /// (`executors`, else `nodes`), from the cluster's record. A cluster
-    /// with neither has no executor and waits.
-    fn cluster_executors(&self, ri: usize, hi: usize) -> Option<buckle_core::Filter> {
-        let spec = self.clusters.get(&self.live[ri].hosts[hi].host)?;
-        buckle_core::Filter::new(spec.executors()?).ok()
     }
 
     // ------------------------------------------------------------ late admission
