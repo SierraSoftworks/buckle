@@ -68,7 +68,10 @@ pub fn list(
 
 /// Every action the fleet's active targets offer now (each from the
 /// revision it runs), with the targets offering it that `selector` matches.
-/// The selector sees a target as the stable revision's phases do.
+/// The selector sees a target as the stable revision's phases do: a host as
+/// itself, a cluster's workload action as that workload's placement
+/// (`workload.*` beside `cluster.*`), so `workload.labels.tier == "web"`
+/// picks the clusters running such a workload, offering its actions only.
 pub async fn fleet(
     store: &crate::store::Store,
     revisions: &crate::source::cache::RevisionCache,
@@ -103,13 +106,14 @@ pub async fn fleet(
         let Some(rev) = loaded.get(&applied).cloned().flatten() else {
             continue;
         };
-        if let Some(selector) = selector {
-            let fleet = &stable.as_deref().unwrap_or(&rev).fleet;
-            if !crate::fleet::record_context(record, facts, fleet).matches(selector) {
+        let seen_by = stable.as_deref().unwrap_or(&rev);
+        let ctx = crate::fleet::record_context(record, facts, &seen_by.fleet);
+        for a in list(&rev, record, facts) {
+            if let Some(selector) = selector
+                && !offers_to(selector, record.kind, &ctx, seen_by, &rev, &a.module)
+            {
                 continue;
             }
-        }
-        for a in list(&rev, record, facts) {
             match out
                 .iter_mut()
                 .find(|f| f.action.module == a.module && f.action.name == a.name)
@@ -124,4 +128,25 @@ pub async fn fleet(
     }
     out.sort_by(|a, b| (&a.action.module, &a.action.name).cmp(&(&b.action.module, &b.action.name)));
     Ok(out)
+}
+
+/// Whether `selector` matches the target offering an action of `module`: a
+/// host as itself, a cluster as the placement of the workload `module`
+/// (labelled as the revision it runs declares it), with the fleet's groups
+/// from `seen_by`.
+fn offers_to(
+    selector: &buckle_core::Filter,
+    kind: TargetKind,
+    ctx: &buckle_core::selectors::HostContext,
+    seen_by: &Revision,
+    runs: &Revision,
+    module: &str,
+) -> bool {
+    match (kind, runs.workload(module)) {
+        (TargetKind::Cluster | TargetKind::Workload, Some(w)) => {
+            buckle_core::engine::validate::placement_context(seen_by, ctx, &w.config)
+                .matches(selector)
+        }
+        _ => ctx.matches(selector),
+    }
 }

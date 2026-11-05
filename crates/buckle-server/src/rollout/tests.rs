@@ -531,7 +531,12 @@ impl Harness {
                                 action: a.action,
                                 revision: a.revision,
                                 target: a.target,
-                                workload: a.workload,
+                                // An agent predating placements echoes none.
+                                workload: if s.no_workloads {
+                                    String::new()
+                                } else {
+                                    a.workload
+                                },
                                 report_id: id,
                                 succeeded: !failed,
                                 error: if failed {
@@ -4968,6 +4973,53 @@ async fn an_action_that_reboots_bakes_once_the_host_is_back() {
             .is_some_and(|w| w.back_at.is_some())
     );
     assert_eq!(action_runs(&h).len(), 1, "the action is not sent again");
+}
+
+/// A cluster's action rollout moves the placement of the workload declaring
+/// the action, phased by its `workload.*`, through the cluster's executor,
+/// one predating placements included (it echoes no workload).
+#[rstest::rstest]
+#[case::current_executor(false)]
+#[case::executor_predating_placements(true)]
+#[tokio::test(start_paused = true)]
+async fn a_cluster_action_rollout_runs_on_its_workloads_placement(#[case] no_workloads: bool) {
+    let mut h = Harness::new().await;
+    let phases = "  health: { bake: 30s }\n  phases:\n    - { name: pg, select: 'workload.name == \"postgres\"' }\n";
+    h.revision_with("r1", phases, NOMAD_CLUSTER, FLAT).await;
+    h.stable("r1").await;
+    h.enrol("n1", "nomad").await;
+    h.script("n1", |s| s.no_workloads = no_workloads);
+    h.connect("n1", Some("r1"));
+    let id = h
+        .command(Command::StartAction {
+            action: RolloutAction {
+                module: "postgres".into(),
+                action: "restart".into(),
+                label: "Restart".into(),
+                confirm: false,
+                selector: None,
+            },
+            targets: BTreeMap::from([(CLUSTER.to_string(), "r1".to_string())]),
+            note: String::new(),
+        })
+        .await
+        .unwrap();
+    let (_, rows) = h.wait_state(&id, RolloutState::Completed).await;
+    let placement = rows.iter().find(|x| x.host == CLUSTER).expect("a row");
+    assert_eq!(
+        (placement.workload.as_str(), placement.runtime.kind),
+        ("postgres", TargetKind::Workload)
+    );
+    assert_eq!(placement.phase, "pg");
+    assert_eq!(placement.state, HostPhase::Healthy);
+    let runs = action_runs(&h);
+    assert_eq!(runs.len(), 1);
+    let (_, executor, sent) = &runs[0];
+    assert_eq!(executor, "n1");
+    assert_eq!(
+        (sent.target.as_str(), sent.workload.as_str()),
+        (CLUSTER, "postgres")
+    );
 }
 
 #[rstest::rstest]

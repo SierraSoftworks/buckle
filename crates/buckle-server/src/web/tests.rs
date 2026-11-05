@@ -3007,3 +3007,73 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
     );
     assert_eq!(summary.hosts_total, 2);
 }
+
+/// A `workload.*` selector sees a cluster's actions as its workloads'
+/// placements: it offers the matching workload's actions only.
+#[actix_web::test]
+async fn workload_selectors_pick_the_placements_offering_an_action() {
+    let e = env(WebConfig::default()).await;
+    revision(
+        &e,
+        "r1",
+        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.labels.nomad == true'\n",
+    )
+    .await;
+    let dir = e.state.revisions.dir("r1");
+    for (name, tier) in [("grafana", "web"), ("postgres", "db")] {
+        let w = dir.join(format!("workloads/{name}/files"));
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(
+            w.join(format!("{name}.nomad.hcl")),
+            format!("job \"{name}\" {{}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("workloads/{name}/workload.yaml")),
+            format!("name: {name}\nlabels: {{ tier: {tier} }}\nresources: [{name}.nomad.hcl]\n"),
+        )
+        .unwrap();
+    }
+    e.store
+        .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "r1"))
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    // Listing materialises the declared cluster.
+    test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+    )
+    .await;
+    e.store
+        .call(|db| db.hosts().set_applied_revision("home-nomad", "r1"))
+        .await
+        .unwrap();
+
+    let listed = |selector: &'static str| {
+        let app = &app;
+        async move {
+            let uri = format!(
+                "/api/v1/actions?selector={}",
+                url::form_urlencoded::byte_serialize(selector.as_bytes()).collect::<String>()
+            );
+            let resp =
+                test::call_service(app, test::TestRequest::get().uri(&uri).to_request()).await;
+            let actions: Vec<buckle_api::FleetAction> = test::read_body_json(resp).await;
+            actions
+                .into_iter()
+                .map(|a| (a.action.module, a.targets))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        }
+    };
+    let web = listed("workload.labels.tier == \"web\"").await;
+    assert_eq!(web.keys().collect::<Vec<_>>(), vec!["grafana"]);
+    assert_eq!(web["grafana"], vec!["home-nomad"]);
+    let cluster = listed("cluster.id == \"home-nomad\"").await;
+    assert_eq!(
+        cluster.keys().collect::<Vec<_>>(),
+        vec!["grafana", "postgres"],
+        "a cluster.* selector picks every placement"
+    );
+    assert!(listed("host.labels.nomad == true").await.is_empty());
+}

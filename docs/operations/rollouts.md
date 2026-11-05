@@ -188,6 +188,10 @@ pause and abort, and reboots.
 
 - **Targets**: every active target whose applied revision offers the action and that the selector
   matches, frozen when the rollout starts. Each runs the action from the revision it runs.
+- **Workloads**: a workload's action moves each cluster as that workload's placement, one row per
+  cluster, phased by its `workload.*` and the cluster's `cluster.*` as a revision's placement
+  would be. The selector sees the placement too: `workload.labels.tier == "web"` picks the
+  clusters running such a workload and offers only its actions.
 - **Approval**: every target has the same plan (the action), so one approval covers a phase. An
   `if_destructive` phase asks for one when the action is declared with `confirm: true`.
 - **Ending**: the rollout completes without promoting anything, and has no stragglers stage. It

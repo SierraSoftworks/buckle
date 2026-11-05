@@ -2633,11 +2633,12 @@ impl Controller {
         let now = self.now();
         let span = self.host_span(ri, hi);
         let run_id = crate::store::RunRecord::new_id();
-        let (target, revision, rollout) = {
+        let (target, workload, revision, rollout) = {
             let live = &self.live[ri];
             let h = &live.hosts[hi];
             (
                 h.host.clone(),
+                h.workload.clone(),
                 h.runtime.revision.clone(),
                 live.record.id.clone(),
             )
@@ -2679,7 +2680,7 @@ impl Controller {
                 revision,
                 traceparent: traceparent_of(&span).unwrap_or_default(),
                 target: String::new(),
-                workload: String::new(),
+                workload,
             }),
         );
     }
@@ -2692,7 +2693,19 @@ impl Controller {
             if self.live[ri].record.runtime.action.is_none() {
                 continue;
             }
-            let Some(hi) = self.live[ri].find_target(host, &a.target, &a.workload) else {
+            // An executor predating placements echoes no workload: its run
+            // id names the placement.
+            let Some(hi) = self.live[ri]
+                .find_target(host, &a.target, &a.workload)
+                .or_else(|| {
+                    self.live[ri].hosts.iter().position(|h| {
+                        !a.target.is_empty()
+                            && h.host == a.target
+                            && h.runtime.executor.as_deref() == Some(host)
+                            && h.runtime.action_run.as_deref() == Some(a.action_id.as_str())
+                    })
+                })
+            else {
                 continue;
             };
             let h = &self.live[ri].hosts[hi];
@@ -3631,6 +3644,12 @@ impl Controller {
         live.record.started_at = now;
         let (id, revision) = (live.record.id.clone(), live.revision.clone());
         let rollout_revision = live.record.revision.clone();
+        let action_workload = live
+            .record
+            .runtime
+            .action
+            .as_ref()
+            .map(|a| a.module.clone());
         let mut rows = Vec::new();
         let mut untargeted = Vec::new();
         for (host, facts) in &hosts {
@@ -3647,7 +3666,7 @@ impl Controller {
                 },
                 None => rollout_revision.clone(),
             };
-            let ctx = crate::fleet::record_context(host, facts, &revision.fleet);
+            let mut ctx = crate::fleet::record_context(host, facts, &revision.fleet);
             // A cluster is rolled one workload placement at a time, each in
             // the phase its labels select, when its executors take placements.
             if only.is_none()
@@ -3672,11 +3691,23 @@ impl Controller {
                 }
                 continue;
             }
+            // An action rollout moves a cluster as the placement of the
+            // workload declaring the action, phased by its `workload.*`.
+            let (kind, workload) = match (&action_workload, host.kind) {
+                (Some(w), TargetKind::Cluster) => {
+                    if let Some(loaded) = revision.workload(w) {
+                        ctx =
+                            buckle_core::engine::placement_context(&revision, &ctx, &loaded.config);
+                    }
+                    (TargetKind::Workload, w.clone())
+                }
+                _ => (host.kind, String::new()),
+            };
             match crate::fleet::phase_for(&ctx, &phases) {
                 Some(pi) => rows.push(RolloutHostRecord {
                     rollout: id.clone(),
                     host: host.id.clone(),
-                    workload: String::new(),
+                    workload,
                     phase: phases[pi].name.clone(),
                     wave: None,
                     state: HostPhase::PlanPending,
@@ -3689,11 +3720,11 @@ impl Controller {
                     runtime: HostRuntime {
                         revision: target_revision,
                         phase_index: Some(pi),
-                        kind: host.kind,
+                        kind,
                         ..Default::default()
                     },
                 }),
-                None => untargeted.push(host.id.clone()),
+                None => untargeted.push(buckle_api::placement_key(&host.id, Some(&workload))),
             }
         }
         let live = &mut self.live[ri];
@@ -6299,12 +6330,16 @@ impl Controller {
     /// steward, while it is connected (leases are assigned by
     /// [`Controller::assign_leases`] on the same pass).
     fn pick_executor(&self, ri: usize, hi: usize) -> Pick {
-        let h = &self.live[ri].hosts[hi];
+        let live = &self.live[ri];
+        let h = &live.hosts[hi];
+        // An action runs as it always has on any steward: the workload is
+        // its module.
+        let placement =
+            h.runtime.kind == TargetKind::Workload && live.record.runtime.action.is_none();
         match self.executors.get(&h.host) {
             Some(steward)
                 if self.connected(steward)
-                    && (h.runtime.kind != TargetKind::Workload
-                        || self.has_capability(steward, WORKLOADS_CAPABILITY)) =>
+                    && (!placement || self.has_capability(steward, WORKLOADS_CAPABILITY)) =>
             {
                 Pick::Executor(steward.clone())
             }
