@@ -794,10 +794,23 @@ fn revision_with_vars(
     })
 }
 
+/// `bookworm` is literal text that equals a fact; only the expressions'
+/// values (in a field and in the content) are the host's, and only those
+/// read as placeholders in the step's display text.
+#[rstest]
+#[case::created(
+    None,
+    "codename=bookworm\nfamily=\u{ab}fact:host.facts.os.family\u{bb}\n"
+)]
+#[case::updated(
+    Some("codename=bookworm\nfamily=old\n"),
+    "--- current\n+++ planned\n@@ -1,2 +1,2 @@\n codename=bookworm\n-family=old\n+family=\u{ab}fact:host.facts.os.family\u{bb}\n"
+)]
 #[tokio::test]
-async fn steps_list_the_host_values_their_templates_emitted() {
-    // `bookworm` is literal text that equals a fact; only the expressions'
-    // values (in a field and in the content) are the host's.
+async fn steps_list_and_display_the_host_values_their_templates_emitted(
+    #[case] previous: Option<&str>,
+    #[case] display: &str,
+) {
     let rev = revision(
         "r1",
         FLEET,
@@ -810,9 +823,28 @@ async fn steps_list_the_host_values_their_templates_emitted() {
         )],
     );
     let sys = FakeSystem::new();
-    let plan = plan(&inputs(rev, &sys)).await;
+    let mut state = State::default();
+    if let Some(shadow) = previous {
+        state.record(ResourceRecord {
+            shadow: Some(Redacted::plain(shadow.to_owned())),
+            ..record_for(
+                "m",
+                "test.render",
+                "/out/aarch64",
+                RemovalPolicy::Cleanup,
+                "r0",
+            )
+        });
+    }
+    let plan = plan(&inputs_with_store(
+        rev,
+        &sys,
+        Arc::new(MemoryStateStore::with(state)),
+    ))
+    .await;
+    let step = step(&plan, "m", "/out/aarch64");
     assert_eq!(
-        step(&plan, "m", "/out/aarch64").facts.as_deref(),
+        step.facts.as_deref(),
         Some(
             &[
                 "host.facts.arch".to_owned(),
@@ -820,6 +852,7 @@ async fn steps_list_the_host_values_their_templates_emitted() {
             ][..]
         )
     );
+    assert_eq!(step.display.as_deref(), Some(display));
 }
 
 fn facts(tree: serde_json::Value) -> Facts {

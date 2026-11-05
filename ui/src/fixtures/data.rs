@@ -975,6 +975,7 @@ fn step(module: &str, kind: &str, key: &str, diff: Option<(DiffKind, &str)>) -> 
         },
         always_runs: false,
         facts: None,
+        display: None,
     }
 }
 

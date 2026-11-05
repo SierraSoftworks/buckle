@@ -4,11 +4,16 @@
 //! * Facts as placeholders: before hosts' plans are compared, host-specific
 //!   values (`host.id`, `host.labels.*`, `host.facts.*`) that differ across
 //!   the fleet are replaced by `«fact:PATH»` tokens, so a change that only
-//!   differs by a host's name or address reads as one change. Only values a
-//!   step's templates emitted through `{{ … }}` expressions are candidates
-//!   ([`StepView::facts`]), so literal text that happens to equal a fact
-//!   (`[global]`, `/backup`) stays text; plans from agents that do not trace
-//!   their renders fall back to every varying value.
+//!   differs by a host's name or address reads as one change. A step's
+//!   diff text is taken from the agent's display copy ([`StepView::display`]),
+//!   which has a placeholder exactly where a template's `{{ … }}` expression
+//!   emitted a host value, so literal text that happens to equal a fact
+//!   (`[global]`, `/backup`, a cluster called `nomad`) stays text; only the
+//!   lines a diff removes, which no template rendered, and the short fields
+//!   (key, name, summary) are matched by value, and only against the values
+//!   the step's templates emitted ([`StepView::facts`]). Plans from agents
+//!   that trace nothing fall back to every varying value. A step one host
+//!   alone plans has nothing to be compared with and reads as planned.
 //! * Variants: a step whose tokenised plan still differs between hosts keeps
 //!   one variant per distinct plan, each with its hosts.
 //! * Exemplars: every fact path used in a token comes with a sample of its
@@ -233,11 +238,14 @@ impl FleetPlan {
                 out.unplanned.push(h.host.clone());
                 continue;
             };
-            let tok = Tokeniser::new(l.iter().filter(|(p, v)| {
-                varying.contains(p.as_str())
-                    && v.len() >= MIN_FACT_LEN
-                    && !everywhere.contains(v.as_str())
-            }));
+            let tok = Tokeniser::new(
+                l.iter().filter(|(p, v)| {
+                    varying.contains(p.as_str())
+                        && v.len() >= MIN_FACT_LEN
+                        && !everywhere.contains(v.as_str())
+                }),
+                l,
+            );
             out.add(&h.host, &tok.plan(plan));
             used.extend(tok.used.into_inner());
         }
@@ -246,6 +254,76 @@ impl FleetPlan {
             .into_iter()
             .map(|path| samples(&path, hosts, &leaves))
             .collect();
+        out.literal_where_alone();
+        out
+    }
+
+    /// A step that one host alone plans has nothing to be compared with,
+    /// so it reads as that host planned it, without placeholders.
+    fn literal_where_alone(&mut self) {
+        let facts = std::mem::take(&mut self.facts);
+        for m in &mut self.modules {
+            for s in &mut m.steps {
+                let host = {
+                    let mut hosts = s.changed_hosts().chain(s.unchanged.iter());
+                    match (hosts.next(), hosts.next()) {
+                        (Some(host), None) => host.clone(),
+                        _ => continue,
+                    }
+                };
+                s.key = render(&facts, &host, &s.key);
+                for v in &mut s.variants {
+                    v.value = render_step(&facts, &host, &v.value);
+                }
+            }
+        }
+        let used = self.token_paths();
+        self.facts = facts
+            .into_iter()
+            .filter(|f| used.contains(&f.path))
+            .collect();
+    }
+
+    /// The paths of every fact token in the plan's text.
+    fn token_paths(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut text = |t: &str| token_paths(t, &mut out);
+        for m in &self.modules {
+            for s in &m.steps {
+                text(&s.key);
+                for v in &s.variants {
+                    text(&v.value.key);
+                    text(&v.value.summary);
+                    for t in [&v.value.name, &v.value.unified, &v.value.preview]
+                        .into_iter()
+                        .flatten()
+                    {
+                        text(t);
+                    }
+                }
+            }
+            for h in &m.handlers {
+                text(&h.value.summary);
+            }
+        }
+        for r in &self.removals {
+            text(&r.value.key);
+            text(&r.value.summary);
+        }
+        for r in &self.rehomed {
+            text(&r.value.from);
+            text(&r.value.to);
+            text(&r.value.summary);
+        }
+        for n in [&self.deferred, &self.held, &self.indeterminate]
+            .into_iter()
+            .flatten()
+        {
+            text(&n.value.reason);
+        }
+        for w in &self.warnings {
+            text(&w.value);
+        }
         out
     }
 
@@ -410,43 +488,73 @@ impl FleetPlan {
     /// `text` as `host` renders it: each fact token replaced by the host's
     /// value (tokens the host has no value for are left in place).
     pub fn render(&self, host: &str, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(start) = rest.find(FACT_TOKEN_PREFIX) {
-            let body = &rest[start + FACT_TOKEN_PREFIX.len()..];
-            let Some(end) = body.find(CLOSE) else {
-                break;
-            };
-            let path = &body[..end];
-            out.push_str(&rest[..start]);
-            match self.fact(path).and_then(|f| f.values.get(host)) {
-                Some(v) => out.push_str(v),
-                None => out.push_str(
-                    &rest[start..start + FACT_TOKEN_PREFIX.len() + end + CLOSE.len_utf8()],
-                ),
-            }
-            rest = &body[end + CLOSE.len_utf8()..];
-        }
-        out.push_str(rest);
-        out
+        render(&self.facts, host, text)
     }
 
     /// A (tokenised) step as `host` planned it.
     pub fn render_step(&self, host: &str, step: &StepView) -> StepView {
-        let r = |t: &String| self.render(host, t);
-        StepView {
-            key: r(&step.key),
-            name: step.name.as_ref().map(r),
-            summary: r(&step.summary),
-            unified: step.unified.as_ref().map(r),
-            preview: step.preview.as_ref().map(r),
-            ..step.clone()
-        }
+        render_step(&self.facts, host, step)
     }
 
     /// The exemplars of a fact token's path.
     pub fn fact(&self, path: &str) -> Option<&FactSamples> {
         self.facts.iter().find(|f| f.path == path)
+    }
+}
+
+/// `text` with each fact token replaced by what `f` makes of its path, or
+/// kept when `f` gives nothing.
+fn replace_tokens(text: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(FACT_TOKEN_PREFIX) {
+        let body = &rest[start + FACT_TOKEN_PREFIX.len()..];
+        let Some(end) = body.find(CLOSE) else {
+            break;
+        };
+        let path = &body[..end];
+        out.push_str(&rest[..start]);
+        match f(path) {
+            Some(v) => out.push_str(&v),
+            None => {
+                out.push_str(&rest[start..start + FACT_TOKEN_PREFIX.len() + end + CLOSE.len_utf8()])
+            }
+        }
+        rest = &body[end + CLOSE.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The paths of the fact tokens in `text`, added to `out`.
+fn token_paths(text: &str, out: &mut BTreeSet<String>) {
+    replace_tokens(text, |path| {
+        out.insert(path.to_owned());
+        None
+    });
+}
+
+/// `text` as `host` renders it, given the fleet's exemplars (see
+/// [`FleetPlan::render`]).
+fn render(facts: &[FactSamples], host: &str, text: &str) -> String {
+    replace_tokens(text, |path| {
+        facts
+            .iter()
+            .find(|f| f.path == path)
+            .and_then(|f| f.values.get(host))
+            .cloned()
+    })
+}
+
+fn render_step(facts: &[FactSamples], host: &str, step: &StepView) -> StepView {
+    let r = |t: &String| render(facts, host, t);
+    StepView {
+        key: r(&step.key),
+        name: step.name.as_ref().map(r),
+        summary: r(&step.summary),
+        unified: step.unified.as_ref().map(r),
+        preview: step.preview.as_ref().map(r),
+        ..step.clone()
     }
 }
 
@@ -544,17 +652,23 @@ fn exemplars<'a>(path: &str, all: impl Iterator<Item = (&'a str, &'a str)>) -> F
 
 /// Replaces one host's fact values with tokens.
 struct Tokeniser {
-    /// `(value, path)`, longest value first; among equal values, the
-    /// shortest path first (`host.id` over `host.facts.os.hostname`), so the
-    /// first one a step allows is the one its text is given.
+    /// `(value, path)` of the facts worth a token, longest value first;
+    /// among equal values, the shortest path first (`host.id` over
+    /// `host.facts.os.hostname`), so the first one a step allows is the one
+    /// its text is given.
     facts: Vec<(String, String)>,
+    /// Every value of the host by path, to show a placeholder the agent put
+    /// at a path that does not vary as the host's value.
+    values: BTreeMap<String, String>,
     used: std::cell::RefCell<BTreeSet<String>>,
 }
 
 impl Tokeniser {
-    fn new<'a>(leaves: impl Iterator<Item = &'a (String, String)>) -> Self {
-        let mut facts: Vec<(String, String)> =
-            leaves.map(|(p, v)| (v.clone(), p.clone())).collect();
+    fn new<'a>(
+        facts: impl Iterator<Item = &'a (String, String)>,
+        leaves: &[(String, String)],
+    ) -> Self {
+        let mut facts: Vec<(String, String)> = facts.map(|(p, v)| (v.clone(), p.clone())).collect();
         facts.sort_by(|a, b| {
             b.0.len()
                 .cmp(&a.0.len())
@@ -563,8 +677,41 @@ impl Tokeniser {
         });
         Self {
             facts,
+            values: leaves.iter().cloned().collect(),
             used: Default::default(),
         }
+    }
+
+    /// A step's display text (its diff with placeholders where the agent
+    /// traced a template emitting a host value) as the fleet shows it: a
+    /// placeholder at a path the fleet varies in stays, any other reads as
+    /// the host's value. In a `unified` diff the removed lines, which no
+    /// template rendered, get placeholders for the values the kept
+    /// placeholders stand for, where those stand as words of their own.
+    fn shown(&self, display: &str, unified: bool) -> String {
+        let mut kept = BTreeSet::new();
+        let text = replace_tokens(display, |path| {
+            if self.facts.iter().any(|(_, p)| p == path) {
+                kept.insert(path.to_owned());
+                self.used.borrow_mut().insert(path.to_owned());
+                None
+            } else {
+                self.values.get(path).cloned()
+            }
+        });
+        if !unified || kept.is_empty() {
+            return text;
+        }
+        let kept: Vec<String> = kept.into_iter().collect();
+        text.split_inclusive('\n')
+            .map(|line| {
+                if line.starts_with('-') && !line.starts_with("--- ") {
+                    self.text_of(line, Some(&kept))
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect()
     }
 
     /// `text` with every fact value that stands as a word of its own (not
@@ -632,13 +779,21 @@ impl Tokeniser {
                 // Which values a host's templates emitted is not part of
                 // the change: hosts sharing a change share a variant.
                 let paths = s.facts.take();
+                let display = s.display.take();
                 let t = |text: &str| self.text_of(text, paths.as_deref());
+                let (unified, preview) = match (display, s.diff) {
+                    (Some(d), Some(crate::DiffKind::Create)) => {
+                        (s.unified.as_deref().map(t), Some(self.shown(&d, false)))
+                    }
+                    (Some(d), _) => (Some(self.shown(&d, true)), s.preview.as_deref().map(t)),
+                    (None, _) => (s.unified.as_deref().map(t), s.preview.as_deref().map(t)),
+                };
                 *s = StepView {
                     key: t(&s.key),
                     name: s.name.as_deref().map(t),
                     summary: t(&s.summary),
-                    unified: s.unified.as_deref().map(t),
-                    preview: s.preview.as_deref().map(t),
+                    unified,
+                    preview,
                     ..s.clone()
                 };
             }
@@ -909,7 +1064,7 @@ mod tests {
             ("host.id".to_owned(), "seer".to_owned()),
             ("host.facts.fqdn".to_owned(), "seer.lan".to_owned()),
         ];
-        assert_eq!(Tokeniser::new(leaves.iter()).text(text), expected);
+        assert_eq!(Tokeniser::new(leaves.iter(), &[]).text(text), expected);
     }
 
     /// A rustic config whose literal `[global]` and `/backup` equal facts
@@ -950,6 +1105,106 @@ mod tests {
         }
     }
 
+    /// A traced step: the agent's display copy of its diff carries
+    /// placeholders where its template emitted `host.id` and the (fleet-wide
+    /// equal) `host.facts.os.family`; its removed line holds the old name.
+    fn traced(name: &str, family: &str) -> FleetHost {
+        let unified = format!(
+            "--- current\n+++ planned\n@@ -1,3 +1,3 @@\n [global]\n-host = \"old-{name}\"\n+host = \"{name}\"\n family = {family}\n"
+        );
+        let display = unified
+            .replace(
+                &format!("+host = \"{name}\""),
+                "+host = \"\u{ab}fact:host.id\u{bb}\"",
+            )
+            .replace(
+                &format!(" family = {family}"),
+                " family = \u{ab}fact:host.facts.os.family\u{bb}",
+            );
+        let mut h = host(
+            name,
+            "10.0.0.1",
+            vec![StepView {
+                display: Some(display),
+                facts: Some(vec!["host.facts.os.family".into(), "host.id".into()]),
+                ..change("rustic", "/etc/rustic/rustic.toml", &unified)
+            }],
+        );
+        h.context["facts"]["os"]["family"] = json!(family);
+        h
+    }
+
+    #[test]
+    fn a_traced_step_is_shown_by_its_display_text() {
+        let seer = traced("seer", "debian");
+        let mut prophet = traced("prophet", "debian");
+        // `[global]` equals a fact of one host: still text, as no template
+        // emitted it.
+        prophet.context["facts"]["scope"] = json!("global");
+        let plan = FleetPlan::build(&[seer, prophet]);
+        let step = &plan.modules[0].steps[0];
+        assert_eq!(step.variants.len(), 1, "{step:#?}");
+        let shown = &step.variants[0].value;
+        assert_eq!(
+            shown.unified.as_deref(),
+            Some(
+                "--- current\n+++ planned\n@@ -1,3 +1,3 @@\n [global]\n-host = \"old-\u{ab}fact:host.id\u{bb}\"\n+host = \"\u{ab}fact:host.id\u{bb}\"\n family = debian\n"
+            )
+        );
+        assert_eq!((shown.facts.as_ref(), shown.display.as_ref()), (None, None));
+        let paths: Vec<&str> = plan.facts.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["host.id"]);
+    }
+
+    /// A step only one host plans (a cluster's job, say) keeps its text,
+    /// whatever its values match elsewhere in the fleet.
+    #[test]
+    fn a_step_one_host_alone_plans_reads_as_planned() {
+        let mut nomad = traced("nomad", "debian");
+        nomad.plan.as_mut().unwrap().modules[0]
+            .steps
+            .push(StepView {
+                kind: "nomad.job".into(),
+                key: "default/rex".into(),
+                task: "rex".into(),
+                outcome: StepOutcome::Change,
+                summary: "update job default/rex".into(),
+                diff: Some(DiffKind::Update),
+                unified: Some("+Meta[buckle.target]: \"nomad\"\n".into()),
+                facts: Some(vec![]),
+                ..Default::default()
+            });
+        let plan = FleetPlan::build(&[nomad, traced("seer", "debian")]);
+        let job = &plan.modules[0].steps[1];
+        assert_eq!(job.variants.len(), 1);
+        assert_eq!(job.variants[0].hosts, ["nomad"]);
+        assert_eq!(
+            job.variants[0].value.unified.as_deref(),
+            Some("+Meta[buckle.target]: \"nomad\"\n")
+        );
+        // The shared step keeps its placeholders, so the exemplars stay.
+        assert!(
+            plan.modules[0].steps[0].variants[0]
+                .value
+                .unified
+                .as_deref()
+                .unwrap()
+                .contains("\u{ab}fact:host.id\u{bb}")
+        );
+        assert_eq!(plan.facts.len(), 1);
+
+        // Alone in the fleet, even a traced step reads as planned.
+        let plan = FleetPlan::build(&[traced("seer", "debian")]);
+        let shown = &plan.modules[0].steps[0].variants[0].value;
+        assert_eq!(
+            shown.unified.as_deref(),
+            Some(
+                "--- current\n+++ planned\n@@ -1,3 +1,3 @@\n [global]\n-host = \"old-seer\"\n+host = \"seer\"\n family = debian\n"
+            )
+        );
+        assert!(plan.facts.is_empty());
+    }
+
     #[test]
     fn equal_values_take_the_shortest_path() {
         let leaves = [
@@ -957,7 +1212,7 @@ mod tests {
             ("host.id".to_owned(), "seer".to_owned()),
         ];
         assert_eq!(
-            Tokeniser::new(leaves.iter()).text("seer"),
+            Tokeniser::new(leaves.iter(), &[]).text("seer"),
             "\u{ab}fact:host.id\u{bb}"
         );
     }

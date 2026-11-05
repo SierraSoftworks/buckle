@@ -129,6 +129,12 @@ pub struct StepView {
     /// where any varying host value is a candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<Vec<String>>,
+    /// The diff text (`preview` of a creation, `unified` of an update) with
+    /// fact placeholders exactly where the step's templates emitted host
+    /// values, which the fleet view shows in its place. `None` when no line
+    /// came from such an expression, or from agents that do not trace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 impl StepView {

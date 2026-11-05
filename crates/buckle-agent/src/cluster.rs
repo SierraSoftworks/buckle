@@ -401,6 +401,7 @@ impl Executor {
                 })
                 .collect();
             after.extend(landing.iter().cloned());
+            let emitted = std::sync::Arc::new(buckle_core::template::Emitted::default());
             let compiled = if w.config.uses_kubernetes_keys() {
                 Err(buckle_core::error::user(
                     format!(
@@ -410,7 +411,9 @@ impl Executor {
                     &["Narrow the workload's `when` to `cluster.kind == \"kubernetes\"`."],
                 ))
             } else {
-                compile(&a.revision, w, &ctx).await
+                // The workload's renders are traced, so the fleet view marks
+                // only the cluster values its templates emitted.
+                compile(&a.revision, w, &ctx.clone().with_emitted(emitted.clone())).await
             };
             let planned = match compiled {
                 Ok(mut workload) => {
@@ -457,6 +460,7 @@ impl Executor {
                     modules.push(module_plan(
                         &name,
                         &w.config.needs,
+                        emitted.paths(),
                         plan.steps
                             .iter()
                             .map(|s| (s.key.key(), s.key.kind.task_kind(), s.planned.clone())),
@@ -1646,10 +1650,12 @@ pub(crate) fn scoped<'a>(
     }
 }
 
-/// A workload's steps (resource key, kind, plan) as a module plan.
+/// A workload's steps (resource key, kind, plan) as a module plan; `facts`
+/// are the cluster values its templates emitted ([`Step::facts`]).
 fn module_plan(
     name: &str,
     needs: &[String],
+    facts: Vec<String>,
     steps: impl Iterator<Item = (String, &'static str, buckle_core::plan::Planned)>,
 ) -> ModulePlan {
     ModulePlan {
@@ -1669,7 +1675,8 @@ fn module_plan(
                 notifies: Vec::new(),
                 always_runs: false,
                 removal: RemovalPolicy::Cleanup,
-                facts: None,
+                facts: Some(facts.clone()),
+                display: None,
             })
             .collect(),
         handlers: Vec::new(),

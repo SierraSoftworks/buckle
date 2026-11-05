@@ -156,6 +156,7 @@ impl Executor {
                 })
                 .collect();
             after.extend(landing.iter().cloned());
+            let emitted = std::sync::Arc::new(buckle_core::template::Emitted::default());
             let compiled = if w.config.uses_nomad_keys() {
                 Err(buckle_core::error::user(
                     format!(
@@ -165,7 +166,9 @@ impl Executor {
                     &["Narrow the workload's `when` to `cluster.kind == \"nomad\"`."],
                 ))
             } else {
-                compile(&a.revision, w, &ctx).await
+                // The workload's renders are traced, so the fleet view marks
+                // only the cluster values its templates emitted.
+                compile(&a.revision, w, &ctx.clone().with_emitted(emitted.clone())).await
             };
             let planned = match compiled {
                 Ok(mut workload) => {
@@ -214,6 +217,7 @@ impl Executor {
                     modules.push(module_plan(
                         &name,
                         &w.config.needs,
+                        emitted.paths(),
                         plan.steps
                             .iter()
                             .map(|s| (s.key.key(), s.task_kind(), s.planned.clone())),
