@@ -1349,7 +1349,7 @@ impl Controller {
                     // Resume the bake. Past its window, a host that was away
                     // reports afresh before it counts as baked, and a check
                     // still failing is followed through settle.
-                    let until = self.live[ri].hosts[hi].runtime.bake_until.unwrap_or(now);
+                    let until = self.bake_watch_until(ri, hi).unwrap_or(now);
                     if until > now {
                         self.send_bake_request(ri, hi, until);
                     } else if c.new_session {
@@ -3741,6 +3741,7 @@ impl Controller {
             h.runtime.failing_since.clear();
             h.runtime.bake_reports = 0;
             h.runtime.bake_requests.clear();
+            h.runtime.bake_asked_until = None;
         }
         self.set_host_state(ri, hi, HostPhase::Baking, &why);
         if bake > 0 {
@@ -3921,9 +3922,21 @@ impl Controller {
         settle.max(chrono::Duration::minutes(1))
     }
 
+    /// Until when row `hi`'s agent must sample its bake: the window and,
+    /// while a required check fails, that check's settle (it is followed
+    /// until it recovers or counts as a regression).
+    fn bake_watch_until(&self, ri: usize, hi: usize) -> Option<DateTime<Utc>> {
+        let settle =
+            chrono::Duration::from_std(self.live[ri].record.policy.settle).unwrap_or_default();
+        let h = &self.live[ri].hosts[hi];
+        let failing = h.runtime.failing_since.values().min().map(|s| *s + settle);
+        h.runtime.bake_until.into_iter().chain(failing).max()
+    }
+
     fn send_bake_request(&mut self, ri: usize, hi: usize, until: DateTime<Utc>) {
         let span = self.host_span(ri, hi);
         let request_id = new_id();
+        self.live[ri].hosts[hi].runtime.bake_asked_until = Some(until);
         {
             let requests = &mut self.live[ri].hosts[hi].runtime.bake_requests;
             requests.push(request_id.clone());
@@ -4006,6 +4019,7 @@ impl Controller {
             h.runtime.failing_since.clear();
             h.runtime.bake_reports = 0;
             h.runtime.bake_requests.clear();
+            h.runtime.bake_asked_until = None;
             h.runtime.approval_digest = None;
             h.runtime.plan_changes = None;
             h.runtime.plan_removals = None;
@@ -4171,6 +4185,21 @@ impl Controller {
                     // failing, and the host is connected and has reported
                     // (when it has a window at all).
                     let window = self.bake_seconds(ri, hi) > 0;
+                    // Past the window, a failing check is followed through
+                    // settle, but the agent samples only until the `until`
+                    // it was asked for: ask it to cover the rest.
+                    let h = &self.live[ri].hosts[hi];
+                    if window
+                        && h.runtime.bake_until.is_some_and(|u| u <= now)
+                        && !h.runtime.failing_since.is_empty()
+                        && self.row_connected(ri, hi)
+                        && let Some(until) = self.bake_watch_until(ri, hi)
+                        && until > now
+                        && h.runtime.bake_asked_until.is_none_or(|a| a < until)
+                    {
+                        self.send_bake_request(ri, hi, until);
+                    }
+                    let h = &self.live[ri].hosts[hi];
                     let reported = !window || h.runtime.bake_reports > 0;
                     let ended = h.runtime.bake_until.filter(|u| *u <= now);
                     if let Some(until) = ended
