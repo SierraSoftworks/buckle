@@ -29,9 +29,12 @@ according to `rollout.supersede`.
 ## 2. Watch the pipeline
 
 Every targeted agent sends a plan, then each phase applies in waves of `parallel` hosts. The
-pipeline shows each phase as a stage, its hosts as blocks, and an approval gate before each stage
-that needs one: approved, needs approval, or waiting. The health check between stages is drawn only
-when it holds the rollout (paused).
+pipeline shows each phase as a stage: its hosts first as square blocks, then a section per cluster
+(headed by the cluster's name) with each workload as a round block, wrapping inside the stage. A
+unit whose plan changes nothing is solid grey; one waiting for an earlier step, a need or its
+cluster's steward is hollow and says what it waits for on hover. An approval gate sits before each
+stage that needs one: approved, needs approval, or waiting. The health check between stages is
+drawn only when it holds the rollout (paused).
 
 <Screenshot name="rollout-pipeline" alt="The rollout pipeline: stages with a block per host, and the gates between them" />
 
@@ -52,20 +55,43 @@ A host's way through a phase:
 A phase that exceeds `max_failures` stops according to `rollout.on_failure`; see
 [Recovering from failures](./recovery.md).
 
+### Placements
+
+A cluster is rolled out one **placement** at a time: each workload the revision selects on it is a
+row of its own (`cluster/workload`), planned, applied and baked on its own through the cluster's
+executor, and placed in the first phase whose selector matches its workload's `labels`
+(`workload.labels.*`, `workload.name`, `workload.tags`) and its cluster (`cluster.*`). A phase
+selecting `'true'` takes the placements no earlier phase named. A workload the cluster's applied
+revision ran that the new revision no longer selects there is a **removal** placement: it removes
+what the workload owned, after the placements that needed it (by the applied revision's `needs`),
+in the latest of their phases. The cluster is on the revision once every placement is
+(`rollout.target.converged`).
+
+While a connected host that could execute for a cluster runs an agent that predates placements,
+the cluster is rolled as one row, as before: one plan covering every workload, one apply.
+
 ### Stages inside a phase
 
 Within a phase, order comes from `needs`. Between the modules of one host that is the agent's
-business and makes no difference to the pipeline; an edge that crosses a cluster boundary does. A
-workload that needs `module:nomad` waits for that module on the cluster's nodes, and a module that
-needs `workload:postgresql` waits for the workload on the cluster its host is a node of. The
-controller resolves those edges into **stages**: everything with no cross-layer dependency first,
-then what depends on it, and so on, each stage applying `parallel` targets at a time. A host whose
-modules sit on both sides of a workload is applied in two steps, its dependent modules after the
-cluster, and shows as pending with the stage it waits for in between.
+business and makes no difference to the pipeline; an edge that leaves the host does. A workload
+that needs `module:nomad` waits for that module on the cluster's nodes, a module that needs
+`workload:postgresql` waits for that placement on the cluster its host is a node of, and a
+workload that needs another waits for that placement. The controller resolves those edges into
+**stages**: everything with no such dependency first, then what depends on it, and so on, each
+stage applying `parallel` targets at a time. A host whose modules sit on both sides of a workload
+is applied in two steps, its dependent modules after the placement, and shows as pending with the
+stage it waits for in between.
+
+A placement whose workload needs one in a **later phase** (or one no phase selects) cannot wait
+for it inside its own phase. `buckle validate` warns about such a `needs`; the placement starts
+only when the needed workload is already running on the cluster (applied and healthy), and
+otherwise misses its phase and converges in the stragglers stage once the need is healthy. Under
+`rollout.dependencies.across_phases: refuse` the revision is rejected instead, and a placement
+whose need turns out not to be running fails.
 
 Every target is planned when the rollout starts, as a **preview** where its stage has not opened
-yet (later phases, clusters after their nodes), and planned again when its stage opens, since it
-depends on what came before. The fresh plan is what applies: one matching what the phase's
+yet (later phases, placements after the nodes or the workloads they need), and planned again when
+its stage opens, since it depends on what came before. The fresh plan is what applies: one matching what the phase's
 approval covered goes ahead, one that changed is marked *changed since preview* (audit
 `rollout.target.plan_drifted`) and needs approval again under `approval: required` (or
 `if_destructive` when destructive); auto phases apply it. A cluster with no free executor at the
@@ -73,7 +99,7 @@ start, or whose preview fails (an earlier stage provides what it needs), stays u
 stage opens. A host's later steps are planned when their stage opens. A cluster with no
 connected host matching its `executors` selector reads *awaiting executor*; it misses its phase
 after the disconnect grace, like an offline host, and converges in the stragglers stage once one
-appears. A phase without cross-layer `needs` is one stage, as before.
+appears. A phase whose `needs` all stay inside one host is one stage, as before.
 
 ## 3. Review and approve
 
@@ -84,11 +110,13 @@ an **Approve** button for the next phase that wants an approval in its head:
 - **Notes**: what that approval leaves out (hosts without a plan yet) and each of the plan's
   warnings. A phase is approved only once every phase before it has finished, so an approval is
   never given blind; until then its button is disabled and a note says what it waits on.
-- **Across the fleet**: one entry per module, with the phases (or hosts) it changes; hover for the
-  hosts by phase. Where a template put a host value that differs per host, it reads as a
-  placeholder such as `«fact:host.id»`; hover it for the hosts' values.
-- **By distinct plan**: hosts with identical plans grouped together by phase, destructive steps
+- **Combined** (the default): one entry per module or workload, with the phases (or hosts) it
+  changes; hover for the hosts by phase. Where a template put a host value that differs per host,
+  it reads as a placeholder such as `«fact:host.id»`; hover it for the hosts' values.
+- **By target**: targets with identical plans grouped together by phase, destructive steps
   flagged.
+
+The toggle between the two sits in the panel's head.
 
 <Screenshot name="rollout-approval" alt="The Plans panel: its Approve button, the approval's notes and a banner per warning, then the plan across every phase by module" />
 
@@ -126,8 +154,9 @@ bake: 15m   # a run that changed nomad bakes for 15m, even in a 1m phase
 | a module with a longer `bake` | the longest such `bake` (the host's row names the module) |
 
 So a phase whose hosts all come out unchanged moves on at once, and a short phase `bake` lets
-low-risk changes through quickly while risky modules hold the rollout as long as they need. Expand a host's row under **Hosts** for its timeline through
-the rollout and its run report.
+low-risk changes through quickly while risky modules hold the rollout as long as they need. Expand a row under **Targets** for its timeline through
+the rollout and its run report. **Targets** lists what changes by default; **All** in its head adds
+the unchanged hosts and workloads (`?targets=all` in the link keeps that view).
 
 When the last phase completes, the revision is **promoted** to stable: it is what new hosts get and
 what a rollback returns to. Hosts that missed their phase (offline, held or skipped) converge in the
@@ -159,6 +188,10 @@ pause and abort, and reboots.
 
 - **Targets**: every active target whose applied revision offers the action and that the selector
   matches, frozen when the rollout starts. Each runs the action from the revision it runs.
+- **Workloads**: a workload's action moves each cluster as that workload's placement, one row per
+  cluster, phased by its `workload.*` and the cluster's `cluster.*` as a revision's placement
+  would be. The selector sees the placement too: `workload.labels.tier == "web"` picks the
+  clusters running such a workload and offers only its actions.
 - **Approval**: every target has the same plan (the action), so one approval covers a phase. An
   `if_destructive` phase asks for one when the action is declared with `confirm: true`.
 - **Ending**: the rollout completes without promoting anything, and has no stragglers stage. It

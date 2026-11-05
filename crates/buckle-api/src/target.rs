@@ -1,7 +1,9 @@
 //! Targets: what a revision is applied to. A host is a target with an agent;
 //! a cluster is a virtual target (a Nomad or Kubernetes API) that hosts speak
 //! for. Both share the `/api/v1/targets` routes and the `HostSummary` row;
-//! `kind` and `cluster` say which is which.
+//! `kind` and `cluster` say which is which. A rollout moves a cluster one
+//! workload placement (workload × cluster) at a time: those rows carry the
+//! `workload` kind and name the workload beside the cluster.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,6 +15,8 @@ pub enum TargetKind {
     #[default]
     Host,
     Cluster,
+    /// One workload on one cluster: a rollout row, never a stored target.
+    Workload,
 }
 
 impl TargetKind {
@@ -20,7 +24,14 @@ impl TargetKind {
         match self {
             TargetKind::Host => "host",
             TargetKind::Cluster => "cluster",
+            TargetKind::Workload => "workload",
         }
+    }
+
+    /// Whether the target lives on a cluster (a cluster, or a placement on
+    /// one), so an executor speaks for it.
+    pub fn on_cluster(self) -> bool {
+        matches!(self, TargetKind::Cluster | TargetKind::Workload)
     }
 }
 
@@ -37,8 +48,28 @@ impl std::str::FromStr for TargetKind {
         match s {
             "host" => Ok(TargetKind::Host),
             "cluster" => Ok(TargetKind::Cluster),
-            other => Err(format!("'{other}' is not a target kind (host, cluster)")),
+            "workload" => Ok(TargetKind::Workload),
+            other => Err(format!(
+                "'{other}' is not a target kind (host, cluster, workload)"
+            )),
         }
+    }
+}
+
+/// How a list of target names writes a workload placement: `cluster/workload`
+/// (neither a target id nor a workload name contains `/`). A host is its id.
+pub fn placement_key(target: &str, workload: Option<&str>) -> String {
+    match workload {
+        Some(w) if !w.is_empty() => format!("{target}/{w}"),
+        _ => target.to_owned(),
+    }
+}
+
+/// The target and workload a [`placement_key`] names.
+pub fn split_placement_key(key: &str) -> (&str, Option<&str>) {
+    match key.split_once('/') {
+        Some((target, workload)) if !workload.is_empty() => (target, Some(workload)),
+        _ => (key, None),
     }
 }
 
@@ -114,6 +145,19 @@ pub struct ClusterSpec {
     /// (`agents.auth: workload_identity`). Absent: none may.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<Box<ClusterTrust>>,
+    /// How often the cluster's steward reads it unprompted. Absent: the
+    /// defaults (health every 60s, drift every 10m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<ClusterWatch>,
+}
+
+/// How often a cluster's steward reads it when nothing wakes it, in
+/// seconds: health (the read covering a dropped long poll) and drift (the
+/// applied revision re-planned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterWatch {
+    pub health_seconds: u64,
+    pub drift_seconds: u64,
 }
 
 /// Which workload identities the server accepts as the cluster's in-cluster
@@ -217,9 +261,25 @@ impl ClusterSpec {
 /// it lists the target.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterStatus {
-    /// The host that last spoke for the cluster (applied or planned it).
+    /// The host that last spoke for the cluster (applied or planned it):
+    /// its steward while it has one. Kept for older clients; see `steward`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    /// The host agent holding the cluster's lease: it watches the cluster
+    /// and runs its placements and actions. `None`: no connected host may
+    /// speak for the cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steward: Option<String>,
+    /// Whether the cluster's API answers its steward, as last reported;
+    /// `None` until a steward reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachable: Option<bool>,
+    /// Why the cluster is unreachable, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachable_error: Option<String>,
+    /// When the steward last read the cluster's health (its watch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watched_at: Option<chrono::DateTime<chrono::Utc>>,
     /// How many workloads the reference revision selects for the cluster.
     #[serde(default)]
     pub workloads: u32,
@@ -313,9 +373,26 @@ mod tests {
         );
         assert_eq!(TargetKind::default(), TargetKind::Host);
         assert_eq!("cluster".parse::<TargetKind>(), Ok(TargetKind::Cluster));
+        assert_eq!("workload".parse::<TargetKind>(), Ok(TargetKind::Workload));
+        assert!(TargetKind::Workload.on_cluster());
         assert!("pod".parse::<TargetKind>().is_err());
         let create: CreateTarget = serde_json::from_value(json!({ "id": "home-nomad" })).unwrap();
         assert_eq!(create.kind, TargetKind::Host);
         assert_eq!(create.cluster, None);
+    }
+
+    #[test]
+    fn placement_keys_round_trip() {
+        assert_eq!(
+            placement_key("home-nomad", Some("grafana")),
+            "home-nomad/grafana"
+        );
+        assert_eq!(placement_key("pi-1", None), "pi-1");
+        assert_eq!(placement_key("pi-1", Some("")), "pi-1");
+        assert_eq!(
+            split_placement_key("home-nomad/grafana"),
+            ("home-nomad", Some("grafana"))
+        );
+        assert_eq!(split_placement_key("pi-1"), ("pi-1", None));
     }
 }

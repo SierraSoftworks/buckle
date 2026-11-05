@@ -1442,6 +1442,7 @@ async fn clusters_created_through_the_api_grant_by_their_selectors(
                             cluster: None,
                             scope: Default::default(),
                             trust: None,
+                            watch: None,
                         },
                         declared: false,
                     },
@@ -1500,6 +1501,7 @@ async fn workload_server(auth: Vec<AgentAuth>) -> Server {
                                 keys: Some(keys),
                                 ..Default::default()
                             })),
+                            watch: None,
                         },
                         declared: false,
                     },

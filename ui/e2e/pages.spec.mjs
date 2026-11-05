@@ -28,10 +28,10 @@ describe("every page renders in demo mode", () => {
     const drawn = await page.locator(".overview__fleet a.block").count();
     const hosts = Number((await bar.locator(".fleet-bar__total").first().textContent()).match(/\d+/)[0]);
     const pending = Number((legend.match(/(\d+) awaiting approval/) ?? [0, 0])[1]);
-    // Cluster targets are drawn beside the hosts but are not counted with them.
-    const clusters = await page.locator('.overview__fleet a.block').filter({ has: page.locator(".block__name", { hasText: /-nomad$/ }) }).count();
-    assert.equal(drawn - clusters, hosts + pending, "every host in the fleet is on the map");
-    assert.ok(clusters >= 1, "clusters are on the map");
+    // Workloads are drawn beside the hosts but are not counted with them.
+    const workloads = await page.locator(".overview__fleet a.block.block--cluster").count();
+    assert.equal(drawn - workloads, hosts + pending, "every host in the fleet is on the map");
+    assert.ok(workloads >= 1, "workloads are on the map");
     assert.equal(await page.locator(".gitlog__item").count(), 5);
     await close();
   });
@@ -158,12 +158,44 @@ describe("every page renders in demo mode", () => {
     await close();
   });
 
+  test("workloads list each workload once across its clusters, opening its page", async () => {
+    const { page, close } = await open("/workloads");
+    assert.equal(await heading(page), "Workloads");
+    await page.getByRole("navigation").getByRole("link", { name: "Workloads" }).waitFor();
+    const rows = page.getByTestId("workloads-table").locator("tbody tr");
+    await rows.first().waitFor();
+    // The worst first: atuin is deploying.
+    assert.equal(await rows.first().getAttribute("data-workload"), "atuin");
+    const paste = page.locator('tr[data-workload="paste"]');
+    const chips = await paste.locator(".placement-chip").evaluateAll((els) => els.map((e) => e.dataset.host));
+    assert.deepEqual(chips, ["home-nomad", "lab-nomad"], "one chip per cluster it runs on");
+    await page.getByRole("searchbox", { name: "Search workloads" }).fill("lab");
+    await eventually(async () => assert.equal(await rows.count(), 2));
+    await paste.locator(".placement-chip", { hasText: "lab-nomad" }).click();
+    assert.equal(await heading(page), "paste");
+    assert.match(page.url(), /\/workloads\/paste\?cluster=lab-nomad/);
+    // One table, a row per cluster it runs on; the cluster it was opened for is open.
+    const placements = page.getByTestId("placements");
+    await eventually(async () => {
+      const hosts = await placements.locator("tbody tr[data-workload]").evaluateAll((els) => els.map((e) => e.dataset.host));
+      assert.deepEqual(hosts.sort(), ["home-nomad", "lab-nomad"]);
+    });
+    await placements.locator('tr[data-detail-of="paste"][data-host="lab-nomad"]').waitFor();
+    // A row opens and closes like the cluster page's.
+    const home = placements.locator('tr[data-detail-of="paste"][data-host="home-nomad"]');
+    const wasOpen = await home.count();
+    await placements.locator('tr[data-workload="paste"][data-host="home-nomad"]').click();
+    await eventually(async () => assert.equal(await home.count(), 1 - wasOpen));
+    assert.match(await page.getByTestId("workload-rollout").textContent(), /home-nomad: unchanged/);
+    await close();
+  });
+
   test("clusters list their workloads and executor, those needing a look first", async () => {
     const { page, close } = await open("/clusters");
     assert.equal(await heading(page), "Clusters");
     const rows = page.getByTestId("clusters-table").locator("tbody tr");
     await rows.first().waitFor();
-    assert.match(await page.locator(".page-head").textContent(), /2 clusters · 4 workloads · 1 needs attention/);
+    assert.match(await page.locator(".page-head").textContent(), /2 clusters · 5 workloads · 1 needs attention/);
     // lab-nomad has a workload and no host to speak for it.
     assert.equal(await rows.first().getAttribute("data-host"), "lab-nomad");
     assert.match(await rows.first().textContent(), /added through the API/);
@@ -195,10 +227,11 @@ describe("every page renders in demo mode", () => {
     // Notes sit under the summary.
     const summary = page.locator(".panel", { has: page.getByRole("heading", { name: "Summary", exact: true }) });
     await summary.getByRole("textbox", { name: "Notes" }).waitFor();
-    // The agents its executors selector matches, the last one marked.
+    // The agents its executors selector matches, the steward marked.
     const executors = page.getByTestId("cluster-executors");
     assert.equal(await executors.locator("li").count(), 4);
-    assert.match(await executors.locator('li[data-host="pi-1"]').textContent(), /last executor/);
+    assert.match(await executors.locator('li[data-host="pi-1"]').textContent(), /steward/);
+    assert.match(await page.getByTestId("cluster-steward").textContent(), /pi-1.*reaches the cluster · watched \d+m ago/s);
     assert.equal(await page.getByText("Would land in").count(), 0);
 
     const workloads = page.getByTestId("workloads");
@@ -236,6 +269,21 @@ describe("every page renders in demo mode", () => {
     // A host address lands on the cluster's own page, and the reverse.
     await page.goto(page.url().replace("/clusters/home-nomad", "/hosts/home-nomad"));
     await page.waitForURL(/\/clusters\/home-nomad/);
+    await close();
+  });
+
+  test("a cluster's lease moves to another agent, and the host holding it says so", async () => {
+    const { page, close } = await open("/hosts/pi-1");
+    await page.locator(".page-head").getByRole("link", { name: "stewards home-nomad" }).click();
+    assert.equal(await heading(page), "home-nomad");
+    await page.getByRole("button", { name: "Move stewardship…" }).click();
+    const dialog = page.getByRole("dialog");
+    const to = dialog.getByTestId("steward-to");
+    const target = await to.locator("option").nth(1).getAttribute("value");
+    await to.selectOption(target);
+    await dialog.getByRole("button", { name: "Move stewardship" }).click();
+    await eventually(async () => assert.match(await page.getByTestId("cluster-steward").textContent(), new RegExp(target)));
+    assert.match(await page.getByTestId("cluster-executors").locator(`li[data-host="${target}"]`).textContent(), /steward/);
     await close();
   });
 

@@ -418,6 +418,7 @@ mod tests {
                         progress: None,
                     })
                     .collect(),
+                ..Default::default()
             }),
             ..host("c")
         }
@@ -559,11 +560,13 @@ mod tests {
             bake_until: None,
             reboot: None,
             kind: Default::default(),
-            stage: 0,
+            step: 0,
+            workload: None,
             executor: None,
             bake: None,
             preview: false,
             drifted_from: None,
+            removal: false,
             needs_approval: stale,
             needs_attention: false,
             error_detail: None,
@@ -609,6 +612,7 @@ mod tests {
                 bake_until: None,
                 health_checks: vec![],
                 stages: 1,
+                unchanged: 0,
             }],
             plans: vec![],
             fleet: None,

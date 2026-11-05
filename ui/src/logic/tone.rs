@@ -121,10 +121,30 @@ pub struct BlockLook {
 pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook {
     let mut classes = vec!["block", host_state_class(entry.state)];
     let mut label = host_state_label(entry.state).to_string();
-    // A cluster is a virtual node: applied through a host speaking for it.
-    if entry.kind == buckle_api::TargetKind::Cluster {
+    // A workload (or an old-style cluster row) is round, so it never reads
+    // as a host.
+    if super::units::is_placement(entry) {
+        classes.push("block--cluster");
+        label = format!("workload, {label}");
+    } else if entry.kind == buckle_api::TargetKind::Cluster {
         classes.push("block--cluster");
         label = format!("cluster, {label}");
+    }
+    // Nothing to change: solid grey, so the eye lands on what moves. A
+    // unit that failed or was held keeps its colour.
+    if super::units::unchanged(entry)
+        && !entry.needs_attention
+        && !matches!(
+            entry.state,
+            HostRolloutState::Failed | HostRolloutState::Held | HostRolloutState::RolledBack
+        )
+    {
+        classes.push("block--unchanged");
+        label.push_str(", unchanged");
+    }
+    if entry.removal {
+        classes.push("block--removal");
+        label.push_str(", removing");
     }
 
     if entry.needs_approval
@@ -148,14 +168,22 @@ pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook 
             entry.state,
             HostRolloutState::Healthy | HostRolloutState::Baking | HostRolloutState::Applying
         );
-        if settled && host.health == HealthSummary::Failing {
+        // A placement fails with its own workload, not the whole cluster.
+        let failing = match &entry.workload {
+            Some(w) => host
+                .cluster_status
+                .as_ref()
+                .is_some_and(|s| s.failing.contains(w)),
+            None => host.health == HealthSummary::Failing,
+        };
+        if settled && failing {
             classes.push("block--regressed");
             label.push_str(", health failing");
         }
         // A rebooting host is offline by design: the state says so already.
         if host.connection == Connection::Offline
             && entry.state != HostRolloutState::Rebooting
-            && entry.kind != buckle_api::TargetKind::Cluster
+            && entry.kind == buckle_api::TargetKind::Host
         {
             classes.push("block--offline");
             label.push_str(", offline");
@@ -410,11 +438,13 @@ mod tests {
             bake_until: None,
             reboot: None,
             kind: Default::default(),
-            stage: 0,
+            step: 0,
+            workload: None,
             executor: None,
             bake: None,
             preview: false,
             drifted_from: None,
+            removal: false,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,

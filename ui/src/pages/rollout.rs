@@ -23,7 +23,7 @@ use crate::components::ui::Copyable;
 use crate::components::{
     Button, Changes, Commit, CommitCard, Confirm, Countdown, ErrorBlock, ErrorState, HostLink,
     HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill, Pipeline, PlanViews, Refresh,
-    RouteLink, RunReportView, SplitButton, TraceLink, use_toast,
+    RouteLink, RunReportView, Segmented, SplitButton, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::controls::{Decision, Standing, decisions, replan_label};
@@ -38,8 +38,10 @@ use crate::logic::tone::{
     Tone, awaited_reboot, host_error_headline, host_error_tone, host_state_label, host_state_tone,
     phase_state_label, phase_state_tone, rollout_finished, rollout_state_label, rollout_state_tone,
 };
+use crate::logic::units;
 use crate::store::use_live;
-use yew_router::prelude::use_navigator;
+use serde::{Deserialize, Serialize};
+use yew_router::prelude::{use_location, use_navigator};
 
 #[derive(Properties, PartialEq)]
 pub struct Props {
@@ -63,10 +65,40 @@ pub(crate) enum Ask {
     Continue(String, Vec<String>),
 }
 
+/// The Targets card's view, kept in the URL so a link shows what its
+/// sender saw (`?targets=all`).
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+struct TargetsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    targets: Option<String>,
+}
+
 #[function_component(RolloutPage)]
 pub fn rollout_page(props: &Props) -> Html {
     let now = use_now(5);
     let auth = use_auth();
+    let location = use_location();
+    let all_targets = location
+        .and_then(|l| l.query::<TargetsQuery>().ok())
+        .is_some_and(|q| q.targets.as_deref() == Some("all"));
+    let on_targets = {
+        let (navigator, id) = (use_navigator(), props.id.clone());
+        Callback::from(move |v: AttrValue| {
+            if let Some(n) = &navigator {
+                let route = Route::Rollout { id: id.clone() };
+                let _ = if v == "all" {
+                    n.replace_with_query(
+                        &route,
+                        &TargetsQuery {
+                            targets: Some("all".into()),
+                        },
+                    )
+                } else {
+                    n.replace_with_query(&route, &TargetsQuery::default())
+                };
+            }
+        })
+    };
     let detail = use_fetch(
         props.id.clone(),
         |id| async move { api::rollout(&id).await },
@@ -148,7 +180,7 @@ pub fn rollout_page(props: &Props) -> Html {
                 .iter()
                 .flat_map(|p| &p.hosts)
                 .filter(|h| h.state == HostRolloutState::Applying)
-                .map(|h| h.host.clone())
+                .map(units::key)
                 .collect();
             v.sort();
             v
@@ -185,6 +217,8 @@ pub fn rollout_page(props: &Props) -> Html {
         });
     }
     let actions = use_rollout_actions(id.clone(), detail.set.clone());
+    // The Plans card: Combined (the union) or By target (distinct plans).
+    let plans_view = use_state(|| AttrValue::from("combined"));
 
     let Some(d) = live else {
         return html! {
@@ -247,7 +281,7 @@ pub fn rollout_page(props: &Props) -> Html {
     </> };
 
     let approving: &[&RolloutPhase] = if finished { &[] } else { &wanting };
-    let plans_panel = plans_panel(approving, &d, &plan_groups, admin, &open);
+    let plans_panel = plans_panel(approving, &d, &plan_groups, admin, &open, &plans_view);
 
     let dialog = actions.dialog(&d, &plan_groups);
 
@@ -273,19 +307,32 @@ pub fn rollout_page(props: &Props) -> Html {
                 </div>
             }
             <Panel title="Pipeline" subtitle={{
-                let clusters = d.phases.iter().flat_map(|p| &p.hosts).filter(|h| h.kind == buckle_api::TargetKind::Cluster).count();
-                let targets = if clusters == 0 {
-                    format!("{} hosts", s.hosts_total)
-                } else {
-                    format!("{} and {}", count(s.hosts_total as usize - clusters, "host", "hosts"), count(clusters, "cluster", "clusters"))
-                };
-                format!("{targets} in {} stages · {}/{} done", d.phases.len(), s.hosts_done, s.hosts_total)
+                let all = || d.phases.iter().flat_map(|p| &p.hosts);
+                let workloads = all().filter(|h| units::is_placement(h)).count();
+                let clusters = all().filter(|h| h.kind == buckle_api::TargetKind::Cluster && h.workload.is_none()).count();
+                let hosts = all().count() - workloads - clusters;
+                let mut parts = vec![count(hosts, "host", "hosts")];
+                if workloads > 0 { parts.push(count(workloads, "workload", "workloads")); }
+                if clusters > 0 { parts.push(count(clusters, "cluster", "clusters")); }
+                let unchanged = all().filter(|h| units::unchanged(h)).count();
+                let mut line = format!("{} in {} stages · {}/{} done", parts.join(", "), d.phases.len(), s.hosts_done, s.hosts_total);
+                if unchanged > 0 { line.push_str(&format!(" · {unchanged} unchanged")); }
+                line
             }}>
                 <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
             </Panel>
             { plans_panel }
-            <Panel title="Hosts" subtitle="By stage. Click a row for the host's way through this rollout and its run report; hover a name for the host">
-                <HostTable detail={d.clone()} plans={plan_groups.clone()} admin={admin && !finished} on_ask={open.clone()} on_run={actions.now.clone()} {activity} {hosts} {now} />
+            <Panel title="Targets" subtitle={{
+                let all = || d.phases.iter().flat_map(|p| &p.hosts);
+                let unchanged = all().filter(|h| units::unchanged(h)).count();
+                format!("{} changed · {unchanged} unchanged · by stage; click a row for its way through this rollout", all().count() - unchanged)
+            }} actions={html! {
+                <Segmented label="Targets shown" testid="targets-view"
+                    value={if all_targets { "all" } else { "changed" }}
+                    options={vec![("changed".into(), "Changed".into()), ("all".into(), "All".into())]}
+                    on_change={on_targets} />
+            }}>
+                <HostTable detail={d.clone()} plans={plan_groups.clone()} admin={admin && !finished} on_ask={open.clone()} on_run={actions.now.clone()} {activity} {hosts} all={all_targets} {now} />
             </Panel>
             <Panel title="Timeline" subtitle="Rollout and phase transitions">
                 { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), s.started_at) }
@@ -627,7 +674,7 @@ fn approval_hosts(phase: &RolloutPhase) -> Vec<&RolloutHost> {
     phase
         .hosts
         .iter()
-        .filter(|h| !finished_state(h.state))
+        .filter(|h| !finished_state(h.state) && !units::unchanged(h))
         .filter(|h| !approved || h.needs_approval || h.plan_digest.is_none())
         .collect()
 }
@@ -687,6 +734,7 @@ fn plans_panel(
     plans: &[PlanGroup],
     admin: bool,
     open: &Callback<Ask>,
+    view: &UseStateHandle<AttrValue>,
 ) -> Html {
     if plans.is_empty() && wanting.is_empty() {
         return html! {};
@@ -694,20 +742,15 @@ fn plans_panel(
     let phases = Phases(
         d.phases
             .iter()
-            .map(|p| {
-                (
-                    p.name.clone(),
-                    p.hosts.iter().map(|h| h.host.clone()).collect(),
-                )
-            })
+            .map(|p| (p.name.clone(), p.hosts.iter().map(units::key).collect()))
             .collect(),
     );
     let clusters: Vec<String> = d
         .phases
         .iter()
         .flat_map(|p| &p.hosts)
-        .filter(|h| h.kind == buckle_api::TargetKind::Cluster)
-        .map(|h| h.host.clone())
+        .filter(|h| h.kind != buckle_api::TargetKind::Host)
+        .map(units::key)
         .collect();
     let in_phases = d.phases.iter().filter(|p| !p.hosts.is_empty()).count();
     let mut subtitle = format!(
@@ -719,16 +762,27 @@ fn plans_panel(
         let names: Vec<&str> = wanting.iter().map(|p| p.name.as_str()).collect();
         subtitle.push_str(&format!(" · approval wanted: {}", names.join(", ")));
     }
-    let (actions, notes) = next_approval(wanting)
+    let (approve, notes) = next_approval(wanting)
         .map(|p| approval(p, d, plans, admin, open))
         .unwrap_or_default();
+    // The toggle only where there is a union to switch from.
+    let union = d.fleet.as_ref().is_some_and(|f| !f.hosts.is_empty());
+    let by_plan = !union || **view == "by-target";
+    let actions = html! { <>
+        if union && !plans.is_empty() {
+            <Segmented label="Plans shown" testid="plans-view" value={(**view).clone()}
+                options={vec![("combined".into(), "Combined".into()), ("by-target".into(), "By target".into())]}
+                on_change={{ let view = view.clone(); Callback::from(move |v| view.set(v)) }} />
+        }
+        { approve }
+    </> };
     html! {
         <Panel title="Plans" id="plans" {subtitle} {actions}
             class={classes!((!wanting.is_empty()).then_some("panel--approval"))}>
             { notes }
             if !plans.is_empty() {
                 <PlanViews fleet={d.fleet.clone()} groups={plans.to_vec()} {phases}
-                    open_destructive={!wanting.is_empty()} clusters={clusters} />
+                    open_destructive={!wanting.is_empty()} clusters={clusters} {by_plan} />
             }
         </Panel>
     }
@@ -751,7 +805,7 @@ fn approval(
     let (deferred, missing): (Vec<&String>, Vec<&String>) =
         scope.without_plan.iter().partition(|name| {
             phase.hosts.iter().any(|h| {
-                &h.host == *name && (h.kind == buckle_api::TargetKind::Cluster || h.stage > 0)
+                units::key(h) == **name && (h.kind != buckle_api::TargetKind::Host || h.step > 0)
             })
         });
     let names = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
@@ -928,7 +982,7 @@ fn dialog(
                 .phases
                 .iter()
                 .flat_map(|p| &p.hosts)
-                .find(|h| &h.host == host)
+                .find(|h| units::key(h) == *host)
                 .map(|h| replan_label(h.state, h.plan_digest.is_some()))
                 .unwrap_or("Re-plan");
             let (label, danger, body) = match *action {
@@ -1144,39 +1198,95 @@ struct HostTableProps {
     activity: BTreeMap<String, String>,
     /// The fleet's hosts, for each name's hover card.
     hosts: BTreeMap<String, HostSummary>,
+    /// Every unit, else only those that change something (or went wrong).
+    all: bool,
     now: DateTime<Utc>,
+}
+
+/// A stage's rows, split by dependency step where it has more than one.
+fn step_groups<'a>(
+    st: &pipeline::Stage<'a>,
+    all: bool,
+) -> Vec<(Option<u32>, Vec<&'a RolloutHost>, usize)> {
+    let mut steps: Vec<u32> = st.hosts().map(|h| h.step).collect();
+    steps.sort_unstable();
+    steps.dedup();
+    let split = steps.len() > 1;
+    let units: Vec<&'a RolloutHost> = st
+        .targets
+        .iter()
+        .copied()
+        .chain(st.clusters.iter().flat_map(|c| c.units.iter().copied()))
+        .collect();
+    let group = |of: Vec<&'a RolloutHost>| {
+        let hidden = of
+            .iter()
+            .filter(|h| !all && !units::changed_view(h))
+            .count();
+        let shown: Vec<_> = of
+            .into_iter()
+            .filter(|h| all || units::changed_view(h))
+            .collect();
+        (shown, hidden)
+    };
+    if !split {
+        let (shown, hidden) = group(units);
+        return vec![(None, shown, hidden)];
+    }
+    steps
+        .into_iter()
+        .map(|s| {
+            let (shown, hidden) = group(units.iter().copied().filter(|h| h.step == s).collect());
+            (Some(s), shown, hidden)
+        })
+        .collect()
 }
 
 #[function_component(HostTable)]
 fn host_table(props: &HostTableProps) -> Html {
     let expanded = use_state(|| None::<String>);
     let p = layout(&props.detail);
-    let groups = p.stages.iter().filter(|st| st.counts.total > 0).map(|st| {
+    let all = props.all;
+    let groups = p.stages.iter().filter(|st| st.counts.total > 0).flat_map(|st| {
         let phase = st.phase;
-        let c = &st.counts;
+        let c = st.counts.clone();
         // Said once on the stage's heading instead of on each of its rows.
         let all_need_approval = c.needs_approval == c.total;
-        let rows = st.hosts().map(move |h| (phase, h, all_need_approval));
-        let head = html! {
-            <tr class="table__group" key={format!("stage-{}", phase.name)} data-stage={phase.name.clone()}>
-                <th colspan="7" scope="colgroup">
-                    <span class="group-head">
-                        <span class="group-head__name">{ phase.name.clone() }</span>
-                        <Pill tone={phase_state_tone(phase.state)} label={phase_state_label(phase.state)} />
-                        <Meter segments={stage_segments(c)} total={c.total} />
-                        <span class="muted small">{ format!("{}/{} done", c.healthy, c.total) }</span>
-                        if all_need_approval { <span class="badge badge--info">{ "needs approval" }</span> }
-                    </span>
-                </th>
-            </tr>
-        };
-        (head, rows)
+        step_groups(st, all).into_iter().enumerate().map(move |(i, (step, rows, hidden))| {
+            let first = i == 0;
+            let key = match step {
+                Some(s) => format!("stage-{}-{s}", phase.name),
+                None => format!("stage-{}", phase.name),
+            };
+            let head = html! {
+                <tr class="table__group" {key} data-stage={phase.name.clone()} data-step={step.map(|s| s.to_string())}>
+                    <th colspan="7" scope="colgroup">
+                        <span class="group-head">
+                            <span class="group-head__name">{ match step {
+                                Some(s) => format!("{} · step {}", phase.name, s + 1),
+                                None => phase.name.clone(),
+                            } }</span>
+                            if first {
+                                <Pill tone={phase_state_tone(phase.state)} label={phase_state_label(phase.state)} />
+                                <Meter segments={stage_segments(&c)} total={c.total} />
+                                <span class="muted small">{ format!("{}/{} done", c.healthy, c.total) }</span>
+                                if all_need_approval { <span class="badge badge--info">{ "needs approval" }</span> }
+                            }
+                            if hidden > 0 {
+                                <span class="muted small" data-testid="hidden-unchanged">{ format!("{hidden} unchanged not shown") }</span>
+                            }
+                        </span>
+                    </th>
+                </tr>
+            };
+            (head, rows.into_iter().map(move |h| (phase, h, all_need_approval)))
+        }).collect::<Vec<_>>()
     });
     html! {
         <div class="table-wrap">
             <table class="table table--hosts">
                 <thead><tr>
-                    <th scope="col">{ "Host" }</th>
+                    <th scope="col">{ "Target" }</th>
                     <th scope="col">{ "Wave" }</th>
                     <th scope="col">{ "State" }</th>
                     <th scope="col">{ "Plan" }</th>
@@ -1188,9 +1298,10 @@ fn host_table(props: &HostTableProps) -> Html {
                     { for groups.map(|(head, rows)| html! { <>
                     { head }
                     { for rows.map(|(phase, h, all_need_approval)| {
-                        let open = expanded.as_deref() == Some(h.host.as_str());
+                        let unit = units::key(h);
+                        let open = expanded.as_deref() == Some(unit.as_str());
                         let toggle = {
-                            let (expanded, name) = (expanded.clone(), h.host.clone());
+                            let (expanded, name) = (expanded.clone(), unit.clone());
                             Callback::from(move |_: MouseEvent| expanded.set(if open { None } else { Some(name.clone()) }))
                         };
                         // A click anywhere on the row opens it, except on
@@ -1209,11 +1320,12 @@ fn host_table(props: &HostTableProps) -> Html {
                             })
                         };
                         html! { <>
-                            <tr key={h.host.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))} onclick={on_row}>
-                                <td><HostLink id={h.host.clone()} host={props.hosts.get(&h.host).cloned()} now={props.now} /></td>
+                            <tr key={unit.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))} onclick={on_row}
+                                data-unit={unit.clone()} data-unchanged={units::unchanged(h).then_some("true")}>
+                                <td>{ unit_cell(h, props.hosts.get(&h.host), props.now) }</td>
                                 <td class="muted">{ h.wave.map(|w| w.to_string()).unwrap_or_else(|| "—".into()) }</td>
                                 <td>
-                                    <HoverTip tip={health_tip(phase, h)} label={format!("{}: {}", h.host, host_state_label(h.state))}>
+                                    <HoverTip tip={health_tip(phase, h)} label={format!("{}: {}", units::name(h), host_state_label(h.state))}>
                                         <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} />
                                     </HoverTip>
                                     if h.needs_approval && !all_need_approval { <span class="badge badge--info">{ "needs approval" }</span> }
@@ -1226,18 +1338,22 @@ fn host_table(props: &HostTableProps) -> Html {
                                     if let Some(r) = awaited_reboot(h, props.now) {
                                         <span class="small muted" title={format!("fails unless back by {}", timestamp(r.until))}>{ " back within " }<Countdown until={r.until} /></span>
                                     }
-                                    if let Some(now) = props.activity.get(&h.host).filter(|_| h.state == HostRolloutState::Applying) {
+                                    if let Some(now) = props.activity.get(&unit).filter(|_| h.state == HostRolloutState::Applying) {
                                         <span class="cell-sub mono" data-testid="host-activity">{ now.clone() }</span>
                                     }
                                     if let Some(w) = crate::logic::clusters::waiting(phase, h) {
                                         <span class="cell-sub" data-testid="host-waiting">{ w.describe() }</span>
-                                    } else if h.kind == buckle_api::TargetKind::Cluster && let Some(e) = &h.executor {
+                                    } else if h.kind != buckle_api::TargetKind::Host && let Some(e) = &h.executor {
                                         <span class="cell-sub">{ "via " }<span class="mono">{ e.clone() }</span></span>
                                     }
                                 </td>
                                 <td>
                                     <span class="nowrap">
-                                        { host_tally(h, &props.plans).map(|tally| html! { <Changes {tally} /> }).unwrap_or_default() }
+                                        if units::unchanged(h) {
+                                            <span class="muted small">{ "unchanged" }</span>
+                                        } else {
+                                            { host_tally(h, &props.plans).map(|tally| html! { <Changes {tally} /> }).unwrap_or_default() }
+                                        }
                                         { h.plan_digest.as_deref().map(|d| html! {
                                             <span class="mono muted small plan-digest" title={format!("plan {d}")}>{ short(d) }</span>
                                         }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
@@ -1258,17 +1374,17 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td title={timestamp(h.updated_at)}>{ relative(h.updated_at, props.now) }</td>
                                 <td class="row-controls">
                                     if props.admin {
-                                        <SplitButton items={host_menu(h, &props.on_ask)} small=true menu_label={format!("More actions for {}", h.host)} testid="host-actions" />
+                                        <SplitButton items={host_menu(h, &props.on_ask)} small=true menu_label={format!("More actions for {}", units::name(h))} testid="host-actions" />
                                     }
                                     <button type="button" class="icon-btn row-toggle" onclick={toggle}
-                                        aria-expanded={open.to_string()} aria-label={format!("Details for {}", h.host)}
+                                        aria-expanded={open.to_string()} aria-label={format!("Details for {}", units::name(h))}
                                         title={if open { "Hide details" } else { "Show details" }}>
                                         { icons::chevron() }
                                     </button>
                                 </td>
                             </tr>
                             if open {
-                                <tr class="table__detail" key={format!("{}-detail", h.host)}>
+                                <tr class="table__detail" key={format!("{unit}-detail")}>
                                     <td colspan="7">
                                         <HostDetailRow detail={props.detail.clone()} host={h.clone()} admin={props.admin} on_run={props.on_run.clone()} now={props.now} />
                                     </td>
@@ -1297,7 +1413,7 @@ fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
             Callback::from(move |_: MouseEvent| on_ask.emit(a.clone())),
         )
     };
-    let host = || h.host.clone();
+    let host = || units::key(h);
     let mut items = Vec::new();
     if can_replan(h.state) {
         let label = format!("{}…", replan_label(h.state, h.plan_digest.is_some()));
@@ -1345,7 +1461,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         .detail
         .events
         .iter()
-        .filter(|e| e.host.as_deref() == Some(h.host.as_str()))
+        .filter(|e| e.host.as_deref() == Some(h.host.as_str()) && e.workload == h.workload)
         .collect();
     // The host's run in this rollout, once it has one.
     let has_run = h.run_id.is_some()
@@ -1361,7 +1477,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
     let run = use_run_report(
         has_run.then(|| RunSource::Rollout {
             rollout: rollout_id.clone(),
-            host: h.host.clone(),
+            host: units::key(h),
             run: h.run_id.clone(),
         }),
         None,
@@ -1378,7 +1494,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         html! {
             <div class="error-block__actions">
                 <SplitButton small=true testid="host-replan" menu_label="More ways to retry" items={
-                    std::iter::once(MenuItem::new(label, run(Ask::Host("retry", h.host.clone()))).kind(Kind::Primary))
+                    std::iter::once(MenuItem::new(label, run(Ask::Host("retry", units::key(h)))).kind(Kind::Primary))
                         .chain((others > 1 && h.state == HostRolloutState::Failed).then(||
                             MenuItem::new(format!("Retry all {others} failed"), run(Ask::Action("retry")))))
                         .collect::<Vec<_>>()
@@ -1409,7 +1525,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
             <div class="host-row__run" data-testid="rollout-host-run">
                 <h4 class="subhead">{ "Run in this rollout" }</h4>
                 { match (&run.report, &run.error) {
-                    (Some(report), _) => html! { <RunReportView report={report.clone()} in_rollout=true workloads={props.host.kind == buckle_api::TargetKind::Cluster} /> },
+                    (Some(report), _) => html! { <RunReportView report={report.clone()} in_rollout=true workloads={props.host.kind != buckle_api::TargetKind::Host} /> },
                     (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={run.reload.clone()} /> },
                     (None, None) if !has_run => html! { <p class="muted">{ "No run yet: the host has not started applying in this rollout." }</p> },
                     (None, None) if run.settled => html! { <p class="muted">{ "The server has no run report for this host in this rollout." }</p> },
@@ -1417,5 +1533,20 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
                 } }
             </div>
         </div>
+    }
+}
+
+/// A Targets row's name: a host's hover card, or a workload linking to its
+/// page with the cluster it runs on as a muted suffix.
+fn unit_cell(h: &RolloutHost, target: Option<&HostSummary>, now: DateTime<Utc>) -> Html {
+    match units::cluster(h) {
+        Some(cluster) => html! {
+            <span class="unit-name">
+                <RouteLink to={Route::unit(h)} query={crate::components::pipeline::unit_query(h)}>{ units::name(h).to_owned() }</RouteLink>
+                <span class="muted">{ format!(" on {cluster}") }</span>
+                if h.removal { { " " }<span class="badge" title="It left the configuration; this removes it from the cluster">{ "removing" }</span> }
+            </span>
+        },
+        None => html! { <HostLink id={h.host.clone()} host={target.cloned()} {now} /> },
     }
 }

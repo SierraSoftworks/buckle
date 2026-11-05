@@ -65,11 +65,24 @@ impl LocalTransport {
 /// Logs a report the way local mode shows it.
 pub fn log_report(report: &Report) {
     match report {
-        Report::For { target, report } => {
-            let _span = tracing::info_span!("target", %target).entered();
+        Report::For {
+            target,
+            workload,
+            report,
+        } => {
+            let _span =
+                tracing::info_span!("target", %target, workload = workload.as_deref().unwrap_or(""))
+                    .entered();
             log_report(report)
         }
         Report::Facts(_) => tracing::debug!("facts collected"),
+        Report::TargetStatus { reachable, error } => {
+            tracing::info!(
+                reachable,
+                error = error.as_deref().unwrap_or(""),
+                "cluster reachability"
+            )
+        }
         Report::Heartbeat { busy, .. } => tracing::debug!(busy, "heartbeat"),
         Report::Plan(plan) => tracing::info!(
             revision = %plan.revision.short(),
@@ -198,12 +211,14 @@ fn assignment(revision: RevisionId, secrets: Vec<WireSecret>) -> [Instruction; 3
             secrets,
             tree_digest: None,
             target: None,
+            workload: None,
             cluster: None,
         },
         Instruction::RequestPlan {
             revision: revision.clone(),
             select: None,
             target: None,
+            workload: None,
         },
         Instruction::Apply {
             revision,
@@ -216,6 +231,7 @@ fn assignment(revision: RevisionId, secrets: Vec<WireSecret>) -> [Instruction; 3
             rollout_id: None,
             phase: None,
             target: None,
+            workload: None,
         },
     ]
 }

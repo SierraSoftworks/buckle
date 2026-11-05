@@ -27,7 +27,7 @@ pub use kv::Kv;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
-pub use runs::{ABANDONED, RUNNING, RunEvent, RunRecord, Runs};
+pub use runs::{ABANDONED, RUNNING, RolloutRunIds, RunEvent, RunRecord, Runs};
 
 use buckle_core::Result;
 use chrono::{DateTime, Utc};
@@ -290,6 +290,40 @@ ALTER TABLE runs ADD COLUMN action TEXT;
     // server counts older revisions from their trees on start).
     r#"
 ALTER TABLE revisions ADD COLUMN workload_count INTEGER;
+"#,
+    // 11: a rollout moves a cluster one workload placement at a time, so a
+    // cluster has one row per workload: `workload` joins the key ('' for a
+    // host's row and for a whole-cluster row). SQLite cannot alter a primary
+    // key in place, so the table is rebuilt.
+    r#"
+CREATE TABLE rollout_hosts_v11 (
+    rollout TEXT NOT NULL,
+    host TEXT NOT NULL,
+    workload TEXT NOT NULL DEFAULT '',
+    phase TEXT NOT NULL,
+    wave INTEGER,
+    state TEXT NOT NULL,
+    plan_digest TEXT,
+    plan TEXT,
+    result TEXT,
+    health TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (rollout, host, workload)
+);
+INSERT INTO rollout_hosts_v11 (rollout, host, workload, phase, wave, state, plan_digest, plan, result, health, created_at, updated_at, detail)
+SELECT rollout, host, '', phase, wave, state, plan_digest, plan, result, health, created_at, updated_at, detail FROM rollout_hosts ORDER BY rowid;
+DROP TABLE rollout_hosts;
+ALTER TABLE rollout_hosts_v11 RENAME TO rollout_hosts;
+CREATE INDEX rollout_hosts_host ON rollout_hosts(host, state);
+"#,
+    // 12: a cluster target's steward (the host agent leasing it) and whether
+    // the cluster answers it (`reachable`/`unreachable`, with the error).
+    r#"
+ALTER TABLE hosts ADD COLUMN steward TEXT;
+ALTER TABLE hosts ADD COLUMN reachable TEXT;
+ALTER TABLE hosts ADD COLUMN reachable_error TEXT;
 "#,
 ];
 

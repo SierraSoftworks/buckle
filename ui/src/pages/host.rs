@@ -267,6 +267,15 @@ pub fn host_page(props: &Props) -> Html {
     let subtitle = html! {
         <div class="rollout-meta">
             { host_state_pills(h) }
+            // The clusters whose lease it holds.
+            { for fleet.as_ref().into_iter().flat_map(|f| &f.clusters).filter(|c| {
+                c.cluster_status.as_ref().and_then(|s| s.steward.as_deref()) == Some(h.id.as_str())
+            }).map(|c| html! {
+                <RouteLink to={Route::Cluster { id: c.id.clone() }} classes={classes!("pill-link")}>
+                    <Pill tone={Tone::Info} label={format!("stewards {}", c.id)}
+                        title={format!("It holds {}'s lease: it watches the cluster and runs its workloads and actions.", c.id)} />
+                </RouteLink>
+            }) }
             <span class="muted">{ format!("{} · last seen {}", if offline { "offline" } else { "online" }, relative_opt(h.last_seen, now)) }</span>
         </div>
     };

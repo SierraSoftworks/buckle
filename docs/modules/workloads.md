@@ -21,11 +21,15 @@ The directory name must equal the workload's `name`. `files/` holds the specs th
 list names; files ending in `.j2` are rendered as [templates](./expressions.md#templates) first.
 
 ::: tip Status
-Nomad and Kubernetes workloads are planned, applied and health checked through one of the
-cluster's executors, which needs no cluster state of its own: the server sends the cluster's spec
-and secrets before each request, and ownership is read back from the cluster. A workload's extra
+Nomad and Kubernetes workloads are planned, applied and health checked through the cluster's
+[steward](./fleet.md#stewards), which needs no cluster state of its own: the server sends the
+cluster's spec and secrets before each request, and ownership is read back from the cluster. A workload's extra
 `health` checks, `restart_on` and cluster `scope` are not yet applied by executors.
 :::
+
+In the UI, **Workloads** lists every workload across the fleet with how it reads on each
+cluster that runs it; a workload's page has a Placements table, one row per cluster, with its checks, its latest run,
+its resources and its actions. A rollout draws each workload on each cluster as a unit of its own.
 
 ## workload.yaml
 
@@ -33,6 +37,7 @@ and secrets before each request, and ownership is read back from the cluster. A 
 name: paste
 description: The paste service and its volume.
 when: 'cluster.labels.site == "home"'      # over cluster.*, never host.*
+labels: { tier: canary }                    # workload.labels.* in phase selectors and groups
 needs: ['module:docker', 'workload:traefik']
 tags: [web]
 vars:
@@ -55,7 +60,8 @@ removal: stop
 | Key | Meaning |
 |---|---|
 | `when` | Selects the clusters the workload runs on, over [`cluster.*`](./expressions.md#cluster-selectors). Absent: every cluster. `buckle validate` rejects a `when` that selects a declared cluster of the other scheduler (a job on a Kubernetes cluster). |
-| `needs` | Order within the layer (a bare name is another workload) and across it (`module:NAME` waits for a module on the cluster's hosts; a module's `needs: ['workload:NAME']` waits for a workload). Cycles are rejected. A cluster's workloads apply concurrently unless one needs another, or an earlier workload creates the namespace or node pool it uses. |
+| `labels` | Labels of the workload itself (strings, numbers or booleans), read as `workload.labels.*` where a rollout phase or a group selects **placements** (the workload on one cluster) together with `workload.name`, `workload.tags`, `workload.groups` and the hosting cluster's `cluster.*`. A `when` cannot select on them: it decides which clusters run the workload before any placement exists. |
+| `needs` | Order within the layer (a bare name is another workload) and across it (`module:NAME` waits for a module on the cluster's hosts; a module's `needs: ['workload:NAME']` waits for a workload). Cycles are rejected. In a rollout each edge is a [stage](../operations/rollouts.md#stages-inside-a-phase): the needed placement applies and bakes first. A need on a workload in a later phase waits for it to be running already (`rollout.dependencies.across_phases`). |
 | `vars` | Defaults, overridden by the fleet's `vars` overlays; on Nomad, those a job declares a `variable` for become its HCL2 variables (fleet overlays reach every target, and Nomad refuses undeclared ones). |
 | `files` | Files passed to every job as string variables, by variable name (`files: { app_config: config.yaml }`, read as `var.app_config`); see [config files](#config-files). |
 | `resources` | The objects the workload consists of, applied in list order and removed in reverse ([below](#resources)). |

@@ -32,8 +32,8 @@ pub use planner::action_step_key;
 pub use targets::{selected_workloads, validate_targets};
 pub use validate::{
     HostSummary, ValidationIssue, ValidationReport, cluster_context, host_context,
-    reads_unknown_facts, secret_names_for_cluster, secret_names_for_host, validate, validate_host,
-    validate_with_facts, with_groups,
+    placement_context, reads_unknown_facts, secret_names_for_cluster, secret_names_for_host,
+    validate, validate_host, validate_with_facts, with_groups,
 };
 
 use crate::error::ErrorReport;

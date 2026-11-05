@@ -901,3 +901,50 @@
     gap: 0.4rem;
   }
 }
+
+// Workloads: a placement chip per cluster, its dot in the placement's tone.
+.dot {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tone, var(--neutral));
+}
+
+.placement-chip {
+  text-decoration: none;
+}
+
+// The meter sits on the centre line of the row's first line of text.
+.workloads__health .meter {
+  width: 120px;
+  margin-block: calc((1lh - 6px) / 2) 0.35rem;
+}
+
+// A card or row scrolled to by its anchor clears the sticky app bar.
+.panel[id],
+tr[id] {
+  scroll-margin-top: calc(var(--bar-h) + 1rem);
+}
+
+.workload-summary {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.4rem 1rem;
+  margin: 0;
+  font-size: 0.85rem;
+
+  dt {
+    color: var(--fg-2);
+  }
+
+  dd {
+    margin: 0;
+  }
+}
+
+// A pill that opens what it names.
+.pill-link {
+  text-decoration: none;
+}

@@ -127,12 +127,37 @@ pub struct RolloutPolicy {
     pub phases: Vec<PhasePolicy>,
     #[serde(default)]
     pub stragglers: StragglersPolicy,
+    /// How `needs` edges that cross phases are treated.
+    #[serde(default)]
+    pub dependencies: DependenciesPolicy,
 }
 
 impl RolloutPolicy {
     fn default_settle() -> Duration {
         Duration::from_secs(120)
     }
+}
+
+/// How a rollout treats a target whose `needs` point at a target of a later
+/// phase (a workload needing one the next phase rolls out).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependenciesPolicy {
+    #[serde(default)]
+    pub across_phases: AcrossPhases,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AcrossPhases {
+    /// Validation warns; the dependent waits for what it needs to be
+    /// running (applied and healthy, in this rollout or before it) and
+    /// otherwise misses its phase and finishes in the stragglers stage.
+    #[default]
+    Warn,
+    /// Validation rejects the revision; a dependent whose need is not yet
+    /// running when its step opens fails.
+    Refuse,
 }
 
 impl Default for RolloutPolicy {
@@ -146,6 +171,7 @@ impl Default for RolloutPolicy {
             local_rollback: LocalRollbackPolicy::default(),
             phases: Vec::new(),
             stragglers: StragglersPolicy::default(),
+            dependencies: DependenciesPolicy::default(),
         }
     }
 }

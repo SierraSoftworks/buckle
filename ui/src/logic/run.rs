@@ -796,8 +796,13 @@ impl RolloutActivity {
                 return false;
             };
             for event in events {
+                // A placement (`cluster/workload`) shares its cluster's
+                // updates with the cluster's other placements: its own are
+                // those of its run.
+                let (target, workload) = buckle_api::split_placement_key(&h.host);
                 if let LiveEvent::RunProgress { progress: p } = &*event
-                    && p.host == h.host
+                    && p.host == target
+                    && (workload.is_none() || p.run_id == h.report.id)
                     && p.rollout_id.as_deref() == Some(rollout.as_str())
                 {
                     h.now = match apply_progress(&mut h.report, p) {

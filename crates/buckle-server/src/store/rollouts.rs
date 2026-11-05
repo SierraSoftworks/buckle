@@ -64,9 +64,10 @@ fn r_record(raw: RawRollout) -> Result<RolloutRecord> {
     })
 }
 
-const H_COLUMNS: &str = "rollout, host, phase, wave, state, plan_digest, plan, result, health, created_at, updated_at, detail";
+const H_COLUMNS: &str = "rollout, host, workload, phase, wave, state, plan_digest, plan, result, health, created_at, updated_at, detail";
 
 type RawHost = (
+    String,
     String,
     String,
     String,
@@ -95,15 +96,30 @@ fn h_row(r: &Row<'_>) -> rusqlite::Result<RawHost> {
         r.get(9)?,
         r.get(10)?,
         r.get(11)?,
+        r.get(12)?,
     ))
 }
 
 fn h_record(raw: RawHost) -> Result<RolloutHostRecord> {
-    let (rollout, host, phase, wave, state, digest, plan, result, health, created, updated, detail) =
-        raw;
+    let (
+        rollout,
+        host,
+        workload,
+        phase,
+        wave,
+        state,
+        digest,
+        plan,
+        result,
+        health,
+        created,
+        updated,
+        detail,
+    ) = raw;
     Ok(RolloutHostRecord {
         rollout,
         host,
+        workload,
         phase,
         wave,
         state: HostPhase::parse(&state).ok_or_else(|| {
@@ -254,14 +270,15 @@ impl<'c> Rollouts<'c> {
             .transpose()
     }
 
-    /// Inserts or replaces a host row.
+    /// Inserts or replaces a row (a host's, or one placement of a cluster's).
     pub fn save_host(&self, h: &RolloutHostRecord) -> Result<()> {
         self.conn
             .execute(
-                &format!("INSERT INTO rollout_hosts ({H_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(rollout, host) DO UPDATE SET phase = excluded.phase, wave = excluded.wave, state = excluded.state, plan_digest = excluded.plan_digest, plan = excluded.plan, result = excluded.result, health = excluded.health, updated_at = excluded.updated_at, detail = excluded.detail"),
+                &format!("INSERT INTO rollout_hosts ({H_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(rollout, host, workload) DO UPDATE SET phase = excluded.phase, wave = excluded.wave, state = excluded.state, plan_digest = excluded.plan_digest, plan = excluded.plan, result = excluded.result, health = excluded.health, updated_at = excluded.updated_at, detail = excluded.detail"),
                 params![
                     h.rollout,
                     h.host,
+                    h.workload,
                     h.phase,
                     h.wave,
                     h.state.as_str(),
@@ -304,13 +321,41 @@ impl<'c> Rollouts<'c> {
             .collect())
     }
 
-    /// The host row of `host` in `rollout`.
-    pub fn host(&self, rollout: &str, host: &str) -> Result<Option<RolloutHostRecord>> {
+    /// The row of `host` in `rollout`: the host's own, or, with `workload`,
+    /// that placement's (an empty `workload` is a host's or a whole
+    /// cluster's row).
+    pub fn host(
+        &self,
+        rollout: &str,
+        host: &str,
+        workload: &str,
+    ) -> Result<Option<RolloutHostRecord>> {
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {H_COLUMNS} FROM rollout_hosts WHERE rollout = ?1 AND host = ?2"),
-                params![rollout, host],
+                &format!("SELECT {H_COLUMNS} FROM rollout_hosts WHERE rollout = ?1 AND host = ?2 AND workload = ?3"),
+                params![rollout, host, workload],
+                h_row,
+            )
+            .optional()
+            .map_err(db_error)?;
+        raw.map(h_record).transpose()
+    }
+
+    /// The row of `host` in `rollout` whose plan is `plan_digest`: the one a
+    /// run of that plan belongs to (a cluster rolled by placements has a row,
+    /// with a plan of its own, per workload).
+    pub fn host_by_plan(
+        &self,
+        rollout: &str,
+        host: &str,
+        plan_digest: &str,
+    ) -> Result<Option<RolloutHostRecord>> {
+        let raw = self
+            .conn
+            .query_row(
+                &format!("SELECT {H_COLUMNS} FROM rollout_hosts WHERE rollout = ?1 AND host = ?2 AND plan_digest = ?3 ORDER BY rowid LIMIT 1"),
+                params![rollout, host, plan_digest],
                 h_row,
             )
             .optional()
@@ -332,7 +377,8 @@ impl<'c> Rollouts<'c> {
             .map_err(db_error)
     }
 
-    /// Removes a host row (a forgotten host).
+    /// Removes a target's rows (a forgotten host; every placement of a
+    /// forgotten cluster).
     pub fn delete_host(&self, rollout: &str, host: &str) -> Result<()> {
         self.conn
             .execute(
@@ -403,6 +449,26 @@ impl Rollouts<'_> {
             .map(h_record)
             .transpose()
     }
+
+    /// What a target last converged to, row by row: a host's (or a whole
+    /// cluster's) latest healthy row, and for a cluster rolled by placements
+    /// the latest healthy row of each workload, newest first.
+    pub fn latest_healthy_rows_for_host(&self, host: &str) -> Result<Vec<RolloutHostRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {H_COLUMNS} FROM rollout_hosts h WHERE host = ?1 AND state = 'healthy' \
+                 AND updated_at = (SELECT MAX(updated_at) FROM rollout_hosts x WHERE x.host = h.host AND x.workload = h.workload AND x.state = 'healthy') \
+                 ORDER BY updated_at DESC, rowid DESC"
+            ))
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![host], h_row)
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        rows.into_iter().map(h_record).collect()
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +497,7 @@ mod tests {
         RolloutHostRecord {
             rollout: rollout.into(),
             host: host.into(),
+            workload: String::new(),
             phase: "all".into(),
             wave: None,
             state: HostPhase::PlanPending,

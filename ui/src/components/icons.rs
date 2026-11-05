@@ -39,6 +39,15 @@ pub fn hosts() -> Html {
     </> })
 }
 
+/// Stacked boxes: workloads.
+pub fn workloads() -> Html {
+    icon(html! { <>
+        <path d="M12 3l8 4-8 4-8-4z" />
+        <path d="M4 12l8 4 8-4" />
+        <path d="M4 17l8 4 8-4" />
+    </> })
+}
+
 /// Three nodes joined: a cluster.
 pub fn clusters() -> Html {
     icon(html! { <>

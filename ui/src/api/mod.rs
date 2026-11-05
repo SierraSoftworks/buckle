@@ -302,6 +302,20 @@ pub async fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiE
 }
 
 /// `approve` (a pending registration), `pause` or `resume`.
+/// Moves a cluster's lease to `host`, noting `note` in the audit log.
+pub async fn move_steward(id: &str, host: &str, note: String) -> Result<HostSummary, ApiError> {
+    demo!(demo_store::move_steward(id, host, &note));
+    write(
+        Method::Post,
+        &format!("/targets/{}/steward", enc(id)),
+        Some(&buckle_api::StewardRequest {
+            host: host.to_owned(),
+            note,
+        }),
+    )
+    .await
+}
+
 pub async fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError> {
     demo!(demo_store::host_action(id, action));
     write::<(), _>(
@@ -504,19 +518,30 @@ pub async fn rollout_host_action(
 ) -> Result<RolloutDetail, ApiError> {
     demo!(demo_store::rollout_host_action(id, host, action, note));
     let body = ActionRequest { note: note.into() };
-    write(
-        Method::Post,
-        &format!("/rollouts/{}/hosts/{}/{}", enc(id), enc(host), enc(action)),
-        Some(&body),
+    write(Method::Post, &unit_url(id, host, action), Some(&body)).await
+}
+
+/// A rollout unit's route: `host` is a host, or a placement's
+/// `cluster/workload` key, which the server takes as the cluster with
+/// `?workload=`.
+fn unit_url(id: &str, host: &str, tail: &str) -> String {
+    let (target, workload) = buckle_api::split_placement_key(host);
+    let query = workload
+        .map(|w| format!("?workload={}", enc(w)))
+        .unwrap_or_default();
+    format!(
+        "/rollouts/{}/hosts/{}/{}{query}",
+        enc(id),
+        enc(target),
+        enc(tail)
     )
-    .await
 }
 
 /// `GET /rollouts/{id}/hosts/{host}/report`: the host's run in this
 /// rollout, live while it applies.
 pub async fn rollout_host_report(id: &str, host: &str) -> Result<RunReport, ApiError> {
     demo!(demo_store::rollout_host_report(id, host));
-    get(&format!("/rollouts/{}/hosts/{}/report", enc(id), enc(host))).await
+    get(&unit_url(id, host, "report")).await
 }
 
 /// Retries a host with the named failing checks waived for this rollout.
@@ -526,12 +551,7 @@ pub async fn continue_host(
     request: &ContinueRequest,
 ) -> Result<RolloutDetail, ApiError> {
     demo!(demo_store::continue_host(id, host, request));
-    write(
-        Method::Post,
-        &format!("/rollouts/{}/hosts/{}/continue", enc(id), enc(host)),
-        Some(request),
-    )
-    .await
+    write(Method::Post, &unit_url(id, host, "continue"), Some(request)).await
 }
 
 // ------------------------------------------------------------------ audit

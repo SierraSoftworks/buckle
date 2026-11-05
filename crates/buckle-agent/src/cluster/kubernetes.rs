@@ -68,6 +68,19 @@ impl Executor {
         purpose: Purpose,
         rollout: Option<&str>,
     ) -> buckle_core::Result<Kube> {
+        self.kube_client_with_expiry(a, purpose, rollout)
+            .await
+            .map(|(kube, _)| kube)
+    }
+
+    /// [`Executor::kube_client`] with the credential's expiry, when it has
+    /// one (a Buckle-issued identity).
+    pub(super) async fn kube_client_with_expiry(
+        &self,
+        a: &Assignment,
+        purpose: Purpose,
+        rollout: Option<&str>,
+    ) -> buckle_core::Result<(Kube, Option<chrono::DateTime<Utc>>)> {
         let kube = self.connect.kubernetes(&a.target, &a.spec)?;
         match &a.spec.identity {
             ClusterIdentity::BuckleJwt => {
@@ -77,14 +90,17 @@ impl Executor {
                     revision: Some(a.revision.id.clone()),
                     rollout: rollout.map(str::to_owned),
                 };
-                match self.credentials.get(&request, &Login::Kubernetes).await? {
-                    Credential::Bearer { token, .. } => Ok(kube.token(token.into())),
-                    Credential::Nomad { secret_id, .. } => Ok(kube.token(secret_id.into())),
-                }
+                let credential = self.credentials.get(&request, &Login::Kubernetes).await?;
+                let expires = credential.expires_at();
+                let kube = match credential {
+                    Credential::Bearer { token, .. } => kube.token(token.into()),
+                    Credential::Nomad { secret_id, .. } => kube.token(secret_id.into()),
+                };
+                Ok((kube, Some(expires)))
             }
-            ClusterIdentity::Local | ClusterIdentity::Workload => Ok(kube),
+            ClusterIdentity::Local | ClusterIdentity::Workload => Ok((kube, None)),
             ClusterIdentity::Secret(name) => match a.secrets.get(name) {
-                Some(secret) => Ok(kube.token(ApiSink.credential(secret))),
+                Some(secret) => Ok((kube.token(ApiSink.credential(secret)), None)),
                 None => Err(buckle_core::error::user(
                     format!(
                         "The credential secret '{name}' for {} did not reach this executor.",
@@ -103,10 +119,11 @@ impl Executor {
         &self,
         a: &Assignment,
         rollout: Option<&str>,
+        scope: Option<&str>,
     ) -> buckle_core::Result<ClusterPlan> {
         let kube = self.kube_client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
-        let workloads = a.workloads(&ctx);
+        let workloads = super::scoped(a.workloads(&ctx), scope);
         let base = buckle_kube::Context::new(
             kube.clone(),
             &a.target,
@@ -242,7 +259,8 @@ impl Executor {
         let mut removals = Vec::new();
         let mut steps = Vec::new();
         for orphan in buckle_kube::primitives::orphans(&base, &declared).await? {
-            if undecided.contains(&orphan.module) {
+            // A placement removes only what its own workload owned.
+            if undecided.contains(&orphan.module) || scope.is_some_and(|s| s != orphan.module) {
                 continue;
             }
             let removal = a

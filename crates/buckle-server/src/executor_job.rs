@@ -395,6 +395,7 @@ mod tests {
             cluster: None,
             scope: Default::default(),
             trust: trust.map(Box::new),
+            watch: None,
         }
     }
 

@@ -7,6 +7,7 @@
 
 pub(crate) mod fake_server;
 mod hardening;
+mod lanes;
 mod reboot;
 mod scenarios;
 
@@ -57,10 +58,15 @@ pub struct Setup {
     pub custom_runner: Option<RunnerFactory>,
     /// The Nomad cluster targets reach (else none is reachable).
     pub cluster: Option<buckle_nomad::testing::FakeNomad>,
+    /// The Kubernetes cluster targets reach (else none is reachable).
+    pub kube: Option<buckle_kube::testing::FakeKube>,
 }
 
-/// Reaches every cluster target through one in-memory Nomad.
-struct FakeCluster(buckle_nomad::testing::FakeNomad);
+/// Reaches every cluster target through one in-memory Nomad or Kubernetes.
+struct FakeCluster {
+    nomad: Option<buckle_nomad::testing::FakeNomad>,
+    kube: Option<buckle_kube::testing::FakeKube>,
+}
 
 impl crate::cluster::Connect for FakeCluster {
     fn nomad(
@@ -68,7 +74,20 @@ impl crate::cluster::Connect for FakeCluster {
         _target: &str,
         _spec: &crate::cluster::TargetSpec,
     ) -> buckle_core::Result<buckle_nomad::Nomad> {
-        Ok(self.0.client())
+        self.nomad
+            .as_ref()
+            .map(|n| n.client())
+            .ok_or_else(|| buckle_core::error::system("no Nomad cluster in this test", &[]))
+    }
+    fn kubernetes(
+        &self,
+        _target: &str,
+        _spec: &crate::cluster::TargetSpec,
+    ) -> buckle_core::Result<buckle_kube::Kube> {
+        self.kube
+            .as_ref()
+            .map(|k| k.client())
+            .ok_or_else(|| buckle_core::error::system("no Kubernetes cluster in this test", &[]))
     }
 }
 
@@ -95,6 +114,7 @@ impl Default for Setup {
             prepare: None,
             custom_runner: None,
             cluster: None,
+            kube: None,
         }
     }
 }
@@ -139,8 +159,11 @@ impl Harness {
         };
         let mut agent =
             Agent::new(config, transport, runner, updater.clone(), options).expect("agent");
-        if let Some(fake) = setup.cluster {
-            agent = agent.with_cluster_connect(Arc::new(FakeCluster(fake)));
+        if setup.cluster.is_some() || setup.kube.is_some() {
+            agent = agent.with_cluster_connect(Arc::new(FakeCluster {
+                nomad: setup.cluster,
+                kube: setup.kube,
+            }));
         }
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn(agent.run(shutdown.clone()));
@@ -195,6 +218,7 @@ pub fn assign(revision: &str, tree_digest: &str) -> pb::server_message::Msg {
 pub fn request_plan(revision: &str) -> pb::server_message::Msg {
     pb::server_message::Msg::Plan(pb::RequestPlan {
         target: String::new(),
+        workload: String::new(),
         revision: revision.into(),
         select: String::new(),
     })

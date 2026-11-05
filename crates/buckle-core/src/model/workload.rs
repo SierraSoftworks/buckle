@@ -689,6 +689,10 @@ pub struct WorkloadConfig {
     pub needs: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Labels of the workload's placements (`workload.labels.*` in phase
+    /// selectors and groups): scalars, kept in the repository only.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub labels: IndexMap<String, serde_yaml::Value>,
     /// Defaults; fleet vars override. On Nomad they become the job's HCL2
     /// variables.
     #[serde(default)]
@@ -750,6 +754,8 @@ struct RawWorkload {
     needs: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    labels: IndexMap<String, serde_yaml::Value>,
     #[serde(default)]
     vars: IndexMap<String, serde_yaml::Value>,
     #[serde(default)]
@@ -882,6 +888,7 @@ impl TryFrom<RawWorkload> for WorkloadConfig {
             when: raw.when,
             needs: raw.needs,
             tags: raw.tags,
+            labels: raw.labels,
             vars: raw.vars,
             files: raw.files,
             resources,
@@ -898,6 +905,14 @@ impl TryFrom<RawWorkload> for WorkloadConfig {
 }
 
 impl WorkloadConfig {
+    /// The placement labels as selector values (`workload.labels.*`).
+    pub fn selector_labels(&self) -> crate::selectors::Labels {
+        self.labels
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), serde_json::to_value(v).ok()?)))
+            .collect()
+    }
+
     pub fn parse(yaml: &str) -> crate::Result<Self> {
         use crate::error::HumanizableResult;
         serde_yaml::from_str(yaml).to_human_error()

@@ -25,6 +25,8 @@ pub struct RouteLinkProps {
     #[prop_or_default]
     pub data_state: Option<AttrValue>,
     #[prop_or_default]
+    pub data_workload: Option<AttrValue>,
+    #[prop_or_default]
     pub current: bool,
     #[prop_or_default]
     pub children: Html,
@@ -64,6 +66,7 @@ pub fn route_link(props: &RouteLinkProps) -> Html {
         <a {href} class={props.classes.clone()} {onclick}
             aria-label={props.label.clone()} title={props.title.clone()}
             data-host={props.data_host.clone()} data-state={props.data_state.clone()}
+            data-workload={props.data_workload.clone()}
             aria-current={props.current.then_some("page")}>
             { props.children.clone() }
         </a>

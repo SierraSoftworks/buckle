@@ -40,6 +40,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+mod lanes;
 mod targets;
 
 /// Tunables of the session loop. The defaults are the design's values; tests
@@ -154,11 +155,6 @@ enum Op {
     WatchdogCheck,
     /// Carries out a pending reboot (one a restart interrupted).
     Reboot,
-    /// Work for a cluster target this agent executes for.
-    Target {
-        target: String,
-        instruction: Box<Instruction>,
-    },
 }
 
 struct Queued {
@@ -243,6 +239,9 @@ struct Shared {
     executor: crate::cluster::Executor,
     /// Cluster credentials tasks ask for (`command.run` `identity`).
     credentials: Arc<crate::identity::Credentials>,
+    /// One lane per cluster target this agent speaks for, beside the host's
+    /// own worker queue.
+    lanes: lanes::Lanes,
 }
 
 enum SessionEnd {
@@ -463,6 +462,7 @@ impl Agent {
                 session_span: Mutex::new(None),
                 boot_id: Mutex::new(None),
                 acked: Notify::new(),
+                lanes: lanes::Lanes::default(),
             }),
         })
     }
@@ -605,6 +605,18 @@ impl Agent {
                     busy = shared.busy.load(Ordering::SeqCst),
                     "waiting for the running operation to finish before exiting"
                 ),
+            }
+        }
+        // The cluster lanes likewise finish what they are running.
+        for mut lane in shared.lanes.close() {
+            loop {
+                match tokio::time::timeout(shared.options.shutdown_grace, &mut lane).await {
+                    Ok(_) => break,
+                    Err(_) => tracing::warn!(
+                        waited = ?waiting_since.elapsed(),
+                        "waiting for a cluster operation to finish before exiting"
+                    ),
+                }
             }
         }
         result
@@ -822,9 +834,19 @@ impl Shared {
                     Some(Instruction::Ping) => {}
                     Some(Instruction::Ack { report_ids }) => self.on_ack(&report_ids).await,
                     Some(Instruction::HostUpdate(update)) => self.on_host_update(update, queue).await,
-                    // Work for a cluster target this host executes for. As
-                    // for the host's own work, all but the Assign belong to
-                    // the session that asked.
+                    Some(Instruction::Lease { target, cluster, applied_revision, watch }) => {
+                        self.lanes.dispatch(&self, &target, lanes::LaneOp::Lease(lanes::LeaseTerms {
+                            cluster,
+                            applied: applied_revision,
+                            watch,
+                        }));
+                    }
+                    Some(Instruction::Release { target, reason }) => {
+                        self.lanes.dispatch(&self, &target, lanes::LaneOp::Release { reason });
+                    }
+                    // Work for a cluster target this host speaks for runs on
+                    // the cluster's lane. As for the host's own work, all
+                    // but the Assign belong to the session that asked.
                     Some(other) if other.target().is_some() => {
                         let target = other.target().unwrap_or_default().to_owned();
                         // An action runs even after a reconnect: its run is
@@ -833,10 +855,10 @@ impl Shared {
                             other,
                             Instruction::Assign { .. } | Instruction::RunAction { .. }
                         );
-                        queue.push(
-                            Op::Target { target, instruction: Box::new(other) },
-                            bound.then_some(generation),
-                        );
+                        self.lanes.dispatch(&self, &target, lanes::LaneOp::Instruction {
+                            instruction: other,
+                            generation: bound.then_some(generation),
+                        });
                     }
                     Some(other) => {
                         if let Some(op) = op_for(other) {
@@ -862,7 +884,7 @@ impl Shared {
                     let applied = self.data.lock().await.agent.applied_revision.clone();
                     self.sink.send(Report::Heartbeat {
                         applied_revision: applied,
-                        busy: self.busy.load(Ordering::SeqCst),
+                        busy: self.busy.load(Ordering::SeqCst) || self.lanes.busy(),
                     }).await;
                 },
                 _ = drift.tick() => if welcomed
@@ -1054,7 +1076,7 @@ impl Shared {
             if let Op::Upgrade {
                 when_idle: true, ..
             } = &queued.op
-                && len.load(Ordering::SeqCst) > 0
+                && (len.load(Ordering::SeqCst) > 0 || self.lanes.busy())
                 && !self.stopping.load(Ordering::SeqCst)
                 && let Some(tx) = requeue.upgrade()
             {
@@ -1231,10 +1253,6 @@ impl Shared {
                 self.reboot_if_pending().await;
             }
             Op::Reboot => self.reboot_if_pending().await,
-            Op::Target {
-                target,
-                instruction,
-            } => self.target_op(target, *instruction).await,
         }
     }
 
@@ -1710,8 +1728,10 @@ impl Shared {
                     rev.id.clone(),
                     plan.digest.to_string(),
                     self.options.event_spacing,
-                    None,
-                    Some(action_id.clone()),
+                    coalesce::EventScope {
+                        action_id: Some(action_id.clone()),
+                        ..Default::default()
+                    },
                 ));
                 let result = self
                     .runner
@@ -2696,6 +2716,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             secrets,
             tree_digest,
             target: _,
+            workload: _,
             cluster: _,
         } => Op::Assign {
             revision,
@@ -2708,6 +2729,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             revision,
             select,
             target: _,
+            workload: _,
         } => Op::Plan { revision, select },
         Instruction::Apply {
             revision,
@@ -2720,6 +2742,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             rollout_id,
             phase,
             target: _,
+            workload: _,
         } => Op::Apply {
             revision,
             plan_digest,
@@ -2737,6 +2760,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             rollout_id,
             traceparent,
             target: _,
+            workload: _,
         } => Op::Rollback {
             revision,
             reason,
@@ -2750,6 +2774,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             until,
             traceparent,
             target: _,
+            workload: _,
             revision: _,
         } => Op::Health {
             request_id,
@@ -2765,6 +2790,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             revision,
             traceparent,
             target: _,
+            workload: _,
         } => Op::Action {
             action_id,
             module,
@@ -2777,6 +2803,8 @@ fn op_for(instruction: Instruction) -> Option<Op> {
         | Instruction::Ping
         | Instruction::Ack { .. }
         | Instruction::HostUpdate(_)
+        | Instruction::Lease { .. }
+        | Instruction::Release { .. }
         | Instruction::Rejected { .. } => return None,
     })
 }

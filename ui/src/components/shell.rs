@@ -27,6 +27,7 @@ const NAV: &[NavItem] = &[
     ("Overview", icons::overview, Route::Overview),
     ("Rollouts", icons::rollouts, Route::Rollouts),
     ("Hosts", icons::hosts, Route::Hosts),
+    ("Workloads", icons::workloads, Route::Workloads),
     ("Clusters", icons::clusters, Route::Clusters),
     ("Audit", icons::audit, Route::Audit),
 ];
@@ -39,6 +40,7 @@ fn section(route: &Route) -> Route {
         Route::Rollout { .. } => Route::Rollouts,
         Route::Host { .. } => Route::Hosts,
         Route::Cluster { .. } => Route::Clusters,
+        Route::Workload { .. } => Route::Workloads,
         other => other.clone(),
     }
 }

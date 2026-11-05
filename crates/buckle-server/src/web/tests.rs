@@ -425,6 +425,25 @@ async fn hosts_can_be_relabelled_approved_and_previewed() {
 #[actix_web::test]
 async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
     let e = env(WebConfig::default()).await;
+    // The workloads go in before the revision is announced: the controller
+    // loads it (for the cluster's lease) as soon as it is valid.
+    let dir = e.state.revisions.dir("r1");
+    for (name, needs) in [("postgresql", ""), ("atuin", "needs: [postgresql]\n")] {
+        let w = dir.join(format!("workloads/{name}/files"));
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(
+            w.join(format!("{name}.nomad.hcl")),
+            format!("job \"{name}\" {{}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("workloads/{name}/workload.yaml")),
+            format!(
+                "name: {name}\ndescription: the {name} job\n{needs}resources: [{name}.nomad.hcl]\n"
+            ),
+        )
+        .unwrap();
+    }
     revision(
         &e,
         "r1",
@@ -443,23 +462,6 @@ async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
             .call(move |db| db.hosts().set_labels(id, &labels).map(|_| ()))
             .await
             .unwrap();
-    }
-    let dir = e.state.revisions.dir("r1");
-    for (name, needs) in [("postgresql", ""), ("atuin", "needs: [postgresql]\n")] {
-        let w = dir.join(format!("workloads/{name}/files"));
-        std::fs::create_dir_all(&w).unwrap();
-        std::fs::write(
-            w.join(format!("{name}.nomad.hcl")),
-            format!("job \"{name}\" {{}}"),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join(format!("workloads/{name}/workload.yaml")),
-            format!(
-                "name: {name}\ndescription: the {name} job\n{needs}resources: [{name}.nomad.hcl]\n"
-            ),
-        )
-        .unwrap();
     }
     e.store
         .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "r1"))
@@ -696,6 +698,7 @@ async fn cluster_targets_are_declared_or_created_and_listed_beside_hosts() {
         cluster: None,
         scope: Default::default(),
         trust: None,
+        watch: None,
     };
     let create = |body: buckle_api::CreateTarget| {
         test::TestRequest::post()
@@ -2159,6 +2162,7 @@ async fn plans_are_served_typed_and_deduplicated_by_digest() {
     let host = |name: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
         rollout: "7".into(),
         host: name.into(),
+        workload: String::new(),
         phase: "canary".into(),
         wave: Some(1),
         state: crate::rollout::model::HostPhase::Healthy,
@@ -2221,6 +2225,7 @@ async fn rollouts_say_what_they_change_once_a_host_has_planned() {
     let row = |rollout: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
         rollout: rollout.into(),
         host: "pi-1".into(),
+        workload: String::new(),
         phase: "canary".into(),
         wave: Some(1),
         state: crate::rollout::model::HostPhase::Healthy,
@@ -2345,6 +2350,7 @@ async fn each_phase_names_the_required_checks_of_the_modules_its_hosts_apply() {
         crate::store::RolloutHostRecord {
             rollout: "7".into(),
             host: name.into(),
+            workload: String::new(),
             phase: phase.into(),
             wave: Some(1),
             state: HostPhase::Healthy,
@@ -2541,6 +2547,7 @@ async fn run_reports_are_served_per_host_and_per_rollout_host() {
     let row = |name: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
         rollout: "7".into(),
         host: name.into(),
+        workload: String::new(),
         phase: "canary".into(),
         wave: Some(1),
         state: crate::rollout::model::HostPhase::Planned,
@@ -2999,4 +3006,74 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
         ("web", "drain")
     );
     assert_eq!(summary.hosts_total, 2);
+}
+
+/// A `workload.*` selector sees a cluster's actions as its workloads'
+/// placements: it offers the matching workload's actions only.
+#[actix_web::test]
+async fn workload_selectors_pick_the_placements_offering_an_action() {
+    let e = env(WebConfig::default()).await;
+    revision(
+        &e,
+        "r1",
+        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.labels.nomad == true'\n",
+    )
+    .await;
+    let dir = e.state.revisions.dir("r1");
+    for (name, tier) in [("grafana", "web"), ("postgres", "db")] {
+        let w = dir.join(format!("workloads/{name}/files"));
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(
+            w.join(format!("{name}.nomad.hcl")),
+            format!("job \"{name}\" {{}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("workloads/{name}/workload.yaml")),
+            format!("name: {name}\nlabels: {{ tier: {tier} }}\nresources: [{name}.nomad.hcl]\n"),
+        )
+        .unwrap();
+    }
+    e.store
+        .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "r1"))
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    // Listing materialises the declared cluster.
+    test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+    )
+    .await;
+    e.store
+        .call(|db| db.hosts().set_applied_revision("home-nomad", "r1"))
+        .await
+        .unwrap();
+
+    let listed = |selector: &'static str| {
+        let app = &app;
+        async move {
+            let uri = format!(
+                "/api/v1/actions?selector={}",
+                url::form_urlencoded::byte_serialize(selector.as_bytes()).collect::<String>()
+            );
+            let resp =
+                test::call_service(app, test::TestRequest::get().uri(&uri).to_request()).await;
+            let actions: Vec<buckle_api::FleetAction> = test::read_body_json(resp).await;
+            actions
+                .into_iter()
+                .map(|a| (a.action.module, a.targets))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        }
+    };
+    let web = listed("workload.labels.tier == \"web\"").await;
+    assert_eq!(web.keys().collect::<Vec<_>>(), vec!["grafana"]);
+    assert_eq!(web["grafana"], vec!["home-nomad"]);
+    let cluster = listed("cluster.id == \"home-nomad\"").await;
+    assert_eq!(
+        cluster.keys().collect::<Vec<_>>(),
+        vec!["grafana", "postgres"],
+        "a cluster.* selector picks every placement"
+    );
+    assert!(listed("host.labels.nomad == true").await.is_empty());
 }

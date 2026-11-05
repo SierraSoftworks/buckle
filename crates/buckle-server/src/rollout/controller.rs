@@ -41,8 +41,6 @@ pub struct ControllerOptions {
     pub disconnect_timeout: Duration,
     /// How long a host may stay applying without a result before it fails.
     pub apply_timeout: Duration,
-    /// How often an applied cluster's health is read outside rollouts.
-    pub cluster_health_interval: Duration,
 }
 
 /// How often an Apply is re-sent to a host that reconnects without having
@@ -58,7 +56,6 @@ impl Default for ControllerOptions {
         Self {
             disconnect_timeout: Duration::from_secs(600),
             apply_timeout: Duration::from_secs(30 * 60),
-            cluster_health_interval: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -132,6 +129,9 @@ pub enum Command {
     Retry {
         rollout: String,
         host: String,
+        /// The placement's workload; empty for a host's (or a whole
+        /// cluster's) row. The same on the other per-row commands.
+        workload: String,
         note: String,
     },
     /// Re-plan and re-apply every failed host of the rollout.
@@ -144,18 +144,21 @@ pub enum Command {
     SkipBake {
         rollout: String,
         host: Option<String>,
+        workload: String,
         note: String,
     },
     /// Exclude a host from the rollout.
     Skip {
         rollout: String,
         host: String,
+        workload: String,
         note: String,
     },
     /// Retry a host with failed checks waived.
     Continue {
         rollout: String,
         host: String,
+        workload: String,
         waive: Vec<String>,
         note: String,
     },
@@ -163,6 +166,7 @@ pub enum Command {
     Force {
         rollout: String,
         host: String,
+        workload: String,
         note: String,
     },
     /// Turn down a rollout awaiting approval: it ends aborted with the
@@ -188,6 +192,13 @@ pub enum Command {
         revision: String,
         note: String,
     },
+    /// Move cluster `target`'s lease to `host`, a connected host that may
+    /// speak for it; its placements in flight are re-planned there.
+    MoveLease {
+        target: String,
+        host: String,
+        note: String,
+    },
 }
 
 impl Command {
@@ -209,6 +220,7 @@ impl Command {
             Command::Reject { .. } => "rollout.reject",
             Command::RunAction { .. } => "host.action.run",
             Command::StartAction { .. } => "rollout.action.start",
+            Command::MoveLease { .. } => "target.steward.move",
         }
     }
 }
@@ -272,6 +284,12 @@ enum Input {
     RevisionAdded(String),
     HostChanged(String),
     HostRegistered(String),
+    /// `host` reported on a cluster `target` it does not steward: its lane
+    /// is released unless the lease is (again) its.
+    StaleSteward {
+        host: String,
+        target: String,
+    },
     /// A durable agent report (ApplyResult, LocalRollback) the gRPC layer
     /// stored as pending; `done` is told once the controller's reaction is
     /// persisted (and the pending copy removed), so the report can be acked.
@@ -324,6 +342,14 @@ impl ControllerHandle {
     /// An operator changed a host's status, labels, or forgot it.
     pub fn host_changed(&self, host: &str) {
         let _ = self.tx.send(Input::HostChanged(host.to_owned()));
+    }
+
+    /// `host` sent a watch report about a cluster it does not steward.
+    pub fn stale_steward(&self, host: &str, target: &str) {
+        let _ = self.tx.send(Input::StaleSteward {
+            host: host.to_owned(),
+            target: target.to_owned(),
+        });
     }
 
     /// A durable agent report the gRPC layer stored as pending (see
@@ -467,22 +493,69 @@ struct Live {
 }
 
 impl Live {
+    /// The first row of `host` (a host has one; a cluster rolled by
+    /// placements has one per workload, so this says whether the target has
+    /// a row at all).
     fn find(&self, host: &str) -> Option<usize> {
         self.hosts.iter().position(|h| h.host == host)
     }
 
+    /// The row of `host` with `workload` (empty: the host's own, or the
+    /// whole cluster's).
+    fn find_row(&self, host: &str, workload: &str) -> Option<usize> {
+        self.hosts
+            .iter()
+            .position(|h| h.host == host && h.workload == workload)
+    }
+
     /// The row a report from `host` is about: the host's own, or, when the
-    /// report names a `target`, that cluster's row while `host` is its
-    /// executor (a report from an executor since replaced is not its).
-    fn find_target(&self, host: &str, target: &str) -> Option<usize> {
+    /// report names a `target`, that cluster's row (the placement of
+    /// `workload`, or the whole cluster's when it names none) while `host`
+    /// is its executor (a report from an executor since replaced is not its).
+    fn find_target(&self, host: &str, target: &str, workload: &str) -> Option<usize> {
         if target.is_empty() {
             return self.find(host);
         }
         self.hosts.iter().position(|h| {
             h.host == target
-                && h.runtime.kind == TargetKind::Cluster
+                && h.workload == workload
+                && h.runtime.kind.on_cluster()
                 && h.runtime.executor.as_deref() == Some(host)
         })
+    }
+
+    /// The row a key from a names list (`host`, or `cluster/workload`)
+    /// stands for.
+    fn find_key(&self, key: &str) -> Option<usize> {
+        let (host, workload) = buckle_api::split_placement_key(key);
+        self.find_row(host, workload.unwrap_or_default())
+    }
+
+    /// Every row of `host` (one for a host; one per placement for a cluster).
+    fn rows_of(&self, host: &str) -> Vec<usize> {
+        (0..self.hosts.len())
+            .filter(|&i| self.hosts[i].host == host)
+            .collect()
+    }
+
+    /// The revision cluster `cluster` has converged on through this rollout,
+    /// once every placement row of it is healthy (or every one rolled back:
+    /// the previous stable revision). `None` while they are still going, or
+    /// when the cluster is rolled as one row (its result says so itself).
+    fn cluster_converged(&self, cluster: &str) -> Option<String> {
+        let rows: Vec<&RolloutHostRecord> = self
+            .hosts
+            .iter()
+            .filter(|h| h.host == cluster && h.runtime.kind == TargetKind::Workload)
+            .collect();
+        let first = rows.first()?;
+        if rows.iter().all(|h| h.state == HostPhase::Healthy) {
+            return Some(first.runtime.revision.clone());
+        }
+        if rows.iter().all(|h| h.state == HostPhase::RolledBack) {
+            return self.record.runtime.previous_stable.clone();
+        }
+        None
     }
 
     fn phase_hosts(&self, phase: usize) -> Vec<usize> {
@@ -508,6 +581,8 @@ enum Out {
         session: String,
         /// The target the plan is for; empty for the host itself.
         target: String,
+        /// The placement the plan is for; empty for the whole target.
+        workload: String,
         revision: String,
         stable: bool,
     },
@@ -517,8 +592,13 @@ enum Out {
     Targeted {
         session: String,
         target: String,
+        /// The placement the message is scoped to; empty for the whole cluster.
+        workload: String,
         msg: Box<ServerMessage>,
     },
+    /// The cluster's lease to its steward: a targeted Assign of the applied
+    /// revision (when there is one), then the Lease.
+    Lease { session: String, target: String },
 }
 
 /// A host agent speaks for clusters only once it announces it runs a
@@ -526,15 +606,48 @@ enum Out {
 /// a cluster's plan.
 pub const TARGETS_CAPABILITY: &str = "targets";
 
-/// The outcome of looking for a cluster's executor.
+/// A host agent is handed one workload placement at a time only once it
+/// announces it scopes its plans, applies and checks to the workload an
+/// instruction names; a cluster whose executors predate that is rolled as
+/// one row, as before.
+pub const WORKLOADS_CAPABILITY: &str = "workloads";
+
+/// How a placement row may start: its needs on the cluster are met, or not.
+enum Readiness {
+    Ready,
+    /// A workload it needs is neither applied by this rollout nor running on
+    /// the cluster: the row waits (it misses its phase and converges in the
+    /// stragglers stage once the need is running).
+    Waiting(String),
+    /// The same under `dependencies.across_phases: refuse`: the row fails.
+    Refused(String),
+}
+
+/// One workload placement of a cluster, as the freeze lays it out.
+struct Placement {
+    workload: String,
+    /// The phase its labels (and the cluster's) select; `None` when none does.
+    phase: Option<usize>,
+    /// The workload left the configuration since the cluster's applied
+    /// revision: the placement removes what it owned.
+    removal: bool,
+    /// Placements of the cluster that must finish first (a removal's
+    /// dependents, by the applied revision's `needs`).
+    after: Vec<String>,
+}
+
+/// The outcome of looking for a cluster's executor: its steward, the host
+/// agent holding its lease.
 enum Pick {
     /// This host speaks for the cluster.
     Executor(String),
-    /// Hosts could, but every one is mid-wave: wait for them.
-    Busy,
     /// No connected, capable host matches the cluster's `executors`.
     None,
 }
+
+/// How often the controller re-evaluates which host stewards each cluster
+/// when nothing (a connect, a disconnect, a host change) prompts it.
+const LEASE_INTERVAL: Duration = Duration::from_secs(30);
 
 struct Controller {
     store: Store,
@@ -562,11 +675,26 @@ struct Controller {
     capabilities: HashMap<String, Vec<String>>,
     /// The boot each host's current (or last) session runs in.
     boot_ids: HashMap<String, String>,
-    /// Each cluster's last executor (kv `executor/<cluster>`), so a pick
-    /// stays with the same host while it qualifies.
+    /// Each cluster's steward (kv `executor/<cluster>`): the host agent
+    /// holding its lease, which watches it and runs its placements. Sticky:
+    /// it stays while the host qualifies.
     executors: BTreeMap<String, String>,
-    /// Clusters whose executor changed since the last checkpoint.
+    /// Clusters whose steward changed since the last checkpoint.
     executors_dirty: BTreeSet<String>,
+    /// Clusters whose steward (or lack of one) is to be written to their
+    /// record with the next checkpoint.
+    stewards_dirty: BTreeMap<String, Option<String>>,
+    /// Clusters whose Lease is (re)sent to their steward with the next
+    /// checkpoint: new or moved leases, reconnects, a new applied revision.
+    lease_resend: BTreeSet<String>,
+    /// Leases are re-evaluated on the next drive pass (a connect, a
+    /// disconnect, a host or cluster change) rather than at `leases_due`.
+    leases_dirty: bool,
+    /// When leases are next re-evaluated unprompted.
+    leases_due: DateTime<Utc>,
+    /// Since when each cluster's steward has been disconnected; past the
+    /// disconnect timeout the lease moves.
+    steward_away: BTreeMap<String, DateTime<Utc>>,
     /// Each cluster target's spec as last loaded (its `executors` and
     /// `nodes` selectors), for the executor pick and the stage layout.
     clusters: HashMap<String, buckle_api::ClusterSpec>,
@@ -585,30 +713,41 @@ struct Controller {
     ack_waiters: Vec<oneshot::Sender<bool>>,
     /// Pending durable reports found on load, replayed before any input.
     replay: Vec<(String, u64, agent_message::Msg)>,
-    /// When applied clusters' health is next read (outside rollouts).
-    cluster_health_due: DateTime<Utc>,
 }
 
 fn msg(m: server_message::Msg) -> ServerMessage {
     ServerMessage { msg: Some(m) }
 }
 
-/// Names `target` on a message bound for a cluster's executor. Empty names
-/// the host itself and leaves the message as it is.
-fn stamp_target(mut m: ServerMessage, target: &str) -> ServerMessage {
+/// Names `target` (and the placement `workload`, when the message is scoped
+/// to one) on a message bound for a cluster's executor. An empty target
+/// names the host itself and leaves the message as it is.
+fn stamp_target(mut m: ServerMessage, target: &str, workload: &str) -> ServerMessage {
     if target.is_empty() {
         return m;
     }
-    match &mut m.msg {
-        Some(server_message::Msg::Assign(a)) => a.target = target.to_owned(),
-        Some(server_message::Msg::Plan(p)) => p.target = target.to_owned(),
-        Some(server_message::Msg::Apply(a)) => a.target = target.to_owned(),
-        Some(server_message::Msg::Rollback(r)) => r.target = target.to_owned(),
-        Some(server_message::Msg::Health(h)) => h.target = target.to_owned(),
-        Some(server_message::Msg::Action(a)) => a.target = target.to_owned(),
-        _ => {}
-    }
+    let (t, w): (&mut String, &mut String) = match &mut m.msg {
+        Some(server_message::Msg::Assign(a)) => (&mut a.target, &mut a.workload),
+        Some(server_message::Msg::Plan(p)) => (&mut p.target, &mut p.workload),
+        Some(server_message::Msg::Apply(a)) => (&mut a.target, &mut a.workload),
+        Some(server_message::Msg::Rollback(r)) => (&mut r.target, &mut r.workload),
+        Some(server_message::Msg::Health(h)) => (&mut h.target, &mut h.workload),
+        Some(server_message::Msg::Action(a)) => (&mut a.target, &mut a.workload),
+        _ => return m,
+    };
+    *t = target.to_owned();
+    *w = workload.to_owned();
     m
+}
+
+/// How a report from `agent` names its row: the agent's host, or the cluster
+/// `target` it executes for (`cluster/workload` for a placement).
+fn report_key(agent: &str, target: &str, workload: &str) -> String {
+    if target.is_empty() {
+        agent.to_owned()
+    } else {
+        buckle_api::placement_key(target, Some(workload))
+    }
 }
 
 fn timestamp(t: DateTime<Utc>) -> prost_types::Timestamp {
@@ -834,8 +973,6 @@ impl Controller {
                 })
                 .await?;
         }
-        let cluster_health_due = now
-            + chrono::Duration::from_std(deps.options.cluster_health_interval).unwrap_or_default();
         Ok(Self {
             store: deps.store,
             link: deps.link,
@@ -857,6 +994,11 @@ impl Controller {
             boot_ids: HashMap::new(),
             executors,
             executors_dirty: BTreeSet::new(),
+            stewards_dirty: BTreeMap::new(),
+            lease_resend: BTreeSet::new(),
+            leases_dirty: true,
+            leases_due: now,
+            steward_away: BTreeMap::new(),
             clusters: HashMap::new(),
             host_seen,
             flush_retry: None,
@@ -865,7 +1007,6 @@ impl Controller {
             pending_clear: Vec::new(),
             ack_waiters: Vec::new(),
             replay,
-            cluster_health_due,
         })
     }
 
@@ -911,8 +1052,16 @@ impl Controller {
         let h = &self.live[ri].hosts[hi];
         match h.runtime.kind {
             TargetKind::Host => Some(h.host.clone()),
-            TargetKind::Cluster => h.runtime.executor.clone(),
+            TargetKind::Cluster | TargetKind::Workload => h.runtime.executor.clone(),
         }
+    }
+
+    /// Whether row `hi`'s session is connected and its connect has been
+    /// handled here (a bake counts a host as back only once its reconnect
+    /// re-asked it to report, not the instant its session appears).
+    fn row_back(&self, ri: usize, hi: usize) -> bool {
+        self.row_session(ri, hi)
+            .is_some_and(|s| self.connected(&s) && self.online.contains(&s))
     }
 
     /// Whether row `hi` can be reached now.
@@ -960,7 +1109,7 @@ impl Controller {
         if h.runtime.disconnected_at.is_some() {
             return false;
         }
-        if h.runtime.kind == TargetKind::Cluster && !self.stage_open(ri, hi) {
+        if h.runtime.kind.on_cluster() && !self.stage_open(ri, hi) {
             return false;
         }
         match self.row_session(ri, hi) {
@@ -1057,7 +1206,7 @@ impl Controller {
     }
 
     fn set_host_state(&mut self, ri: usize, hi: usize, state: HostPhase, why: &str) {
-        let (from, host, phase, rollout, trace) = {
+        let (from, host, workload, phase, rollout, trace) = {
             let live = &self.live[ri];
             let h = &live.hosts[hi];
             if h.state == state {
@@ -1065,7 +1214,8 @@ impl Controller {
             }
             (
                 h.state,
-                h.host.clone(),
+                view::row_key(h),
+                h.workload.clone(),
                 h.phase.clone(),
                 live.record.id.clone(),
                 live.record.runtime.trace_id.clone(),
@@ -1090,12 +1240,13 @@ impl Controller {
         if buckle_api::is_progress_action("controller", &action) {
             return;
         }
+        let (host, _) = buckle_api::split_placement_key(&host);
         self.audit(
             "controller",
             &action,
             &rollout,
             message,
-            serde_json::json!({"host": host, "phase": phase, "from": from.as_str(), "to": state.as_str()}),
+            serde_json::json!({"host": host, "workload": workload, "phase": phase, "from": from.as_str(), "to": state.as_str()}),
             trace,
         );
     }
@@ -1144,7 +1295,7 @@ impl Controller {
 
     fn host_span(&mut self, ri: usize, hi: usize) -> Span {
         let live = &mut self.live[ri];
-        let host = live.hosts[hi].host.clone();
+        let host = view::row_key(&live.hosts[hi]);
         if let Some(s) = live.host_spans.get(&host) {
             return s.clone();
         }
@@ -1171,16 +1322,24 @@ impl Controller {
             return;
         };
         let target = self.row_target(ri, hi);
-        let m = Box::new(stamp_target(msg(m), &target));
+        let workload = self.live[ri].hosts[hi].workload.clone();
+        let m = Box::new(stamp_target(msg(m), &target, &workload));
         self.outbox.push(if target.is_empty() {
             Out::Msg(session, m)
         } else {
             Out::Targeted {
                 session,
                 target,
+                workload,
                 msg: m,
             }
         });
+    }
+
+    /// How names lists and messages write row `hi`: its host, or
+    /// `cluster/workload` for a placement.
+    fn row_key(&self, ri: usize, hi: usize) -> String {
+        view::row_key(&self.live[ri].hosts[hi])
     }
 
     /// The `target` a row's messages carry: the cluster's id, or empty for
@@ -1189,7 +1348,7 @@ impl Controller {
         let h = &self.live[ri].hosts[hi];
         match h.runtime.kind {
             TargetKind::Host => String::new(),
-            TargetKind::Cluster => h.host.clone(),
+            TargetKind::Cluster | TargetKind::Workload => h.host.clone(),
         }
     }
 
@@ -1210,6 +1369,7 @@ impl Controller {
             Input::RevisionAdded(id) => self.on_revision_added(&id).await,
             Input::HostChanged(host) => self.on_host_changed(&host).await,
             Input::HostRegistered(host) => self.on_host_registered(&host).await,
+            Input::StaleSteward { host, target } => self.on_stale_steward(&host, &target),
             Input::Durable {
                 host,
                 report_id,
@@ -1266,6 +1426,16 @@ impl Controller {
 
     async fn on_connected(&mut self, c: Connected) {
         self.online.insert(c.host.clone());
+        // Leases are re-evaluated (an in-cluster executor that appears takes
+        // its cluster's), and the ones this host holds are re-sent: its
+        // lanes may have ended with its last session.
+        self.leases_dirty = true;
+        for (cluster, steward) in &self.executors {
+            if steward == &c.host {
+                self.lease_resend.insert(cluster.clone());
+                self.steward_away.remove(cluster);
+            }
+        }
         if c.new_session {
             self.capabilities
                 .insert(c.host.clone(), c.capabilities.clone());
@@ -1404,7 +1574,7 @@ impl Controller {
                 _ => {}
             }
             // A pending pre-phase gate check.
-            let subject = self.live[ri].hosts[hi].host.clone();
+            let subject = self.row_key(ri, hi);
             let pending = self.live[ri].record.runtime.phases.iter().find_map(|p| {
                 p.gate
                     .as_ref()
@@ -1417,6 +1587,7 @@ impl Controller {
                     hi,
                     server_message::Msg::Health(RunHealth {
                         target: String::new(),
+                        workload: String::new(),
                         revision: String::new(),
                         request_id,
                         scope: HealthScope::Rollout as i32,
@@ -1432,12 +1603,18 @@ impl Controller {
     fn on_disconnected(&mut self, host: &str) {
         let now = self.now();
         self.online.remove(host);
+        for (cluster, steward) in &self.executors {
+            if steward == host {
+                self.steward_away.entry(cluster.clone()).or_insert(now);
+            }
+        }
+        self.leases_dirty = true;
         for ri in 0..self.live.len() {
             let rows: Vec<usize> = (0..self.live[ri].hosts.len())
                 .filter(|&hi| self.row_session(ri, hi).as_deref() == Some(host))
                 .collect();
             for hi in rows {
-                let subject = self.live[ri].hosts[hi].host.clone();
+                let subject = self.row_key(ri, hi);
                 let gate_pending = self.live[ri].record.runtime.phases.iter().any(|p| {
                     p.gate
                         .as_ref()
@@ -1460,7 +1637,7 @@ impl Controller {
             if self.live[ri].record.runtime.action.is_some() {
                 continue;
             }
-            let Some(hi) = self.live[ri].find_target(host, &target) else {
+            let Some(hi) = self.live[ri].find_target(host, &target, &plan.workload) else {
                 continue;
             };
             let h = &self.live[ri].hosts[hi];
@@ -1545,17 +1722,21 @@ impl Controller {
                 h.runtime.deferred_modules = plan.deferred_modules.clone();
                 self.touch_host(ri, hi);
                 if !forced && !from.is_empty() && from != plan.digest {
-                    let host = host.to_owned();
+                    let key = self.row_key(ri, hi);
+                    let (host, workload) = (
+                        self.live[ri].hosts[hi].host.clone(),
+                        self.live[ri].hosts[hi].workload.clone(),
+                    );
                     self.command_audit(
                         "controller",
                         "rollout.host.plan_content_changed",
                         ri,
                         format!(
-                            "{host}: applying {} under the approval of {}: the plan's content changed, its resources and actions did not",
+                            "{key}: applying {} under the approval of {}: the plan's content changed, its resources and actions did not",
                             short(&plan.digest),
                             short(&from)
                         ),
-                        serde_json::json!({"host": host, "approved": from, "applied": plan.digest}),
+                        serde_json::json!({"host": host, "workload": workload, "approved": from, "applied": plan.digest}),
                     );
                 }
                 continue;
@@ -1563,10 +1744,11 @@ impl Controller {
                 continue;
             }
             if !plan.error.is_empty() && !stale && self.live[ri].hosts[hi].runtime.preview {
-                // A cluster's preview may fail on what an earlier stage
-                // provides: it waits for its stage to plan for real.
+                // A cluster's (or placement's) preview may fail on what an
+                // earlier stage provides: it waits for its stage to plan
+                // for real.
                 let h = &mut self.live[ri].hosts[hi];
-                if h.runtime.kind == TargetKind::Cluster {
+                if h.runtime.kind.on_cluster() {
                     h.runtime.error = Some(format!(
                         "the preview could not be planned: {}; plans again when its stage opens",
                         plan.error
@@ -1627,11 +1809,15 @@ impl Controller {
 
     fn on_apply_result(&mut self, host: &str, result: ApplyResult) {
         let target = result.target.clone();
+        // The cluster's applied revision moved: its steward's watch follows.
+        if !target.is_empty() && result.succeeded {
+            self.lease_resend.insert(target.clone());
+        }
         for ri in 0..self.live.len() {
             if self.live[ri].record.runtime.action.is_some() {
                 continue;
             }
-            let Some(hi) = self.live[ri].find_target(host, &target) else {
+            let Some(hi) = self.live[ri].find_target(host, &target, &result.workload) else {
                 continue;
             };
             let state = self.live[ri].hosts[hi].state;
@@ -1756,12 +1942,13 @@ impl Controller {
         let scope = HealthScope::try_from(report.scope).unwrap_or(HealthScope::Unspecified);
         let now = self.now();
         let target = report.target.clone();
-        // The row the report is about: the agent's host, or the cluster it
-        // names as its executor.
-        let host: &str = if target.is_empty() { agent } else { &target };
-        tracing::debug!(buckle.host = %agent, target = %target, scope = ?scope, request = %report.request_id, revision = %report.revision, results = report.results.len(), "health report");
+        // The row the report is about: the agent's host, or the cluster (or
+        // placement) it names as its executor.
+        let key = report_key(agent, &target, &report.workload);
+        let host: &str = &key;
+        tracing::debug!(buckle.host = %agent, target = %target, workload = %report.workload, scope = ?scope, request = %report.request_id, revision = %report.revision, results = report.results.len(), "health report");
         for ri in 0..self.live.len() {
-            let row = self.live[ri].find_target(agent, &target);
+            let row = self.live[ri].find_target(agent, &target, &report.workload);
             // Pre-phase gate answers.
             let gate_phase = self.live[ri].record.runtime.phases.iter().position(|p| {
                 p.gate
@@ -1986,6 +2173,7 @@ impl Controller {
     }
 
     async fn on_host_changed(&mut self, host: &str) {
+        self.leases_dirty = true;
         let h = host.to_owned();
         let record = self
             .store
@@ -2067,32 +2255,39 @@ impl Controller {
     /// as a failure) and dropped from pending gates.
     fn forget_host(&mut self, host: &str) {
         self.clusters.remove(host);
+        // A forgotten cluster's lease ends; a forgotten host's leases move.
+        if self.executors.contains_key(host) {
+            self.set_steward(host, None, "controller", "the cluster was forgotten");
+        }
+        self.leases_dirty = true;
         for ri in 0..self.live.len() {
             let mut gated = false;
             for p in &mut self.live[ri].record.runtime.phases {
                 if let Some(g) = p.gate.as_mut() {
-                    gated |= g.pending.remove(host).is_some();
+                    let before = g.pending.len();
+                    g.pending
+                        .retain(|k, _| buckle_api::split_placement_key(k).0 != host);
+                    gated |= g.pending.len() != before;
                 }
             }
             self.live[ri].dirty |= gated;
-            let Some(hi) = self.live[ri].find(host) else {
-                continue;
-            };
-            let state = self.live[ri].hosts[hi].state;
-            if matches!(
-                state,
-                HostPhase::Healthy | HostPhase::Skipped | HostPhase::RolledBack
-            ) {
-                continue;
+            for hi in self.live[ri].rows_of(host) {
+                let state = self.live[ri].hosts[hi].state;
+                if matches!(
+                    state,
+                    HostPhase::Healthy | HostPhase::Skipped | HostPhase::RolledBack
+                ) {
+                    continue;
+                }
+                {
+                    let h = &mut self.live[ri].hosts[hi];
+                    h.runtime.error = Some("the host was forgotten".into());
+                    h.runtime.disconnected_at = None;
+                    h.runtime.request_id = None;
+                }
+                self.set_host_state(ri, hi, HostPhase::Skipped, "the host was forgotten");
+                self.unpause_if_cleared(ri, "controller");
             }
-            {
-                let h = &mut self.live[ri].hosts[hi];
-                h.runtime.error = Some("the host was forgotten".into());
-                h.runtime.disconnected_at = None;
-                h.runtime.request_id = None;
-            }
-            self.set_host_state(ri, hi, HostPhase::Skipped, "the host was forgotten");
-            self.unpause_if_cleared(ri, "controller");
         }
     }
 
@@ -2144,9 +2339,12 @@ impl Controller {
             .ok_or_else(|| CommandError::not_found(format!("No active rollout '{id}'.")))
     }
 
-    fn find_host(&self, ri: usize, host: &str) -> Result<usize, CommandError> {
-        self.live[ri].find(host).ok_or_else(|| {
-            CommandError::not_found(format!("Host '{host}' is not part of this rollout."))
+    fn find_host(&self, ri: usize, host: &str, workload: &str) -> Result<usize, CommandError> {
+        self.live[ri].find_row(host, workload).ok_or_else(|| {
+            CommandError::not_found(format!(
+                "Host '{}' is not part of this rollout.",
+                buckle_api::placement_key(host, Some(workload))
+            ))
         })
     }
 
@@ -2217,7 +2415,7 @@ impl Controller {
                     &["Run the action once its agent reconnects."],
                 ));
             }
-            TargetKind::Cluster => self
+            TargetKind::Cluster | TargetKind::Workload => self
                 .executors
                 .get(&target)
                 .filter(|e| {
@@ -2266,18 +2464,20 @@ impl Controller {
             revision,
             traceparent: traceparent_of(&span).unwrap_or_default(),
             target: String::new(),
+            workload: String::new(),
         }));
         self.outbox.push(match record.kind {
             TargetKind::Host => Out::Msg(session, Box::new(m)),
-            TargetKind::Cluster => Out::Targeted {
+            TargetKind::Cluster | TargetKind::Workload => Out::Targeted {
                 session,
                 target: target.clone(),
-                msg: Box::new(stamp_target(m, &target)),
+                workload: String::new(),
+                msg: Box::new(stamp_target(m, &target, "")),
             },
         });
         let noun = match record.kind {
             TargetKind::Host => "host",
-            TargetKind::Cluster => "target",
+            TargetKind::Cluster | TargetKind::Workload => "target",
         };
         let message = if note.is_empty() {
             format!("{actor} ran {label} on {target}")
@@ -2433,11 +2633,12 @@ impl Controller {
         let now = self.now();
         let span = self.host_span(ri, hi);
         let run_id = crate::store::RunRecord::new_id();
-        let (target, revision, rollout) = {
+        let (target, workload, revision, rollout) = {
             let live = &self.live[ri];
             let h = &live.hosts[hi];
             (
                 h.host.clone(),
+                h.workload.clone(),
                 h.runtime.revision.clone(),
                 live.record.id.clone(),
             )
@@ -2479,6 +2680,7 @@ impl Controller {
                 revision,
                 traceparent: traceparent_of(&span).unwrap_or_default(),
                 target: String::new(),
+                workload,
             }),
         );
     }
@@ -2491,7 +2693,19 @@ impl Controller {
             if self.live[ri].record.runtime.action.is_none() {
                 continue;
             }
-            let Some(hi) = self.live[ri].find_target(host, &a.target) else {
+            // An executor predating placements echoes no workload: its run
+            // id names the placement.
+            let Some(hi) = self.live[ri]
+                .find_target(host, &a.target, &a.workload)
+                .or_else(|| {
+                    self.live[ri].hosts.iter().position(|h| {
+                        !a.target.is_empty()
+                            && h.host == a.target
+                            && h.runtime.executor.as_deref() == Some(host)
+                            && h.runtime.action_run.as_deref() == Some(a.action_id.as_str())
+                    })
+                })
+            else {
                 continue;
             };
             let h = &self.live[ri].hosts[hi];
@@ -2560,6 +2774,9 @@ impl Controller {
                     .await
             }
             Command::Start { revision, note } => self.start(&revision, actor, &note).await,
+            Command::MoveLease { target, host, note } => {
+                self.move_lease_to(actor, &target, &host, &note).await
+            }
             Command::StartAction {
                 action,
                 targets,
@@ -2720,10 +2937,12 @@ impl Controller {
             Command::Retry {
                 rollout,
                 host,
+                workload,
                 note,
             } => {
                 let ri = self.find_rollout(&rollout)?;
-                let hi = self.find_host(ri, &host)?;
+                let hi = self.find_host(ri, &host, &workload)?;
+                let host = buckle_api::placement_key(&host, Some(&workload));
                 if !matches!(
                     self.live[ri].hosts[hi].state,
                     HostPhase::Failed
@@ -2745,7 +2964,7 @@ impl Controller {
                     "rollout.host.retry",
                     ri,
                     format!("{actor} retried {host}. {note}"),
-                    serde_json::json!({"host": host, "note": note}),
+                    serde_json::json!({"host": self.live[ri].hosts[hi].host, "workload": workload, "note": note}),
                 );
                 self.replan(ri, hi, actor);
                 Ok(rollout)
@@ -2793,16 +3012,19 @@ impl Controller {
             Command::SkipBake {
                 rollout,
                 host,
+                workload,
                 note,
-            } => self.skip_bake(actor, rollout, host, note),
+            } => self.skip_bake(actor, rollout, host, workload, note),
             Command::Continue {
                 rollout,
                 host,
+                workload,
                 waive,
                 note,
             } => {
                 let ri = self.find_rollout(&rollout)?;
-                let hi = self.find_host(ri, &host)?;
+                let hi = self.find_host(ri, &host, &workload)?;
+                let host = buckle_api::placement_key(&host, Some(&workload));
                 let h = &self.live[ri].hosts[hi];
                 if h.state != HostPhase::Failed || h.runtime.failed_checks.is_empty() {
                     return Err(CommandError::conflict(
@@ -2852,7 +3074,7 @@ impl Controller {
                         "{actor} continued {host} waiving {}. {note}",
                         waive.join(", ")
                     ),
-                    serde_json::json!({"host": host, "waived": waive, "note": note}),
+                    serde_json::json!({"host": self.live[ri].hosts[hi].host, "workload": workload, "waived": waive, "note": note}),
                 );
                 self.replan(ri, hi, actor);
                 Ok(rollout)
@@ -2860,10 +3082,12 @@ impl Controller {
             Command::Skip {
                 rollout,
                 host,
+                workload,
                 note,
             } => {
                 let ri = self.find_rollout(&rollout)?;
-                let hi = self.find_host(ri, &host)?;
+                let hi = self.find_host(ri, &host, &workload)?;
+                let host = buckle_api::placement_key(&host, Some(&workload));
                 let state = self.live[ri].hosts[hi].state;
                 if matches!(
                     state,
@@ -2879,7 +3103,7 @@ impl Controller {
                     "rollout.host.skip",
                     ri,
                     format!("{actor} skipped {host}. {note}"),
-                    serde_json::json!({"host": host, "note": note}),
+                    serde_json::json!({"host": self.live[ri].hosts[hi].host, "workload": workload, "note": note}),
                 );
                 self.live[ri].hosts[hi].runtime.error = Some(if note.is_empty() {
                     format!("skipped by {actor}")
@@ -2893,10 +3117,12 @@ impl Controller {
             Command::Force {
                 rollout,
                 host,
+                workload,
                 note,
             } => {
                 let ri = self.find_rollout(&rollout)?;
-                let hi = self.find_host(ri, &host)?;
+                let hi = self.find_host(ri, &host, &workload)?;
+                let host = buckle_api::placement_key(&host, Some(&workload));
                 let state = self.live[ri].hosts[hi].state;
                 if !matches!(
                     state,
@@ -2918,8 +3144,11 @@ impl Controller {
                 let Some(session) = self.row_session(ri, hi).filter(|s| self.connected(s)) else {
                     let what = match self.live[ri].hosts[hi].runtime.kind {
                         TargetKind::Host => format!("Host '{host}' is not connected."),
-                        TargetKind::Cluster => {
-                            format!("Cluster '{host}' has no connected executor.")
+                        TargetKind::Cluster | TargetKind::Workload => {
+                            format!(
+                                "Cluster '{}' has no connected executor.",
+                                self.live[ri].hosts[hi].host
+                            )
                         }
                     };
                     return Err(CommandError::conflict(
@@ -2962,7 +3191,7 @@ impl Controller {
                     "rollout.host.force",
                     ri,
                     format!("{actor} force applied {host} {what}. {note}"),
-                    serde_json::json!({"host": host, "note": note, "from": state.as_str(), "force_plan": force_plan}),
+                    serde_json::json!({"host": self.live[ri].hosts[hi].host, "workload": workload, "note": note, "from": state.as_str(), "force_plan": force_plan}),
                 );
                 {
                     let h = &mut self.live[ri].hosts[hi];
@@ -2997,6 +3226,7 @@ impl Controller {
         actor: &str,
         rollout: String,
         host: Option<String>,
+        workload: String,
         note: String,
     ) -> Result<String, CommandError> {
         let ri = self.find_rollout(&rollout)?;
@@ -3010,8 +3240,9 @@ impl Controller {
             ));
         }
         let rows: Vec<usize> = match &host {
-            Some(name) => {
-                let hi = self.find_host(ri, name)?;
+            Some(target) => {
+                let hi = self.find_host(ri, target, &workload)?;
+                let name = buckle_api::placement_key(target, Some(&workload));
                 if self.live[ri].hosts[hi].state != HostPhase::Baking {
                     return Err(CommandError::conflict(
                         format!("Host '{name}' is not baking, so there is no bake to skip."),
@@ -3035,7 +3266,7 @@ impl Controller {
             .partition(|&i| !self.live[ri].hosts[i].runtime.failing_since.is_empty());
         let names = |rows: &[usize]| -> Vec<String> {
             rows.iter()
-                .map(|&i| self.live[ri].hosts[i].host.clone())
+                .map(|&i| super::view::row_key(&self.live[ri].hosts[i]))
                 .collect()
         };
         let (skipped, kept) = (names(&clear), names(&failing));
@@ -3050,7 +3281,10 @@ impl Controller {
             ));
         }
         let (action, subject) = match &host {
-            Some(h) => ("rollout.host.skip_bake", h.clone()),
+            Some(h) => (
+                "rollout.host.skip_bake",
+                buckle_api::placement_key(h, Some(&workload)),
+            ),
             None => (
                 "rollout.skip_bake",
                 format!("{} host(s): {}", skipped.len(), skipped.join(", ")),
@@ -3355,10 +3589,18 @@ impl Controller {
                 Ok(out)
             })
             .await?;
-        self.clusters = targets
+        let clusters: HashMap<String, buckle_api::ClusterSpec> = targets
             .iter()
             .filter_map(|(h, _)| h.cluster.as_ref().map(|c| (h.id.clone(), c.spec.clone())))
             .collect();
+        // A cluster that appeared (synced from a revision) or went needs
+        // its lease reviewed.
+        if clusters.len() != self.clusters.len()
+            || clusters.keys().any(|c| !self.clusters.contains_key(c))
+        {
+            self.leases_dirty = true;
+        }
+        self.clusters = clusters;
         Ok(targets)
     }
 
@@ -3374,7 +3616,6 @@ impl Controller {
         let hosts = self.load_targets(Some(revision)).await?;
         let now = self.now();
         let live = &mut self.live[ri];
-        let fleet = &live.revision.fleet;
         let policy = &live.record.policy;
         let phases = crate::fleet::effective_phases(policy);
         live.record.runtime.phases = phases
@@ -3401,6 +3642,15 @@ impl Controller {
             None => self.stable.clone(),
         };
         live.record.started_at = now;
+        let (id, revision) = (live.record.id.clone(), live.revision.clone());
+        let rollout_revision = live.record.revision.clone();
+        let action_workload = live
+            .record
+            .runtime
+            .action
+            .as_ref()
+            .map(|a| a.module.clone());
+        let mut rows = Vec::new();
         let mut untargeted = Vec::new();
         for (host, facts) in &hosts {
             self.host_seen
@@ -3409,18 +3659,55 @@ impl Controller {
             if host.status != HostStatus::Active || host.executor_of().is_some() {
                 continue;
             }
-            let revision = match &only {
+            let target_revision = match &only {
                 Some(only) => match only.get(&host.id) {
                     Some(r) => r.clone(),
                     None => continue,
                 },
-                None => live.record.revision.clone(),
+                None => rollout_revision.clone(),
             };
-            let ctx = crate::fleet::record_context(host, facts, fleet);
+            let mut ctx = crate::fleet::record_context(host, facts, &revision.fleet);
+            // A cluster is rolled one workload placement at a time, each in
+            // the phase its labels select, when its executors take placements.
+            if only.is_none()
+                && crate::targets::is_cluster(host)
+                && self.placements_supported(&host.id, &revision.fleet, &hosts)
+            {
+                for p in self.placements(&revision, &ctx, host, facts, &phases).await {
+                    match p.phase {
+                        Some(pi) => rows.push(placement_row(
+                            &id,
+                            &host.id,
+                            &p,
+                            pi,
+                            &phases[pi].name,
+                            &target_revision,
+                            now,
+                        )),
+                        None => {
+                            untargeted.push(buckle_api::placement_key(&host.id, Some(&p.workload)))
+                        }
+                    }
+                }
+                continue;
+            }
+            // An action rollout moves a cluster as the placement of the
+            // workload declaring the action, phased by its `workload.*`.
+            let (kind, workload) = match (&action_workload, host.kind) {
+                (Some(w), TargetKind::Cluster) => {
+                    if let Some(loaded) = revision.workload(w) {
+                        ctx =
+                            buckle_core::engine::placement_context(&revision, &ctx, &loaded.config);
+                    }
+                    (TargetKind::Workload, w.clone())
+                }
+                _ => (host.kind, String::new()),
+            };
             match crate::fleet::phase_for(&ctx, &phases) {
-                Some(pi) => live.hosts.push(RolloutHostRecord {
-                    rollout: live.record.id.clone(),
+                Some(pi) => rows.push(RolloutHostRecord {
+                    rollout: id.clone(),
                     host: host.id.clone(),
+                    workload,
                     phase: phases[pi].name.clone(),
                     wave: None,
                     state: HostPhase::PlanPending,
@@ -3431,20 +3718,22 @@ impl Controller {
                     created_at: now,
                     updated_at: now,
                     runtime: HostRuntime {
-                        revision,
+                        revision: target_revision,
                         phase_index: Some(pi),
-                        kind: host.kind,
+                        kind,
                         ..Default::default()
                     },
                 }),
-                None => untargeted.push(host.id.clone()),
+                None => untargeted.push(buckle_api::placement_key(&host.id, Some(&workload))),
             }
         }
+        let live = &mut self.live[ri];
+        live.hosts.extend(rows);
         live.record.runtime.untargeted = untargeted;
         live.dirty = true;
         live.dirty_hosts = (0..live.hosts.len()).collect();
         let n = live.hosts.len();
-        let count = format!("{n} hosts frozen into {} phases", phases.len());
+        let count = format!("{n} targets frozen into {} phases", phases.len());
         // An action runs on each target as one step: no dependency stages.
         if only.is_none() {
             for pi in 0..phases.len() {
@@ -3461,6 +3750,123 @@ impl Controller {
         Ok(())
     }
 
+    /// Whether cluster `cluster` is rolled by placements: its steward takes
+    /// one workload at a time ([`WORKLOADS_CAPABILITY`]), or, with the lease
+    /// unheld, every host that could take it does. With none connected, it
+    /// is (the agents that come are current ones); while an older executor
+    /// holds or could take the lease the cluster is rolled as one row, which
+    /// that agent understands.
+    fn placements_supported(
+        &self,
+        cluster: &str,
+        fleet: &buckle_core::model::FleetConfig,
+        targets: &[(crate::store::HostRecord, serde_json::Value)],
+    ) -> bool {
+        if let Some(steward) = self.executors.get(cluster)
+            && self.connected(steward)
+        {
+            return self.has_capability(steward, WORKLOADS_CAPABILITY);
+        }
+        self.steward_candidates(cluster, fleet, targets)
+            .iter()
+            .all(|h| self.has_capability(h, WORKLOADS_CAPABILITY))
+    }
+
+    /// The workload placements of `record` (a cluster) for `revision`: one
+    /// per workload the revision selects on it, phased by its labels and the
+    /// cluster's, plus one **removal** per workload the cluster's applied
+    /// revision ran that this one no longer selects. A removal goes after the
+    /// placements that needed its workload, in their latest phase; one no
+    /// phase names rides with the cluster's last placement.
+    async fn placements(
+        &self,
+        revision: &Revision,
+        cluster: &buckle_core::selectors::HostContext,
+        record: &crate::store::HostRecord,
+        facts: &serde_json::Value,
+        phases: &[buckle_core::model::PhasePolicy],
+    ) -> Vec<Placement> {
+        let selected = buckle_core::engine::selected_workloads(revision, cluster);
+        let names: BTreeSet<&str> = selected.iter().map(|w| w.config.name.as_str()).collect();
+        let mut out: Vec<Placement> = selected
+            .iter()
+            .map(|w| Placement {
+                workload: w.config.name.clone(),
+                phase: crate::fleet::phase_for(
+                    &buckle_core::engine::placement_context(revision, cluster, &w.config),
+                    phases,
+                ),
+                removal: false,
+                after: Vec::new(),
+            })
+            .collect();
+        let applied = record
+            .applied_revision
+            .as_deref()
+            .filter(|a| *a != revision.id.0.as_str());
+        if let Some(applied) = applied {
+            match self.revisions.load(applied).await {
+                Ok(old) => {
+                    let old_ctx = crate::fleet::record_context(record, facts, &old.fleet);
+                    let was = buckle_core::engine::selected_workloads(&old, &old_ctx);
+                    for w in &was {
+                        if names.contains(w.config.name.as_str()) {
+                            continue;
+                        }
+                        // Its labels are the applied config's, read against
+                        // the cluster as this revision declares it.
+                        let ctx =
+                            buckle_core::engine::placement_context(revision, cluster, &w.config);
+                        let after = was
+                            .iter()
+                            .filter(|d| {
+                                d.config.needs().iter().any(|n| {
+                                    matches!(n, buckle_core::model::Need::Workload(x) if *x == w.config.name)
+                                })
+                            })
+                            .map(|d| d.config.name.clone())
+                            .collect();
+                        out.push(Placement {
+                            workload: w.config.name.clone(),
+                            phase: crate::fleet::phase_for(&ctx, phases),
+                            removal: true,
+                            after,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(cluster = %record.id, revision = %applied, error = %e, "the cluster's applied revision could not be loaded; workloads it ran that left the configuration are not removed by this rollout");
+                }
+            }
+        }
+        let latest = out
+            .iter()
+            .filter(|p| !p.removal)
+            .filter_map(|p| p.phase)
+            .max();
+        // A removal's dependents may be removals bumped here themselves:
+        // phases only move later, so this settles.
+        loop {
+            let phases_of: Vec<(String, Option<usize>)> =
+                out.iter().map(|p| (p.workload.clone(), p.phase)).collect();
+            let mut moved = false;
+            for p in out.iter_mut().filter(|p| p.removal) {
+                let dependents = phases_of
+                    .iter()
+                    .filter(|(w, _)| p.after.contains(w))
+                    .filter_map(|(_, phase)| *phase)
+                    .max();
+                let phase = p.phase.max(dependents).or(latest);
+                moved |= phase != p.phase;
+                p.phase = phase;
+            }
+            if !moved {
+                break;
+            }
+        }
+        out
+    }
+
     /// Plans the clusters whose stage has not opened yet as previews, through
     /// an executor free now. One without a free executor stays unplanned
     /// until its stage opens, as does one whose preview fails.
@@ -3468,7 +3874,7 @@ impl Controller {
         let rows: Vec<usize> = (0..self.live[ri].hosts.len())
             .filter(|&hi| {
                 let h = &self.live[ri].hosts[hi];
-                h.runtime.kind == TargetKind::Cluster
+                h.runtime.kind.on_cluster()
                     && h.state == HostPhase::PlanPending
                     && !self.stage_open(ri, hi)
             })
@@ -3526,10 +3932,11 @@ impl Controller {
     }
 
     /// Lays phase `pi`'s targets out in dependency stages (see
-    /// [`stages`]) from the cross-layer `needs` of the modules selected on
-    /// its hosts and of the workloads on its clusters, and records each
-    /// target's steps. Hosts' first steps keep any plan they have unless
-    /// the step narrowed to a module subset, in which case they re-plan.
+    /// [`stages`]) from the `needs` of the modules selected on its hosts and
+    /// of the workloads on its clusters (one unit per placement), and
+    /// records each target's steps. Hosts' first steps keep any plan they
+    /// have unless the step narrowed to a module subset, in which case they
+    /// re-plan.
     fn compute_stages(
         &mut self,
         ri: usize,
@@ -3542,6 +3949,7 @@ impl Controller {
             let revision = &live.revision;
             let mut hosts = Vec::new();
             let mut clusters = Vec::new();
+            let mut placements: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             for &hi in &rows {
                 let row = &live.hosts[hi];
                 match row.runtime.kind {
@@ -3576,6 +3984,14 @@ impl Controller {
                             clusters.push(c);
                         }
                     }
+                    TargetKind::Workload => {
+                        placements.entry(row.host.clone()).or_default().push(hi)
+                    }
+                }
+            }
+            for (cluster, rows_of) in &placements {
+                if let Some(c) = self.placements_input(ri, cluster, rows_of, &rows, targets) {
+                    clusters.push(c);
                 }
             }
             (hosts, clusters)
@@ -3585,7 +4001,7 @@ impl Controller {
         for &hi in &rows {
             let steps = staged
                 .steps
-                .get(&self.live[ri].hosts[hi].host)
+                .get(&self.row_key(ri, hi))
                 .cloned()
                 .unwrap_or_else(|| vec![stages::whole()]);
             let h = &mut self.live[ri].hosts[hi];
@@ -3619,8 +4035,40 @@ impl Controller {
         }
     }
 
-    /// The stage input for cluster row `hi`: its node hosts among `rows` and
-    /// the workloads selected on it.
+    /// The node hosts of `cluster` among the phase's `rows`.
+    fn cluster_nodes(
+        &self,
+        ri: usize,
+        cluster: &str,
+        rows: &[usize],
+        targets: &[(crate::store::HostRecord, serde_json::Value)],
+    ) -> Option<Vec<String>> {
+        let live = &self.live[ri];
+        let spec = self.clusters.get(cluster)?;
+        let fleet = &live.revision.fleet;
+        let record = |id: &str| targets.iter().find(|(h, _)| h.id == id);
+        let nodes_filter = spec
+            .nodes
+            .as_deref()
+            .and_then(|raw| buckle_core::Filter::new(raw).ok());
+        Some(
+            rows.iter()
+                .map(|&i| &live.hosts[i])
+                .filter(|r| r.runtime.kind == TargetKind::Host)
+                .filter(|r| {
+                    nodes_filter.as_ref().is_some_and(|f| {
+                        record(&r.host).is_some_and(|(h, facts)| {
+                            crate::fleet::record_context(h, facts, fleet).matches(f)
+                        })
+                    })
+                })
+                .map(|r| r.host.clone())
+                .collect(),
+        )
+    }
+
+    /// The stage input for cluster row `hi` (a cluster applied as one unit):
+    /// its node hosts among `rows` and the workloads selected on it.
     fn cluster_input(
         &self,
         ri: usize,
@@ -3630,28 +4078,9 @@ impl Controller {
     ) -> Option<stages::ClusterInput> {
         let live = &self.live[ri];
         let cluster = &live.hosts[hi].host;
-        let spec = self.clusters.get(cluster)?;
-        let fleet = &live.revision.fleet;
-        let record = |id: &str| targets.iter().find(|(h, _)| h.id == id);
-        let nodes_filter = spec
-            .nodes
-            .as_deref()
-            .and_then(|raw| buckle_core::Filter::new(raw).ok());
-        let nodes = rows
-            .iter()
-            .map(|&i| &live.hosts[i])
-            .filter(|r| r.runtime.kind == TargetKind::Host)
-            .filter(|r| {
-                nodes_filter.as_ref().is_some_and(|f| {
-                    record(&r.host).is_some_and(|(h, facts)| {
-                        crate::fleet::record_context(h, facts, fleet).matches(f)
-                    })
-                })
-            })
-            .map(|r| r.host.clone())
-            .collect();
-        let (rec, facts) = record(cluster)?;
-        let ctx = crate::fleet::record_context(rec, facts, fleet);
+        let nodes = self.cluster_nodes(ri, cluster, rows, targets)?;
+        let (rec, facts) = targets.iter().find(|(h, _)| &h.id == cluster)?;
+        let ctx = crate::fleet::record_context(rec, facts, &live.revision.fleet);
         let workloads = buckle_core::engine::selected_workloads(&live.revision, &ctx)
             .into_iter()
             .map(|w| stages::WorkloadUnit {
@@ -3668,6 +4097,56 @@ impl Controller {
             id: cluster.clone(),
             nodes,
             workloads,
+            placements: false,
+        })
+    }
+
+    /// The stage input for the placement rows `placements` of `cluster`: its
+    /// node hosts among `rows` and one unit per placement, a removal's needs
+    /// being the placements that needed its workload.
+    fn placements_input(
+        &self,
+        ri: usize,
+        cluster: &str,
+        placements: &[usize],
+        rows: &[usize],
+        targets: &[(crate::store::HostRecord, serde_json::Value)],
+    ) -> Option<stages::ClusterInput> {
+        let live = &self.live[ri];
+        let nodes = self.cluster_nodes(ri, cluster, rows, targets)?;
+        let workloads = placements
+            .iter()
+            .map(|&i| {
+                let r = &live.hosts[i];
+                let needs = if r.runtime.removal {
+                    r.runtime
+                        .after
+                        .iter()
+                        .map(|a| stages::Need::Workload(a.clone()))
+                        .collect()
+                } else {
+                    live.revision
+                        .workload(&r.workload)
+                        .map(|w| {
+                            w.config
+                                .needs()
+                                .into_iter()
+                                .map(stages::Need::from)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                stages::WorkloadUnit {
+                    name: r.workload.clone(),
+                    needs,
+                }
+            })
+            .collect();
+        Some(stages::ClusterInput {
+            id: cluster.to_owned(),
+            nodes,
+            workloads,
+            placements: true,
         })
     }
 
@@ -3692,8 +4171,10 @@ impl Controller {
                 return;
             }
             h.runtime.drifted_from = Some(from.clone());
-            (h.host.clone(), from, to, h.phase.clone())
+            (view::row_key(h), from, to, h.phase.clone())
         };
+        let (host, workload) = buckle_api::split_placement_key(&target);
+        let (host, workload) = (host.to_owned(), workload.unwrap_or_default().to_owned());
         self.command_audit(
             "controller",
             "rollout.target.plan_drifted",
@@ -3703,7 +4184,7 @@ impl Controller {
                 short(&from),
                 short(&to)
             ),
-            serde_json::json!({"host": target, "phase": phase, "previewed": from, "planned": to}),
+            serde_json::json!({"host": host, "workload": workload, "phase": phase, "previewed": from, "planned": to}),
         );
     }
 
@@ -3743,11 +4224,13 @@ impl Controller {
             self.live[ri].dirty_hosts.insert(hi);
         }
         let target = self.row_target(ri, hi);
+        let workload = self.live[ri].hosts[hi].workload.clone();
         let revision = self.live[ri].hosts[hi].runtime.revision.clone();
         let stable = self.stable.as_deref() == Some(revision.as_str());
         self.outbox.push(Out::AssignAndPlan {
             session,
             target,
+            workload,
             revision,
             stable,
         });
@@ -3967,6 +4450,7 @@ impl Controller {
             hi,
             server_message::Msg::Health(RunHealth {
                 target: String::new(),
+                workload: String::new(),
                 revision: String::new(),
                 request_id,
                 scope: HealthScope::Baseline as i32,
@@ -3988,6 +4472,7 @@ impl Controller {
         let rollout = live.record.id.clone();
         Apply {
             target: String::new(),
+            workload: String::new(),
             revision: h.runtime.revision.clone(),
             plan_digest: digest.clone(),
             approval_token: approval_token(&self.key, &rollout, &phase, &digest),
@@ -4113,7 +4598,7 @@ impl Controller {
             };
         };
         let revision = &live.revision;
-        let cluster = live.hosts[hi].runtime.kind == TargetKind::Cluster;
+        let cluster = live.hosts[hi].runtime.kind.on_cluster();
         bake::window(min, &changed, |name| {
             if cluster {
                 revision.workload(name).and_then(|w| w.config.bake)
@@ -4165,11 +4650,15 @@ impl Controller {
     }
 
     /// The workloads whose checks gate cluster row `hi` (its baseline, bake
-    /// and gates): those its plan changes, so a workload this rollout leaves
-    /// alone, already unhealthy, does not hold it. None (every check gates)
-    /// for a host, or a cluster without a plan.
+    /// and gates): those its plan changes (a placement's plan names its own
+    /// workload at most), so a workload this rollout leaves alone, already
+    /// unhealthy, does not hold it. None (every check gates) for a host, or
+    /// a cluster without a plan.
     fn gated_workloads(&self, ri: usize, hi: usize) -> Option<BTreeSet<String>> {
-        (self.live[ri].hosts[hi].runtime.kind == TargetKind::Cluster)
+        self.live[ri].hosts[hi]
+            .runtime
+            .kind
+            .on_cluster()
             .then(|| self.plan_changes(ri, hi))
             .flatten()
     }
@@ -4330,6 +4819,7 @@ impl Controller {
             hi,
             server_message::Msg::Health(RunHealth {
                 target: String::new(),
+                workload: String::new(),
                 revision: String::new(),
                 request_id,
                 scope: HealthScope::Bake as i32,
@@ -4351,6 +4841,7 @@ impl Controller {
             hi,
             server_message::Msg::Rollback(pb::Rollback {
                 target: String::new(),
+                workload: String::new(),
                 revision: prev,
                 reason: format!("rollout {rollout} is being rolled back"),
                 rollout_id: rollout,
@@ -4412,27 +4903,30 @@ impl Controller {
             h.runtime.preview = false;
             h.runtime.previewed = None;
             h.runtime.drifted_from = None;
-            (h.host.clone(), from)
+            (view::row_key(h), from)
         };
-        let (id, phase, trace) = {
+        let (id, phase, trace, workload) = {
             let live = &self.live[ri];
             (
                 live.record.id.clone(),
                 live.hosts[hi].phase.clone(),
                 live.record.runtime.trace_id.clone(),
+                live.hosts[hi].workload.clone(),
             )
         };
         self.live[ri].host_spans.remove(&host);
+        let key = host;
+        let host = buckle_api::split_placement_key(&key).0.to_owned();
         self.audit(
             "controller",
             "rollout.host.staged",
             &id,
             format!(
-                "{host}: stage {} applied and baked; waits for stage {}",
+                "{key}: stage {} applied and baked; waits for stage {}",
                 from + 1,
                 next.stage + 1
             ),
-            serde_json::json!({"host": host, "phase": phase, "from_stage": from, "stage": next.stage}),
+            serde_json::json!({"host": host, "workload": workload, "phase": phase, "from_stage": from, "stage": next.stage}),
             trace,
         );
         self.set_host_state(
@@ -4459,7 +4953,7 @@ impl Controller {
         if failures <= budget {
             return;
         }
-        let host = self.live[ri].hosts[hi].host.clone();
+        let host = self.row_key(ri, hi);
         self.on_breach(ri, pi, failures, Some((host, why.to_owned())));
     }
 
@@ -4477,7 +4971,7 @@ impl Controller {
         let mut consider = |t: DateTime<Utc>| {
             next = Some(next.map_or(t, |n| n.min(t)));
         };
-        consider(self.cluster_health_due);
+        consider(self.leases_due);
         if let Some(t) = self.flush_retry {
             consider(t);
         }
@@ -4543,7 +5037,7 @@ impl Controller {
                 chrono::Duration::from_std(self.live[ri].record.policy.settle).unwrap_or_default();
             for hi in 0..self.live[ri].hosts.len() {
                 let h = &self.live[ri].hosts[hi];
-                let host = h.host.clone();
+                let host = view::row_key(h);
                 if h.state == HostPhase::Baking {
                     let regressed: Vec<String> = h
                         .runtime
@@ -4585,12 +5079,12 @@ impl Controller {
                     if let Some(until) = ended
                         && h.runtime.failing_since.is_empty()
                     {
-                        if reported && (!window || self.row_connected(ri, hi)) {
+                        if reported && (!window || self.row_back(ri, hi)) {
                             self.finish_step(ri, hi);
                             continue;
                         }
                         if !reported
-                            && self.row_connected(ri, hi)
+                            && self.row_back(ri, hi)
                             && until + self.bake_report_grace(ri) <= now
                         {
                             let why = "sent no health report during its bake".to_owned();
@@ -4647,7 +5141,7 @@ impl Controller {
                     && !self.row_connected(ri, hi)
                 {
                     let state = h.state;
-                    if h.runtime.kind == TargetKind::Cluster {
+                    if h.runtime.kind.on_cluster() {
                         self.live[ri].hosts[hi].runtime.disconnected_at = None;
                         self.touch_host(ri, hi);
                         self.executor_lost(ri, hi).await;
@@ -4690,7 +5184,7 @@ impl Controller {
 
     async fn drive(&mut self) {
         self.on_time().await;
-        self.read_cluster_health().await;
+        self.assign_leases().await;
         for _ in 0..64 {
             let mut changed = false;
             for ri in 0..self.live.len() {
@@ -4847,17 +5341,31 @@ impl Controller {
                 if slot && inflight >= cap {
                     continue;
                 }
-                let h = &self.live[ri].hosts[hi];
-                if h.state == HostPhase::Planned
+                let startable = self.live[ri].hosts[hi].state == HostPhase::Planned
                     && self.stage_open(ri, hi)
                     && self.row_eligible(ri, hi)
                     && !self.row_session(ri, hi).is_some_and(|s| busy.contains(&s))
-                    && self.approved(ri, hi)
-                {
-                    self.start_baseline(ri, hi);
-                    inflight += usize::from(slot);
-                    changed = true;
+                    && self.approved(ri, hi);
+                if !startable {
+                    continue;
                 }
+                match self.readiness(ri, hi).await {
+                    Readiness::Ready => {
+                        self.start_baseline(ri, hi);
+                        inflight += usize::from(slot);
+                    }
+                    // Misses its phase; converges in the stragglers stage
+                    // once what it needs is running.
+                    Readiness::Waiting(why) => {
+                        self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                        self.set_host_state(ri, hi, HostPhase::Missed, &why);
+                    }
+                    Readiness::Refused(why) => {
+                        self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                        self.fail_host(ri, hi, &why);
+                    }
+                }
+                changed = true;
             }
             // The phase is done when its hosts, and hosts of earlier phases an
             // operator retried, have finished (or missed it).
@@ -5029,7 +5537,7 @@ impl Controller {
     fn fail_gate(&mut self, ri: usize, p: usize, host: &str, why: &str) {
         self.live[ri].record.runtime.phases[p].gate = None;
         self.live[ri].dirty = true;
-        if let Some(hi) = self.live[ri].find(host) {
+        if let Some(hi) = self.live[ri].find_key(host) {
             self.live[ri].hosts[hi].runtime.error = Some(why.to_owned());
             self.live[ri].hosts[hi].runtime.disconnected_at = None;
             self.set_host_state(ri, hi, HostPhase::Failed, why);
@@ -5038,21 +5546,20 @@ impl Controller {
     }
 
     /// Hosts another live rollout (another rollout's phases, or an open
-    /// stragglers stage) is working on, and hosts executing a cluster's
-    /// apply in any rollout: they are not started here until that is done.
+    /// stragglers stage) is working on: they are not started here until
+    /// that is done. A host stewarding a cluster mid-apply is not busy: the
+    /// cluster's work runs on a lane of its own.
     fn busy_elsewhere(&self, ri: usize) -> HashSet<String> {
         self.live
             .iter()
             .enumerate()
-            .flat_map(|(rj, l)| {
+            .filter(|(rj, _)| *rj != ri)
+            .flat_map(|(_, l)| {
                 l.hosts
                     .iter()
                     .filter(|h| h.state.in_flight() || h.state == HostPhase::RollingBack)
-                    .flat_map(move |h| {
-                        let own = (rj != ri && h.runtime.kind == TargetKind::Host)
-                            .then(|| h.host.clone());
-                        own.into_iter().chain(h.runtime.executor.clone())
-                    })
+                    .filter(|h| h.runtime.kind == TargetKind::Host)
+                    .map(|h| h.host.clone())
             })
             .collect()
     }
@@ -5064,7 +5571,9 @@ impl Controller {
         self.live.iter().enumerate().any(|(rj, l)| {
             rj != ri
                 && (l.record.is_active() || l.record.runtime.stragglers_open)
-                && l.find(host).is_some_and(|hi| !l.hosts[hi].state.finished())
+                && l.hosts
+                    .iter()
+                    .any(|h| h.host == host && !h.state.finished())
         })
     }
 
@@ -5084,7 +5593,7 @@ impl Controller {
         let now = self.now();
         for hi in targets {
             let rid = new_id();
-            let host = self.live[ri].hosts[hi].host.clone();
+            let host = self.row_key(ri, hi);
             gate.pending.insert(host, rid.clone());
             if self.row_connected(ri, hi) {
                 self.send_to(
@@ -5092,6 +5601,7 @@ impl Controller {
                     hi,
                     server_message::Msg::Health(RunHealth {
                         target: String::new(),
+                        workload: String::new(),
                         revision: String::new(),
                         request_id: rid,
                         scope: HealthScope::Rollout as i32,
@@ -5219,28 +5729,78 @@ impl Controller {
         }
         // Targets that appeared since the freeze, and carried stragglers.
         let candidates = self.load_targets(None).await.unwrap_or_default();
-        for (host, facts) in candidates {
+        let fleet = self.live[ri].revision.clone();
+        for (host, facts) in &candidates {
             let carried_here = carried.contains(&host.id);
-            if self.live[ri].find(&host.id).is_some()
-                || host.status != HostStatus::Active
-                || host.executor_of().is_some()
+            if host.status != HostStatus::Active || host.executor_of().is_some() {
+                continue;
+            }
+            if !carried_here && host.applied_revision.as_deref() == Some(revision.as_str()) {
+                continue;
+            }
+            // A cluster rolled by placements: those without a row yet.
+            if crate::targets::is_cluster(host)
+                && self.placements_supported(&host.id, &fleet.fleet, &candidates)
             {
+                self.add_cluster_stragglers(ri, host, facts, si, carried_here)
+                    .await;
+                continue;
+            }
+            if self.live[ri].find(&host.id).is_some() {
                 continue;
             }
             if !carried_here {
-                if self.live[ri].record.runtime.untargeted.contains(&host.id)
-                    || host.applied_revision.as_deref() == Some(revision.as_str())
-                {
+                if self.live[ri].record.runtime.untargeted.contains(&host.id) {
                     continue;
                 }
-                let ctx =
-                    crate::fleet::record_context(&host, &facts, &self.live[ri].revision.fleet);
+                let ctx = crate::fleet::record_context(host, facts, &fleet.fleet);
                 if crate::fleet::phase_for(&ctx, &crate::fleet::effective_phases(&policy)).is_none()
                 {
                     continue;
                 }
             }
             self.add_straggler(ri, &host.id, si, host.kind);
+        }
+    }
+
+    /// Adds the placements of cluster `record` that have no row in rollout
+    /// `ri` to its stragglers stage `si`: those a phase names (any, when the
+    /// cluster was `carried` from an older stragglers stage). A cluster this
+    /// rollout rolls as one row (an older executor) is left as it is.
+    async fn add_cluster_stragglers(
+        &mut self,
+        ri: usize,
+        record: &crate::store::HostRecord,
+        facts: &serde_json::Value,
+        si: usize,
+        carried: bool,
+    ) {
+        let whole = self.live[ri]
+            .rows_of(&record.id)
+            .into_iter()
+            .any(|i| self.live[ri].hosts[i].runtime.kind == TargetKind::Cluster);
+        if whole {
+            return;
+        }
+        let revision = self.live[ri].revision.clone();
+        let phases = crate::fleet::effective_phases(&self.live[ri].record.policy);
+        let ctx = crate::fleet::record_context(record, facts, &revision.fleet);
+        let placements = self
+            .placements(&revision, &ctx, record, facts, &phases)
+            .await;
+        let now = self.now();
+        let (id, rev) = (
+            self.live[ri].record.id.clone(),
+            self.live[ri].record.revision.clone(),
+        );
+        for p in placements {
+            if self.live[ri].find_row(&record.id, &p.workload).is_some()
+                || (!carried && p.phase.is_none())
+            {
+                continue;
+            }
+            let row = placement_row(&id, &record.id, &p, si, STRAGGLERS, &rev, now);
+            self.add_straggler_row(ri, row);
         }
     }
 
@@ -5272,25 +5832,38 @@ impl Controller {
         let now = self.now();
         let revision = self.live[ri].record.revision.clone();
         let id = self.live[ri].record.id.clone();
-        self.live[ri].hosts.push(RolloutHostRecord {
-            rollout: id.clone(),
-            host: host.to_owned(),
-            phase: STRAGGLERS.into(),
-            wave: None,
-            state: HostPhase::PlanPending,
-            plan_digest: None,
-            plan: None,
-            result: None,
-            health: None,
-            created_at: now,
-            updated_at: now,
-            runtime: HostRuntime {
-                revision,
-                phase_index: Some(si),
-                kind,
-                ..Default::default()
+        self.add_straggler_row(
+            ri,
+            RolloutHostRecord {
+                rollout: id,
+                host: host.to_owned(),
+                workload: String::new(),
+                phase: STRAGGLERS.into(),
+                wave: None,
+                state: HostPhase::PlanPending,
+                plan_digest: None,
+                plan: None,
+                result: None,
+                health: None,
+                created_at: now,
+                updated_at: now,
+                runtime: HostRuntime {
+                    revision,
+                    phase_index: Some(si),
+                    kind,
+                    ..Default::default()
+                },
             },
-        });
+        );
+    }
+
+    /// Adds `row` (a host, a cluster or a placement) to the stragglers stage
+    /// and asks for its plan.
+    fn add_straggler_row(&mut self, ri: usize, row: RolloutHostRecord) {
+        let key = view::row_key(&row);
+        let (host, workload) = (row.host.clone(), row.workload.clone());
+        let id = self.live[ri].record.id.clone();
+        self.live[ri].hosts.push(row);
         let hi = self.live[ri].hosts.len() - 1;
         self.live[ri].dirty_hosts.insert(hi);
         let trace = self.live[ri].record.runtime.trace_id.clone();
@@ -5298,8 +5871,8 @@ impl Controller {
             "controller",
             "rollout.stragglers.added",
             &id,
-            format!("{host} joined the stragglers stage"),
-            serde_json::json!({"host": host, "phase": STRAGGLERS}),
+            format!("{key} joined the stragglers stage"),
+            serde_json::json!({"host": host, "workload": workload, "phase": STRAGGLERS}),
             trace,
         );
         self.request_plan(ri, hi);
@@ -5313,7 +5886,7 @@ impl Controller {
         else {
             return;
         };
-        if self.live[ri].find(host).is_some() || self.excluded.contains(host) {
+        if self.excluded.contains(host) {
             return;
         }
         if applied == Some(self.live[ri].record.revision.as_str()) {
@@ -5354,6 +5927,20 @@ impl Controller {
         if record.status != HostStatus::Active || record.executor_of().is_some() {
             return;
         }
+        if crate::targets::is_cluster(&record) {
+            let targets = self.load_targets(None).await.unwrap_or_default();
+            let fleet = self.live[ri].revision.clone();
+            if self.placements_supported(host, &fleet.fleet, &targets)
+                && let Some(si) = self.live[ri].stragglers_index()
+            {
+                self.add_cluster_stragglers(ri, &record, &facts, si, false)
+                    .await;
+                return;
+            }
+        }
+        if self.live[ri].find(host).is_some() {
+            return;
+        }
         let ctx = crate::fleet::record_context(&record, &facts, &self.live[ri].revision.fleet);
         if crate::fleet::phase_for(
             &ctx,
@@ -5390,16 +5977,142 @@ impl Controller {
                 continue;
             }
             let h = &self.live[ri].hosts[hi];
-            if h.state == HostPhase::Planned
+            let startable = h.state == HostPhase::Planned
                 && self.row_eligible(ri, hi)
                 && !busy.contains(&h.host)
                 && !self.row_session(ri, hi).is_some_and(|s| busy.contains(&s))
-                && self.approved(ri, hi)
-            {
-                self.start_baseline(ri, hi);
-                inflight += usize::from(slot);
+                && self.approved(ri, hi);
+            if !startable {
+                continue;
+            }
+            match self.readiness(ri, hi).await {
+                Readiness::Ready => {
+                    self.start_baseline(ri, hi);
+                    inflight += usize::from(slot);
+                }
+                // The stragglers stage has no end: the row waits, saying why.
+                Readiness::Waiting(why) => {
+                    if self.live[ri].hosts[hi].runtime.error.as_deref() != Some(why.as_str()) {
+                        self.live[ri].hosts[hi].runtime.error = Some(why);
+                        self.touch_host(ri, hi);
+                    }
+                }
+                Readiness::Refused(why) => {
+                    self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                    self.fail_host(ri, hi, &why);
+                }
             }
         }
+    }
+
+    /// Whether placement row `hi` may start now: the workloads its workload
+    /// needs on the cluster are healthy in this rollout or running there
+    /// already, and, for a removal, the placements that needed its workload
+    /// are done. A host's or a whole cluster's row always may (the engine
+    /// orders its modules or workloads itself).
+    async fn readiness(&mut self, ri: usize, hi: usize) -> Readiness {
+        let h = &self.live[ri].hosts[hi];
+        if h.runtime.kind != TargetKind::Workload {
+            return Readiness::Ready;
+        }
+        let (cluster, workload) = (h.host.clone(), h.workload.clone());
+        if h.runtime.removal {
+            let pending: Vec<String> = h
+                .runtime
+                .after
+                .iter()
+                .filter(|a| {
+                    self.live[ri]
+                        .find_row(&cluster, a)
+                        .is_some_and(|i| !self.live[ri].hosts[i].state.finished())
+                })
+                .cloned()
+                .collect();
+            return if pending.is_empty() {
+                Readiness::Ready
+            } else {
+                Readiness::Waiting(format!(
+                    "{workload} is removed once {} finished",
+                    pending.join(", ")
+                ))
+            };
+        }
+        let needs: Vec<String> = self.live[ri]
+            .revision
+            .workload(&workload)
+            .map(|w| {
+                w.config
+                    .needs()
+                    .into_iter()
+                    .filter_map(|n| match n {
+                        buckle_core::model::Need::Workload(x) if x != workload => Some(x),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut missing = Vec::new();
+        for need in needs {
+            let healthy_here = self.live[ri]
+                .find_row(&cluster, &need)
+                .is_some_and(|i| self.live[ri].hosts[i].state == HostPhase::Healthy);
+            if healthy_here || self.running_on(&cluster, &need).await {
+                continue;
+            }
+            missing.push(need);
+        }
+        if missing.is_empty() {
+            return Readiness::Ready;
+        }
+        let why = format!(
+            "needs {} on {cluster}, which is not running yet",
+            missing.join(", ")
+        );
+        match self.live[ri].record.policy.dependencies.across_phases {
+            buckle_core::model::AcrossPhases::Warn => Readiness::Waiting(why),
+            buckle_core::model::AcrossPhases::Refuse => Readiness::Refused(why),
+        }
+    }
+
+    /// Whether `workload` runs on `cluster` outside this rollout: the
+    /// cluster's applied revision selects it there, and none of its
+    /// required checks reads as failing.
+    async fn running_on(&self, cluster: &str, workload: &str) -> bool {
+        let c = cluster.to_owned();
+        let found = self
+            .store
+            .call(move |db| {
+                let Some(rec) = db.hosts().target(&c)? else {
+                    return Ok(None);
+                };
+                let facts = db.hosts().latest_facts(&c)?.map(|(f, _)| f);
+                let checks = db.health().checks(&c)?;
+                Ok(Some((
+                    rec,
+                    facts.unwrap_or(serde_json::Value::Null),
+                    checks,
+                )))
+            })
+            .await;
+        let Ok(Some((rec, facts, checks))) = found else {
+            return false;
+        };
+        let Some(applied) = rec.applied_revision.clone() else {
+            return false;
+        };
+        let Ok(rev) = self.revisions.load(&applied).await else {
+            return false;
+        };
+        let ctx = crate::fleet::record_context(&rec, &facts, &rev.fleet);
+        if !buckle_core::engine::selected_workloads(&rev, &ctx)
+            .iter()
+            .any(|w| w.config.name == workload)
+        {
+            return false;
+        }
+        !checks
+            .iter()
+            .any(|c| c.module == workload && c.required && c.status == "fail")
     }
 
     fn drive_rollback(&mut self, ri: usize) -> bool {
@@ -5543,18 +6256,18 @@ impl Controller {
 
     // ------------------------------------------------------------ executors
 
-    /// Picks an executor for each cluster row among `rows` still without
-    /// one (and still to plan or apply), returning the rows that got one.
-    /// A cluster whose candidates are all mid-wave waits for them; one with
-    /// no candidate at all starts the "awaiting executor" grace when `grace`
-    /// (inside a phase; the stragglers stage waits without end).
+    /// Points each cluster row among `rows` still without an executor (and
+    /// still to plan or apply) at its cluster's steward, returning the rows
+    /// that got one. A cluster nobody stewards starts the "awaiting
+    /// executor" grace when `grace` (inside a phase; the stragglers stage
+    /// waits without end).
     async fn assign_executors(&mut self, ri: usize, rows: &[usize], grace: bool) -> Vec<usize> {
         let waiting: Vec<usize> = rows
             .iter()
             .copied()
             .filter(|&hi| {
                 let h = &self.live[ri].hosts[hi];
-                h.runtime.kind == TargetKind::Cluster
+                h.runtime.kind.on_cluster()
                     && h.runtime.executor.is_none()
                     && matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
             })
@@ -5562,19 +6275,16 @@ impl Controller {
         if waiting.is_empty() {
             return Vec::new();
         }
-        let Ok(targets) = self.load_targets(None).await else {
-            return Vec::new();
-        };
+        self.review_leases_if_due().await;
         let now = self.now();
         let mut picked = Vec::new();
         for hi in waiting {
-            match self.pick_executor(ri, hi, &targets) {
+            match self.pick_executor(ri, hi) {
                 Pick::Executor(executor) => {
                     self.set_executor(ri, hi, Some(executor));
                     self.live[ri].hosts[hi].runtime.disconnected_at = None;
                     picked.push(hi);
                 }
-                Pick::Busy => {}
                 Pick::None if grace => {
                     let h = &mut self.live[ri].hosts[hi];
                     if h.runtime.disconnected_at.is_none() {
@@ -5592,65 +6302,6 @@ impl Controller {
     /// that wait for one, and asks the newly spoken-for ones for their
     /// plans. Run on every pass, so a host that connects or finishes its
     /// own wave is picked up at once.
-    /// Outside rollouts nothing reads a cluster's health: its executors are
-    /// stateless and run no drift pass. Every `cluster_health_interval`, each
-    /// applied cluster no rollout is working on is checked through an idle
-    /// executor, its last one first (as a host's agent checks itself with
-    /// each drift pass).
-    async fn read_cluster_health(&mut self) {
-        let now = self.now();
-        if now < self.cluster_health_due {
-            return;
-        }
-        self.cluster_health_due = now
-            + chrono::Duration::from_std(self.options.cluster_health_interval)
-                .unwrap_or_default()
-                .max(chrono::Duration::seconds(1));
-        let targets = match self.load_targets(None).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "the clusters could not be listed for their health");
-                return;
-            }
-        };
-        let clusters: Vec<(String, String)> = targets
-            .iter()
-            .filter(|(c, _)| c.kind == TargetKind::Cluster && c.status == HostStatus::Active)
-            .filter(|(c, _)| !self.excluded.contains(&c.id))
-            .filter(|(c, _)| !self.spoken_for_elsewhere(usize::MAX, &c.id))
-            .filter_map(|(c, _)| Some((c.id.clone(), c.applied_revision.clone()?)))
-            .collect();
-        for (cluster, revision) in clusters {
-            let fleet = match self.revisions.load(&revision).await {
-                Ok(rev) => rev.fleet.clone(),
-                Err(e) => {
-                    tracing::warn!(%cluster, %revision, error = %e, "the applied revision could not be loaded to read the cluster's health");
-                    continue;
-                }
-            };
-            // The last executor while it qualifies, else any other that
-            // does: one away does not leave the cluster's health stale.
-            let Pick::Executor(executor) = self.pick_executor_for(&cluster, &fleet, &targets)
-            else {
-                continue;
-            };
-            let m = msg(server_message::Msg::Health(RunHealth {
-                target: String::new(),
-                revision: String::new(),
-                request_id: new_id(),
-                scope: HealthScope::Drift as i32,
-                modules: vec![],
-                until: None,
-                traceparent: String::new(),
-            }));
-            self.outbox.push(Out::Targeted {
-                session: executor,
-                msg: Box::new(stamp_target(m, &cluster)),
-                target: cluster,
-            });
-        }
-    }
-
     async fn serve_waiting_executors(&mut self, ri: usize, p: usize, grace: bool) -> bool {
         let open = self.live[ri].record.runtime.phases[p].open_stage;
         let rows: Vec<usize> = self.live[ri]
@@ -5658,7 +6309,7 @@ impl Controller {
             .into_iter()
             .filter(|&hi| {
                 let h = &self.live[ri].hosts[hi];
-                h.runtime.kind == TargetKind::Cluster
+                h.runtime.kind.on_cluster()
                     && h.runtime.executor.is_none()
                     && h.runtime.stage == open
             })
@@ -5675,78 +6326,106 @@ impl Controller {
         !picked.is_empty()
     }
 
-    /// A host agent that may speak for cluster row `hi` now: connected and
-    /// active, running an agent with a pipeline per target, matching the
-    /// cluster's `executors` selector, and not mid-wave in any rollout. The
-    /// cluster's last executor is preferred (sticky), then names sort.
-    fn pick_executor(
-        &self,
-        ri: usize,
-        hi: usize,
-        targets: &[(crate::store::HostRecord, serde_json::Value)],
-    ) -> Pick {
+    /// The host agent that speaks for cluster row `hi` now: the cluster's
+    /// steward, while it is connected (leases are assigned by
+    /// [`Controller::assign_leases`] on the same pass).
+    fn pick_executor(&self, ri: usize, hi: usize) -> Pick {
         let live = &self.live[ri];
-        self.pick_executor_for(&live.hosts[hi].host, &live.revision.fleet, targets)
+        let h = &live.hosts[hi];
+        // An action runs as it always has on any steward: the workload is
+        // its module.
+        let placement =
+            h.runtime.kind == TargetKind::Workload && live.record.runtime.action.is_none();
+        match self.executors.get(&h.host) {
+            Some(steward)
+                if self.connected(steward)
+                    && (!placement || self.has_capability(steward, WORKLOADS_CAPABILITY)) =>
+            {
+                Pick::Executor(steward.clone())
+            }
+            _ => Pick::None,
+        }
     }
 
-    /// [`Self::pick_executor`] for cluster `target`, its selectors read
-    /// against `fleet`.
-    fn pick_executor_for(
+    fn has_capability(&self, host: &str, capability: &str) -> bool {
+        self.capabilities
+            .get(host)
+            .is_some_and(|c| c.iter().any(|c| c == capability))
+    }
+
+    /// The hosts that may steward cluster `target` now, in order of
+    /// preference: connected and active, running an agent with a lane per
+    /// target, matching the cluster's `executors` selector (an in-cluster
+    /// executor speaks for its own cluster only, and comes first: its lane
+    /// survives every node's own rollout), then names sort.
+    fn steward_candidates(
         &self,
         target: &str,
         fleet: &buckle_core::model::FleetConfig,
         targets: &[(crate::store::HostRecord, serde_json::Value)],
-    ) -> Pick {
+    ) -> Vec<String> {
         let executors = self
             .clusters
             .get(target)
             .and_then(|spec| buckle_core::Filter::new(spec.executors()?).ok());
         let parent = self.clusters.get(target).and_then(|s| s.cluster.as_deref());
-        let busy = self.busy_elsewhere(usize::MAX);
-        let inflight: HashSet<&str> = self
-            .live
-            .iter()
-            .flat_map(|l| l.hosts.iter())
-            .filter(|h| h.runtime.kind == TargetKind::Host && h.state.in_flight())
-            .map(|h| h.host.as_str())
-            .collect();
-        let able: Vec<&str> = targets
-            .iter()
-            .filter(|(h, _)| h.kind == TargetKind::Host)
-            .filter(|(h, _)| h.status == HostStatus::Active && !self.excluded.contains(&h.id))
-            .filter(|(h, _)| self.connected(&h.id))
-            .filter(|(h, _)| {
-                self.capabilities
+        let mut inside: Vec<String> = Vec::new();
+        let mut outside: Vec<String> = Vec::new();
+        for (h, facts) in targets {
+            if h.kind != TargetKind::Host
+                || h.status != HostStatus::Active
+                || self.excluded.contains(&h.id)
+                || !self.connected(&h.id)
+                || !self
+                    .capabilities
                     .get(&h.id)
                     .is_some_and(|c| c.iter().any(|c| c == TARGETS_CAPABILITY))
-            })
-            .filter(|(h, facts)| match h.executor_of() {
-                // An in-cluster executor speaks for its own cluster only.
-                Some(c) => c == target || parent == Some(c),
-                None => executors.as_ref().is_some_and(|executors| {
-                    crate::fleet::record_context(h, facts, fleet).matches(executors)
-                }),
-            })
-            .map(|(h, _)| h.id.as_str())
-            .collect();
-        if able.is_empty() {
-            return Pick::None;
+            {
+                continue;
+            }
+            match h.executor_of() {
+                Some(c) if c == target || parent == Some(c) => inside.push(h.id.clone()),
+                Some(_) => {}
+                None => {
+                    if executors.as_ref().is_some_and(|executors| {
+                        crate::fleet::record_context(h, facts, fleet).matches(executors)
+                    }) {
+                        outside.push(h.id.clone());
+                    }
+                }
+            }
         }
-        let mut candidates: Vec<&str> = able
-            .into_iter()
-            .filter(|h| !busy.contains(*h) && !inflight.contains(h))
-            .collect();
-        if candidates.is_empty() {
-            return Pick::Busy;
+        inside.sort();
+        outside.sort();
+        inside.extend(outside);
+        inside
+    }
+
+    /// Which host should steward `target`: an in-cluster executor when one
+    /// is connected, else the current steward while it qualifies, else the
+    /// first candidate; `None` when nobody can speak for the cluster.
+    fn choose_steward(
+        &self,
+        target: &str,
+        fleet: &buckle_core::model::FleetConfig,
+        targets: &[(crate::store::HostRecord, serde_json::Value)],
+    ) -> Option<String> {
+        let candidates = self.steward_candidates(target, fleet, targets);
+        let in_cluster = candidates.iter().find(|c| {
+            targets
+                .iter()
+                .any(|(h, _)| &h.id == *c && h.executor_of().is_some())
+        });
+        if let Some(c) = in_cluster {
+            return Some(c.clone());
         }
-        candidates.sort();
-        let last = self.executors.get(target).cloned();
-        candidates
-            .iter()
-            .find(|c| Some(**c) == last.as_deref())
-            .or(candidates.first())
-            .map(|c| Pick::Executor((*c).to_owned()))
-            .unwrap_or(Pick::None)
+        let current = self.executors.get(target);
+        if let Some(c) = current
+            && candidates.contains(c)
+        {
+            return Some(c.clone());
+        }
+        candidates.first().cloned()
     }
 
     /// Records `executor` as cluster row `hi`'s executor (and the cluster's
@@ -5783,37 +6462,35 @@ impl Controller {
     }
 
     /// Cluster row `hi`'s executor stayed away past the disconnect timeout:
-    /// another is picked and the cluster re-planned; with none to pick, the
-    /// cluster fails its wave when it was in flight, else waits.
+    /// the lease moves to another candidate and the row with it (planned
+    /// again when it was in flight); with none to pick, the cluster fails
+    /// its wave when it was in flight, else waits.
     async fn executor_lost(&mut self, ri: usize, hi: usize) {
         let lost = self.live[ri].hosts[hi].runtime.executor.clone();
         let state = self.live[ri].hosts[hi].state;
-        self.set_executor(ri, hi, None);
+        let cluster = self.live[ri].hosts[hi].host.clone();
         let targets = self.load_targets(None).await.unwrap_or_default();
-        let picked = match self.pick_executor(ri, hi, &targets) {
-            Pick::Executor(e) => Some(e),
-            Pick::Busy | Pick::None => None,
-        };
-        match (picked, state) {
-            (Some(executor), _) => {
-                self.set_executor(ri, hi, Some(executor));
-                if state.in_flight() || state == HostPhase::Planned {
-                    let why = format!(
-                        "executor {} lost; re-planning through {}",
-                        lost.unwrap_or_default(),
-                        self.live[ri].hosts[hi]
-                            .runtime
-                            .executor
-                            .clone()
-                            .unwrap_or_default()
-                    );
-                    self.live[ri].hosts[hi].runtime.error = Some(why.clone());
-                    self.replan(ri, hi, "controller");
-                } else {
-                    self.request_plan(ri, hi);
-                }
+        let fleet = self.live[ri].revision.fleet.clone();
+        let picked = self
+            .choose_steward(&cluster, &fleet, &targets)
+            .filter(|c| Some(c) != lost.as_ref());
+        self.set_steward(
+            &cluster,
+            picked.clone(),
+            "controller",
+            "its steward stayed disconnected",
+        );
+        if let Some(to) = picked {
+            // Moved with the lease above, unless the row was pointed
+            // elsewhere already.
+            if self.live[ri].hosts[hi].runtime.executor.as_ref() != Some(&to) {
+                self.repoint_row(ri, hi, to, "controller");
             }
-            (None, s) if s.in_flight() || s == HostPhase::RollingBack => {
+            return;
+        }
+        self.set_executor(ri, hi, None);
+        match state {
+            s if s.in_flight() || s == HostPhase::RollingBack => {
                 let why = format!(
                     "executor {} lost and no other connected host can speak for the cluster",
                     lost.unwrap_or_default()
@@ -5830,7 +6507,7 @@ impl Controller {
                     self.fail_host(ri, hi, &why);
                 }
             }
-            (None, _) => {
+            _ => {
                 // Still to plan or apply when the grace ran out: it misses
                 // its phase like an offline host and converges in the
                 // stragglers stage, where it waits for an executor without
@@ -5915,21 +6592,52 @@ impl Controller {
         };
         let now = self.now();
         let id = self.live[ri].record.id.clone();
+        let rev = self.live[ri].revision.clone();
         let mut touched: BTreeSet<usize> = BTreeSet::new();
+        // Stages are laid out over the whole phase (a cluster's nodes among
+        // them), and a cluster's executors are looked for among every host,
+        // so both need every target, not just the one admitted.
+        let mut targets: Option<Vec<(crate::store::HostRecord, serde_json::Value)>> =
+            only.is_none().then(|| candidates.clone());
         for (host, facts) in &candidates {
             if !candidate(self, host) {
                 continue;
             }
-            let ctx = crate::fleet::record_context(host, facts, &self.live[ri].revision.fleet);
+            let ctx = crate::fleet::record_context(host, facts, &rev.fleet);
+            let mut rows = Vec::new();
+            if crate::targets::is_cluster(host) {
+                if targets.is_none() {
+                    targets = Some(self.load_targets(None).await.unwrap_or_default());
+                }
+                let all = targets.as_deref().unwrap_or_default();
+                if self.placements_supported(&host.id, &rev.fleet, all) {
+                    for p in self.placements(&rev, &ctx, host, facts, &phases).await {
+                        if let Some(pi) = p.phase.filter(|&pi| pi > current) {
+                            rows.push(placement_row(
+                                &id,
+                                &host.id,
+                                &p,
+                                pi,
+                                &phases[pi].name,
+                                &revision,
+                                now,
+                            ));
+                        }
+                    }
+                    self.admit_rows(ri, rows, &mut touched);
+                    continue;
+                }
+            }
             let Some(pi) = crate::fleet::phase_for(&ctx, &phases) else {
                 continue;
             };
             if pi <= current {
                 continue;
             }
-            self.live[ri].hosts.push(RolloutHostRecord {
+            rows.push(RolloutHostRecord {
                 rollout: id.clone(),
                 host: host.id.clone(),
+                workload: String::new(),
                 phase: phases[pi].name.clone(),
                 wave: None,
                 state: HostPhase::PlanPending,
@@ -5946,31 +6654,14 @@ impl Controller {
                     ..Default::default()
                 },
             });
-            let hi = self.live[ri].hosts.len() - 1;
-            self.live[ri].dirty_hosts.insert(hi);
-            let trace = self.live[ri].record.runtime.trace_id.clone();
-            let phase = phases[pi].name.clone();
-            self.audit(
-                "controller",
-                "rollout.target.admitted",
-                &id,
-                format!("{} joined phase '{phase}' after the freeze", host.id),
-                serde_json::json!({"host": host.id, "phase": phase}),
-                trace,
-            );
-            touched.insert(pi);
+            self.admit_rows(ri, rows, &mut touched);
         }
         if touched.is_empty() {
             return;
         }
-        // Stages are laid out over the whole phase (a cluster's nodes among
-        // them), so they need every target, not just the one admitted.
-        let targets = match only {
-            Some(_) => match self.load_targets(None).await {
-                Ok(targets) => targets,
-                Err(_) => candidates,
-            },
-            None => candidates,
+        let targets = match targets {
+            Some(targets) => targets,
+            None => self.load_targets(None).await.unwrap_or(candidates),
         };
         for pi in touched {
             self.compute_stages(ri, pi, &targets);
@@ -5981,6 +6672,37 @@ impl Controller {
                     self.request_plan(ri, hi);
                 }
             }
+        }
+    }
+
+    /// Adds `rows` (admitted after the freeze) to rollout `ri`, noting the
+    /// phases they joined in `touched`.
+    fn admit_rows(
+        &mut self,
+        ri: usize,
+        rows: Vec<RolloutHostRecord>,
+        touched: &mut BTreeSet<usize>,
+    ) {
+        let id = self.live[ri].record.id.clone();
+        for row in rows {
+            let key = view::row_key(&row);
+            let (host, workload, phase) =
+                (row.host.clone(), row.workload.clone(), row.phase.clone());
+            if let Some(pi) = row.runtime.phase_index {
+                touched.insert(pi);
+            }
+            self.live[ri].hosts.push(row);
+            let hi = self.live[ri].hosts.len() - 1;
+            self.live[ri].dirty_hosts.insert(hi);
+            let trace = self.live[ri].record.runtime.trace_id.clone();
+            self.audit(
+                "controller",
+                "rollout.target.admitted",
+                &id,
+                format!("{key} joined phase '{phase}' after the freeze"),
+                serde_json::json!({"host": host, "workload": workload, "phase": phase}),
+                trace,
+            );
         }
     }
 
@@ -5996,6 +6718,10 @@ impl Controller {
     async fn flush(&mut self) -> bool {
         let mut rollouts = Vec::new();
         let mut hosts = Vec::new();
+        // A cluster rolled by placements is on a revision once every one
+        // of them is healthy (an executor's result speaks for its placement
+        // only): recorded with the rows that completed it.
+        let mut converged: BTreeMap<String, (String, String)> = BTreeMap::new();
         for l in &self.live {
             if l.dirty {
                 rollouts.push(l.record.clone());
@@ -6003,9 +6729,33 @@ impl Controller {
             for &hi in &l.dirty_hosts {
                 if let Some(h) = l.hosts.get(hi) {
                     hosts.push(h.clone());
+                    if h.runtime.kind == TargetKind::Workload
+                        && let Some(rev) = l.cluster_converged(&h.host)
+                    {
+                        converged.insert(h.host.clone(), (rev, l.record.id.clone()));
+                    }
                 }
             }
         }
+        for (cluster, (rev, rollout)) in &converged {
+            let trace = self
+                .live
+                .iter()
+                .find(|l| &l.record.id == rollout)
+                .and_then(|l| l.record.runtime.trace_id.clone());
+            self.audit(
+                "controller",
+                "rollout.target.converged",
+                rollout,
+                format!("{cluster}: every placement is on {}", short(rev)),
+                serde_json::json!({"host": cluster, "revision": rev}),
+                trace,
+            );
+        }
+        let converged: Vec<(String, String)> = converged
+            .into_iter()
+            .map(|(c, (rev, _))| (c, rev))
+            .collect();
         let audits = std::mem::take(&mut self.audits);
         let runs = std::mem::take(&mut self.new_runs);
         let stable = self.stable_dirty.then(|| self.stable.clone()).flatten();
@@ -6015,19 +6765,27 @@ impl Controller {
             .iter()
             .filter_map(|c| self.executors.get(c).map(|e| (c.clone(), e.clone())))
             .collect();
+        let stewards: Vec<(String, Option<String>)> = self
+            .stewards_dirty
+            .iter()
+            .map(|(c, s)| (c.clone(), s.clone()))
+            .collect();
         if !(rollouts.is_empty()
             && hosts.is_empty()
             && audits.is_empty()
             && runs.is_empty()
             && stable.is_none()
             && cleared.is_empty()
-            && executors.is_empty())
+            && executors.is_empty()
+            && converged.is_empty()
+            && stewards.is_empty())
         {
-            let (r2, h2, a2, n2) = (
+            let (r2, h2, a2, n2, s2) = (
                 rollouts.clone(),
                 hosts.clone(),
                 audits.clone(),
                 runs.clone(),
+                stewards.clone(),
             );
             let result = self
                 .store
@@ -6051,6 +6809,13 @@ impl Controller {
                         db.kv()
                             .set(&format!("{}{cluster}", keys::EXECUTOR_PREFIX), executor)?;
                     }
+                    for (cluster, revision) in &converged {
+                        db.hosts().set_applied_revision(cluster, revision)?;
+                        db.drift().clear(cluster)?;
+                    }
+                    for (cluster, steward) in &s2 {
+                        db.hosts().set_steward(cluster, steward.as_deref())?;
+                    }
                     let mut entries = Vec::new();
                     for a in &a2 {
                         entries.push(db.audit().add(a)?);
@@ -6062,9 +6827,7 @@ impl Controller {
                         .map(|h| h.rollout.as_str())
                         .collect::<BTreeSet<_>>()
                     {
-                        for (host, id) in db.runs().ids_for_rollout(rollout)? {
-                            run_ids.insert((rollout.to_owned(), host), id);
-                        }
+                        run_ids.insert(rollout.to_owned(), db.runs().ids_for_rollout(rollout)?);
                     }
                     Ok((entries, run_ids))
                 })
@@ -6075,6 +6838,14 @@ impl Controller {
                     self.flush_failures = 0;
                     self.pending_clear.clear();
                     self.executors_dirty.clear();
+                    for (cluster, _) in &stewards {
+                        if let Some(host) =
+                            crate::views::load_summary(&self.store, &self.revisions, cluster).await
+                        {
+                            self.events.publish(LiveEvent::HostChanged { host });
+                        }
+                    }
+                    self.stewards_dirty.clear();
                     self.stable_dirty = false;
                     for l in &mut self.live {
                         l.dirty = false;
@@ -6090,8 +6861,13 @@ impl Controller {
                     for h in &hosts {
                         if let Some(l) = self.live.iter().find(|l| l.record.id == h.rollout) {
                             let mut host = view::host(&l.record, h, &l.approvals);
-                            host.run_id =
-                                run_ids.get(&(h.rollout.clone(), h.host.clone())).cloned();
+                            host.run_id = run_ids.get(&h.rollout).and_then(|ids| {
+                                ids.get(
+                                    &h.host,
+                                    host.workload.as_deref(),
+                                    host.plan_digest.as_deref(),
+                                )
+                            });
                             self.events.publish(LiveEvent::RolloutHostChanged {
                                 rollout_id: h.rollout.clone(),
                                 host,
@@ -6138,11 +6914,12 @@ impl Controller {
                 Out::AssignAndPlan {
                     session,
                     target,
+                    workload,
                     revision,
                     stable,
                 } => {
                     if !self
-                        .assign_and_plan(&session, &target, &revision, stable)
+                        .assign_and_plan(&session, &target, &workload, &revision, stable)
                         .await
                     {
                         undeliverable.insert(session);
@@ -6151,9 +6928,15 @@ impl Controller {
                 Out::Targeted {
                     session,
                     target,
+                    workload,
                     msg,
                 } => {
-                    if !self.send_targeted(&session, &target, *msg).await {
+                    if !self.send_targeted(&session, &target, &workload, *msg).await {
+                        undeliverable.insert(session);
+                    }
+                }
+                Out::Lease { session, target } => {
+                    if !self.send_lease(&session, &target).await {
                         undeliverable.insert(session);
                     }
                 }
@@ -6182,12 +6965,14 @@ impl Controller {
     }
 
     /// Sends Assign and RequestPlan over `host`'s session, for the host
-    /// itself or for the cluster `target` it executes; `false` when the host
-    /// has no session.
+    /// itself or for the cluster `target` it executes (the placement of
+    /// `workload`, or the whole cluster); `false` when the host has no
+    /// session.
     async fn assign_and_plan(
         &mut self,
         host: &str,
         target: &str,
+        workload: &str,
         revision: &str,
         stable: bool,
     ) -> bool {
@@ -6199,7 +6984,7 @@ impl Controller {
             .iter()
             .enumerate()
             .find_map(|(ri, l)| {
-                l.find_target(host, target)
+                l.find_target(host, target, workload)
                     .filter(|&hi| l.hosts[hi].runtime.revision == revision)
                     .map(|hi| self.row_select(ri, hi))
             })
@@ -6209,6 +6994,7 @@ impl Controller {
             host,
             msg(server_message::Msg::Plan(RequestPlan {
                 target: target.to_owned(),
+                workload: workload.to_owned(),
                 revision: revision.to_owned(),
                 select,
             })),
@@ -6216,11 +7002,17 @@ impl Controller {
         assigned && planned
     }
 
-    /// Sends `m` for the cluster `target` over `session`, behind a targeted
-    /// Assign of the revision it concerns (for health, the cluster's applied
-    /// revision, which the request then names); `false` when the session is
-    /// gone.
-    async fn send_targeted(&mut self, session: &str, target: &str, mut m: ServerMessage) -> bool {
+    /// Sends `m` (scoped to `workload`'s placement, or the whole cluster) for
+    /// the cluster `target` over `session`, behind a targeted Assign of the
+    /// revision it concerns (for health, the cluster's applied revision,
+    /// which the request then names); `false` when the session is gone.
+    async fn send_targeted(
+        &mut self,
+        session: &str,
+        target: &str,
+        workload: &str,
+        mut m: ServerMessage,
+    ) -> bool {
         let revision = match &m.msg {
             Some(server_message::Msg::Plan(p)) => p.revision.clone(),
             Some(server_message::Msg::Apply(a)) => a.revision.clone(),
@@ -6239,6 +7031,7 @@ impl Controller {
         };
         if let Some(server_message::Msg::Health(h)) = &mut m.msg {
             h.revision = revision.clone();
+            h.workload = workload.to_owned();
         }
         if !revision.is_empty() {
             let stable = self.stable.as_deref() == Some(revision.as_str());
@@ -6293,17 +7086,7 @@ impl Controller {
                 tracing::warn!(target = %target, "not a cluster target; nothing assigned");
                 return None;
             };
-            // The revision's declaration wins over the stored record, which
-            // follows the reference revision.
             let declared = rev.fleet.fleet.clusters.get(target);
-            let kind = declared
-                .map(|d| d.kind.as_str())
-                .unwrap_or(crate::targets::core_kind(spec.kind).as_str())
-                .to_owned();
-            let api = declared
-                .map(|d| d.api.clone())
-                .unwrap_or_else(|| spec.api.clone())
-                .unwrap_or_default();
             let identity = declared
                 .map(|d| d.identity.to_string())
                 .unwrap_or_else(|| spec.identity.clone());
@@ -6314,17 +7097,12 @@ impl Controller {
                 .secrets
                 .for_cluster(&rev, &ctx, secret.as_deref())
                 .await;
-            let cluster = pb::ClusterTarget {
-                kind,
-                api,
-                identity,
-                labels: record.effective_labels().into_iter().collect(),
-                fingerprint_key: self.secrets.fingerprint_key(target),
-            };
+            let cluster = self.cluster_target(target, &record, spec, declared);
             (secrets, Some(cluster))
         };
         Some(msg(server_message::Msg::Assign(Assign {
             target: target.to_owned(),
+            workload: String::new(),
             revision: revision.to_owned(),
             stable,
             secrets: Some(secrets),
@@ -6332,6 +7110,439 @@ impl Controller {
             cluster,
         })))
     }
+}
+
+/// The row of placement `p` of `cluster` in phase `pi` (`phase`), moving it
+/// to `revision`.
+fn placement_row(
+    rollout: &str,
+    cluster: &str,
+    p: &Placement,
+    pi: usize,
+    phase: &str,
+    revision: &str,
+    now: DateTime<Utc>,
+) -> RolloutHostRecord {
+    RolloutHostRecord {
+        rollout: rollout.to_owned(),
+        host: cluster.to_owned(),
+        workload: p.workload.clone(),
+        phase: phase.to_owned(),
+        wave: None,
+        state: HostPhase::PlanPending,
+        plan_digest: None,
+        plan: None,
+        result: None,
+        health: None,
+        created_at: now,
+        updated_at: now,
+        runtime: HostRuntime {
+            revision: revision.to_owned(),
+            phase_index: Some(pi),
+            kind: TargetKind::Workload,
+            removal: p.removal,
+            after: p.after.clone(),
+            ..Default::default()
+        },
+    }
+}
+
+// ------------------------------------------------------------ leases
+
+impl Controller {
+    /// Re-evaluates which host stewards each cluster when prompted (a
+    /// connect, a disconnect, a host or cluster change) or every
+    /// [`LEASE_INTERVAL`], then (re)sends the leases due. A cluster is
+    /// leased to one connected, capable host matching its `executors` (an
+    /// in-cluster executor first); the lease stays with its holder while it
+    /// qualifies, and survives a disconnect up to the disconnect timeout.
+    async fn assign_leases(&mut self) {
+        self.review_leases_if_due().await;
+        for cluster in std::mem::take(&mut self.lease_resend) {
+            if let Some(steward) = self.executors.get(&cluster)
+                && self.connected(steward)
+            {
+                self.outbox.push(Out::Lease {
+                    session: steward.clone(),
+                    target: cluster,
+                });
+            }
+        }
+    }
+
+    /// Reviews the leases when something prompted it or the interval
+    /// passed (also run before an executor pick, so a cluster that just
+    /// appeared is spoken for on the pass that plans it).
+    async fn review_leases_if_due(&mut self) {
+        let now = self.now();
+        if !(self.leases_dirty || now >= self.leases_due) {
+            return;
+        }
+        self.leases_dirty = false;
+        self.leases_due = now + chrono::Duration::from_std(LEASE_INTERVAL).unwrap_or_default();
+        self.review_leases(now).await;
+    }
+
+    /// One pass over every cluster target: see [`Controller::assign_leases`].
+    async fn review_leases(&mut self, now: DateTime<Utc>) {
+        let Ok(targets) = self.load_targets(None).await else {
+            return;
+        };
+        let Some(reference) = crate::views::reference_revision(&self.store, &self.revisions).await
+        else {
+            return;
+        };
+        let fleet = &reference.fleet;
+        let timeout =
+            chrono::Duration::from_std(self.options.disconnect_timeout).unwrap_or_default();
+        let clusters: Vec<String> = targets
+            .iter()
+            .filter(|(h, _)| h.kind == TargetKind::Cluster)
+            .map(|(h, _)| h.id.clone())
+            .collect();
+        for cluster in &clusters {
+            let current = self.executors.get(cluster).cloned();
+            let desired = self.choose_steward(cluster, fleet, &targets);
+            let inside = desired
+                .as_ref()
+                .is_some_and(|d| in_cluster_executor(d, &targets));
+            match (&current, &desired) {
+                (Some(c), Some(d)) if c == d => {}
+                (None, None) => {}
+                (Some(c), _) if !self.connected(c) => {
+                    // Away: the lease holds until the disconnect timeout,
+                    // unless the cluster's own executor connects meanwhile.
+                    let since = *self.steward_away.entry(cluster.clone()).or_insert(now);
+                    if inside {
+                        self.set_steward(
+                            cluster,
+                            desired,
+                            "controller",
+                            "an in-cluster executor is connected",
+                        );
+                    } else if since + timeout <= now {
+                        self.set_steward(
+                            cluster,
+                            desired,
+                            "controller",
+                            "its steward stayed disconnected",
+                        );
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    let reason = if inside {
+                        "an in-cluster executor is connected"
+                    } else {
+                        "its steward no longer qualifies"
+                    };
+                    self.set_steward(cluster, desired, "controller", reason);
+                }
+                (Some(_), None) => self.set_steward(
+                    cluster,
+                    None,
+                    "controller",
+                    "its steward no longer qualifies and no other host can speak for the cluster",
+                ),
+                (None, Some(_)) => {
+                    self.set_steward(cluster, desired, "controller", "no host held its lease")
+                }
+            }
+        }
+        // A lease of a cluster that is gone ends.
+        let stale: Vec<String> = self
+            .executors
+            .keys()
+            .filter(|c| !clusters.contains(c))
+            .cloned()
+            .collect();
+        for cluster in stale {
+            self.set_steward(&cluster, None, "controller", "the cluster was forgotten");
+        }
+    }
+
+    /// Hands cluster `target`'s lease to `steward`, or ends it (`None`):
+    /// the kv entry and the cluster's record follow with the next
+    /// checkpoint, the old holder gets a Release and the new one a Lease,
+    /// and the live rollout rows the old holder spoke for move with it
+    /// (planned again when they had a plan or were in flight).
+    fn set_steward(&mut self, target: &str, steward: Option<String>, actor: &str, reason: &str) {
+        let from = self.executors.get(target).cloned();
+        if from == steward {
+            return;
+        }
+        match &steward {
+            Some(s) => {
+                self.executors.insert(target.to_owned(), s.clone());
+                self.executors_dirty.insert(target.to_owned());
+                self.lease_resend.insert(target.to_owned());
+            }
+            None => {
+                self.executors.remove(target);
+                self.executors_dirty.remove(target);
+                self.lease_resend.remove(target);
+                self.pending_clear
+                    .push(format!("{}{target}", keys::EXECUTOR_PREFIX));
+            }
+        }
+        self.steward_away.remove(target);
+        self.stewards_dirty
+            .insert(target.to_owned(), steward.clone());
+        if let Some(old) = &from
+            && self.connected(old)
+        {
+            self.outbox.push(Out::Msg(
+                old.clone(),
+                Box::new(msg(server_message::Msg::Release(pb::Release {
+                    target: target.to_owned(),
+                    reason: reason.to_owned(),
+                }))),
+            ));
+        }
+        let message = match (&from, &steward) {
+            (None, Some(s)) => format!("{target}: leased to {s} ({reason})"),
+            (Some(f), Some(s)) => format!("{target}: lease moved from {f} to {s} ({reason})"),
+            (Some(f), None) => format!("{target}: lease held by {f} ended ({reason})"),
+            (None, None) => return,
+        };
+        self.audit(
+            actor,
+            "target.steward",
+            target,
+            message,
+            serde_json::json!({
+                "target": target,
+                "steward": steward,
+                "from": from,
+                "reason": reason,
+            }),
+            None,
+        );
+        let Some(old) = from else {
+            return;
+        };
+        for ri in 0..self.live.len() {
+            if self.live[ri].record.is_terminal() && !self.live[ri].record.runtime.stragglers_open {
+                continue;
+            }
+            for hi in 0..self.live[ri].hosts.len() {
+                let h = &self.live[ri].hosts[hi];
+                if h.runtime.kind == TargetKind::Host
+                    || h.host != target
+                    || h.runtime.executor.as_deref() != Some(old.as_str())
+                {
+                    continue;
+                }
+                match &steward {
+                    Some(s) => self.repoint_row(ri, hi, s.clone(), actor),
+                    None => self.set_executor(ri, hi, None),
+                }
+            }
+        }
+    }
+
+    /// Cluster row `hi` is spoken for by `to` from now on. Its plan was the
+    /// old holder's: planned again (a retry when it was in flight), or asked
+    /// for when it was still waiting for one.
+    fn repoint_row(&mut self, ri: usize, hi: usize, to: String, actor: &str) {
+        let state = self.live[ri].hosts[hi].state;
+        let from = self.live[ri].hosts[hi].runtime.executor.clone();
+        self.set_executor(ri, hi, Some(to.clone()));
+        self.live[ri].hosts[hi].runtime.disconnected_at = None;
+        if state.in_flight() || state == HostPhase::Planned {
+            let why = format!(
+                "the lease moved from {} to {to}; re-planning",
+                from.unwrap_or_default()
+            );
+            self.live[ri].hosts[hi].runtime.error = Some(why);
+            self.replan(ri, hi, actor);
+        } else if state == HostPhase::PlanPending {
+            self.request_plan(ri, hi);
+        }
+    }
+
+    /// `host` sent a watch report for `target` without holding its lease
+    /// (its lane outlived a handover, or a lease it never got): released.
+    fn on_stale_steward(&mut self, host: &str, target: &str) {
+        if self.executors.get(target).map(String::as_str) == Some(host) || !self.connected(host) {
+            return;
+        }
+        self.outbox.push(Out::Msg(
+            host.to_owned(),
+            Box::new(msg(server_message::Msg::Release(pb::Release {
+                target: target.to_owned(),
+                reason: "another host stewards the cluster".to_owned(),
+            }))),
+        ));
+    }
+
+    /// An operator moves cluster `target`'s lease to `host`, which must
+    /// qualify now (see [`Controller::steward_candidates`]); an in-cluster
+    /// executor keeps the lease over an outside host.
+    async fn move_lease_to(
+        &mut self,
+        actor: &str,
+        target: &str,
+        host: &str,
+        note: &str,
+    ) -> Result<String, CommandError> {
+        let targets = self
+            .load_targets(None)
+            .await
+            .map_err(CommandError::internal)?;
+        let Some((record, _)) = targets.iter().find(|(h, _)| h.id == target) else {
+            return Err(CommandError::not_found(format!("No target '{target}'.")));
+        };
+        if record.kind != TargetKind::Cluster {
+            return Err(CommandError::invalid(
+                format!("'{target}' is not a cluster; only clusters have a steward."),
+                &[],
+            ));
+        }
+        let Some(reference) = crate::views::reference_revision(&self.store, &self.revisions).await
+        else {
+            return Err(CommandError::conflict(
+                "No valid revision declares the fleet yet.",
+                &["Push a valid revision first."],
+            ));
+        };
+        let candidates = self.steward_candidates(target, &reference.fleet, &targets);
+        if !candidates.iter().any(|c| c == host) {
+            return Err(CommandError::conflict(
+                format!("'{host}' cannot speak for '{target}' now."),
+                &[
+                    "The host must be connected and active, run an agent with a lane per target, and match the cluster's `executors` selector.",
+                ],
+            ));
+        }
+        if !in_cluster_executor(host, &targets)
+            && let Some(inside) = candidates.iter().find(|c| in_cluster_executor(c, &targets))
+        {
+            return Err(CommandError::conflict(
+                format!("'{inside}' runs inside '{target}' and keeps its lease."),
+                &["An in-cluster executor speaks for its cluster while it is connected."],
+            ));
+        }
+        if self.executors.get(target).map(String::as_str) == Some(host) {
+            return Err(CommandError::conflict(
+                format!("'{host}' already speaks for '{target}'."),
+                &[],
+            ));
+        }
+        let reason = if note.is_empty() {
+            "moved by an operator"
+        } else {
+            note
+        };
+        self.set_steward(target, Some(host.to_owned()), actor, reason);
+        Ok(target.to_owned())
+    }
+
+    /// Sends cluster `target`'s lease over `session`: a targeted Assign of
+    /// the applied revision when there is one (the lane's watch checks its
+    /// workloads), then the Lease with how to reach the cluster and how
+    /// often to read it. `false` when the session is gone.
+    async fn send_lease(&mut self, session: &str, target: &str) -> bool {
+        let t = target.to_owned();
+        let found = self.store.call(move |db| db.hosts().target(&t)).await;
+        let Ok(Some(record)) = found else {
+            return true;
+        };
+        let Some(spec) = record.cluster.as_ref().map(|c| c.spec.clone()) else {
+            return true;
+        };
+        let mut applied = record.applied_revision.clone().unwrap_or_default();
+        let mut cluster = None;
+        if !applied.is_empty() {
+            let stable = self.stable.as_deref() == Some(applied.as_str());
+            match self.assign_message(session, target, &applied, stable).await {
+                Some(assign) => {
+                    if let Some(server_message::Msg::Assign(a)) = &assign.msg {
+                        cluster = a.cluster.clone();
+                    }
+                    if !self.link.send(session, assign) {
+                        return false;
+                    }
+                }
+                // The applied revision cannot be loaded any more: the lane
+                // only probes reachability until the next apply.
+                None => applied.clear(),
+            }
+        }
+        let cluster = match cluster {
+            Some(c) => c,
+            None => {
+                let reference =
+                    crate::views::reference_revision(&self.store, &self.revisions).await;
+                let declared = reference
+                    .as_ref()
+                    .and_then(|r| r.fleet.fleet.clusters.get(target));
+                self.cluster_target(target, &record, &spec, declared)
+            }
+        };
+        let watch = spec.watch.map(|w| pb::Watch {
+            health: Some(prost_types::Duration {
+                seconds: w.health_seconds as i64,
+                nanos: 0,
+            }),
+            drift: Some(prost_types::Duration {
+                seconds: w.drift_seconds as i64,
+                nanos: 0,
+            }),
+        });
+        let until = self.now()
+            + chrono::Duration::from_std(self.options.disconnect_timeout).unwrap_or_default();
+        self.link.send(
+            session,
+            msg(server_message::Msg::Lease(pb::Lease {
+                target: target.to_owned(),
+                cluster: Some(cluster),
+                applied_revision: applied,
+                watch,
+                until: Some(timestamp(until)),
+            })),
+        )
+    }
+
+    /// How an executor reaches cluster `target`: the revision's declaration
+    /// (`declared`) wins over the stored record, which follows the
+    /// reference revision.
+    fn cluster_target(
+        &self,
+        target: &str,
+        record: &crate::store::HostRecord,
+        spec: &buckle_api::ClusterSpec,
+        declared: Option<&buckle_core::model::ClusterDecl>,
+    ) -> pb::ClusterTarget {
+        let kind = declared
+            .map(|d| d.kind.as_str())
+            .unwrap_or(crate::targets::core_kind(spec.kind).as_str())
+            .to_owned();
+        let api = declared
+            .map(|d| d.api.clone())
+            .unwrap_or_else(|| spec.api.clone())
+            .unwrap_or_default();
+        let identity = declared
+            .map(|d| d.identity.to_string())
+            .unwrap_or_else(|| spec.identity.clone());
+        pb::ClusterTarget {
+            kind,
+            api,
+            identity,
+            labels: record.effective_labels().into_iter().collect(),
+            fingerprint_key: self.secrets.fingerprint_key(target),
+        }
+    }
+}
+
+/// Whether `host` is an executor running inside a cluster (its agent
+/// authenticated with the cluster's workload identity).
+fn in_cluster_executor(
+    host: &str,
+    targets: &[(crate::store::HostRecord, serde_json::Value)],
+) -> bool {
+    targets
+        .iter()
+        .any(|(h, _)| h.id == host && h.executor_of().is_some())
 }
 
 fn short(s: &str) -> &str {

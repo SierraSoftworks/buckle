@@ -8,6 +8,7 @@ use crate::object::ObjectKey;
 use crate::transport::{HttpTransport, Request, Response, Transport};
 use buckle_core::Result;
 use buckle_core::error::{system, user};
+use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
@@ -56,6 +57,9 @@ impl ApiResource {
 }
 
 type Discovery = HashMap<String, Option<Arc<Vec<ApiResource>>>>;
+
+/// The events of a watch, as [`Kube::watch`] yields them.
+pub type EventStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<Value>> + Send>>;
 
 /// A Kubernetes API client bound to one cluster and credential.
 #[derive(Clone)]
@@ -135,6 +139,76 @@ impl Kube {
                 body,
             })
             .await
+    }
+
+    /// Watches `path` (a collection: `/apis/apps/v1/deployments`, with its
+    /// own query such as `labelSelector`) from `resource_version` (empty:
+    /// from now, after the server sends what exists). Yields each watch
+    /// event (`{"type": "ADDED"|"MODIFIED"|"DELETED"|"BOOKMARK"|"ERROR",
+    /// "object": …}`) as it arrives, until the server closes the stream or
+    /// it breaks (an error item, then the end).
+    pub async fn watch(&self, path: &str, resource_version: &str) -> Result<EventStream> {
+        let mut url = with_query(path, "watch", "true");
+        url.push_str("&allowWatchBookmarks=true");
+        if !resource_version.is_empty() {
+            url = with_query(&url, "resourceVersion", resource_version);
+        }
+        let mut headers = Vec::new();
+        if let Some(token) = &self.token {
+            headers.push((
+                "Authorization".to_owned(),
+                format!("Bearer {}", token.expose_secret()),
+            ));
+        }
+        let bytes = self
+            .transport
+            .stream(Request {
+                method: "GET",
+                path: url,
+                headers,
+                content_type: None,
+                body: None,
+            })
+            .await?;
+        Ok(Box::pin(futures::stream::unfold(
+            (bytes, Vec::<u8>::new(), false),
+            |(mut bytes, mut buf, mut done)| async move {
+                loop {
+                    // One event per line; a partial line waits for more.
+                    if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=i).collect();
+                        let line = String::from_utf8_lossy(&line).trim().to_owned();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let item = serde_json::from_str::<Value>(&line).map_err(|e| {
+                            system(
+                                format!("A Kubernetes watch event could not be read ({e})."),
+                                &[],
+                            )
+                        });
+                        return Some((item, (bytes, buf, done)));
+                    }
+                    if done {
+                        return None;
+                    }
+                    match bytes.next().await {
+                        Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                        Some(Err(e)) => {
+                            done = true;
+                            return Some((Err(e), (bytes, buf, done)));
+                        }
+                        None => {
+                            done = true;
+                            if buf.is_empty() {
+                                return None;
+                            }
+                            buf.push(b'\n');
+                        }
+                    }
+                }
+            },
+        )))
     }
 
     /// `GET path`, decoding JSON; `None` on 404.

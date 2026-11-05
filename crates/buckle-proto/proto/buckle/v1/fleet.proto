@@ -45,6 +45,7 @@ message AgentMessage {
     UpgradeResult upgrade = 10;
     RebootFailed reboot_failed = 11;
     ActionResult action = 12;
+    TargetStatus target_status = 13;
   }
 }
 
@@ -122,6 +123,9 @@ message PlanResult {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 11;
+  // With `target`: the one workload the plan is scoped to (a workload
+  // placement), echoed from the request. Empty: the whole cluster.
+  string workload = 12;
 }
 
 message ApplyEvent {
@@ -145,6 +149,9 @@ message ApplyEvent {
   string target = 9;
   // The RunAction this event belongs to; empty for an Apply's events.
   string action_id = 10;
+  // With `target`: the placement the run belongs to (as the Apply or
+  // RunAction named it). Empty: the whole cluster.
+  string workload = 11;
 }
 
 // A structured error: what went wrong, the causes beneath it (outermost
@@ -192,6 +199,9 @@ message ApplyResult {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 19;
+  // With `target`: the one workload placement this concerns, echoed from
+  // the instruction. Empty: the whole cluster.
+  string workload = 20;
 }
 
 message Reboot {
@@ -233,6 +243,9 @@ message ActionResult {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 15;
+  // With `target`: the one workload placement this concerns, echoed from
+  // the instruction. Empty: the whole cluster.
+  string workload = 16;
 }
 
 // The reboot an ApplyResult announced could not be started: the host stays
@@ -273,6 +286,9 @@ message HealthReport {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 5;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 6;
 }
 
 message Drift {
@@ -286,6 +302,9 @@ message Drift {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 7;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 8;
 }
 
 message LocalRollback {
@@ -326,7 +345,56 @@ message ServerMessage {
     Ack ack = 10;
     HostUpdate host_update = 11;
     RunAction action = 12;
+    Lease lease = 13;
+    Release release = 14;
   }
+}
+
+// The server leases a cluster target to this agent: it is the cluster's
+// steward until a Release. The agent opens a lane for the cluster beside its
+// host lane, keeps a credential for it, serves the cluster's plans, applies,
+// health requests and actions there, and watches the cluster between them:
+// health as it changes (Nomad blocking queries, a Kubernetes watch), drift
+// on a timer, and reachability (TargetStatus). A targeted Assign of
+// `applied_revision` precedes the Lease when there is one, so the lane can
+// check and re-plan what is applied. Re-sent after every reconnect and
+// whenever the applied revision or the watch settings change: a lease for a
+// lane the agent already runs refreshes it.
+message Lease {
+  string target = 1;
+  ClusterTarget cluster = 2;
+  // The revision applied to the cluster, whose workloads the watch checks;
+  // empty when nothing is applied yet (the lane only probes reachability).
+  string applied_revision = 3;
+  Watch watch = 4;
+  // When the lease lapses unless renewed. Informational for now: a lease
+  // ends with a Release or the session (the server re-leases on reconnect).
+  google.protobuf.Timestamp until = 5;
+}
+
+// How often the lease holder reads a cluster when nothing wakes it.
+message Watch {
+  // The health read that covers a dropped long poll (Nomad); default 60s.
+  google.protobuf.Duration health = 1;
+  // How often the applied revision is re-planned for drift; default 10m.
+  google.protobuf.Duration drift = 2;
+}
+
+// The agent no longer stewards the cluster: its lane finishes the
+// instruction it is running, drops the rest and stops watching.
+message Release {
+  string target = 1;
+  string reason = 2;
+}
+
+// Whether a cluster target's API answers its steward: sent when a lease
+// starts and whenever reachability changes.
+message TargetStatus {
+  string target = 1;
+  bool reachable = 2;
+  // Why not, when it is not (scrubbed).
+  string error = 3;
+  google.protobuf.Timestamp at = 4;
 }
 
 // Runs a module's action on the host (or a workload's on a cluster target,
@@ -346,6 +414,9 @@ message RunAction {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 6;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 7;
 }
 
 // The host's record changed while it is connected (approved, paused,
@@ -400,6 +471,9 @@ message Assign {
   // targeted Assign ahead of every RequestPlan, Apply, Rollback and
   // RunHealth for the cluster, so an executor keeps nothing between them.
   ClusterTarget cluster = 6;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 7;
 }
 
 // A cluster target as its executor needs it. `secrets` on the Assign are
@@ -427,6 +501,9 @@ message RequestPlan {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 3;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 4;
 }
 
 message Apply {
@@ -455,6 +532,9 @@ message Apply {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 12;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 13;
 }
 
 message Rollback {
@@ -466,6 +546,9 @@ message Rollback {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 5;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 6;
 }
 
 message RunHealth {
@@ -484,6 +567,9 @@ message RunHealth {
   // cluster's applied revision; an executor keeps none). Empty for a host,
   // which checks its own applied revision.
   string revision = 7;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 8;
 }
 
 message Ping {

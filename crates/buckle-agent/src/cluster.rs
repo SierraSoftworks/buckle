@@ -342,9 +342,49 @@ impl Executor {
         }
     }
 
+    /// A Nomad client for `a`'s cluster with a `read` credential: what a
+    /// lease holder's watch reads with. The credential cache renews it as
+    /// it nears expiry.
+    pub(crate) async fn read_nomad(&self, a: &Assignment) -> buckle_core::Result<Nomad> {
+        self.client(a, Purpose::Read, None).await
+    }
+
+    /// A Kubernetes client for `a`'s cluster with a `read` credential, and
+    /// when the credential expires (`None` for a credential of the host's
+    /// own that does not): a watch re-syncs when the identity is re-issued.
+    pub(crate) async fn read_kube(
+        &self,
+        a: &Assignment,
+    ) -> buckle_core::Result<(buckle_kube::Kube, Option<chrono::DateTime<Utc>>)> {
+        self.kube_client_with_expiry(a, Purpose::Read, None).await
+    }
+
+    /// Whether the cluster's API answers at all, without a credential (a
+    /// lease holder's probe while nothing is applied yet): Nomad's leader
+    /// and Kubernetes' version endpoints answer anonymous callers.
+    pub(crate) async fn probe(&self, target: &str, spec: &TargetSpec) -> buckle_core::Result<()> {
+        match spec.kind {
+            ClusterKind::Nomad => {
+                let nomad = self.connect.nomad(target, spec)?;
+                let resp = nomad.send("GET", "/v1/status/leader", None).await?;
+                nomad.ok("GET", "/v1/status/leader", resp).map(|_| ())
+            }
+            ClusterKind::Kubernetes => {
+                let kube = self.connect.kubernetes(target, spec)?;
+                let resp = kube.send("GET", "/version", None, None).await?;
+                kube.ok("GET", "/version", resp).map(|_| ())
+            }
+        }
+    }
+
     /// Plans `a`. Pure: reads the cluster, changes nothing. A workload that
     /// cannot be planned is indeterminate (its objects are never orphans);
     /// one that is unreachable fails the plan.
+    ///
+    /// With a `scope`, plans that one workload placement: the workload named
+    /// (nothing, when the revision no longer selects it on the cluster) and
+    /// the removal of what that workload owns beyond its plan; other
+    /// workloads' objects are not its orphans.
     ///
     /// Plans with a `deploy` credential: Nomad's job plan needs `submit-job`
     /// (it has no plan-only capability), which leaves `read` read-only.
@@ -352,13 +392,14 @@ impl Executor {
         &self,
         a: &Assignment,
         rollout: Option<&str>,
+        scope: Option<&str>,
     ) -> buckle_core::Result<ClusterPlan> {
         if a.spec.kind == ClusterKind::Kubernetes {
-            return self.plan_kubernetes(a, rollout).await;
+            return self.plan_kubernetes(a, rollout, scope).await;
         }
         let nomad = self.client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
-        let workloads = a.workloads(&ctx);
+        let workloads = scoped(a.workloads(&ctx), scope);
         // ACL policies need a management token, which only workloads that
         // list one ask for; the cluster binds `acl` to it.
         let acl = if workloads
@@ -488,8 +529,9 @@ impl Executor {
         let mut removals = Vec::new();
         let mut planned_removals = Vec::new();
         for orphan in buckle_nomad::primitives::orphans(&cx, &declared).await? {
-            // A workload whose plan failed declares nothing we know of.
-            if undecided.contains(&orphan.module) {
+            // A workload whose plan failed declares nothing we know of, and
+            // a placement removes only what its own workload owned.
+            if undecided.contains(&orphan.module) || scope.is_some_and(|s| s != orphan.module) {
                 continue;
             }
             let removal = a
@@ -1626,6 +1668,20 @@ fn finish(
         plan,
         units,
         removals: steps,
+    }
+}
+
+/// `workloads` narrowed to the placement `scope` names, when it names one.
+pub(crate) fn scoped<'a>(
+    workloads: Vec<&'a LoadedWorkload>,
+    scope: Option<&str>,
+) -> Vec<&'a LoadedWorkload> {
+    match scope {
+        None => workloads,
+        Some(s) => workloads
+            .into_iter()
+            .filter(|w| w.config.name == s)
+            .collect(),
     }
 }
 

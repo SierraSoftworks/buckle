@@ -91,6 +91,8 @@ fn write_status(s: &mut State, key: &Key, status: &Value) {
 #[derive(Debug, Clone)]
 pub struct FakeKube {
     state: Arc<Mutex<State>>,
+    /// Woken by every write, for watch streams.
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl Default for FakeKube {
@@ -117,6 +119,7 @@ impl FakeKube {
         };
         let fake = Self {
             state: Arc::new(Mutex::new(state)),
+            changed: Arc::new(tokio::sync::Notify::new()),
         };
         fake.insert(
             json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}}),
@@ -194,6 +197,7 @@ impl FakeKube {
             .unwrap_or_default()
             .to_owned();
         s.objects.insert((r.gv, r.plural, ns, name), obj);
+        self.changed.notify_waiters();
     }
 
     /// Edits a stored object out of band, as `manager` (`kubectl edit`):
@@ -232,6 +236,7 @@ impl FakeKube {
         }
         managed.push(json!({"manager": manager, "operation": "Update", "fieldsV1": set}));
         obj["metadata"]["managedFields"] = Value::Array(managed);
+        self.changed.notify_waiters();
     }
 
     /// Writes a controller's status, as the status subresource does: the
@@ -240,6 +245,7 @@ impl FakeKube {
         let mut s = self.state.lock().unwrap();
         let key = s.key_of(api_version, kind, ns, name);
         write_status(&mut s, &key, &status);
+        self.changed.notify_waiters();
     }
 
     /// Has a controller write status to the object just before each of the
@@ -527,7 +533,52 @@ impl FakeKube {
 #[async_trait]
 impl Transport for FakeKube {
     async fn send(&self, request: Request) -> buckle_core::Result<Response> {
-        Ok(self.handle(&request))
+        let response = self.handle(&request);
+        if request.method != "GET" {
+            self.changed.notify_waiters();
+        }
+        Ok(response)
+    }
+
+    /// A watch: one `MODIFIED` event (of the collection's first object, or
+    /// an empty object) per write to the fake, as newline-delimited JSON,
+    /// until the stream is dropped. What changed is not filtered: a watcher
+    /// re-reads what it cares about.
+    async fn stream(&self, request: Request) -> buckle_core::Result<crate::transport::ByteStream> {
+        if !request.path.contains("watch=true") {
+            return Err(buckle_core::error::system(
+                "the fake streams watches only",
+                &[],
+            ));
+        }
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .push((request.method.to_owned(), request.path.clone()));
+        let fake = self.clone();
+        let seen = fake.state.lock().unwrap().version;
+        Ok(Box::pin(futures::stream::unfold(
+            (fake, seen),
+            |(fake, mut seen)| async move {
+                loop {
+                    let version = {
+                        let notified = fake.changed.notified();
+                        let version = fake.state.lock().unwrap().version;
+                        if version == seen {
+                            notified.await;
+                            continue;
+                        }
+                        version
+                    };
+                    seen = version;
+                    let event = json!({"type": "MODIFIED", "object": {"metadata": {"resourceVersion": version.to_string()}}});
+                    let mut line = serde_json::to_vec(&event).unwrap();
+                    line.push(b'\n');
+                    return Some((Ok(bytes::Bytes::from(line)), (fake, seen)));
+                }
+            },
+        )))
     }
 }
 

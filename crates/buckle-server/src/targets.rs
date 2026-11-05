@@ -35,6 +35,10 @@ pub fn spec_from_decl(decl: &ClusterDecl) -> ClusterSpec {
                 subjects: t.subjects.clone(),
             })
         }),
+        watch: (!decl.watch.is_default()).then_some(buckle_api::ClusterWatch {
+            health_seconds: decl.watch.health.as_secs(),
+            drift_seconds: decl.watch.drift.as_secs(),
+        }),
     }
 }
 
@@ -278,6 +282,7 @@ secrets:
             cluster: None,
             scope: Default::default(),
             trust: None,
+            watch: None,
         }
     }
 

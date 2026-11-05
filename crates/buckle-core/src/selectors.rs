@@ -5,14 +5,18 @@
 //!   `host.facts.<path.to.leaf>` (facts tree, leaves only; objects are null)
 //! * on a cluster target: `cluster.id`, `cluster.kind`, `cluster.labels.<k>`,
 //!   `cluster.groups`, `cluster.facts.<path>`, the same way
+//! * on a workload placement (one workload on one cluster): `workload.name`,
+//!   `workload.labels.<k>`, `workload.tags` and `workload.groups`, beside the
+//!   hosting cluster's `cluster.*`
 //! * `vars.<name>` (scalars and lists)
 //! * `secrets.<name>` (a redacting secret value), `secrets.<name>.present`, `secrets.<name>.fingerprint`
 //! * `module.name`, `module.tags`, `task.kind`, `task.id`, `task.tags` when evaluating inside a module/task
 //!
-//! The two namespaces are disjoint: `host.*` is null on a cluster and
+//! The namespaces are disjoint: `host.*` is null on a cluster and
 //! `cluster.*` is null on a host, and a selector applies only to the targets
 //! whose namespace it names ([`HostContext::applies`]), so `!(host.labels.x)`
-//! never leaks onto a cluster.
+//! never leaks onto a cluster. A placement reads both `cluster.*` (its
+//! cluster) and `workload.*`; `host.*` is null there too.
 
 use crate::model::ClusterKind;
 use crate::secrets::SecretStore;
@@ -21,14 +25,16 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, LazyLock};
 
-/// What a rollout deploys to: a host (an enrolled agent) or a cluster (a
-/// virtual target an executor speaks for).
+/// What a rollout deploys to: a host (an enrolled agent), a cluster (a
+/// virtual target an executor speaks for) or a workload placement (one
+/// workload on one cluster, the unit a rollout moves clusters by).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
     #[default]
     Host,
     Cluster,
+    Workload,
 }
 
 impl TargetKind {
@@ -37,7 +43,22 @@ impl TargetKind {
         match self {
             TargetKind::Host => "host",
             TargetKind::Cluster => "cluster",
+            TargetKind::Workload => "workload",
         }
+    }
+
+    /// The namespace the target's identity (id, labels, groups, facts) is
+    /// read through: a placement's identity is its cluster's.
+    pub fn identity_namespace(self) -> &'static str {
+        match self {
+            TargetKind::Host => "host",
+            TargetKind::Cluster | TargetKind::Workload => "cluster",
+        }
+    }
+
+    /// Whether the target lives on a cluster (a cluster row or a placement).
+    pub fn on_cluster(self) -> bool {
+        matches!(self, TargetKind::Cluster | TargetKind::Workload)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -55,32 +76,47 @@ static HOST_NS: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)\bhost\.").expect("static regex compiles"));
 static CLUSTER_NS: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)\bcluster\.").expect("static regex compiles"));
+static WORKLOAD_NS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\bworkload\.").expect("static regex compiles"));
 
 /// Which target namespaces a selector names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Namespaces {
     pub host: bool,
     pub cluster: bool,
+    pub workload: bool,
 }
 
 impl Namespaces {
     /// Whether a selector naming these namespaces applies to a target of
-    /// `kind`: it names that kind's namespace, or names neither (`true`,
-    /// `vars.x == 1`), so a selector written for the other kind alone is
-    /// simply false here.
+    /// `kind`: it names that kind's namespace, or names none (`true`,
+    /// `vars.x == 1`), so a selector written for another kind alone is
+    /// simply false here. A placement is also what `cluster.*` selects (every
+    /// placement on the matching clusters), and `host.*` never selects one;
+    /// a whole cluster is never selected by `workload.*`.
     pub fn applies_to(self, kind: TargetKind) -> bool {
         match kind {
-            TargetKind::Host => self.host || !self.cluster,
-            TargetKind::Cluster => self.cluster || !self.host,
+            TargetKind::Host => self.host || (!self.cluster && !self.workload),
+            TargetKind::Cluster => self.cluster || (!self.host && !self.workload),
+            TargetKind::Workload => !self.host,
         }
+    }
+
+    /// Whether the selector names namespaces no one target reads together
+    /// (`host.*` beside `cluster.*` or `workload.*`): the other half is
+    /// always null, so it selects nothing it was meant to.
+    pub fn mixed(self) -> bool {
+        self.host && (self.cluster || self.workload)
     }
 }
 
-/// The target namespaces (`host.*`, `cluster.*`) a selector's text names.
+/// The target namespaces (`host.*`, `cluster.*`, `workload.*`) a selector's
+/// text names.
 pub fn selector_namespaces(raw: &str) -> Namespaces {
     Namespaces {
         host: HOST_NS.is_match(raw),
         cluster: CLUSTER_NS.is_match(raw),
+        workload: WORKLOAD_NS.is_match(raw),
     }
 }
 
@@ -134,10 +170,13 @@ pub struct HostIdentity {
 #[derive(Clone, Default)]
 pub struct HostContext {
     pub host: HostIdentity,
-    /// Which namespace the identity is read through: `host.*` or `cluster.*`.
+    /// Which namespace the identity is read through: `host.*`, or
+    /// `cluster.*` for a cluster and for a placement on it.
     pub target: TargetKind,
     /// For a cluster target, its scheduler (`cluster.kind`).
     pub cluster_kind: Option<ClusterKind>,
+    /// For a placement: the workload, read as `workload.*`.
+    pub workload: Option<WorkloadScope>,
     pub groups: Vec<String>,
     /// The facts tree as collected by fact providers, mounted at `host.facts`.
     pub facts: serde_json::Value,
@@ -156,6 +195,16 @@ pub struct ModuleScope {
     pub tags: Vec<String>,
 }
 
+/// The workload of a placement, as `workload.*` reads it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkloadScope {
+    pub name: String,
+    #[serde(default)]
+    pub labels: Labels,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskScope {
     pub kind: String,
@@ -169,6 +218,7 @@ impl std::fmt::Debug for HostContext {
             .field("host", &self.host)
             .field("target", &self.target)
             .field("cluster_kind", &self.cluster_kind)
+            .field("workload", &self.workload)
             .field("groups", &self.groups)
             .field("vars", &self.vars.keys().collect::<Vec<_>>())
             .field("secrets", &self.secrets.names().collect::<Vec<_>>())
@@ -195,6 +245,28 @@ impl HostContext {
             cluster_kind: Some(kind),
             ..Default::default()
         }
+    }
+
+    /// The context of a placement of the workload `name` on the cluster
+    /// `cluster` describes: `cluster.*` still reads the cluster, and
+    /// `workload.*` the workload. Groups are the cluster's until
+    /// re-evaluated for the placement.
+    pub fn for_workload(
+        cluster: &HostContext,
+        name: &str,
+        labels: Labels,
+        tags: &[String],
+    ) -> Self {
+        let mut c = cluster.clone();
+        c.target = TargetKind::Workload;
+        c.workload = Some(WorkloadScope {
+            name: name.to_owned(),
+            labels,
+            tags: tags.to_vec(),
+        });
+        c.module = None;
+        c.task = None;
+        c
     }
 
     /// Whether `filter` applies to this kind of target at all (see
@@ -301,9 +373,9 @@ impl HostContext {
         })
     }
 
-    /// The template context (`host` or `cluster`, `vars`, `module`, `task`)
-    /// as JSON. Secrets are added by the templater as a special object, never
-    /// as JSON.
+    /// The template context (`host` or `cluster`, `workload` on a placement,
+    /// `vars`, `module`, `task`) as JSON. Secrets are added by the templater
+    /// as a special object, never as JSON.
     pub fn template_json(&self) -> serde_json::Value {
         let mut host = serde_json::Map::new();
         host.insert("id".into(), serde_json::Value::String(self.host.id.clone()));
@@ -327,9 +399,38 @@ impl HostContext {
         host.insert("facts".into(), self.facts.clone());
         let mut root = serde_json::Map::new();
         root.insert(
-            self.target.namespace().into(),
+            self.target.identity_namespace().into(),
             serde_json::Value::Object(host),
         );
+        if let Some(w) = &self.workload {
+            let mut workload = serde_json::Map::new();
+            workload.insert("name".into(), serde_json::Value::String(w.name.clone()));
+            workload.insert(
+                "labels".into(),
+                serde_json::Value::Object(w.labels.clone().into_iter().collect()),
+            );
+            workload.insert(
+                "tags".into(),
+                serde_json::Value::Array(
+                    w.tags
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+            workload.insert(
+                "groups".into(),
+                serde_json::Value::Array(
+                    self.groups
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+            root.insert("workload".into(), serde_json::Value::Object(workload));
+        }
         root.insert(
             "vars".into(),
             serde_json::Value::Object(self.vars.clone().into_iter().collect()),
@@ -407,14 +508,15 @@ impl Filterable for HostContext {
     fn get(&self, key: &str) -> FilterValue<'_> {
         let lower = key.to_ascii_lowercase();
         // The identity is read through the namespace of the target's kind
-        // only; the other namespace is null here.
+        // only (a placement's through its cluster's); the other namespaces
+        // are null here.
         let identity = lower
             .strip_prefix("host.")
             .filter(|_| self.target == TargetKind::Host)
             .or_else(|| {
                 lower
                     .strip_prefix("cluster.")
-                    .filter(|_| self.target == TargetKind::Cluster)
+                    .filter(|_| self.target.on_cluster())
             });
         if let Some(rest) = identity {
             return match rest {
@@ -446,6 +548,35 @@ impl Filterable for HostContext {
                         FilterValue::Null
                     }
                 }
+            };
+        }
+        if let Some(rest) = lower.strip_prefix("workload.") {
+            let Some(w) = &self.workload else {
+                return FilterValue::Null;
+            };
+            return match rest {
+                "name" => w.name.as_str().into(),
+                "tags" => FilterValue::Tuple(
+                    w.tags
+                        .iter()
+                        .map(|t| FilterValue::String(t.as_str().into()))
+                        .collect(),
+                ),
+                "groups" => FilterValue::Tuple(
+                    self.groups
+                        .iter()
+                        .map(|g| FilterValue::String(g.as_str().into()))
+                        .collect(),
+                ),
+                _ => rest
+                    .strip_prefix("labels.")
+                    .and_then(|label| {
+                        w.labels
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(label))
+                            .map(|(_, v)| json_to_filter_value(v))
+                    })
+                    .unwrap_or(FilterValue::Null),
             };
         }
         if lower.starts_with("host.") || lower.starts_with("cluster.") {
@@ -669,17 +800,38 @@ mod tests {
     }
 
     #[rstest]
-    #[case("host.labels.x == 1", true, false)]
-    #[case("cluster.kind == \"nomad\"", false, true)]
-    #[case("HOST.id == \"a\" && Cluster.id == \"b\"", true, true)]
-    #[case("vars.a == 1", false, false)]
-    #[case("host.facts.fqdn == \"cluster.local\"", true, true)]
+    #[case("host.labels.x == 1", true, false, false)]
+    #[case("cluster.kind == \"nomad\"", false, true, false)]
+    #[case("HOST.id == \"a\" && Cluster.id == \"b\"", true, true, false)]
+    #[case("vars.a == 1", false, false, false)]
+    #[case("host.facts.fqdn == \"cluster.local\"", true, true, false)]
+    #[case("workload.labels.tier == \"canary\"", false, false, true)]
+    #[case(
+        "cluster.kind == \"nomad\" && workload.name == \"grafana\"",
+        false,
+        true,
+        true
+    )]
+    #[case(
+        "host.labels.a == 1 && workload.tags contains \"db\"",
+        true,
+        false,
+        true
+    )]
     fn selector_namespaces_are_read_from_the_text(
         #[case] raw: &str,
         #[case] host: bool,
         #[case] cluster: bool,
+        #[case] workload: bool,
     ) {
-        assert_eq!(selector_namespaces(raw), Namespaces { host, cluster });
+        assert_eq!(
+            selector_namespaces(raw),
+            Namespaces {
+                host,
+                cluster,
+                workload
+            }
+        );
     }
 
     #[test]

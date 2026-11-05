@@ -131,7 +131,7 @@ async fn apply_with_events(
     ex: &Executor,
     a: &Assignment,
 ) -> (ApplyOutcome, Vec<buckle_core::engine::ApplyEvent>) {
-    let planned = ex.plan(a, None).await.unwrap();
+    let planned = ex.plan(a, None, None).await.unwrap();
     let (tx, mut rx) = mpsc::channel(256);
     let drain = tokio::spawn(async move {
         let mut seen = Vec::new();
@@ -150,7 +150,7 @@ async fn a_workload_plans_applies_and_then_plans_as_a_no_op() {
     let ex = executor(&fake);
     let a = assignment(revision("r1", &paste()), ClusterIdentity::BuckleJwt, 7);
 
-    let planned = ex.plan(&a, None).await.unwrap();
+    let planned = ex.plan(&a, None, None).await.unwrap();
     let plan = &planned.plan;
     assert_eq!(plan.host, TARGET);
     assert_eq!(plan.modules.len(), 1);
@@ -180,7 +180,7 @@ async fn a_workload_plans_applies_and_then_plans_as_a_no_op() {
     assert!(fake.entity("namespace", "apps").is_some());
     assert!(fake.variable("apps", "nomad/jobs/paste").is_some());
 
-    let again = ex.plan(&a, None).await.unwrap().plan;
+    let again = ex.plan(&a, None, None).await.unwrap().plan;
     assert_eq!(again.changes(), 0, "{again:#?}");
     assert!(again.removals.is_empty(), "{:?}", again.removals);
     // Nomad reports the untouched allocation as `ignore`: not a warning.
@@ -211,7 +211,7 @@ async fn plans_deploy_and_health_checks_read() {
     let fake = FakeNomad::new();
     let ex = executor(&fake);
     let a = assignment(revision("r1", &paste()), ClusterIdentity::BuckleJwt, 7);
-    ex.plan(&a, None).await.unwrap();
+    ex.plan(&a, None, None).await.unwrap();
     assert_eq!(fake.logins(), vec![format!("jwt:{TARGET}:Deploy")]);
     ex.health(&a, HealthScope::Bake, None, None).await.unwrap();
     assert!(
@@ -230,7 +230,7 @@ async fn a_secret_identity_sends_the_secret_as_the_token() {
         ClusterIdentity::Secret("DB".into()),
         7,
     );
-    ex.plan(&a, None).await.unwrap();
+    ex.plan(&a, None, None).await.unwrap();
     assert!(fake.logins().is_empty());
     assert!(fake.tokens().iter().all(|t| t == SECRET));
 }
@@ -249,11 +249,16 @@ async fn plan_digests_depend_on_the_targets_key_not_the_executor(
         .plan(
             &assignment(rev.clone(), ClusterIdentity::BuckleJwt, 7),
             None,
+            None,
         )
         .await
         .unwrap();
     let two = executor(&fake)
-        .plan(&assignment(rev, ClusterIdentity::BuckleJwt, other), None)
+        .plan(
+            &assignment(rev, ClusterIdentity::BuckleJwt, other),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(one.plan.digest == two.plan.digest, same);
@@ -276,7 +281,7 @@ async fn a_removed_workload_is_planned_as_a_removal_and_stopped() {
         ClusterIdentity::Local,
         7,
     );
-    let plan = ex.plan(&a, None).await.unwrap().plan;
+    let plan = ex.plan(&a, None, None).await.unwrap().plan;
     let removed: Vec<String> = plan
         .removals
         .iter()
@@ -303,7 +308,7 @@ async fn a_workload_that_cannot_be_planned_is_indeterminate_and_keeps_its_object
     // The secret its variable reads did not reach the executor.
     let mut a = assignment(revision("r2", &paste()), ClusterIdentity::Local, 7);
     a.secrets = Arc::new(SecretStore::new());
-    let planned = ex.plan(&a, None).await.unwrap();
+    let planned = ex.plan(&a, None, None).await.unwrap();
     assert_eq!(planned.plan.indeterminate.len(), 1);
     assert_eq!(planned.plan.indeterminate[0].module, "paste");
     assert!(
@@ -328,7 +333,7 @@ async fn workloads_apply_after_the_workloads_they_need() {
         "name: nomad\ntasks: []\n".into(),
     ));
     let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
-    let planned = executor(&fake).plan(&a, None).await.unwrap();
+    let planned = executor(&fake).plan(&a, None, None).await.unwrap();
     let order: Vec<&str> = planned
         .plan
         .modules
@@ -347,7 +352,7 @@ async fn submitted_alongside(
     let fake = FakeNomad::new();
     let ex = executor(&fake);
     let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
-    let planned = ex.plan(&a, None).await.unwrap();
+    let planned = ex.plan(&a, None, None).await.unwrap();
     for (ns, id) in [first, second] {
         fake.hold(ns, id);
     }
@@ -463,7 +468,7 @@ async fn resources_apply_in_list_order_and_every_job_is_health_checked() {
         ),
     ];
     let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
-    let planned = ex.plan(&a, None).await.unwrap();
+    let planned = ex.plan(&a, None, None).await.unwrap();
     let steps: Vec<String> = planned.plan.modules[0]
         .steps
         .iter()
@@ -500,7 +505,7 @@ async fn resources_apply_in_list_order_and_every_job_is_health_checked() {
     fake.edit_job("default", "shop-worker", |j| {
         j["TaskGroups"][0]["Count"] = 3.into()
     });
-    assert_eq!(ex.plan(&a, None).await.unwrap().plan.changes(), 0);
+    assert_eq!(ex.plan(&a, None, None).await.unwrap().plan.changes(), 0);
 }
 
 #[tokio::test]
@@ -523,7 +528,7 @@ async fn a_config_writes_its_files_as_plain_items_of_the_variable_a_secret_share
         ("workloads/app/files/app.nomad.hcl".to_owned(), job_spec("app")),
     ];
     let a = assignment(revision("r1", &files), ClusterIdentity::Local, 7);
-    let planned = ex.plan(&a, None).await.unwrap();
+    let planned = ex.plan(&a, None, None).await.unwrap();
     let steps: Vec<String> = planned.plan.modules[0]
         .steps
         .iter()
@@ -554,7 +559,7 @@ async fn a_config_writes_its_files_as_plain_items_of_the_variable_a_secret_share
     assert_eq!(items["extra.toml"], "level = \"debug\"\n");
     assert_eq!(items["mode"], "fast");
     assert_eq!(items["token"], SECRET);
-    assert_eq!(ex.plan(&a, None).await.unwrap().plan.changes(), 0);
+    assert_eq!(ex.plan(&a, None, None).await.unwrap().plan.changes(), 0);
 }
 
 #[tokio::test]
@@ -670,7 +675,7 @@ async fn a_kubernetes_workload_plans_applies_and_then_plans_as_a_no_op() {
         ClusterIdentity::BuckleJwt,
     );
 
-    let planned = ex.plan(&a, None).await.unwrap();
+    let planned = ex.plan(&a, None, None).await.unwrap();
     let resources: Vec<String> = planned.plan.modules[0]
         .steps
         .iter()
@@ -714,7 +719,7 @@ async fn a_kubernetes_workload_plans_applies_and_then_plans_as_a_no_op() {
         "{auth:?}"
     );
 
-    let again = ex.plan(&a, None).await.unwrap().plan;
+    let again = ex.plan(&a, None, None).await.unwrap().plan;
     assert_eq!(again.changes(), 0, "{again:#?}");
     assert!(again.removals.is_empty(), "{:?}", again.removals);
 
@@ -722,7 +727,7 @@ async fn a_kubernetes_workload_plans_applies_and_then_plans_as_a_no_op() {
         revision("r2", &grafana("11.4.0")),
         ClusterIdentity::BuckleJwt,
     );
-    let changed = ex.plan(&next, None).await.unwrap().plan;
+    let changed = ex.plan(&next, None, None).await.unwrap().plan;
     assert_eq!(changed.changes(), 1, "only the Deployment's image changes");
 
     let health = ex.health(&a, HealthScope::Bake, None, None).await.unwrap();
@@ -747,7 +752,7 @@ async fn a_removed_kubernetes_workload_is_planned_as_a_removal() {
     .await;
 
     let empty = kube_assignment(revision("r2", &[]), ClusterIdentity::Local);
-    let plan = ex.plan(&empty, None).await.unwrap();
+    let plan = ex.plan(&empty, None, None).await.unwrap();
     let summaries: Vec<&str> = plan
         .plan
         .removals
@@ -782,6 +787,7 @@ async fn a_nomad_workload_on_a_kubernetes_cluster_is_indeterminate() {
     let plan = ex
         .plan(
             &kube_assignment(revision("r1", &paste()), ClusterIdentity::Local),
+            None,
             None,
         )
         .await
@@ -913,4 +919,50 @@ async fn an_implicit_action_needs_a_registered_job() {
             .unwrap_or_default()
             .contains("no job registered")
     );
+}
+
+/// A plan scoped to one workload placement plans that workload alone and
+/// removes only what it owned: another workload's objects are not its
+/// orphans, and a workload the revision dropped plans as its removal only.
+#[tokio::test]
+async fn a_scoped_plan_covers_one_workload_and_its_own_orphans() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let mut both = workload_files("paste", "");
+    both.extend(workload_files("grafana", ""));
+    let a = assignment(revision("r1", &both), ClusterIdentity::BuckleJwt, 7);
+    assert!(apply(&ex, &a).await.succeeded);
+
+    let next = assignment(
+        revision("r2", &workload_files("grafana", "")),
+        ClusterIdentity::BuckleJwt,
+        7,
+    );
+    let grafana = ex.plan(&next, None, Some("grafana")).await.unwrap().plan;
+    assert_eq!(
+        grafana
+            .modules
+            .iter()
+            .map(|m| m.module.as_str())
+            .collect::<Vec<_>>(),
+        ["grafana"]
+    );
+    assert!(
+        grafana.removals.is_empty(),
+        "paste's objects are not grafana's orphans: {:?}",
+        grafana.removals
+    );
+
+    let paste = ex.plan(&next, None, Some("paste")).await.unwrap().plan;
+    assert!(paste.modules.is_empty(), "{:?}", paste.modules);
+    assert!(!paste.removals.is_empty());
+    assert!(
+        paste.removals.iter().all(|r| r.resource.module == "paste"),
+        "{:?}",
+        paste.removals
+    );
+
+    let whole = ex.plan(&next, None, None).await.unwrap().plan;
+    assert_eq!(whole.modules.len(), 1);
+    assert_eq!(whole.removals.len(), paste.removals.len());
 }

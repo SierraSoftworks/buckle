@@ -56,6 +56,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/targets/{id}", web::delete().to(host_forget))
             .route("/targets/{id}/executor", web::get().to(target_executor))
             .route("/targets/{id}/preview", web::post().to(host_preview))
+            .route("/targets/{id}/steward", web::post().to(target_steward))
             .route(
                 "/targets/{id}/actions/{module}/{action}",
                 web::post().to(run_action),
@@ -120,6 +121,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/targets/t/preview"),
     ("GET", "/api/v1/targets/t/executor"),
     ("POST", "/api/v1/targets/t/pause"),
+    ("POST", "/api/v1/targets/t/steward"),
     ("GET", "/api/v1/join"),
     ("POST", "/api/v1/join"),
     ("GET", "/api/v1/join/j"),
@@ -468,6 +470,8 @@ async fn summaries_of(
             let records = match kind {
                 Some(TargetKind::Host) => db.hosts().list()?,
                 Some(TargetKind::Cluster) => db.hosts().clusters()?,
+                // A placement is a rollout row, never a stored target.
+                Some(TargetKind::Workload) => Vec::new(),
                 None => db.hosts().targets()?,
             };
             let mut out = Vec::new();
@@ -634,6 +638,33 @@ async fn target_executor(state: Data, _: Administrative, path: web::Path<String>
     Ok(HttpResponse::Ok().json(rendered))
 }
 
+/// `POST /targets/{id}/steward`: moves a cluster's lease to the host named
+/// in the body, which must be able to speak for it now.
+async fn target_steward(
+    state: Data,
+    admin: Administrative,
+    path: web::Path<String>,
+    body: web::Json<buckle_api::StewardRequest>,
+) -> ApiResult {
+    let id = path.into_inner();
+    let buckle_api::StewardRequest { host, note } = body.into_inner();
+    if host.is_empty() {
+        return Err(ApiError::bad_request("Name the host to move the lease to."));
+    }
+    state
+        .controller
+        .command(
+            &admin.0.actor(),
+            Command::MoveLease {
+                target: id.clone(),
+                host,
+                note,
+            },
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(summary_or_404(&state, &id).await?))
+}
+
 async fn summary_or_404(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {
     let mut summary = crate::views::load_summary(&state.store, &state.revisions, id)
         .await
@@ -647,29 +678,45 @@ async fn summary_or_404(state: &AppState, id: &str) -> Result<buckle_api::HostSu
 fn audit_noun(kind: TargetKind) -> &'static str {
     match kind {
         TargetKind::Host => "host",
-        TargetKind::Cluster => "target",
+        TargetKind::Cluster | TargetKind::Workload => "target",
     }
 }
 
-fn resources(row: Option<crate::store::RolloutHostRecord>) -> Vec<ResourceSummary> {
-    let Some(row) = row else { return vec![] };
-    let Some(plan) = row
-        .plan
-        .clone()
-        .and_then(|p| serde_json::from_value::<buckle_core::plan::Plan>(p).ok())
-    else {
-        return vec![];
-    };
-    plan.steps()
-        .map(|s| ResourceSummary {
-            module: s.resource.module.clone(),
-            kind: s.resource.kind.clone(),
-            key: s.resource.key.clone(),
-            revision: row.runtime.revision.clone(),
-            applied_at: row.updated_at,
-            removal: format!("{:?}", s.removal).to_lowercase(),
-        })
-        .collect()
+/// The resources a target converged to, from the plans of its latest
+/// healthy rows (newest first: a cluster rolled by placements has one per
+/// workload, and a row from before placements covers the whole cluster, so
+/// a resource is taken from the first row that names it).
+fn resources(rows: &[crate::store::RolloutHostRecord]) -> Vec<ResourceSummary> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(plan) = row
+            .plan
+            .clone()
+            .and_then(|p| serde_json::from_value::<buckle_core::plan::Plan>(p).ok())
+        else {
+            continue;
+        };
+        for s in plan.steps() {
+            let id = (
+                s.resource.module.clone(),
+                s.resource.kind.clone(),
+                s.resource.key.clone(),
+            );
+            if !seen.insert(id) {
+                continue;
+            }
+            out.push(ResourceSummary {
+                module: s.resource.module.clone(),
+                kind: s.resource.kind.clone(),
+                key: s.resource.key.clone(),
+                revision: row.runtime.revision.clone(),
+                applied_at: row.updated_at,
+                removal: format!("{:?}", s.removal).to_lowercase(),
+            });
+        }
+    }
+    out
 }
 
 fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
@@ -725,8 +772,7 @@ async fn stored_report(
             let plan = match &r.rollout {
                 Some(rollout) => db
                     .rollouts()
-                    .host(rollout, &r.host)?
-                    .filter(|h| h.plan_digest.as_deref() == Some(r.plan_digest.as_str()))
+                    .host_by_plan(rollout, &r.host, &r.plan_digest)?
                     .and_then(|h| h.plan),
                 None => None,
             };
@@ -766,7 +812,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         .call(move |db| {
             Ok((
                 db.hosts().latest_facts(&lookup)?,
-                db.rollouts().latest_healthy_for_host(&lookup)?,
+                db.rollouts().latest_healthy_rows_for_host(&lookup)?,
                 // Newest first, the run in progress included.
                 db.runs().page(&lookup, None, 20)?.0,
                 db.health().for_host(&lookup, 100)?,
@@ -804,7 +850,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
             .map(|(f, _)| f.clone())
             .unwrap_or(serde_json::Value::Null),
         facts_at: facts.map(|(_, at)| at),
-        resources: resources(row),
+        resources: resources(&row),
         drift,
         recent_runs: runs.into_iter().map(|r| run_dto(&state, r)).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
@@ -904,11 +950,11 @@ async fn host_facts(state: Data, _: Authenticated, path: web::Path<String>) -> A
 async fn host_state(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
     let id = path.into_inner();
     summary_or_404(&state, &id).await?;
-    let row = state
+    let rows = state
         .store
-        .call(move |db| db.rollouts().latest_healthy_for_host(&id))
+        .call(move |db| db.rollouts().latest_healthy_rows_for_host(&id))
         .await?;
-    Ok(HttpResponse::Ok().json(resources(row)))
+    Ok(HttpResponse::Ok().json(resources(&rows)))
 }
 
 async fn host_health(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
@@ -1608,7 +1654,7 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
     let mut detail = view::detail(&r, &hosts, &approvals, &audit);
     for h in detail.phases.iter_mut().flat_map(|p| p.hosts.iter_mut()) {
         if h.run_id.is_none() {
-            h.run_id = run_ids.get(&h.host).cloned();
+            h.run_id = run_ids.get(&h.host, h.workload.as_deref(), h.plan_digest.as_deref());
         }
     }
     detail.summary = state.link_rollout(detail.summary);
@@ -1677,7 +1723,7 @@ fn union_plan(
     let input: Vec<buckle_api::FleetHost> = hosts
         .iter()
         .map(|h| buckle_api::FleetHost {
-            host: h.host.clone(),
+            host: crate::rollout::view::row_key(h),
             plan: crate::views::stored_plan_view(h.plan.as_ref())
                 .filter(|p| p.revision.is_empty() || p.revision == revision),
             context: contexts.get(&h.host).cloned().unwrap_or_default(),
@@ -1846,25 +1892,46 @@ async fn rollout(state: Data, _: Authenticated, path: web::Path<String>) -> ApiR
 
 /// The host's run in a rollout: the plan as pending before it starts, live
 /// while it applies, final once its result arrived.
+/// `?workload=NAME` on a rollout's host routes: addresses one workload
+/// placement of the cluster the path names.
+#[derive(Deserialize, Default)]
+struct WorkloadQuery {
+    #[serde(default)]
+    workload: String,
+}
+
 async fn rollout_host_report(
     state: Data,
     _: Authenticated,
     path: web::Path<(String, String)>,
+    query: web::Query<WorkloadQuery>,
 ) -> ApiResult {
     let (rollout, host) = path.into_inner();
+    let workload = query.into_inner().workload;
     let rollout = resolve_rollout(&state, rollout).await?;
-    let (r, h) = (rollout.clone(), host.clone());
+    let (r, h, w) = (rollout.clone(), host.clone(), workload.clone());
     let (row, run) = state
         .store
         .call(move |db| {
-            Ok((
-                db.rollouts().host(&r, &h)?,
-                db.runs().latest_for_rollout_host(&r, &h)?,
-            ))
+            let row = db.rollouts().host(&r, &h, &w)?;
+            // A placement's run is the one of its own plan; the cluster's
+            // other placements have runs of their own.
+            let run = match &row {
+                Some(row) if !row.workload.is_empty() => match &row.plan_digest {
+                    Some(digest) => db.runs().latest_for_rollout_plan(&r, &h, digest)?,
+                    None => None,
+                },
+                _ => db.runs().latest_for_rollout_host(&r, &h)?,
+            };
+            Ok((row, run))
         })
         .await?;
-    let row = row
-        .ok_or_else(|| ApiError::not_found(format!("No host '{host}' in rollout '{rollout}'.")))?;
+    let row = row.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "No host '{}' in rollout '{rollout}'.",
+            buckle_api::placement_key(&host, Some(&workload))
+        ))
+    })?;
     use serde::Deserialize as _;
     let plan = row
         .plan
@@ -1982,6 +2049,7 @@ async fn rollout_action(
         "skip-bake" => Command::SkipBake {
             rollout,
             host: None,
+            workload: String::new(),
             note,
         },
         "rollback" => Command::Rollback { rollout, note },
@@ -2000,9 +2068,11 @@ async fn rollout_host_action(
     state: Data,
     admin: Administrative,
     path: web::Path<(String, String, String)>,
+    query: web::Query<WorkloadQuery>,
     body: Option<web::Json<ActionRequest>>,
 ) -> ApiResult {
     let (id, host, action) = path.into_inner();
+    let workload = query.into_inner().workload;
     let id = resolve_rollout(&state, id).await?;
     let note = body.map(|b| b.into_inner().note).unwrap_or_default();
     let rollout = id.clone();
@@ -2010,21 +2080,25 @@ async fn rollout_host_action(
         "retry" => Command::Retry {
             rollout,
             host,
+            workload,
             note,
         },
         "skip" => Command::Skip {
             rollout,
             host,
+            workload,
             note,
         },
         "force" => Command::Force {
             rollout,
             host,
+            workload,
             note,
         },
         "skip-bake" => Command::SkipBake {
             rollout,
             host: Some(host),
+            workload,
             note,
         },
         _ => return Err(ApiError::not_found(format!("No host action '{action}'."))),
@@ -2037,9 +2111,11 @@ async fn rollout_continue(
     state: Data,
     admin: Administrative,
     path: web::Path<(String, String)>,
+    query: web::Query<WorkloadQuery>,
     body: web::Json<ContinueRequest>,
 ) -> ApiResult {
     let (id, host) = path.into_inner();
+    let workload = query.into_inner().workload;
     let id = resolve_rollout(&state, id).await?;
     let b = body.into_inner();
     state
@@ -2049,6 +2125,7 @@ async fn rollout_continue(
             Command::Continue {
                 rollout: id.clone(),
                 host,
+                workload,
                 waive: b.waive_checks,
                 note: b.note,
             },

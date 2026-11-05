@@ -38,6 +38,13 @@ pub struct HostRecord {
     pub health: HealthSummary,
     pub health_at: Option<DateTime<Utc>>,
     pub drifted: bool,
+    /// For a cluster: the host agent holding its lease (its steward).
+    pub steward: Option<String>,
+    /// For a cluster: whether its API answers the steward, as last reported;
+    /// `None` until a steward reports.
+    pub reachable: Option<bool>,
+    /// Why the cluster is unreachable, when it is.
+    pub reachable_error: Option<String>,
 }
 
 /// `auth_method` of a host enrolled by workload identity: the prefix, then
@@ -92,7 +99,7 @@ pub struct Hosts<'c> {
     conn: &'c Connection,
 }
 
-const COLUMNS: &str = "host_id, agent_labels, labels, status, notes, token_hash, platform, arch, agent_version, applied_revision, last_plan_digest, connection, auth_method, first_seen, last_seen, health, health_at, drifted, kind, cluster";
+const COLUMNS: &str = "host_id, agent_labels, labels, status, notes, token_hash, platform, arch, agent_version, applied_revision, last_plan_digest, connection, auth_method, first_seen, last_seen, health, health_at, drifted, kind, cluster, steward, reachable, reachable_error";
 
 pub(crate) fn status_str(s: HostStatus) -> &'static str {
     match s {
@@ -150,6 +157,9 @@ fn row(r: &Row<'_>) -> rusqlite::Result<RawHost> {
         drifted: r.get(17)?,
         kind: r.get(18)?,
         cluster: r.get(19)?,
+        steward: r.get(20)?,
+        reachable: r.get(21)?,
+        reachable_error: r.get(22)?,
     })
 }
 
@@ -174,6 +184,9 @@ struct RawHost {
     drifted: bool,
     kind: String,
     cluster: Option<String>,
+    steward: Option<String>,
+    reachable: Option<String>,
+    reachable_error: Option<String>,
 }
 
 impl RawHost {
@@ -207,6 +220,13 @@ impl RawHost {
             health: parse_health(&self.health),
             health_at: parse_ts_opt(self.health_at)?,
             drifted: self.drifted,
+            steward: self.steward.filter(|s| !s.is_empty()),
+            reachable: match self.reachable.as_deref() {
+                Some("reachable") => Some(true),
+                Some("unreachable") => Some(false),
+                _ => None,
+            },
+            reachable_error: self.reachable_error.filter(|e| !e.is_empty()),
         })
     }
 }
@@ -486,6 +506,38 @@ impl<'c> Hosts<'c> {
         Ok(())
     }
 
+    /// Records which host agent holds a cluster target's lease (`None`:
+    /// nobody). A cluster without a steward is neither reachable nor not:
+    /// nobody is asking.
+    pub fn set_steward(&self, id: &str, steward: Option<&str>) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE hosts SET steward = ?2, reachable = CASE WHEN ?2 IS NULL THEN NULL ELSE reachable END, reachable_error = CASE WHEN ?2 IS NULL THEN NULL ELSE reachable_error END WHERE host_id = ?1",
+                params![id, steward],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// Records whether a cluster target's API answers its steward.
+    pub fn set_reachable(&self, id: &str, reachable: bool, error: Option<&str>) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE hosts SET reachable = ?2, reachable_error = ?3 WHERE host_id = ?1",
+                params![
+                    id,
+                    if reachable {
+                        "reachable"
+                    } else {
+                        "unreachable"
+                    },
+                    error.filter(|_| !reachable)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
     /// Records whether the last drift pass found changes.
     pub fn set_drifted(&self, id: &str, drifted: bool) -> Result<()> {
         self.conn
@@ -619,6 +671,7 @@ mod tests {
             cluster: None,
             scope: Default::default(),
             trust: None,
+            watch: None,
         };
         let (host, target, hosts, targets, clusters) = store
             .call(move |db| {

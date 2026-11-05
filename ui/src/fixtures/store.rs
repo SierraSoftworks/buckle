@@ -237,12 +237,12 @@ pub fn rollout_host_report(id: &str, host: &str) -> Result<RunReport, ApiError> 
             r.phases
                 .iter()
                 .flat_map(|p| &p.hosts)
-                .find(|h| h.host == host)
+                .find(|h| crate::logic::units::key(h) == host)
                 .and_then(|h| h.run_id.clone())
         })
     })?
     .ok_or_else(|| ApiError::NotFound(format!("{host} has no run in rollout {id}.")))?;
-    host_run(host, &run)
+    host_run(buckle_api::split_placement_key(host).0, &run)
 }
 
 pub fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> {
@@ -268,6 +268,39 @@ pub fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> 
             format!("{} updated {id}", actor()),
         );
         Ok(s.host_changed(id).expect("the host exists"))
+    })
+}
+
+pub fn move_steward(id: &str, host: &str, note: &str) -> Result<HostSummary, ApiError> {
+    admin()?;
+    with(|s| {
+        let cluster = s
+            .clusters
+            .iter_mut()
+            .find(|h| h.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("No target '{id}'.")))?;
+        let status = cluster.cluster_status.get_or_insert_with(Default::default);
+        status.steward = Some(host.to_owned());
+        status.executor = Some(host.to_owned());
+        let cluster = cluster.clone();
+        if let Some(d) = s.details.iter_mut().find(|d| d.summary.id == id) {
+            d.summary = cluster.clone();
+        }
+        let why = if note.is_empty() {
+            String::new()
+        } else {
+            format!(": {note}")
+        };
+        s.record(
+            &actor(),
+            "target.steward",
+            id,
+            format!("{} moved {id}'s lease to {host}{why}", actor()),
+        );
+        s.outbox.push(LiveEvent::HostChanged {
+            host: cluster.clone(),
+        });
+        Ok(cluster)
     })
 }
 
@@ -325,7 +358,7 @@ pub fn run_action(
             .clone();
         let noun = match detail.summary.kind {
             buckle_api::TargetKind::Host => "host",
-            buckle_api::TargetKind::Cluster => "target",
+            buckle_api::TargetKind::Cluster | buckle_api::TargetKind::Workload => "target",
         };
         let ran = format!("{} ran {module}/{action} on {id}", actor());
         s.record(
@@ -695,7 +728,9 @@ fn event(kind: &str, message: String, host: Option<&str>, phase: Option<&str>) -
         at: Utc::now(),
         kind: kind.into(),
         message,
-        host: host.map(Into::into),
+        // A placement's `cluster/workload` key names both, as the server does.
+        host: host.map(|h| buckle_api::split_placement_key(h).0.into()),
+        workload: host.and_then(|h| buckle_api::split_placement_key(h).1.map(Into::into)),
         phase: phase.map(Into::into),
         actor: Some(actor()),
     }
@@ -960,7 +995,7 @@ fn host_entry(
         .phases
         .iter_mut()
         .flat_map(|p| p.hosts.iter_mut())
-        .find(|h| h.host == host)
+        .find(|h| crate::logic::units::key(h) == host)
         .ok_or_else(|| ApiError::NotFound(format!("Host '{host}' is not in rollout {id}.")))?;
     let message = f(entry)?;
     entry.updated_at = Utc::now();

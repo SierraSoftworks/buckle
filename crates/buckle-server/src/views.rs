@@ -187,8 +187,13 @@ pub fn cluster_status(
             }
         }
     }
+    let steward = host.steward.clone().or(executor);
     Ok(Some(ClusterStatus {
-        executor,
+        executor: steward.clone(),
+        steward,
+        reachable: host.reachable,
+        reachable_error: host.reachable_error.clone(),
+        watched_at: host.health_at,
         workloads,
         failing,
         deploying,
@@ -410,6 +415,7 @@ pub fn rollout_event(e: &buckle_api::AuditEntry) -> buckle_api::RolloutEvent {
         kind: e.action.clone(),
         message: e.message.clone(),
         host: detail("host"),
+        workload: detail("workload").filter(|w| !w.is_empty()),
         phase: detail("phase"),
         actor: Some(e.actor.clone()),
     }

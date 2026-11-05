@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{Connection, HealthSummary, HostStatus, HostSummary};
+use buckle_api::{ClusterStatus, HealthSummary, HostStatus, HostSummary};
 use serde::{Deserialize, Serialize};
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -153,7 +153,7 @@ pub fn clusters() -> Html {
                                 <th scope="col">{ "Cluster" }</th>
                                 <th scope="col">{ "State" }</th>
                                 <th scope="col">{ "Workloads" }</th>
-                                <th scope="col">{ "Executor" }</th>
+                                <th scope="col">{ "Steward" }</th>
                                 <th scope="col">{ "Groups" }</th>
                                 <th scope="col">{ "Revision" }</th>
                                 <th scope="col">{ "Health read" }</th>
@@ -213,22 +213,23 @@ pub fn cluster_state_pills(c: &HostSummary) -> Html {
 }
 
 /// The host speaking for a cluster, with its card, and whether it is gone.
-pub fn executor_cell(
-    executor: Option<&str>,
+pub fn steward_cell(
+    status: &ClusterStatus,
     hosts: &BTreeMap<&str, &HostSummary>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Html {
-    match executor {
+    match status.steward.as_deref() {
         Some(e) => {
             let host = hosts.get(e).copied();
-            let offline = host.is_some_and(|h| h.connection == Connection::Offline);
             html! { <>
                 <HostLink id={e.to_owned()} host={host.cloned()} {now} classes={classes!("mono")} />
-                if offline { <span class="cell-sub text-warn">{ "offline: the next rollout picks another" }</span> }
+                if status.reachable == Some(false) {
+                    <span class="cell-sub text-warn" title={status.reachable_error.clone()}>{ "cannot reach the cluster" }</span>
+                }
             </> }
         }
         None => {
-            html! { <span class="muted" title="Picked when a rollout reaches the cluster: a connected host matching its executors selector.">{ "none yet" }</span> }
+            html! { <span class="muted" title="No connected agent its executors selector matches holds its lease.">{ "none yet" }</span> }
         }
     }
 }
@@ -267,7 +268,7 @@ fn row(
                     <span class="cell-sub">{ format!("deploying {}", deploying_text(&status.deploying)) }</span>
                 }
             </td>
-            <td class="nowrap">{ executor_cell(status.executor.as_deref(), hosts, now) }</td>
+            <td class="nowrap">{ steward_cell(&status, hosts, now) }</td>
             <td>{ for c.groups.iter().map(|g| html! { <span class="badge">{ g.clone() }</span> }) }</td>
             <td class="nowrap">
                 { match &c.applied_revision {

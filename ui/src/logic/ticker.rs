@@ -222,6 +222,7 @@ mod tests {
             kind: kind.into(),
             message: kind.into(),
             host: Some("pi-1".into()),
+            workload: None,
             phase: Some("canary".into()),
             actor: Some("controller".into()),
         }

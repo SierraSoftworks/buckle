@@ -5,8 +5,13 @@
 use async_trait::async_trait;
 use buckle_core::Result;
 use buckle_core::error::{user, wrap_user};
+use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretBox};
+use std::pin::Pin;
 use std::time::Duration;
+
+/// A response body read as it arrives: a `watch`'s event stream.
+pub type ByteStream = Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes>> + Send>>;
 
 /// One HTTP request, relative to the API server's address.
 #[derive(Clone, Default)]
@@ -57,6 +62,17 @@ impl std::fmt::Debug for Response {
 #[async_trait]
 pub trait Transport: Send + Sync + std::fmt::Debug {
     async fn send(&self, request: Request) -> Result<Response>;
+
+    /// Sends a request whose response body streams until the server closes
+    /// it (a `watch`). A non-2xx status is an error. Transports that cannot
+    /// stream say so.
+    async fn stream(&self, request: Request) -> Result<ByteStream> {
+        let _ = request;
+        Err(buckle_core::error::system(
+            "This Kubernetes transport cannot stream a watch.",
+            &[],
+        ))
+    }
 }
 
 /// The TLS material for an API server.
@@ -79,6 +95,9 @@ impl std::fmt::Debug for Tls {
 
 /// The longest a single API call may take.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a watch stream stays open on this side; the watcher reopens
+/// it (the API server closes watches sooner on its own).
+pub const WATCH_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
 /// HTTP(S) over TCP.
 #[derive(Debug, Clone)]
@@ -129,9 +148,8 @@ impl HttpTransport {
     }
 }
 
-#[async_trait]
-impl Transport for HttpTransport {
-    async fn send(&self, request: Request) -> Result<Response> {
+impl HttpTransport {
+    fn request(&self, request: Request) -> Result<reqwest::RequestBuilder> {
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|e| human_errors::wrap_system(e, "An invalid HTTP method was used.", &[]))?;
         let mut req = self
@@ -149,7 +167,15 @@ impl Transport for HttpTransport {
                 )
                 .body(body);
         }
-        let resp = req
+        Ok(req)
+    }
+}
+
+#[async_trait]
+impl Transport for HttpTransport {
+    async fn send(&self, request: Request) -> Result<Response> {
+        let resp = self
+            .request(request)?
             .send()
             .await
             .map_err(|e| unreachable_err(&self.base, e))?;
@@ -160,6 +186,34 @@ impl Transport for HttpTransport {
             .map_err(|e| unreachable_err(&self.base, e))?
             .to_vec();
         Ok(Response { status, body })
+    }
+
+    async fn stream(&self, request: Request) -> Result<ByteStream> {
+        let path = request.path.clone();
+        let resp = self
+            .request(request)?
+            .timeout(WATCH_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| unreachable_err(&self.base, e))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = resp.bytes().await.unwrap_or_default();
+            return Err(user(
+                format!(
+                    "The Kubernetes API answered {status} to a watch of {}: {}",
+                    path.split('?').next().unwrap_or(&path),
+                    String::from_utf8_lossy(&body).trim()
+                ),
+                &[
+                    "Check that the executor's credential may list and watch the objects it applied.",
+                ],
+            ));
+        }
+        let base = self.base.clone();
+        Ok(Box::pin(resp.bytes_stream().map(move |chunk| {
+            chunk.map_err(|e| unreachable_err(&base, e))
+        })))
     }
 }
 

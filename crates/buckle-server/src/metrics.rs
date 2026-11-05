@@ -97,6 +97,7 @@ mod tests {
         RolloutHostRecord {
             rollout: rollout.into(),
             host: host.into(),
+            workload: String::new(),
             phase: phase.into(),
             wave: None,
             state,

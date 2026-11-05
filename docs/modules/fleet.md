@@ -78,6 +78,7 @@ fleet:
       executors: 'host.groups contains "nomad-servers"'   # which hosts may speak for it; absent: nodes
       identity: buckle_jwt                          # buckle_jwt (default), local, workload or secret://NAME
       labels: { site: home }
+      watch: { health: 60s, drift: 10m }            # how often its steward reads it unprompted (defaults)
       trust:                                        # optional: an executor running inside the cluster
         jwks_url: http://nomad.home:4646/.well-known/jwks.json
         subjects: [default/buckle-executor]
@@ -90,12 +91,36 @@ fleet:
 | Key | Meaning |
 |---|---|
 | `nodes` | A [selector](./expressions.md) over `host.*` choosing the cluster's members: what a workload's `module:` edge and a module's `workload:` edge refer to. |
-| `executors` | Which of the hosts may apply workloads to the cluster. Defaults to `nodes`. |
+| `executors` | Which of the hosts may apply workloads to the cluster, and hold its lease (see [Stewards](#stewards)). Defaults to `nodes`. |
 | `ui` | The cluster's own web UI, for the links beside each workload on the cluster's page (Nomad: `…/ui/jobs/NAME@NAMESPACE`). Defaults to `api` when that is an HTTP URL. |
 | `identity` | How an executor authenticates to the API: a token Buckle issues (`buckle_jwt`, see [identity](../agent/server.md#identity)), the host's own credentials (`local`), the scheduler's workload identity (`workload`), or a declared secret (`secret://NAME`). |
 | `labels` | Seed labels, as an agent's are for a host. Operators may add to them in the UI, and `cluster.labels.*` selects on the result. |
 | `cluster`, `scope` | A *scoped* target is part of another cluster and may touch only the namespaces listed. |
+| `watch` | How often the steward reads the cluster when nothing wakes it: `health` (default `60s`) covers a dropped Nomad long poll, `drift` (default `10m`) re-plans the applied revision. |
 | `trust` | Which workload identities may speak for the cluster from inside it ([in-cluster executors](../agent/server.md#in-cluster-executors)): `jwks_url` the server reads the signing keys from, or `keys` pinned as a JWKS document; an optional `issuer`; `subjects` as `namespace/job` (Nomad, default `default/buckle-executor`) or `sub` (Kubernetes, default `system:serviceaccount:buckle-system:buckle-executor`). Not on a scoped target. |
+
+### Stewards
+
+Each cluster is *leased* to one host agent at a time, its steward, which runs the cluster's
+placements and watches it between rollouts. The server picks it among the connected hosts that
+match `executors`: an [executor running inside the cluster](../agent/server.md#in-cluster-executors)
+first, else the current holder while it still qualifies, else the first by name. The lease is
+sticky across server restarts and survives a disconnect up to `agents.disconnect_timeout`; then
+it moves, and any placement in flight is planned again through the new steward.
+
+The steward watches the cluster from one lane per lease, beside its own host's work:
+
+- **health on change**: Nomad's jobs, allocations and deployments are long polled, and the
+  Kubernetes watch stream is followed (with a full re-sync whenever the executor's identity is
+  re-issued); each change re-reads the applied workloads' health once it settles, and the
+  `watch.health` timer covers a dropped poll;
+- **drift** every `watch.drift`: the applied revision is planned again and a non-empty plan is
+  reported (never corrected);
+- **reachability**: whether the cluster's API answers, shown on its page and reported as it
+  changes.
+
+The cluster's page shows its steward; `POST /api/v1/targets/{id}/steward` with `{"host": …}`
+moves the lease to another qualifying host (an in-cluster executor keeps it while connected).
 
 Declared clusters appear on the UI's Clusters page and under `GET /api/v1/targets`, with their
 spec and seed labels following the repository. Operators can also create clusters that are not in
@@ -169,9 +194,11 @@ rollout:
   stragglers:
     parallel: 1
     approval: auto
+  dependencies:
+    across_phases: warn    # warn | refuse
   phases:
     - name: canary
-      select: 'host.labels.canary == true'
+      select: 'host.labels.canary == true || workload.labels.tier == "canary"'
       parallel: 1
       approval: required   # auto | required | if_destructive
       bake: 10m
@@ -196,24 +223,25 @@ rollout:
 | `local_rollback.on_health` | `true` | Also require failing health checks (so a server outage alone never triggers it). |
 | `stragglers.parallel` | `1` | Hosts that missed their phase converge in a final stage after promotion, this many at a time. |
 | `stragglers.approval` | `auto` | Approval policy for that stage. |
+| `dependencies.across_phases` | `warn` | A workload needing one its cluster rolls out in a later phase: `warn` accepts the revision (the placement waits for the need to be running, else finishes in the stragglers stage); `refuse` rejects it. |
 
 Each phase:
 
 | Key | Default | Description |
 |---|---|---|
 | `name` | **required** | Unique; `stragglers` is reserved. |
-| `select` | **required** | A selector. A host belongs to the **first** phase whose selector matches it, and only that one. |
-| `parallel` | `1` | Hosts applied at once: a count, or a percentage of the phase's hosts (rounded up). Targets whose plan changes nothing run alongside, outside the count. |
+| `select` | **required** | A selector over `host.*` for hosts and over `workload.*` and `cluster.*` for [placements](../operations/rollouts.md#placements) (a workload on a cluster). A target belongs to the **first** phase whose selector matches it, and only that one. |
+| `parallel` | `1` | Targets applied at once: a count, or a percentage of the phase's targets (rounded up). Targets whose plan changes nothing run alongside, outside the count. |
 | `approval` | `auto` | `required` stops for an operator to approve the phase's plans; `if_destructive` only when a plan removes or deletes something. |
 | `bake` | `health.bake` | The minimum time to watch health after each host applies. |
 | `max_failures` | `0` | Failed hosts tolerated (a count or a percentage) before the phase pauses. |
 
-Without `phases`, one implicit phase selects every host, one at a time. Hosts that no phase
-selects are reported on the rollout and left on their current revision, so end with a
-`select: 'true'` phase if every host should follow.
+Without `phases`, one implicit phase selects every target, one at a time. Hosts and placements
+that no phase selects are reported on the rollout and left on their current revision, so end with
+a `select: 'true'` phase if everything should follow.
 
-Inside a phase, `needs` that cross a cluster boundary (`module:` on a workload, `workload:` on a
-module) order its targets into stages; see
+Inside a phase, `needs` that leave a host (`module:` on a workload, `workload:` on a module, one
+workload on another) order its targets into stages; see
 [Stages inside a phase](../operations/rollouts.md#stages-inside-a-phase).
 
 See [Rolling out changes](../operations/rollouts.md) for what each phase does, step by step.

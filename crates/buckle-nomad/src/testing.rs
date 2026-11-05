@@ -40,6 +40,8 @@ struct State {
 #[derive(Debug, Clone)]
 pub struct FakeNomad {
     state: Arc<Mutex<State>>,
+    /// Woken by every write, for blocking queries (`?index=`).
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl Default for FakeNomad {
@@ -56,6 +58,7 @@ impl FakeNomad {
         };
         let fake = Self {
             state: Arc::new(Mutex::new(state)),
+            changed: Arc::new(tokio::sync::Notify::new()),
         };
         fake.state.lock().unwrap().namespaces.insert(
             "default".into(),
@@ -71,7 +74,11 @@ impl FakeNomad {
 
     /// How the next deployments end: `successful`, `failed`, `cancelled`.
     pub fn deployment_outcome(&self, outcome: &str) {
-        self.state.lock().unwrap().outcome = outcome.into();
+        let mut s = self.state.lock().unwrap();
+        s.outcome = outcome.into();
+        s.index += 1;
+        drop(s);
+        self.changed.notify_waiters();
     }
 
     /// Fails the placement of the next registrations: their evaluation
@@ -83,20 +90,20 @@ impl FakeNomad {
 
     /// Keeps the deployment of `ns`/`id` running until [`Self::release`].
     pub fn hold(&self, ns: &str, id: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .held
-            .insert((ns.into(), id.into()));
+        let mut s = self.state.lock().unwrap();
+        s.held.insert((ns.into(), id.into()));
+        s.index += 1;
+        drop(s);
+        self.changed.notify_waiters();
     }
 
     /// Lets a held deployment end in the configured outcome.
     pub fn release(&self, ns: &str, id: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .held
-            .remove(&(ns.into(), id.into()));
+        let mut s = self.state.lock().unwrap();
+        s.held.remove(&(ns.into(), id.into()));
+        s.index += 1;
+        drop(s);
+        self.changed.notify_waiters();
     }
 
     /// A stored job, as `GET /v1/job/:id` returns it.
@@ -119,6 +126,7 @@ impl FakeNomad {
             job["JobModifyIndex"] = json!(index);
             job["Version"] = json!(job["Version"].as_u64().unwrap_or(0) + 1);
         }
+        self.changed.notify_waiters();
     }
 
     /// The submission registered with a job's current version.
@@ -146,6 +154,7 @@ impl FakeNomad {
         s.jobs.insert(key, stored);
         s.submissions
             .insert((ns.to_owned(), id.to_owned(), version), submission);
+        self.changed.notify_waiters();
     }
 
     /// A stored variable's items.
@@ -173,6 +182,7 @@ impl FakeNomad {
                 index,
             ),
         );
+        self.changed.notify_waiters();
     }
 
     /// A stored policy, namespace or node pool (`policy`, `namespace`, `pool`).
@@ -245,11 +255,19 @@ impl FakeNomad {
             })
             .collect();
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-        s.index += 1;
+        // Reads leave the index alone, as Nomad's do: a blocking query
+        // returns only once something was written.
+        if req.method != "GET" {
+            s.index += 1;
+        }
         let index = s.index;
         let not_found = (404, Value::String("not found".into()));
 
         match (req.method, parts.as_slice()) {
+            ("GET", ["status", "leader"]) => (200, json!("127.0.0.1:4647")),
+            // The fleet-wide lists a steward long polls: the fake keeps no
+            // allocations or deployments of its own beyond each job's.
+            ("GET", ["allocations"]) | ("GET", ["deployments"]) => (200, json!([])),
             ("POST", ["jobs", "parse"]) => {
                 // The fake's "HCL" is JSON; `${var.name}` takes a string
                 // variable's value from the var file.
@@ -549,16 +567,68 @@ impl Transport for FakeNomad {
     async fn send(&self, request: Request) -> buckle_core::Result<Response> {
         // Let concurrent callers interleave, as they would over a network.
         tokio::task::yield_now().await;
+        // A blocking query (`?index=N&wait=D`) waits for a write past N, or
+        // for `wait` (default 5m), before answering.
+        if request.method == "GET"
+            && let Some(min_index) =
+                query_value(&request.path, "index").and_then(|v| v.parse::<u64>().ok())
+        {
+            let wait = query_value(&request.path, "wait")
+                .and_then(|w| parse_wait(&w))
+                .unwrap_or(std::time::Duration::from_secs(300));
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                let notified = self.changed.notified();
+                if self.state.lock().unwrap().index > min_index {
+                    break;
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+        }
         let (status, body) = self.handle(&request);
+        if request.method != "GET" {
+            self.changed.notify_waiters();
+        }
+        let index = self.state.lock().unwrap().index.max(1);
         Ok(Response {
             status,
-            headers: vec![("X-Nomad-Index".into(), "1".into())],
+            headers: vec![("X-Nomad-Index".into(), index.to_string())],
             body: match body {
                 Value::String(s) if status >= 400 => s.into_bytes(),
                 other => serde_json::to_vec(&other).unwrap_or_default(),
             },
         })
     }
+}
+
+fn query_value(path: &str, key: &str) -> Option<String> {
+    let (_, query) = path.split_once('?')?;
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        .map(|v| {
+            percent_encoding::percent_decode_str(v)
+                .decode_utf8_lossy()
+                .into_owned()
+        })
+}
+
+/// Nomad's `wait` syntax: `50s`, `5m`, `1500ms`.
+fn parse_wait(w: &str) -> Option<std::time::Duration> {
+    let (digits, unit) = w
+        .trim()
+        .split_at(w.trim().find(|c: char| !c.is_ascii_digit())?);
+    let n: u64 = digits.parse().ok()?;
+    Some(match unit {
+        "ms" => std::time::Duration::from_millis(n),
+        "s" => std::time::Duration::from_secs(n),
+        "m" => std::time::Duration::from_secs(n * 60),
+        "h" => std::time::Duration::from_secs(n * 3600),
+        _ => return None,
+    })
 }
 
 /// A wiremock server and a client pointed at it, for client-level tests.

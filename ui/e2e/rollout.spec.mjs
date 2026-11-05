@@ -10,14 +10,14 @@ const STATES = [
 ];
 
 describe("the rollout pipeline", () => {
-  test("shows one block per host, each in exactly one stage", async () => {
+  test("shows one block per unit, each in exactly one stage", async () => {
     const { page, close } = await open("/rollouts/42");
     assert.equal(await heading(page), "Rollout #42");
     const blocks = page.locator(".pipeline:not(.pipeline--compact) .stage a.block");
     await blocks.first().waitFor();
-    const hosts = await blocks.evaluateAll((els) => els.map((e) => e.dataset.host));
-    assert.equal(hosts.length, 27, "the rollout targets 25 hosts and 2 clusters");
-    assert.equal(new Set(hosts).size, hosts.length, "no host is drawn twice");
+    const units = await blocks.evaluateAll((els) => els.map((e) => [e.dataset.host, e.dataset.workload ?? ""].join("/")));
+    assert.equal(units.length, 31, "the rollout targets 25 hosts and 6 workloads");
+    assert.equal(new Set(units).size, units.length, "no unit is drawn twice");
     // Stage membership: each host appears under one data-stage only.
     const byStage = await page.locator(".stage").evaluateAll((stages) =>
       stages.map((s) => [s.dataset.stage, [...s.querySelectorAll("a.block")].map((b) => b.dataset.host)]),
@@ -79,21 +79,61 @@ describe("the rollout pipeline", () => {
     await close();
   });
 
-  test("a cluster is its own node, applied through its executor or waiting for its stage", async () => {
+  test("workloads follow the hosts in a section per cluster, waiting ones hollow and unchanged ones grey", async () => {
     const { page, close } = await open("/rollouts/42");
-    const home = page.locator('.stage[data-stage="home"] a.block--cluster');
-    await home.waitFor();
-    assert.match(await home.textContent(), /via pi-1/);
-    const lab = page.locator('.stage[data-stage="everything-else"] a.block--cluster');
-    assert.match(await lab.getAttribute("class"), /block--waiting/);
-    assert.match(await lab.textContent(), /waits for lab-1, lab-2, lab-3/);
-    // The host table names what it waits on, and what the deployment is doing.
-    assert.match(await page.locator("tr", { has: page.getByRole("link", { name: "lab-nomad", exact: true }) }).getByTestId("host-waiting").textContent(), /waits for lab-1/);
-    const row = page.locator("tr", { has: page.getByRole("link", { name: "home-nomad", exact: true }) });
+    const home = page.locator('.stage[data-stage="home"]');
+    const section = home.locator('.stage__cluster[data-cluster="home-nomad"]');
+    await section.waitFor();
+    assert.equal((await section.locator(".stage__cluster-label").textContent()).trim(), "home-nomad");
+    // Hosts come first, then the cluster's workloads.
+    const order = await home.locator("a.block").evaluateAll((els) => els.map((e) => e.dataset.workload ?? "host"));
+    assert.equal(order.indexOf("atuin"), order.length - 4, "workloads after every host");
+    const atuin = section.locator('a.block[data-workload="atuin"]');
+    assert.match(await atuin.textContent(), /on home-nomad.*via pi-1/s);
+    assert.equal(await section.locator("a.block--unchanged").count(), 2, "postgresql and paste change nothing");
+    assert.match(await home.locator(".stage__meta").first().textContent(), /2 unchanged/);
+    // A workload that left the configuration is removed: struck through, and said so.
+    const grey = section.locator('a.block[data-workload="grey"]');
+    assert.match(await grey.getAttribute("class"), /block--removal/);
+    assert.match(await grey.textContent(), /removes the workload/);
+    // Waiting for an earlier step, and naming only what it waits on.
+    const grafana = page.locator('.stage[data-stage="everything-else"] a.block[data-workload="grafana"]');
+    assert.match(await grafana.getAttribute("class"), /block--waiting/);
+    assert.match(await grafana.textContent(), /waits for lab-1, lab-3/);
+    // A workload block opens the workload, at its cluster.
+    assert.match(await atuin.getAttribute("href"), /^\/workloads\/atuin\?cluster=home-nomad/);
+    // The Targets card names what it waits on, and what the deployment is doing.
+    const targets = page.locator("section.panel", { has: page.locator(".panel__title", { hasText: /^Targets$/ }) });
+    assert.match(await targets.locator('tr[data-unit="lab-nomad/grafana"]').getByTestId("host-waiting").textContent(), /waits for lab-1/);
+    assert.match(await targets.locator('tr[data-unit="home-nomad/grey"]').textContent(), /grey on home-nomad removing/);
+    const row = targets.locator('tr[data-unit="home-nomad/atuin"]');
+    assert.match(await row.textContent(), /atuin on home-nomad/);
     await eventually(async () => assert.match(await row.getByTestId("host-activity").textContent(), /server 1\/2 healthy/));
     // Its plan's modules are marked as workloads.
     await page.locator("#plans").getByTestId("workload-badge").first().waitFor();
     await close();
+  });
+});
+
+describe("the targets card", () => {
+  test("lists what changes by default, and every unit with All, kept in the URL", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const card = page.locator("section.panel", { has: page.locator(".panel__title", { hasText: /^Targets$/ }) });
+    const rows = card.locator("tr[data-unit]");
+    await rows.first().waitFor();
+    assert.match(await card.locator(".panel__subtitle").textContent(), /27 changed · 4 unchanged/);
+    assert.equal(await card.locator("tr[data-unchanged]").count(), 0, "Changed hides the no-ops");
+    assert.match(await card.locator('tr[data-stage="home"]').first().textContent(), /2 unchanged not shown/);
+    // Steps split a stage that has more than one.
+    await card.locator('tr[data-stage="everything-else"][data-step="1"]').waitFor();
+    await card.getByTestId("targets-view").getByRole("radio", { name: "All" }).click();
+    await eventually(async () => assert.match(page.url(), /targets=all/));
+    assert.equal(await card.locator("tr[data-unchanged]").count(), 4);
+    await close();
+    // A link with ?targets=all opens on All.
+    const again = await open("/rollouts/42", { flags: "targets=all" });
+    await again.page.locator('tr[data-unit="home-nomad/postgresql"]').waitFor();
+    await again.close();
   });
 });
 
@@ -112,14 +152,14 @@ describe("approving a phase", () => {
     // The plan's warnings sit beside the approval's notes, the health gate does not.
     assert.equal(await pane.getByTestId("plan-warning").count(), 2);
     assert.equal(await pane.getByText(/Health gate/).count(), 0);
-    await pane.getByRole("tab", { name: "By distinct plan" }).click();
+    await pane.getByTestId("plans-view").getByRole("radio", { name: "By target" }).click();
     // Every distinct plan of the rollout, whatever its phase, the
     // destructive one flagged, the secret rotation shown only as tokens.
     assert.equal(await pane.locator("details.plan").count(), 4);
     assert.equal(await pane.locator("details.plan--destructive").count(), 1);
     const hosts = await pane.locator(".plan__hosts").allTextContents();
     assert.ok(hosts.some((h) => /canary: pi-1 · home: pi-2/.test(h)), "hosts are named by phase");
-    assert.ok(hosts.some((h) => /everything-else: lab-1, lab-2/.test(h)), "later phases' plans are listed too");
+    assert.ok(hosts.some((h) => /everything-else: lab-1/.test(h)), "later phases' plans are listed too");
     assert.match(await pane.textContent(), /«secret:nomad_server@3f9a»/);
     assert.match(await pane.textContent(), /Rotates nomad_server/);
     assert.ok((await pane.locator(".step--destructive").count()) >= 4);

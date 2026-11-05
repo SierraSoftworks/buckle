@@ -137,7 +137,7 @@ pub fn apply_rollout(detail: &mut RolloutDetail, event: &LiveEvent) {
             let current = detail.phases.iter().enumerate().find_map(|(i, p)| {
                 p.hosts
                     .iter()
-                    .position(|h| h.host == host.host)
+                    .position(|h| super::units::same(h, host))
                     .map(|j| (i, j))
             });
             match (current, target) {
@@ -398,11 +398,13 @@ mod tests {
             bake_until: None,
             reboot: None,
             kind: Default::default(),
-            stage: 0,
+            step: 0,
+            workload: None,
             executor: None,
             bake: None,
             preview: false,
             drifted_from: None,
+            removal: false,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -425,6 +427,7 @@ mod tests {
             bake_until: None,
             health_checks: vec![],
             stages: 1,
+            unchanged: 0,
         }
     }
 
@@ -568,6 +571,7 @@ mod tests {
             kind: kind.into(),
             message: kind.into(),
             host: None,
+            workload: None,
             phase: None,
             actor: Some("controller".into()),
         };

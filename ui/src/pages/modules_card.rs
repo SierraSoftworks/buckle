@@ -12,6 +12,8 @@ use yew::prelude::*;
 
 use super::host::check_row;
 use crate::api;
+use crate::app::Route;
+use crate::components::RouteLink;
 use crate::components::blueprint::resource_steps;
 use crate::components::changes::Took;
 use crate::components::run_report::{health_bar, module_steps, removal_steps, run_summary};
@@ -187,7 +189,7 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
                                 .filter(|x| resource_module(&x.resource) == Some(r.name.as_str()))
                                 .collect();
                             html! { <>
-                                { workload_row(d, r, cluster, module, run, is_open, toggle, now, live, props.on_action.as_ref().map(|on_run| html! {
+                                { workload_row(d, r, cluster, false, module, run, is_open, toggle, now, live, props.on_action.as_ref().map(|on_run| html! {
                                     <ActionsButton actions={of_module(&d.actions, &r.name)} on_run={on_run.clone()}
                                         testid={format!("actions-{}", r.name)} />
                                 })) }
@@ -206,11 +208,90 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
         }
     };
     html! {
-        <Panel title={if cluster { "Workloads" } else { "Modules" }} id={many} {subtitle} actions={html! { <>{ back.unwrap_or_default() }{ picker }</> }}>
+        <Panel title={if cluster { "Workloads" } else { "Modules" }} id={many}
+            {subtitle} actions={html! { <>{ back.unwrap_or_default() }{ picker }</> }}>
             { head }
             { body }
         </Panel>
     }
+}
+
+#[derive(Properties, PartialEq)]
+pub(super) struct PlacementProps {
+    /// The cluster.
+    pub detail: HostDetail,
+    pub workload: String,
+    /// Set where the operator may run the workload's actions there.
+    pub on_action: Option<Callback<ActionInfo>>,
+    /// Opened at first (the cluster the page was opened for).
+    #[prop_or_default]
+    pub focus: bool,
+}
+
+/// One placement of a workload as a row of its page's Placements table:
+/// the cluster's Workloads row for it, on the cluster's newest run, opening
+/// to the same checks, steps and resources.
+#[function_component(PlacementRow)]
+pub(super) fn placement_row(props: &PlacementProps) -> Html {
+    let d = &props.detail;
+    let feed = use_run_report(
+        d.latest_run.as_ref().map(|r| RunSource::Host {
+            host: d.summary.id.clone(),
+            run: r.id.clone(),
+        }),
+        d.latest_run.clone(),
+    );
+    let run = feed.report.as_ref();
+    let live = run.is_some_and(|r| !run_finished(r.state));
+    let now = use_now(if live { 1 } else { 30 });
+    let opened = use_state_eq(|| None::<bool>);
+    let Some(r) = workload_rows(d, d.latest_run.as_ref())
+        .into_iter()
+        .find(|r| r.name == props.workload)
+    else {
+        return html! {};
+    };
+    let module = run.and_then(|x| x.modules.iter().find(|m| m.name == r.name));
+    let is_open = (*opened).unwrap_or_else(|| {
+        props.focus
+            || r.state == WorkloadState::Failing
+            || module.is_some_and(expanded_by_default)
+            || d.drift.iter().any(|x| x.module == r.name)
+    });
+    let toggle = {
+        let opened = opened.clone();
+        Callback::from(move |e: MouseEvent| {
+            let own = e
+                .target_dyn_into::<web_sys::Element>()
+                .and_then(|t| t.closest("a").ok().flatten())
+                .is_some();
+            if !own {
+                opened.set(Some(!is_open));
+            }
+        })
+    };
+    let gone: Vec<&RemovalReport> = run
+        .map(|x| {
+            x.removals
+                .iter()
+                .filter(|x| resource_module(&x.resource) == Some(r.name.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let actions = props.on_action.as_ref().map(|on_run| {
+        html! {
+            <ActionsButton actions={of_module(&d.actions, &r.name)} on_run={on_run.clone()}
+                testid={format!("actions-{}-{}", d.summary.id, r.name)} />
+        }
+    });
+    html! { <>
+        { workload_row(d, &r, true, true, module, run, is_open, toggle, now, live, actions) }
+        if is_open {
+            <tr class="table__detail" key={format!("{}-detail", d.summary.id)} data-detail-of={r.name.clone()} data-host={d.summary.id.clone()}>
+                <td colspan="6">{ workload_detail(d, &r, true, module, &gone, run, now, live) }</td>
+            </tr>
+        }
+    </> }
 }
 
 /// An opened workload: its checks with their history, what the run shown
@@ -286,7 +367,7 @@ fn workload_detail(
     }
 }
 
-fn state_pill(r: &WorkloadRow, cluster: bool) -> Html {
+pub(super) fn state_pill(r: &WorkloadRow, cluster: bool) -> Html {
     match r.state {
         WorkloadState::Failing => {
             html! { <Pill tone={Tone::Danger} label="failing" title={r.reason.clone()} /> }
@@ -308,6 +389,7 @@ fn workload_row(
     d: &HostDetail,
     r: &WorkloadRow,
     cluster: bool,
+    placement: bool,
     module: Option<&ModuleReport>,
     run: Option<&RunReport>,
     open: bool,
@@ -318,12 +400,24 @@ fn workload_row(
 ) -> Html {
     html! {
         <tr key={r.name.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))}
+            id={placement.then(|| format!("on-{}", d.summary.id))} data-host={placement.then(|| d.summary.id.clone())}
             data-workload={cluster.then(|| r.name.clone())} data-module={(!cluster).then(|| r.name.clone())}
             data-state={r.state.label().replace(' ', "-")} onclick={toggle.clone()}>
             <td>
-                <span class="mono strong">{ r.name.clone() }</span>
-                if !r.description.is_empty() { <span class="cell-sub">{ r.description.clone() }</span> }
-                if !r.needs.is_empty() { <span class="cell-sub">{ format!("needs {}", r.needs.join(", ")) }</span> }
+                if placement {
+                    <RouteLink to={Route::Cluster { id: d.summary.id.clone() }} classes={classes!("mono", "strong")}>{ d.summary.id.clone() }</RouteLink>
+                    { match d.summary.cluster_status.as_ref().and_then(|s| s.steward.clone()) {
+                        Some(e) => html! { <span class="cell-sub muted" title="its steward: the agent holding the cluster's lease">{ format!("via {e}") }</span> },
+                        None => html! { <span class="cell-sub muted">{ "no steward yet" }</span> },
+                    } }
+                } else if cluster {
+                    <RouteLink to={Route::Workload { name: r.name.clone() }} query={vec![("cluster".to_owned(), d.summary.id.clone())]}
+                        classes={classes!("mono", "strong")}>{ r.name.clone() }</RouteLink>
+                } else {
+                    <span class="mono strong">{ r.name.clone() }</span>
+                }
+                if !placement && !r.description.is_empty() { <span class="cell-sub">{ r.description.clone() }</span> }
+                if !placement && !r.needs.is_empty() { <span class="cell-sub">{ format!("needs {}", r.needs.join(", ")) }</span> }
             </td>
             <td>
                 { state_pill(r, cluster) }

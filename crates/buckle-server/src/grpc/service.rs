@@ -790,9 +790,37 @@ impl FleetService {
             agent_message::Msg::Health(r) => r.target.clone(),
             agent_message::Msg::Drift(d) => d.target.clone(),
             agent_message::Msg::Action(a) => a.target.clone(),
+            agent_message::Msg::TargetStatus(s) => s.target.clone(),
             _ => String::new(),
         };
         let subject: &str = if target.is_empty() { host } else { &target };
+        // What a cluster's steward reports from its watch (facts, idle
+        // health, drift, reachability) counts only from the steward: a lane
+        // still running on a host whose lease moved is told to stop.
+        let watch_report = match &msg {
+            agent_message::Msg::Facts(_)
+            | agent_message::Msg::Drift(_)
+            | agent_message::Msg::TargetStatus(_) => true,
+            agent_message::Msg::Health(r) => r.scope == buckle_proto::v1::HealthScope::Drift as i32,
+            _ => false,
+        };
+        if !target.is_empty() && watch_report {
+            let t = target.clone();
+            let steward = self
+                .store
+                .call(move |db| {
+                    db.kv()
+                        .get(&format!("{}{t}", crate::store::kv::keys::EXECUTOR_PREFIX))
+                })
+                .await
+                .ok()
+                .flatten();
+            if steward.as_deref() != Some(host) {
+                tracing::debug!(buckle.host = %host, target = %target, steward = steward.as_deref().unwrap_or(""), "a watch report from a host that does not steward the cluster; releasing it");
+                self.controller.stale_steward(host, &target);
+                return;
+            }
+        }
         let h = subject.to_owned();
         let agent = host.to_owned();
         // Durable reports (ApplyResult, LocalRollback) carry a report id the
@@ -1012,8 +1040,12 @@ impl FleetService {
                         .then(|| String::from_utf8_lossy(&r.outcome_json).into_owned()),
                     action: None,
                 };
-                let applied = (r.succeeded && !r.applied_revision.is_empty())
-                    .then(|| r.applied_revision.clone());
+                // A placement's result speaks for one workload: the cluster
+                // is on the revision once every placement is (the
+                // controller records that).
+                let applied =
+                    (r.succeeded && !r.applied_revision.is_empty() && r.workload.is_empty())
+                        .then(|| r.applied_revision.clone());
                 let pending = durable_id.map(|id| {
                     (
                         crate::rollout::pending_report_key(host, id),
@@ -1188,6 +1220,19 @@ impl FleetService {
                 .await;
                 Ok(true)
             }
+            agent_message::Msg::TargetStatus(s) => {
+                let (reachable, error) = (s.reachable, s.error.clone());
+                self.store
+                    .call(move |db| {
+                        db.hosts().set_reachable(
+                            &h,
+                            reachable,
+                            Some(error.as_str()).filter(|e| !e.is_empty()),
+                        )
+                    })
+                    .await
+                    .map(|()| true)
+            }
             agent_message::Msg::Hello(_) => Ok(true),
         };
         match &stored {
@@ -1213,7 +1258,8 @@ impl FleetService {
             | agent_message::Msg::Action(_)
             | agent_message::Msg::Rollback(_)
             | agent_message::Msg::Upgrade(_)
-            | agent_message::Msg::RebootFailed(_) => true,
+            | agent_message::Msg::RebootFailed(_)
+            | agent_message::Msg::TargetStatus(_) => true,
             _ => false,
         };
         if matches!(
