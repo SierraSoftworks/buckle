@@ -148,11 +148,6 @@ $tones: (
       padding: 0.2rem 0.35rem;
     }
 
-    &--alone {
-      margin-left: 0;
-      border-radius: var(--radius);
-    }
-
     svg {
       transform: rotate(90deg);
       transition: transform var(--transition);
