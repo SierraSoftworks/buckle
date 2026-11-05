@@ -3,11 +3,13 @@
 
 pub mod auth;
 pub mod guard;
+pub mod proxy;
 mod service;
 pub mod tls;
 
 pub use auth::{LocalApiWhois, Whois, WhoisIdentity};
 pub use guard::{LiveSessions, SessionGuard};
+pub use proxy::{Peer, ProxyHop};
 pub use service::{FleetService, serve};
 
 #[cfg(test)]

@@ -788,6 +788,7 @@ dependencies = [
  "humantime-serde",
  "include_dir",
  "indexmap",
+ "ipnet",
  "jsonwebtoken",
  "minijinja",
  "notify",

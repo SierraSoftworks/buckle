@@ -422,6 +422,12 @@ pub struct AgentsConfig {
     /// Which tailnet nodes are trusted as agents (design §02, §08).
     #[serde(default)]
     pub tailscale: TailscaleConfig,
+    /// TCP proxies (a Tailscale Service host) whose connections may start
+    /// with a PROXY protocol v2 header naming the agent's own address, which
+    /// whois then identifies. Each entry is an ACL tag (`tag:…`, matched by
+    /// whois on the proxy) or an IP address or CIDR range.
+    #[serde(default)]
+    pub trusted_proxies: Vec<TrustedProxy>,
     /// What the join commands generated for new hosts contain.
     #[serde(default)]
     pub join: JoinConfig,
@@ -454,6 +460,7 @@ impl std::fmt::Debug for AgentsConfig {
             .field("desired_version", &self.desired_version)
             .field("tailscale_socket", &self.tailscale_socket)
             .field("tailscale", &self.tailscale)
+            .field("trusted_proxies", &self.trusted_proxies)
             .field("join", &self.join)
             .field("disconnect_timeout", &self.disconnect_timeout)
             .field("apply_timeout", &self.apply_timeout)
@@ -488,9 +495,42 @@ impl Default for AgentsConfig {
             desired_version: None,
             tailscale_socket: Self::default_tailscale_socket(),
             tailscale: TailscaleConfig::default(),
+            trusted_proxies: Vec::new(),
             join: JoinConfig::default(),
             disconnect_timeout: Self::default_disconnect_timeout(),
             apply_timeout: Self::default_apply_timeout(),
+        }
+    }
+}
+
+/// An `agents.trusted_proxies` entry: a proxy node's ACL tag, or the
+/// addresses its connections arrive from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum TrustedProxy {
+    Tag(String),
+    Net(ipnet::IpNet),
+}
+
+impl TryFrom<String> for TrustedProxy {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if s.starts_with("tag:") && s.len() > 4 {
+            return Ok(Self::Tag(s));
+        }
+        s.parse::<ipnet::IpNet>()
+            .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+            .map(Self::Net)
+            .map_err(|_| format!("`{s}` is not a `tag:…`, an IP address or a CIDR range"))
+    }
+}
+
+impl From<TrustedProxy> for String {
+    fn from(p: TrustedProxy) -> Self {
+        match p {
+            TrustedProxy::Tag(t) => t,
+            TrustedProxy::Net(n) => n.to_string(),
         }
     }
 }
@@ -1065,6 +1105,21 @@ secrets:
             cfg.secrets.providers.env.as_ref().unwrap().deny,
             vec!["AWS_*".to_string()]
         );
+    }
+
+    #[rstest]
+    #[case::tag("tag:nomad-tailscale", true)]
+    #[case::address("100.64.0.9", true)]
+    #[case::range("172.16.0.0/12", true)]
+    #[case::ipv6("fd7a:115c:a1e0::/48", true)]
+    #[case::bare_name("nomad-tailscale", false)]
+    #[case::empty_tag("tag:", false)]
+    fn trusted_proxies_are_tags_or_addresses(#[case] entry: &str, #[case] ok: bool) {
+        let yaml = EXAMPLE.replace(
+            "  registration: approve\n",
+            &format!("  registration: approve\n  trusted_proxies: [\"{entry}\"]\n"),
+        );
+        assert_eq!(with_env(&yaml).is_ok(), ok);
     }
 
     const PROVISIONING: &str = "  tailscale:\n    allowed_tags: [\"tag:buckle\"]\n    provisioning: { client_id: c, client_secret: shh }\n";

@@ -2,6 +2,7 @@
 
 use super::auth::{self, Whois};
 use super::guard::SessionGuard;
+use super::proxy::{Peer, Proxies, ProxyHop};
 use super::tls::ServerIdentity;
 use crate::clock::Clock;
 use crate::config::{AgentAuth, AgentsConfig, Registration};
@@ -87,7 +88,8 @@ pub async fn serve(
                 )
             })?;
     }
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let incoming = Proxies::new(&service.agents.trusted_proxies, service.whois.clone())
+        .incoming(listener, cancel.clone());
     builder
         // An ApplyResult carries the whole outcome (every module and step) and
         // is the authoritative record of a run: never refuse one for its size.
@@ -109,6 +111,11 @@ struct Authenticated {
     host: String,
     issued_token: Option<String>,
     status: HostStatus,
+}
+
+/// The audit detail naming the proxy a host connected through.
+fn proxy_detail(hop: &ProxyHop) -> serde_json::Value {
+    serde_json::json!({ "proxy": { "addr": hop.addr.to_string(), "node": hop.node } })
 }
 
 fn rejected(reason: impl Into<String>, retry: bool) -> ServerStream {
@@ -210,7 +217,7 @@ impl FleetService {
     /// Authenticates a session from its Hello. `Err` carries the rejection.
     async fn authenticate(
         &self,
-        peer: Option<SocketAddr>,
+        conn: &Peer,
         hello: &Hello,
         metadata_token: Option<String>,
     ) -> Result<Authenticated, (String, bool)> {
@@ -221,6 +228,7 @@ impl FleetService {
         if !hello.workload_token.is_empty() {
             return self.authenticate_workload(hello).await;
         }
+        let peer = conn.addr;
         let mut whois_error = None;
         if self.uses(AgentAuth::Tailscale)
             && let (Some(peer), Some(whois)) = (peer, &self.whois)
@@ -300,19 +308,26 @@ impl FleetService {
                         // A forgotten host registering afresh: the controller
                         // still excludes it until told.
                         self.controller.host_registered(&identity.node);
-                        let how = match &joined {
+                        let mut how = match &joined {
                             Some(j) => format!(" with a join command from {}", j.created_by),
                             None => String::new(),
                         };
-                        self.audit(
-                            "controller",
-                            "host.registered",
-                            &identity.node,
-                            format!(
+                        if let Some(hop) = &conn.proxy {
+                            how.push_str(&format!(" through the proxy {hop}"));
+                        }
+                        self.audit_entry(NewAudit {
+                            at: self.now(),
+                            actor: "controller".into(),
+                            action: "host.registered".into(),
+                            outcome: "ok".into(),
+                            subject: Some(identity.node.clone()),
+                            message: format!(
                                 "{} registered over the tailnet{how} ({:?})",
                                 identity.node, created.0
                             ),
-                        )
+                            detail: conn.proxy.as_ref().map(proxy_detail),
+                            trace_id: None,
+                        })
                         .await;
                     }
                     return Ok(Authenticated {
@@ -590,7 +605,7 @@ impl FleetService {
     /// Authenticates a unary/streaming content call by per-host token or whois.
     async fn caller<T>(&self, request: &Request<T>) -> Result<String, Status> {
         if self.uses(AgentAuth::Tailscale)
-            && let (Some(peer), Some(whois)) = (request.remote_addr(), &self.whois)
+            && let (Some(peer), Some(whois)) = (Peer::of(request).addr, &self.whois)
             && whois.covers(&peer)
             && let Ok(Some(identity)) = whois.whois(&peer).await
         {
@@ -1369,7 +1384,8 @@ impl Fleet for FleetService {
         &self,
         request: Request<Streaming<AgentMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        let peer = request.remote_addr();
+        let conn = Peer::of(&request);
+        let peer = conn.addr;
         let metadata_token = request
             .metadata()
             .get(buckle_proto::TOKEN_METADATA_KEY)
@@ -1410,10 +1426,11 @@ impl Fleet for FleetService {
                 false,
             )));
         }
-        let authed = match self.authenticate(peer, &hello, metadata_token).await {
+        let proxy = conn.proxy.as_ref().map(ProxyHop::to_string);
+        let authed = match self.authenticate(&conn, &hello, metadata_token).await {
             Ok(a) => a,
             Err((reason, retry)) => {
-                tracing::warn!(peer = ?peer, host = %hello.host_id, reason = %reason, "agent rejected");
+                tracing::warn!(peer = ?peer, proxy = ?proxy, host = %hello.host_id, reason = %reason, "agent rejected");
                 return Ok(Response::new(rejected(reason, retry)));
             }
         };
@@ -1462,7 +1479,7 @@ impl Fleet for FleetService {
         if let Some(settled) = self.upgrades.connected(&host, &hello.agent_version) {
             self.settled(&host, settled).await;
         }
-        tracing::info!(buckle.host = %host, session = session_id, status = %welcome.status, version = %hello.agent_version, "agent connected");
+        tracing::info!(buckle.host = %host, session = session_id, status = %welcome.status, version = %hello.agent_version, proxy = ?proxy, "agent connected");
         self.controller.connected(Connected {
             host: host.clone(),
             applied_revision: (!hello.applied_revision.is_empty())
