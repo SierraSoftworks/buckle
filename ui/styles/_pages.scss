@@ -866,6 +866,26 @@
 }
 
 // Cluster page: an opened workload's health, run and resources.
+// A row's latest run: short lines with even gaps, items centred on each.
+.run-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
+
+  &__line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  &__progress {
+    font-size: 0.8rem;
+    color: var(--fg-2);
+  }
+}
+
 .workloads__run {
   margin-bottom: 0.75rem;
 }

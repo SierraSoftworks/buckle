@@ -335,20 +335,31 @@ fn workload_row(
                 }
             </td>
             <td data-testid="workload-run" data-run-state={module.map(|m| module_slug(m.state))}>
-                { match module {
-                    Some(m) => html! { <>
-                        <Pill tone={module_tone(m.state)} label={module_label(m.state)} />
-                        { " " }<Changes tally={module_tally(m)} />
-                        { " " }{ health_bar(m, run.and_then(|x| x.started_at)) }
-                        if let Some(took) = elapsed_ms(m.duration_ms, m.started_at, m.finished_at, now, live && m.state == ModuleState::Running).map(millis) {
-                            { " " }<Took label={took} running={live && m.state == ModuleState::Running} />
+                // Even lines: its state and how long, what it changed and how
+                // it read meanwhile, then any deploy progress.
+                <div class="run-cell">
+                    { match module {
+                        Some(m) => {
+                            let running = live && m.state == ModuleState::Running;
+                            html! { <>
+                                <div class="run-cell__line">
+                                    <Pill tone={module_tone(m.state)} label={module_label(m.state)} />
+                                    if let Some(took) = elapsed_ms(m.duration_ms, m.started_at, m.finished_at, now, running).map(millis) {
+                                        <Took label={took} {running} />
+                                    }
+                                </div>
+                                <div class="run-cell__line">
+                                    <Changes tally={module_tally(m)} />
+                                    { health_bar(m, run.and_then(|x| x.started_at)) }
+                                </div>
+                            </> }
                         }
-                    </> },
-                    None => html! { <span class="muted">{ "—" }</span> },
-                } }
-                if let Some(p) = &r.progress {
-                    <span class="cell-sub mono" data-testid="workload-progress">{ p.clone() }</span>
-                }
+                        None => html! { <span class="muted">{ "—" }</span> },
+                    } }
+                    if let Some(p) = &r.progress {
+                        <span class="run-cell__progress mono" data-testid="workload-progress">{ p.clone() }</span>
+                    }
+                </div>
             </td>
             <td>{ resources_cell(d, &r.name, run) }</td>
             <td class="nowrap">
