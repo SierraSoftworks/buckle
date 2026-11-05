@@ -15,8 +15,8 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, PageHead, Panel, Refresh,
-    RouteLink, RunAction, host_state_pills, icons, use_toast,
+    Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, MenuItem, PageHead, Panel,
+    Refresh, RouteLink, RunAction, SplitButton, host_state_pills, icons, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{agents_behind, expected_version, matches_filter, same_version};
@@ -314,14 +314,22 @@ pub fn hosts() -> Html {
             <PageHead title="Hosts" subtitle={html! { "Every enrolled agent. Label changes apply to the next rollout's selection." }}
                 actions={html! { <>
                     <Refresh loading={fleet.loading} reload={fleet.reload.clone()} />
-                    if auth.is_admin() && !upgrade_ids.is_empty() {
-                        <Button onclick={{ let u = upgrading.clone(); Callback::from(move |_| u.set(true)) }}>{ "Upgrade all agents…" }</Button>
-                    }
                     if auth.is_admin() {
-                        <Button onclick={{ let r = running.clone(); Callback::from(move |_| r.set(true)) }}>{ "Run action…" }</Button>
-                    }
-                    if auth.is_admin() {
-                        <Button kind={Kind::Primary} onclick={{ let a = adding.clone(); Callback::from(move |_| a.set(true)) }}>{ icons::plus() }{ "Add an agent…" }</Button>
+                        <SplitButton menu_label="More fleet actions" testid="hosts-actions" items={
+                            // Agents left behind are the likeliest next step.
+                            (!upgrade_ids.is_empty()).then(|| {
+                                let u = upgrading.clone();
+                                MenuItem::new("Upgrade all agents…", Callback::from(move |_| u.set(true)))
+                            })
+                            .into_iter()
+                            .chain([
+                                { let a = adding.clone(); MenuItem::new("Add an agent…", Callback::from(move |_| a.set(true))) },
+                                { let r = running.clone(); MenuItem::new("Run action…", Callback::from(move |_| r.set(true))) },
+                            ])
+                            .enumerate()
+                            .map(|(i, item)| if i == 0 { item.kind(Kind::Primary) } else { item })
+                            .collect::<Vec<_>>()
+                        } />
                     }
                 </> }} />
             <Panel>{ body }</Panel>

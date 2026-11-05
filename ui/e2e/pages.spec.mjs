@@ -2,7 +2,7 @@
 // and its admin controls only for admins.
 
 import { describe, test } from "node:test";
-import { assert, decide, decisions, eventually, heading, open } from "./helpers.mjs";
+import { assert, decide, decisions, eventually, heading, offered, open } from "./helpers.mjs";
 
 describe("every page renders in demo mode", () => {
   test("overview rolls the fleet up with reading ages", async () => {
@@ -210,7 +210,7 @@ describe("every page renders in demo mode", () => {
     await page.locator("tr[data-run] button", { hasText: "Report" }).last().click();
     await page.getByRole("button", { name: "Show the newest" }).waitFor();
     assert.match(await postgresql.getByTestId("workload-run").textContent(), /unchanged/);
-    assert.equal(await page.getByRole("button", { name: "Forget…" }).count(), 0, "declared in buckle.yaml");
+    assert.ok(!(await offered(page.getByTestId("cluster-actions"))).menu.includes("Forget…"), "declared in buckle.yaml");
     // A host address lands on the cluster's own page, and the reverse.
     await page.goto(page.url().replace("/clusters/home-nomad", "/hosts/home-nomad"));
     await page.waitForURL(/\/clusters\/home-nomad/);
@@ -224,7 +224,7 @@ describe("every page renders in demo mode", () => {
     assert.equal(await grafana.getAttribute("data-state"), "not-applied-yet");
     assert.match(await page.getByTestId("cluster-executors").textContent(), /No active agent matches/);
     // Added through the API, so it can be forgotten; a declared one cannot.
-    await page.getByRole("button", { name: "Forget…" }).waitFor();
+    assert.ok((await offered(page.getByTestId("cluster-actions"))).menu.includes("Forget…"));
     await close();
   });
 
@@ -364,7 +364,7 @@ describe("empty and not-permitted states", () => {
     }
     await page.goto(page.url().replace("/rollouts/42", "/hosts/pi-1"));
     await page.getByRole("heading", { name: "Labels", exact: true }).waitFor();
-    assert.equal(await page.getByRole("button", { name: "Forget…" }).count(), 0);
+    assert.equal(await page.getByTestId("host-actions").count(), 0);
     assert.equal(await page.getByRole("button", { name: "Add label" }).count(), 0);
     await close();
   });

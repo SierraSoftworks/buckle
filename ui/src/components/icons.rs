@@ -117,15 +117,6 @@ pub fn chevron() -> Html {
     icon(html! { <polyline points="9 6 15 12 9 18" /> })
 }
 
-/// Three dots stacked: a row's menu of actions.
-pub fn kebab() -> Html {
-    icon(html! { <>
-        <circle cx="12" cy="5" r="1.2" fill="currentColor" />
-        <circle cx="12" cy="12" r="1.2" fill="currentColor" />
-        <circle cx="12" cy="19" r="1.2" fill="currentColor" />
-    </> })
-}
-
 pub fn clock() -> Html {
     icon(html! { <>
         <circle cx="12" cy="12" r="9" />

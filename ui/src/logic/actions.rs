@@ -21,16 +21,12 @@ pub fn click(a: &ActionInfo) -> Click {
 }
 
 /// The action's label on a button or menu item: an ellipsis when it asks
-/// for confirmation, the module first when the list spans modules.
-pub fn label(a: &ActionInfo, qualified: bool) -> String {
-    let base = match click(a) {
+/// for confirmation. Where a list spans modules, the module follows as the
+/// item's muted aside.
+pub fn label(a: &ActionInfo) -> String {
+    match click(a) {
         Click::Confirm => format!("{}…", a.label),
         Click::Run => a.label.clone(),
-    };
-    if qualified {
-        format!("{} · {base}", a.module)
-    } else {
-        base
     }
 }
 
@@ -83,13 +79,12 @@ mod tests {
 
     #[test]
     fn actions_are_labelled_by_what_a_click_does() {
-        for (confirm, qualified, expected, does) in [
-            (false, false, "Restart", Click::Run),
-            (true, false, "Restart…", Click::Confirm),
-            (false, true, "web · Restart", Click::Run),
+        for (confirm, expected, does) in [
+            (false, "Restart", Click::Run),
+            (true, "Restart…", Click::Confirm),
         ] {
             let a = action("web", "Restart", confirm);
-            assert_eq!(label(&a, qualified), expected);
+            assert_eq!(label(&a), expected);
             assert_eq!(click(&a), does);
         }
     }

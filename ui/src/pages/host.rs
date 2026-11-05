@@ -23,12 +23,14 @@ use super::modules_card::ModulesPanel;
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
-    ActionsButton, Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind,
-    Loading, PageHead, Panel, Pill, Refresh, RouteLink, TraceLink,
+    Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind, Loading, MenuItem,
+    PageHead, Panel, Pill, Refresh, RouteLink, SplitButton, TraceLink, action_items,
     changes::{RunChanges, Took},
-    host_state_pills, use_target_actions, use_toast,
+    host_state_pills, target_items, use_target_actions, use_toast,
 };
 use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
+use crate::logic::controls::{TargetAction, TargetStanding, head_actions};
+use crate::logic::fleet::agents_behind;
 use crate::logic::format::{
     commit, relative, relative_opt, rollout_label, short, short_duration, timestamp,
 };
@@ -67,6 +69,7 @@ pub fn host_page(props: &Props) -> Html {
     let desired = fleet
         .as_ref()
         .and_then(|f| f.desired_agent_version.clone().or(f.server_version.clone()));
+    let review = super::rollout::use_approval_wanted(active.clone(), props.id.clone());
     let ask = use_state(|| None::<Ask>);
     // The version the upgrade dialog will ask for.
     let upgrade_to = use_state(String::new);
@@ -222,23 +225,39 @@ pub fn host_page(props: &Props) -> Html {
 
     let refresh = html! { <Refresh loading={detail.loading} reload={detail.reload.clone()} /> };
     let actions = if admin {
-        html! { <>
-            if h.status == HostStatus::Pending {
-                <Button kind={Kind::Primary} onclick={open(Ask::Approve)}>{ "Approve registration…" }</Button>
+        let (own, primary) = head_actions(TargetStanding {
+            pending: h.status == HostStatus::Pending,
+            paused: h.status == HostStatus::Paused,
+            approval_wanted: review.is_some(),
+            upgradable: h.connection == Connection::Online,
+            behind: desired.as_deref().is_some_and(|v| {
+                !agents_behind(std::slice::from_ref(h), v)
+                    .upgradable
+                    .is_empty()
+            }),
+            forgettable: true,
+        });
+        let modules: Vec<MenuItem> = if can_act {
+            action_items(&d.actions, &on_action, Some("Module actions"))
+        } else {
+            Vec::new()
+        };
+        let items = target_items(&own, primary, modules, |a| match a {
+            TargetAction::ApproveRegistration => open(Ask::Approve),
+            TargetAction::ApproveRollout => {
+                let (navigator, id) = (navigator.clone(), review.clone().unwrap_or_default());
+                Callback::from(move |_: MouseEvent| {
+                    if let Some(n) = &navigator {
+                        n.push(&Route::rollout(&id));
+                    }
+                })
             }
-            if h.status == HostStatus::Paused {
-                <Button onclick={open(Ask::Resume)}>{ "Resume" }</Button>
-            } else {
-                <Button onclick={open(Ask::Pause)}>{ "Pause…" }</Button>
-            }
-            if h.connection == Connection::Online {
-                <Button onclick={open(Ask::Upgrade)}>{ "Upgrade agent…" }</Button>
-            }
-            if can_act {
-                <ActionsButton actions={d.actions.clone()} on_run={on_action.clone()} testid="host-actions" />
-            }
-            <Button kind={Kind::Danger} onclick={open(Ask::Forget)}>{ "Forget…" }</Button>
-        </> }
+            TargetAction::UpgradeAgent => open(Ask::Upgrade),
+            TargetAction::Pause => open(Ask::Pause),
+            TargetAction::Resume => open(Ask::Resume),
+            TargetAction::Forget => open(Ask::Forget),
+        });
+        html! { <SplitButton {items} menu_label="More host actions" testid="host-actions" /> }
     } else {
         html! {}
     };

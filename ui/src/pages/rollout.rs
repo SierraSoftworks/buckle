@@ -21,9 +21,9 @@ use crate::components::icons;
 use crate::components::meter::stage_segments;
 use crate::components::ui::Copyable;
 use crate::components::{
-    ActionMenu, Button, Changes, Commit, CommitCard, Confirm, Countdown, ErrorBlock, ErrorState,
-    HostLink, HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill, Pipeline, PlanViews,
-    Refresh, RouteLink, RunReportView, SplitButton, TraceLink, use_toast,
+    Button, Changes, Commit, CommitCard, Confirm, Countdown, ErrorBlock, ErrorState, HostLink,
+    HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill, Pipeline, PlanViews, Refresh,
+    RouteLink, RunReportView, SplitButton, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::controls::{Decision, Standing, decisions, replan_label};
@@ -478,24 +478,46 @@ pub(crate) fn controls(
         let (o, a) = (open.clone(), ask_for(d));
         Callback::from(move |_: MouseEvent| o.emit(a.clone()))
     };
-    let kind = match &d.primary {
-        Decision::Approve(_) | Decision::Resume | Decision::Retry => Kind::Primary,
-        p if p.destructive() => Kind::Danger,
-        _ => Kind::Default,
+    let item = |d: &Decision| {
+        let kind = match d {
+            Decision::Approve(_) | Decision::Resume | Decision::Retry => Kind::Primary,
+            d if d.destructive() => Kind::Danger,
+            _ => Kind::Default,
+        };
+        MenuItem::new(d.label(), ask(d)).kind(kind)
     };
-    let items = d
-        .menu
-        .iter()
-        .map(|m| MenuItem {
-            label: m.label().into(),
-            danger: m.destructive(),
-            onclick: ask(m),
-        })
-        .collect::<Vec<_>>();
+    let items: Vec<MenuItem> = std::iter::once(&d.primary)
+        .chain(&d.menu)
+        .map(item)
+        .collect();
     html! {
-        <SplitButton label={d.primary.label()} onclick={ask(&d.primary)} {kind} {items}
-            menu_label="More rollout actions" testid="rollout-controls" />
+        <SplitButton {items} menu_label="More rollout actions" testid="rollout-controls" />
     }
+}
+
+/// The active rollout (`active`) when it wants an approval for a phase that
+/// holds `target`: a host or cluster page puts reviewing it first.
+#[hook]
+pub(crate) fn use_approval_wanted(active: Option<String>, target: String) -> Option<String> {
+    let rollout = use_fetch(active.clone(), |id| async move {
+        match id {
+            Some(id) => api::rollout(&id).await.map(Some),
+            None => Ok(None),
+        }
+    });
+    let live = use_live_value(&rollout, |d: &mut Option<RolloutDetail>, e| {
+        if let Some(d) = d {
+            apply_rollout(d, e)
+        }
+    });
+    let d = live
+        .flatten()
+        .filter(|d| Some(&d.summary.id) == active.as_ref())?;
+    let pipeline = layout(&d);
+    wanting_approval(&pipeline)
+        .iter()
+        .any(|p| p.hosts.iter().any(|h| h.host == target))
+        .then(|| d.summary.id.clone())
 }
 
 fn ask_for(d: &Decision) -> Ask {
@@ -1220,7 +1242,9 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td title={timestamp(h.updated_at)}>{ relative(h.updated_at, props.now) }</td>
                                 <td class="row-controls">
                                     if props.admin {
-                                        <ActionMenu items={host_menu(h, &props.on_ask)} label={format!("Actions for {}", h.host)} testid="host-actions" />
+                                        {{ let (items, face) = host_menu(h, &props.on_ask); html! {
+                                            <SplitButton {items} small=true menu_only={!face} menu_label={format!("Actions for {}", h.host)} testid="host-actions" />
+                                        } }}
                                     }
                                     <button type="button" class="icon-btn row-toggle" onclick={toggle}
                                         aria-expanded={open.to_string()} aria-label={format!("Details for {}", h.host)}
@@ -1246,42 +1270,44 @@ fn host_table(props: &HostTableProps) -> Html {
 }
 
 /// A host's own decisions, for the menu on its row.
-fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
-    let item = |label: &str, danger: bool, a: Ask| {
+/// A host's own actions in a rollout, the most likely first: retry what
+/// failed, continue past its failed checks, or skip its bake period, then
+/// the ones that override the rollout. The second is whether the first is
+/// one its state calls for (a face); a routine row shows only its menu.
+fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> (Vec<MenuItem>, bool) {
+    let item = |label: &str, a: Ask| {
         let on_ask = on_ask.clone();
-        MenuItem {
-            label: AttrValue::from(label.to_string()),
-            danger,
-            onclick: Callback::from(move |_: MouseEvent| on_ask.emit(a.clone())),
-        }
+        MenuItem::new(
+            label.to_string(),
+            Callback::from(move |_: MouseEvent| on_ask.emit(a.clone())),
+        )
     };
     let host = || h.host.clone();
     let mut items = Vec::new();
     if can_replan(h.state) {
         let label = format!("{}…", replan_label(h.state, h.plan_digest.is_some()));
-        items.push(item(&label, false, Ask::Host("retry", host())));
+        items.push(item(&label, Ask::Host("retry", host())));
     }
     if h.state == HostRolloutState::Failed && !h.failed_checks.is_empty() {
         items.push(item(
             "Continue with checks waived…",
-            false,
             Ask::Continue(host(), h.failed_checks.clone()),
         ));
     }
     if h.state == HostRolloutState::Baking {
-        items.push(item(
-            "Skip bake period…",
-            false,
-            Ask::Host("skip-bake", host()),
-        ));
+        items.push(item("Skip bake period…", Ask::Host("skip-bake", host())));
     }
     if can_force_apply(h.state) {
-        items.push(item("Force apply…", true, Ask::Host("force", host())));
+        items.push(item("Force apply…", Ask::Host("force", host())).danger());
     }
     if !finished_state(h.state) {
-        items.push(item("Skip…", true, Ask::Host("skip", host())));
+        items.push(item("Skip…", Ask::Host("skip", host())).danger());
     }
-    items
+    let face = matches!(
+        h.state,
+        HostRolloutState::Failed | HostRolloutState::Held | HostRolloutState::Baking
+    );
+    (items, face)
 }
 
 #[derive(Properties, PartialEq)]
@@ -1333,11 +1359,13 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
             Callback::from(move |_: MouseEvent| on_run.emit(a.clone()))
         };
         html! {
-            <div class="error-block__actions" data-testid="host-replan">
-                <Button small=true kind={Kind::Primary} onclick={run(Ask::Host("retry", h.host.clone()))}>{ label }</Button>
-                if others > 1 && h.state == HostRolloutState::Failed {
-                    <Button small=true onclick={run(Ask::Action("retry"))}>{ format!("Retry all {others} failed") }</Button>
-                }
+            <div class="error-block__actions">
+                <SplitButton small=true testid="host-replan" menu_label="More ways to retry" items={
+                    std::iter::once(MenuItem::new(label, run(Ask::Host("retry", h.host.clone()))).kind(Kind::Primary))
+                        .chain((others > 1 && h.state == HostRolloutState::Failed).then(||
+                            MenuItem::new(format!("Retry all {others} failed"), run(Ask::Action("retry")))))
+                        .collect::<Vec<_>>()
+                } />
             </div>
         }
     });

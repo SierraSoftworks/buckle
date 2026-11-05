@@ -9,6 +9,68 @@ use super::split_button::{MenuItem, SplitButton};
 use super::{Confirm, use_toast};
 use crate::api;
 use crate::logic::actions::{Click, click, label, spans_modules};
+use crate::logic::controls::TargetAction;
+
+/// A target's actions as split button items, in declaration order: named
+/// for what they do, each with its module as a muted aside when the list
+/// spans modules, and in `section` when given.
+pub fn action_items(
+    actions: &[ActionInfo],
+    on_run: &Callback<ActionInfo>,
+    section: Option<&str>,
+) -> Vec<MenuItem> {
+    let qualified = spans_modules(actions);
+    actions
+        .iter()
+        .map(|a| {
+            let (on_run, run) = (on_run.clone(), a.clone());
+            let mut item = MenuItem::new(
+                label(a),
+                Callback::from(move |_: MouseEvent| on_run.emit(run.clone())),
+            );
+            if qualified {
+                item = item.aside(a.module.clone());
+            }
+            if let Some(d) = &a.description {
+                item = item.title(d.clone());
+            }
+            match section {
+                Some(s) => item.section(s.to_string()),
+                None => item,
+            }
+        })
+        .collect()
+}
+
+/// A target's page head as split button items: its own actions (from
+/// [`crate::logic::controls::target_actions`], `primary` when the first is
+/// what its state calls for), then `extra` (its modules' actions), then
+/// Forget, set apart.
+pub fn target_items(
+    actions: &[TargetAction],
+    primary: bool,
+    extra: Vec<MenuItem>,
+    onclick: impl Fn(TargetAction) -> Callback<MouseEvent>,
+) -> Vec<MenuItem> {
+    let item = |i: usize, a: TargetAction| {
+        let item = MenuItem::new(a.label(), onclick(a));
+        match a {
+            TargetAction::Forget => item.danger(),
+            _ if i == 0 && primary => item.kind(super::Kind::Primary),
+            _ => item,
+        }
+    };
+    let (own, forget): (Vec<_>, Vec<_>) = actions
+        .iter()
+        .copied()
+        .enumerate()
+        .partition(|(_, a)| *a != TargetAction::Forget);
+    own.into_iter()
+        .map(|(i, a)| item(i, a))
+        .chain(extra)
+        .chain(forget.into_iter().map(|(i, a)| item(i, a)))
+        .collect()
+}
 
 #[derive(Properties, PartialEq)]
 pub struct ActionsButtonProps {
@@ -18,34 +80,12 @@ pub struct ActionsButtonProps {
     pub testid: Option<AttrValue>,
 }
 
-/// Nothing when there are no actions.
+/// A module's actions as one split button; nothing when there are none.
 #[function_component(ActionsButton)]
 pub fn actions_button(props: &ActionsButtonProps) -> Html {
-    let Some(first) = props.actions.first() else {
-        return html! {};
-    };
-    let qualified = spans_modules(&props.actions);
-    let pick = |a: &ActionInfo| {
-        let (on_run, a) = (props.on_run.clone(), a.clone());
-        Callback::from(move |e: MouseEvent| {
-            // A module head toggles open on a click.
-            e.stop_propagation();
-            on_run.emit(a.clone())
-        })
-    };
-    let items: Vec<MenuItem> = props.actions[1..]
-        .iter()
-        .map(|a| MenuItem {
-            label: label(a, qualified).into(),
-            danger: a.confirm,
-            onclick: pick(a),
-        })
-        .collect();
     html! {
-        <span class="actions-button" onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
-            <SplitButton label={label(first, qualified)} onclick={pick(first)} {items}
-                menu_label="More actions" testid={props.testid.clone()} />
-        </span>
+        <SplitButton items={action_items(&props.actions, &props.on_run, None)} small=true
+            menu_label="More actions" testid={props.testid.clone()} />
     }
 }
 

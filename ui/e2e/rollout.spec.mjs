@@ -2,7 +2,7 @@
 // phase goes through a confirmation that names what it binds.
 
 import { describe, test } from "node:test";
-import { assert, decide, decisions, eventually, heading, open } from "./helpers.mjs";
+import { act, assert, decide, decisions, eventually, heading, open } from "./helpers.mjs";
 
 const STATES = [
   "pending", "plan-pending", "planned", "held", "applying",
@@ -283,8 +283,7 @@ describe("approving a phase", () => {
   test("a baking host's bake can be skipped from its row's menu", async () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-3", exact: true }) });
-    await row.getByRole("button", { name: "Actions for pi-3" }).click();
-    await row.getByRole("menuitem", { name: "Skip bake period…" }).click();
+    await act(row.getByTestId("host-actions"), "Skip bake period…");
     await page.getByRole("dialog", { name: "Skip the bake of pi-3" }).getByRole("button", { name: "Skip bake period" }).click();
     await page.getByRole("status").filter({ hasText: "pi-3: skip-bake sent." }).waitFor();
     await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-3"]').getAttribute("data-state"), "healthy"));
@@ -306,8 +305,7 @@ describe("approving a phase", () => {
   test("a failed host can continue with its failing checks waived", async () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });
-    await row.getByRole("button", { name: "Actions for pi-5" }).click();
-    await row.getByRole("menuitem", { name: "Continue with checks waived…" }).click();
+    await act(row.getByTestId("host-actions"), "Continue with checks waived…");
     const dialog = page.getByRole("dialog", { name: "Continue pi-5 with checks waived" });
     await dialog.getByRole("checkbox").check();
     await dialog.getByRole("button", { name: "Waive 1 check and continue" }).click();

@@ -3,7 +3,7 @@
 // confirmations, and Add an agent walks through to a join command.
 
 import { describe, test } from "node:test";
-import { assert, eventually, heading, open } from "./helpers.mjs";
+import { act, assert, eventually, heading, offered, open } from "./helpers.mjs";
 
 describe("host labels", () => {
   test("the preview of groups and phase follows the labels as they are typed", async () => {
@@ -112,7 +112,7 @@ describe("registration and forgetting", () => {
 
   test("forgetting a host needs its name typed", async () => {
     const { page, close } = await open("/hosts/lab-4");
-    await page.getByRole("button", { name: "Forget…" }).click();
+    await act(page.getByTestId("host-actions"), "Forget…");
     const dialog = page.getByRole("dialog", { name: "Forget lab-4" });
     const forget = dialog.getByRole("button", { name: "Forget lab-4" });
     await dialog.getByRole("textbox", { name: /Type/ }).fill("lab-");
@@ -129,7 +129,7 @@ describe("registration and forgetting", () => {
 describe("add an agent", () => {
   test("the wizard turns a platform, method and labels into a join command", async () => {
     const { page, close } = await open("/hosts");
-    await page.getByRole("button", { name: "Add an agent…" }).click();
+    await act(page.getByTestId("hosts-actions"), "Add an agent…");
     const wizard = page.getByRole("dialog", { name: "Add an agent" });
     const next = wizard.getByRole("button", { name: "Next" });
     assert.ok(await next.isDisabled(), "a platform is chosen first");
@@ -155,7 +155,7 @@ describe("add an agent", () => {
 
   test("over Tailscale the command joins the tailnet with the chosen tags", async () => {
     const { page, close } = await open("/hosts");
-    await page.getByRole("button", { name: "Add an agent…" }).click();
+    await act(page.getByTestId("hosts-actions"), "Add an agent…");
     const wizard = page.getByRole("dialog", { name: "Add an agent" });
     await wizard.getByRole("radio", { name: /Linux/ }).click();
     await wizard.getByRole("button", { name: "Next" }).click();
@@ -173,7 +173,7 @@ describe("add an agent", () => {
   test("viewers are not offered the wizard", async () => {
     const { page, close } = await open("/hosts", { flags: "role=viewer" });
     await page.getByTestId("hosts-table").waitFor();
-    assert.equal(await page.getByRole("button", { name: "Add an agent…" }).count(), 0);
+    assert.equal(await page.getByTestId("hosts-actions").count(), 0);
     await close();
   });
 });
@@ -181,12 +181,17 @@ describe("add an agent", () => {
 describe("actions", () => {
   test("an action runs at once, and one asking for confirmation takes a reason first", async () => {
     const { page, close } = await open("/hosts/lab-3");
+    // The host's head lists its modules' actions in a section, each named
+    // first with its module after it.
     const actions = page.getByTestId("host-actions");
-    await actions.getByRole("button", { name: "common · Upgrade packages" }).click();
+    const { face, menu } = await offered(actions);
+    assert.equal(face, "Upgrade agent…", "an agent behind the server is upgraded first");
+    assert.ok(menu.includes("Upgrade packages common") && menu.includes("Restart Nomad nomad"), menu.join(", "));
+    assert.equal(menu.at(-1), "Forget…");
+    await act(actions, "Upgrade packages common");
     await page.getByRole("status").filter({ hasText: "Upgrade packages started on lab-3" }).waitFor();
 
-    await actions.getByRole("button", { name: "More actions" }).click();
-    await actions.getByRole("menuitem", { name: "common · Reboot…" }).click();
+    await act(actions, "Reboot… common");
     const dialog = page.getByRole("dialog", { name: "Reboot on lab-3" });
     const confirm = dialog.getByRole("button", { name: "Reboot", exact: true });
     assert.ok(await confirm.isDisabled(), "a reason is required");
@@ -205,7 +210,7 @@ describe("actions", () => {
 describe("action rollouts", () => {
   test("Run action… picks an action and its targets, and opens the rollout it starts", async () => {
     const { page, close } = await open("/hosts");
-    await page.getByRole("button", { name: "Run action…" }).click();
+    await act(page.getByTestId("hosts-actions"), "Run action…");
     const dialog = page.getByRole("dialog", { name: "Run an action across the fleet" });
     await dialog.getByRole("combobox", { name: "Action" }).selectOption({ label: "common · Upgrade packages" });
     await eventually(async () =>

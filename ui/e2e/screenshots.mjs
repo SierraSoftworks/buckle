@@ -150,8 +150,9 @@ const SHOTS = [
     name: "rollout-waive",
     path: "/rollouts/42",
     setup: async (p) => {
-      await p.getByRole("button", { name: "Actions for pi-5" }).click();
-      await p.getByRole("menuitem", { name: "Continue with checks waived…" }).click();
+      const row = p.locator("tr", { has: p.getByRole("link", { name: "pi-5", exact: true }) });
+      await row.getByRole("button", { name: "Actions for pi-5" }).click();
+      await row.getByRole("menuitem", { name: "Continue with checks waived…" }).click();
       await dialog(p).getByRole("checkbox").check();
     },
     target: dialog,
@@ -160,8 +161,7 @@ const SHOTS = [
     name: "rollout-paused",
     path: "/rollouts/42",
     setup: async (p) => {
-      await openActions(p);
-      await p.getByRole("menuitem", { name: "Pause", exact: true }).click();
+      await p.getByTestId("rollout-controls").first().getByRole("button", { name: "Pause", exact: true }).click();
       await dialog(p).getByRole("button", { name: "Pause rollout" }).click();
       await p.locator(".page-head .pill", { hasText: "paused" }).waitFor();
       await openActions(p);
