@@ -366,6 +366,9 @@ pub struct HostRuntime {
     /// e.g. another rollout's, are not this bake's).
     #[serde(default)]
     pub bake_requests: Vec<String>,
+    /// The `until` of the latest bake request: the agent samples no longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bake_asked_until: Option<DateTime<Utc>>,
     /// Modules the plan defers to apply time (their plan is unknown yet).
     #[serde(default)]
     pub deferred_modules: Vec<String>,
