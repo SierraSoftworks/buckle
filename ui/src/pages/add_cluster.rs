@@ -67,6 +67,7 @@ fn request(
             kind,
             description: String::new(),
             api: (!api.is_empty()).then(|| api.to_owned()),
+            ui: None,
             nodes: None,
             executors,
             identity: identity.to_owned(),

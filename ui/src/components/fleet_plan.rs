@@ -13,17 +13,21 @@ use crate::components::ui::{Note, NoteKind};
 use super::diff::{FactExemplars, secret_text};
 use super::icons;
 use super::plan::{
-    DEFERRED_NOTE, HELD_NOTE, INDETERMINATE_NOTE, block, handler, module_head, note, notes_head,
+    DEFERRED_NOTE, HELD_NOTE, INDETERMINATE_NOTE, block, handler, module_head_of, note, notes_head,
     rehome, rehomed_block, removal, removals_block, step_class, step_detail, step_line,
 };
 use crate::logic::fleet_plan::{
-    Phases, hosts_changed, phase_label, scope_label, scope_title, summarise,
+    Phases, phase_label, scope_label, scope_title, summarise, targets_changed,
 };
 use crate::logic::format::count;
 
 #[derive(Properties, PartialEq)]
 pub struct FleetPlanProps {
     pub plan: FleetPlan,
+    /// The cluster targets among the plan's hosts: a module planned only
+    /// on them is a workload.
+    #[prop_or_default]
+    pub clusters: Vec<String>,
 }
 
 /// Which hosts a line applies to: all of them, or a named subset (by
@@ -45,13 +49,22 @@ fn shared_scope<T>(all: &[String], s: &Shared<T>, phases: &Phases) -> Html {
 /// How many of the hosts under review a block changes, for its heading;
 /// across phases, the phases it changes where they say it.
 fn changed_of(all: &[String], changed: &[String], phases: &Phases) -> Html {
+    changed_of_targets(all, changed, phases, ("host", "hosts"))
+}
+
+fn changed_of_targets(
+    all: &[String],
+    changed: &[String],
+    phases: &Phases,
+    noun: (&str, &str),
+) -> Html {
     let fleet_wide = all.iter().all(|h| changed.contains(h));
     html! {
         <span class={classes!("scope", if fleet_wide { "scope--all" } else { "scope--subset" })}
             title={scope_title(changed, phases)} data-testid="hosts-changed">
             { (!fleet_wide).then(|| phase_label(all, changed, phases)).flatten()
                 .map(|p| format!("{p} changed"))
-                .unwrap_or_else(|| hosts_changed(all.len(), changed.len())) }
+                .unwrap_or_else(|| targets_changed(all.len(), changed.len(), noun)) }
         </span>
     }
 }
@@ -93,15 +106,35 @@ pub fn fleet_plan_view(props: &FleetPlanProps) -> Html {
         }
         let changed: Vec<&FleetStep> = m.steps.iter().filter(|s| !s.variants.is_empty()).collect();
         let within = summary.changed.clone();
+        // A workload is weighed against the clusters under review, a
+        // module against the hosts.
+        let workload = !m.hosts.is_empty() && m.hosts.iter().all(|h| props.clusters.contains(h));
+        let peers: Vec<String> = all
+            .iter()
+            .filter(|h| props.clusters.contains(h) == workload)
+            .cloned()
+            .collect();
         Some(block(
             "",
-            module_head(&m.module, &m.needs, !m.deferred.is_empty(), summary.tally, changed_of(all, &summary.changed, ph)),
+            module_head_of(
+                &m.module,
+                workload.then_some(m.hosts.as_slice()),
+                &m.needs,
+                !m.deferred.is_empty(),
+                summary.tally,
+                changed_of_targets(
+                    &peers,
+                    &summary.changed,
+                    ph,
+                    if workload { ("cluster", "clusters") } else { ("host", "hosts") },
+                ),
+            ),
             html! {
                 <ul class="steps">
                     { for changed.into_iter().map(|s| html! {
-                        <FleetStepView step={s.clone()} all={all.clone()} module={within.clone()} />
+                        <FleetStepView step={s.clone()} all={peers.clone()} module={within.clone()} />
                     }) }
-                    { for m.handlers.iter().map(|h| handler(&m.module, &h.value, scope_within(all, &within, &h.hosts, ph))) }
+                    { for m.handlers.iter().map(|h| handler(&m.module, &h.value, scope_within(&peers, &within, &h.hosts, ph))) }
                 </ul>
             },
         ))
@@ -261,6 +294,9 @@ pub struct PlanViewsProps {
     /// Open any destructive plan in the per-plan view.
     #[prop_or_default]
     pub open_destructive: bool,
+    /// The cluster targets among the hosts.
+    #[prop_or_default]
+    pub clusters: Vec<String>,
 }
 
 /// A rollout's plans across all its phases, as one fleet-wide union (the
@@ -298,7 +334,7 @@ pub fn plan_views(props: &PlanViewsProps) -> Html {
                 { tab("By distinct plan", *by_plan, true) }
             </div>
             if *by_plan { { by_plan_view } }
-            else { <FleetPlanView plan={fleet.clone()} /> }
+            else { <FleetPlanView plan={fleet.clone()} clusters={props.clusters.clone()} /> }
         </ContextProvider<Phases>>
     }
 }

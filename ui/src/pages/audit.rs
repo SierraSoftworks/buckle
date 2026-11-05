@@ -54,6 +54,7 @@ fn subject_route(e: &AuditEntry) -> Option<Route> {
     let subject = e.subject.clone()?;
     match e.action.split('.').next()? {
         "host" | "agent" => Some(Route::Host { id: subject }),
+        "target" => Some(Route::Cluster { id: subject }),
         "rollout" | "phase" => Some(Route::rollout(&subject)),
         "revision" => Some(Route::Rollouts),
         _ => None,

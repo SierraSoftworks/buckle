@@ -24,6 +24,10 @@ pub enum Route {
     Hosts,
     #[at("/hosts/:id")]
     Host { id: String },
+    #[at("/clusters")]
+    Clusters,
+    #[at("/clusters/:id")]
+    Cluster { id: String },
     #[at("/revisions")]
     Revisions,
     #[at("/audit")]
@@ -34,6 +38,14 @@ pub enum Route {
 }
 
 impl Route {
+    /// A target's page: a cluster's own, else the host's.
+    pub fn target(id: &str, kind: buckle_api::TargetKind) -> Route {
+        match kind {
+            buckle_api::TargetKind::Cluster => Route::Cluster { id: id.to_owned() },
+            buckle_api::TargetKind::Host => Route::Host { id: id.to_owned() },
+        }
+    }
+
     /// A rollout's page, addressed by its `word.word.word` name where it has
     /// one (the API resolves names) and by its id otherwise.
     pub fn rollout(id: &str) -> Route {
@@ -161,6 +173,8 @@ fn switch(route: Route) -> Html {
         Route::Rollout { id } => html! { <pages::rollout::RolloutPage {id} /> },
         Route::Hosts => html! { <pages::hosts::Hosts /> },
         Route::Host { id } => html! { <pages::host::HostPage {id} /> },
+        Route::Clusters => html! { <pages::clusters::Clusters /> },
+        Route::Cluster { id } => html! { <pages::cluster::ClusterPage {id} /> },
         // Revisions and rollouts are one history now.
         Route::Revisions => html! { <Redirect<Route> to={Route::Rollouts} /> },
         Route::Audit => html! { <pages::audit::Audit /> },

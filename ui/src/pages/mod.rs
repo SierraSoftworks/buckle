@@ -3,6 +3,8 @@
 pub mod add_agent;
 pub mod add_cluster;
 pub mod audit;
+pub mod cluster;
+pub mod clusters;
 pub mod host;
 pub mod hosts;
 pub mod overview;

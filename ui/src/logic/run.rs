@@ -656,20 +656,26 @@ pub fn apply_run_list(list: &mut [RunSummary], host: &str, p: &RunProgress) -> b
 }
 
 /// What a host is doing right now: the module it is in and, when known,
-/// the step.
+/// the step, with how far the step got (a deployment's healthy allocations).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Activity {
     pub module: String,
     pub step: Option<String>,
+    pub progress: Option<String>,
 }
 
 impl Activity {
-    /// `nomad › file.template[/etc/nomad.d/nomad.hcl]`.
+    /// `nomad › file.template[/etc/nomad.d/nomad.hcl]`, then its progress:
+    /// `atuin › nomad.job[default/atuin] · deploying: server 1/2 healthy`.
     pub fn describe(&self) -> String {
-        match &self.step {
+        let mut text = match &self.step {
             Some(step) => format!("{} › {}", self.module, step),
             None => self.module.clone(),
+        };
+        if let Some(p) = &self.progress {
+            text.push_str(&format!(" · {p}"));
         }
+        text
     }
 }
 
@@ -683,15 +689,17 @@ pub fn activity(r: &RunReport) -> Option<Activity> {
         .iter()
         .find(|m| m.state == ModuleState::Running)
         .or_else(|| r.modules.iter().find(|m| current_step(m).is_some()))?;
+    let step = current_step(module);
     Some(Activity {
         module: module.name.clone(),
-        step: current_step(module).map(|s| s.id.clone()),
+        step: step.map(|s| s.id.clone()),
+        progress: step.and_then(|s| s.result.clone()),
     })
 }
 
 /// What a host is doing after an update, from the updates alone (for a host
-/// whose report is not held): a step or module starting is what it is on, and
-/// it finishing leaves the rest.
+/// whose report is not held): a step or module starting is what it is on, a
+/// step's progress says how far it got, and it finishing leaves the rest.
 pub fn track(current: Option<Activity>, p: &RunProgress) -> Option<Activity> {
     if run_finished(p.run_state) {
         return None;
@@ -703,12 +711,20 @@ pub fn track(current: Option<Activity>, p: &RunProgress) -> Option<Activity> {
         (Some(step), Some(StepState::Running), _) => Some(Activity {
             module: module.clone(),
             step: Some(step.clone()),
+            progress: None,
+        }),
+        // A progress update: no state of its own.
+        (Some(step), None, None) => Some(Activity {
+            module: module.clone(),
+            step: Some(step.clone()),
+            progress: p.result.clone(),
         }),
         (Some(step), Some(state), _) if state != StepState::Pending => current.map(|a| {
             if a.module == *module && a.step.as_deref() == Some(step) {
                 Activity {
                     module: a.module,
                     step: None,
+                    progress: None,
                 }
             } else {
                 a
@@ -717,6 +733,7 @@ pub fn track(current: Option<Activity>, p: &RunProgress) -> Option<Activity> {
         (None, _, Some(ModuleState::Running)) => Some(Activity {
             module: module.clone(),
             step: None,
+            progress: None,
         }),
         (None, _, Some(_)) => current.filter(|a| a.module != *module),
         _ => current,
@@ -1535,6 +1552,31 @@ pub(crate) mod tests {
         let mut between = r;
         between.modules[1].steps[0].state = StepState::Changed;
         assert_eq!(activity(&between).unwrap().describe(), "nomad");
+    }
+
+    #[test]
+    fn a_step_reports_how_far_it_got() {
+        let mut r = live_report();
+        let running = r.modules[1]
+            .steps
+            .iter_mut()
+            .find(|s| s.state == StepState::Running)
+            .unwrap();
+        running.result = Some("deploying: web 1/2 healthy".into());
+        assert_eq!(
+            activity(&r).unwrap().describe(),
+            "nomad › file.copy[b] · deploying: web 1/2 healthy"
+        );
+        let mut p = progress(Some("nomad"), Some("file.copy[b]"));
+        p.result = Some("deploying: web 2/2 healthy".into());
+        let a = track(activity(&r), &p).unwrap();
+        assert_eq!(a.progress.as_deref(), Some("deploying: web 2/2 healthy"));
+        p.step_state = Some(StepState::Changed);
+        assert_eq!(
+            track(Some(a), &p).unwrap().progress,
+            None,
+            "a finished step's progress goes"
+        );
     }
 
     #[test]

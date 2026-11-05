@@ -247,8 +247,25 @@ pub fn module_head(
     changes: Tally,
     hosts: Html,
 ) -> Html {
+    module_head_of(module, None, needs, deferred, changes, hosts)
+}
+
+/// [`module_head`], for a workload when `clusters` names the clusters it is
+/// planned on.
+pub fn module_head_of(
+    module: &str,
+    clusters: Option<&[String]>,
+    needs: &[String],
+    deferred: bool,
+    changes: Tally,
+    hosts: Html,
+) -> Html {
     html! { <>
         <h4 class="plan-module__name mono">{ module.to_string() }</h4>
+        if let Some(clusters) = clusters {
+            <span class="badge badge--info" data-testid="workload-badge"
+                title={format!("a workload, applied to {}", clusters.join(", "))}>{ "workload" }</span>
+        }
         if deferred { <span class="badge" title={DEFERRED_BADGE}>{ "deferred" }</span> }
         if !needs.is_empty() { <span class="muted">{ format!("needs: {}", needs.join(", ")) }</span> }
         <span class="plan-module__aside"><Changes tally={changes} />{ hosts }</span>

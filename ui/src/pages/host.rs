@@ -107,6 +107,10 @@ pub fn host_page(props: &Props) -> Html {
         };
     };
     let h = &d.summary;
+    // A cluster has a page of its own.
+    if h.kind == buckle_api::TargetKind::Cluster {
+        return html! { <Redirect<Route> to={Route::Cluster { id: h.id.clone() }} /> };
+    }
     let admin = auth.is_admin();
 
     let open = |a: Ask| {
@@ -286,7 +290,7 @@ pub fn host_page(props: &Props) -> Html {
                 <NotesEditor id={h.id.clone()} notes={h.notes.clone()} admin={admin} on_saved={detail.reload.clone()} />
                 <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
             </div>
-            { health_panel(&d.health_checks, now) }
+            { health_panel(&d.health_checks, now, false) }
             if !d.drift.is_empty() || h.drifted {
                 <Panel title="Drift" subtitle="What the latest drift check found different from the applied revision">
                     if d.drift.is_empty() {
@@ -373,7 +377,7 @@ fn agent_version(
 /// Each check as it reads now, module by module, with how it fared in the
 /// host's recent rollouts: one mark per rollout, oldest to newest, coloured
 /// by its worst reading.
-fn health_panel(checks: &[HostCheck], now: DateTime<Utc>) -> Html {
+pub(super) fn health_panel(checks: &[HostCheck], now: DateTime<Utc>, cluster: bool) -> Html {
     let mut by_module: BTreeMap<&str, Vec<&HostCheck>> = BTreeMap::new();
     for c in checks {
         by_module.entry(c.module.as_str()).or_default().push(c);
@@ -381,7 +385,11 @@ fn health_panel(checks: &[HostCheck], now: DateTime<Utc>) -> Html {
     html! {
         <Panel title="Health" subtitle="Each check as it reads now, and its worst reading in each recent rollout">
             if checks.is_empty() {
-                <Empty title="No health results" message="Checks run with each drift check and during rollouts." />
+                <Empty title="No health results" message={if cluster {
+                    "Each workload's jobs are checked during rollouts and whenever the cluster's health is read."
+                } else {
+                    "Checks run with each drift check and during rollouts."
+                }} />
             }
             { for by_module.into_iter().map(|(module, list)| {
                 let worst = list.iter().map(|c| CheckState::of(&c.status, c.required)).max();
@@ -444,7 +452,7 @@ fn scope_label(scope: &str) -> &str {
     }
 }
 
-fn runs(
+pub(super) fn runs(
     d: &HostDetail,
     now: DateTime<Utc>,
     shown: Option<String>,
@@ -495,21 +503,24 @@ fn runs(
 }
 
 #[derive(Properties, PartialEq)]
-struct RunsProps {
-    host: String,
+pub(super) struct RunsProps {
+    pub host: String,
+    /// A cluster's runs: workload by workload.
+    #[prop_or_default]
+    pub cluster: bool,
     /// The detail's latest run, kept current.
-    latest: Option<RunReport>,
+    pub latest: Option<RunReport>,
     /// The newest run heard of (a run may have started since the detail).
-    newest: Option<String>,
+    pub newest: Option<String>,
     /// The run the reader picked; `None` follows the newest.
-    picked: Option<String>,
-    on_pick: Callback<Option<String>>,
+    pub picked: Option<String>,
+    pub on_pick: Callback<Option<String>>,
 }
 
 /// The report of the host's newest run, live, or of an older one picked
 /// from the host's runs.
 #[function_component(RunsPanel)]
-fn runs_panel(props: &RunsProps) -> Html {
+pub(super) fn runs_panel(props: &RunsProps) -> Html {
     let now = use_now(30);
     let shown = props.picked.clone().or_else(|| props.newest.clone());
     let older = props.picked.is_some() && props.picked != props.newest;
@@ -609,9 +620,15 @@ fn runs_panel(props: &RunsProps) -> Html {
 
     let body = match (&shown, &feed.report, &feed.error) {
         (None, _, _) => html! {
-            <Empty title="No runs yet" message="A report appears here once the host applies a revision: every module and step, live while it runs." />
+            <Empty title="No runs yet" message={if props.cluster {
+                "A report appears here once a revision is applied to the cluster: every workload and step, live while it runs."
+            } else {
+                "A report appears here once the host applies a revision: every module and step, live while it runs."
+            }} />
         },
-        (Some(_), Some(report), _) => html! { <RunReportView report={report.clone()} /> },
+        (Some(_), Some(report), _) => {
+            html! { <RunReportView report={report.clone()} workloads={props.cluster} /> }
+        }
         (Some(_), None, Some(e)) => {
             html! { <ErrorState error={e.clone()} retry={feed.reload.clone()} /> }
         }
@@ -620,7 +637,12 @@ fn runs_panel(props: &RunsProps) -> Html {
     };
     html! {
         <Panel title={if older { "Run report" } else { "Latest run" }} id="run-report" class="run-panel"
-            subtitle={if older { "An older run of this host, module by module" } else { "The host's newest run, module by module and step by step" }}
+            subtitle={match (older, props.cluster) {
+                (true, false) => "An older run of this host, module by module",
+                (false, false) => "The host's newest run, module by module and step by step",
+                (true, true) => "An older run of this cluster, workload by workload",
+                (false, true) => "The cluster's newest run, workload by workload and step by step",
+            }}
             actions={html! { <>{ back.unwrap_or_default() }{ list_error.unwrap_or_default() }{ picker.unwrap_or_default() }</> }}>
             { body }
         </Panel>
@@ -628,17 +650,17 @@ fn runs_panel(props: &RunsProps) -> Html {
 }
 
 #[derive(Properties, PartialEq)]
-struct LabelsProps {
-    detail: HostDetail,
-    admin: bool,
-    rollout_active: bool,
-    on_saved: Callback<()>,
+pub(super) struct LabelsProps {
+    pub detail: HostDetail,
+    pub admin: bool,
+    pub rollout_active: bool,
+    pub on_saved: Callback<()>,
 }
 
 /// Server labels, edited row by row, with what they would make of the host
 /// previewed as they are typed.
 #[function_component(LabelsEditor)]
-fn labels_editor(props: &LabelsProps) -> Html {
+pub(super) fn labels_editor(props: &LabelsProps) -> Html {
     let h = &props.detail.summary;
     let toast = use_toast();
     let draft = use_state(|| rows(&h.labels));
@@ -851,15 +873,15 @@ fn labels_editor(props: &LabelsProps) -> Html {
 }
 
 #[derive(Properties, PartialEq)]
-struct NotesProps {
-    id: String,
-    notes: String,
-    admin: bool,
-    on_saved: Callback<()>,
+pub(super) struct NotesProps {
+    pub id: String,
+    pub notes: String,
+    pub admin: bool,
+    pub on_saved: Callback<()>,
 }
 
 #[function_component(NotesEditor)]
-fn notes_editor(props: &NotesProps) -> Html {
+pub(super) fn notes_editor(props: &NotesProps) -> Html {
     let toast = use_toast();
     let draft = use_state(|| props.notes.clone());
     let saving = use_state(|| false);
@@ -917,7 +939,7 @@ fn notes_editor(props: &NotesProps) -> Html {
         <Panel title="Notes">
             if props.admin {
                 <textarea class="input notes" rows="4" value={(*draft).clone()} {oninput} aria-label="Notes"
-                    placeholder="Anything the next operator should know about this host." />
+                    placeholder="Anything the next operator should know." />
                 <div class="row-actions">
                     <Button small=true onclick={save} busy={*saving} disabled={*draft == props.notes}>{ "Save notes" }</Button>
                 </div>
