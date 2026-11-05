@@ -9,7 +9,7 @@ mod variable;
 mod volume;
 
 pub use entity::{EntityKind, EntitySpec};
-pub use job::{JobSpec, follow_deployment};
+pub use job::{JobSpec, Waits, follow_deployment};
 pub use policy::{Attach, PolicySpec};
 pub use variable::VariableSpec;
 pub use volume::VolumeSpec;

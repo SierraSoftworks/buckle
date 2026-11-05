@@ -40,6 +40,12 @@ pub struct JobSpec {
     /// value is adopted before the plan, so neither the diff nor the apply
     /// touches them.
     pub ignore: Vec<FieldPath>,
+    /// How long the apply waits on a blocked placement; `None`:
+    /// [`PLACEMENT_GRACE`].
+    pub placement_timeout: Option<Duration>,
+    /// How long the apply follows the deployment; `None`:
+    /// [`DEPLOYMENT_TIMEOUT`].
+    pub rollout_timeout: Option<Duration>,
 }
 
 impl JobSpec {
@@ -74,6 +80,25 @@ pub(crate) struct Pending {
     enforce_index: u64,
     /// The job's revision and digest, recorded in the index on apply.
     entry: Entry,
+    waits: Waits,
+}
+
+/// How long an apply waits on the scheduler.
+#[derive(Debug, Clone, Copy)]
+pub struct Waits {
+    /// On a blocked placement.
+    pub placement: Duration,
+    /// On the whole: placement and deployment.
+    pub rollout: Duration,
+}
+
+impl Waits {
+    fn of(spec: &JobSpec) -> Self {
+        Self {
+            placement: spec.placement_timeout.unwrap_or(PLACEMENT_GRACE),
+            rollout: spec.rollout_timeout.unwrap_or(DEPLOYMENT_TIMEOUT),
+        }
+    }
 }
 
 /// How often an apply polls the evaluation and the deployment.
@@ -87,7 +112,7 @@ pub const DEPLOYMENT_TIMEOUT: Duration = Duration::from_secs(3600);
 /// job as unplaceable. A destructive update of a job with a static port
 /// blocks until the old allocation lets go of the port, usually within its
 /// `kill_timeout`.
-const PLACEMENT_GRACE: Duration = Duration::from_secs(300);
+pub const PLACEMENT_GRACE: Duration = Duration::from_secs(300);
 
 /// The values the spec is rendered with: its declared vars, its files, and
 /// `pinned` over both.
@@ -295,6 +320,7 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
                 submission,
                 enforce_index: 0,
                 entry,
+                waits: Waits::of(spec),
             }),
             key,
         });
@@ -349,6 +375,7 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
             submission,
             enforce_index,
             entry,
+            waits: Waits::of(spec),
         }),
     })
 }
@@ -382,7 +409,7 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
     (cx.progress)(&format!("registered {key}"));
     let entry = p.entry.clone();
     index::update(&cx.nomad, &cx.target, |e| index::upsert(e, entry.clone())).await?;
-    let outcome = follow_deployment(cx, key, &eval, modify, DEPLOYMENT_TIMEOUT).await?;
+    let outcome = follow_deployment(cx, key, &eval, modify, p.waits).await?;
     Ok(Applied::changed(format!("registered {key}; {outcome}")))
 }
 
@@ -395,9 +422,9 @@ pub async fn follow_deployment(
     key: &ObjectKey,
     eval_id: &str,
     job_modify_index: u64,
-    timeout: Duration,
+    waits: Waits,
 ) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + waits.rollout;
     let ns = &key.namespace;
     if !eval_id.is_empty() {
         let mut eval_id = eval_id.to_owned();
@@ -442,7 +469,7 @@ pub async fn follow_deployment(
                 }
                 "blocked" => {
                     if let Some((why, since)) = &unplaced
-                        && since.elapsed() >= PLACEMENT_GRACE
+                        && since.elapsed() >= waits.placement
                     {
                         return Err(unplaceable(why));
                     }

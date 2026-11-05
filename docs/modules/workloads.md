@@ -62,6 +62,7 @@ removal: stop
 | `namespace` | The namespace the workload's entities live in, created if missing. Absent: the scheduler's default. |
 | `health` | Checks beside the implicit ones (each job's deployment and allocations; a Deployment's rollout). |
 | `bake` | How long a rollout bakes the cluster after a run that changed this workload, when longer than the phase's `bake`. |
+| `timeouts` | How long an apply waits on the scheduler: `placement` for a placement it cannot make yet (default `5m`; on Nomad a blocked evaluation, such as a static port the old allocation still holds) and `rollout` for the whole deployment (default `1h`; the job's own `progress_deadline` usually ends it first). |
 | `restart_on` | Resources (by file or secret name) whose change restarts the jobs even when their specs did not change. |
 | `removal` | What happens when the workload is dropped: `stop` (default), `purge` or `keep`. |
 

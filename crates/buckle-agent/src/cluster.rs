@@ -1096,6 +1096,8 @@ async fn compile(
                     namespace: cfg.namespace.clone(),
                     live_vars: entry.live_vars.clone(),
                     ignore: paths(entry)?,
+                    placement_timeout: cfg.timeouts.placement,
+                    rollout_timeout: cfg.timeouts.rollout,
                 })
             }
             ResourceKind::Volume => Primitive::Volume(VolumeSpec {
