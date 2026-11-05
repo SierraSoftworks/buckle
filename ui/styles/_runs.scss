@@ -92,6 +92,8 @@
   }
 
   &__raw {
+    flex: 1;
+    min-width: 0;
     margin: 0;
     color: var(--fg);
     font-size: 0.8rem;
@@ -109,12 +111,12 @@
     font-size: 0.76rem;
   }
 
-  // What can be done about it, at its foot.
+  // What can be done about it, top right beside the headline.
   &__actions {
     display: flex;
-    flex-wrap: wrap;
+    flex-shrink: 0;
     gap: 0.5rem;
-    margin-top: 0.6rem;
+    margin: -0.15rem 0;
   }
 }
 

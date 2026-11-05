@@ -253,10 +253,11 @@ describe("approving a phase", () => {
     await close();
   });
 
-  test("a failed host is re-planned from its error", async () => {
+  test("a host whose apply failed is retried from its error", async () => {
     const { page, close } = await open("/rollouts/42");
     await page.getByRole("button", { name: "Details for pi-5" }).click();
-    await page.getByTestId("host-replan").getByRole("button", { name: "Re-plan", exact: true }).click();
+    // pi-5 failed applying a plan it had, so re-planning it applies again.
+    await page.getByTestId("host-replan").getByRole("button", { name: "Retry", exact: true }).click();
     await page.getByRole("status").filter({ hasText: "pi-5: retry sent." }).waitFor();
     assert.equal(await page.getByTestId("host-replan").count(), 0, "a re-planned host has no error to act on");
     await close();

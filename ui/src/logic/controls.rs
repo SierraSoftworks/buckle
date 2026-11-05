@@ -2,7 +2,7 @@
 //! the decision the rollout is waiting on (approve, else pause, retry or
 //! resume) on its face, and the rest behind its menu.
 
-use buckle_api::{RevisionStatus, RevisionSummary, RolloutState, RolloutSummary};
+use buckle_api::{HostRolloutState, RevisionStatus, RevisionSummary, RolloutState, RolloutSummary};
 use chrono::{DateTime, Utc};
 
 use super::tone::{rollout_active, rollout_finished};
@@ -146,6 +146,22 @@ pub fn decisions(state: RolloutState, approve: Option<&str>, hosts: Standing) ->
     all.push(Decision::Abort);
     let primary = all.remove(0);
     Some(Decisions { primary, menu: all })
+}
+
+/// What re-planning a host amounts to, as its button says it: a host that
+/// failed past its plan (its apply or bake failed, it was held, skipped or
+/// missed with a plan in hand) is planned and applied again, a "Retry"; one
+/// whose planning failed, or that is still waiting to apply, only plans again.
+pub fn replan_label(state: HostRolloutState, has_plan: bool) -> &'static str {
+    let waiting = matches!(
+        state,
+        HostRolloutState::PlanPending | HostRolloutState::Planned
+    );
+    if has_plan && !waiting {
+        "Retry"
+    } else {
+        "Re-plan"
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +327,20 @@ mod tests {
         }
         let d = decisions(RolloutState::Baking, None, Standing::default()).unwrap();
         assert!(!d.menu.contains(&SkipBake));
+    }
+
+    #[test]
+    fn a_host_that_failed_past_its_plan_is_retried_else_replanned() {
+        use HostRolloutState as S;
+        for (state, has_plan, want) in [
+            (S::Failed, true, "Retry"),
+            (S::Held, true, "Retry"),
+            (S::Pending, true, "Retry"),
+            (S::Failed, false, "Re-plan"),
+            (S::Planned, true, "Re-plan"),
+            (S::PlanPending, false, "Re-plan"),
+        ] {
+            assert_eq!(replan_label(state, has_plan), want, "{state:?} {has_plan}");
+        }
     }
 }

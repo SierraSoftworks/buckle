@@ -411,7 +411,12 @@
   }
 }
 
+// A host's details under its row. Its content never sets the table's width
+// (a long error or run step would scroll the whole table sideways): it
+// takes the row's width and wraps, or scrolls on its own.
 .host-row {
+  contain: inline-size;
+
   &__ticker {
     margin-top: 0.25rem;
   }

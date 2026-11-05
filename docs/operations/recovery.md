@@ -5,7 +5,7 @@ decision below takes a note, which is kept in the audit log.
 
 | Situation | Act on | Options |
 |---|---|---|
-| One host failed to plan, apply or pass its health checks | The host | Re-plan, continue with checks waived, force apply, skip |
+| One host failed to plan, apply or pass its health checks | The host | Retry or re-plan, continue with checks waived, force apply, skip |
 | A phase ran out of failure budget and paused | The rollout | Fix the cause and retry; or skip the phase, roll back, or abort |
 | The revision is wrong | The rollout | Roll back, abort, or push a fix |
 | A revision that already finished is wrong | The fleet | Push a revert, or roll the fleet back from Rollouts |
@@ -14,17 +14,18 @@ decision below takes a note, which is kept in the audit log.
 ## A failed host
 
 A failed host is red in the pipeline. Expand its row under **Hosts** for what failed, why, and what
-to do about it, followed by its timeline and run report. **Re-plan** on the error retries the host at
-once; **Re-plan all** retries every failed host of the rollout. A host whose own rollback also
+to do about it, followed by its timeline and run report. The button at the top right of the error acts at
+once: **Retry** when the host failed past its plan (it plans and applies again), **Re-plan** when its
+planning failed; **Retry all** retries every failed host of the rollout. A host whose own rollback also
 failed is marked **needs attention**: it is on a mix of revisions until someone acts.
 
-<Screenshot name="rollout-failed-host" alt="A failed host's row: the error chain, what to fix, and the Re-plan buttons on it" />
+<Screenshot name="rollout-failed-host" alt="A failed host's row: the error chain, what to fix, and the Retry button at its top right" />
 
 Every host decision is also in the **⋮** menu on the host's row.
 
 | Action | What it does | Use it when |
 |---|---|---|
-| **Re-plan** | Plans the host again as it stands; a failed, held or skipped host is then re-applied with the same checks. Offered on any host whose plan is not applied yet. | You fixed the cause: a secret, a repository, an identity, the host itself. |
+| **Retry** / **Re-plan** | Plans the host again as it stands; a host that failed past its plan (Retry) is then re-applied with the same checks. Re-plan is offered on any host whose plan is not applied yet. | You fixed the cause: a secret, a repository, an identity, the host itself. |
 | **Continue with checks waived…** | Retries with the named failing checks waived for this host in this rollout. They still run and report. | A check is wrong or flaky, not the change. |
 | **Skip bake period…** | Counts a baking host as baked now. Refused while one of its checks is failing. | The change is verified and the bake window only delays the rollout. |
 | **Force apply…** | Applies whatever the host plans now, without approval, digest check or a passing baseline. | A plan keeps changing between attempts, or a host held at baseline must go ahead. |
