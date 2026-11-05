@@ -1010,7 +1010,8 @@ impl Controller {
     /// rollout stopped running) to planned, so it starts again from its
     /// baseline when the rollout resumes.
     fn defer_host(&mut self, ri: usize, hi: usize, why: &str) {
-        if let Some(pi) = self.live[ri].hosts[hi].runtime.phase_index
+        if !self.unchanged(ri, hi)
+            && let Some(pi) = self.live[ri].hosts[hi].runtime.phase_index
             && let Some(p) = self.live[ri].record.runtime.phases.get_mut(pi)
         {
             p.started = p.started.saturating_sub(1);
@@ -1493,9 +1494,11 @@ impl Controller {
                 let approved = h.plan_digest.clone().unwrap_or_default();
                 let refusals = h.runtime.stale_refusals + 1;
                 let phase_index = h.runtime.phase_index;
+                let took_slot = !self.unchanged(ri, hi);
                 // The host never applied: its slot in the wave is given back,
                 // as when it is deferred, so wave numbers count real waves.
-                if let Some(pi) = phase_index
+                if took_slot
+                    && let Some(pi) = phase_index
                     && let Some(p) = self.live[ri].record.runtime.phases.get_mut(pi)
                 {
                     p.started = p.started.saturating_sub(1);
@@ -1770,15 +1773,15 @@ impl Controller {
                     })
             });
             if let Some(pi) = gate_phase {
-                let waived = row
-                    .map(|hi| self.live[ri].hosts[hi].runtime.waived_checks.clone())
-                    .unwrap_or_default();
-                let failures: Vec<String> = report
-                    .results
-                    .iter()
-                    .filter(|r| is_failure(r, &waived))
-                    .map(check_name)
-                    .collect();
+                let failures: Vec<String> = match row {
+                    Some(hi) => self.failures_of(ri, hi, &report.results),
+                    None => report
+                        .results
+                        .iter()
+                        .filter(|r| is_failure(r, &[]))
+                        .map(check_name)
+                        .collect(),
+                };
                 let phase_name = self.live[ri].record.runtime.phases[pi].name.clone();
                 if failures.is_empty() {
                     if let Some(g) = self.live[ri].record.runtime.phases[pi].gate.as_mut() {
@@ -1804,7 +1807,6 @@ impl Controller {
                 continue;
             };
             let state = self.live[ri].hosts[hi].state;
-            let waived = self.live[ri].hosts[hi].runtime.waived_checks.clone();
             match (scope, state) {
                 (HealthScope::Baseline, HostPhase::Baseline)
                     if self.live[ri].hosts[hi].runtime.request_id.as_deref()
@@ -1813,12 +1815,7 @@ impl Controller {
                 {
                     self.live[ri].hosts[hi].health =
                         serde_json::to_value(HealthView::from(&report)).ok();
-                    let failures: Vec<String> = report
-                        .results
-                        .iter()
-                        .filter(|r| is_failure(r, &waived))
-                        .map(check_name)
-                        .collect();
+                    let failures = self.failures_of(ri, hi, &report.results);
                     if failures.is_empty() {
                         self.send_apply(ri, hi);
                     } else {
@@ -1851,11 +1848,12 @@ impl Controller {
                 {
                     self.live[ri].hosts[hi].health =
                         serde_json::to_value(HealthView::from(&report)).ok();
+                    let failures = self.failures_of(ri, hi, &report.results);
                     let h = &mut self.live[ri].hosts[hi];
                     h.runtime.bake_reports = h.runtime.bake_reports.saturating_add(1);
                     for r in &report.results {
                         let name = check_name(r);
-                        if is_failure(r, &waived) {
+                        if failures.contains(&name) {
                             h.runtime.failing_since.entry(name).or_insert(now);
                         } else if r.passed && h.runtime.failing_since.remove(&name).is_some() {
                             h.runtime.flaps.push(name);
@@ -3940,10 +3938,21 @@ impl Controller {
             let n = self.live[ri].phase_hosts(pi).len();
             self.live[ri].record.runtime.phases[pi].parallel.resolve(n) as u32
         };
+        let unchanged = self.unchanged(ri, hi);
         let started = self.live[ri].record.runtime.phases[pi].started;
-        self.live[ri].record.runtime.phases[pi].started += 1;
+        // A target with nothing to change rides along with the current wave
+        // without taking a slot of it.
+        if !unchanged {
+            self.live[ri].record.runtime.phases[pi].started += 1;
+        }
         self.live[ri].dirty = true;
         self.live[ri].hosts[hi].wave = Some(started / parallel.max(1) + 1);
+        if unchanged {
+            // Nothing to change: its health before the run says nothing
+            // about the run, so it is not checked (nor held for it).
+            self.send_apply(ri, hi);
+            return;
+        }
         self.set_host_state(ri, hi, HostPhase::Baseline, "baseline health requested");
         self.send_baseline(ri, hi);
     }
@@ -4140,6 +4149,42 @@ impl Controller {
         serde_json::from_value::<buckle_core::plan::Plan>(plan.clone())
             .ok()
             .map(|p| bake::planned(&p))
+    }
+
+    /// Row `hi` is in flight and holds a slot of its phase's `parallel`.
+    fn takes_slot(&self, ri: usize, hi: usize) -> bool {
+        self.live[ri].hosts[hi].state.in_flight() && !self.unchanged(ri, hi)
+    }
+
+    /// Row `hi`'s plan changes nothing (no changes, removals or deferred
+    /// modules): its health does not gate the rollout, and it takes no slot
+    /// of its phase's `parallel`.
+    fn unchanged(&self, ri: usize, hi: usize) -> bool {
+        let r = &self.live[ri].hosts[hi].runtime;
+        r.plan_changes == Some(0) && r.plan_removals == Some(0) && r.deferred_modules.is_empty()
+    }
+
+    /// The workloads whose checks gate cluster row `hi` (its baseline, bake
+    /// and gates): those its plan changes, so a workload this rollout leaves
+    /// alone, already unhealthy, does not hold it. None (every check gates)
+    /// for a host, or a cluster without a plan.
+    fn gated_workloads(&self, ri: usize, hi: usize) -> Option<BTreeSet<String>> {
+        (self.live[ri].hosts[hi].runtime.kind == TargetKind::Cluster)
+            .then(|| self.plan_changes(ri, hi))
+            .flatten()
+    }
+
+    /// Row `hi`'s required, failing, non-waived checks in `results`, of the
+    /// workloads that gate it.
+    fn failures_of(&self, ri: usize, hi: usize, results: &[pb::HealthResult]) -> Vec<String> {
+        let h = &self.live[ri].hosts[hi];
+        let gated = self.gated_workloads(ri, hi);
+        results
+            .iter()
+            .filter(|r| is_failure(r, &h.runtime.waived_checks))
+            .filter(|r| gated.as_ref().is_none_or(|g| g.contains(&r.module)))
+            .map(check_name)
+            .collect()
     }
 
     /// A host back from a reboot bakes for at least `settle` (and a minute),
@@ -4794,14 +4839,13 @@ impl Controller {
             let cap = self.live[ri].record.runtime.phases[p]
                 .parallel
                 .resolve(hosts.len());
-            let mut inflight = hosts
-                .iter()
-                .filter(|&&i| self.live[ri].hosts[i].state.in_flight())
-                .count();
+            let mut inflight = hosts.iter().filter(|&&i| self.takes_slot(ri, i)).count();
             let busy = self.busy_elsewhere(ri);
             for &hi in &hosts {
-                if inflight >= cap {
-                    break;
+                // A target with nothing to change starts past the cap.
+                let slot = !self.unchanged(ri, hi);
+                if slot && inflight >= cap {
+                    continue;
                 }
                 let h = &self.live[ri].hosts[hi];
                 if h.state == HostPhase::Planned
@@ -4811,7 +4855,7 @@ impl Controller {
                     && self.approved(ri, hi)
                 {
                     self.start_baseline(ri, hi);
-                    inflight += 1;
+                    inflight += usize::from(slot);
                     changed = true;
                 }
             }
@@ -4969,11 +5013,8 @@ impl Controller {
             let cap = self.live[ri].record.runtime.phases[pi]
                 .parallel
                 .resolve(hosts.len());
-            let inflight = hosts
-                .iter()
-                .filter(|&&i| self.live[ri].hosts[i].state.in_flight())
-                .count();
-            if inflight < cap {
+            let inflight = hosts.iter().filter(|&&i| self.takes_slot(ri, i)).count();
+            if inflight < cap || self.unchanged(ri, hi) {
                 self.start_baseline(ri, hi);
                 changed = true;
             }
@@ -5028,10 +5069,14 @@ impl Controller {
     }
 
     fn start_gate(&mut self, ri: usize, p: usize) {
+        // A target this rollout changed nothing on (in a single step) is not
+        // gated: its health is not the rollout's doing.
         let targets: Vec<usize> = (0..self.live[ri].hosts.len())
             .filter(|&hi| {
                 let h = &self.live[ri].hosts[hi];
-                h.state == HostPhase::Healthy && h.runtime.phase_index.is_some_and(|i| i <= p)
+                h.state == HostPhase::Healthy
+                    && h.runtime.phase_index.is_some_and(|i| i <= p)
+                    && !(h.runtime.step == 0 && self.unchanged(ri, hi))
             })
             .collect();
         let mut gate = GateRuntime::default();
@@ -5338,13 +5383,11 @@ impl Controller {
             .filter(|l| l.record.is_active())
             .flat_map(|l| l.hosts.iter().map(|h| h.host.clone()))
             .collect();
-        let mut inflight = hosts
-            .iter()
-            .filter(|&&i| self.live[ri].hosts[i].state.in_flight())
-            .count();
+        let mut inflight = hosts.iter().filter(|&&i| self.takes_slot(ri, i)).count();
         for &hi in &hosts {
-            if inflight >= cap {
-                break;
+            let slot = !self.unchanged(ri, hi);
+            if slot && inflight >= cap {
+                continue;
             }
             let h = &self.live[ri].hosts[hi];
             if h.state == HostPhase::Planned
@@ -5354,7 +5397,7 @@ impl Controller {
                 && self.approved(ri, hi)
             {
                 self.start_baseline(ri, hi);
-                inflight += 1;
+                inflight += usize::from(slot);
             }
         }
     }

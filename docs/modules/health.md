@@ -39,6 +39,10 @@ scrubbed of secret values before they leave the host.
 | **Before the next phase** | Every host this rollout already updated is checked again; a regression pauses the rollout before the next phase starts. |
 | **Each drift pass** | Every 15 minutes by default, giving the Overview a current reading between rollouts. |
 
+Only what the rollout touches gates it. A target whose plan changes nothing skips its baseline and
+the pre-phase gate, and a cluster is checked only on the workloads its plan changes, so a workload
+already failing that the rollout leaves alone does not hold it.
+
 A failing required check only counts once it has failed continuously for `rollout.settle`
 (default `2m`), so a service that restarts during the apply is not mistaken for a broken one. A
 check that recovers inside that window is recorded as a flap. Locally, `buckle apply` runs checks
