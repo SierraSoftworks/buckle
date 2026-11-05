@@ -593,6 +593,31 @@ impl Serialize for ResourceEntry {
     }
 }
 
+/// How long an apply waits on the scheduler for a workload's objects.
+/// Scheduler-neutral: each executor maps them onto what its scheduler
+/// reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadTimeouts {
+    /// For a placement the scheduler cannot make yet (Nomad's blocked
+    /// evaluation, say a static port the old allocation still holds),
+    /// before the apply fails.
+    #[serde(
+        default,
+        with = "humantime_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub placement: Option<std::time::Duration>,
+    /// For a rollout to finish (Nomad's deployment) once placed. The
+    /// scheduler's own deadlines (`progress_deadline`) usually end it first.
+    #[serde(
+        default,
+        with = "humantime_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rollout: Option<std::time::Duration>,
+}
+
 /// `workload.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawWorkload")]
@@ -634,6 +659,10 @@ pub struct WorkloadConfig {
     /// workload; the phase's `bake` is the minimum.
     #[serde(default, with = "humantime_serde")]
     pub bake: Option<std::time::Duration>,
+    /// How long an apply waits on the scheduler; absent: the executor's
+    /// defaults.
+    #[serde(default)]
+    pub timeouts: WorkloadTimeouts,
     /// Entries (by file or secret name) whose change restarts the jobs even
     /// when their specs did not change.
     #[serde(default)]
@@ -674,6 +703,8 @@ struct RawWorkload {
     health: Vec<HealthDecl>,
     #[serde(default, with = "humantime_serde")]
     bake: Option<std::time::Duration>,
+    #[serde(default)]
+    timeouts: WorkloadTimeouts,
     #[serde(default)]
     restart_on: Vec<String>,
     #[serde(default)]
@@ -796,6 +827,7 @@ impl TryFrom<RawWorkload> for WorkloadConfig {
             namespace: raw.namespace,
             health: raw.health,
             bake: raw.bake,
+            timeouts: raw.timeouts,
             restart_on: raw.restart_on,
             removal: raw.removal,
             legacy_keys,
@@ -934,6 +966,7 @@ impl WorkloadConfig {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use std::time::Duration;
 
     const NOMAD: &str = r#"
 name: atuin
@@ -1227,6 +1260,29 @@ removal: purge
         let again = WorkloadConfig::parse(&yaml).unwrap();
         assert_eq!(again.resources, w.resources);
         assert_eq!(again.needs(), w.needs());
+    }
+
+    #[rstest]
+    #[case::absent("", WorkloadTimeouts::default())]
+    #[case::placement(
+        "timeouts: { placement: 10m }\n",
+        WorkloadTimeouts { placement: Some(Duration::from_secs(600)), rollout: None }
+    )]
+    #[case::both(
+        "timeouts: { placement: 30s, rollout: 2h }\n",
+        WorkloadTimeouts {
+            placement: Some(Duration::from_secs(30)),
+            rollout: Some(Duration::from_secs(7200)),
+        }
+    )]
+    fn timeouts_are_optional_durations(#[case] yaml: &str, #[case] expected: WorkloadTimeouts) {
+        let w = WorkloadConfig::parse(&format!("name: paste\n{yaml}")).unwrap();
+        assert_eq!(w.timeouts, expected);
+    }
+
+    #[test]
+    fn unknown_timeouts_are_refused() {
+        assert!(WorkloadConfig::parse("name: paste\ntimeouts: { plaecment: 10m }\n").is_err());
     }
 
     #[rstest]

@@ -686,14 +686,23 @@ async fn concurrent_index_writes_through_one_client_all_land() {
 }
 
 #[rstest::rstest]
-#[case::placed_once_the_port_frees(3, None)]
-#[case::never_placed(usize::MAX, Some("could not be placed: api: cannot place"))]
+#[case::placed_once_the_port_frees(3, None, None)]
+#[case::never_placed(usize::MAX, None, Some("could not be placed: api: cannot place"))]
+// 2s polls: blocked for ~7 minutes, past the default grace of 5.
+#[case::past_the_default_grace(200, None, Some("could not be placed"))]
+#[case::within_the_workloads_timeout(200, Some(600), None)]
 #[tokio::test(start_paused = true)]
-async fn a_blocked_placement_is_waited_for(#[case] polls: usize, #[case] error: Option<&str>) {
+async fn a_blocked_placement_is_waited_for(
+    #[case] polls: usize,
+    #[case] placement_secs: Option<u64>,
+    #[case] error: Option<&str>,
+) {
     let fake = FakeNomad::new();
     fake.block_placement(polls);
     let cx = cx(&fake, "r1");
-    let applied = workload(Some(atuin_job("atuin:1")))
+    let mut spec = atuin_job("atuin:1");
+    spec.placement_timeout = placement_secs.map(std::time::Duration::from_secs);
+    let applied = workload(Some(spec))
         .plan(&cx)
         .await
         .unwrap()

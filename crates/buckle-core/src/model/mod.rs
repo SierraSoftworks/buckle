@@ -16,6 +16,7 @@ pub use cluster::{
 pub use task_decl::{RetryPolicy, TaskDecl};
 pub use workload::{
     Items, Layer, Need, PolicyAttach, ResourceEntry, ResourceKind, WorkloadConfig, WorkloadRemoval,
+    WorkloadTimeouts,
 };
 
 use crate::Filter;
