@@ -2153,6 +2153,13 @@ fn cluster_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         drift: vec![],
         latest_run,
         workloads,
+        // The nomad servers its executors selector matches; the lab
+        // cluster's matches no agent yet.
+        executors: if home {
+            vec!["nas-1".into(), "pi-1".into(), "pi-2".into(), "pi-3".into()]
+        } else {
+            vec![]
+        },
         actions: demo_actions(host, !home),
     }
 }
@@ -2383,6 +2390,7 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         drift,
         latest_run,
         workloads: vec![],
+        executors: vec![],
         actions: demo_actions(host, pending),
     }
 }

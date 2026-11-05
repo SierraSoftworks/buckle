@@ -9,32 +9,33 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    ActionInfo, AgentUpgrade, Connection, HostCheck, HostDetail, HostPatch, HostPreview,
-    HostStatus, RunReport, RunSummary, UpgradeState,
+    AgentUpgrade, Connection, HostCheck, HostDetail, HostPatch, HostPreview, HostStatus,
+    UpgradeState,
 };
 use chrono::{DateTime, Utc};
-use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
+use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
 use crate::components::ui::{Note, NoteKind};
 use yew_router::prelude::*;
 
+use super::modules_card::ModulesPanel;
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
-    ActionsButton, BlueprintView, Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState,
-    JsonTree, Kind, Loading, PageHead, Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink,
+    ActionsButton, Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind,
+    Loading, PageHead, Panel, Pill, Refresh, RouteLink, TraceLink,
     changes::{RunChanges, Took},
     host_state_pills, use_target_actions, use_toast,
 };
-use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
+use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
 use crate::logic::format::{
-    commit, count, relative, relative_opt, rollout_label, short, short_duration, timestamp,
+    commit, relative, relative_opt, rollout_label, short, short_duration, timestamp,
 };
 use crate::logic::health::CheckState;
 use crate::logic::labels::{Change, Row, changes, collect, effective, rows};
 use crate::logic::live::{apply_fleet, apply_host_detail};
-use crate::logic::run::{follow_run_list, newest_run, run_label};
+use crate::logic::run::newest_run;
 use crate::logic::tone::{Tone, check_status_tone, outcome_tone};
 use crate::store::use_live;
 
@@ -289,6 +290,8 @@ pub fn host_page(props: &Props) -> Html {
         }
     });
 
+    let shown = (*picked).clone().or(newest.clone());
+
     html! {
         <div class="page page--wide">
             <PageHead title={h.id.clone()} {subtitle} {actions} />
@@ -306,10 +309,13 @@ pub fn host_page(props: &Props) -> Html {
                         ("Health read", html! { <span title={h.health_at.map(timestamp)}>{ relative_opt(h.health_at, now) }</span> }),
                     ]) }
                 </Panel>
-                <NotesEditor id={h.id.clone()} notes={h.notes.clone()} admin={admin} on_saved={detail.reload.clone()} />
-                <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
+                <Panel title="Notes and labels" class="notes-labels">
+                    <NotesEditor id={h.id.clone()} notes={h.notes.clone()} admin={admin} on_saved={detail.reload.clone()} embedded=true />
+                    <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} embedded=true />
+                </Panel>
             </div>
-            { health_panel(&d.health_checks, now, false, &d.actions, module_actions.as_ref()) }
+            <ModulesPanel detail={d.clone()} on_action={module_actions.clone()} newest={newest.clone()} picked={(*picked).clone()}
+                on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             if !d.drift.is_empty() || h.drifted {
                 <Panel title="Drift" subtitle="What the latest drift check found different from the applied revision">
                     if d.drift.is_empty() {
@@ -327,18 +333,12 @@ pub fn host_page(props: &Props) -> Html {
                     }) }
                 </Panel>
             }
-            <RunsPanel host={h.id.clone()} latest={d.latest_run.clone()} newest={newest.clone()}
-                picked={(*picked).clone()} on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
-            <Panel title="Blueprint" subtitle="What Buckle manages on this host, module by module: each resource's state and whether removal cleans it up">
-                <BlueprintView resources={d.resources.clone()} drift={d.drift.clone()} run={d.latest_run.clone()}
-                    actions={d.actions.clone()} on_action={module_actions.clone()} />
-            </Panel>
-            <Panel title="Recent runs">{ runs(&d, now, (*picked).clone().or(newest.clone()), &{
+            <Panel title="Recent runs">{ runs(&d, now, shown, &{
                 let picked = picked.clone();
                 let newest = newest.clone();
                 Callback::from(move |run: String| {
                     picked.set((Some(&run) != newest.as_ref()).then_some(run));
-                    if let Some(el) = crate::util::window().document().and_then(|d| d.get_element_by_id("run-report")) {
+                    if let Some(el) = crate::util::window().document().and_then(|d| d.get_element_by_id("modules")) {
                         el.scroll_into_view();
                     }
                 })
@@ -395,52 +395,10 @@ fn agent_version(
     html! { <>{ version }{ " " }{ status }{ for error }</> }
 }
 
-/// Each check as it reads now, module by module, with how it fared in the
-/// host's recent rollouts: one mark per rollout, oldest to newest, coloured
-/// by its worst reading.
-pub(super) fn health_panel(
-    checks: &[HostCheck],
-    now: DateTime<Utc>,
-    cluster: bool,
-    actions: &[ActionInfo],
-    on_action: Option<&Callback<ActionInfo>>,
-) -> Html {
-    let mut by_module: BTreeMap<&str, Vec<&HostCheck>> = BTreeMap::new();
-    for c in checks {
-        by_module.entry(c.module.as_str()).or_default().push(c);
-    }
-    html! {
-        <Panel title="Health" subtitle="Each check as it reads now, and its worst reading in each recent rollout">
-            if checks.is_empty() {
-                <Empty title="No health results" message={if cluster {
-                    "Each workload's jobs are checked during rollouts and whenever the cluster's health is read."
-                } else {
-                    "Checks run with each drift check and during rollouts."
-                }} />
-            }
-            { for by_module.into_iter().map(|(module, list)| {
-                let worst = list.iter().map(|c| CheckState::of(&c.status, c.required)).max();
-                let n = list.len();
-                html! {
-                    <section class={classes!("health-module", worst.map(|w| w.tone().class()))} data-module={module.to_string()}>
-                        <h3 class="health-module__head">
-                            <span class="mono">{ module.to_string() }</span>
-                            if let Some(w) = worst { <Pill tone={w.tone()} label={w.label()} /> }
-                            <span class="muted small">{ count(n, "check", "checks") }</span>
-                            if let Some(on_run) = on_action {
-                                <ActionsButton actions={crate::logic::actions::of_module(actions, module)}
-                                    on_run={on_run.clone()} testid={format!("actions-{module}")} />
-                            }
-                        </h3>
-                        <ul class="checks">{ for list.into_iter().map(|c| check_row(c, now)) }</ul>
-                    </section>
-                }
-            }) }
-        </Panel>
-    }
-}
-
-fn check_row(c: &HostCheck, now: DateTime<Utc>) -> Html {
+/// One check as it reads now, with how it fared in the target's recent
+/// rollouts: one mark per rollout, oldest to newest, coloured by its worst
+/// reading.
+pub(super) fn check_row(c: &HostCheck, now: DateTime<Utc>) -> Html {
     let state = CheckState::of(&c.status, c.required);
     html! {
         <li class="checks__item" data-check={format!("{}/{}", c.module, c.check)} data-state={state.slug()}>
@@ -538,158 +496,18 @@ pub(super) fn runs(
 }
 
 #[derive(Properties, PartialEq)]
-pub(super) struct RunsProps {
-    pub host: String,
-    /// A cluster's runs: workload by workload.
-    #[prop_or_default]
-    pub cluster: bool,
-    /// The detail's latest run, kept current.
-    pub latest: Option<RunReport>,
-    /// The newest run heard of (a run may have started since the detail).
-    pub newest: Option<String>,
-    /// The run the reader picked; `None` follows the newest.
-    pub picked: Option<String>,
-    pub on_pick: Callback<Option<String>>,
-}
-
-/// The report of the host's newest run, live, or of an older one picked
-/// from the host's runs.
-#[function_component(RunsPanel)]
-pub(super) fn runs_panel(props: &RunsProps) -> Html {
-    let now = use_now(30);
-    let shown = props.picked.clone().or_else(|| props.newest.clone());
-    let older = props.picked.is_some() && props.picked != props.newest;
-    let feed = use_run_report(
-        shown.clone().map(|run| RunSource::Host {
-            host: props.host.clone(),
-            run,
-        }),
-        props.latest.clone(),
-    );
-
-    // The picker's list, with states kept current, fetched again when a run
-    // it does not list starts.
-    let list = use_fetch(
-        props.host.clone(),
-        |id| async move { api::host_runs(&id).await },
-    );
-    let store = use_live();
-    let mut runs: Vec<RunSummary> = list.value().cloned().unwrap_or_default();
-    let unlisted = follow_run_list(
-        &mut runs,
-        &props.host,
-        list.data.as_ref().map(|d| d.0),
-        &store.log,
-    );
-    // Fetched again once per update about a run it lacks: a fetch that
-    // fails is tried again on the next such update, not in a loop.
-    let tried = use_mut_ref(|| 0u64);
-    {
-        let (reload, tried) = (list.reload.clone(), tried.clone());
-        use_effect_with((unlisted, list.loading), move |(unlisted, loading)| {
-            if let Some(seq) = *unlisted
-                && !*loading
-                && seq > *tried.borrow()
-            {
-                *tried.borrow_mut() = seq;
-                reload.emit(());
-            }
-            || ()
-        });
-    }
-    runs.retain(|r| !r.id.is_empty());
-    let list_error = list.error.as_ref().map(|e| {
-        let reload = list.reload.clone();
-        html! {
-            <span class="run-picker__error" role="alert" title={e.to_string()}>
-                { if runs.is_empty() { "The host's runs could not be listed." } else { "The list of runs may be out of date." } }
-                <Button small=true kind={Kind::Subtle} onclick={Callback::from(move |_| reload.emit(()))}>{ "Try again" }</Button>
-            </span>
-        }
-    });
-
-    // The select shows the run shown, also after "Show the newest" or a
-    // recent-runs row changed it (an option's `selected` attribute does not
-    // move a select the reader has already changed).
-    let select = use_node_ref();
-    {
-        let select = select.clone();
-        let value = shown.clone().unwrap_or_default();
-        use_effect_with((value, runs.len()), move |(value, _)| {
-            if let Some(el) = select.cast::<HtmlSelectElement>() {
-                el.set_value(value);
-            }
-            || ()
-        });
-    }
-
-    let onchange = {
-        let (on_pick, newest) = (props.on_pick.clone(), props.newest.clone());
-        Callback::from(move |e: Event| {
-            let run = e.target_unchecked_into::<HtmlSelectElement>().value();
-            on_pick.emit((Some(&run) != newest.as_ref()).then_some(run));
-        })
-    };
-    let picker = (!runs.is_empty()).then(|| {
-        let listed = shown.as_ref().is_some_and(|s| runs.iter().any(|r| &r.id == s));
-        html! {
-            <label class="run-picker">
-                <span class="muted small">{ "Run" }</span>
-                <select class="input" aria-label="Run to show" ref={select.clone()} {onchange}>
-                    if let (false, Some(s)) = (listed, &shown) {
-                        <option value={s.clone()} selected=true>{ "newest" }</option>
-                    }
-                    { for runs.iter().enumerate().map(|(i, r)| {
-                        let state = r.state.map(run_label).map(str::to_string).unwrap_or_else(|| r.outcome.replace('_', " "));
-                        let label = format!("{}{} · {state} · {}", if i == 0 { "newest · " } else { "" }, relative(r.started_at, now), commit(&r.revision));
-                        html! { <option value={r.id.clone()} selected={shown.as_deref() == Some(r.id.as_str())}>{ label }</option> }
-                    }) }
-                </select>
-            </label>
-        }
-    });
-    let back = older.then(|| {
-        let on_pick = props.on_pick.clone();
-        html! { <Button small=true kind={Kind::Subtle} onclick={Callback::from(move |_| on_pick.emit(None))}>{ "Show the newest" }</Button> }
-    });
-
-    let body = match (&shown, &feed.report, &feed.error) {
-        (None, _, _) => html! {
-            <Empty title="No runs yet" message={if props.cluster {
-                "A report appears here once a revision is applied to the cluster: every workload and step, live while it runs."
-            } else {
-                "A report appears here once the host applies a revision: every module and step, live while it runs."
-            }} />
-        },
-        (Some(_), Some(report), _) => {
-            html! { <RunReportView report={report.clone()} workloads={props.cluster} /> }
-        }
-        (Some(_), None, Some(e)) => {
-            html! { <ErrorState error={e.clone()} retry={feed.reload.clone()} /> }
-        }
-        (Some(_), None, None) if feed.settled => html! { <Empty title="No report for this run" /> },
-        (Some(_), None, None) => html! { <Loading label="Loading the run…" /> },
-    };
-    html! {
-        <Panel title={if older { "Run report" } else { "Latest run" }} id="run-report" class="run-panel"
-            subtitle={match (older, props.cluster) {
-                (true, false) => "An older run of this host, module by module",
-                (false, false) => "The host's newest run, module by module and step by step",
-                (true, true) => "An older run of this cluster, workload by workload",
-                (false, true) => "The cluster's newest run, workload by workload and step by step",
-            }}
-            actions={html! { <>{ back.unwrap_or_default() }{ list_error.unwrap_or_default() }{ picker.unwrap_or_default() }</> }}>
-            { body }
-        </Panel>
-    }
-}
-
-#[derive(Properties, PartialEq)]
 pub(super) struct LabelsProps {
     pub detail: HostDetail,
     pub admin: bool,
     pub rollout_active: bool,
     pub on_saved: Callback<()>,
+    /// Drawn inside another panel, under a subheading, not as its own.
+    #[prop_or_default]
+    pub embedded: bool,
+    /// Shown in place of what the labels would make of the target, which
+    /// is then previewed only while there are unsaved changes.
+    #[prop_or_default]
+    pub aside: Option<Html>,
 }
 
 /// Server labels, edited row by row, with what they would make of the host
@@ -850,8 +668,13 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
         </> },
     };
 
-    html! {
-        <Panel title="Labels" subtitle="Operator labels win over the agent's own" class="grid__wide">
+    let preview_block = html! { <>
+        if props.aside.is_none() || !changed.is_empty() {
+            <h3 class="subhead">{ "Would land in" }</h3>
+            { preview_view }
+        }
+    </> };
+    let labels = html! {
             <div class="labels">
                 <div class="labels__edit">
                     <h3 class="subhead">{ "Reported by the agent" }</h3>
@@ -880,8 +703,8 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                     }
                 </div>
                 <div class="labels__preview">
-                    <h3 class="subhead">{ "Would land in" }</h3>
-                    { preview_view }
+                    { props.aside.clone().unwrap_or_default() }
+                    { preview_block }
                     if !changed.is_empty() {
                         <ul class="changes" aria-label="Unsaved changes">
                             { for changed.iter().map(|c| match c {
@@ -895,7 +718,8 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                         <Note>{ "A rollout is in progress: the change applies to the next rollout's selection and does not move this host between phases mid-flight." }</Note>
                     }
                     if let Some(e) = &*save_error { <Note kind={NoteKind::Danger}>{ e.clone() }</Note> }
-                    if props.admin {
+                    // Beside an aside, offered once there is something to save.
+                    if props.admin && (props.aside.is_none() || !changed.is_empty()) {
                         <div class="row-actions">
                             <Button kind={Kind::Primary} onclick={save} busy={*saving} disabled={changed.is_empty() || wanted.is_none()}>{ "Save labels" }</Button>
                             <Button kind={Kind::Subtle} onclick={reset} disabled={changed.is_empty()}>{ "Discard" }</Button>
@@ -903,6 +727,16 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                     }
                 </div>
             </div>
+    };
+    if props.embedded {
+        return html! { <section class="panel__section" aria-label="Labels">
+            <h3 class="subhead">{ "Labels" }<span class="muted small">{ " · operator labels win over the agent's own" }</span></h3>
+            { labels }
+        </section> };
+    }
+    html! {
+        <Panel title="Labels" subtitle="Operator labels win over the agent's own" class="grid__wide">
+            { labels }
         </Panel>
     }
 }
@@ -913,6 +747,9 @@ pub(super) struct NotesProps {
     pub notes: String,
     pub admin: bool,
     pub on_saved: Callback<()>,
+    /// Drawn inside another panel, under a subheading, not as its own.
+    #[prop_or_default]
+    pub embedded: bool,
 }
 
 #[function_component(NotesEditor)]
@@ -970,8 +807,7 @@ pub(super) fn notes_editor(props: &NotesProps) -> Html {
             });
         })
     };
-    html! {
-        <Panel title="Notes">
+    let body = html! { <>
             if props.admin {
                 <textarea class="input notes" rows="4" value={(*draft).clone()} {oninput} aria-label="Notes"
                     placeholder="Anything the next operator should know." />
@@ -983,6 +819,12 @@ pub(super) fn notes_editor(props: &NotesProps) -> Html {
             } else {
                 <p class="notes-text">{ props.notes.clone() }</p>
             }
-        </Panel>
+    </> };
+    if props.embedded {
+        return html! { <section class="panel__section" aria-label="Notes">
+            <h3 class="subhead">{ "Notes" }</h3>
+            { body }
+        </section> };
     }
+    html! { <Panel title="Notes">{ body }</Panel> }
 }

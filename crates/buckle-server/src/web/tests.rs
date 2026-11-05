@@ -15,7 +15,7 @@ use actix_web::test;
 use base64::Engine as _;
 use buckle_api::HostStatus;
 use buckle_core::secrets::InstallKey;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
 use wiremock::matchers::{method, path};
@@ -428,9 +428,22 @@ async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
     revision(
         &e,
         "r1",
-        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      ui: https://nomad.example:4646/\n",
+        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      ui: https://nomad.example:4646/\n      executors: 'host.labels.role == \"nomad\"'\n",
     )
     .await;
+    // Agents able to speak for it: active and matching its executors.
+    for (id, status, role) in [
+        ("seer", HostStatus::Active, "nomad"),
+        ("prophet", HostStatus::Active, "web"),
+        ("oracle", HostStatus::Pending, "nomad"),
+    ] {
+        add_host(&e.store, id, status).await;
+        let labels = BTreeMap::from([("role".to_string(), role.to_string())]);
+        e.store
+            .call(move |db| db.hosts().set_labels(id, &labels).map(|_| ()))
+            .await
+            .unwrap();
+    }
     let dir = e.state.revisions.dir("r1");
     for (name, needs) in [("postgresql", ""), ("atuin", "needs: [postgresql]\n")] {
         let w = dir.join(format!("workloads/{name}/files"));
@@ -570,6 +583,7 @@ async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
     let atuin = detail.workloads.iter().find(|w| w.name == "atuin").unwrap();
     assert_eq!(atuin.needs, vec!["postgresql"]);
     assert_eq!(atuin.resources, vec!["job"]);
+    assert_eq!(detail.executors, vec!["seer"]);
     assert_eq!(detail.summary.cluster_status, Some(status));
     let spec = &detail.summary.cluster.as_ref().unwrap().spec;
     assert_eq!(

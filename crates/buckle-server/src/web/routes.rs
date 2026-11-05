@@ -795,7 +795,8 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         Some(run) => Some(stored_report(&state, run).await?),
         None => None,
     };
-    let workloads = cluster_workloads(&state, &summary, facts.as_ref().map(|(f, _)| f)).await;
+    let (workloads, executors) =
+        cluster_view(&state, &summary, facts.as_ref().map(|(f, _)| f)).await;
     Ok(HttpResponse::Ok().json(HostDetail {
         summary,
         facts: facts
@@ -810,19 +811,21 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         health_checks: checks,
         latest_run,
         workloads,
+        executors,
         actions,
     }))
 }
 
-/// The workloads a cluster target runs: those its applied revision selects
-/// for it, else the reference revision's. Empty for a host.
-async fn cluster_workloads(
+/// The workloads a cluster target runs (those its applied revision
+/// selects for it, else the reference revision's) and the host agents able
+/// to speak for it. Empty for a host.
+async fn cluster_view(
     state: &AppState,
     summary: &buckle_api::HostSummary,
     facts: Option<&serde_json::Value>,
-) -> Vec<buckle_api::WorkloadView> {
+) -> (Vec<buckle_api::WorkloadView>, Vec<String>) {
     if summary.kind != TargetKind::Cluster {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let applied = match &summary.applied_revision {
         Some(r) => state.revisions.load(r).await.ok(),
@@ -832,14 +835,60 @@ async fn cluster_workloads(
         Some(r) => Some(r),
         None => crate::views::reference_revision(&state.store, &state.revisions).await,
     }) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let id = summary.id.clone();
-    let Ok(Some(record)) = state.store.call(move |db| db.hosts().target(&id)).await else {
-        return Vec::new();
+    let parent = summary
+        .cluster
+        .as_ref()
+        .and_then(|c| c.spec.cluster.clone());
+    let selector = summary
+        .cluster
+        .as_ref()
+        .and_then(|c| c.spec.executors())
+        .and_then(|s| buckle_core::Filter::new(s).ok());
+    let fleet = revision.fleet.clone();
+    let Ok((Some(record), executors)) = state
+        .store
+        .call(move |db| {
+            let mut able = Vec::new();
+            for h in db.hosts().list()? {
+                if h.status != HostStatus::Active {
+                    continue;
+                }
+                let speaks = match h.executor_of() {
+                    // An in-cluster executor speaks for its own cluster only.
+                    Some(c) => c == id || parent.as_deref() == Some(c),
+                    None => match &selector {
+                        Some(f) => {
+                            let facts = db.hosts().latest_facts(&h.id)?.map(|(f, _)| f);
+                            let null = serde_json::Value::Null;
+                            crate::fleet::record_context(
+                                &h,
+                                facts.as_ref().unwrap_or(&null),
+                                &fleet,
+                            )
+                            .matches(f)
+                        }
+                        None => false,
+                    },
+                };
+                if speaks {
+                    able.push(h.id.clone());
+                }
+            }
+            able.sort();
+            Ok((db.hosts().target(&id)?, able))
+        })
+        .await
+    else {
+        return (Vec::new(), Vec::new());
     };
     let null = serde_json::Value::Null;
-    crate::views::workload_views(&revision, &record, facts.unwrap_or(&null))
+    (
+        crate::views::workload_views(&revision, &record, facts.unwrap_or(&null)),
+        executors,
+    )
 }
 
 async fn host_facts(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {

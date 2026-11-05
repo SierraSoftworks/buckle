@@ -1,29 +1,28 @@
 //! A cluster's page: what the host page is for a host, with workloads in
 //! place of modules. Its summary (scheduler, API, nodes, the host speaking
-//! for it), notes and labels; each workload's checks; the Workloads panel
-//! (what the revision declares, how each reads, what is deploying, a link
-//! into the cluster's own UI per job); the latest run workload by workload;
-//! recent runs; and its audit trail. Allocation-level detail stays in the
-//! cluster's UI.
+//! for it); notes and labels beside the agents able to run its operations;
+//! one Workloads card (how each reads, what the latest run did to it, a
+//! link into the cluster's own UI per job, and opened: its checks, that
+//! run's steps and its resources); recent runs; and its audit trail.
+//! Allocation-level detail stays in the cluster's UI.
 
 use std::collections::BTreeMap;
 
-use buckle_api::{ActionInfo, Connection, HostDetail, HostStatus, HostSummary};
+use buckle_api::{Connection, HostStatus, HostSummary};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
 use super::clusters::{cluster_state_pills, executor_cell};
-use super::host::{LabelsEditor, NotesEditor, RunsPanel, health_panel, runs};
+use super::host::{LabelsEditor, NotesEditor, runs};
+use super::modules_card::ModulesPanel;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    ActionsButton, BlueprintView, Button, Confirm, Empty, ErrorState, Kind, Loading, PageHead,
-    Panel, Pill, Refresh, RouteLink, icons, use_target_actions, use_toast,
+    ActionsButton, Button, Confirm, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh,
+    RouteLink, icons, use_target_actions, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
-use crate::logic::actions::of_module;
-use crate::logic::clusters::{WorkloadRow, WorkloadState, workload_rows};
-use crate::logic::format::{commit, count, relative, relative_opt, timestamp};
+use crate::logic::format::{commit, relative_opt, timestamp};
 use crate::logic::live::{apply_fleet, apply_host_detail};
 use crate::logic::run::newest_run;
 use crate::logic::tone::Tone;
@@ -304,28 +303,61 @@ pub fn cluster_page(props: &Props) -> Html {
         ),
     ]);
 
+    let executors = html! {
+        <div class="cluster-executors" data-testid="cluster-executors">
+            <h3 class="subhead">{ "Can run its operations" }</h3>
+            if d.executors.is_empty() {
+                <p class="muted small">{ match spec.as_ref().and_then(|s| s.executors().map(str::to_owned)) {
+                    Some(sel) => html! { <>{ "No active agent matches " }<code class="mono">{ sel }</code>{ ": nothing can apply its workloads or run its actions." }</> },
+                    None => html! { "It declares no executors selector: nothing can apply its workloads or run its actions." },
+                } }</p>
+            } else {
+                <p class="muted small">{ "The agents its executors selector matches; a connected one is picked for each rollout or action." }</p>
+                <ul class="cluster-executors__list">
+                    { for d.executors.iter().map(|e| {
+                        let host = by_id.get(e.as_str()).copied();
+                        let online = host.is_some_and(|h| h.connection == Connection::Online);
+                        let current = status.executor.as_deref() == Some(e.as_str());
+                        html! {
+                            <li data-host={e.clone()} data-online={online.to_string()}>
+                                <crate::components::HostLink id={e.clone()} host={host.cloned()} {now} classes={classes!("mono")} />
+                                if current { <Pill tone={Tone::Info} label="last executor" /> }
+                                if !online { <span class="muted small">{ "offline" }</span> }
+                            </li>
+                        }
+                    }) }
+                </ul>
+            }
+        </div>
+    };
+    let show_run = {
+        let (picked, newest) = (picked.clone(), newest.clone());
+        Callback::from(move |run: String| {
+            picked.set((Some(&run) != newest.as_ref()).then_some(run));
+            if let Some(el) = crate::util::window()
+                .document()
+                .and_then(|d| d.get_element_by_id("workloads"))
+            {
+                el.scroll_into_view();
+            }
+        })
+    };
+    let shown = (*picked).clone().or(newest.clone());
+
     html! {
         <div class="page page--wide" data-testid="cluster-page">
             <PageHead title={c.id.clone()} {subtitle} {actions} />
             <div class="grid grid--host">
                 <Panel title="Summary">{ summary }</Panel>
-                <NotesEditor id={c.id.clone()} notes={c.notes.clone()} admin={admin} on_saved={detail.reload.clone()} />
-                <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
+                <Panel title="Notes and labels" class="notes-labels">
+                    <NotesEditor id={c.id.clone()} notes={c.notes.clone()} admin={admin} on_saved={detail.reload.clone()} embedded=true />
+                    <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()}
+                        embedded=true aside={executors} />
+                </Panel>
             </div>
-            <WorkloadsPanel detail={d.clone()} on_action={on_action.clone()} />
-            { health_panel(&d.health_checks, now, true, &d.actions, on_action.as_ref()) }
-            <RunsPanel host={c.id.clone()} cluster=true latest={d.latest_run.clone()} newest={newest.clone()}
-                picked={(*picked).clone()} on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
-            <Panel title="Recent runs">{ runs(&d, now, (*picked).clone().or(newest.clone()), &{
-                let picked = picked.clone();
-                let newest = newest.clone();
-                Callback::from(move |run: String| {
-                    picked.set((Some(&run) != newest.as_ref()).then_some(run));
-                    if let Some(el) = crate::util::window().document().and_then(|d| d.get_element_by_id("run-report")) {
-                        el.scroll_into_view();
-                    }
-                })
-            }) }</Panel>
+            <ModulesPanel detail={d.clone()} cluster=true on_action={on_action.clone()} newest={newest.clone()} picked={(*picked).clone()}
+                on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
+            <Panel title="Recent runs">{ runs(&d, now, shown, &show_run) }</Panel>
             <p class="muted small">
                 <RouteLink to={Route::Audit} query={vec![("filter".to_string(), crate::logic::filter::equals("subject", &c.id))]}>
                     { format!("Audit entries for {}", c.id) }
@@ -334,169 +366,5 @@ pub fn cluster_page(props: &Props) -> Html {
             { dialog.unwrap_or_default() }
             { target_actions.dialog }
         </div>
-    }
-}
-
-#[derive(Properties, PartialEq)]
-struct WorkloadsProps {
-    detail: HostDetail,
-    /// Set where the operator may run the workloads' actions.
-    on_action: Option<Callback<ActionInfo>>,
-}
-
-/// What Buckle manages on the cluster, workload by workload: how each
-/// reads, what is deploying, its jobs linked into the cluster's UI. A row
-/// opens to the workload's resources (rendered only once opened).
-#[function_component(WorkloadsPanel)]
-fn workloads_panel(props: &WorkloadsProps) -> Html {
-    let now = use_now(30);
-    let open = use_state(|| None::<String>);
-    let d = &props.detail;
-    let rows = workload_rows(d, d.latest_run.as_ref());
-    let failing = rows
-        .iter()
-        .filter(|r| r.state == WorkloadState::Failing)
-        .count();
-    let deploying = rows
-        .iter()
-        .filter(|r| r.state == WorkloadState::Deploying)
-        .count();
-    let mut subtitle = format!(
-        "What Buckle manages on this cluster: {}",
-        count(rows.len(), "workload", "workloads")
-    );
-    if failing > 0 {
-        subtitle.push_str(&format!(" · {failing} failing"));
-    }
-    if deploying > 0 {
-        subtitle.push_str(&format!(" · {deploying} deploying"));
-    }
-    let body = if rows.is_empty() {
-        html! { <Empty title="No workloads" message="The revision selects no workloads for this cluster. Add workloads/NAME/workload.yaml whose `when` matches it." /> }
-    } else {
-        html! {
-            <div class="table-wrap">
-                <table class="table table--workloads" data-testid="workloads">
-                    <thead><tr>
-                        <th scope="col">{ "Workload" }</th>
-                        <th scope="col">{ "State" }</th>
-                        <th scope="col">{ "Jobs" }</th>
-                        <th scope="col">{ "Resources" }</th>
-                        <th scope="col">{ "Applied" }</th>
-                        <th scope="col"><span class="visually-hidden">{ "Details" }</span></th>
-                    </tr></thead>
-                    <tbody>
-                        { for rows.iter().map(|r| {
-                            let is_open = open.as_deref() == Some(r.name.as_str());
-                            let toggle = {
-                                let (open, name) = (open.clone(), r.name.clone());
-                                Callback::from(move |e: MouseEvent| {
-                                    let own = e
-                                        .target_dyn_into::<web_sys::Element>()
-                                        .and_then(|t| t.closest("a").ok().flatten())
-                                        .is_some();
-                                    if !own {
-                                        open.set(if is_open { None } else { Some(name.clone()) });
-                                    }
-                                })
-                            };
-                            html! { <>
-                                { workload_row(r, is_open, toggle, now, props.on_action.as_ref().map(|on_run| html! {
-                                    <ActionsButton actions={of_module(&d.actions, &r.name)} on_run={on_run.clone()}
-                                        testid={format!("actions-{}", r.name)} />
-                                })) }
-                                if is_open {
-                                    <tr class="table__detail" key={format!("{}-detail", r.name)}>
-                                        <td colspan="6">
-                                            <BlueprintView
-                                                resources={d.resources.iter().filter(|x| x.module == r.name).cloned().collect::<Vec<_>>()}
-                                                drift={d.drift.iter().filter(|x| x.module == r.name).cloned().collect::<Vec<_>>()}
-                                                run={d.latest_run.clone()} />
-                                        </td>
-                                    </tr>
-                                }
-                            </> }
-                        }) }
-                    </tbody>
-                </table>
-            </div>
-        }
-    };
-    html! {
-        <Panel title="Workloads" {subtitle}>{ body }</Panel>
-    }
-}
-
-fn state_pill(r: &WorkloadRow) -> Html {
-    match r.state {
-        WorkloadState::Failing => {
-            html! { <Pill tone={Tone::Danger} label="failing" title={r.reason.clone()} /> }
-        }
-        WorkloadState::Deploying => html! { <Pill tone={Tone::Active} label="deploying" /> },
-        // The norm, said quietly.
-        WorkloadState::Running => html! { <span class="muted">{ "running" }</span> },
-        WorkloadState::NotApplied => html! { <span class="muted">{ "not applied yet" }</span> },
-    }
-}
-
-fn workload_row(
-    r: &WorkloadRow,
-    open: bool,
-    toggle: Callback<MouseEvent>,
-    now: chrono::DateTime<chrono::Utc>,
-    actions: Option<Html>,
-) -> Html {
-    html! {
-        <tr key={r.name.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))}
-            data-workload={r.name.clone()} data-state={r.state.label().replace(' ', "-")} onclick={toggle.clone()}>
-            <td>
-                <span class="mono strong">{ r.name.clone() }</span>
-                if !r.description.is_empty() { <span class="cell-sub">{ r.description.clone() }</span> }
-                if !r.needs.is_empty() { <span class="cell-sub">{ format!("needs {}", r.needs.join(", ")) }</span> }
-            </td>
-            <td>
-                { state_pill(r) }
-                if let Some(p) = &r.progress {
-                    <span class="cell-sub mono" data-testid="workload-progress">{ p.clone() }</span>
-                }
-                if let (WorkloadState::Failing, Some(reason)) = (r.state, &r.reason) {
-                    <span class="cell-sub">{ reason.clone() }</span>
-                }
-                if r.checks.1 > 0 && r.state != WorkloadState::Failing {
-                    <span class="cell-sub muted">{ format!("{} of {} passing", r.checks.0, count(r.checks.1, "check", "checks")) }</span>
-                }
-            </td>
-            <td>
-                { for r.jobs.iter().map(|j| html! {
-                    <span class="workload-job">
-                        <span class="mono">{ j.key.clone() }</span>
-                        if let Some(url) = &j.url {
-                            { " " }
-                            <a href={url.clone()} target="_blank" rel="noopener noreferrer"
-                                aria-label={format!("Open {} in the cluster's UI", j.key)}>{ "Nomad" }{ icons::external() }</a>
-                        }
-                    </span>
-                }) }
-                if r.jobs.is_empty() { <span class="muted">{ "—" }</span> }
-            </td>
-            <td class="muted">{ r.kinds.join(", ") }</td>
-            <td class="nowrap">
-                { match &r.applied {
-                    Some((at, rev)) => html! { <>
-                        <span title={timestamp(*at)}>{ relative(*at, now) }</span>
-                        <span class="cell-sub mono" title={rev.clone()}>{ commit(rev) }</span>
-                    </> },
-                    None => html! { <span class="muted">{ "—" }</span> },
-                } }
-            </td>
-            <td class="row-controls">
-                { actions.unwrap_or_default() }
-                <button type="button" class="icon-btn row-toggle" onclick={toggle}
-                    aria-expanded={open.to_string()} aria-label={format!("Resources of {}", r.name)}
-                    title={if open { "Hide resources" } else { "Show resources" }}>
-                    { icons::chevron() }
-                </button>
-            </td>
-        </tr>
     }
 }

@@ -158,6 +158,42 @@ pub fn run_report(props: &RunReportProps) -> Html {
     }
 }
 
+/// A run's summary strip on its own: state, step counts, timing, what was
+/// applied, its rollout and trace.
+pub fn run_summary(r: &RunReport, now: DateTime<Utc>, noun: &str) -> Html {
+    summary(r, now, false, noun)
+}
+
+/// What one module (or workload) of a run did, as its expanded body shows
+/// it: its error, then its steps and handlers.
+pub fn module_steps(m: &ModuleReport, now: DateTime<Utc>, live: bool) -> Html {
+    html! { <>
+        if let Some(note) = &m.note { <p class="run-module__note">{ note.clone() }</p> }
+        <ErrorBlock error={m.error.clone()} tone={error_tone(module_tone(m.state))}
+            context={AttrValue::from(format!("{} {}", m.name, module_label(m.state)))} />
+        if m.steps.is_empty() {
+            <p class="muted small">{ "No steps." }</p>
+        } else {
+            <ol class="run-steps" aria-label={format!("Steps of {}", m.name)}>
+                { for m.steps.iter().map(|s| step_row(s, now, live, false)) }
+            </ol>
+        }
+        if !m.handlers.is_empty() {
+            <h5 class="run-module__sub">{ "Handlers" }</h5>
+            <ol class="run-steps run-steps--handlers" aria-label={format!("Handlers of {}", m.name)}>
+                { for m.handlers.iter().map(|s| step_row(s, now, live, false)) }
+            </ol>
+        }
+    </> }
+}
+
+/// A run's removals, drawn as steps.
+pub fn removal_steps(removals: &[&RemovalReport], now: DateTime<Utc>, live: bool) -> Html {
+    html! {
+        <ol class="run-steps run-steps--removals">{ for removals.iter().map(|x| removal_row(x, now, live)) }</ol>
+    }
+}
+
 fn removal_problem(x: &RemovalReport) -> bool {
     matches!(x.state, StepState::Failed | StepState::Blocked) || x.error.is_some()
 }
@@ -398,7 +434,8 @@ const HEALTH_BUCKETS: usize = 20;
 /// in its heading: equal time slices, each as bad as its worst check, with
 /// the checks' readings on hover or focus. An empty slot keeps the bars of
 /// a run's modules in line when one has no readings.
-fn health_bar(m: &ModuleReport, started: Option<DateTime<Utc>>) -> Html {
+/// A module's health through a run, as its heading shows it.
+pub fn health_bar(m: &ModuleReport, started: Option<DateTime<Utc>>) -> Html {
     let buckets = timeline(&m.health, started, HEALTH_BUCKETS);
     let Some(t0) = buckets.first().map(|b| b.from) else {
         return html! { <span class="hbar hbar--inline hbar--none" aria-hidden="true" /> };

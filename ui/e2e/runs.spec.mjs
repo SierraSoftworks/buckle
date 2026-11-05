@@ -1,6 +1,7 @@
-// Run reports: a host's run module by module and step by step, errors as
-// blocks (message, causes, advice) rather than dumps, the rollout drawer's
-// view of a host's run, and the live updates that move a run on.
+// Runs: a host's run module by module and step by step in its Modules
+// card, errors as blocks (message, causes, advice) rather than dumps, the
+// rollout drawer's view of a host's run, and the live updates that move a
+// run on.
 
 import { describe, test } from "node:test";
 import { assert, eventually, heading, open } from "./helpers.mjs";
@@ -9,37 +10,38 @@ const TEMPLATE = "file.template[/etc/nomad.d/nomad.hcl]";
 const step = (scope, id) => scope.locator(`.run-step[data-step="${id}"]`);
 const module = (scope, name) => scope.locator(`.run-module[data-module="${name}"]`);
 
+// On the host page the run lives in the Modules card: a row per module
+// with what the run did to it, opened to its steps.
+const card = (page) => page.locator("#modules");
+const row = (scope, name) => scope.locator(`tr[data-module="${name}"]`);
+const detail = (scope, name) => scope.locator(`tr[data-detail-of="${name}"]`);
+const ran = (scope, name) => row(scope, name).getByTestId("workload-run");
+
 describe("a host's latest run", () => {
-  test("lists every module and step with its state, and opens a failed module on its error", async () => {
+  test("lists every module with what the run did, and opens a failed module on its error", async () => {
     const { page, close } = await open("/hosts/pi-5");
     assert.equal(await heading(page), "pi-5");
-    const report = page.locator("#run-report");
-    await report.getByRole("heading", { name: "Latest run" }).waitFor();
+    const report = card(page);
     await report.locator(".run").waitFor();
     assert.equal(await report.locator(".run").getAttribute("data-state"), "failed");
 
-    // Every module, in plan order, with its state.
-    const modules = await report.locator(".run-module").evaluateAll((els) =>
-      els.map((e) => [e.dataset.module, e.dataset.state]),
-    );
-    assert.deepEqual(modules, [
-      ["common", "applied"],
-      ["tailscale", "unchanged"],
-      ["docker", "unchanged"],
-      ["nomad", "failed"],
-      ["otel_ebpf_profiler", "rolled-back"],
-    ]);
+    // The run's modules first, in plan order, with their states.
+    const modules = await report.locator("tr[data-module]").evaluateAll((els) => els.map((e) => e.dataset.module));
+    assert.deepEqual(modules.slice(0, 5), ["common", "tailscale", "docker", "nomad", "otel_ebpf_profiler"]);
+    const states = {};
+    for (const m of modules.slice(0, 5)) states[m] = await ran(report, m).getAttribute("data-run-state");
+    assert.deepEqual(states, {
+      common: "applied", tailscale: "unchanged", docker: "unchanged", nomad: "failed", otel_ebpf_profiler: "rolled-back",
+    });
     // The counts at the top.
     assert.match(await report.locator('.run-count[data-count="failed"]').textContent(), /^1 failed$/);
     assert.match(await report.locator('.run-count[data-count="not-run"]').textContent(), /^2 not run$/);
 
-    // Problems are open, the rest collapsed.
-    const nomad = module(report, "nomad");
-    assert.equal(await nomad.locator(".run-module__row").getAttribute("aria-expanded"), "true");
-    assert.equal(await module(report, "otel_ebpf_profiler").locator(".run-module__row").getAttribute("aria-expanded"), "true");
-    const common = module(report, "common");
-    assert.equal(await common.locator(".run-module__row").getAttribute("aria-expanded"), "false");
-    assert.equal(await common.locator(".run-step").count(), 0);
+    // Problems are open, the rest collapsed and out of the page.
+    const nomad = detail(report, "nomad");
+    await nomad.waitFor();
+    await detail(report, "otel_ebpf_profiler").waitFor();
+    assert.equal(await detail(report, "common").count(), 0);
 
     // The failed step, then the steps it kept from running.
     const failed = step(nomad, TEMPLATE);
@@ -60,51 +62,45 @@ describe("a host's latest run", () => {
     assert.match(advice[0], /store it as host:4647/);
     assert.equal((await error.locator(".error-block__kind").textContent()).trim(), "user");
     // The module's own error (its rollback) is a block of its own.
-    assert.match(await nomad.locator(".run-module__body > .error-block .error-block__message").textContent(), /Rolling nomad back to 5d4a9b2 failed/);
+    assert.match(await nomad.locator(".error-block__message", { hasText: /Rolling nomad back/ }).textContent(), /Rolling nomad back to 5d4a9b2 failed/);
+    // Beside the run: its checks and its resources.
+    assert.ok((await nomad.locator(".checks__item").count()) > 0);
+    assert.ok((await nomad.locator(".run-step[data-resource]").count()) > 0);
     // Nothing is shown as a flattened dump.
     assert.equal(await report.locator(".error-block--raw").count(), 0);
     await close();
   });
 
-  test("expands, collapses and narrows to the problems", async () => {
+  test("opens and closes a module", async () => {
     const { page, close } = await open("/hosts/pi-5");
-    const report = page.locator("#run-report");
+    const report = card(page);
     await report.locator(".run").waitFor();
-    await report.getByRole("button", { name: "Expand all" }).click();
-    const common = module(report, "common");
-    await eventually(async () => assert.equal(await common.locator(".run-steps:not(.run-steps--handlers) > .run-step").count(), 3));
+    await row(report, "common").click();
+    const common = detail(report, "common");
+    await eventually(async () => assert.equal(await common.locator(".run-steps:not(.run-steps--handlers) > .run-step[data-step]").count(), 3));
     assert.equal(await common.locator(".run-steps--handlers > .run-step").count(), 1);
-    await report.getByRole("button", { name: "Collapse all" }).click();
-    await eventually(async () => assert.equal(await report.locator(".run-module__body").count(), 0));
-
-    const chip = report.getByRole("button", { name: /Problems only/ });
-    await chip.click();
-    assert.equal(await chip.getAttribute("aria-pressed"), "true");
-    await eventually(async () =>
-      assert.deepEqual(await report.locator(".run-module").evaluateAll((els) => els.map((e) => e.dataset.module)), ["nomad", "otel_ebpf_profiler"]),
-    );
+    await row(report, "nomad").getByRole("button", { name: "Details of nomad" }).click();
+    await eventually(async () => assert.equal(await detail(report, "nomad").count(), 0));
     await close();
   });
 
   test("loads an older run from the picker, and goes back to the newest", async () => {
     const { page, close } = await open("/hosts/pi-5");
-    const report = page.locator("#run-report");
+    const report = card(page);
     await report.locator(".run").waitFor();
     const picker = page.getByLabel("Run to show");
     assert.match(await picker.locator("option").first().textContent(), /^newest · .* · failed · 7c2e1f0$/);
     await picker.selectOption("pi-5-9a0c6d1");
-    await report.getByRole("heading", { name: "Run report" }).waitFor();
     await eventually(async () => assert.equal(await report.locator(".run").getAttribute("data-run"), "pi-5-9a0c6d1"));
-    assert.equal(await module(report, "docker").getAttribute("data-state"), "rolled-back");
-    assert.equal(await module(report, "nomad").getAttribute("data-state"), "not-started");
-    assert.match(await module(report, "docker").locator(".error-block__message").textContent(), /docker\/daemon failed/);
+    assert.equal(await ran(report, "docker").getAttribute("data-run-state"), "rolled-back");
+    assert.equal(await ran(report, "nomad").getAttribute("data-run-state"), "not-started");
+    assert.match(await detail(report, "docker").locator(".error-block__message").first().textContent(), /docker\/daemon failed/);
 
     await report.getByRole("button", { name: "Show the newest" }).click();
-    await report.getByRole("heading", { name: "Latest run" }).waitFor();
     await eventually(async () => assert.equal(await report.locator(".run").getAttribute("data-run"), "pi-5-7c2e1f0"));
     assert.equal(await picker.inputValue(), "pi-5-7c2e1f0", "the picker follows");
 
-    // The recent-runs table opens a run's report too.
+    // The recent-runs table opens a run too.
     await page.locator('tr[data-run="pi-5-5d4a9b2"]').getByRole("button", { name: /Show the report of the run started/ }).click();
     await eventually(async () => assert.equal(await report.locator(".run").getAttribute("data-run"), "pi-5-5d4a9b2"));
     assert.equal(await report.locator(".run").getAttribute("data-state"), "succeeded");
@@ -114,23 +110,22 @@ describe("a host's latest run", () => {
 
   test("blocked steps make a run that needs attention, with the reason as a warning", async () => {
     const { page, close } = await open("/hosts/edge-1");
-    const report = page.locator("#run-report");
+    const report = card(page);
     await report.locator(".run").waitFor();
     assert.equal(await report.locator(".run").getAttribute("data-state"), "needs-attention");
-    const tailscale = module(report, "tailscale");
-    assert.equal(await tailscale.getAttribute("data-state"), "blocked");
-    const unit = step(tailscale, "systemd.unit[tailscaled]");
+    assert.equal(await ran(report, "tailscale").getAttribute("data-run-state"), "blocked");
+    const unit = step(detail(report, "tailscale"), "systemd.unit[tailscaled]");
     assert.equal(await unit.getAttribute("data-state"), "blocked");
     assert.match(await unit.locator(".error-block").getAttribute("class"), /tone-warn/);
-    assert.equal(await module(report, "docker").getAttribute("data-state"), "indeterminate");
+    assert.equal(await ran(report, "docker").getAttribute("data-run-state"), "indeterminate");
     await close();
   });
 
-  test("a run list that cannot be read says so, and the report still shows", async () => {
+  test("a run list that cannot be read says so, and the run still shows", async () => {
     const { page, close } = await open("/hosts/pi-5", { flags: "runs=fail" });
-    const report = page.locator("#run-report");
+    const report = card(page);
     await report.locator(".run").waitFor();
-    const error = report.getByRole("alert").filter({ hasText: "The host's runs could not be listed." });
+    const error = report.getByRole("alert").filter({ hasText: "The runs could not be listed." });
     await error.waitFor();
     await error.getByRole("button", { name: "Try again" }).waitFor();
     assert.equal(await page.getByLabel("Run to show").count(), 0);
@@ -139,18 +134,19 @@ describe("a host's latest run", () => {
 
   test("a host without runs says so", async () => {
     const { page, close } = await open("/hosts/rpi-new");
-    await page.locator("#run-report").getByText("No runs yet").waitFor();
+    await card(page).getByText("Nothing managed yet").waitFor();
+    await page.getByText("No runs yet").waitFor();
     await close();
   });
 
   test("shows each module's health over the run, worst per slice, with the checks on hover", async () => {
     const { page, close } = await open("/hosts/pi-1");
-    // The bar sits in the module's heading, beside its changes and time.
-    const head = page.locator('#run-report .run-module[data-module="nomad"] .run-module__head');
-    const nomad = head.locator(".hbar");
+    // The bar sits in the module's run cell, beside its changes.
+    const cell = ran(card(page), "nomad");
+    const nomad = cell.locator(".hbar");
     await nomad.waitFor();
     assert.equal(await nomad.getAttribute("data-state"), "pass", "it reads healthy now");
-    await head.getByTestId("tally").waitFor();
+    await cell.getByTestId("tally").waitFor();
     // The api blipped once during bake: one slice shows it, the rest pass.
     const failing = nomad.locator('.hbar__bucket[data-state="fail"]');
     assert.equal(await failing.count(), 1);
@@ -222,9 +218,11 @@ describe("a host's run in a rollout", () => {
 describe("live run updates", () => {
   test("the host page follows the run step by step until it succeeds", async () => {
     const { page, close } = await open("/hosts/pi-4", { flags: "live" });
-    const report = page.locator("#run-report");
+    const report = card(page);
     await report.locator(".run").waitFor();
-    const nomad = module(report, "nomad");
+    // The module being applied is open.
+    const nomad = detail(report, "nomad");
+    await nomad.waitFor();
     // The template finishes and the unit starts…
     await eventually(async () => assert.equal(await step(nomad, TEMPLATE).getAttribute("data-state"), "changed"), 10_000);
     assert.match(await step(nomad, TEMPLATE).locator(".run-step__result").textContent(), /validate passed/);
@@ -234,7 +232,8 @@ describe("live run updates", () => {
     10_000);
     // …the removal goes, and the run ends.
     await eventually(async () => assert.equal(await report.locator(".run").getAttribute("data-state"), "succeeded"), 15_000);
-    assert.equal(await step(report, "nomad/file.copy[/etc/nomad.d/client.hcl]").getAttribute("data-state"), "changed");
+    if ((await nomad.count()) === 0) await row(report, "nomad").click();
+    assert.equal(await step(detail(report, "nomad"), "nomad/file.copy[/etc/nomad.d/client.hcl]").getAttribute("data-state"), "changed");
     // Nothing is left pending, and a finished run lists no zero counts.
     assert.equal(await report.locator('.run-count[data-count="pending"]').count(), 0);
     assert.equal(await report.locator(".run__progress").count(), 0, "no progress bar once finished");

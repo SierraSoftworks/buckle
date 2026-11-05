@@ -26,7 +26,6 @@ pub mod toast;
 pub mod ui;
 
 pub use actions::{ActionsButton, use_target_actions};
-pub use blueprint::BlueprintView;
 pub use changes::Changes;
 pub use commit::{Commit, CommitCard};
 pub use countdown::Countdown;

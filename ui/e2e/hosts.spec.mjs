@@ -170,8 +170,8 @@ describe("actions", () => {
     await confirm.click();
     await page.getByRole("status").filter({ hasText: "Reboot started on lab-3" }).waitFor();
 
-    // Each module's head offers its own actions, unqualified.
-    const nomad = page.locator(".blueprint").getByTestId("actions-nomad");
+    // Each module's row offers its own actions, unqualified.
+    const nomad = page.locator("#modules").getByTestId("actions-nomad");
     await nomad.getByRole("button", { name: "Restart Nomad" }).click();
     await page.getByRole("status").filter({ hasText: "Restart Nomad started on lab-3" }).waitFor();
     await close();
