@@ -33,23 +33,28 @@ async fn the_agent_transport_enrols_is_assigned_and_fetches_a_verified_revision(
         "hello {{ host.id }}\n",
     )
     .unwrap();
-    let grpc = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let http = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // Port 0: a port picked here and released could be taken by another
+    // process's client socket (k3s and Nomad share the CI runner) before the
+    // server binds it, and the server would exit on start-up.
     let yaml = format!(
-        "listen: {{ grpc: \"{grpc}\", http: \"{http}\", tls: {{ mode: auto }} }}\ndata_dir: {}\nsource: {{ path: {} }}\nagents: {{ auth: [token], bootstrap_token: boot, minimum_agent_version: \"2.0.0-dev\" }}\n",
+        "listen: {{ grpc: \"127.0.0.1:0\", http: \"127.0.0.1:0\", tls: {{ mode: auto }} }}\ndata_dir: {}\nsource: {{ path: {} }}\nagents: {{ auth: [token], bootstrap_token: boot, minimum_agent_version: \"2.0.0-dev\" }}\n",
         dir.path().join("data").display(),
         source.display()
     );
     let config = buckle_server::ServerConfig::parse(&yaml).unwrap();
     let fingerprint = buckle_server::fingerprint(&config).unwrap().unwrap();
     let shutdown = CancellationToken::new();
-    let server = tokio::spawn(buckle_server::run(config, shutdown.clone()));
+    let (listening, mut bound) = tokio::sync::watch::channel(None);
+    let hooks = buckle_server::Hooks {
+        listening: Some(std::sync::Arc::new(listening)),
+        ..Default::default()
+    };
+    let mut server = tokio::spawn(buckle_server::run_with(config, shutdown.clone(), hooks));
+    let buckle_server::Listening { grpc, http } = tokio::select! {
+        r = bound.wait_for(Option::is_some) => r.expect("the server is running").expect("addresses are sent"),
+        r = &mut server => panic!("the server exited on start-up: {r:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(20)) => panic!("the server binds its listeners"),
+    };
 
     // Wait for the first revision to be promoted, so the host is a straggler.
     let mut stable = None;
