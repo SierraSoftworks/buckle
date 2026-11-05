@@ -101,8 +101,16 @@ pub async fn read(nomad: &Nomad, target: &str) -> Result<Index> {
 
 /// Read-modify-writes the index with check-and-set, retrying when another
 /// workload of the same target wrote it in between.
+///
+/// Writes through one client (and its clones) take turns; a conflict with
+/// another writer (another executor) re-reads, re-applies `change` and
+/// retries after a growing pause.
 pub async fn update(nomad: &Nomad, target: &str, change: impl Fn(&mut Vec<Entry>)) -> Result<()> {
-    for _ in 0..8 {
+    let _turn = nomad.index_lock.lock().await;
+    for attempt in 0..8u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(5))).await;
+        }
         let mut index = read(nomad, target).await?;
         let before = index.entries.clone();
         change(&mut index.entries);

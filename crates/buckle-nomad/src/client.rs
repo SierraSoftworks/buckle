@@ -21,6 +21,10 @@ pub struct Nomad {
     token: Option<Arc<SecretString>>,
     region: Option<String>,
     redactor: Option<Arc<Redactor>>,
+    /// Serialises this client's (and its clones') index variable writes, so
+    /// workloads applying concurrently do not race each other's
+    /// check-and-set. See [`crate::index::update`].
+    pub(crate) index_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for Nomad {
@@ -55,6 +59,7 @@ impl Nomad {
             token: None,
             region: None,
             redactor: None,
+            index_lock: Arc::default(),
         }
     }
 
