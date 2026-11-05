@@ -725,7 +725,9 @@ restart_on: [nomad/jobs/paste]
 
     #[rstest]
     #[case::by_kind("name: a\nwhen: 'cluster.kind == \"nomad\"'\nresources: [a.nomad.hcl]\n")]
-    #[case::by_label("name: a\nwhen: 'cluster.labels.site == \"home\"'\nresources: [a.nomad.hcl]\n")]
+    #[case::by_label(
+        "name: a\nwhen: 'cluster.labels.site == \"home\"'\nresources: [a.nomad.hcl]\n"
+    )]
     #[case::secrets_alone("name: a\nresources: [{ secret: s, items: { A: x } }]\n")]
     fn workloads_narrowed_to_their_scheduler_are_valid(#[case] workload: &str) {
         let errors = errors(&[
