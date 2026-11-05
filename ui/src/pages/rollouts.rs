@@ -7,11 +7,15 @@ use buckle_api::{LiveEvent, Page};
 use yew::prelude::*;
 
 use crate::api;
+use crate::app::Route;
 use crate::components::{
-    Button, Empty, ErrorState, Loading, PageHead, Panel, Refresh, RevisionLog, use_revision_actions,
+    Button, Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RevisionLog, RouteLink,
+    use_revision_actions,
 };
 use crate::hooks::{Fetch, use_fetch, use_live_value, use_now};
+use crate::logic::format::relative;
 use crate::logic::live::{apply_revisions, apply_rollouts};
+use crate::logic::tone::{rollout_state_label, rollout_state_tone};
 
 #[function_component(Rollouts)]
 pub fn rollouts() -> Html {
@@ -67,8 +71,57 @@ pub fn rollouts() -> Html {
                     Callback::from(move |_| { a.emit(()); b.emit(()); })
                 }} /> }} />
             <Panel>{ body }</Panel>
+            { action_rollouts(rolls.as_deref().unwrap_or_default(), now) }
             { actions.dialog(&rolls.unwrap_or_default()) }
         </div>
+    }
+}
+
+/// Rollouts of an action rather than a revision (Run action… on the Hosts
+/// and Clusters pages), newest first; nothing when there are none.
+fn action_rollouts(
+    rolls: &[buckle_api::RolloutSummary],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Html {
+    let rows: Vec<&buckle_api::RolloutSummary> =
+        rolls.iter().filter(|r| r.action.is_some()).collect();
+    if rows.is_empty() {
+        return html! {};
+    }
+    html! {
+        <Panel title="Action rollouts" subtitle="Actions run across the fleet through the stable revision's phases">
+            <div class="table-wrap">
+                <table class="table" data-testid="action-rollouts">
+                    <thead><tr>
+                        <th scope="col">{ "Rollout" }</th>
+                        <th scope="col">{ "Action" }</th>
+                        <th scope="col">{ "State" }</th>
+                        <th scope="col">{ "Targets" }</th>
+                        <th scope="col">{ "Started" }</th>
+                    </tr></thead>
+                    <tbody>
+                        { for rows.into_iter().map(|r| {
+                            let a = r.action.as_ref().expect("filtered on its action");
+                            html! {
+                                <tr key={r.id.clone()}>
+                                    <td><RouteLink to={Route::Rollout { id: r.id.clone() }}>{ r.name.clone().unwrap_or_else(|| r.id.clone()) }</RouteLink></td>
+                                    <td>
+                                        <span class="strong">{ a.label.clone() }</span>
+                                        <span class="cell-sub mono">{ format!("{}/{}", a.module, a.action) }</span>
+                                        if let Some(sel) = &a.selector { <span class="cell-sub mono">{ sel.clone() }</span> }
+                                    </td>
+                                    <td><Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} /></td>
+                                    <td>{ format!("{} of {}", r.hosts_done, r.hosts_total) }
+                                        if r.hosts_failed > 0 { <span class="cell-sub text-warn">{ format!("{} failed", r.hosts_failed) }</span> }
+                                    </td>
+                                    <td class="muted">{ format!("{} · {}", r.triggered_by, relative(r.started_at, now)) }</td>
+                                </tr>
+                            }
+                        }) }
+                    </tbody>
+                </table>
+            </div>
+        </Panel>
     }
 }
 

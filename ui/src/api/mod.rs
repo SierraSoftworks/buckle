@@ -23,7 +23,8 @@ use buckle_api::{
     ActionRequest, ActionStarted, ApproveRequest, AuditEntry, ContinueRequest, CreateTarget,
     CsrfToken, ErrorBody, ExecutorSpec, Fleet, HostDetail, HostPatch, HostPreview, HostSummary,
     JoinOptions, JoinRequest, JoinTicket, Me, Page, PlanGroup, RejectRequest, RevisionSummary,
-    RolloutDetail, RolloutSummary, RunReport, RunSummary, StartRollout, UpgradeRequest,
+    RolloutDetail, RolloutSummary, RunReport, RunSummary, StartActionRollout, StartRollout,
+    UpgradeRequest,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -326,6 +327,24 @@ pub async fn run_action(
         Some(&ActionRequest { note }),
     )
     .await
+}
+
+/// Every action the fleet offers now, with the targets offering it that
+/// `selector` matches (blank: every target).
+pub async fn fleet_actions(selector: &str) -> Result<Vec<buckle_api::FleetAction>, ApiError> {
+    demo!(demo_store::fleet_actions(selector));
+    let selector = selector.trim();
+    if selector.is_empty() {
+        get("/actions").await
+    } else {
+        get(&format!("/actions?selector={}", enc(selector))).await
+    }
+}
+
+/// Starts an action rollout over the targets offering the action.
+pub async fn start_action_rollout(body: StartActionRollout) -> Result<RolloutSummary, ApiError> {
+    demo!(demo_store::start_action_rollout(&body));
+    write(Method::Post, "/rollouts", Some(&body)).await
 }
 
 /// Asks the host's agent to install `version` (or the fleet's desired agent

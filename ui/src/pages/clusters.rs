@@ -15,7 +15,8 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Empty, ErrorState, HostLink, Kind, Loading, PageHead, Panel, Pill, Refresh, icons,
+    Button, Empty, ErrorState, HostLink, Kind, Loading, PageHead, Panel, Pill, Refresh, RunAction,
+    icons,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::clusters::deploying_text;
@@ -62,6 +63,7 @@ pub fn clusters() -> Html {
     let fleet = use_fetch((), |_| api::fleet());
     let live = use_live_value(&fleet, apply_fleet);
     let adding = use_state(|| false);
+    let running = use_state(|| false);
 
     let on_search = {
         let navigator = navigator.clone();
@@ -172,10 +174,16 @@ pub fn clusters() -> Html {
                 actions={html! { <>
                     <Refresh loading={fleet.loading} reload={fleet.reload.clone()} />
                     if auth.is_admin() {
+                        <Button onclick={{ let r = running.clone(); Callback::from(move |_| r.set(true)) }}>{ "Run action…" }</Button>
+                    }
+                    if auth.is_admin() {
                         <Button kind={Kind::Primary} onclick={add}>{ icons::plus() }{ "Add a cluster…" }</Button>
                     }
                 </> }} />
             <Panel>{ body }</Panel>
+            if auth.is_admin() && *running {
+                <RunAction on_close={{ let r = running.clone(); Callback::from(move |_| r.set(false)) }} />
+            }
             if auth.is_admin() && *adding {
                 <super::add_cluster::AddCluster on_close={{
                     let (a, reload) = (adding.clone(), fleet.reload.clone());

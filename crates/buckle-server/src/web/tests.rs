@@ -60,8 +60,12 @@ async fn env(web_config: WebConfig) -> Env {
 }
 
 async fn env_with(web_config: WebConfig, adjust: impl FnOnce(&mut AppState)) -> Env {
+    env_on(Store::in_memory().await.unwrap(), web_config, adjust).await
+}
+
+/// An env over `store`, as the controller finds it on start.
+async fn env_on(store: Store, web_config: WebConfig, adjust: impl FnOnce(&mut AppState)) -> Env {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::in_memory().await.unwrap();
     let revisions = Arc::new(RevisionCache::new(data.path()));
     let events = EventBus::default();
     let sessions = Arc::new(Sessions::new());
@@ -2828,4 +2832,95 @@ async fn admins_run_the_actions_a_host_offers_with_notes_audited() {
         page.items.iter().filter(|a| a.outcome == "ok").collect();
     assert_eq!(ran.len(), 1, "refusals are audited as refused");
     assert!(ran[0].message.contains("before maintenance"));
+}
+
+#[actix_web::test]
+async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
+    let store = Store::in_memory().await.unwrap();
+    store
+        .call(|db| db.kv().set("stable_revision", "r1"))
+        .await
+        .unwrap();
+    let e = env_on(
+        store,
+        WebConfig {
+            admin_acl: acl("true"),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .await;
+    revision(&e, "r1", "version: 2\n").await;
+    let module = e.state.revisions.dir("r1").join("modules/web");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("module.yaml"),
+        "name: web\nactions:\n  drain: { command.run: { run: [\"true\"] }, confirm: true }\n",
+    )
+    .unwrap();
+    for (host, role) in [("pi-1", "web"), ("pi-2", "web"), ("pi-3", "db")] {
+        add_host(&e.store, host, HostStatus::Active).await;
+        let (h, role) = (host.to_owned(), role.to_owned());
+        e.store
+            .call(move |db| {
+                db.hosts().set_applied_revision(&h, "r1")?;
+                db.hosts().set_labels(
+                    &h,
+                    &std::collections::BTreeMap::from([("role".to_string(), role)]),
+                )
+            })
+            .await
+            .unwrap();
+    }
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+
+    let selector = "host.labels.role == \"web\"";
+    let listed = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/actions?selector=host.labels.role%20%3D%3D%20%22web%22")
+            .to_request(),
+    )
+    .await;
+    let listed: Vec<buckle_api::FleetAction> = test::read_body_json(listed).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].targets, vec!["pi-1", "pi-2"]);
+
+    let start = |action: &str, note: &str| {
+        test::TestRequest::post()
+            .uri("/api/v1/rollouts")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(buckle_api::StartActionRollout {
+                module: "web".into(),
+                action: action.into(),
+                selector: Some(selector.into()),
+                note: note.into(),
+            })
+            .to_request()
+    };
+    for (action, note, status) in [
+        ("drain", "", StatusCode::BAD_REQUEST),
+        ("vacuum", "why", StatusCode::NOT_FOUND),
+    ] {
+        let resp = test::call_service(&app, start(action, note)).await;
+        assert_eq!(resp.status(), status, "{action}");
+    }
+    let resp = test::call_service(&app, start("drain", "before maintenance")).await;
+    let status = resp.status();
+    let body = test::read_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let summary: buckle_api::RolloutSummary = serde_json::from_slice(&body).unwrap();
+    let action = summary.action.expect("an action rollout");
+    assert_eq!(
+        (action.module.as_str(), action.action.as_str()),
+        ("web", "drain")
+    );
+    assert_eq!(summary.hosts_total, 2);
 }

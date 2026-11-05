@@ -177,3 +177,19 @@ describe("actions", () => {
     await close();
   });
 });
+
+describe("action rollouts", () => {
+  test("Run action… picks an action and its targets, and opens the rollout it starts", async () => {
+    const { page, close } = await open("/hosts");
+    await page.getByRole("button", { name: "Run action…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Run an action across the fleet" });
+    await dialog.getByRole("combobox", { name: "Action" }).selectOption({ label: "common · Upgrade packages" });
+    await eventually(async () =>
+      assert.match(await dialog.getByTestId("run-action-targets").textContent(), /Runs on .+/),
+    );
+    await dialog.getByRole("button", { name: /^Run Upgrade packages on \d+ targets?$/ }).click();
+    await page.getByTestId("rollout-action").waitFor();
+    assert.match(await page.getByTestId("rollout-action").textContent(), /Upgrade packages/);
+    await close();
+  });
+});

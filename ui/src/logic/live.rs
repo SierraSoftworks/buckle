@@ -367,6 +367,7 @@ mod tests {
             superseded_by: None,
             trace_id: None,
             trace_url: None,
+            action: None,
         }
     }
 

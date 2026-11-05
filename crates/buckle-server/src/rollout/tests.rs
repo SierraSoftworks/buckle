@@ -78,7 +78,12 @@ struct Script {
     target_digest: Option<String>,
     /// Planning a cluster target fails with this error.
     target_plan_error: Option<String>,
+    /// Actions fail.
+    action_fail: bool,
 }
+
+/// Report ids for the fake agents' durable action results.
+static NEXT_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 type Log = Arc<Mutex<Vec<(DateTime<Utc>, String, SMsg)>>>;
 
@@ -470,6 +475,33 @@ impl Harness {
                             ..Default::default()
                         }));
                     }
+                    // An action's result is durable, as the agent's is.
+                    SMsg::Action(a) => {
+                        let id = NEXT_REPORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let failed = s.action_fail;
+                        // The ack is not awaited: the controller reacts either way.
+                        drop(handle.durable_report(
+                            &name,
+                            id,
+                            AMsg::Action(pb::ActionResult {
+                                action_id: a.action_id,
+                                module: a.module,
+                                action: a.action,
+                                revision: a.revision,
+                                target: a.target,
+                                report_id: id,
+                                succeeded: !failed,
+                                error: if failed {
+                                    "apt is locked".into()
+                                } else {
+                                    String::new()
+                                },
+                                changes: 1,
+                                reboot: s.reboot.clone(),
+                                ..Default::default()
+                            }),
+                        ));
+                    }
                     SMsg::Rollback(_) if s.silent_rollback => {}
                     SMsg::Rollback(r) => reply(AMsg::Result(ApplyResult {
                         target: r.target.clone(),
@@ -622,6 +654,36 @@ impl Harness {
 
     async fn command(&self, cmd: Command) -> Result<String, CommandError> {
         self.handle.command("alice", cmd).await
+    }
+
+    /// Makes `revision` the stable one (the controller reads it on start).
+    async fn stable(&mut self, revision: &str) {
+        let r = revision.to_owned();
+        self.store
+            .call(move |db| db.kv().set("stable_revision", &r))
+            .await
+            .unwrap();
+        self.restart().await;
+    }
+
+    /// Starts an action rollout of `common/upgrade` on `targets` (each
+    /// running `r1`).
+    async fn start_action(&self, targets: &[&str], confirm: bool) -> Result<String, CommandError> {
+        self.command(Command::StartAction {
+            action: RolloutAction {
+                module: "common".into(),
+                action: "upgrade".into(),
+                label: "Upgrade packages".into(),
+                confirm,
+                selector: None,
+            },
+            targets: targets
+                .iter()
+                .map(|t| (t.to_string(), "r1".to_string()))
+                .collect(),
+            note: String::new(),
+        })
+        .await
     }
 }
 
@@ -4521,4 +4583,199 @@ async fn an_action_is_refused_while_its_target_applies_in_a_rollout() {
         .expect_err("refused mid-apply");
     assert_eq!(refused.kind, CommandErrorKind::Conflict);
     assert!(h.sent(|_, m| matches!(m, SMsg::Action(_))).is_empty());
+}
+
+// ---------------------------------------------------------------- action rollouts
+
+const ACTION_PHASES: &str = "  health: { bake: 1m }\n  phases:\n    - { name: canary, select: 'host.groups contains \"canary\"' }\n    - { name: web, select: 'host.groups contains \"web\"', parallel: 1 }\n";
+
+/// Hosts c1 (canary), w1, w2 (web) and x (web, not targeted), connected on
+/// a stable r1 with `rollout`.
+async fn action_fleet(rollout: &str) -> Harness {
+    let mut h = Harness::new().await;
+    h.revision("r1", rollout).await;
+    h.stable("r1").await;
+    for (id, tier) in [("c1", "canary"), ("w1", "web"), ("w2", "web"), ("x", "web")] {
+        h.enrol(id, tier).await;
+        h.connect(id, Some("r1"));
+    }
+    h
+}
+
+fn action_runs(h: &Harness) -> Vec<(DateTime<Utc>, String, pb::RunAction)> {
+    h.sent(|_, m| matches!(m, SMsg::Action(_)))
+        .into_iter()
+        .filter_map(|(t, host, m)| match m {
+            SMsg::Action(a) => Some((t, host, a)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_action_rollout_runs_the_action_phase_by_phase_and_promotes_nothing() {
+    let h = action_fleet(ACTION_PHASES).await;
+    let id = h.start_action(&["c1", "w1", "w2"], false).await.unwrap();
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(r.runtime.action.is_some());
+    assert_eq!(hosts.len(), 3, "only the targets it was started for");
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+
+    let runs = action_runs(&h);
+    let order: Vec<&str> = runs.iter().map(|(_, host, _)| host.as_str()).collect();
+    assert_eq!(order.len(), 3);
+    assert_eq!(order[0], "c1", "the canary phase runs first");
+    assert!(
+        runs.iter()
+            .all(|(_, _, a)| a.module == "common" && a.action == "upgrade")
+    );
+    // Nothing is planned or applied, and the stable revision is unchanged.
+    assert!(
+        h.sent(|_, m| matches!(m, SMsg::Plan(_) | SMsg::Apply(_)))
+            .is_empty()
+    );
+    let stable = h
+        .store
+        .call(|db| db.kv().get("stable_revision"))
+        .await
+        .unwrap();
+    assert_eq!(stable.as_deref(), Some("r1"));
+    // Each target's run is the rollout's.
+    let rid = id.clone();
+    let stored = h
+        .store
+        .call(move |db| db.runs().ids_for_rollout(&rid))
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 3);
+    // Baseline and bake checks ran around each action.
+    for scope in [HealthScope::Baseline, HealthScope::Bake] {
+        assert!(
+            !h.sent(
+                |host, m| host == "w2" && matches!(m, SMsg::Health(x) if x.scope == scope as i32)
+            )
+            .is_empty()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_action_pauses_the_rollout_on_its_budget_and_cannot_be_rolled_back() {
+    let h = action_fleet(ACTION_PHASES).await;
+    h.script("c1", |s| s.action_fail = true);
+    let id = h.start_action(&["c1", "w1", "w2"], false).await.unwrap();
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    assert_eq!(r.runtime.pause.as_ref().unwrap().kind, "failure_budget");
+    let c1 = host(&hosts, "c1");
+    assert_eq!(c1.state, HostPhase::Failed);
+    assert!(
+        c1.runtime
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("apt is locked")
+    );
+    assert_eq!(action_runs(&h).len(), 1, "the web phase never started");
+    let refused = h
+        .command(Command::Rollback {
+            rollout: id.clone(),
+            note: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind, CommandErrorKind::Conflict);
+    // A retry runs the action again.
+    h.script("c1", |s| s.action_fail = false);
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: "c1".into(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(action_runs(&h).len(), 4);
+}
+
+#[rstest::rstest]
+#[case::required("approval: required", false)]
+#[case::confirmed_action_if_destructive("approval: if_destructive", true)]
+#[tokio::test(start_paused = true)]
+async fn an_action_rollout_waits_for_one_approval_per_phase(
+    #[case] approval: &str,
+    #[case] confirm: bool,
+) {
+    let h = action_fleet(&format!(
+        "  phases:\n    - {{ name: web, select: 'true', {approval} }}\n"
+    ))
+    .await;
+    let id = h.start_action(&["w1", "w2"], confirm).await.unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::AwaitingApproval).await;
+    let digests: std::collections::BTreeSet<_> =
+        hosts.iter().filter_map(|x| x.plan_digest.clone()).collect();
+    assert_eq!(digests.len(), 1, "one action, one plan to approve");
+    assert!(action_runs(&h).is_empty());
+    h.command(Command::Approve {
+        rollout: id.clone(),
+        phase: "web".into(),
+        digests: digests.into_iter().collect(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(action_runs(&h).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_action_that_reboots_bakes_once_the_host_is_back() {
+    let mut h =
+        action_fleet("  health: { bake: 1m }\n  phases:\n    - { name: web, select: 'true' }\n")
+            .await;
+    h.script("w1", |s| {
+        s.boot_id = Some("boot-1".into());
+        s.reboot = Some(reboot(1800));
+    });
+    let id = h.start_action(&["w1"], false).await.unwrap();
+    h.wait(&id, "rebooting", |_, hs| {
+        host(hs, "w1").state == HostPhase::Rebooting
+    })
+    .await;
+    h.disconnect("w1");
+    h.script("w1", |s| s.boot_id = Some("boot-2".into()));
+    h.connect("w1", Some("r1"));
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let w1 = host(&hosts, "w1");
+    assert_eq!(w1.state, HostPhase::Healthy);
+    assert!(
+        w1.runtime
+            .reboot
+            .as_ref()
+            .is_some_and(|w| w.back_at.is_some())
+    );
+    assert_eq!(action_runs(&h).len(), 1, "the action is not sent again");
+}
+
+#[rstest::rstest]
+#[case::another_rollout_under_way(true)]
+#[case::no_targets(false)]
+#[tokio::test(start_paused = true)]
+async fn an_action_rollout_is_refused(#[case] busy: bool) {
+    let h = action_fleet(ACTION_PHASES).await;
+    if busy {
+        h.script("x", |s| s.silent_apply = true);
+        h.revision("r2", ACTION_PHASES).await;
+        h.start("r2").await;
+    }
+    let targets: &[&str] = if busy { &["w1"] } else { &[] };
+    let refused = h.start_action(targets, false).await.unwrap_err();
+    assert_eq!(
+        refused.kind,
+        if busy {
+            CommandErrorKind::Conflict
+        } else {
+            CommandErrorKind::Invalid
+        }
+    );
+    assert!(action_runs(&h).is_empty());
 }

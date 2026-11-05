@@ -155,6 +155,15 @@ pub struct ActionInfo {
     pub implicit: bool,
 }
 
+/// An action and the targets offering it now
+/// (`GET /api/v1/actions?selector=…`), for an action rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetAction {
+    pub action: ActionInfo,
+    /// The targets offering it (that the selector matches), by name.
+    pub targets: Vec<String>,
+}
+
 /// The run an action request started.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionStarted {

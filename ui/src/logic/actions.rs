@@ -1,7 +1,7 @@
 //! How a target's actions (`HostDetail.actions`) are offered: which ones a
 //! module head shows, how each is labelled, and what a click does.
 
-use buckle_api::ActionInfo;
+use buckle_api::{ActionInfo, FleetAction};
 
 /// What clicking an action does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +50,21 @@ pub fn spans_modules(actions: &[ActionInfo]) -> bool {
         .is_some_and(|first| actions.iter().any(|a| a.module != first.module))
 }
 
+/// Names a fleet action in the Run action picker: `module/name`.
+pub fn fleet_key(f: &FleetAction) -> String {
+    format!("{}/{}", f.action.module, f.action.name)
+}
+
+/// The Run action dialog's button: what starts, on how many targets.
+pub fn rollout_label(f: &FleetAction) -> String {
+    let n = f.targets.len();
+    format!(
+        "Run {} on {n} {}",
+        f.action.label,
+        if n == 1 { "target" } else { "targets" }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +109,20 @@ mod tests {
         assert!(spans_modules(&all));
         assert!(!spans_modules(&of_module(&all, "web")));
         assert!(!spans_modules(&[]));
+    }
+
+    #[test]
+    fn a_fleet_action_says_what_starts_and_where() {
+        for (targets, expected) in [
+            (vec!["a"], "Run Restart on 1 target"),
+            (vec!["a", "b"], "Run Restart on 2 targets"),
+        ] {
+            let f = FleetAction {
+                action: action("web", "Restart", false),
+                targets: targets.into_iter().map(str::to_owned).collect(),
+            };
+            assert_eq!(rollout_label(&f), expected);
+            assert_eq!(fleet_key(&f), "web/restart");
+        }
     }
 }

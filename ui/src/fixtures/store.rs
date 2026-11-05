@@ -536,6 +536,132 @@ pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiEr
     })
 }
 
+/// The demo reads a selector loosely: a target matches when its name or
+/// one of its labels' values is quoted in it.
+fn demo_selects(selector: &str, target: &HostSummary) -> bool {
+    let selector = selector.trim();
+    selector.is_empty()
+        || selector.contains(&format!("\"{}\"", target.id))
+        || target
+            .effective_labels
+            .values()
+            .any(|v| selector.contains(&format!("\"{v}\"")))
+}
+
+pub fn fleet_actions(selector: &str) -> Result<Vec<buckle_api::FleetAction>, ApiError> {
+    with(|s| {
+        let mut out: Vec<buckle_api::FleetAction> = Vec::new();
+        for d in &s.details {
+            if d.summary.status != HostStatus::Active || !demo_selects(selector, &d.summary) {
+                continue;
+            }
+            for a in &d.actions {
+                match out
+                    .iter_mut()
+                    .find(|f| f.action.module == a.module && f.action.name == a.name)
+                {
+                    Some(f) => f.targets.push(d.summary.id.clone()),
+                    None => out.push(buckle_api::FleetAction {
+                        action: a.clone(),
+                        targets: vec![d.summary.id.clone()],
+                    }),
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.action.module, &a.action.name).cmp(&(&b.action.module, &b.action.name))
+        });
+        Ok(out)
+    })
+}
+
+pub fn start_action_rollout(
+    body: &buckle_api::StartActionRollout,
+) -> Result<RolloutSummary, ApiError> {
+    admin()?;
+    let selector = body.selector.clone().unwrap_or_default();
+    let found = fleet_actions(&selector)?
+        .into_iter()
+        .find(|f| f.action.module == body.module && f.action.name == body.action)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "No target offers the action '{}' of '{}'.",
+                body.action, body.module
+            ))
+        })?;
+    // The demo always has a rollout under way, which the server would refuse
+    // to start beside: the demo starts it anyway.
+    with(|s| {
+        let stable = s
+            .revisions
+            .iter()
+            .find(|r| r.is_stable)
+            .cloned()
+            .ok_or_else(|| ApiError::Conflict("There is no stable revision yet.".into()))?;
+        let id = (s
+            .rollouts
+            .iter()
+            .filter_map(|r| r.summary.id.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1)
+        .to_string();
+        let mut detail = data::active_rollout(Utc::now());
+        detail.summary.id = id.clone();
+        detail.summary.revision = stable.id.clone();
+        detail.summary.revision_message =
+            format!("{} ({}/{})", found.action.label, body.module, body.action);
+        detail.summary.action = Some(buckle_api::RolloutActionInfo {
+            module: body.module.clone(),
+            action: body.action.clone(),
+            label: found.action.label.clone(),
+            selector: body.selector.clone(),
+        });
+        detail.summary.state = RolloutState::Rolling;
+        detail.summary.triggered_by = actor();
+        detail.summary.started_at = Utc::now();
+        detail.events.clear();
+        detail.plans.clear();
+        for (i, phase) in detail.phases.iter_mut().enumerate() {
+            phase.state = if i == 0 {
+                PhaseState::Open
+            } else {
+                PhaseState::Pending
+            };
+            phase.approved_by = None;
+            phase.hosts.retain(|h| found.targets.contains(&h.host));
+            for h in &mut phase.hosts {
+                h.state = HostRolloutState::Planned;
+                h.error = None;
+                h.failed_checks.clear();
+            }
+        }
+        detail.summary.current_phase = detail.phases.first().map(|p| p.name.clone());
+        detail.summary.hosts_total = detail.phases.iter().map(|p| p.hosts.len() as u32).sum();
+        detail.summary.hosts_done = 0;
+        detail.summary.hosts_failed = 0;
+        let summary = detail.summary.clone();
+        s.rollouts.insert(0, detail);
+        s.record(
+            &actor(),
+            "rollout.detected",
+            &id,
+            format!(
+                "rollout of {}/{} on {} targets created by {}. {}",
+                body.module,
+                body.action,
+                found.targets.len(),
+                actor(),
+                body.note
+            ),
+        );
+        s.outbox.push(LiveEvent::RolloutChanged {
+            rollout: summary.clone(),
+        });
+        Ok(summary)
+    })
+}
+
 pub fn rollouts(offset: u64) -> Result<Page<RolloutSummary>, ApiError> {
     with(|s| {
         let list: Vec<RolloutSummary> = s.rollouts.iter().map(|r| r.summary.clone()).collect();
