@@ -391,6 +391,7 @@ fn entry(
         bake: None,
         preview: false,
         drifted_from: None,
+        removal: false,
         needs_approval: false,
         needs_attention: false,
         error_detail: None,
@@ -554,6 +555,13 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
                 now,
                 30,
             )),
+            // grey left the configuration: its removal waits its turn.
+            {
+                let mut c = placement("home-nomad", "grey", "home", S::Pending, None, now, 3);
+                c.removal = true;
+                c.step = 1;
+                c
+            },
         ],
     );
 

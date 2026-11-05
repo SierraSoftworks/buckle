@@ -139,6 +139,10 @@ pub struct RolloutHost {
     /// apply changed between the rollout's start and the stage opening.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drifted_from: Option<String>,
+    /// A placement whose workload left the configuration: it removes what
+    /// the workload owned on the cluster.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removal: bool,
 }
 
 /// A reboot a rollout host's run asked for.

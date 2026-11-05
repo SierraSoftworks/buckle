@@ -50,6 +50,7 @@ pub fn pipeline(props: &PipelineProps) -> Html {
     let units = || props.detail.phases.iter().flat_map(|ph| &ph.hosts);
     let has_cluster = units().any(|h| h.kind != TargetKind::Host);
     let has_unchanged = units().any(units::unchanged);
+    let has_removal = units().any(|h| h.removal);
     let stages = p.stages.iter().enumerate().map(|(i, stage)| {
         html! {
             <div class="pipeline__step" role="listitem">
@@ -91,6 +92,12 @@ pub fn pipeline(props: &PipelineProps) -> Html {
                         <li class="legend__item">
                             <span class="block block--legend block--planned block--cluster block--waiting" aria-hidden="true" />
                             { "waiting (earlier step, need, steward)" }
+                        </li>
+                    }
+                    if has_removal {
+                        <li class="legend__item">
+                            <span class="block block--legend block--planned block--cluster block--removal" aria-hidden="true" />
+                            { "removing" }
                         </li>
                     }
                     if has_unchanged {
@@ -309,6 +316,9 @@ fn block(
     }
     if let Some(wave) = entry.wave {
         detail.push(html! { <span>{ format!("wave {wave}") }</span> });
+    }
+    if entry.removal {
+        detail.push(html! { <span>{ "removes the workload: it left the configuration" }</span> });
     }
     if units::unchanged(entry) {
         detail.push(html! { <span class="muted">{ "plan changes nothing" }</span> });

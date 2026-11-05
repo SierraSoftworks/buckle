@@ -566,6 +566,7 @@ mod tests {
             bake: None,
             preview: false,
             drifted_from: None,
+            removal: false,
             needs_approval: stale,
             needs_attention: false,
             error_detail: None,

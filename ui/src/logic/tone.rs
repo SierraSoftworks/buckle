@@ -142,6 +142,10 @@ pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook 
         classes.push("block--unchanged");
         label.push_str(", unchanged");
     }
+    if entry.removal {
+        classes.push("block--removal");
+        label.push_str(", removing");
+    }
 
     if entry.needs_approval
         && !matches!(
@@ -440,6 +444,7 @@ mod tests {
             bake: None,
             preview: false,
             drifted_from: None,
+            removal: false,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,

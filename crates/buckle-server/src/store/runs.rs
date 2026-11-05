@@ -410,26 +410,35 @@ impl<'c> Runs<'c> {
             .next())
     }
 
-    /// The newest run id of every host of a rollout.
-    pub fn ids_for_rollout(
-        &self,
-        rollout: &str,
-    ) -> Result<std::collections::BTreeMap<String, String>> {
+    /// The newest run id of every host of a rollout, and of every plan a
+    /// host ran in it (a placement's run is its plan's).
+    pub fn ids_for_rollout(&self, rollout: &str) -> Result<RolloutRunIds> {
         let mut stmt = self
             .conn
-            .prepare("SELECT host, run_id FROM runs WHERE rollout = ?1 ORDER BY id ASC")
+            .prepare(
+                "SELECT host, plan_digest, run_id FROM runs WHERE rollout = ?1 ORDER BY id ASC",
+            )
             .map_err(db_error)?;
         let rows = stmt
             .query_map(params![rollout], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(host, id)| id.map(|id| (host, id)))
-            .collect())
+        let mut ids = RolloutRunIds::default();
+        for (host, digest, id) in rows {
+            let Some(id) = id else { continue };
+            if let Some(d) = digest {
+                ids.by_plan.insert((host.clone(), d), id.clone());
+            }
+            ids.by_host.insert(host, id);
+        }
+        Ok(ids)
     }
 
     /// Stores the latest event for one key (a step, module, handler,
@@ -639,5 +648,33 @@ mod tests {
             events.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
             vec!["failed", "blocked"]
         );
+    }
+}
+
+/// The newest runs of a rollout's rows ([`Runs::ids_for_rollout`]).
+#[derive(Debug, Default)]
+pub struct RolloutRunIds {
+    by_host: std::collections::BTreeMap<String, String>,
+    by_plan: std::collections::BTreeMap<(String, String), String>,
+}
+
+impl RolloutRunIds {
+    /// How many hosts (clusters counted once) have a run in the rollout.
+    pub fn len(&self) -> usize {
+        self.by_host.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_host.is_empty()
+    }
+
+    /// The run a rollout row is on: a placement's is the run of its own
+    /// plan (a cluster runs one per placement), a host's its newest.
+    pub fn get(&self, host: &str, workload: Option<&str>, plan: Option<&str>) -> Option<String> {
+        match (workload, plan) {
+            (Some(_), Some(d)) => self.by_plan.get(&(host.to_owned(), d.to_owned())).cloned(),
+            (Some(_), None) => None,
+            (None, _) => self.by_host.get(host).cloned(),
+        }
     }
 }

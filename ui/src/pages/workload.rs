@@ -155,7 +155,8 @@ pub fn workload_page(props: &Props) -> Html {
                                 html! {
                                     <span class="workload-rollout__unit" data-host={h.host.clone()}>
                                         { format!(" · {}: ", h.host) }
-                                        if quiet { <Pill tone={Tone::Neutral} label="unchanged" /> }
+                                        if h.removal { <Pill tone={Tone::Warn} label="removing" /> }
+                                        else if quiet { <Pill tone={Tone::Neutral} label="unchanged" /> }
                                         else { <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} /> }
                                         <span class="muted">{ format!(" in {}", h.phase) }</span>
                                     </span>

@@ -6792,9 +6792,7 @@ impl Controller {
                         .map(|h| h.rollout.as_str())
                         .collect::<BTreeSet<_>>()
                     {
-                        for (host, id) in db.runs().ids_for_rollout(rollout)? {
-                            run_ids.insert((rollout.to_owned(), host), id);
-                        }
+                        run_ids.insert(rollout.to_owned(), db.runs().ids_for_rollout(rollout)?);
                     }
                     Ok((entries, run_ids))
                 })
@@ -6828,8 +6826,13 @@ impl Controller {
                     for h in &hosts {
                         if let Some(l) = self.live.iter().find(|l| l.record.id == h.rollout) {
                             let mut host = view::host(&l.record, h, &l.approvals);
-                            host.run_id =
-                                run_ids.get(&(h.rollout.clone(), h.host.clone())).cloned();
+                            host.run_id = run_ids.get(&h.rollout).and_then(|ids| {
+                                ids.get(
+                                    &h.host,
+                                    host.workload.as_deref(),
+                                    host.plan_digest.as_deref(),
+                                )
+                            });
                             self.events.publish(LiveEvent::RolloutHostChanged {
                                 rollout_id: h.rollout.clone(),
                                 host,

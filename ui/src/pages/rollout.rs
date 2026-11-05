@@ -1263,7 +1263,7 @@ fn host_table(props: &HostTableProps) -> Html {
                     <th colspan="7" scope="colgroup">
                         <span class="group-head">
                             <span class="group-head__name">{ match step {
-                                Some(s) => format!("{} · step {s}", phase.name),
+                                Some(s) => format!("{} · step {}", phase.name, s + 1),
                                 None => phase.name.clone(),
                             } }</span>
                             if first {
@@ -1544,6 +1544,7 @@ fn unit_cell(h: &RolloutHost, target: Option<&HostSummary>, now: DateTime<Utc>) 
             <span class="unit-name">
                 <RouteLink to={Route::unit(h)} query={crate::components::pipeline::unit_query(h)}>{ units::name(h).to_owned() }</RouteLink>
                 <span class="muted">{ format!(" on {cluster}") }</span>
+                if h.removal { { " " }<span class="badge" title="It left the configuration; this removes it from the cluster">{ "removing" }</span> }
             </span>
         },
         None => html! { <HostLink id={h.host.clone()} host={target.cloned()} {now} /> },

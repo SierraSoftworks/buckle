@@ -1654,7 +1654,7 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
     let mut detail = view::detail(&r, &hosts, &approvals, &audit);
     for h in detail.phases.iter_mut().flat_map(|p| p.hosts.iter_mut()) {
         if h.run_id.is_none() {
-            h.run_id = run_ids.get(&h.host).cloned();
+            h.run_id = run_ids.get(&h.host, h.workload.as_deref(), h.plan_digest.as_deref());
         }
     }
     detail.summary = state.link_rollout(detail.summary);

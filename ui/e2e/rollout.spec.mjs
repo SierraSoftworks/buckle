@@ -16,7 +16,7 @@ describe("the rollout pipeline", () => {
     const blocks = page.locator(".pipeline:not(.pipeline--compact) .stage a.block");
     await blocks.first().waitFor();
     const units = await blocks.evaluateAll((els) => els.map((e) => [e.dataset.host, e.dataset.workload ?? ""].join("/")));
-    assert.equal(units.length, 30, "the rollout targets 25 hosts and 5 workloads");
+    assert.equal(units.length, 31, "the rollout targets 25 hosts and 6 workloads");
     assert.equal(new Set(units).size, units.length, "no unit is drawn twice");
     // Stage membership: each host appears under one data-stage only.
     const byStage = await page.locator(".stage").evaluateAll((stages) =>
@@ -87,11 +87,15 @@ describe("the rollout pipeline", () => {
     assert.equal((await section.locator(".stage__cluster-label").textContent()).trim(), "home-nomad");
     // Hosts come first, then the cluster's workloads.
     const order = await home.locator("a.block").evaluateAll((els) => els.map((e) => e.dataset.workload ?? "host"));
-    assert.equal(order.indexOf("atuin"), order.length - 3, "workloads after every host");
+    assert.equal(order.indexOf("atuin"), order.length - 4, "workloads after every host");
     const atuin = section.locator('a.block[data-workload="atuin"]');
     assert.match(await atuin.textContent(), /on home-nomad.*via pi-1/s);
     assert.equal(await section.locator("a.block--unchanged").count(), 2, "postgresql and paste change nothing");
     assert.match(await home.locator(".stage__meta").first().textContent(), /2 unchanged/);
+    // A workload that left the configuration is removed: struck through, and said so.
+    const grey = section.locator('a.block[data-workload="grey"]');
+    assert.match(await grey.getAttribute("class"), /block--removal/);
+    assert.match(await grey.textContent(), /removes the workload/);
     // Waiting for an earlier step, and naming only what it waits on.
     const grafana = page.locator('.stage[data-stage="everything-else"] a.block[data-workload="grafana"]');
     assert.match(await grafana.getAttribute("class"), /block--waiting/);
@@ -101,6 +105,7 @@ describe("the rollout pipeline", () => {
     // The Targets card names what it waits on, and what the deployment is doing.
     const targets = page.locator("section.panel", { has: page.locator(".panel__title", { hasText: /^Targets$/ }) });
     assert.match(await targets.locator('tr[data-unit="lab-nomad/grafana"]').getByTestId("host-waiting").textContent(), /waits for lab-1/);
+    assert.match(await targets.locator('tr[data-unit="home-nomad/grey"]').textContent(), /grey on home-nomad removing/);
     const row = targets.locator('tr[data-unit="home-nomad/atuin"]');
     assert.match(await row.textContent(), /atuin on home-nomad/);
     await eventually(async () => assert.match(await row.getByTestId("host-activity").textContent(), /server 1\/2 healthy/));
@@ -116,9 +121,9 @@ describe("the targets card", () => {
     const card = page.locator("section.panel", { has: page.locator(".panel__title", { hasText: /^Targets$/ }) });
     const rows = card.locator("tr[data-unit]");
     await rows.first().waitFor();
-    assert.match(await card.locator(".panel__subtitle").textContent(), /26 changed · 4 unchanged/);
+    assert.match(await card.locator(".panel__subtitle").textContent(), /27 changed · 4 unchanged/);
     assert.equal(await card.locator("tr[data-unchanged]").count(), 0, "Changed hides the no-ops");
-    assert.match(await card.locator('tr[data-stage="home"]').textContent(), /2 unchanged not shown/);
+    assert.match(await card.locator('tr[data-stage="home"]').first().textContent(), /2 unchanged not shown/);
     // Steps split a stage that has more than one.
     await card.locator('tr[data-stage="everything-else"][data-step="1"]').waitFor();
     await card.getByTestId("targets-view").getByRole("radio", { name: "All" }).click();

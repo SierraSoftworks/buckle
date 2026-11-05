@@ -95,6 +95,7 @@ pub fn host(
         bake: h.runtime.bake.clone(),
         preview: h.runtime.preview && h.plan_digest.is_some(),
         drifted_from: h.runtime.drifted_from.clone(),
+        removal: h.runtime.removal,
     }
 }
 
