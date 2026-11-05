@@ -123,12 +123,25 @@ fn paste() -> Vec<(String, String)> {
 }
 
 async fn apply(ex: &Executor, a: &Assignment) -> ApplyOutcome {
+    apply_with_events(ex, a).await.0
+}
+
+/// Applies `a`'s plan, with the events the apply sent.
+async fn apply_with_events(
+    ex: &Executor,
+    a: &Assignment,
+) -> (ApplyOutcome, Vec<buckle_core::engine::ApplyEvent>) {
     let planned = ex.plan(a, None).await.unwrap();
     let (tx, mut rx) = mpsc::channel(256);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let drain = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(e) = rx.recv().await {
+            seen.push(e);
+        }
+        seen
+    });
     let outcome = ex.apply(&planned, tx).await;
-    drain.await.unwrap();
-    outcome
+    (outcome, drain.await.unwrap())
 }
 
 #[tokio::test]
@@ -153,8 +166,17 @@ async fn a_workload_plans_applies_and_then_plans_as_a_no_op() {
     let json = serde_json::to_string(plan).unwrap();
     assert!(!json.contains(SECRET), "the secret leaked into the plan");
 
-    let outcome = apply(&ex, &a).await;
+    let (outcome, events) = apply_with_events(&ex, &a).await;
     assert!(outcome.succeeded, "{:?}", outcome.error);
+    // The job's deployment is followed step by step.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            buckle_core::engine::ApplyEvent::StepProgress { module, kind, message, .. }
+                if module == "paste" && kind == "nomad.job" && message.contains("healthy")
+        )),
+        "{events:?}"
+    );
     assert!(fake.entity("namespace", "apps").is_some());
     assert!(fake.variable("apps", "nomad/jobs/paste").is_some());
 

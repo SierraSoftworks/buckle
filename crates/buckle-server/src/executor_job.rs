@@ -388,6 +388,7 @@ mod tests {
             kind: ClusterKind::Nomad,
             description: String::new(),
             api: api.map(str::to_owned),
+            ui: None,
             nodes: None,
             executors: None,
             identity: "workload".into(),

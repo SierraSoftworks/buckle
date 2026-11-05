@@ -73,6 +73,7 @@ fleet:
     home-nomad:
       kind: nomad                                   # nomad or kubernetes
       api: http://127.0.0.1:4646                    # as an executor reaches it; absent: the local default
+      ui: https://nomad.home:4646                   # where people open its UI; absent: api, when HTTP
       nodes:     'host.groups contains "nomad-servers" || host.groups contains "nomad-clients"'
       executors: 'host.groups contains "nomad-servers"'   # which hosts may speak for it; absent: nodes
       identity: buckle_jwt                          # buckle_jwt (default), local, workload or secret://NAME
@@ -90,12 +91,13 @@ fleet:
 |---|---|
 | `nodes` | A [selector](./expressions.md) over `host.*` choosing the cluster's members: what a workload's `module:` edge and a module's `workload:` edge refer to. |
 | `executors` | Which of the hosts may apply workloads to the cluster. Defaults to `nodes`. |
+| `ui` | The cluster's own web UI, for the links beside each workload on the cluster's page (Nomad: `…/ui/jobs/NAME@NAMESPACE`). Defaults to `api` when that is an HTTP URL. |
 | `identity` | How an executor authenticates to the API: a token Buckle issues (`buckle_jwt`, see [identity](../agent/server.md#identity)), the host's own credentials (`local`), the scheduler's workload identity (`workload`), or a declared secret (`secret://NAME`). |
 | `labels` | Seed labels, as an agent's are for a host. Operators may add to them in the UI, and `cluster.labels.*` selects on the result. |
 | `cluster`, `scope` | A *scoped* target is part of another cluster and may touch only the namespaces listed. |
 | `trust` | Which workload identities may speak for the cluster from inside it ([in-cluster executors](../agent/server.md#in-cluster-executors)): `jwks_url` the server reads the signing keys from, or `keys` pinned as a JWKS document; an optional `issuer`; `subjects` as `namespace/job` (Nomad, default `default/buckle-executor`) or `sub` (Kubernetes, default `system:serviceaccount:buckle-system:buckle-executor`). Not on a scoped target. |
 
-Declared clusters appear beside the hosts in the UI and under `GET /api/v1/targets`, with their
+Declared clusters appear on the UI's Clusters page and under `GET /api/v1/targets`, with their
 spec and seed labels following the repository. Operators can also create clusters that are not in
 the repository with `POST /api/v1/targets` (`kind: cluster`), and pause, relabel or forget those
 through the same routes as hosts.

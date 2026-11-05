@@ -91,6 +91,10 @@ pub struct ClusterSpec {
     /// local default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
+    /// Where people open the cluster's own web UI (Nomad's `/ui`), for the
+    /// links beside each workload. Absent: `api`, when it is an HTTP URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<String>,
     /// Which hosts are members of the cluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<String>,
@@ -181,6 +185,78 @@ impl ClusterSpec {
     pub fn executors(&self) -> Option<&str> {
         self.executors.as_deref().or(self.nodes.as_deref())
     }
+
+    /// The base URL of the cluster's web UI: `ui`, else an HTTP `api`.
+    pub fn ui_base(&self) -> Option<&str> {
+        self.ui
+            .as_deref()
+            .or(self
+                .api
+                .as_deref()
+                .filter(|a| a.starts_with("http://") || a.starts_with("https://")))
+            .map(|u| u.trim_end_matches('/'))
+    }
+
+    /// Where the cluster's UI shows a job (`namespace/name`), when it has
+    /// a UI Buckle knows of and the scheduler is one it links into.
+    pub fn job_url(&self, job: &str) -> Option<String> {
+        let base = self.ui_base()?;
+        match self.kind {
+            ClusterKind::Nomad => {
+                let (ns, name) = job.split_once('/').unwrap_or(("default", job));
+                let base = base.strip_suffix("/ui").unwrap_or(base);
+                Some(format!("{base}/ui/jobs/{name}@{ns}"))
+            }
+            ClusterKind::Kubernetes => None,
+        }
+    }
+}
+
+/// How a cluster target stands now, beside its spec in the summary row:
+/// who speaks for it and how its workloads fare. Filled by the server when
+/// it lists the target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterStatus {
+    /// The host that last spoke for the cluster (applied or planned it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    /// How many workloads the reference revision selects for the cluster.
+    #[serde(default)]
+    pub workloads: u32,
+    /// Workloads with a required check failing now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failing: Vec<String>,
+    /// Workloads the cluster's run in progress is applying.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deploying: Vec<Deploying>,
+}
+
+/// A workload being applied, with its latest progress (`deploying: server
+/// 1/2 healthy`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deploying {
+    pub workload: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
+}
+
+/// One workload a cluster runs, as the cluster page lists it: what the
+/// revision declares, beside the applied resources, health and runs the
+/// detail already carries by module name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadView {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// `needs` as written (`postgresql`, `module:nomad`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    /// The kinds of its resources, in order (`job`, `volume`, `secret`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
+    /// What removing it does: `stop`, `purge` or `keep`.
+    #[serde(default)]
+    pub removal: String,
 }
 
 /// The cluster half of a target's summary.

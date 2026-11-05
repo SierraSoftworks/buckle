@@ -419,6 +419,175 @@ async fn hosts_can_be_relabelled_approved_and_previewed() {
 }
 
 #[actix_web::test]
+async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
+    let e = env(WebConfig::default()).await;
+    revision(
+        &e,
+        "r1",
+        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      ui: https://nomad.example:4646/\n",
+    )
+    .await;
+    let dir = e.state.revisions.dir("r1");
+    for (name, needs) in [("postgresql", ""), ("atuin", "needs: [postgresql]\n")] {
+        let w = dir.join(format!("workloads/{name}/files"));
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(
+            w.join(format!("{name}.nomad.hcl")),
+            format!("job \"{name}\" {{}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("workloads/{name}/workload.yaml")),
+            format!(
+                "name: {name}\ndescription: the {name} job\n{needs}resources: [{name}.nomad.hcl]\n"
+            ),
+        )
+        .unwrap();
+    }
+    e.store
+        .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "r1"))
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    // Listing materialises the declared cluster.
+    test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+    )
+    .await;
+
+    let now = chrono::Utc::now();
+    e.store
+        .call(move |db| {
+            db.kv().set(
+                &format!("{}home-nomad", crate::store::kv::keys::EXECUTOR_PREFIX),
+                "seer",
+            )?;
+            db.health().record(
+                "r1",
+                &[crate::store::HealthEventRecord {
+                    host: "home-nomad".into(),
+                    rollout: None,
+                    scope: "drift".into(),
+                    module: "postgresql".into(),
+                    check: "job".into(),
+                    kind: "nomad.job".into(),
+                    required: true,
+                    status: "fail".into(),
+                    reason: Some("0/1 allocations running".into()),
+                    at: now,
+                }],
+            )?;
+            let run = crate::store::RunRecord {
+                id: String::new(),
+                host: "home-nomad".into(),
+                rollout: None,
+                revision: "r1".into(),
+                plan_digest: "d".into(),
+                started_at: now,
+                finished_at: now,
+                outcome: crate::store::RUNNING.into(),
+                changes: 0,
+                removals: 0,
+                error: None,
+                trace_id: None,
+                outcome_json: None,
+            };
+            let id = db.runs().add(&run)?;
+            use buckle_core::engine::ApplyEvent as E;
+            let step = |message: &str| E::StepProgress {
+                module: "atuin".into(),
+                task_id: "default/atuin".into(),
+                id: "nomad.job[default/atuin]".into(),
+                kind: "nomad.job".into(),
+                message: message.into(),
+            };
+            for event in [
+                E::ModuleStarted {
+                    module: "postgresql".into(),
+                },
+                E::ModuleFinished {
+                    module: "postgresql".into(),
+                    status: buckle_core::engine::ModuleStatus::Unchanged,
+                },
+                E::ModuleStarted {
+                    module: "atuin".into(),
+                },
+                step("deploying: server 0/2 healthy"),
+                step("deploying: server 1/2 healthy"),
+            ] {
+                let key = crate::views::event_key(&event);
+                db.runs().record_event(
+                    &id,
+                    &key,
+                    None,
+                    None,
+                    None,
+                    &serde_json::to_string(&event).unwrap(),
+                    now,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let fleet: buckle_api::Fleet = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+        )
+        .await,
+    )
+    .await;
+    let status = fleet.clusters[0].cluster_status.clone().unwrap();
+    assert_eq!(status.executor.as_deref(), Some("seer"));
+    assert_eq!(status.workloads, 2);
+    assert_eq!(status.failing, vec!["postgresql"]);
+    assert_eq!(
+        status.deploying,
+        vec![buckle_api::Deploying {
+            workload: "atuin".into(),
+            progress: Some("deploying: server 1/2 healthy".into()),
+        }]
+    );
+
+    let detail: buckle_api::HostDetail = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/targets/home-nomad")
+                .to_request(),
+        )
+        .await,
+    )
+    .await;
+    let atuin = detail.workloads.iter().find(|w| w.name == "atuin").unwrap();
+    assert_eq!(atuin.needs, vec!["postgresql"]);
+    assert_eq!(atuin.resources, vec!["job"]);
+    assert_eq!(detail.summary.cluster_status, Some(status));
+    let spec = &detail.summary.cluster.as_ref().unwrap().spec;
+    assert_eq!(
+        spec.job_url("default/atuin").as_deref(),
+        Some("https://nomad.example:4646/ui/jobs/atuin@default")
+    );
+
+    // A host has neither.
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    let host: buckle_api::HostDetail = test::read_body_json(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/hosts/pi-1")
+                .to_request(),
+        )
+        .await,
+    )
+    .await;
+    assert!(host.summary.cluster_status.is_none() && host.workloads.is_empty());
+}
+
+#[actix_web::test]
 async fn cluster_targets_are_declared_or_created_and_listed_beside_hosts() {
     let e = env(WebConfig {
         admin_acl: acl("true"),
@@ -501,6 +670,7 @@ async fn cluster_targets_are_declared_or_created_and_listed_beside_hosts() {
         kind: buckle_api::ClusterKind::Kubernetes,
         description: String::new(),
         api: Some("https://10.0.0.1:6443".into()),
+        ui: None,
         nodes: Some("host.labels.k3s == true".into()),
         executors: None,
         identity: "local".into(),

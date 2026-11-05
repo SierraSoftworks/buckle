@@ -40,6 +40,9 @@ pub struct HostSummary {
     /// The cluster half of a cluster target; absent for a host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<crate::ClusterInfo>,
+    /// For a cluster: its executor and workload tally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_status: Option<crate::ClusterStatus>,
     pub status: HostStatus,
     pub connection: Connection,
     /// Seed labels reported by the agent.
@@ -119,6 +122,9 @@ pub struct HostDetail {
     /// while it is applying). `GET /hosts/{id}/runs/{run}` serves older ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_run: Option<crate::run::RunReport>,
+    /// For a cluster: the workloads its revision selects for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workloads: Vec<crate::WorkloadView>,
 }
 
 /// One resource whose live state no longer matches what Buckle applied, as

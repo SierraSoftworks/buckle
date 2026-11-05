@@ -396,6 +396,22 @@ fn apply_event(report: &mut RunReport, event: &ApplyEvent, at: DateTime<Utc>, st
                 }
             }
         }
+        // While it runs, a step's result is how far it got.
+        ApplyEvent::StepProgress {
+            module,
+            id,
+            task_id,
+            kind,
+            message,
+        } => {
+            let id = if id.is_empty() { task_id } else { id };
+            let s = step_mut(module_mut(report, module), id, kind);
+            if matches!(s.state, StepState::Pending | StepState::Running) {
+                s.state = StepState::Running;
+                s.started_at.get_or_insert(at);
+                s.result = Some(message.clone());
+            }
+        }
         ApplyEvent::HealthChecked { .. } | ApplyEvent::FactsRefreshed { .. } => {}
     }
 }
@@ -700,6 +716,7 @@ pub fn progress(run: &RunRecord, event: &ApplyEvent, at: DateTime<Utc>) -> RunPr
     }
     match event {
         ApplyEvent::StepFinished { summary, .. } => p.result = Some(summary.clone()),
+        ApplyEvent::StepProgress { message, .. } => p.result = Some(message.clone()),
         ApplyEvent::StepBlocked { reason, .. } | ApplyEvent::StepSkipped { reason, .. } => {
             p.result = Some(reason.clone())
         }
@@ -792,6 +809,15 @@ pub fn event_key(event: &ApplyEvent) -> String {
         ApplyEvent::RemovalRun { resource, .. } => format!("removal:{resource}"),
         ApplyEvent::HealthChecked { module, check, .. } => format!("health:{module}/{check}"),
         ApplyEvent::FactsRefreshed { .. } => "facts".to_owned(),
+        ApplyEvent::StepProgress {
+            module,
+            id,
+            task_id,
+            ..
+        } => format!(
+            "progress:{module}/{}",
+            if id.is_empty() { task_id } else { id }
+        ),
     }
 }
 
@@ -956,6 +982,45 @@ mod tests {
         assert_eq!(module(&report, "base").handlers[0].id, "base:restart");
         assert!(module(&report, "base").handlers[0].handler);
         assert_eq!(report.removals[0].state, StepState::Pending);
+    }
+
+    #[test]
+    fn a_running_step_shows_its_progress_until_it_finishes() {
+        let progress = |message: &str| ApplyEvent::StepProgress {
+            module: "base".into(),
+            task_id: "/b".into(),
+            id: "file.copy[/b]".into(),
+            kind: "file.copy".into(),
+            message: message.into(),
+        };
+        let result = |events: Vec<RunEvent>| {
+            let report = run_report(
+                &run(crate::store::RUNNING),
+                Some(&plan()),
+                &events,
+                None,
+                &[],
+            );
+            let s = &module(&report, "base").steps[1];
+            (s.state, s.result.clone())
+        };
+        let running = vec![
+            ev(1, started("base", "/b")),
+            ev(2, progress("deploying: web 1/2 healthy")),
+        ];
+        assert_eq!(
+            result(running.clone()),
+            (
+                StepState::Running,
+                Some("deploying: web 1/2 healthy".into())
+            )
+        );
+        let mut done = running;
+        done.push(ev(3, finished("base", "/b")));
+        let (state, text) = result(done);
+        assert_eq!(state, StepState::Changed);
+        assert_ne!(text.as_deref(), Some("deploying: web 1/2 healthy"));
+        assert_ne!(event_key(&progress("x")), event_key(&started("base", "/b")));
     }
 
     #[test]

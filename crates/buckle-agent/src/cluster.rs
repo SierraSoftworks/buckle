@@ -234,10 +234,16 @@ impl UnitPlan {
         }
     }
 
-    async fn apply(&self, i: usize) -> buckle_core::Result<buckle_core::task::Applied> {
+    /// Applies step `i`, reporting its progress (a rollout's healthy
+    /// allocations or replicas) through `progress`.
+    async fn apply(
+        &self,
+        i: usize,
+        progress: buckle_nomad::primitives::Progress,
+    ) -> buckle_core::Result<buckle_core::task::Applied> {
         match self {
-            UnitPlan::Nomad(cx, p) => p.steps[i].apply(cx).await,
-            UnitPlan::Kube(cx, p) => p.steps[i].apply(cx).await,
+            UnitPlan::Nomad(cx, p) => p.steps[i].apply(&cx.clone().with_progress(progress)).await,
+            UnitPlan::Kube(cx, p) => p.steps[i].apply(&cx.clone().with_progress(progress)).await,
         }
     }
 }
@@ -802,7 +808,28 @@ async fn apply_unit(
         .await;
         let step_started = Utc::now();
         let clock = tokio::time::Instant::now();
-        let applied = unit.plan.apply(i).await;
+        // A step's progress (a deployment's healthy allocations) goes out
+        // as it happens; one the channel has no room for is dropped, as the
+        // next replaces it anyway.
+        let progress: buckle_nomad::primitives::Progress = {
+            let (events, module, task_id, id, kind) = (
+                events.clone(),
+                module.clone(),
+                step.key.clone(),
+                id.clone(),
+                kind.clone(),
+            );
+            std::sync::Arc::new(move |message: &str| {
+                let _ = events.try_send(ApplyEvent::StepProgress {
+                    module: module.clone(),
+                    task_id: task_id.clone(),
+                    id: id.clone(),
+                    kind: kind.clone(),
+                    message: message.to_owned(),
+                });
+            })
+        };
+        let applied = unit.plan.apply(i, progress).await;
         let outcome = steps.get_mut(i);
         match applied {
             Ok(applied) => {
