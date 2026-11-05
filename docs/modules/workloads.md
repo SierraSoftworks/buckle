@@ -43,6 +43,7 @@ resources:
   - secret: nomad/jobs/paste                        # inline: a Nomad variable at that path
     items: { db_password: '{{ secrets.PASTE_DB }}' }
   - { file: paste.policy.hcl, attach: { job: paste } }
+  - { config: nomad/jobs/paste, files: [config.yaml] }  # inline: config files as items of that variable
   - { file: paste.nomad.hcl.j2, live_vars: [version], ignore: ['Meta[autoupdate.*]'] }
   - paste-cleanup.nomad.hcl                         # a second job
 restart_on: [nomad/jobs/paste]
@@ -56,7 +57,7 @@ removal: stop
 | `when` | Selects the clusters the workload runs on, over [`cluster.*`](./expressions.md#cluster-selectors). Absent: every cluster. |
 | `needs` | Order within the layer (a bare name is another workload) and across it (`module:NAME` waits for a module on the cluster's hosts; a module's `needs: ['workload:NAME']` waits for a workload). Cycles are rejected. A cluster's workloads apply concurrently unless one needs another, or an earlier workload creates the namespace or node pool it uses. |
 | `vars` | Defaults, overridden by the fleet's `vars` overlays; on Nomad, those a job declares a `variable` for become its HCL2 variables (fleet overlays reach every target, and Nomad refuses undeclared ones). |
-| `files` | Files passed to every job as string variables, by variable name (`files: { app_config: config.yaml }`, read as `var.app_config`). |
+| `files` | Files passed to every job as string variables, by variable name (`files: { app_config: config.yaml }`, read as `var.app_config`); see [config files](#config-files). |
 | `resources` | The objects the workload consists of, applied in list order and removed in reverse ([below](#resources)). |
 | `namespace` | The namespace the workload's entities live in, created if missing. Absent: the scheduler's default. |
 | `health` | Checks beside the implicit ones (each job's deployment and allocations; a Deployment's rollout). |
@@ -81,9 +82,46 @@ workload: each is planned, deployed and health checked on its own, and all share
 | `namespace`, `node_pool`, `quota` | `*.namespace.hcl`, `*.pool.hcl`, `*.quota.hcl` | `file`, `ignore` | Nomad |
 | `manifest` | `*.yaml`, `*.yml`, `*.json` | `file`, `ignore` | Kubernetes |
 | `secret` | inline `secret: NAME` | `items` (values may read `secrets.*`), `type` (Kubernetes, default `Opaque`) | both: a Nomad variable at the path `NAME`, or a Kubernetes Secret called `NAME` |
+| `config` | inline `config: NAME` | `files` (a list, or `{ item: file }`), `items` (plain values) | both: a Nomad variable at the path `NAME`, or a Kubernetes ConfigMap called `NAME` |
 
-A workload lists one scheduler's kinds, never both; secrets fit either. `.j2` may follow any
-file suffix.
+A workload lists one scheduler's kinds, never both; secrets and configs fit either. `.j2` may
+follow any file suffix.
+
+### Config files
+
+A `config` entry carries files from `files/` into the cluster as items of a Nomad variable or a
+ConfigMap, named after the file (less `.j2`; `{ item: file }` renames). A `.j2` file is rendered
+with the workload's `vars` first; a config is stored in clear, so a file or item that reads
+`secrets.*` is rejected. A `config` and a `secret` may name the same Nomad variable: Buckle writes
+both sets of items to it in one step, and items an operator added to the variable stay.
+
+```yaml
+resources:
+  - { config: nomad/jobs/paste, files: [config.yaml] }
+  - paste.nomad.hcl
+```
+
+A Nomad job reads the item in any `template`, where it mixes with lines consul-template renders;
+inserted values are not rendered again, so the file needs no escaping:
+
+```hcl
+template {
+  destination = "local/config.yaml"
+  change_mode = "restart"
+  data        = <<-EOT
+    {{ with nomadVar "nomad/jobs/paste" }}{{ index . "config.yaml" }}{{ end }}
+  EOT
+}
+```
+
+A task reads `nomad/jobs/<job>`, `nomad/jobs/<job>/<group>` and `nomad/jobs/<job>/<group>/<task>`
+without a policy, so a config meant for one job lives at one of those paths. A change to the file
+changes the variable, not the job spec: consul-template restarts the task (`change_mode`), outside
+the rollout's health gate. When a config change should be a deployment of its own, pass the file
+as a job variable instead: `files: { config: config.yaml }` on the workload or the job entry, a
+`variable "config" { type = string }` in the spec and `data = var.config` in the template. The file
+is then part of the spec, so the change is a deployment Buckle waits for, and the submission
+keeps it for tools that re-render the job.
 
 ### Values other tools own
 
