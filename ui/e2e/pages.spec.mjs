@@ -161,13 +161,16 @@ describe("every page renders in demo mode", () => {
   test("a cluster shows its workloads with their health, the latest run and the agents able to act for it", async () => {
     const { page, close } = await open("/clusters/home-nomad");
     assert.equal(await heading(page), "home-nomad");
-    for (const panel of ["Summary", "Notes and labels", "Workloads", "Recent runs"]) {
+    for (const panel of ["Summary", "Labels", "Workloads", "Recent runs"]) {
       await page.getByRole("heading", { name: panel, exact: true }).waitFor();
     }
     // Health and the latest run live in the Workloads card, not cards of their own.
-    for (const panel of ["Health", "Latest run", "Labels", "Notes"]) {
+    for (const panel of ["Health", "Latest run", "Notes"]) {
       assert.equal(await page.locator(".panel__title", { hasText: new RegExp(`^${panel}$`) }).count(), 0, panel);
     }
+    // Notes sit under the summary.
+    const summary = page.locator(".panel", { has: page.getByRole("heading", { name: "Summary", exact: true }) });
+    await summary.getByRole("textbox", { name: "Notes" }).waitFor();
     // The agents its executors selector matches, the last one marked.
     const executors = page.getByTestId("cluster-executors");
     assert.equal(await executors.locator("li").count(), 4);
@@ -179,7 +182,11 @@ describe("every page renders in demo mode", () => {
     assert.equal(await atuin.getAttribute("data-state"), "deploying");
     assert.match(await atuin.getByTestId("workload-progress").textContent(), /server 1\/2 healthy/);
     assert.match(await atuin.getByTestId("workload-run").textContent(), /running/);
-    const link = atuin.getByRole("link", { name: "Open default/atuin in the cluster's UI" });
+    // No Jobs column: a job links into the cluster's UI from its resource row.
+    assert.equal(await workloads.getByRole("columnheader", { name: "Jobs" }).count(), 0);
+    const link = workloads
+      .locator('tr[data-detail-of="atuin"] .run-step[data-resource="nomad.job[default/atuin]"]')
+      .getByRole("link", { name: "Open default/atuin in the cluster's UI" });
     assert.equal(await link.getAttribute("href"), "https://nomad.home.example:4646/ui/jobs/atuin@default");
     const postgresql = workloads.locator('tr[data-workload="postgresql"]');
     assert.equal(await postgresql.getAttribute("data-state"), "running");
@@ -222,7 +229,7 @@ describe("every page renders in demo mode", () => {
   test("a host shows facts, its modules with health and blueprint, drift and runs", async () => {
     const { page, close } = await open("/hosts/hz-3");
     assert.equal(await heading(page), "hz-3");
-    for (const panel of ["Summary", "Notes and labels", "Modules", "Drift", "Recent runs", "Facts"]) {
+    for (const panel of ["Summary", "Labels", "Modules", "Drift", "Recent runs", "Facts"]) {
       await page.getByRole("heading", { name: panel, exact: true }).waitFor();
     }
     // A module with drift starts open, tagging each resource for cleanup or not.
@@ -352,7 +359,7 @@ describe("empty and not-permitted states", () => {
       assert.equal(await page.getByRole("button", { name }).count(), 0, name);
     }
     await page.goto(page.url().replace("/rollouts/42", "/hosts/pi-1"));
-    await page.getByRole("heading", { name: "Notes and labels" }).waitFor();
+    await page.getByRole("heading", { name: "Labels", exact: true }).waitFor();
     assert.equal(await page.getByRole("button", { name: "Forget…" }).count(), 0);
     assert.equal(await page.getByRole("button", { name: "Add label" }).count(), 0);
     await close();

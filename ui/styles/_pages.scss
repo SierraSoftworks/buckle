@@ -565,8 +565,8 @@
 // Host labels editor
 .labels {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
-  gap: 1.5rem;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1.25rem;
 
   .subhead:first-child {
     margin-top: 0;
@@ -837,8 +837,9 @@
 
 // Cluster page: notes and labels in one card, beside the agents able to
 // run the cluster's operations.
-.notes-labels {
-  .panel__section + .panel__section {
+// A panel whose later parts sit under subheadings, ruled off.
+.panel--sections {
+  .panel__section {
     margin-top: 1rem;
     padding-top: 0.75rem;
     border-top: 1px solid var(--line);
@@ -846,10 +847,6 @@
 
   .panel__section > .subhead:first-child {
     margin-top: 0;
-  }
-
-  .labels {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 }
 
