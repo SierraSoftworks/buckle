@@ -226,6 +226,7 @@ pub fn plan_view(plan: &Plan) -> PlanView {
                         notifies: s.notifies.clone(),
                         always_runs: s.always_runs,
                         facts: s.facts.clone(),
+                        display: s.display.clone(),
                         ..Default::default()
                     };
                     match &s.planned {
@@ -470,6 +471,7 @@ pub(crate) mod tests {
             always_runs: false,
             removal: RemovalPolicy::Cleanup,
             facts: None,
+            display: None,
         }
     }
 

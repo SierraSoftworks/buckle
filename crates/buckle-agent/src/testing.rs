@@ -37,6 +37,7 @@ pub fn plan_with_changes(revision: &RevisionId, changes: usize) -> Plan {
             always_runs: false,
             removal: RemovalPolicy::Cleanup,
             facts: None,
+            display: None,
         })
         .collect();
     Plan::new(

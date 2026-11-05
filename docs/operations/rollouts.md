@@ -85,7 +85,8 @@ an **Approve** button for the next phase that wants an approval in its head:
   warnings. A phase is approved only once every phase before it has finished, so an approval is
   never given blind; until then its button is disabled and a note says what it waits on.
 - **Across the fleet**: one entry per module, with the phases (or hosts) it changes; hover for the
-  hosts by phase. Values that differ per host read as placeholders such as `«fact:host.id»`.
+  hosts by phase. Where a template put a host value that differs per host, it reads as a
+  placeholder such as `«fact:host.id»`; hover it for the hosts' values.
 - **By distinct plan**: hosts with identical plans grouped together by phase, destructive steps
   flagged.
 

@@ -312,6 +312,7 @@ fn plans_built_from_redacted_renders_hold_only_tokens(
         always_runs: false,
         removal: Default::default(),
         facts: None,
+        display: None,
     };
     let module = ModulePlan {
         module: "nomad".into(),

@@ -243,7 +243,13 @@ impl HostContext {
     /// The host values a traced context's templates emitted, by path; `None`
     /// when renders were not traced.
     pub fn emitted_paths(&self) -> Option<Vec<String>> {
-        self.emitted.as_ref().map(|e| e.paths(self))
+        self.emitted.as_ref().map(|e| e.paths())
+    }
+
+    /// `planned`'s diff text with the host values a traced context's
+    /// templates emitted as placeholders ([`crate::template::Emitted::display`]).
+    pub fn emitted_display(&self, planned: &crate::plan::Planned) -> Option<String> {
+        self.emitted.as_ref().and_then(|e| e.display(planned))
     }
 
     /// The target's string values by template path, as the fleet view names
