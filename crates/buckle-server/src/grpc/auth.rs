@@ -11,10 +11,26 @@ use std::path::PathBuf;
 pub struct WhoisIdentity {
     /// The node's short name (the host identity).
     pub node: String,
+    /// The node's MagicDNS name (`node.tailnet.ts.net`), without the root dot.
+    pub dns_name: Option<String>,
     /// The owning user's login, when the node is user-owned.
     pub user: Option<String>,
     /// The node's ACL tags (`tag:…`); empty for a user-owned node.
     pub tags: Vec<String>,
+}
+
+impl WhoisIdentity {
+    /// Whether an agent claiming `host_id` is this node: by its short name or
+    /// its MagicDNS name, since a host whose hostname is set to the FQDN
+    /// reports that.
+    pub fn is_named(&self, host_id: &str) -> bool {
+        let host_id = host_id.trim_end_matches('.');
+        host_id.eq_ignore_ascii_case(&self.node)
+            || self
+                .dns_name
+                .as_deref()
+                .is_some_and(|d| host_id.eq_ignore_ascii_case(d))
+    }
 }
 
 /// Resolves tailnet peers to node identities.
@@ -62,6 +78,11 @@ impl LocalApiWhois {
 pub fn parse_whois(body: &[u8]) -> Option<WhoisIdentity> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let node = &v["Node"];
+    let dns_name = node["Name"]
+        .as_str()
+        .map(|n| n.trim_end_matches('.'))
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned);
     let name = node["ComputedName"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -83,6 +104,7 @@ pub fn parse_whois(body: &[u8]) -> Option<WhoisIdentity> {
         .unwrap_or_default();
     Some(WhoisIdentity {
         node: name,
+        dns_name,
         // Tagged nodes report a placeholder profile; only a user-owned node
         // has an owner worth matching.
         user: v["UserProfile"]["LoginName"]
@@ -241,6 +263,7 @@ mod tests {
             parse_whois(body),
             Some(WhoisIdentity {
                 node: "pi-1".into(),
+                dns_name: Some("pi-1.tail1234.ts.net".into()),
                 user: Some("ada@example.com".into()),
                 tags: vec![],
             })
@@ -252,6 +275,24 @@ mod tests {
         assert_eq!(id.tags, vec!["tag:buckle".to_string()]);
         assert_eq!(id.user, None, "a tagged node has no owner to match");
         assert_eq!(parse_whois(b"nope"), None);
+    }
+
+    #[rstest]
+    #[case::short_name("voron", true)]
+    #[case::magic_dns("voron.raptor-perch.ts.net", true)]
+    #[case::rooted("voron.raptor-perch.ts.net.", true)]
+    #[case::case_insensitive("Voron", true)]
+    #[case::other_node("voron-2", false)]
+    #[case::other_tailnet("voron.elsewhere.ts.net", false)]
+    #[case::other_domain("voron.example.com", false)]
+    fn agents_may_claim_either_tailnet_name(#[case] host_id: &str, #[case] ok: bool) {
+        let id = WhoisIdentity {
+            node: "voron".into(),
+            dns_name: Some("voron.raptor-perch.ts.net".into()),
+            user: None,
+            tags: vec![],
+        };
+        assert_eq!(id.is_named(host_id), ok);
     }
 
     #[rstest]
