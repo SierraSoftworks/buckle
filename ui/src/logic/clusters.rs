@@ -323,6 +323,7 @@ mod tests {
                 cluster: None,
                 scope: Default::default(),
                 trust: None,
+                watch: None,
             },
             declared: true,
         });
