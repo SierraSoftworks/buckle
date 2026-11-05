@@ -1520,6 +1520,7 @@ impl Fleet for FleetService {
             IdentityPurpose::Read => Purpose::Read,
             IdentityPurpose::Deploy => Purpose::Deploy,
             IdentityPurpose::Drain => Purpose::Drain,
+            IdentityPurpose::Acl => Purpose::Acl,
             IdentityPurpose::Unspecified => {
                 return Err(Status::invalid_argument("name the identity's purpose"));
             }

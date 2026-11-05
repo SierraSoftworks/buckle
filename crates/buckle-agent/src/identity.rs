@@ -27,6 +27,8 @@ pub enum Purpose {
     Deploy,
     /// Draining this host's own node.
     Drain,
+    /// ACL policies, for executors only: never offered to `command.run`.
+    Acl,
 }
 
 /// A request for an identity.

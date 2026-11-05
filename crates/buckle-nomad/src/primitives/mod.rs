@@ -29,6 +29,9 @@ pub type Progress = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Clone)]
 pub struct Context {
     pub nomad: Nomad,
+    /// The client for ACL policies, which Nomad serves only to management
+    /// tokens; `None` uses `nomad`.
+    pub acl: Option<Nomad>,
     /// The cluster target's id (`home-nomad`).
     pub target: String,
     /// The workload being applied (`paste`).
@@ -52,6 +55,7 @@ impl Context {
     ) -> Self {
         Self {
             nomad,
+            acl: None,
             target: target.into(),
             module: module.into(),
             revision: revision.into(),
@@ -63,6 +67,17 @@ impl Context {
     pub fn with_progress(mut self, progress: Progress) -> Self {
         self.progress = progress;
         self
+    }
+
+    /// Uses `acl` for ACL policies.
+    pub fn with_acl(mut self, acl: Option<Nomad>) -> Self {
+        self.acl = acl;
+        self
+    }
+
+    /// The client ACL policies are read and written with.
+    pub fn acl(&self) -> &Nomad {
+        self.acl.as_ref().unwrap_or(&self.nomad)
     }
 }
 

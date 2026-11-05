@@ -271,6 +271,16 @@ impl Executor {
         let nomad = self.client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
         let workloads = a.workloads(&ctx);
+        // ACL policies need a management token, which only workloads that
+        // list one ask for; the cluster binds `acl` to it.
+        let acl = if workloads
+            .iter()
+            .any(|w| w.config.of_kind(ResourceKind::Policy).next().is_some())
+        {
+            Some(self.client(a, Purpose::Acl, rollout).await?)
+        } else {
+            None
+        };
         let implicit = implicit_namespaces(&nomad, &workloads).await?;
 
         let mut units = Vec::new();
@@ -324,7 +334,8 @@ impl Executor {
                         &name,
                         &a.revision.id.0,
                         a.spec.fingerprints.clone(),
-                    );
+                    )
+                    .with_acl(acl.clone());
                     workload
                         .plan_after(&cx, &earlier)
                         .await
@@ -375,7 +386,8 @@ impl Executor {
             "",
             &a.revision.id.0,
             a.spec.fingerprints.clone(),
-        );
+        )
+        .with_acl(acl);
         let mut removals = Vec::new();
         let mut planned_removals = Vec::new();
         for orphan in buckle_nomad::primitives::orphans(&cx, &declared).await? {

@@ -419,6 +419,25 @@ async fn policies_namespaces_and_pools_are_stamped_and_converge() {
 }
 
 #[tokio::test]
+async fn policies_go_through_the_acl_client_and_everything_else_does_not() {
+    let fake = FakeNomad::new();
+    let acl = FakeNomad::new();
+    let cx = cx(&fake, "r1").with_acl(Some(acl.client()));
+    let w = with(vec![
+        Primitive::Policy(PolicySpec {
+            file: "atuin.policy.hcl".into(),
+            rules: "namespace \"default\" { policy = \"read\" }\n".into(),
+            ..Default::default()
+        }),
+        volume(),
+    ]);
+    w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
+    assert!(acl.entity("policy", "atuin").is_some());
+    assert!(fake.entity("policy", "atuin").is_none());
+    assert_eq!(w.plan(&cx).await.unwrap().changes(), 0);
+}
+
+#[tokio::test]
 async fn existing_unmanaged_objects_are_adopted_with_a_warning() {
     let fake = FakeNomad::new();
     let cx = cx(&fake, "r1");

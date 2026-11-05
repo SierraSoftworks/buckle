@@ -95,7 +95,7 @@ pub(crate) async fn plan(cx: &Context, spec: &PolicySpec) -> Result<Step> {
         ));
     }
     let key = ObjectKey::new(Kind::Policy, "", &name);
-    let live = cx.nomad.get::<Value>(&url(&name)).await?;
+    let live = cx.acl().get::<Value>(&url(&name)).await?;
     let (_, live_stamps) = live
         .as_ref()
         .map(|l| Stamps::from_description(l["Description"].as_str().unwrap_or_default()))
@@ -180,27 +180,27 @@ pub(crate) async fn plan(cx: &Context, spec: &PolicySpec) -> Result<Step> {
 }
 
 pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<Applied> {
-    let live = cx.nomad.get::<Value>(&url(&key.name)).await?;
+    let live = cx.acl().get::<Value>(&url(&key.name)).await?;
     if live.as_ref().and_then(|l| l["ModifyIndex"].as_u64()) != p.modify_index {
         return Err(user(
             format!("{key} changed in the cluster after it was planned."),
             &["Plan again: the apply refuses to overwrite a change it has not shown."],
         ));
     }
-    cx.nomad
+    cx.acl()
         .write::<_, Value>("POST", &url(&key.name), &p.body)
         .await?;
     Ok(Applied::changed(format!("wrote {key}")))
 }
 
 pub(crate) async fn remove(cx: &Context, key: &ObjectKey) -> Result<Applied> {
-    cx.nomad.delete(&url(&key.name)).await?;
+    cx.acl().delete(&url(&key.name)).await?;
     Ok(Applied::changed(format!("deleted {key}")))
 }
 
 pub(crate) async fn owned(cx: &Context) -> Result<Vec<Orphan>> {
     let list = cx
-        .nomad
+        .acl()
         .get::<Vec<Value>>("/v1/acl/policies")
         .await?
         .unwrap_or_default();
