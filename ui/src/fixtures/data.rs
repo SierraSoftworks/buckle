@@ -2031,6 +2031,7 @@ pub fn clusters(now: DateTime<Utc>) -> Vec<HostSummary> {
             cluster: None,
             scope: Default::default(),
             trust: None,
+            watch: None,
         };
     let mut home = cluster(
         "home-nomad",

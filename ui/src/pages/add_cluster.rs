@@ -74,6 +74,7 @@ fn request(
             cluster: None,
             scope: Default::default(),
             trust,
+            watch: None,
         }),
         labels: Default::default(),
         notes: String::new(),
