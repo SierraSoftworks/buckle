@@ -409,6 +409,7 @@ pub fn rollout_event(e: &buckle_api::AuditEntry) -> buckle_api::RolloutEvent {
         kind: e.action.clone(),
         message: e.message.clone(),
         host: detail("host"),
+        workload: detail("workload").filter(|w| !w.is_empty()),
         phase: detail("phase"),
         actor: Some(e.actor.clone()),
     }

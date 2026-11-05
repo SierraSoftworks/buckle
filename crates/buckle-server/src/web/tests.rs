@@ -2159,6 +2159,7 @@ async fn plans_are_served_typed_and_deduplicated_by_digest() {
     let host = |name: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
         rollout: "7".into(),
         host: name.into(),
+        workload: String::new(),
         phase: "canary".into(),
         wave: Some(1),
         state: crate::rollout::model::HostPhase::Healthy,
@@ -2221,6 +2222,7 @@ async fn rollouts_say_what_they_change_once_a_host_has_planned() {
     let row = |rollout: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
         rollout: rollout.into(),
         host: "pi-1".into(),
+        workload: String::new(),
         phase: "canary".into(),
         wave: Some(1),
         state: crate::rollout::model::HostPhase::Healthy,
@@ -2345,6 +2347,7 @@ async fn each_phase_names_the_required_checks_of_the_modules_its_hosts_apply() {
         crate::store::RolloutHostRecord {
             rollout: "7".into(),
             host: name.into(),
+            workload: String::new(),
             phase: phase.into(),
             wave: Some(1),
             state: HostPhase::Healthy,
@@ -2541,6 +2544,7 @@ async fn run_reports_are_served_per_host_and_per_rollout_host() {
     let row = |name: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
         rollout: "7".into(),
         host: name.into(),
+        workload: String::new(),
         phase: "canary".into(),
         wave: Some(1),
         state: crate::rollout::model::HostPhase::Planned,

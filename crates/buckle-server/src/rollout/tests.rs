@@ -394,6 +394,7 @@ impl Harness {
                         }
                         reply(AMsg::Health(HealthReport {
                             target: h.target.clone(),
+                            workload: String::new(),
                             scope: h.scope,
                             request_id: h.request_id,
                             revision: String::new(),
@@ -938,6 +939,7 @@ async fn a_failing_baseline_holds_the_host_until_forced() {
     h.command(Command::Force {
         rollout: id.clone(),
         host: "a".into(),
+        workload: String::new(),
         note: "known flaky".into(),
     })
     .await
@@ -1143,6 +1145,7 @@ async fn a_flap_inside_settle_is_not_a_failure() {
         "a",
         AMsg::Health(HealthReport {
             target: String::new(),
+            workload: String::new(),
             scope: HealthScope::Bake as i32,
             request_id: String::new(),
             revision: String::new(),
@@ -1200,6 +1203,7 @@ async fn continue_waives_the_failed_checks_and_finishes() {
     h.command(Command::Continue {
         rollout: id.clone(),
         host: "a".into(),
+        workload: String::new(),
         waive: vec!["web/http".into()],
         note: String::new(),
     })
@@ -1759,6 +1763,7 @@ fn answer_baseline(h: &Harness, host: &str) {
         host,
         AMsg::Health(HealthReport {
             target: String::new(),
+            workload: String::new(),
             scope: HealthScope::Baseline as i32,
             request_id,
             revision: String::new(),
@@ -2307,6 +2312,7 @@ async fn a_required_phase_whose_hosts_are_all_offline_waits(#[case] decision: &s
             h.command(Command::Skip {
                 rollout: id.clone(),
                 host: "c1".into(),
+                workload: String::new(),
                 note: String::new(),
             })
             .await
@@ -2338,6 +2344,7 @@ async fn a_phase_over_budget_does_not_complete_while_a_failure_stands() {
     h.command(Command::Retry {
         rollout: id.clone(),
         host: "a".into(),
+        workload: String::new(),
         note: String::new(),
     })
     .await
@@ -2362,6 +2369,7 @@ async fn a_phase_over_budget_does_not_complete_while_a_failure_stands() {
     h.command(Command::Skip {
         rollout: id.clone(),
         host: "b".into(),
+        workload: String::new(),
         note: "decommissioning".into(),
     })
     .await
@@ -2409,6 +2417,7 @@ async fn host_decisions_do_not_override_an_operator_pause() {
     h.command(Command::Retry {
         rollout: id.clone(),
         host: "a".into(),
+        workload: String::new(),
         note: String::new(),
     })
     .await
@@ -2472,11 +2481,13 @@ async fn a_failed_gate_fails_the_host_and_host_decisions_clear_it(#[case] decisi
         "skip" => Command::Skip {
             rollout,
             host: "c1".into(),
+            workload: String::new(),
             note,
         },
         "continue" => Command::Continue {
             rollout,
             host: "c1".into(),
+            workload: String::new(),
             waive: vec!["web/http".into()],
             note,
         },
@@ -2886,6 +2897,7 @@ async fn a_bake_report_for_another_revision_or_request_is_not_this_bake() {
     let failing = |revision: &str, request: &str| {
         AMsg::Health(HealthReport {
             target: String::new(),
+            workload: String::new(),
             scope: HealthScope::Bake as i32,
             request_id: request.into(),
             revision: revision.into(),
@@ -2958,6 +2970,7 @@ async fn a_plan_error_in_a_later_phase_is_charged_when_that_phase_starts() {
     h.command(Command::Retry {
         rollout: id.clone(),
         host: "w1".into(),
+        workload: String::new(),
         note: String::new(),
     })
     .await
@@ -3137,6 +3150,7 @@ async fn rollback_leaves_skipped_hosts_and_ignores_forward_results() {
     h.command(Command::Skip {
         rollout: id.clone(),
         host: "a".into(),
+        workload: String::new(),
         note: String::new(),
     })
     .await
@@ -3277,6 +3291,7 @@ async fn continue_refuses_to_waive_checks_the_host_did_not_fail() {
         .command(Command::Continue {
             rollout: id.clone(),
             host: "a".into(),
+            workload: String::new(),
             waive: vec!["web/http".into(), "db/ping".into()],
             note: String::new(),
         })
@@ -3452,6 +3467,7 @@ async fn a_host_skipped_at_baseline_moves_to_the_stragglers_on_promotion() {
     h.command(Command::Skip {
         rollout: id.clone(),
         host: "a".into(),
+        workload: String::new(),
         note: "fix it later".into(),
     })
     .await
@@ -3667,6 +3683,7 @@ fn force(id: &str) -> Command {
     Command::Force {
         rollout: id.to_owned(),
         host: "a".into(),
+        workload: String::new(),
         note: "operator says so".into(),
     }
 }
@@ -4452,6 +4469,7 @@ async fn skipping_a_bake_finishes_the_host_now(#[case] target: Option<&str>) {
     h.command(Command::SkipBake {
         rollout: id.clone(),
         host: target.map(String::from),
+        workload: String::new(),
         note: String::new(),
     })
     .await
@@ -4488,6 +4506,7 @@ async fn a_bake_with_failing_checks_cannot_be_skipped() {
             .command(Command::SkipBake {
                 rollout: id.clone(),
                 host: target,
+                workload: String::new(),
                 note: String::new(),
             })
             .await
@@ -4517,6 +4536,7 @@ async fn a_planned_host_can_be_planned_again_before_it_applies() {
     h.command(Command::Retry {
         rollout: id.clone(),
         host: "a".into(),
+        workload: String::new(),
         note: String::new(),
     })
     .await
@@ -4821,6 +4841,7 @@ async fn a_failed_action_pauses_the_rollout_on_its_budget_and_cannot_be_rolled_b
     h.command(Command::Retry {
         rollout: id.clone(),
         host: "c1".into(),
+        workload: String::new(),
         note: String::new(),
     })
     .await

@@ -392,6 +392,24 @@ impl<'c> Runs<'c> {
             .next())
     }
 
+    /// The newest run of `host` in rollout `rollout` applying the plan
+    /// `plan_digest` (a placement's own run: each placement of a cluster has
+    /// a plan, and a run, of its own).
+    pub fn latest_for_rollout_plan(
+        &self,
+        rollout: &str,
+        host: &str,
+        plan_digest: &str,
+    ) -> Result<Option<RunRecord>> {
+        Ok(self
+            .query(
+                &format!("SELECT {COLUMNS} FROM runs WHERE rollout = ?1 AND host = ?2 AND plan_digest = ?3 ORDER BY id DESC LIMIT 1"),
+                params![rollout, host, plan_digest],
+            )?
+            .into_iter()
+            .next())
+    }
+
     /// The newest run id of every host of a rollout.
     pub fn ids_for_rollout(
         &self,

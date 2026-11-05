@@ -489,11 +489,16 @@ impl RebootWait {
     }
 }
 
-/// One `rollout_hosts` row.
+/// One `rollout_hosts` row: a host, a whole cluster (an executor that
+/// predates placements), or one workload placement of a cluster.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RolloutHostRecord {
     pub rollout: String,
+    /// The host, or the cluster a placement is on.
     pub host: String,
+    /// The placement's workload; empty for a host's or a whole cluster's row.
+    #[serde(default)]
+    pub workload: String,
     pub phase: String,
     pub wave: Option<u32>,
     pub state: HostPhase,

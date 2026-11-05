@@ -726,6 +726,7 @@ async fn an_apply_re_plans_with_the_select_of_the_approved_plan() {
     session
         .send(pb::server_message::Msg::Plan(pb::RequestPlan {
             target: String::new(),
+            workload: String::new(),
             revision: "rev1".into(),
             select: select.into(),
         }))
@@ -1336,6 +1337,7 @@ async fn an_executor_plans_applies_and_checks_a_cluster_target_beside_its_host()
     session
         .send(pb::server_message::Msg::Plan(pb::RequestPlan {
             target: "home-nomad".into(),
+            workload: String::new(),
             revision: "rev1".into(),
             select: String::new(),
         }))
@@ -1421,6 +1423,7 @@ async fn targeted_work_without_its_assignment_fails_with_a_reason() {
     session
         .send(pb::server_message::Msg::Plan(pb::RequestPlan {
             target: "home-nomad".into(),
+            workload: String::new(),
             revision: "rev1".into(),
             select: String::new(),
         }))

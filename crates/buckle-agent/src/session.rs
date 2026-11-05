@@ -2696,6 +2696,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             secrets,
             tree_digest,
             target: _,
+            workload: _,
             cluster: _,
         } => Op::Assign {
             revision,
@@ -2708,6 +2709,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             revision,
             select,
             target: _,
+            workload: _,
         } => Op::Plan { revision, select },
         Instruction::Apply {
             revision,
@@ -2720,6 +2722,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             rollout_id,
             phase,
             target: _,
+            workload: _,
         } => Op::Apply {
             revision,
             plan_digest,
@@ -2737,6 +2740,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             rollout_id,
             traceparent,
             target: _,
+            workload: _,
         } => Op::Rollback {
             revision,
             reason,
@@ -2750,6 +2754,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             until,
             traceparent,
             target: _,
+            workload: _,
             revision: _,
         } => Op::Health {
             request_id,
@@ -2765,6 +2770,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             revision,
             traceparent,
             target: _,
+            workload: _,
         } => Op::Action {
             action_id,
             module,

@@ -384,7 +384,8 @@ fn entry(
         bake_until: None,
         reboot: None,
         kind: Default::default(),
-        stage: 0,
+        step: 0,
+        workload: None,
         executor: None,
         bake: None,
         preview: false,
@@ -419,6 +420,7 @@ fn phase(
         bake_until: None,
         health_checks: gate_checks(name),
         stages: 1,
+        unchanged: 0,
     }
 }
 
@@ -589,7 +591,7 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
             {
                 let mut c = entry("lab-nomad", "everything-else", 1, S::Pending, None, now, 30);
                 c.kind = buckle_api::TargetKind::Cluster;
-                c.stage = 1;
+                c.step = 1;
                 c
             },
         ],
@@ -705,6 +707,7 @@ fn ev(
         kind: kind.into(),
         message: message.into(),
         host: host.map(Into::into),
+        workload: None,
         phase: phase.map(Into::into),
         actor: actor.map(Into::into),
     }
@@ -1424,6 +1427,7 @@ fn finished(
         kind: "rollout.started".into(),
         message: format!("Revision {} detected; rollout started.", &rev[..7]),
         host: None,
+        workload: None,
         phase: None,
         actor: Some("controller".into()),
     }];
@@ -1434,6 +1438,7 @@ fn finished(
                 kind: "rollout.paused".into(),
                 message: "pi-1 failed docker/daemon; max_failures 0 breached.".into(),
                 host: Some("pi-1".into()),
+                workload: None,
                 phase: Some("canary".into()),
                 actor: Some("controller".into()),
             });
@@ -1442,6 +1447,7 @@ fn finished(
                 kind: "rollout.rollback".into(),
                 message: "Rolling back 1 host to 0aa1b2c.".into(),
                 host: None,
+                workload: None,
                 phase: None,
                 actor: Some("alice@example.com".into()),
             });
@@ -1452,6 +1458,7 @@ fn finished(
                 kind: "rollout.paused".into(),
                 message: "pi-1 failed swap/zram.".into(),
                 host: Some("pi-1".into()),
+                workload: None,
                 phase: Some("canary".into()),
                 actor: Some("controller".into()),
             });
@@ -1460,6 +1467,7 @@ fn finished(
                 kind: "rollout.aborted".into(),
                 message: "Aborted: zram needs a kernel module the Pis do not ship.".into(),
                 host: None,
+                workload: None,
                 phase: None,
                 actor: Some("bob@example.com".into()),
             });
@@ -1469,6 +1477,7 @@ fn finished(
             kind: "rollout.completed".into(),
             message: "Last phase baked; revision promoted to stable.".into(),
             host: None,
+            workload: None,
             phase: None,
             actor: Some("controller".into()),
         }),
@@ -1566,6 +1575,7 @@ fn skipped(id: &str, rev: &str, message: &str, by: &str, at: DateTime<Utc>) -> R
                 kind: "rollout.detected".into(),
                 message: format!("Revision {} queued behind rollout 40.", &rev[..7]),
                 host: None,
+                workload: None,
                 phase: None,
                 actor: Some("controller".into()),
             },
@@ -1574,6 +1584,7 @@ fn skipped(id: &str, rev: &str, message: &str, by: &str, at: DateTime<Utc>) -> R
                 kind: "rollout.skipped".into(),
                 message: format!("rollout detected → skipped: superseded by {by}"),
                 host: None,
+                workload: None,
                 phase: None,
                 actor: Some("controller".into()),
             },

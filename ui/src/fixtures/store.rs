@@ -325,7 +325,7 @@ pub fn run_action(
             .clone();
         let noun = match detail.summary.kind {
             buckle_api::TargetKind::Host => "host",
-            buckle_api::TargetKind::Cluster => "target",
+            buckle_api::TargetKind::Cluster | buckle_api::TargetKind::Workload => "target",
         };
         let ran = format!("{} ran {module}/{action} on {id}", actor());
         s.record(
@@ -696,6 +696,7 @@ fn event(kind: &str, message: String, host: Option<&str>, phase: Option<&str>) -
         kind: kind.into(),
         message,
         host: host.map(Into::into),
+        workload: None,
         phase: phase.map(Into::into),
         actor: Some(actor()),
     }

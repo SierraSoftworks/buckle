@@ -41,7 +41,9 @@ impl Route {
     /// A target's page: a cluster's own, else the host's.
     pub fn target(id: &str, kind: buckle_api::TargetKind) -> Route {
         match kind {
-            buckle_api::TargetKind::Cluster => Route::Cluster { id: id.to_owned() },
+            buckle_api::TargetKind::Cluster | buckle_api::TargetKind::Workload => {
+                Route::Cluster { id: id.to_owned() }
+            }
             buckle_api::TargetKind::Host => Route::Host { id: id.to_owned() },
         }
     }

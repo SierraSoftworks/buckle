@@ -67,6 +67,7 @@ pub fn host(
     let waiting = matches!(h.state, HostPhase::Planned);
     RolloutHost {
         host: h.host.clone(),
+        workload: (!h.workload.is_empty()).then(|| h.workload.clone()),
         phase: h.phase.clone(),
         wave: h.wave,
         state: h.state.api(),
@@ -89,7 +90,7 @@ pub fn host(
             .as_ref()
             .map(super::model::RebootWait::view),
         kind: h.runtime.kind,
-        stage: h.runtime.stage,
+        step: h.runtime.stage,
         executor: h.runtime.executor.clone(),
         bake: h.runtime.bake.clone(),
         preview: h.runtime.preview && h.plan_digest.is_some(),
@@ -158,9 +159,23 @@ pub fn plan_groups(hosts: &[RolloutHostRecord]) -> Vec<PlanGroup> {
             destructive: h.runtime.destructive,
             plan: crate::views::stored_plan_view(h.plan.as_ref()),
         });
-        entry.hosts.push(h.host.clone());
+        entry.hosts.push(row_key(h));
     }
     groups.into_values().collect()
+}
+
+/// How lists of names write a row: the host, or `cluster/workload` for a
+/// placement ([`buckle_api::placement_key`]).
+pub fn row_key(h: &RolloutHostRecord) -> String {
+    buckle_api::placement_key(&h.host, Some(&h.workload))
+}
+
+/// Whether a finished row changed nothing: its plan had no changes and no
+/// removals, so it was counted rather than rolled.
+fn unchanged(h: &RolloutHostRecord) -> bool {
+    h.runtime.plan_changes == Some(0)
+        && h.runtime.plan_removals == Some(0)
+        && h.runtime.deferred_modules.is_empty()
 }
 
 /// The full rollout as the detail page shows it. `audit` is the audit trail
@@ -196,6 +211,10 @@ pub fn detail(
                 bake_until: p.bake_until,
                 health_checks: Vec::new(),
                 stages: p.stages,
+                unchanged: hosts
+                    .iter()
+                    .filter(|h| h.runtime.phase_index == Some(i) && unchanged(h))
+                    .count() as u32,
             }
         })
         .collect();
@@ -210,6 +229,13 @@ pub fn detail(
                 .as_ref()
                 .and_then(|d| d.get("host"))
                 .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            workload: e
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("workload"))
+                .and_then(|v| v.as_str())
+                .filter(|w| !w.is_empty())
                 .map(str::to_owned),
             phase: e
                 .detail

@@ -195,6 +195,7 @@ pub fn assign(revision: &str, tree_digest: &str) -> pb::server_message::Msg {
 pub fn request_plan(revision: &str) -> pb::server_message::Msg {
     pb::server_message::Msg::Plan(pb::RequestPlan {
         target: String::new(),
+        workload: String::new(),
         revision: revision.into(),
         select: String::new(),
     })

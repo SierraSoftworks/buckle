@@ -6,8 +6,8 @@
 use super::graph::Graph;
 use super::validate::{ValidationReport, secret_references, yaml_strings};
 use super::{LoadedWorkload, Revision};
-use crate::model::{ClusterDecl, Need, ResourceKind};
-use crate::selectors::{Namespaces, selector_namespaces};
+use crate::model::{AcrossPhases, ClusterDecl, Need, ResourceKind};
+use crate::selectors::{HostContext, selector_namespaces};
 use crate::template::Templater;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -20,13 +20,13 @@ fn cluster_location(name: &str) -> String {
     format!("buckle.yaml fleet.clusters.{name}")
 }
 
-/// The problem with a selector that names both target namespaces, if it does:
-/// such a selector is evaluated against one kind of target at a time, so the
-/// other half is always null.
+/// The problem with a selector that names `host.*` beside `cluster.*` or
+/// `workload.*`, if it does: such a selector is evaluated against one target
+/// at a time (a host reads only `host.*`; a placement reads `cluster.*` and
+/// `workload.*` together), so the other half is always null.
 pub fn mixed_namespaces(raw: &str) -> Option<String> {
-    let Namespaces { host, cluster } = selector_namespaces(raw);
-    (host && cluster).then(|| {
-        "names both `host.*` and `cluster.*`; a selector is evaluated against one target at a time, so the other namespace is always null here".to_owned()
+    selector_namespaces(raw).mixed().then(|| {
+        "names `host.*` beside `cluster.*` or `workload.*`; a selector is evaluated against one target at a time (a host reads only `host.*`, a workload placement `cluster.*` and `workload.*`), so the other namespace is always null here".to_owned()
     })
 }
 
@@ -127,14 +127,36 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
 
         if let Some(when) = &cfg.when {
             let location = format!("{file} when");
-            if selector_namespaces(when.raw()).host {
+            let namespaces = selector_namespaces(when.raw());
+            if namespaces.host {
                 report.error(
                     Some(name),
                     &location,
                     "selects on `host.*`, but a workload's `when` is evaluated against cluster targets; select on `cluster.*` (`cluster.kind`, `cluster.labels.*`, `cluster.groups`) instead",
                 );
             }
+            if namespaces.workload {
+                report.error(
+                    Some(name),
+                    &location,
+                    "selects on `workload.*`, but a workload's `when` decides which clusters run it and is evaluated before any placement exists; `workload.labels.*` and `workload.name` select placements in phase selectors and groups",
+                );
+            }
             check_secrets(&mut report, Some(name), &location, when.raw());
+        }
+        for (key, value) in &cfg.labels {
+            if !matches!(
+                value,
+                serde_yaml::Value::String(_)
+                    | serde_yaml::Value::Bool(_)
+                    | serde_yaml::Value::Number(_)
+            ) {
+                report.error(
+                    Some(name),
+                    format!("{file} labels.{key}"),
+                    "a label must be a string, number or boolean",
+                );
+            }
         }
 
         for need in cfg.needs() {
@@ -419,7 +441,68 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
         );
     }
 
+    cross_phase_needs(&mut report, revision);
+
     report
+}
+
+/// A workload placement that needs a workload the same cluster rolls out in
+/// a later phase: it cannot be ordered by steps (those lie inside a phase),
+/// so the rollout waits for the need to be running (`rollout.dependencies.
+/// across_phases: warn`, the default) or the revision is refused (`refuse`).
+/// Decided over the clusters `buckle.yaml` declares, with their declared
+/// labels.
+fn cross_phase_needs(report: &mut ValidationReport, revision: &Revision) {
+    let phases = &revision.fleet.rollout.phases;
+    if phases.is_empty() {
+        return;
+    }
+    let refuse = revision.fleet.rollout.dependencies.across_phases == AcrossPhases::Refuse;
+    for (cluster, decl) in &revision.fleet.fleet.clusters {
+        let ctx = declared_cluster_context(revision, cluster, decl);
+        let placed: Vec<(&LoadedWorkload, Option<usize>)> = revision
+            .workloads
+            .iter()
+            .filter(|w| selects_in(&ctx, w))
+            .map(|w| {
+                let pc = super::validate::placement_context(revision, &ctx, &w.config);
+                (w, phases.iter().position(|p| pc.matches(&p.select)))
+            })
+            .collect();
+        for (w, phase) in &placed {
+            let Some(phase) = phase else { continue };
+            for need in w.config.needs() {
+                let Need::Workload(needed) = &need else {
+                    continue;
+                };
+                let Some((_, Some(needed_phase))) =
+                    placed.iter().find(|(x, _)| x.config.name == *needed)
+                else {
+                    continue;
+                };
+                if needed_phase <= phase {
+                    continue;
+                }
+                let name = w.config.name.as_str();
+                let message = format!(
+                    "needs '{needed}', which the cluster '{cluster}' rolls out in the later phase '{}' (this workload is in '{}'); {}",
+                    phases[*needed_phase].name,
+                    phases[*phase].name,
+                    if refuse {
+                        "`rollout.dependencies.across_phases: refuse` does not allow a dependency on a later phase"
+                    } else {
+                        "it waits for '{needed}' to be running (applied and healthy) before it applies, and otherwise finishes in the stragglers stage"
+                    }
+                );
+                let location = workload_file(name);
+                if refuse {
+                    report.error(Some(name), location, message);
+                } else {
+                    report.warning(Some(name), location, message);
+                }
+            }
+        }
+    }
 }
 
 fn validate_cluster(
@@ -523,26 +606,35 @@ fn validate_cluster(
     }
 }
 
-/// Whether `w`'s `when` selects the declared cluster `name`, with the labels
+/// The selector context of the declared cluster `name`, with the labels
 /// buckle.yaml gives it (labels added through the API are not known here).
-fn selects(revision: &Revision, w: &LoadedWorkload, name: &str, decl: &ClusterDecl) -> bool {
-    let Some(when) = &w.config.when else {
-        return true;
-    };
+fn declared_cluster_context(revision: &Revision, name: &str, decl: &ClusterDecl) -> HostContext {
     let labels = decl
         .labels
         .iter()
         .filter_map(|(k, v)| Some((k.clone(), serde_json::to_value(v).ok()?)))
         .collect();
-    let ctx = super::validate::cluster_context(
+    super::validate::cluster_context(
         revision,
         crate::selectors::HostIdentity {
             id: name.to_owned(),
             labels,
         },
         decl.kind,
-    );
-    ctx.in_module(&w.config.name, &w.config.tags).matches(when)
+    )
+}
+
+/// Whether `w`'s `when` selects the declared cluster `name`.
+fn selects(revision: &Revision, w: &LoadedWorkload, name: &str, decl: &ClusterDecl) -> bool {
+    selects_in(&declared_cluster_context(revision, name, decl), w)
+}
+
+/// Whether `w`'s `when` selects the cluster `ctx` describes.
+fn selects_in(ctx: &HostContext, w: &LoadedWorkload) -> bool {
+    match &w.config.when {
+        None => true,
+        Some(when) => ctx.in_module(&w.config.name, &w.config.tags).matches(when),
+    }
 }
 
 /// The names of the cluster targets a workload selects, given the contexts to

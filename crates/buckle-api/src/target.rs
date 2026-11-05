@@ -1,7 +1,9 @@
 //! Targets: what a revision is applied to. A host is a target with an agent;
 //! a cluster is a virtual target (a Nomad or Kubernetes API) that hosts speak
 //! for. Both share the `/api/v1/targets` routes and the `HostSummary` row;
-//! `kind` and `cluster` say which is which.
+//! `kind` and `cluster` say which is which. A rollout moves a cluster one
+//! workload placement (workload × cluster) at a time: those rows carry the
+//! `workload` kind and name the workload beside the cluster.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,6 +15,8 @@ pub enum TargetKind {
     #[default]
     Host,
     Cluster,
+    /// One workload on one cluster: a rollout row, never a stored target.
+    Workload,
 }
 
 impl TargetKind {
@@ -20,7 +24,14 @@ impl TargetKind {
         match self {
             TargetKind::Host => "host",
             TargetKind::Cluster => "cluster",
+            TargetKind::Workload => "workload",
         }
+    }
+
+    /// Whether the target lives on a cluster (a cluster, or a placement on
+    /// one), so an executor speaks for it.
+    pub fn on_cluster(self) -> bool {
+        matches!(self, TargetKind::Cluster | TargetKind::Workload)
     }
 }
 
@@ -37,8 +48,28 @@ impl std::str::FromStr for TargetKind {
         match s {
             "host" => Ok(TargetKind::Host),
             "cluster" => Ok(TargetKind::Cluster),
-            other => Err(format!("'{other}' is not a target kind (host, cluster)")),
+            "workload" => Ok(TargetKind::Workload),
+            other => Err(format!(
+                "'{other}' is not a target kind (host, cluster, workload)"
+            )),
         }
+    }
+}
+
+/// How a list of target names writes a workload placement: `cluster/workload`
+/// (neither a target id nor a workload name contains `/`). A host is its id.
+pub fn placement_key(target: &str, workload: Option<&str>) -> String {
+    match workload {
+        Some(w) if !w.is_empty() => format!("{target}/{w}"),
+        _ => target.to_owned(),
+    }
+}
+
+/// The target and workload a [`placement_key`] names.
+pub fn split_placement_key(key: &str) -> (&str, Option<&str>) {
+    match key.split_once('/') {
+        Some((target, workload)) if !workload.is_empty() => (target, Some(workload)),
+        _ => (key, None),
     }
 }
 
@@ -313,9 +344,26 @@ mod tests {
         );
         assert_eq!(TargetKind::default(), TargetKind::Host);
         assert_eq!("cluster".parse::<TargetKind>(), Ok(TargetKind::Cluster));
+        assert_eq!("workload".parse::<TargetKind>(), Ok(TargetKind::Workload));
+        assert!(TargetKind::Workload.on_cluster());
         assert!("pod".parse::<TargetKind>().is_err());
         let create: CreateTarget = serde_json::from_value(json!({ "id": "home-nomad" })).unwrap();
         assert_eq!(create.kind, TargetKind::Host);
         assert_eq!(create.cluster, None);
+    }
+
+    #[test]
+    fn placement_keys_round_trip() {
+        assert_eq!(
+            placement_key("home-nomad", Some("grafana")),
+            "home-nomad/grafana"
+        );
+        assert_eq!(placement_key("pi-1", None), "pi-1");
+        assert_eq!(placement_key("pi-1", Some("")), "pi-1");
+        assert_eq!(
+            split_placement_key("home-nomad/grafana"),
+            ("home-nomad", Some("grafana"))
+        );
+        assert_eq!(split_placement_key("pi-1"), ("pi-1", None));
     }
 }

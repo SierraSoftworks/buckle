@@ -35,9 +35,11 @@ fn json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
 
 /// Optional behaviours this agent understands, announced in Hello:
 /// `force_plan` (an operator's force apply skips the digest check),
-/// `approval_digest` (an approval binds the plan's intent) and `targets`
-/// (it runs a pipeline per cluster target it executes for).
-pub const CAPABILITIES: &[&str] = &["force_plan", "approval_digest", "targets"];
+/// `approval_digest` (an approval binds the plan's intent), `targets` (it
+/// runs a pipeline per cluster target it executes for) and `workloads` (it
+/// plans, applies and checks one workload placement of a cluster at a time
+/// when an instruction names one, and echoes the workload on its reports).
+pub const CAPABILITIES: &[&str] = &["force_plan", "approval_digest", "targets", "workloads"];
 
 /// The protobuf Hello.
 pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
@@ -126,6 +128,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             secrets: secrets_from_proto(a.secrets),
             tree_digest: non_empty(a.tree_digest),
             target: non_empty(a.target),
+            workload: non_empty(a.workload),
             cluster: a.cluster.map(|mut c| WireCluster {
                 kind: std::mem::take(&mut c.kind),
                 api: std::mem::take(&mut c.api),
@@ -139,6 +142,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             revision: RevisionId(p.revision),
             select: non_empty(p.select),
             target: non_empty(p.target),
+            workload: non_empty(p.workload),
         },
         // The server always binds a digest: an empty one never matches a plan
         // and is refused as stale, rather than meaning "apply anything".
@@ -156,6 +160,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             rollout_id: non_empty(a.rollout_id),
             phase: non_empty(a.phase),
             target: non_empty(a.target),
+            workload: non_empty(a.workload),
         },
         Msg::Rollback(r) => Instruction::Rollback {
             revision: RevisionId(r.revision),
@@ -163,6 +168,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             rollout_id: non_empty(r.rollout_id),
             traceparent: non_empty(r.traceparent),
             target: non_empty(r.target),
+            workload: non_empty(r.workload),
         },
         Msg::Health(h) => {
             let scope = pb::HealthScope::try_from(h.scope)
@@ -178,6 +184,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
                 traceparent: non_empty(h.traceparent),
                 target: non_empty(h.target),
                 revision: non_empty(h.revision).map(RevisionId),
+                workload: non_empty(h.workload),
             }
         }
         Msg::Action(a) => Instruction::RunAction {
@@ -187,6 +194,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             revision: RevisionId(a.revision),
             traceparent: non_empty(a.traceparent),
             target: non_empty(a.target),
+            workload: non_empty(a.workload),
         },
         Msg::Ping(_) => Instruction::Ping,
         Msg::Upgrade(u) => Instruction::Upgrade {
@@ -265,6 +273,7 @@ pub fn health_report_to_proto(
 ) -> pb::HealthReport {
     pb::HealthReport {
         target: String::new(),
+        workload: String::new(),
         scope: scope_to_proto(report.scope) as i32,
         request_id: request_id.unwrap_or_default().to_owned(),
         revision: revision.map(|r| r.0.clone()).unwrap_or_default(),
@@ -336,6 +345,7 @@ pub fn apply_event_to_proto(
         .unwrap_or_default();
     pb::ApplyEvent {
         target: String::new(),
+        workload: String::new(),
         action_id: String::new(),
         revision: revision.0.clone(),
         plan_digest: plan_digest.to_owned(),
@@ -365,6 +375,7 @@ pub fn apply_event_to_proto(
 fn plan_result(plan: &buckle_core::plan::Plan, error: String) -> pb::PlanResult {
     pb::PlanResult {
         target: String::new(),
+        workload: String::new(),
         module_errors: plan
             .indeterminate
             .iter()
@@ -458,6 +469,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             let outcome = &run.outcome;
             Msg::Action(pb::ActionResult {
                 target: String::new(),
+                workload: String::new(),
                 action_id: run.action_id.clone(),
                 module: run.module.clone(),
                 action: run.action.clone(),
@@ -484,6 +496,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             applied_revision,
         } => Msg::Result(pb::ApplyResult {
             target: String::new(),
+            workload: String::new(),
             report_id: *report_id,
             needs_attention: needs_attention(outcome),
             revision: revision.0.clone(),
@@ -537,6 +550,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             corrected,
         } => Msg::Drift(pb::Drift {
             target: String::new(),
+            workload: String::new(),
             revision: revision.0.clone(),
             plan_digest: plan
                 .as_ref()
@@ -564,10 +578,14 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             boot_id: boot_id.clone().unwrap_or_default(),
             error: error.clone(),
         }),
-        Report::For { target, report } => {
+        Report::For {
+            target,
+            workload,
+            report,
+        } => {
             let mut inner = report_to_proto(report);
             if let Some(msg) = inner.msg.as_mut() {
-                set_target(msg, target);
+                set_target(msg, target, workload.as_deref().unwrap_or_default());
             }
             return inner;
         }
@@ -575,20 +593,24 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
     pb::AgentMessage { msg: Some(msg) }
 }
 
-/// Names the cluster `target` on a report that carries one.
-fn set_target(msg: &mut pb::agent_message::Msg, target: &str) {
+/// Names the cluster `target` (and the `workload` placement, when the
+/// report is scoped to one) on a report that carries them.
+fn set_target(msg: &mut pb::agent_message::Msg, target: &str, workload: &str) {
     use pb::agent_message::Msg;
-    let field = match msg {
-        Msg::Facts(m) => &mut m.target,
-        Msg::Plan(m) => &mut m.target,
-        Msg::Apply(m) => &mut m.target,
-        Msg::Result(m) => &mut m.target,
-        Msg::Health(m) => &mut m.target,
-        Msg::Drift(m) => &mut m.target,
-        Msg::Action(m) => &mut m.target,
+    let (t, w): (&mut String, Option<&mut String>) = match msg {
+        Msg::Facts(m) => (&mut m.target, None),
+        Msg::Plan(m) => (&mut m.target, Some(&mut m.workload)),
+        Msg::Apply(m) => (&mut m.target, Some(&mut m.workload)),
+        Msg::Result(m) => (&mut m.target, Some(&mut m.workload)),
+        Msg::Health(m) => (&mut m.target, Some(&mut m.workload)),
+        Msg::Drift(m) => (&mut m.target, Some(&mut m.workload)),
+        Msg::Action(m) => (&mut m.target, Some(&mut m.workload)),
         _ => return,
     };
-    *field = target.to_owned();
+    *t = target.to_owned();
+    if let Some(w) = w {
+        *w = workload.to_owned();
+    }
 }
 
 #[cfg(test)]

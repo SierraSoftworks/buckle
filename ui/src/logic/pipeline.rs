@@ -309,7 +309,8 @@ pub fn fleet_map(
             bake_until: None,
             reboot: None,
             kind: h.kind,
-            stage: 0,
+            step: 0,
+            workload: None,
             executor: None,
             bake: None,
             preview: false,
@@ -335,6 +336,7 @@ pub fn fleet_map(
             bake_until: None,
             health_checks: vec![],
             stages: 1,
+            unchanged: 0,
         });
     }
     map
@@ -424,7 +426,8 @@ mod tests {
             bake_until: None,
             reboot: None,
             kind: Default::default(),
-            stage: 0,
+            step: 0,
+            workload: None,
             executor: None,
             bake: None,
             preview: false,
@@ -456,6 +459,7 @@ mod tests {
             bake_until: None,
             health_checks: vec![],
             stages: 1,
+            unchanged: 0,
         }
     }
 

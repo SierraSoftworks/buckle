@@ -101,6 +101,7 @@ pub fn tick() -> Vec<LiveEvent> {
                         kind: kind.into(),
                         message,
                         host: Some(h.host.clone()),
+                        workload: None,
                         phase: Some(phase.name.clone()),
                         actor: Some("controller".into()),
                     });

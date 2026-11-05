@@ -32,7 +32,7 @@ pub fn list(
                 })
                 .collect()
         }
-        TargetKind::Cluster => {
+        TargetKind::Cluster | TargetKind::Workload => {
             let ctx = crate::fleet::record_context(record, facts, &revision.fleet);
             buckle_core::engine::selected_workloads(revision, &ctx)
                 .into_iter()

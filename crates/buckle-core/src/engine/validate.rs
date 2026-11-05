@@ -586,6 +586,27 @@ pub fn cluster_context(
     with_groups(revision, HostContext::for_cluster(identity, kind))
 }
 
+/// The selector context of a workload placement: the cluster `cluster`
+/// describes (`cluster.*`) hosting `workload` (`workload.name`,
+/// `workload.labels.*`, `workload.tags`), with the fleet's groups evaluated
+/// for the placement (`cluster.*` groups match as they do for the cluster;
+/// `workload.*` groups may match too; `host.*` groups never do).
+pub fn placement_context(
+    revision: &Revision,
+    cluster: &HostContext,
+    workload: &crate::model::WorkloadConfig,
+) -> HostContext {
+    with_groups(
+        revision,
+        HostContext::for_workload(
+            cluster,
+            &workload.name,
+            workload.selector_labels(),
+            &workload.tags,
+        ),
+    )
+}
+
 /// `ctx` with the fleet's groups evaluated in declaration order, so a group
 /// may refer to earlier ones.
 pub fn with_groups(revision: &Revision, mut ctx: HostContext) -> HostContext {

@@ -751,7 +751,7 @@ fn approval(
     let (deferred, missing): (Vec<&String>, Vec<&String>) =
         scope.without_plan.iter().partition(|name| {
             phase.hosts.iter().any(|h| {
-                &h.host == *name && (h.kind == buckle_api::TargetKind::Cluster || h.stage > 0)
+                &h.host == *name && (h.kind == buckle_api::TargetKind::Cluster || h.step > 0)
             })
         });
     let names = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");

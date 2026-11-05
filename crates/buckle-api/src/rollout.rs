@@ -68,7 +68,12 @@ pub struct BakeWindow {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutHost {
+    /// The host, or for a cluster's rows the cluster.
     pub host: String,
+    /// For a workload placement: the workload rolled out on the cluster
+    /// `host` names. Each placement is its own row (`kind: workload`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
     pub phase: String,
     pub wave: Option<u32>,
     pub state: HostRolloutState,
@@ -108,14 +113,16 @@ pub struct RolloutHost {
     /// The reboot the host's run asked for in this rollout, once it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reboot: Option<HostReboot>,
-    /// A host, or a cluster applied through an executor.
+    /// A host, a whole cluster applied through an executor (an executor
+    /// that predates placements), or one workload placement on a cluster.
     #[serde(default)]
     pub kind: crate::TargetKind,
-    /// The dependency stage inside the phase the target's current step runs
-    /// in (0-based): cross-layer `needs` put a cluster after the modules its
-    /// workloads need, and a host's dependent modules after the cluster.
-    #[serde(default)]
-    pub stage: u32,
+    /// The dependency step inside the phase the target's current step runs
+    /// in (0-based): `needs` edges between the phase's targets (a workload
+    /// after the module or workload it needs, a host's dependent modules
+    /// after the workload) put the dependent in a later step.
+    #[serde(default, alias = "stage")]
+    pub step: u32,
     /// For a cluster: the host agent speaking for it in this rollout, once
     /// one is picked (`None` reads "awaiting executor").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,10 +177,18 @@ pub struct RolloutPhase {
     /// pre-phase re-check hold the phase to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub health_checks: Vec<String>,
-    /// How many dependency stages the phase's targets are laid out in (1
-    /// when nothing crosses a cluster boundary).
+    /// How many dependency steps the phase's targets are laid out in (1
+    /// when no `needs` edge crosses between its targets).
     #[serde(default = "one")]
     pub stages: u32,
+    /// How many of `hosts` finished without changing anything (their plan
+    /// had no changes and no removals): they are counted, not rolled.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unchanged: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn one() -> u32 {
@@ -274,6 +289,8 @@ pub struct RolloutDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanGroup {
     pub digest: String,
+    /// Hosts by id; a workload placement as `cluster/workload`
+    /// ([`crate::placement_key`]).
     pub hosts: Vec<String>,
     pub changes: u32,
     pub removals: u32,
@@ -289,8 +306,12 @@ pub struct RolloutEvent {
     pub at: DateTime<Utc>,
     pub kind: String,
     pub message: String,
+    /// The host, or the cluster of the placement, the event is about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// The workload, when the event is about one placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

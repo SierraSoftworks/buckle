@@ -291,6 +291,33 @@ ALTER TABLE runs ADD COLUMN action TEXT;
     r#"
 ALTER TABLE revisions ADD COLUMN workload_count INTEGER;
 "#,
+    // 11: a rollout moves a cluster one workload placement at a time, so a
+    // cluster has one row per workload: `workload` joins the key ('' for a
+    // host's row and for a whole-cluster row). SQLite cannot alter a primary
+    // key in place, so the table is rebuilt.
+    r#"
+CREATE TABLE rollout_hosts_v11 (
+    rollout TEXT NOT NULL,
+    host TEXT NOT NULL,
+    workload TEXT NOT NULL DEFAULT '',
+    phase TEXT NOT NULL,
+    wave INTEGER,
+    state TEXT NOT NULL,
+    plan_digest TEXT,
+    plan TEXT,
+    result TEXT,
+    health TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (rollout, host, workload)
+);
+INSERT INTO rollout_hosts_v11 (rollout, host, workload, phase, wave, state, plan_digest, plan, result, health, created_at, updated_at, detail)
+SELECT rollout, host, '', phase, wave, state, plan_digest, plan, result, health, created_at, updated_at, detail FROM rollout_hosts ORDER BY rowid;
+DROP TABLE rollout_hosts;
+ALTER TABLE rollout_hosts_v11 RENAME TO rollout_hosts;
+CREATE INDEX rollout_hosts_host ON rollout_hosts(host, state);
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.

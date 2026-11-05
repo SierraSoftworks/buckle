@@ -212,6 +212,9 @@ pub enum Instruction {
         target: Option<String>,
         /// For a cluster target: how to reach it.
         cluster: Option<WireCluster>,
+        /// With `target`: the one workload placement the following
+        /// instructions concern; `None` for the whole cluster.
+        workload: Option<String>,
     },
     /// Plan the revision and report the plan.
     RequestPlan {
@@ -221,6 +224,9 @@ pub enum Instruction {
         select: Option<String>,
         /// The cluster target to plan for; `None` for the host itself.
         target: Option<String>,
+        /// With `target`: plan only this workload (its objects and its
+        /// orphans); `None` plans the whole cluster.
+        workload: Option<String>,
     },
     /// Apply the revision if its fresh plan has the approved digest.
     Apply {
@@ -248,6 +254,9 @@ pub enum Instruction {
         phase: Option<String>,
         /// The cluster target to apply to; `None` for the host itself.
         target: Option<String>,
+        /// With `target`: the one workload placement to apply (the plan
+        /// was made for it); `None` for the whole cluster.
+        workload: Option<String>,
     },
     /// Apply this (older) revision now.
     Rollback {
@@ -261,6 +270,8 @@ pub enum Instruction {
         traceparent: Option<String>,
         /// The cluster target to roll back; `None` for the host itself.
         target: Option<String>,
+        /// With `target`: the one workload placement to roll back.
+        workload: Option<String>,
     },
     /// Run health checks now.
     RunHealth {
@@ -278,6 +289,9 @@ pub enum Instruction {
         target: Option<String>,
         /// For a cluster target: the revision to check (its applied one).
         revision: Option<RevisionId>,
+        /// With `target`: the placement the report is about (its workload
+        /// is also in `modules`); echoed on the report.
+        workload: Option<String>,
     },
     /// Run an action of a module (or, for a cluster target, a workload)
     /// declared in `revision`, now.
@@ -294,6 +308,9 @@ pub enum Instruction {
         traceparent: Option<String>,
         /// The cluster target to run it on; `None` for the host itself.
         target: Option<String>,
+        /// With `target`: the placement the action belongs to (its
+        /// workload is `module`); echoed on the result.
+        workload: Option<String>,
     },
     /// Keepalive from the server; nothing to do.
     Ping,
@@ -331,6 +348,20 @@ impl Instruction {
             | Instruction::Rollback { target, .. }
             | Instruction::RunHealth { target, .. }
             | Instruction::RunAction { target, .. } => target.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The workload placement a targeted instruction concerns, when it is
+    /// scoped to one rather than to the whole cluster.
+    pub fn workload(&self) -> Option<&str> {
+        match self {
+            Instruction::Assign { workload, .. }
+            | Instruction::RequestPlan { workload, .. }
+            | Instruction::Apply { workload, .. }
+            | Instruction::Rollback { workload, .. }
+            | Instruction::RunHealth { workload, .. }
+            | Instruction::RunAction { workload, .. } => workload.as_deref(),
             _ => None,
         }
     }
@@ -485,10 +516,13 @@ pub enum Report {
         error: String,
     },
     /// A report about a cluster target this agent executes for: the inner
-    /// report travels with `target` set.
+    /// report travels with `target` (and, for one placement, `workload`)
+    /// set.
     For {
         /// The cluster target.
         target: String,
+        /// The workload placement, when the report is scoped to one.
+        workload: Option<String>,
         /// The report.
         report: Box<Report>,
     },
@@ -519,9 +553,17 @@ impl Report {
 
     /// `self` about the cluster `target`, or as it is for `None`.
     pub fn about(self, target: Option<&str>) -> Report {
+        self.about_placement(target, None)
+    }
+
+    /// `self` about the placement of `workload` on the cluster `target`
+    /// (about the whole cluster without a workload), or as it is when there
+    /// is no target.
+    pub fn about_placement(self, target: Option<&str>, workload: Option<&str>) -> Report {
         match target {
             Some(target) => Report::For {
                 target: target.to_owned(),
+                workload: workload.filter(|w| !w.is_empty()).map(str::to_owned),
                 report: Box::new(self),
             },
             None => self,
@@ -586,6 +628,9 @@ pub enum DurableReport {
         /// The cluster target the run was for; `None` for the host itself.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<String>,
+        /// The workload placement the run was for, when scoped to one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workload: Option<String>,
     },
     /// A local or module rollback.
     LocalRollback(LocalRollbackRecord),
@@ -598,6 +643,9 @@ pub enum DurableReport {
         /// The cluster target the action ran on; `None` for the host itself.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<String>,
+        /// The workload placement the action ran on, when scoped to one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workload: Option<String>,
     },
 }
 
@@ -638,14 +686,20 @@ impl DurableReport {
                 outcome: serde_json::to_value(outcome).unwrap_or_default(),
                 applied_revision: applied_revision.clone(),
                 target: None,
+                workload: None,
             }),
             Report::LocalRollback(record) => Some(DurableReport::LocalRollback(record.clone())),
             Report::ActionResult(run) => Some(DurableReport::ActionResult {
                 run: serde_json::to_value(run).unwrap_or_default(),
                 report_id: run.report_id,
                 target: None,
+                workload: None,
             }),
-            Report::For { target, report } => match Self::from_report(report)? {
+            Report::For {
+                target,
+                workload,
+                report,
+            } => match Self::from_report(report)? {
                 DurableReport::ApplyResult {
                     report_id,
                     revision,
@@ -658,12 +712,14 @@ impl DurableReport {
                     outcome,
                     applied_revision,
                     target: Some(target.clone()),
+                    workload: workload.clone(),
                 }),
                 DurableReport::ActionResult { run, report_id, .. } => {
                     Some(DurableReport::ActionResult {
                         run,
                         report_id,
                         target: Some(target.clone()),
+                        workload: workload.clone(),
                     })
                 }
                 other => Some(other),
@@ -681,6 +737,7 @@ impl DurableReport {
                 outcome,
                 applied_revision,
                 target,
+                workload,
             } => match serde_json::from_value(outcome.clone()) {
                 Ok(outcome) => Some(
                     Report::ApplyResult {
@@ -689,7 +746,7 @@ impl DurableReport {
                         outcome,
                         applied_revision: applied_revision.clone(),
                     }
-                    .about(target.as_deref()),
+                    .about_placement(target.as_deref(), workload.as_deref()),
                 ),
                 Err(err) => {
                     tracing::warn!(report = report_id, error = %err, "dropping a stored apply result that no longer parses");
@@ -701,8 +758,12 @@ impl DurableReport {
                 run,
                 report_id,
                 target,
+                workload,
             } => match serde_json::from_value::<ActionRun>(run.clone()) {
-                Ok(run) => Some(Report::ActionResult(run).about(target.as_deref())),
+                Ok(run) => Some(
+                    Report::ActionResult(run)
+                        .about_placement(target.as_deref(), workload.as_deref()),
+                ),
                 Err(err) => {
                     tracing::warn!(report = report_id, error = %err, "dropping a stored action result that no longer parses");
                     None

@@ -280,12 +280,12 @@ pub fn waiting(phase: &RolloutPhase, entry: &RolloutHost) -> Option<Waiting> {
     let on: Vec<String> = phase
         .hosts
         .iter()
-        .filter(|h| h.stage < entry.stage && !through(h.state))
+        .filter(|h| h.step < entry.step && !through(h.state))
         .map(|h| h.host.clone())
         .collect();
     if !on.is_empty() {
         return Some(Waiting::Stage {
-            stage: entry.stage,
+            stage: entry.step,
             on,
         });
     }
@@ -515,7 +515,7 @@ mod tests {
             "host": host, "phase": "home", "state": state, "updated_at": t(0),
         }))
         .unwrap();
-        e.stage = stage;
+        e.step = stage;
         e.kind = kind;
         e
     }

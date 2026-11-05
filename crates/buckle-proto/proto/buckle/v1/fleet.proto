@@ -122,6 +122,9 @@ message PlanResult {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 11;
+  // With `target`: the one workload the plan is scoped to (a workload
+  // placement), echoed from the request. Empty: the whole cluster.
+  string workload = 12;
 }
 
 message ApplyEvent {
@@ -145,6 +148,9 @@ message ApplyEvent {
   string target = 9;
   // The RunAction this event belongs to; empty for an Apply's events.
   string action_id = 10;
+  // With `target`: the placement the run belongs to (as the Apply or
+  // RunAction named it). Empty: the whole cluster.
+  string workload = 11;
 }
 
 // A structured error: what went wrong, the causes beneath it (outermost
@@ -192,6 +198,9 @@ message ApplyResult {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 19;
+  // With `target`: the one workload placement this concerns, echoed from
+  // the instruction. Empty: the whole cluster.
+  string workload = 20;
 }
 
 message Reboot {
@@ -233,6 +242,9 @@ message ActionResult {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 15;
+  // With `target`: the one workload placement this concerns, echoed from
+  // the instruction. Empty: the whole cluster.
+  string workload = 16;
 }
 
 // The reboot an ApplyResult announced could not be started: the host stays
@@ -273,6 +285,9 @@ message HealthReport {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 5;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 6;
 }
 
 message Drift {
@@ -286,6 +301,9 @@ message Drift {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 7;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 8;
 }
 
 message LocalRollback {
@@ -346,6 +364,9 @@ message RunAction {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 6;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 7;
 }
 
 // The host's record changed while it is connected (approved, paused,
@@ -400,6 +421,9 @@ message Assign {
   // targeted Assign ahead of every RequestPlan, Apply, Rollback and
   // RunHealth for the cluster, so an executor keeps nothing between them.
   ClusterTarget cluster = 6;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 7;
 }
 
 // A cluster target as its executor needs it. `secrets` on the Assign are
@@ -427,6 +451,9 @@ message RequestPlan {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 3;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 4;
 }
 
 message Apply {
@@ -455,6 +482,9 @@ message Apply {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 12;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 13;
 }
 
 message Rollback {
@@ -466,6 +496,9 @@ message Rollback {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 5;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 6;
 }
 
 message RunHealth {
@@ -484,6 +517,9 @@ message RunHealth {
   // cluster's applied revision; an executor keeps none). Empty for a host,
   // which checks its own applied revision.
   string revision = 7;
+  // With `target`: the one workload placement this concerns. Empty: the
+  // whole cluster.
+  string workload = 8;
 }
 
 message Ping {

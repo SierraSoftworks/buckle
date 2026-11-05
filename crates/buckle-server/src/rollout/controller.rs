@@ -132,6 +132,9 @@ pub enum Command {
     Retry {
         rollout: String,
         host: String,
+        /// The placement's workload; empty for a host's (or a whole
+        /// cluster's) row. The same on the other per-row commands.
+        workload: String,
         note: String,
     },
     /// Re-plan and re-apply every failed host of the rollout.
@@ -144,18 +147,21 @@ pub enum Command {
     SkipBake {
         rollout: String,
         host: Option<String>,
+        workload: String,
         note: String,
     },
     /// Exclude a host from the rollout.
     Skip {
         rollout: String,
         host: String,
+        workload: String,
         note: String,
     },
     /// Retry a host with failed checks waived.
     Continue {
         rollout: String,
         host: String,
+        workload: String,
         waive: Vec<String>,
         note: String,
     },
@@ -163,6 +169,7 @@ pub enum Command {
     Force {
         rollout: String,
         host: String,
+        workload: String,
         note: String,
     },
     /// Turn down a rollout awaiting approval: it ends aborted with the
@@ -467,8 +474,19 @@ struct Live {
 }
 
 impl Live {
+    /// The first row of `host` (a host has one; a cluster rolled by
+    /// placements has one per workload, so this says whether the target has
+    /// a row at all).
     fn find(&self, host: &str) -> Option<usize> {
         self.hosts.iter().position(|h| h.host == host)
+    }
+
+    /// The row of `host` with `workload` (empty: the host's own, or the
+    /// whole cluster's).
+    fn find_row(&self, host: &str, workload: &str) -> Option<usize> {
+        self.hosts
+            .iter()
+            .position(|h| h.host == host && h.workload == workload)
     }
 
     /// The row a report from `host` is about: the host's own, or, when the
@@ -911,7 +929,7 @@ impl Controller {
         let h = &self.live[ri].hosts[hi];
         match h.runtime.kind {
             TargetKind::Host => Some(h.host.clone()),
-            TargetKind::Cluster => h.runtime.executor.clone(),
+            TargetKind::Cluster | TargetKind::Workload => h.runtime.executor.clone(),
         }
     }
 
@@ -1189,7 +1207,7 @@ impl Controller {
         let h = &self.live[ri].hosts[hi];
         match h.runtime.kind {
             TargetKind::Host => String::new(),
-            TargetKind::Cluster => h.host.clone(),
+            TargetKind::Cluster | TargetKind::Workload => h.host.clone(),
         }
     }
 
@@ -1417,6 +1435,7 @@ impl Controller {
                     hi,
                     server_message::Msg::Health(RunHealth {
                         target: String::new(),
+                        workload: String::new(),
                         revision: String::new(),
                         request_id,
                         scope: HealthScope::Rollout as i32,
@@ -2144,9 +2163,12 @@ impl Controller {
             .ok_or_else(|| CommandError::not_found(format!("No active rollout '{id}'.")))
     }
 
-    fn find_host(&self, ri: usize, host: &str) -> Result<usize, CommandError> {
-        self.live[ri].find(host).ok_or_else(|| {
-            CommandError::not_found(format!("Host '{host}' is not part of this rollout."))
+    fn find_host(&self, ri: usize, host: &str, workload: &str) -> Result<usize, CommandError> {
+        self.live[ri].find_row(host, workload).ok_or_else(|| {
+            CommandError::not_found(format!(
+                "Host '{}' is not part of this rollout.",
+                buckle_api::placement_key(host, Some(workload))
+            ))
         })
     }
 
@@ -2217,7 +2239,7 @@ impl Controller {
                     &["Run the action once its agent reconnects."],
                 ));
             }
-            TargetKind::Cluster => self
+            TargetKind::Cluster | TargetKind::Workload => self
                 .executors
                 .get(&target)
                 .filter(|e| {
@@ -2266,10 +2288,11 @@ impl Controller {
             revision,
             traceparent: traceparent_of(&span).unwrap_or_default(),
             target: String::new(),
+            workload: String::new(),
         }));
         self.outbox.push(match record.kind {
             TargetKind::Host => Out::Msg(session, Box::new(m)),
-            TargetKind::Cluster => Out::Targeted {
+            TargetKind::Cluster | TargetKind::Workload => Out::Targeted {
                 session,
                 target: target.clone(),
                 msg: Box::new(stamp_target(m, &target)),
@@ -2277,7 +2300,7 @@ impl Controller {
         });
         let noun = match record.kind {
             TargetKind::Host => "host",
-            TargetKind::Cluster => "target",
+            TargetKind::Cluster | TargetKind::Workload => "target",
         };
         let message = if note.is_empty() {
             format!("{actor} ran {label} on {target}")
@@ -2479,6 +2502,7 @@ impl Controller {
                 revision,
                 traceparent: traceparent_of(&span).unwrap_or_default(),
                 target: String::new(),
+                workload: String::new(),
             }),
         );
     }
@@ -2720,10 +2744,12 @@ impl Controller {
             Command::Retry {
                 rollout,
                 host,
+                workload,
                 note,
             } => {
                 let ri = self.find_rollout(&rollout)?;
-                let hi = self.find_host(ri, &host)?;
+                let hi = self.find_host(ri, &host, &workload)?;
+                let host = buckle_api::placement_key(&host, Some(&workload));
                 if !matches!(
                     self.live[ri].hosts[hi].state,
                     HostPhase::Failed
@@ -2745,7 +2771,7 @@ impl Controller {
                     "rollout.host.retry",
                     ri,
                     format!("{actor} retried {host}. {note}"),
-                    serde_json::json!({"host": host, "note": note}),
+                    serde_json::json!({"host": self.live[ri].hosts[hi].host, "workload": workload, "note": note}),
                 );
                 self.replan(ri, hi, actor);
                 Ok(rollout)
@@ -2793,16 +2819,19 @@ impl Controller {
             Command::SkipBake {
                 rollout,
                 host,
+                workload,
                 note,
-            } => self.skip_bake(actor, rollout, host, note),
+            } => self.skip_bake(actor, rollout, host, workload, note),
             Command::Continue {
                 rollout,
                 host,
+                workload,
                 waive,
                 note,
             } => {
                 let ri = self.find_rollout(&rollout)?;
-                let hi = self.find_host(ri, &host)?;
+                let hi = self.find_host(ri, &host, &workload)?;
+                let host = buckle_api::placement_key(&host, Some(&workload));
                 let h = &self.live[ri].hosts[hi];
                 if h.state != HostPhase::Failed || h.runtime.failed_checks.is_empty() {
                     return Err(CommandError::conflict(
@@ -2852,7 +2881,7 @@ impl Controller {
                         "{actor} continued {host} waiving {}. {note}",
                         waive.join(", ")
                     ),
-                    serde_json::json!({"host": host, "waived": waive, "note": note}),
+                    serde_json::json!({"host": self.live[ri].hosts[hi].host, "workload": workload, "waived": waive, "note": note}),
                 );
                 self.replan(ri, hi, actor);
                 Ok(rollout)
@@ -2860,10 +2889,12 @@ impl Controller {
             Command::Skip {
                 rollout,
                 host,
+                workload,
                 note,
             } => {
                 let ri = self.find_rollout(&rollout)?;
-                let hi = self.find_host(ri, &host)?;
+                let hi = self.find_host(ri, &host, &workload)?;
+                let host = buckle_api::placement_key(&host, Some(&workload));
                 let state = self.live[ri].hosts[hi].state;
                 if matches!(
                     state,
@@ -2879,7 +2910,7 @@ impl Controller {
                     "rollout.host.skip",
                     ri,
                     format!("{actor} skipped {host}. {note}"),
-                    serde_json::json!({"host": host, "note": note}),
+                    serde_json::json!({"host": self.live[ri].hosts[hi].host, "workload": workload, "note": note}),
                 );
                 self.live[ri].hosts[hi].runtime.error = Some(if note.is_empty() {
                     format!("skipped by {actor}")
@@ -2893,10 +2924,12 @@ impl Controller {
             Command::Force {
                 rollout,
                 host,
+                workload,
                 note,
             } => {
                 let ri = self.find_rollout(&rollout)?;
-                let hi = self.find_host(ri, &host)?;
+                let hi = self.find_host(ri, &host, &workload)?;
+                let host = buckle_api::placement_key(&host, Some(&workload));
                 let state = self.live[ri].hosts[hi].state;
                 if !matches!(
                     state,
@@ -2918,8 +2951,11 @@ impl Controller {
                 let Some(session) = self.row_session(ri, hi).filter(|s| self.connected(s)) else {
                     let what = match self.live[ri].hosts[hi].runtime.kind {
                         TargetKind::Host => format!("Host '{host}' is not connected."),
-                        TargetKind::Cluster => {
-                            format!("Cluster '{host}' has no connected executor.")
+                        TargetKind::Cluster | TargetKind::Workload => {
+                            format!(
+                                "Cluster '{}' has no connected executor.",
+                                self.live[ri].hosts[hi].host
+                            )
                         }
                     };
                     return Err(CommandError::conflict(
@@ -2962,7 +2998,7 @@ impl Controller {
                     "rollout.host.force",
                     ri,
                     format!("{actor} force applied {host} {what}. {note}"),
-                    serde_json::json!({"host": host, "note": note, "from": state.as_str(), "force_plan": force_plan}),
+                    serde_json::json!({"host": self.live[ri].hosts[hi].host, "workload": workload, "note": note, "from": state.as_str(), "force_plan": force_plan}),
                 );
                 {
                     let h = &mut self.live[ri].hosts[hi];
@@ -2997,6 +3033,7 @@ impl Controller {
         actor: &str,
         rollout: String,
         host: Option<String>,
+        workload: String,
         note: String,
     ) -> Result<String, CommandError> {
         let ri = self.find_rollout(&rollout)?;
@@ -3010,8 +3047,9 @@ impl Controller {
             ));
         }
         let rows: Vec<usize> = match &host {
-            Some(name) => {
-                let hi = self.find_host(ri, name)?;
+            Some(target) => {
+                let hi = self.find_host(ri, target, &workload)?;
+                let name = buckle_api::placement_key(target, Some(&workload));
                 if self.live[ri].hosts[hi].state != HostPhase::Baking {
                     return Err(CommandError::conflict(
                         format!("Host '{name}' is not baking, so there is no bake to skip."),
@@ -3035,7 +3073,7 @@ impl Controller {
             .partition(|&i| !self.live[ri].hosts[i].runtime.failing_since.is_empty());
         let names = |rows: &[usize]| -> Vec<String> {
             rows.iter()
-                .map(|&i| self.live[ri].hosts[i].host.clone())
+                .map(|&i| super::view::row_key(&self.live[ri].hosts[i]))
                 .collect()
         };
         let (skipped, kept) = (names(&clear), names(&failing));
@@ -3050,7 +3088,10 @@ impl Controller {
             ));
         }
         let (action, subject) = match &host {
-            Some(h) => ("rollout.host.skip_bake", h.clone()),
+            Some(h) => (
+                "rollout.host.skip_bake",
+                buckle_api::placement_key(h, Some(&workload)),
+            ),
             None => (
                 "rollout.skip_bake",
                 format!("{} host(s): {}", skipped.len(), skipped.join(", ")),
@@ -3421,6 +3462,7 @@ impl Controller {
                 Some(pi) => live.hosts.push(RolloutHostRecord {
                     rollout: live.record.id.clone(),
                     host: host.id.clone(),
+                    workload: String::new(),
                     phase: phases[pi].name.clone(),
                     wave: None,
                     state: HostPhase::PlanPending,
@@ -3571,7 +3613,7 @@ impl Controller {
                             modules,
                         });
                     }
-                    TargetKind::Cluster => {
+                    TargetKind::Cluster | TargetKind::Workload => {
                         if let Some(c) = self.cluster_input(ri, hi, &rows, targets) {
                             clusters.push(c);
                         }
@@ -3967,6 +4009,7 @@ impl Controller {
             hi,
             server_message::Msg::Health(RunHealth {
                 target: String::new(),
+                workload: String::new(),
                 revision: String::new(),
                 request_id,
                 scope: HealthScope::Baseline as i32,
@@ -3988,6 +4031,7 @@ impl Controller {
         let rollout = live.record.id.clone();
         Apply {
             target: String::new(),
+            workload: String::new(),
             revision: h.runtime.revision.clone(),
             plan_digest: digest.clone(),
             approval_token: approval_token(&self.key, &rollout, &phase, &digest),
@@ -4330,6 +4374,7 @@ impl Controller {
             hi,
             server_message::Msg::Health(RunHealth {
                 target: String::new(),
+                workload: String::new(),
                 revision: String::new(),
                 request_id,
                 scope: HealthScope::Bake as i32,
@@ -4351,6 +4396,7 @@ impl Controller {
             hi,
             server_message::Msg::Rollback(pb::Rollback {
                 target: String::new(),
+                workload: String::new(),
                 revision: prev,
                 reason: format!("rollout {rollout} is being rolled back"),
                 rollout_id: rollout,
@@ -5092,6 +5138,7 @@ impl Controller {
                     hi,
                     server_message::Msg::Health(RunHealth {
                         target: String::new(),
+                        workload: String::new(),
                         revision: String::new(),
                         request_id: rid,
                         scope: HealthScope::Rollout as i32,
@@ -5275,6 +5322,7 @@ impl Controller {
         self.live[ri].hosts.push(RolloutHostRecord {
             rollout: id.clone(),
             host: host.to_owned(),
+            workload: String::new(),
             phase: STRAGGLERS.into(),
             wave: None,
             state: HostPhase::PlanPending,
@@ -5636,6 +5684,7 @@ impl Controller {
             };
             let m = msg(server_message::Msg::Health(RunHealth {
                 target: String::new(),
+                workload: String::new(),
                 revision: String::new(),
                 request_id: new_id(),
                 scope: HealthScope::Drift as i32,
@@ -5930,6 +5979,7 @@ impl Controller {
             self.live[ri].hosts.push(RolloutHostRecord {
                 rollout: id.clone(),
                 host: host.id.clone(),
+                workload: String::new(),
                 phase: phases[pi].name.clone(),
                 wave: None,
                 state: HostPhase::PlanPending,
@@ -6209,6 +6259,7 @@ impl Controller {
             host,
             msg(server_message::Msg::Plan(RequestPlan {
                 target: target.to_owned(),
+                workload: String::new(),
                 revision: revision.to_owned(),
                 select,
             })),
@@ -6325,6 +6376,7 @@ impl Controller {
         };
         Some(msg(server_message::Msg::Assign(Assign {
             target: target.to_owned(),
+            workload: String::new(),
             revision: revision.to_owned(),
             stable,
             secrets: Some(secrets),
