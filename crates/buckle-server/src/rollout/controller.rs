@@ -1056,6 +1056,14 @@ impl Controller {
         }
     }
 
+    /// Whether row `hi`'s session is connected and its connect has been
+    /// handled here (a bake counts a host as back only once its reconnect
+    /// re-asked it to report, not the instant its session appears).
+    fn row_back(&self, ri: usize, hi: usize) -> bool {
+        self.row_session(ri, hi)
+            .is_some_and(|s| self.connected(&s) && self.online.contains(&s))
+    }
+
     /// Whether row `hi` can be reached now.
     fn row_connected(&self, ri: usize, hi: usize) -> bool {
         self.row_session(ri, hi).is_some_and(|s| self.connected(&s))
@@ -5040,12 +5048,12 @@ impl Controller {
                     if let Some(until) = ended
                         && h.runtime.failing_since.is_empty()
                     {
-                        if reported && (!window || self.row_connected(ri, hi)) {
+                        if reported && (!window || self.row_back(ri, hi)) {
                             self.finish_step(ri, hi);
                             continue;
                         }
                         if !reported
-                            && self.row_connected(ri, hi)
+                            && self.row_back(ri, hi)
                             && until + self.bake_report_grace(ri) <= now
                         {
                             let why = "sent no health report during its bake".to_owned();
