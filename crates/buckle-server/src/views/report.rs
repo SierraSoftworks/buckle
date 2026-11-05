@@ -856,6 +856,7 @@ mod tests {
             always_runs: false,
             removal: RemovalPolicy::Cleanup,
             facts: None,
+            display: None,
         }
     }
 

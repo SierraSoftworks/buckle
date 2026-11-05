@@ -774,6 +774,7 @@ impl<'a> Planner<'a> {
             .instrument(span.clone())
             .await?;
             span.record("buckle.changed", planned.is_change());
+            let display = pt.cx.host.emitted_display(&planned);
             steps.push(Step {
                 task: TaskRef {
                     module: module.clone(),
@@ -788,6 +789,7 @@ impl<'a> Planner<'a> {
                 always_runs: pt.task.always_runs(&pt.spec),
                 removal: removal_policy(pt.decl.removal, prepared.removal, pt.task),
                 facts: pt.cx.host.emitted_paths(),
+                display,
             });
             rich.push(RichStep {
                 task: pt.task,

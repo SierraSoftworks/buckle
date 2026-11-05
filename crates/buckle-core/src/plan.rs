@@ -185,6 +185,13 @@ pub struct Step {
     /// part of the plan's digests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<Vec<String>>,
+    /// The step's diff text (the preview of a creation, the unified diff of
+    /// an update) with `«fact:PATH»` placeholders exactly where the task's
+    /// templates emitted host values, for the fleet view; `None` when no
+    /// line of it came from such an expression. Not part of the plan's
+    /// digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,13 +522,18 @@ impl Plan {
         }
         // Which host values a step's text came from is display metadata:
         // hosts with the same plan share a digest whatever their facts.
-        let traced = |m: &ModulePlan| m.steps.iter().any(|s| s.facts.is_some());
+        let traced = |m: &ModulePlan| {
+            m.steps
+                .iter()
+                .any(|s| s.facts.is_some() || s.display.is_some())
+        };
         let untraced = |m: &ModulePlan| ModulePlan {
             steps: m
                 .steps
                 .iter()
                 .map(|s| Step {
                     facts: None,
+                    display: None,
                     ..s.clone()
                 })
                 .collect(),
@@ -657,6 +669,7 @@ mod tests {
             always_runs: false,
             removal: RemovalPolicy::Cleanup,
             facts: None,
+            display: None,
         }
     }
 
@@ -771,6 +784,7 @@ mod tests {
             ..traced.deferred[0].clone()
         });
         traced.modules[0].steps[0].facts = Some(vec!["host.facts.fqdn".into()]);
+        traced.modules[0].steps[0].display = Some("-a\n+\u{ab}fact:host.id\u{bb}".into());
         assert_eq!(traced.compute_digest(), deferred.compute_digest());
         assert_eq!(traced.intent_digest(), deferred.intent_digest());
     }
