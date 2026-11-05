@@ -65,6 +65,7 @@ removal: stop
 | `timeouts` | How long an apply waits on the scheduler: `placement` for a placement it cannot make yet (default `5m`; on Nomad a blocked evaluation, such as a static port the old allocation still holds; on Kubernetes a controller's pods left unschedulable) and `rollout` for the whole deployment (default `1h`; on Kubernetes the Deployment, StatefulSet or DaemonSet rollout; the job's `progress_deadline` or the Deployment's `progressDeadlineSeconds` usually ends it first). |
 | `restart_on` | Resources (by file or secret name) whose change restarts the jobs even when their specs did not change. |
 | `removal` | What happens when the workload is dropped: `stop` (default), `purge` or `keep`. |
+| `actions` | Extra [actions](#actions) beside the implicit ones. |
 
 ## Resources
 
@@ -195,6 +196,30 @@ on Kubernetes, applied in a fixed order (`variables` and `secrets` are both `sec
 and `buckle validate` warns about them; they go away in a later release. `job: paste.nomad.hcl`
 with `volumes: [paste.volume.hcl]` becomes `resources: [paste.volume.hcl, paste.nomad.hcl]`.
 :::
+
+## Actions
+
+Every workload with a job offers **Restart**, **Stop** and **Roll back** on its cluster's page,
+run by the cluster's executor on each job the workload owns there:
+
+| Action | What it does |
+|---|---|
+| `restart` | Restarts the jobs' running allocations in place. |
+| `stop` | Stops the jobs (asks for a reason); volumes and variables stay, and the next rollout that changes the workload starts them again. |
+| `revert` | Re-registers each job's newest stable version older than the running one (asks for a reason). |
+
+`actions:` adds more, of the `dispatch` kind (a parameterized job with fixed meta and payload):
+
+```yaml
+actions:
+  backfill:
+    dispatch: { job: paste-maintenance, meta: { task: backfill }, payload: '{{ vars.version }}' }
+    confirm: true
+    description: Re-index every paste
+```
+
+`job` and `meta` are rendered with the workload's vars; `namespace` defaults to the
+workload's. An extra cannot take an implicit action's name, `notify` or `when`.
 
 ## Secrets
 

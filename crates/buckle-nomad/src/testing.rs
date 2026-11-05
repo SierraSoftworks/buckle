@@ -401,6 +401,16 @@ impl FakeNomad {
                 }
             }
             ("GET", ["allocation", _, "checks"]) => (200, Value::Null),
+            ("POST", ["client", "allocation", _, "restart"]) => (200, json!({})),
+            ("POST", ["job", id, "dispatch"]) => {
+                match s.jobs.get(&(ns.clone(), (*id).to_owned())) {
+                    Some(_) => (
+                        200,
+                        json!({"DispatchedJobID": format!("{id}/dispatch-{index}"), "EvalID": format!("eval-{index}")}),
+                    ),
+                    None => not_found,
+                }
+            }
             ("GET", ["job", id]) => match s.jobs.get(&(ns.clone(), (*id).to_owned())) {
                 Some(j) => (200, j.clone()),
                 None => not_found,

@@ -96,6 +96,9 @@ struct Executor<'a> {
     pending_handlers: Mutex<HashMap<String, Vec<(String, String)>>>,
     /// The reboot the run's steps and handlers asked for so far.
     reboot: Mutex<Option<crate::reboot::RebootRequest>>,
+    /// Whether steps are recorded in state. An action's run owns nothing,
+    /// so it records nothing and leaves the state file alone.
+    record: bool,
 }
 
 /// `Engine::apply`.
@@ -142,8 +145,102 @@ pub(super) async fn apply(
         pending_handlers: Mutex::new(HashMap::new()),
         save_errors: Mutex::new(Vec::new()),
         reboot: Mutex::new(None),
+        record: true,
     };
     let outcome = executor.run(&planner, rich, started, started_at).await?;
+    Ok(outcome)
+}
+
+/// `Engine::run_action`: re-plans the action, refuses when its intent no
+/// longer matches `plan`, then runs its step, the handlers it notifies and
+/// (when it changed something) the module's health checks with settle. It
+/// records nothing in state and rolls nothing back.
+pub(super) async fn apply_action(
+    inputs: &Inputs,
+    module: &str,
+    action: &str,
+    plan: &Plan,
+    events: Sender<ApplyEvent>,
+) -> crate::Result<ApplyOutcome> {
+    let started = tokio::time::Instant::now();
+    let started_at = inputs.system.now();
+    let planner = Planner::from_inputs(inputs, &inputs.revision)?;
+    let facts = collect_facts(inputs, &planner).await;
+    let state = inputs.state.load()?;
+    let (rich, warnings) =
+        super::planner::plan_action_with(&planner, &facts, &state, module, action).await?;
+    let fresh = super::planner::action_plan(&planner, &rich, warnings);
+    if fresh.intent_digest() != plan.intent_digest() {
+        return Err(crate::error::wrap_user(
+            super::StalePlan {
+                planned: plan.digest.clone(),
+                fresh: fresh.digest.clone(),
+            },
+            format!(
+                "The action's plan is stale: it was computed as {} but the host now plans it as {}.",
+                plan.digest.short(),
+                fresh.digest.short()
+            ),
+            &["The host changed since the action was planned; plan it again and review it."],
+        ));
+    }
+    let executor = Executor {
+        inputs,
+        events,
+        locks: LockTable::default(),
+        state: Arc::new(Mutex::new(state)),
+        redactor: Redactor::new(&inputs.secrets),
+        changed_so_far: AtomicUsize::new(0),
+        facts: Mutex::new(facts),
+        scheduled: Mutex::new(HashSet::new()),
+        pending_handlers: Mutex::new(HashMap::new()),
+        save_errors: Mutex::new(Vec::new()),
+        reboot: Mutex::new(None),
+        record: false,
+    };
+    let contexts = planner.contexts(&executor.facts());
+    let revision = planner.revision.id.clone();
+    let span = tracing::info_span!("action.run", buckle.module = %module, buckle.action = %action);
+    let run = executor
+        .run_module(&planner, Arc::new(rich), &contexts, &revision, true)
+        .instrument(span)
+        .await;
+    let succeeded = !run.failed && run.blocked.is_empty();
+    let error = (!succeeded)
+        .then(|| {
+            run.outcome
+                .error
+                .clone()
+                .map(|e| format!("module '{module}': {e}"))
+        })
+        .flatten();
+    let failed_module = run.failed.then(|| module.to_owned());
+    let outcome = ApplyOutcome {
+        plan_digest: fresh.digest.clone(),
+        succeeded,
+        changes: run.outcome.changes,
+        removals: 0,
+        duration_ms: started.elapsed().as_millis() as u64,
+        module_results: vec![run.outcome],
+        failed_module,
+        rolled_back_modules: Vec::new(),
+        not_started: Vec::new(),
+        health: Some(HealthReport {
+            scope: HealthScope::Bake,
+            results: run.health,
+        }),
+        error,
+        error_detail: None,
+        removals_run: Vec::new(),
+        started_at: Some(started_at),
+        finished_at: Some(inputs.system.now()),
+        reboot: executor
+            .reboot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take(),
+    };
+    tracing::info!(succeeded, changes = outcome.changes, "action finished");
     Ok(outcome)
 }
 
@@ -223,6 +320,9 @@ impl<'a> Executor<'a> {
     /// Saves state now (after every step, so a crash loses at most the step
     /// in flight); a failure is remembered for the outcome, not fatal.
     fn checkpoint(&self) {
+        if !self.record {
+            return;
+        }
         if let Err(e) = self.save_state() {
             let report = self.report(&e).prefixed("state could not be saved");
             let mut errors = self.save_errors.lock().unwrap_or_else(|p| p.into_inner());
@@ -271,6 +371,9 @@ impl<'a> Executor<'a> {
         applied: Option<&Applied>,
         revision: &RevisionId,
     ) {
+        if !self.record {
+            return;
+        }
         let now = self.inputs.system.now();
         self.with_state(|state| {
             let notifies: Vec<String> = step

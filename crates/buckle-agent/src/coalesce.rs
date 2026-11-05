@@ -74,10 +74,11 @@ pub async fn forward(
     plan_digest: String,
     spacing: Duration,
 ) -> (usize, usize) {
-    forward_for(events, sink, revision, plan_digest, spacing, None).await
+    forward_for(events, sink, revision, plan_digest, spacing, None, None).await
 }
 
-/// [`forward`] for the cluster `target` (`None`: the host itself).
+/// [`forward`] for the cluster `target` (`None`: the host itself), tagging
+/// each event with `action_id` when the run is an action's.
 pub async fn forward_for(
     mut events: mpsc::Receiver<ApplyEvent>,
     sink: ReportSink,
@@ -85,6 +86,7 @@ pub async fn forward_for(
     plan_digest: String,
     spacing: Duration,
     target: Option<String>,
+    action_id: Option<String>,
 ) -> (usize, usize) {
     let mut pending: IndexMap<String, (chrono::DateTime<chrono::Utc>, ApplyEvent)> =
         IndexMap::new();
@@ -100,6 +102,7 @@ pub async fn forward_for(
             plan_digest: plan_digest.clone(),
             at,
             event,
+            action_id: action_id.clone(),
         }
         .about(target.as_deref());
         async move { sink.send(report).await }

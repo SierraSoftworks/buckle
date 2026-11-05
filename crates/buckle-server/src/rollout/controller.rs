@@ -168,6 +168,15 @@ pub enum Command {
         rollout: String,
         reason: String,
     },
+    /// Run an action of `module` (a cluster's: a workload) on `target`
+    /// from `revision`, its applied revision; replies with the run's id.
+    RunAction {
+        target: String,
+        module: String,
+        action: String,
+        revision: String,
+        note: String,
+    },
 }
 
 impl Command {
@@ -187,6 +196,7 @@ impl Command {
             Command::Continue { .. } => "rollout.host.continue",
             Command::Force { .. } => "rollout.host.force",
             Command::Reject { .. } => "rollout.reject",
+            Command::RunAction { .. } => "host.action.run",
         }
     }
 }
@@ -578,6 +588,7 @@ fn stamp_target(mut m: ServerMessage, target: &str) -> ServerMessage {
         Some(server_message::Msg::Apply(a)) => a.target = target.to_owned(),
         Some(server_message::Msg::Rollback(r)) => r.target = target.to_owned(),
         Some(server_message::Msg::Health(h)) => h.target = target.to_owned(),
+        Some(server_message::Msg::Action(a)) => a.target = target.to_owned(),
         _ => {}
     }
     m
@@ -2115,8 +2126,150 @@ impl Controller {
         self.audit(actor, action, &id, message, detail, trace);
     }
 
+    /// Starts an operator's action on `target` (see [`Command::RunAction`]):
+    /// refused while the target is applying in a rollout, paused, offline
+    /// (a cluster: without a connected executor) or running another action.
+    async fn run_action(
+        &mut self,
+        actor: &str,
+        target: String,
+        module: String,
+        action: String,
+        revision: String,
+        note: String,
+    ) -> Result<String, CommandError> {
+        let applying = self.live.iter().any(|l| {
+            l.hosts.iter().any(|h| {
+                h.host == target && (h.state.in_flight() || h.state == HostPhase::RollingBack)
+            })
+        });
+        if applying {
+            return Err(CommandError::conflict(
+                format!("{target} is applying in a rollout."),
+                &["Run the action once the rollout has finished with it."],
+            ));
+        }
+        let t = target.clone();
+        let (record, running) = self
+            .store
+            .call(move |db| Ok((db.hosts().target(&t)?, db.runs().running_action(&t)?)))
+            .await
+            .map_err(CommandError::internal)?;
+        let record =
+            record.ok_or_else(|| CommandError::not_found(format!("No target '{target}'.")))?;
+        if record.status != HostStatus::Active {
+            return Err(CommandError::conflict(
+                format!(
+                    "{target} is {:?}; actions run on active targets only.",
+                    record.status
+                ),
+                &["Resume (or approve) it first."],
+            ));
+        }
+        if let Some(running) = running {
+            return Err(CommandError::conflict(
+                format!("{running} is still running on {target}."),
+                &["Wait for it to finish; its run is on the target's page."],
+            ));
+        }
+        let session = match record.kind {
+            TargetKind::Host if self.eligible(&target) => target.clone(),
+            TargetKind::Host => {
+                return Err(CommandError::conflict(
+                    format!("{target} is offline."),
+                    &["Run the action once its agent reconnects."],
+                ));
+            }
+            TargetKind::Cluster => self
+                .executors
+                .get(&target)
+                .filter(|e| {
+                    self.eligible(e)
+                        && self
+                            .capabilities
+                            .get(*e)
+                            .is_some_and(|c| c.iter().any(|c| c == TARGETS_CAPABILITY))
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    CommandError::conflict(
+                        format!("No executor of {target} is connected."),
+                        &["Run the action once a rollout has picked an executor that is online."],
+                    )
+                })?,
+        };
+        let now = self.now();
+        let run_id = crate::store::RunRecord::new_id();
+        let label = format!("{module}/{action}");
+        let span = tracing::info_span!("action.run", buckle.host = %target, buckle.module = %module, buckle.action = %action, buckle.run = %run_id);
+        let run = crate::store::RunRecord {
+            id: run_id.clone(),
+            host: target.clone(),
+            rollout: None,
+            revision: revision.clone(),
+            plan_digest: String::new(),
+            started_at: now,
+            finished_at: now,
+            outcome: crate::store::RUNNING.to_owned(),
+            changes: 0,
+            removals: 0,
+            error: None,
+            trace_id: trace_id_of(&span),
+            outcome_json: None,
+            action: Some(label.clone()),
+        };
+        self.store
+            .call(move |db| db.runs().add(&run).map(|_| ()))
+            .await
+            .map_err(CommandError::internal)?;
+        let m = msg(server_message::Msg::Action(pb::RunAction {
+            action_id: run_id.clone(),
+            module,
+            action,
+            revision,
+            traceparent: traceparent_of(&span).unwrap_or_default(),
+            target: String::new(),
+        }));
+        self.outbox.push(match record.kind {
+            TargetKind::Host => Out::Msg(session, Box::new(m)),
+            TargetKind::Cluster => Out::Targeted {
+                session,
+                target: target.clone(),
+                msg: Box::new(stamp_target(m, &target)),
+            },
+        });
+        let noun = match record.kind {
+            TargetKind::Host => "host",
+            TargetKind::Cluster => "target",
+        };
+        let message = if note.is_empty() {
+            format!("{actor} ran {label} on {target}")
+        } else {
+            format!("{actor} ran {label} on {target}: {note}")
+        };
+        self.audit(
+            actor,
+            &format!("{noun}.action.run"),
+            &target,
+            message,
+            serde_json::json!({"module": label.split('/').next(), "action": label, "note": note, "run": run_id}),
+            trace_id_of(&span),
+        );
+        Ok(run_id)
+    }
+
     async fn on_command(&mut self, actor: &str, command: Command) -> Result<String, CommandError> {
         match command {
+            Command::RunAction {
+                target,
+                module,
+                action,
+                revision,
+                note,
+            } => {
+                self.run_action(actor, target, module, action, revision, note)
+                    .await
+            }
             Command::Start { revision, note } => self.start(&revision, actor, &note).await,
             Command::Approve {
                 rollout,
@@ -5576,6 +5729,7 @@ impl Controller {
             Some(server_message::Msg::Plan(p)) => p.revision.clone(),
             Some(server_message::Msg::Apply(a)) => a.revision.clone(),
             Some(server_message::Msg::Rollback(r)) => r.revision.clone(),
+            Some(server_message::Msg::Action(a)) => a.revision.clone(),
             Some(server_message::Msg::Health(_)) => {
                 let t = target.to_owned();
                 self.store

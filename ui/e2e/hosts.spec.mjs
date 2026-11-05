@@ -153,3 +153,27 @@ describe("add an agent", () => {
     await close();
   });
 });
+
+describe("actions", () => {
+  test("an action runs at once, and one asking for confirmation takes a reason first", async () => {
+    const { page, close } = await open("/hosts/lab-3");
+    const actions = page.getByTestId("host-actions");
+    await actions.getByRole("button", { name: "common · Upgrade packages" }).click();
+    await page.getByRole("status").filter({ hasText: "Upgrade packages started on lab-3" }).waitFor();
+
+    await actions.getByRole("button", { name: "More actions" }).click();
+    await actions.getByRole("menuitem", { name: "common · Reboot…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Reboot on lab-3" });
+    const confirm = dialog.getByRole("button", { name: "Reboot", exact: true });
+    assert.ok(await confirm.isDisabled(), "a reason is required");
+    await dialog.getByRole("textbox", { name: /Reason/ }).fill("kernel update");
+    await confirm.click();
+    await page.getByRole("status").filter({ hasText: "Reboot started on lab-3" }).waitFor();
+
+    // Each module's head offers its own actions, unqualified.
+    const nomad = page.locator(".blueprint").getByTestId("actions-nomad");
+    await nomad.getByRole("button", { name: "Restart Nomad" }).click();
+    await page.getByRole("status").filter({ hasText: "Restart Nomad started on lab-3" }).waitFor();
+    await close();
+  });
+});

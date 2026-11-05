@@ -145,24 +145,42 @@ pub async fn run(nomad: &Nomad, ns: &str, id: &str, action: &Action) -> Result<S
                 .await?;
             Ok(format!("rolled job {id} back to version {stable}"))
         }
-        Action::Dispatch => {
-            let resp: Value = nomad
-                .write(
-                    "POST",
-                    &with_query(&format!("{job_path}/dispatch"), "namespace", ns),
-                    &json!({"JobID": id}),
-                )
-                .await?;
-            Ok(format!(
-                "dispatched {}",
-                resp["DispatchedJobID"].as_str().unwrap_or(id)
-            ))
-        }
+        Action::Dispatch => dispatch(nomad, ns, id, &Default::default(), None).await,
         Action::Task { name, .. } => Err(user(
             format!("The task action {name} of job {id} runs from Nomad for now."),
             &["Run it with `nomad action` or from Nomad's UI."],
         )),
     }
+}
+
+/// Dispatches the parameterized job `id` in `ns` with `meta` and an
+/// optional `payload`, returning a summary naming the dispatched job.
+pub async fn dispatch(
+    nomad: &Nomad,
+    ns: &str,
+    id: &str,
+    meta: &std::collections::BTreeMap<String, String>,
+    payload: Option<&str>,
+) -> Result<String> {
+    use base64::Engine as _;
+    let mut body = json!({"JobID": id});
+    if !meta.is_empty() {
+        body["Meta"] = json!(meta);
+    }
+    if let Some(payload) = payload {
+        body["Payload"] = json!(base64::engine::general_purpose::STANDARD.encode(payload));
+    }
+    let resp: Value = nomad
+        .write(
+            "POST",
+            &with_query(&format!("/v1/job/{}/dispatch", seg(id)), "namespace", ns),
+            &body,
+        )
+        .await?;
+    Ok(format!(
+        "dispatched {}",
+        resp["DispatchedJobID"].as_str().unwrap_or(id)
+    ))
 }
 
 #[cfg(test)]

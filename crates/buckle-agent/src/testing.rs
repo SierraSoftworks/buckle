@@ -139,6 +139,15 @@ pub enum Call {
         /// The modules.
         modules: Option<Vec<String>>,
     },
+    /// `run_action`.
+    Action {
+        /// The revision.
+        revision: RevisionId,
+        /// The module.
+        module: String,
+        /// The action.
+        action: String,
+    },
     /// `reboot`.
     Reboot,
 }
@@ -389,6 +398,43 @@ impl Runner for FakeRunner {
         });
         let report = (lock(&self.health))(&revision.id, scope);
         Ok(report)
+    }
+
+    async fn plan_action(
+        &self,
+        revision: Arc<Revision>,
+        ctx: &RunContext,
+        module: &str,
+        action: &str,
+    ) -> buckle_core::Result<(Plan, Facts)> {
+        if action == "missing" {
+            return Err(buckle_core::error::user(
+                format!("The module {module} declares no action '{action}'."),
+                &["Pick another."],
+            ));
+        }
+        Ok((self.plan_for(&revision.id), ctx.facts.clone()))
+    }
+
+    async fn run_action(
+        &self,
+        revision: Arc<Revision>,
+        _ctx: &RunContext,
+        module: &str,
+        action: &str,
+        plan: &Plan,
+        events: mpsc::Sender<ApplyEvent>,
+    ) -> buckle_core::Result<ApplyOutcome> {
+        self.record(Call::Action {
+            revision: revision.id.clone(),
+            module: module.to_owned(),
+            action: action.to_owned(),
+        });
+        let scripted = lock(&self.events_per_apply).clone();
+        for event in scripted {
+            let _ = events.send(event).await;
+        }
+        Ok((lock(&self.outcome))(plan))
     }
 
     async fn boot_id(&self) -> Option<String> {

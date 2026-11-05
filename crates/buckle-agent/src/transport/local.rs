@@ -108,6 +108,13 @@ pub fn log_report(report: &Report) {
                 )
             }
         }
+        Report::ActionResult(run) => {
+            if run.outcome.succeeded {
+                tracing::info!(module = %run.module, action = %run.action, summary = %run.summary(), "action ran")
+            } else {
+                tracing::error!(module = %run.module, action = %run.action, error = ?run.outcome.error, "action failed")
+            }
+        }
         Report::Health { report, .. } => {
             let failures: Vec<String> = report
                 .failures(&[])

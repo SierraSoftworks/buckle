@@ -1561,3 +1561,82 @@ async fn workload_identities_are_refused_with_a_reason(
     assert!(rejected.reason.contains(reason), "{}", rejected.reason);
     assert!(!rejected.retry);
 }
+
+#[tokio::test]
+async fn action_events_and_results_land_in_the_action_run_beside_an_open_apply() {
+    use buckle_core::engine::ApplyEvent;
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    // An apply's run is open; the action's run was started by the server.
+    tx.send(module_started("d1")).await.unwrap();
+    let apply = next_progress(&mut live).await.run_id;
+    let action = crate::store::RunRecord {
+        id: "act-1".into(),
+        host: "pi-1".into(),
+        rollout: None,
+        revision: "r1".into(),
+        plan_digest: String::new(),
+        started_at: chrono::Utc::now(),
+        finished_at: chrono::Utc::now(),
+        outcome: crate::store::RUNNING.into(),
+        changes: 0,
+        removals: 0,
+        error: None,
+        trace_id: None,
+        outcome_json: None,
+        action: Some("web/restart".into()),
+    };
+    s.store
+        .call(move |db| db.runs().add(&action).map(|_| ()))
+        .await
+        .unwrap();
+
+    let mut event = apply_event(
+        "ad",
+        ApplyEvent::ModuleStarted {
+            module: "web".into(),
+        },
+    );
+    if let Some(agent_message::Msg::Apply(e)) = &mut event.msg {
+        e.action_id = "act-1".into();
+    }
+    tx.send(event).await.unwrap();
+    assert_eq!(next_progress(&mut live).await.run_id, "act-1");
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::Action(buckle_proto::v1::ActionResult {
+            action_id: "act-1".into(),
+            module: "web".into(),
+            action: "restart".into(),
+            revision: "r1".into(),
+            succeeded: true,
+            changes: 1,
+            report_id: 11,
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![11]);
+    let done = next_progress(&mut live).await;
+    assert_eq!(
+        (done.run_id.as_str(), done.run_state),
+        ("act-1", buckle_api::RunState::Succeeded)
+    );
+    let finished = run_of(&s, "act-1").await;
+    assert_eq!(
+        (
+            finished.outcome.as_str(),
+            finished.changes,
+            finished.action.as_deref()
+        ),
+        ("succeeded", 1, Some("web/restart"))
+    );
+    assert!(
+        run_of(&s, &apply).await.is_running(),
+        "the apply's run is untouched"
+    );
+    let events = s.store.call(|db| db.runs().events("act-1")).await.unwrap();
+    assert_eq!(events.len(), 1);
+}

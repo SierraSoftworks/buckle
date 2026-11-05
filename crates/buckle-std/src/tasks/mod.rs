@@ -11,6 +11,7 @@ pub(crate) mod ufw_common;
 pub mod apt_package;
 pub mod apt_repository;
 pub mod apt_update;
+pub mod apt_upgrade;
 pub mod sysctl;
 pub mod systemd_daemon_reload;
 pub mod systemd_dropin;

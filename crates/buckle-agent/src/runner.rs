@@ -76,6 +76,27 @@ pub trait Runner: Send + Sync + 'static {
         modules: Option<&[String]>,
     ) -> buckle_core::Result<HealthReport>;
 
+    /// Plans `action` of `module` in `revision`. Pure.
+    async fn plan_action(
+        &self,
+        revision: Arc<Revision>,
+        ctx: &RunContext,
+        module: &str,
+        action: &str,
+    ) -> buckle_core::Result<(Plan, Facts)>;
+
+    /// Runs `action` of `module` as `plan` planned it, streaming progress
+    /// to `events`. Records nothing in state.
+    async fn run_action(
+        &self,
+        revision: Arc<Revision>,
+        ctx: &RunContext,
+        module: &str,
+        action: &str,
+        plan: &Plan,
+        events: mpsc::Sender<ApplyEvent>,
+    ) -> buckle_core::Result<ApplyOutcome>;
+
     /// The identity of the current boot, when the host exposes one.
     async fn boot_id(&self) -> Option<String> {
         None
@@ -210,6 +231,28 @@ impl Runner for EngineRunner {
         modules: Option<&[String]>,
     ) -> buckle_core::Result<HealthReport> {
         Engine::health(&self.inputs(revision, ctx)?, scope, modules).await
+    }
+
+    async fn plan_action(
+        &self,
+        revision: Arc<Revision>,
+        ctx: &RunContext,
+        module: &str,
+        action: &str,
+    ) -> buckle_core::Result<(Plan, Facts)> {
+        Engine::plan_action(&self.inputs(revision, ctx)?, module, action).await
+    }
+
+    async fn run_action(
+        &self,
+        revision: Arc<Revision>,
+        ctx: &RunContext,
+        module: &str,
+        action: &str,
+        plan: &Plan,
+        events: mpsc::Sender<ApplyEvent>,
+    ) -> buckle_core::Result<ApplyOutcome> {
+        Engine::run_action(&self.inputs(revision, ctx)?, module, action, plan, events).await
     }
 
     async fn boot_id(&self) -> Option<String> {

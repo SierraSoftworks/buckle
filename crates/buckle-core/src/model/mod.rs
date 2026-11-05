@@ -5,17 +5,20 @@
 //! [`filt_rs::Filter`]s; string fields that may contain `{{ }}` are kept as raw
 //! strings and rendered by the engine with the host's context.
 
+mod action_decl;
 mod cluster;
 mod task_decl;
 mod workload;
 
+pub use action_decl::ActionDecl;
 pub use cluster::{
     ClusterDecl, ClusterIdentity, ClusterKind, ClusterScope, ClusterTrust, trust_problem,
     yaml_scalar_text,
 };
 pub use task_decl::{RetryPolicy, TaskDecl};
 pub use workload::{
-    Items, Layer, Need, PolicyAttach, ResourceEntry, ResourceKind, WorkloadConfig, WorkloadRemoval,
+    DispatchSpec, IMPLICIT_ACTIONS, ImplicitAction, Items, Layer, Need, PolicyAttach,
+    ResourceEntry, ResourceKind, WORKLOAD_ACTION_KINDS, WorkloadConfig, WorkloadRemoval,
     WorkloadTimeouts,
 };
 
@@ -411,6 +414,11 @@ pub struct ModuleConfig {
     /// Handlers are tasks run once at the end of the module when notified.
     #[serde(default)]
     pub handlers: IndexMap<String, TaskDecl>,
+    /// Named tasks an operator runs on demand (from the UI or the API, or
+    /// across many hosts as an action rollout), in the order the UI lists
+    /// them: the first is the one on the Actions button's face.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub actions: IndexMap<String, ActionDecl>,
     #[serde(default)]
     pub health: Vec<HealthDecl>,
     /// How long a rollout watches a host after a run that changed this
@@ -668,6 +676,9 @@ tasks:
     retry: { limit: 3, delay: 5s }
 handlers:
   nomad: { systemd.restart: { name: nomad } }
+actions:
+  restart: { systemd.restart: { name: nomad }, description: Restart the Nomad agent }
+  drain: { command.run: { run: [nomad, node, drain, -self, -enable] }, confirm: true }
 health:
   - name: api
     http: { url: 'http://127.0.0.1:4646/v1/agent/health' }
@@ -691,6 +702,12 @@ removal: { policy: cleanup }
         assert_eq!(m.tasks[2].removal, Some(RemovalPolicy::Leave));
         assert_eq!(m.tasks[2].retry.limit, 3);
         assert_eq!(m.handlers["nomad"].kind, "systemd.restart");
+        assert_eq!(
+            m.actions.keys().collect::<Vec<_>>(),
+            vec!["restart", "drain"],
+            "actions keep their declared order"
+        );
+        assert!(m.actions["drain"].confirm && !m.actions["restart"].confirm);
         assert_eq!(m.health[0].display_name(), "api");
         assert_eq!(m.health[0].check.kind, "http");
         assert_eq!(m.health[1].display_name(), "systemd");

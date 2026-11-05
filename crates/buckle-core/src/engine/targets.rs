@@ -249,6 +249,53 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
             }
         }
 
+        for (aname, action) in &cfg.actions {
+            let location = format!("{file} actions.{aname} ({})", action.task.kind);
+            let task = &action.task;
+            if cfg.implicit_actions().iter().any(|i| i.name == aname) {
+                report.error(
+                    Some(name),
+                    &location,
+                    format!("'{aname}' is an implicit action of every workload with a job; give the extra another name"),
+                );
+            }
+            if !crate::model::WORKLOAD_ACTION_KINDS.contains(&task.kind.as_str()) {
+                report.error(
+                    Some(name),
+                    &location,
+                    format!(
+                        "'{}' is not a workload action kind (use one of: {})",
+                        task.kind,
+                        crate::model::WORKLOAD_ACTION_KINDS.join(", ")
+                    ),
+                );
+            } else if let Err(e) =
+                serde_yaml::from_value::<crate::model::DispatchSpec>(task.spec.clone())
+            {
+                report.error(Some(name), &location, format!("invalid: {e}"));
+            }
+            let mut unsupported = action.unsupported_keys();
+            if !task.notify.is_empty() {
+                unsupported.push("notify");
+            }
+            if task.when.is_some() {
+                unsupported.push("when");
+            }
+            for key in unsupported {
+                report.error(
+                    Some(name),
+                    &location,
+                    format!("a workload action does not take `{key}`"),
+                );
+            }
+            let mut strings = Vec::new();
+            yaml_strings(&task.spec, &mut strings);
+            for s in strings {
+                check_secrets(&mut report, Some(name), &location, s);
+                check_template(&mut report, Some(name), &location, s);
+            }
+        }
+
         for (k, v) in &cfg.vars {
             let mut strings = Vec::new();
             yaml_strings(v, &mut strings);
@@ -618,6 +665,18 @@ fleet:
         &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nrestart_on: [variables]\n"), ("workloads/a/files/a.nomad.hcl", "")],
         "not a resource of this workload"
     )]
+    #[case::workload_action_unknown_kind(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nactions:\n  backfill: { systemd.restart: { name: x } }\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "not a workload action kind"
+    )]
+    #[case::workload_action_shadows_implicit(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nactions:\n  restart: { dispatch: { job: a } }\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "implicit action"
+    )]
+    #[case::workload_action_bad_spec(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nactions:\n  backfill: { dispatch: { meta: { a: b } } }\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "invalid"
+    )]
     #[case::cross_layer_cycle(
         &[("buckle.yaml", FLEET), ("modules/m/module.yaml", "name: m\nneeds: ['workload:a']\n"), ("workloads/a/workload.yaml", "name: a\nneeds: ['module:m']\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "")],
         "form a cycle"
@@ -710,6 +769,8 @@ resources:
   - { secret: nomad/jobs/paste, items: { db: '{{ secrets.DB }}' } }
   - { file: paste.nomad.hcl.j2, live_vars: [version], ignore: ['Meta[autoupdate.*]'] }
 restart_on: [nomad/jobs/paste]
+actions:
+  backfill: { dispatch: { job: paste-maintenance, meta: { task: backfill } }, confirm: true }
 ",
             ),
             (

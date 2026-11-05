@@ -382,6 +382,17 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
                 &format!("{file} handlers.{hname} ({})", decl.kind),
             );
         }
+        for (aname, action) in &m.config.actions {
+            let location = format!("{file} actions.{aname} ({})", action.task.kind);
+            check_decl(&mut report, &action.task, &location);
+            for key in action.unsupported_keys() {
+                report.error(
+                    Some(name),
+                    &location,
+                    format!("an action does not take `{key}`: it owns no resource, so it has no id, removal or task order"),
+                );
+            }
+        }
         for (i, h) in m.config.health.iter().enumerate() {
             let location = format!("{file} health[{i}] ({})", h.display_name());
             if crate::health::registry()

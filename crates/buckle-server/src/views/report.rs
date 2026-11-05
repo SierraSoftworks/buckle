@@ -579,6 +579,7 @@ pub fn run_report(
         error: None,
         trace_id: run.trace_id.clone(),
         trace_url: None,
+        action: run.action.clone(),
     };
     if let Some(plan) = plan {
         from_plan(&mut report, plan);
@@ -676,6 +677,7 @@ pub fn pending_report(
         error: None,
         trace_id: None,
         outcome_json: None,
+        action: None,
     };
     run_report(&run, Some(plan), &[], None, &[])
 }
@@ -911,6 +913,7 @@ mod tests {
             error: None,
             trace_id: None,
             outcome_json: None,
+            action: None,
         }
     }
 

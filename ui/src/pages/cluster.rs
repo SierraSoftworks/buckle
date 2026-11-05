@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{HostDetail, HostStatus, HostSummary};
+use buckle_api::{ActionInfo, Connection, HostDetail, HostStatus, HostSummary};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
@@ -17,10 +17,11 @@ use super::host::{LabelsEditor, NotesEditor, RunsPanel, health_panel, runs};
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    BlueprintView, Button, Confirm, Empty, ErrorState, Kind, Loading, PageHead, Panel, Pill,
-    Refresh, RouteLink, icons, use_toast,
+    ActionsButton, BlueprintView, Button, Confirm, Empty, ErrorState, Kind, Loading, PageHead,
+    Panel, Pill, Refresh, RouteLink, icons, use_target_actions, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
+use crate::logic::actions::of_module;
 use crate::logic::clusters::{WorkloadRow, WorkloadState, workload_rows};
 use crate::logic::format::{commit, count, relative, relative_opt, timestamp};
 use crate::logic::live::{apply_fleet, apply_host_detail};
@@ -61,6 +62,17 @@ pub fn cluster_page(props: &Props) -> Html {
             || ()
         });
     }
+    // An action that started: follow the newest run, its own.
+    let target_actions = {
+        let (picked, reload) = (picked.clone(), detail.reload.clone());
+        use_target_actions(
+            props.id.clone(),
+            Callback::from(move |_| {
+                picked.set(None);
+                reload.emit(());
+            }),
+        )
+    };
     let store = use_live();
     let newest = live.as_ref().and_then(|d| {
         let events = detail
@@ -98,6 +110,16 @@ pub fn cluster_page(props: &Props) -> Html {
     let hosts: Vec<HostSummary> = fleet.as_ref().map(|f| f.hosts.clone()).unwrap_or_default();
     let by_id: BTreeMap<&str, &HostSummary> = hosts.iter().map(|h| (h.id.as_str(), h)).collect();
     let active = fleet.as_ref().and_then(|f| f.active_rollout.clone());
+    // Actions run on an active cluster through its connected executor, and
+    // only for admins.
+    let can_act = admin
+        && c.status == HostStatus::Active
+        && status
+            .executor
+            .as_deref()
+            .and_then(|e| by_id.get(e))
+            .is_some_and(|h| h.connection == Connection::Online);
+    let on_action = can_act.then(|| target_actions.on_action.clone());
 
     let open = |a: Ask| {
         let (ask, error) = (ask.clone(), error.clone());
@@ -161,6 +183,9 @@ pub fn cluster_page(props: &Props) -> Html {
 
     let actions = html! { <>
         <Refresh loading={detail.loading} reload={detail.reload.clone()} />
+        if let Some(on_run) = &on_action {
+            <ActionsButton actions={d.actions.clone()} on_run={on_run.clone()} testid="cluster-actions" />
+        }
         if admin {
             if c.status == HostStatus::Paused {
                 <Button onclick={open(Ask::Resume)}>{ "Resume" }</Button>
@@ -287,8 +312,8 @@ pub fn cluster_page(props: &Props) -> Html {
                 <NotesEditor id={c.id.clone()} notes={c.notes.clone()} admin={admin} on_saved={detail.reload.clone()} />
                 <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
             </div>
-            <WorkloadsPanel detail={d.clone()} />
-            { health_panel(&d.health_checks, now, true) }
+            <WorkloadsPanel detail={d.clone()} on_action={on_action.clone()} />
+            { health_panel(&d.health_checks, now, true, &d.actions, on_action.as_ref()) }
             <RunsPanel host={c.id.clone()} cluster=true latest={d.latest_run.clone()} newest={newest.clone()}
                 picked={(*picked).clone()} on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             <Panel title="Recent runs">{ runs(&d, now, (*picked).clone().or(newest.clone()), &{
@@ -307,6 +332,7 @@ pub fn cluster_page(props: &Props) -> Html {
                 </RouteLink>
             </p>
             { dialog.unwrap_or_default() }
+            { target_actions.dialog }
         </div>
     }
 }
@@ -314,6 +340,8 @@ pub fn cluster_page(props: &Props) -> Html {
 #[derive(Properties, PartialEq)]
 struct WorkloadsProps {
     detail: HostDetail,
+    /// Set where the operator may run the workloads' actions.
+    on_action: Option<Callback<ActionInfo>>,
 }
 
 /// What Buckle manages on the cluster, workload by workload: how each
@@ -373,7 +401,10 @@ fn workloads_panel(props: &WorkloadsProps) -> Html {
                                 })
                             };
                             html! { <>
-                                { workload_row(r, is_open, toggle, now) }
+                                { workload_row(r, is_open, toggle, now, props.on_action.as_ref().map(|on_run| html! {
+                                    <ActionsButton actions={of_module(&d.actions, &r.name)} on_run={on_run.clone()}
+                                        testid={format!("actions-{}", r.name)} />
+                                })) }
                                 if is_open {
                                     <tr class="table__detail" key={format!("{}-detail", r.name)}>
                                         <td colspan="6">
@@ -413,6 +444,7 @@ fn workload_row(
     open: bool,
     toggle: Callback<MouseEvent>,
     now: chrono::DateTime<chrono::Utc>,
+    actions: Option<Html>,
 ) -> Html {
     html! {
         <tr key={r.name.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))}
@@ -458,6 +490,7 @@ fn workload_row(
                 } }
             </td>
             <td class="row-controls">
+                { actions.unwrap_or_default() }
                 <button type="button" class="icon-btn row-toggle" onclick={toggle}
                     aria-expanded={open.to_string()} aria-label={format!("Resources of {}", r.name)}
                     title={if open { "Hide resources" } else { "Show resources" }}>

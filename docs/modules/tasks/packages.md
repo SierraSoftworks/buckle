@@ -86,3 +86,23 @@ Refresh the package index when it is older than `max_age`.
 <KindReference registry="tasks" kind="apt.update" />
 
 Put it first in a baseline module; `apt.repository` already updates after adding a repository.
+
+## apt.upgrade
+
+Upgrade every upgradable package. Meant for [`actions:`](../README.md#actions), where an operator
+runs it on demand or across the fleet; as a task it would upgrade on every apply.
+
+```yaml
+actions:
+  upgrade:
+    apt.upgrade: { autoremove: true }
+    notify: [reboot-if-required]
+handlers:
+  reboot-if-required: { system.reboot: { only_if: "test -f /run/reboot-required" } }
+```
+
+<KindReference registry="tasks" kind="apt.upgrade" />
+
+The plan lists what `apt-get -s dist-upgrade` would upgrade, install and remove from the index as
+it is. With `update_cache` (the default) the plan is always a change and applying runs
+`apt-get update` first; without it, nothing upgradable plans as no change. Held packages stay put.

@@ -11,6 +11,7 @@
 //! * [`grpc`] — the agent-facing `Fleet` service (token and Tailscale auth).
 //! * [`web`] — the operator API, SSE, OIDC sign-in and the embedded UI.
 
+pub mod actions;
 pub mod clock;
 pub mod config;
 pub mod events;

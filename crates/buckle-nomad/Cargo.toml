@@ -15,6 +15,7 @@ testing = []
 [dependencies]
 buckle-core.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
 hcl-rs.workspace = true
 human-errors.workspace = true

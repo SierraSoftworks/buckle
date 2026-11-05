@@ -810,3 +810,107 @@ fn assignments_keep_a_few_revisions_per_target() {
     assert!(held.get(TARGET, &last).is_some());
     assert_eq!(held.revisions().count(), Assignments::KEEP);
 }
+
+// ------------------------------------------------------------ actions
+
+async fn run_action(ex: &Executor, a: &Assignment, workload: &str, action: &str) -> ApplyOutcome {
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let outcome = ex.run_action(a, workload, action, tx).await;
+    drain.await.unwrap();
+    outcome
+}
+
+fn with_backfill() -> Vec<(String, String)> {
+    let mut files = workload_files(
+        "paste",
+        "vars: { task: backfill }\nactions:\n  backfill: { dispatch: { job: paste, meta: { task: '{{ vars.task }}' }, payload: hello }, confirm: true }\n",
+    );
+    files[0].1 = files[0]
+        .1
+        .replace("name: paste\n", "name: paste\nnamespace: apps\n");
+    files
+}
+
+#[rstest]
+#[case::restart("restart", "POST", "/v1/client/allocation/alloc-1/restart")]
+#[case::stop("stop", "DELETE", "/v1/job/paste")]
+#[case::dispatch("backfill", "POST", "/v1/job/paste/dispatch")]
+#[tokio::test]
+async fn workload_actions_run_on_the_workloads_jobs(
+    #[case] action: &str,
+    #[case] method: &str,
+    #[case] path: &str,
+) {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = assignment(
+        revision("r1", &with_backfill()),
+        ClusterIdentity::BuckleJwt,
+        7,
+    );
+    assert!(apply(&ex, &a).await.succeeded);
+
+    let outcome = run_action(&ex, &a, "paste", action).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    assert_eq!(outcome.changes, 1);
+    assert!(
+        fake.requests()
+            .iter()
+            .any(|(m, p)| m == method && p.starts_with(path)),
+        "{:?}",
+        fake.requests()
+    );
+}
+
+#[rstest]
+#[case::unknown_workload("nope", "restart", "not selected")]
+#[case::unknown_action("paste", "vacuum", "declares no action")]
+#[tokio::test]
+async fn workload_actions_that_cannot_run_fail_without_touching_the_cluster(
+    #[case] workload: &str,
+    #[case] action: &str,
+    #[case] error: &str,
+) {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = assignment(
+        revision("r1", &with_backfill()),
+        ClusterIdentity::BuckleJwt,
+        7,
+    );
+    assert!(apply(&ex, &a).await.succeeded);
+    let before = fake.requests().len();
+
+    let outcome = run_action(&ex, &a, workload, action).await;
+    assert!(!outcome.succeeded);
+    assert!(
+        outcome.error.as_deref().unwrap_or_default().contains(error),
+        "{:?}",
+        outcome.error
+    );
+    assert!(
+        fake.requests()[before..].iter().all(|(m, _)| m == "GET"),
+        "{:?}",
+        &fake.requests()[before..]
+    );
+}
+
+#[tokio::test]
+async fn an_implicit_action_needs_a_registered_job() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = assignment(
+        revision("r1", &with_backfill()),
+        ClusterIdentity::BuckleJwt,
+        7,
+    );
+    let outcome = run_action(&ex, &a, "paste", "restart").await;
+    assert!(!outcome.succeeded);
+    assert!(
+        outcome
+            .error
+            .unwrap_or_default()
+            .contains("no job registered")
+    );
+}

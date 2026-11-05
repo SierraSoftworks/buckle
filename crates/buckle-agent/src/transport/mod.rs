@@ -279,6 +279,22 @@ pub enum Instruction {
         /// For a cluster target: the revision to check (its applied one).
         revision: Option<RevisionId>,
     },
+    /// Run an action of a module (or, for a cluster target, a workload)
+    /// declared in `revision`, now.
+    RunAction {
+        /// The server's id for the run; events and the result carry it.
+        action_id: String,
+        /// The module (or workload) declaring the action.
+        module: String,
+        /// The action's name.
+        action: String,
+        /// The revision to run it from (the target's applied one).
+        revision: RevisionId,
+        /// W3C trace context of the requesting span.
+        traceparent: Option<String>,
+        /// The cluster target to run it on; `None` for the host itself.
+        target: Option<String>,
+    },
     /// Keepalive from the server; nothing to do.
     Ping,
     /// Install this agent version when idle, then restart.
@@ -313,7 +329,8 @@ impl Instruction {
             | Instruction::RequestPlan { target, .. }
             | Instruction::Apply { target, .. }
             | Instruction::Rollback { target, .. }
-            | Instruction::RunHealth { target, .. } => target.as_deref(),
+            | Instruction::RunHealth { target, .. }
+            | Instruction::RunAction { target, .. } => target.as_deref(),
             _ => None,
         }
     }
@@ -417,6 +434,8 @@ pub enum Report {
         at: chrono::DateTime<chrono::Utc>,
         /// The event.
         event: buckle_core::engine::ApplyEvent,
+        /// The RunAction the event belongs to, when it is not an apply.
+        action_id: Option<String>,
     },
     /// The result of an apply (durable: kept until acknowledged).
     ApplyResult {
@@ -429,6 +448,8 @@ pub enum Report {
         /// The revision applied on the host after the run.
         applied_revision: Option<RevisionId>,
     },
+    /// How a RunAction went (durable: kept until acknowledged).
+    ActionResult(ActionRun),
     /// Health check results.
     Health {
         /// The RunHealth request this answers, if any.
@@ -490,6 +511,7 @@ impl Report {
         match self {
             Report::ApplyResult { report_id, .. } => Some(*report_id),
             Report::LocalRollback(record) => Some(record.report_id),
+            Report::ActionResult(run) => Some(run.report_id),
             Report::For { report, .. } => report.report_id(),
             _ => None,
         }
@@ -503,6 +525,46 @@ impl Report {
                 report: Box::new(self),
             },
             None => self,
+        }
+    }
+}
+
+/// A finished RunAction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRun {
+    /// The durable report id.
+    pub report_id: u64,
+    /// The RunAction's id.
+    pub action_id: String,
+    /// The module (or workload) declaring the action.
+    pub module: String,
+    /// The action's name.
+    pub action: String,
+    /// The revision it ran from.
+    pub revision: RevisionId,
+    /// The run: its step, handlers and health checks. A failure before the
+    /// action started is an outcome with `error` set and no module results.
+    pub outcome: buckle_core::engine::ApplyOutcome,
+}
+
+impl ActionRun {
+    /// What the action did, one line.
+    pub fn summary(&self) -> String {
+        let o = &self.outcome;
+        if let Some(error) = &o.error {
+            return error.clone();
+        }
+        // The action's own step: what applying it reported, else its plan.
+        let step = o
+            .module_results
+            .iter()
+            .flat_map(|m| m.steps.first())
+            .next()
+            .map(|s| s.result.clone().unwrap_or_else(|| s.summary.clone()));
+        match step {
+            Some(text) if !text.is_empty() => text,
+            _ if o.changes == 0 => "nothing to do".into(),
+            _ => format!("{} change(s)", o.changes),
         }
     }
 }
@@ -527,6 +589,16 @@ pub enum DurableReport {
     },
     /// A local or module rollback.
     LocalRollback(LocalRollbackRecord),
+    /// A RunAction's result.
+    ActionResult {
+        /// The run (its outcome kept as typed JSON).
+        run: serde_json::Value,
+        /// The durable report id (also in `run`, kept here for acks).
+        report_id: u64,
+        /// The cluster target the action ran on; `None` for the host itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
 }
 
 impl DurableReport {
@@ -535,6 +607,7 @@ impl DurableReport {
         match self {
             DurableReport::ApplyResult { report_id, .. } => *report_id,
             DurableReport::LocalRollback(record) => record.report_id,
+            DurableReport::ActionResult { report_id, .. } => *report_id,
         }
     }
 
@@ -567,6 +640,11 @@ impl DurableReport {
                 target: None,
             }),
             Report::LocalRollback(record) => Some(DurableReport::LocalRollback(record.clone())),
+            Report::ActionResult(run) => Some(DurableReport::ActionResult {
+                run: serde_json::to_value(run).unwrap_or_default(),
+                report_id: run.report_id,
+                target: None,
+            }),
             Report::For { target, report } => match Self::from_report(report)? {
                 DurableReport::ApplyResult {
                     report_id,
@@ -581,6 +659,13 @@ impl DurableReport {
                     applied_revision,
                     target: Some(target.clone()),
                 }),
+                DurableReport::ActionResult { run, report_id, .. } => {
+                    Some(DurableReport::ActionResult {
+                        run,
+                        report_id,
+                        target: Some(target.clone()),
+                    })
+                }
                 other => Some(other),
             },
             _ => None,
@@ -612,6 +697,17 @@ impl DurableReport {
                 }
             },
             DurableReport::LocalRollback(record) => Some(Report::LocalRollback(record.clone())),
+            DurableReport::ActionResult {
+                run,
+                report_id,
+                target,
+            } => match serde_json::from_value::<ActionRun>(run.clone()) {
+                Ok(run) => Some(Report::ActionResult(run).about(target.as_deref())),
+                Err(err) => {
+                    tracing::warn!(report = report_id, error = %err, "dropping a stored action result that no longer parses");
+                    None
+                }
+            },
         }
     }
 }

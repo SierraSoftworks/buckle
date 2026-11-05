@@ -230,6 +230,7 @@ fn report(
         removals,
         error: None,
         trace_url: Some(trace_url(&trace)),
+        action: None,
         trace_id: Some(trace),
     };
     r.recount();
@@ -1194,6 +1195,7 @@ pub fn summary_of(r: &RunReport, outcome: &str, error: Option<&str>) -> RunSumma
         error: error.map(Into::into),
         trace_id: r.trace_id.clone(),
         trace_url: r.trace_url.clone(),
+        action: r.action.clone(),
     }
 }
 
@@ -1218,6 +1220,7 @@ pub fn summaries(host: &HostSummary, now: DateTime<Utc>) -> Vec<RunSummary> {
             error: None,
             trace_id: None,
             trace_url: None,
+            action: None,
         };
         summary_of(&report_for(id, &skeleton, now), outcome, error)
     };
@@ -1293,6 +1296,7 @@ mod tests {
             error: None,
             trace_id: None,
             trace_url: None,
+            action: None,
         }
     }
 

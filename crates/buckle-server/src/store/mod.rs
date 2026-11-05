@@ -282,6 +282,10 @@ CREATE INDEX hosts_kind ON hosts(kind);
     r#"
 ALTER TABLE revisions ADD COLUMN validated_by TEXT;
 "#,
+    // 9: runs of an operator's action (`module/action`); NULL for applies.
+    r#"
+ALTER TABLE runs ADD COLUMN action TEXT;
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.

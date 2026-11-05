@@ -42,6 +42,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/hosts/{id}/runs/{run}", web::get().to(host_run))
             .route("/hosts/{id}/preview", web::post().to(host_preview))
             .route("/hosts/{id}/upgrade", web::post().to(host_upgrade))
+            .route(
+                "/hosts/{id}/actions/{module}/{action}",
+                web::post().to(run_action),
+            )
             .route("/hosts/{id}/{action}", web::post().to(host_action))
             // Targets: hosts and cluster targets behind one set of routes.
             // The host routes above stay as the host-only view.
@@ -52,6 +56,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/targets/{id}", web::delete().to(host_forget))
             .route("/targets/{id}/executor", web::get().to(target_executor))
             .route("/targets/{id}/preview", web::post().to(host_preview))
+            .route(
+                "/targets/{id}/actions/{module}/{action}",
+                web::post().to(run_action),
+            )
             .route("/targets/{id}/{action}", web::post().to(host_action))
             .route("/join", web::get().to(join_options))
             .route("/join", web::post().to(join_create))
@@ -677,6 +685,7 @@ fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
         removals: r.removals,
         error: r.error,
         trace_id: r.trace_id,
+        action: r.action,
     }
 }
 
@@ -747,21 +756,37 @@ async fn stored_report(
 async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
     let id = path.into_inner();
     let summary = summary_or_404(&state, &id).await?;
-    let (facts, row, runs, health, checks, drift, latest) = state
+    let lookup = id.clone();
+    let (facts, row, runs, health, checks, drift, latest, record) = state
         .store
         .call(move |db| {
             Ok((
-                db.hosts().latest_facts(&id)?,
-                db.rollouts().latest_healthy_for_host(&id)?,
+                db.hosts().latest_facts(&lookup)?,
+                db.rollouts().latest_healthy_for_host(&lookup)?,
                 // Newest first, the run in progress included.
-                db.runs().page(&id, None, 20)?.0,
-                db.health().for_host(&id, 100)?,
-                db.health().checks(&id)?,
-                db.drift().for_host(&id)?,
-                db.runs().latest_for_host(&id)?,
+                db.runs().page(&lookup, None, 20)?.0,
+                db.health().for_host(&lookup, 100)?,
+                db.health().checks(&lookup)?,
+                db.drift().for_host(&lookup)?,
+                db.runs().latest_for_host(&lookup)?,
+                db.hosts().target(&lookup)?,
             ))
         })
         .await?;
+    let actions = match (&record, summary.applied_revision.as_deref()) {
+        (Some(record), Some(revision)) => match state.revisions.load(revision).await {
+            Ok(rev) => crate::actions::list(
+                &rev,
+                record,
+                facts
+                    .as_ref()
+                    .map(|(f, _)| f)
+                    .unwrap_or(&serde_json::Value::Null),
+            ),
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
     let latest_run = match latest {
         Some(run) => Some(stored_report(&state, run).await?),
         None => None,
@@ -781,6 +806,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         health_checks: checks,
         latest_run,
         workloads,
+        actions,
     }))
 }
 
@@ -1026,6 +1052,74 @@ async fn host_action(
     )
     .await;
     Ok(HttpResponse::Ok().json(host_changed(&state, &id).await?))
+}
+
+/// Runs an action of a module (a cluster's: a workload) declared in the
+/// target's applied revision, now. The run appears in the target's runs.
+async fn run_action(
+    state: Data,
+    admin: Administrative,
+    path: web::Path<(String, String, String)>,
+    body: Option<web::Json<ActionRequest>>,
+) -> ApiResult {
+    let (id, module, action) = path.into_inner();
+    let note = body.map(|b| b.into_inner().note).unwrap_or_default();
+    let summary = summary_or_404(&state, &id).await?;
+    let revision = summary.applied_revision.clone().ok_or_else(|| {
+        ApiError::conflict(format!(
+            "{id} has no applied revision; its actions come from the revision it runs."
+        ))
+    })?;
+    let lookup = id.clone();
+    let (record, facts) = state
+        .store
+        .call(move |db| {
+            Ok((
+                db.hosts().target(&lookup)?,
+                db.hosts().latest_facts(&lookup)?.map(|(f, _)| f),
+            ))
+        })
+        .await?;
+    let record = record.ok_or_else(|| ApiError::not_found(format!("No target '{id}'.")))?;
+    let rev = state.revisions.load(&revision).await?;
+    let offered = crate::actions::list(
+        &rev,
+        &record,
+        facts.as_ref().unwrap_or(&serde_json::Value::Null),
+    );
+    let info = offered
+        .iter()
+        .find(|a| a.module == module && a.name == action)
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "{id} offers no action '{action}' of '{module}' at revision {revision}."
+            ))
+        })?;
+    if info.confirm && note.trim().is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "The action '{}' asks for confirmation: send a note for the audit log.",
+            info.label
+        )));
+    }
+    let run_id = state
+        .controller
+        .command(
+            &admin.0.actor(),
+            Command::RunAction {
+                target: id.clone(),
+                module,
+                action,
+                revision,
+                note,
+            },
+        )
+        .await?;
+    if let Ok(summary) = summary_or_404(&state, &id).await {
+        state
+            .events
+            .publish(LiveEvent::HostChanged { host: summary });
+    }
+    Ok(HttpResponse::Accepted().json(buckle_api::ActionStarted { run_id }))
 }
 
 /// Asks the host's agent to install a release once idle and restart into it.

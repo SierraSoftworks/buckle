@@ -15,7 +15,13 @@ notes, labels, health checks, drift and its latest run. Its actions are at the t
 | **Approve registration…** | Admits a pending host ([Bootstrapping](./bootstrapping.md#_2-approve-the-registration)). |
 | **Pause…** / **Resume** | A paused host stays in the fleet but is excluded from rollouts and drift correction until resumed. |
 | **Upgrade agent…** | Installs another agent release ([Upgrading](./upgrading.md#agents)). |
+| **Actions** | Runs one of the [actions](../modules/README.md#actions) its modules declare (a cluster's: its [workloads'](../modules/workloads.md#actions)); each module's head in Health and Blueprint offers its own. |
 | **Forget…** | Removes the host and its history from the server. |
+
+An action runs at once, or asks for a reason first when it is declared with `confirm: true`. It
+is refused while the host applies in a rollout, while it is paused or offline, and while another
+action runs there. Its run appears under **Recent runs**, marked as an action, and the audit log
+records who ran it and why.
 
 Pause a host before maintenance that Buckle would otherwise undo, such as a manual hotfix you are
 testing, and resume it afterwards.

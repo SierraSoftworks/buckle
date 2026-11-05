@@ -34,6 +34,30 @@ impl Runner for StateWritingRunner {
         self.inner.facts(previous).await
     }
 
+    async fn plan_action(
+        &self,
+        revision: Arc<Revision>,
+        ctx: &RunContext,
+        module: &str,
+        action: &str,
+    ) -> buckle_core::Result<(Plan, Facts)> {
+        self.inner.plan_action(revision, ctx, module, action).await
+    }
+
+    async fn run_action(
+        &self,
+        revision: Arc<Revision>,
+        ctx: &RunContext,
+        module: &str,
+        action: &str,
+        plan: &Plan,
+        events: mpsc::Sender<ApplyEvent>,
+    ) -> buckle_core::Result<ApplyOutcome> {
+        self.inner
+            .run_action(revision, ctx, module, action, plan, events)
+            .await
+    }
+
     async fn plan(
         &self,
         revision: Arc<Revision>,

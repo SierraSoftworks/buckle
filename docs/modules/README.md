@@ -72,6 +72,7 @@ health:
 | `vars` | Default [variables](./fleet.md#vars); every fleet overlay overrides them. |
 | `tasks` | The ordered list of [tasks](./tasks/README.md). |
 | `handlers` | Named tasks run at the end of the module when a task notifies them. |
+| `actions` | Named tasks an operator runs on demand ([below](#actions)). |
 | `health` | [Health checks](./health.md) for this module. |
 | `bake` | How long a rollout bakes a host whose run changed this module, when longer than the phase's `bake` (see [Bake and promote](../operations/rollouts.md#_4-bake-and-promote)). |
 | `facts.provides` | Fact providers to refresh after this module applies (for example `[tailscale]`), so dependants see the new values. |
@@ -125,6 +126,35 @@ handlers:
 
 A [`system.reboot`](./tasks/system.md#system-reboot) handler reboots the host once, after the whole
 run has finished and been reported, and a rollout waits for the host to come back.
+
+## Actions
+
+An action is a task an operator runs on demand from the host page, outside any rollout. It is
+written like a handler, plus two keys of its own:
+
+```yaml
+actions:
+  upgrade:
+    apt.upgrade: { autoremove: true }
+    name: Upgrade packages
+    notify: [reboot-if-required]
+  drain:
+    command.run: { run: [nomad, node, drain, -self, -enable, -yes] }
+    confirm: true
+    description: Move this node's allocations elsewhere
+handlers:
+  reboot-if-required: { system.reboot: { only_if: "test -f /run/reboot-required" } }
+```
+
+* **Running.** The action is planned and run from the host's applied revision, with the
+  handlers it notifies and, when it changed something, the module's health checks. A
+  `system.reboot` it notifies reboots the host as after a rollout's run.
+* **State.** Nothing is recorded: an action owns no resource, so `id`, `removal` and `after`
+  are rejected, and the next rollout never sees it.
+* **Confirmation.** `confirm: true` asks the operator for a reason, kept in the audit log.
+  `name` labels the button; `when` and `retry` work as on a task.
+
+[`apt.upgrade`](./tasks/packages.md#apt-upgrade) is meant for an action.
 
 ## Removal
 

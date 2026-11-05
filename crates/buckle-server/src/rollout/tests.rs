@@ -4498,3 +4498,27 @@ async fn a_cluster_whose_preview_fails_plans_when_its_stage_opens() {
     let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
     assert_eq!(host(&hosts, CLUSTER).state, HostPhase::Healthy);
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_action_is_refused_while_its_target_applies_in_a_rollout() {
+    let mut h = Harness::new().await;
+    h.revision("r1", "  phases:\n    - { name: web, select: 'true' }\n")
+        .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.silent_apply = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait_apply(&id, "a").await;
+    let refused = h
+        .command(Command::RunAction {
+            target: "a".into(),
+            module: "m".into(),
+            action: "restart".into(),
+            revision: "r1".into(),
+            note: String::new(),
+        })
+        .await
+        .expect_err("refused mid-apply");
+    assert_eq!(refused.kind, CommandErrorKind::Conflict);
+    assert!(h.sent(|_, m| matches!(m, SMsg::Action(_))).is_empty());
+}

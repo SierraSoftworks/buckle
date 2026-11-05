@@ -2150,6 +2150,7 @@ fn cluster_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         drift: vec![],
         latest_run,
         workloads,
+        actions: demo_actions(host, !home),
     }
 }
 
@@ -2379,7 +2380,87 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         drift,
         latest_run,
         workloads: vec![],
+        actions: demo_actions(host, pending),
     }
+}
+
+/// What the demo's targets offer: hosts their modules' actions, clusters
+/// each workload's implicit ones.
+fn demo_actions(host: &HostSummary, pending: bool) -> Vec<buckle_api::ActionInfo> {
+    let action =
+        |module: &str, name: &str, label: &str, kind: &str, confirm: bool, description: &str| {
+            buckle_api::ActionInfo {
+                module: module.into(),
+                name: name.into(),
+                label: label.into(),
+                kind: kind.into(),
+                description: Some(description.into()),
+                confirm,
+                implicit: false,
+            }
+        };
+    if pending {
+        return vec![];
+    }
+    if host.kind == buckle_api::TargetKind::Cluster {
+        return ["postgresql", "atuin", "paste"]
+            .into_iter()
+            .flat_map(|w| {
+                [
+                    (
+                        "restart",
+                        "Restart",
+                        false,
+                        "Restart the running allocations of the workload's jobs in place.",
+                    ),
+                    (
+                        "stop",
+                        "Stop",
+                        true,
+                        "Stop the workload's jobs; their volumes and variables stay.",
+                    ),
+                    (
+                        "revert",
+                        "Roll back",
+                        true,
+                        "Re-register each job's newest stable version older than the running one.",
+                    ),
+                ]
+                .map(|(name, label, confirm, description)| {
+                    buckle_api::ActionInfo {
+                        implicit: true,
+                        ..action(w, name, label, name, confirm, description)
+                    }
+                })
+            })
+            .collect();
+    }
+    vec![
+        action(
+            "common",
+            "upgrade",
+            "Upgrade packages",
+            "apt.upgrade",
+            false,
+            "apt-get dist-upgrade, then reboot if required.",
+        ),
+        action(
+            "common",
+            "reboot",
+            "Reboot",
+            "system.reboot",
+            true,
+            "Reboot the host and wait for its agent to come back.",
+        ),
+        action(
+            "nomad",
+            "restart",
+            "Restart Nomad",
+            "systemd.restart",
+            false,
+            "Restart the nomad unit.",
+        ),
+    ]
 }
 
 /// Each check's status per rollout, as the server aggregates it: the demo's

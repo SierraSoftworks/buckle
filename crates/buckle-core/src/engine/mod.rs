@@ -28,6 +28,7 @@ pub mod validate;
 mod tests;
 
 pub use context::{layer_vars_over, merged_labels, render_vars};
+pub use planner::action_step_key;
 pub use targets::{selected_workloads, validate_targets};
 pub use validate::{
     HostSummary, ValidationIssue, ValidationReport, cluster_context, host_context,
@@ -714,6 +715,49 @@ impl Engine {
     ) -> crate::Result<ApplyOutcome> {
         let span = tracing::info_span!("engine.apply", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id, buckle.plan.digest = %plan.digest.short());
         tracing::Instrument::instrument(executor::apply(inputs, plan, events), span).await
+    }
+
+    /// Pure: plans `action` of `module` on this host (a plan whose only
+    /// module is `module`, holding the action's step and the handlers it
+    /// notifies). Fails when the module is not selected here, declares no
+    /// such action, or the action's `when` is false.
+    pub async fn plan_action(
+        inputs: &Inputs,
+        module: &str,
+        action: &str,
+    ) -> crate::Result<(Plan, Facts)> {
+        let span = tracing::info_span!("engine.plan_action", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id, buckle.module = %module, buckle.action = %action);
+        tracing::Instrument::instrument(
+            async {
+                let planner = planner::Planner::from_inputs(inputs, &inputs.revision)?;
+                let facts = planner::collect_facts(inputs, &planner).await;
+                let state = inputs.state.load()?;
+                let (rich, warnings) =
+                    planner::plan_action_with(&planner, &facts, &state, module, action).await?;
+                Ok((planner::action_plan(&planner, &rich, warnings), facts))
+            },
+            span,
+        )
+        .await
+    }
+
+    /// Runs `action` of `module` as planned by [`Engine::plan_action`]
+    /// (refusing a stale plan, as [`Engine::apply`] does): its step, the
+    /// handlers it notifies and, when it changed something, the module's
+    /// health checks. Nothing is recorded in state; nothing is rolled back.
+    pub async fn run_action(
+        inputs: &Inputs,
+        module: &str,
+        action: &str,
+        plan: &Plan,
+        events: tokio::sync::mpsc::Sender<ApplyEvent>,
+    ) -> crate::Result<ApplyOutcome> {
+        let span = tracing::info_span!("engine.run_action", buckle.host = %inputs.host.id, buckle.revision = %inputs.revision.id, buckle.module = %module, buckle.action = %action, buckle.plan.digest = %plan.digest.short());
+        tracing::Instrument::instrument(
+            executor::apply_action(inputs, module, action, plan, events),
+            span,
+        )
+        .await
     }
 
     /// Runs the health checks of the given modules (or all modules selected on
