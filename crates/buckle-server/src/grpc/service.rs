@@ -236,7 +236,7 @@ impl FleetService {
         {
             match whois.whois(&peer).await {
                 Ok(Some(identity)) => {
-                    if !hello.host_id.is_empty() && hello.host_id != identity.node {
+                    if !hello.host_id.is_empty() && !identity.is_named(&hello.host_id) {
                         return Err((
                             format!(
                                 "This agent claims to be '{}', but the tailnet says it is '{}'.",

@@ -52,6 +52,7 @@ impl Whois for FakeWhois {
     async fn whois(&self, _peer: &SocketAddr) -> buckle_core::Result<Option<WhoisIdentity>> {
         Ok(Some(WhoisIdentity {
             node: "tail-1".into(),
+            dns_name: Some("tail-1.tail1234.ts.net".into()),
             user: self.user.clone(),
             tags: self.tags.clone(),
         }))
@@ -591,15 +592,18 @@ async fn a_failed_whois_is_retried_not_refused(#[case] auth: Vec<AgentAuth>) {
     );
 }
 
+#[rstest::rstest]
+#[case::short_name("tail-1")]
+#[case::magic_dns("tail-1.tail1234.ts.net")]
 #[tokio::test]
-async fn whois_authenticates_by_node_name() {
+async fn whois_authenticates_by_node_name(#[case] claimed: &str) {
     let s = server(
         Registration::Auto,
         Some(FakeWhois::tagged("tag:buckle")),
         vec![AgentAuth::Tailscale, AgentAuth::Token],
     )
     .await;
-    let (_tx, _stream, reply) = open(s.addr, hello("tail-1", "", "2.0.0")).await;
+    let (_tx, _stream, reply) = open(s.addr, hello(claimed, "", "2.0.0")).await;
     assert_eq!(expect_welcome(reply).status, "active");
     let host = s
         .store
@@ -1666,6 +1670,7 @@ impl Whois for ProxiedWhois {
         };
         Ok(Some(WhoisIdentity {
             node: node.into(),
+            dns_name: None,
             user: None,
             tags: vec![tag.into()],
         }))
