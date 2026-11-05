@@ -244,6 +244,24 @@ describe("approving a phase", () => {
     await close();
   });
 
+  test("clicking the name to type copies it, but it still has to be pasted", async () => {
+    const { page, context, close } = await open("/rollouts/42");
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await decide(page, "Abort…");
+    const dialog = page.getByRole("dialog", { name: "Abort rollout #42" });
+    const confirm = dialog.getByRole("button", { name: "Abort rollout" });
+    const box = dialog.getByRole("textbox", { name: /Type/ });
+    await dialog.getByRole("button", { name: "#42" }).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "#42");
+    assert.ok(await box.evaluate((el) => el === document.activeElement), "focus moves to the box");
+    assert.ok(await confirm.isDisabled(), "copying alone does not confirm");
+    await page.keyboard.press("ControlOrMeta+V");
+    assert.equal(await box.inputValue(), "#42");
+    assert.ok(await confirm.isEnabled());
+    await page.keyboard.press("Escape");
+    await close();
+  });
+
   test("rejecting a rollout held at a gate needs a reason and ends it", async () => {
     const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
     await page.locator(".page-head .pill", { hasText: "awaiting approval" }).waitFor();

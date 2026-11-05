@@ -1110,6 +1110,34 @@ textarea.input {
   &__error {
     color: var(--danger);
   }
+
+  // The name to type, as a chip that copies itself on a click.
+  &__word {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin: 0 0.1rem;
+    padding: 0.05rem 0.35rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+    color: var(--fg);
+    cursor: copy;
+
+    &:hover {
+      border-color: var(--brand);
+    }
+
+    &-icon {
+      display: inline-flex;
+      color: var(--fg-2);
+
+      svg {
+        width: 12px;
+        height: 12px;
+      }
+    }
+  }
 }
 
 .toasts {
