@@ -172,7 +172,10 @@ pub fn revision_controls(props: &RevisionControlsProps) -> Html {
     match stance(rev, props.rollout.as_ref(), props.stable_at) {
         None => html! {},
         Some(Stance::Corrupt) => html! {
-            <span class="marker tone-danger" title="Rejected by validation: this revision cannot be deployed">{ "Corrupt" }</span>
+            <>
+                if admin { <Revalidate revision={rev.clone()} /> }
+                <span class="marker tone-danger" title="Rejected by validation: this revision cannot be deployed">{ "Corrupt" }</span>
+            </>
         },
         Some(Stance::Stable) => html! {
             <span class="marker tone-ok" title="The release the fleet is on">{ "Stable" }</span>
@@ -195,6 +198,47 @@ pub fn revision_controls(props: &RevisionControlsProps) -> Html {
             <Button small=true onclick={ask(RevisionAsk::Start(rev.clone()))}>{ "Start rollout…" }</Button>
         },
         Some(_) => html! {},
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct RevalidateProps {
+    revision: RevisionSummary,
+}
+
+/// Validates a rejected revision again: a server upgrade may accept what an
+/// older one refused. The card updates from the live event.
+#[function_component(Revalidate)]
+fn revalidate(props: &RevalidateProps) -> Html {
+    let toast = use_toast();
+    let busy = use_state(|| false);
+    let onclick = {
+        let (busy, toast, rev) = (busy.clone(), toast.clone(), props.revision.clone());
+        Callback::from(move |_: MouseEvent| {
+            let (busy, toast, rev) = (busy.clone(), toast.clone(), rev.clone());
+            busy.set(true);
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::revalidate(&rev.id).await {
+                    Ok(r) if r.status == RevisionStatus::Valid => {
+                        toast.ok(format!("{} is valid now.", commit(&r.commit)))
+                    }
+                    Ok(r) => toast.error(format!(
+                        "{} is still rejected: {}",
+                        commit(&r.commit),
+                        r.validation_errors
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("")
+                    )),
+                    Err(e) => toast.error(e.to_string()),
+                }
+                busy.set(false);
+            });
+        })
+    };
+    html! {
+        <Button small=true busy={*busy} {onclick}
+            title="Validate this revision again with the server's current rules">{ "Re-validate" }</Button>
     }
 }
 

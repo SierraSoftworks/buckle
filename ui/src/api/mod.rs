@@ -393,6 +393,17 @@ pub async fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary,
     .await
 }
 
+/// Validates a rejected revision again with the server's current rules.
+pub async fn revalidate(revision: &str) -> Result<RevisionSummary, ApiError> {
+    demo!(demo_store::revalidate(revision));
+    write::<(), _>(
+        Method::Post,
+        &format!("/revisions/{}/validate", enc(revision)),
+        None,
+    )
+    .await
+}
+
 // ------------------------------------------------------------------ rollouts
 
 pub async fn rollouts(offset: u64) -> Result<Page<RolloutSummary>, ApiError> {

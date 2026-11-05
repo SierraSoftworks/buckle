@@ -396,6 +396,18 @@ pub fn revisions(offset: u64) -> Result<Page<RevisionSummary>, ApiError> {
     with(|s| Ok(page(&s.revisions, offset, 50)))
 }
 
+/// The demo has no validator: a revision keeps its status.
+pub fn revalidate(revision: &str) -> Result<RevisionSummary, ApiError> {
+    admin()?;
+    with(|s| {
+        s.revisions
+            .iter()
+            .find(|r| r.id == revision)
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound(format!("No revision '{revision}'.")))
+    })
+}
+
 pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiError> {
     admin()?;
     with(|s| {

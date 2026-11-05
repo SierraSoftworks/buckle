@@ -14,7 +14,7 @@ pub mod tarball;
 pub mod validate;
 
 use crate::events::EventBus;
-use crate::store::{RevisionRecord, Store};
+use crate::store::{RevisionRecord, Store, kv::keys};
 use buckle_api::{LiveEvent, RevisionStatus, RevisionSummary};
 use buckle_core::plan::RevisionId;
 use buckle_core::{Digest, Result};
@@ -106,7 +106,7 @@ impl RevisionBuilder {
         let cache = self.cache.clone();
         let id = commit.id.clone();
         let source = source.to_owned();
-        let (record, revision, blobs) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (record, outcome) = blocking("Building a revision", move || {
             let dir = cache.dir(&id);
             if dir != tree {
                 if dir.exists() {
@@ -117,55 +117,104 @@ impl RevisionBuilder {
                 }
                 std::fs::rename(&tree, &dir).map_err(io_error)?;
             }
-            let now = Utc::now();
             let mut record = RevisionRecord {
                 id: id.clone(),
                 commit: id.clone(),
                 author: commit.author.clone(),
                 message: commit.message.clone(),
                 committed_at: commit.time,
-                created_at: now,
+                created_at: Utc::now(),
                 tarball_digest: None,
                 status: RevisionStatus::Rejected,
                 errors: Vec::new(),
                 module_count: 0,
                 source,
+                validated_by: None,
             };
-            match buckle_core::engine::loader::load_dir(&dir, RevisionId::new(id.clone())) {
-                Err(e) => {
-                    record.errors = vec![error_text(&e)];
-                    Ok((record, None, Vec::new()))
+            let outcome = validate_tree(&cache, &mut record)?;
+            Ok((record, outcome))
+        })
+        .await?;
+        self.store_validated(record, outcome, true).await
+    }
+
+    /// Validates a rejected revision's tree again with this server's rules
+    /// (a newer server may accept what an older one refused). The revision
+    /// is announced when it becomes valid and `announce` is set; a valid
+    /// revision is returned unchanged.
+    pub async fn revalidate(&self, id: &str, announce: bool) -> Result<RevisionRecord> {
+        let i = id.to_owned();
+        let Some(mut record) = self.store.call(move |db| db.revisions().get(&i)).await? else {
+            return Err(buckle_core::error::user(
+                format!("No revision '{id}'."),
+                &["Check the revision id."],
+            ));
+        };
+        if record.status == RevisionStatus::Valid {
+            return Ok(record);
+        }
+        let cache = self.cache.clone();
+        let (record, outcome) = blocking("Validating a revision", move || {
+            if !cache.dir(&record.id).join("buckle.yaml").is_file() {
+                return Err(buckle_core::error::user(
+                    format!("The tree of revision '{}' is no longer on disk.", record.id),
+                    &["Push a new commit to build the configuration again."],
+                ));
+            }
+            let outcome = validate_tree(&cache, &mut record)?;
+            Ok((record, outcome))
+        })
+        .await?;
+        self.store_validated(record, outcome, announce).await
+    }
+
+    /// Validates again every rejected revision an older server version
+    /// validated, newest first. Only the branch tip (the last commit the
+    /// Git source processed, else the newest revision) is announced, so an
+    /// upgrade never starts a rollout of a superseded commit.
+    pub async fn revalidate_stale(&self) -> Result<()> {
+        let stale = self
+            .store
+            .call(|db| db.revisions().rejected_unless_validated_by(VALIDATOR))
+            .await?;
+        let tip = self.tip().await?;
+        for rec in stale {
+            let announce = tip.as_deref() == Some(rec.id.as_str());
+            match self.revalidate(&rec.id, announce).await {
+                Ok(r) if r.status == RevisionStatus::Valid => {
+                    tracing::info!(revision = %r.id, "a rejected revision is valid for this server version")
                 }
-                Ok(revision) => {
-                    record.module_count = revision.modules.len() as u32;
-                    let errors = validate::validate(&revision);
-                    if !errors.is_empty() {
-                        record.errors = errors;
-                        return Ok((record, None, Vec::new()));
-                    }
-                    let digest = tarball::create(&dir, &cache.tarball(&id))?;
-                    record.tarball_digest = Some(digest.to_string());
-                    record.status = RevisionStatus::Valid;
-                    let mut blobs = Vec::new();
-                    for rel in tarball::files(&dir)? {
-                        let bytes = std::fs::read(dir.join(&rel)).map_err(io_error)?;
-                        blobs.push((
-                            Digest::of(&bytes).to_string(),
-                            rel.to_string_lossy().replace('\\', "/"),
-                        ));
-                    }
-                    Ok((record, Some(revision), blobs))
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(revision = %rec.id, error = %e, "a rejected revision could not be validated again")
                 }
             }
-        })
-        .await
-        .map_err(|e| {
-            buckle_core::error::wrap_system(
-                e,
-                "Building a revision panicked.",
-                &["Report this issue."],
-            )
-        })??;
+        }
+        Ok(())
+    }
+
+    /// The revision the source points at: the last commit the Git source
+    /// processed, else the newest revision.
+    pub async fn tip(&self) -> Result<Option<String>> {
+        self.store
+            .call(|db| {
+                Ok(match db.kv().get(keys::LAST_COMMIT)? {
+                    Some(last) => Some(last),
+                    None => db.revisions().list(1, 0)?.pop().map(|r| r.id),
+                })
+            })
+            .await
+    }
+
+    /// Stores a validated record (with its blobs), publishes it and, when
+    /// `announce` is set, hands it to the `on_added` callback.
+    async fn store_validated(
+        &self,
+        record: RevisionRecord,
+        outcome: Outcome,
+        announce: bool,
+    ) -> Result<RevisionRecord> {
+        let Outcome { revision, blobs } = outcome;
         if let Some(revision) = revision {
             self.cache.insert(&record.id, Arc::new(revision));
         }
@@ -183,11 +232,74 @@ impl RevisionBuilder {
         self.events.publish(LiveEvent::RevisionAdded {
             revision: summary(&record, false, None),
         });
-        if let Some(f) = &self.on_added {
+        if announce && let Some(f) = &self.on_added {
             f(&record);
         }
         Ok(record)
     }
+}
+
+/// The server version recorded on each revision it validates.
+pub const VALIDATOR: &str = env!("CARGO_PKG_VERSION");
+
+/// What validating a tree produced besides its record.
+struct Outcome {
+    revision: Option<buckle_core::engine::Revision>,
+    blobs: Vec<(String, String)>,
+}
+
+/// Loads and validates the tree of `record` under `cache`, filling in its
+/// status, errors and module count. A valid tree gets its tarball and the
+/// index of its files.
+fn validate_tree(cache: &RevisionCache, record: &mut RevisionRecord) -> Result<Outcome> {
+    let dir = cache.dir(&record.id);
+    record.validated_by = Some(VALIDATOR.to_owned());
+    record.status = RevisionStatus::Rejected;
+    record.tarball_digest = None;
+    record.errors.clear();
+    let none = || Outcome {
+        revision: None,
+        blobs: Vec::new(),
+    };
+    let revision =
+        match buckle_core::engine::loader::load_dir(&dir, RevisionId::new(record.id.clone())) {
+            Err(e) => {
+                record.errors = vec![error_text(&e)];
+                return Ok(none());
+            }
+            Ok(r) => r,
+        };
+    record.module_count = revision.modules.len() as u32;
+    let errors = validate::validate(&revision);
+    if !errors.is_empty() {
+        record.errors = errors;
+        return Ok(none());
+    }
+    let digest = tarball::create(&dir, &cache.tarball(&record.id))?;
+    record.tarball_digest = Some(digest.to_string());
+    record.status = RevisionStatus::Valid;
+    let mut blobs = Vec::new();
+    for rel in tarball::files(&dir)? {
+        let bytes = std::fs::read(dir.join(&rel)).map_err(io_error)?;
+        blobs.push((
+            Digest::of(&bytes).to_string(),
+            rel.to_string_lossy().replace('\\', "/"),
+        ));
+    }
+    Ok(Outcome {
+        revision: Some(revision),
+        blobs,
+    })
+}
+
+/// Runs `f` on the blocking pool; `what` names it if it panics.
+async fn blocking<T: Send + 'static>(
+    what: &'static str,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        buckle_core::error::wrap_system(e, format!("{what} panicked."), &["Report this issue."])
+    })?
 }
 
 /// The UI view of a revision.
@@ -345,5 +457,113 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.errors, rec.errors);
+    }
+
+    /// A valid tree stored as rejected by `validated_by`, `age` seconds old.
+    async fn stored_rejected(
+        store: &Store,
+        cache: &RevisionCache,
+        id: &str,
+        validated_by: Option<&str>,
+        age: i64,
+    ) {
+        let dir = cache.dir(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("buckle.yaml"), "version: 2\n").unwrap();
+        let rec = RevisionRecord {
+            id: id.into(),
+            commit: id.into(),
+            author: "Ada".into(),
+            message: "uses a newer schema".into(),
+            committed_at: Utc::now(),
+            created_at: Utc::now() - chrono::Duration::seconds(age),
+            tarball_digest: None,
+            status: RevisionStatus::Rejected,
+            errors: vec!["unknown field `resources`".into()],
+            module_count: 0,
+            source: "git".into(),
+            validated_by: validated_by.map(str::to_owned),
+        };
+        store
+            .call(move |db| db.revisions().upsert(&rec))
+            .await
+            .unwrap();
+    }
+
+    fn announcing(
+        store: &Store,
+        cache: &Arc<RevisionCache>,
+    ) -> (RevisionBuilder, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let builder = RevisionBuilder::new(store.clone(), cache.clone(), EventBus::default())
+            .on_added(Arc::new(move |r| s.lock().unwrap().push(r.id.clone())));
+        (builder, seen)
+    }
+
+    async fn status(store: &Store, id: &str) -> RevisionStatus {
+        let id = id.to_owned();
+        store
+            .call(move |db| db.revisions().get(&id))
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_validates_stale_rejections_again_and_announces_only_the_tip() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().await.unwrap();
+        let cache = Arc::new(RevisionCache::new(data.path()));
+        stored_rejected(&store, &cache, "old", None, 60).await;
+        stored_rejected(&store, &cache, "tip", Some("0.0.1"), 0).await;
+        stored_rejected(&store, &cache, "current", Some(VALIDATOR), 30).await;
+        let (builder, seen) = announcing(&store, &cache);
+
+        builder.revalidate_stale().await.unwrap();
+
+        assert_eq!(status(&store, "old").await, RevisionStatus::Valid);
+        assert_eq!(status(&store, "tip").await, RevisionStatus::Valid);
+        assert_eq!(
+            status(&store, "current").await,
+            RevisionStatus::Rejected,
+            "a rejection by this version stands"
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["tip".to_owned()]);
+        assert!(cache.tarball("tip").is_file(), "agents can fetch it");
+    }
+
+    #[rstest]
+    #[case::announced(true)]
+    #[case::quiet(false)]
+    #[tokio::test]
+    async fn a_manual_revalidation_rebuilds_a_rejected_revision(#[case] announce: bool) {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().await.unwrap();
+        let cache = Arc::new(RevisionCache::new(data.path()));
+        stored_rejected(&store, &cache, "r1", Some(VALIDATOR), 0).await;
+        let (builder, seen) = announcing(&store, &cache);
+
+        let rec = builder.revalidate("r1", announce).await.unwrap();
+
+        assert_eq!(rec.status, RevisionStatus::Valid);
+        assert!(rec.errors.is_empty());
+        assert_eq!(rec.validated_by.as_deref(), Some(VALIDATOR));
+        assert_eq!(seen.lock().unwrap().len(), announce as usize);
+    }
+
+    #[tokio::test]
+    async fn a_revision_without_its_tree_cannot_be_validated_again() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().await.unwrap();
+        let cache = Arc::new(RevisionCache::new(data.path()));
+        stored_rejected(&store, &cache, "gone", None, 0).await;
+        std::fs::remove_dir_all(cache.dir("gone")).unwrap();
+        let (builder, _) = announcing(&store, &cache);
+
+        assert!(builder.revalidate("gone", true).await.is_err());
+        assert!(builder.revalidate("missing", true).await.is_err());
+        assert_eq!(status(&store, "gone").await, RevisionStatus::Rejected);
     }
 }

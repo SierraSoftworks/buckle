@@ -200,6 +200,7 @@ impl Harness {
             errors: vec![],
             module_count: 0,
             source: "path".into(),
+            validated_by: None,
         };
         self.store
             .call(move |db| db.revisions().upsert(&rec))
