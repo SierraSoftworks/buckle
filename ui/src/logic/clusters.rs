@@ -5,8 +5,8 @@
 //! run updates.
 
 use buckle_api::{
-    ClusterStatus, Deploying, HostCheck, HostDetail, HostRolloutState, ModuleState, RolloutHost,
-    RolloutPhase, RunProgress, RunReport, StepState, TargetKind,
+    ClusterSpec, ClusterStatus, Deploying, HostCheck, HostDetail, HostRolloutState, ModuleState,
+    RolloutHost, RolloutPhase, RunProgress, RunReport, StepState, TargetKind,
 };
 use chrono::{DateTime, Utc};
 
@@ -37,27 +37,12 @@ impl WorkloadState {
     }
 }
 
-/// One object of a workload Buckle applied, with where the cluster's own UI
-/// shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Object {
-    /// `nomad.job`.
-    pub kind: String,
-    /// `default/atuin`.
-    pub key: String,
-    pub url: Option<String>,
-}
-
 /// A row of the cluster page's Workloads panel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkloadRow {
     pub name: String,
     pub description: String,
     pub needs: Vec<String>,
-    /// The kinds the revision declares (`job`, `volume`), in order.
-    pub kinds: Vec<String>,
-    /// Its jobs (or Deployments) as applied, linked into the cluster's UI.
-    pub jobs: Vec<Object>,
     pub state: WorkloadState,
     /// The latest progress of the step being applied, while it deploys.
     pub progress: Option<String>,
@@ -69,9 +54,13 @@ pub struct WorkloadRow {
     pub applied: Option<(DateTime<Utc>, String)>,
 }
 
-/// The kinds of resource that are a workload's running part, linked to.
-fn is_job(kind: &str) -> bool {
-    matches!(kind, "nomad.job")
+/// Where the cluster's own UI shows a resource of `kind` and `key`: its
+/// jobs, when the cluster has a UI Buckle links into.
+pub fn resource_url(spec: Option<&ClusterSpec>, kind: &str, key: &str) -> Option<String> {
+    match kind {
+        "nomad.job" => spec?.job_url(key),
+        _ => None,
+    }
 }
 
 /// One row from what the detail's resources, checks and the run in
@@ -82,19 +71,8 @@ fn row_of(
     name: &str,
     description: &str,
     needs: &[String],
-    kinds: &[String],
 ) -> WorkloadRow {
-    let spec = d.summary.cluster.as_ref().map(|c| &c.spec);
     let own: Vec<_> = d.resources.iter().filter(|r| r.module == name).collect();
-    let jobs = own
-        .iter()
-        .filter(|r| is_job(&r.kind))
-        .map(|r| Object {
-            kind: r.kind.clone(),
-            key: r.key.clone(),
-            url: spec.and_then(|s| s.job_url(&r.key)),
-        })
-        .collect();
     let applied = own
         .iter()
         .max_by_key(|r| r.applied_at)
@@ -142,8 +120,6 @@ fn row_of(
         name: name.to_owned(),
         description: description.to_owned(),
         needs: needs.to_vec(),
-        kinds: kinds.to_vec(),
-        jobs,
         state,
         progress: progress
             .flatten()
@@ -163,7 +139,7 @@ pub fn workload_rows(d: &HostDetail, run: Option<&RunReport>) -> Vec<WorkloadRow
     let mut rows: Vec<WorkloadRow> = d
         .workloads
         .iter()
-        .map(|w| row_of(d, live, &w.name, &w.description, &w.needs, &w.resources))
+        .map(|w| row_of(d, live, &w.name, &w.description, &w.needs))
         .collect();
     let mut leftover: Vec<&str> = d
         .resources
@@ -173,7 +149,7 @@ pub fn workload_rows(d: &HostDetail, run: Option<&RunReport>) -> Vec<WorkloadRow
         .collect();
     leftover.dedup();
     for name in leftover {
-        let mut r = row_of(d, live, name, "", &[], &[]);
+        let mut r = row_of(d, live, name, "", &[]);
         r.description = "no longer selected by the revision".into();
         rows.push(r);
     }
@@ -197,7 +173,7 @@ pub fn module_rows(d: &HostDetail, run: Option<&RunReport>) -> Vec<WorkloadRow> 
     }
     names
         .into_iter()
-        .map(|name| row_of(d, live, name, "", &[], &[]))
+        .map(|name| row_of(d, live, name, "", &[]))
         .collect()
 }
 
@@ -416,14 +392,23 @@ mod tests {
         assert_eq!(atuin.state, WorkloadState::Running);
         assert_eq!(atuin.checks, (1, 1));
         assert_eq!(atuin.applied.as_ref().map(|a| a.0), Some(t(3)));
-        assert_eq!(
-            atuin.jobs[0].url.as_deref(),
-            Some("http://nomad.home:4646/ui/jobs/atuin@apps"),
-            "only jobs are listed, linked into Nomad's UI"
-        );
-        assert_eq!(atuin.jobs.len(), 1);
         assert_eq!(row(&rows, "paste").state, WorkloadState::NotApplied);
         assert!(row(&rows, "retired").description.contains("no longer"));
+    }
+
+    #[test]
+    fn only_jobs_link_into_the_clusters_ui() {
+        let d = detail();
+        let spec = d.summary.cluster.as_ref().map(|c| &c.spec);
+        assert_eq!(
+            resource_url(spec, "nomad.job", "apps/atuin").as_deref(),
+            Some("http://nomad.home:4646/ui/jobs/atuin@apps")
+        );
+        assert_eq!(
+            resource_url(spec, "nomad.variable", "nomad/jobs/atuin"),
+            None
+        );
+        assert_eq!(resource_url(None, "nomad.job", "apps/atuin"), None);
     }
 
     #[test]

@@ -348,12 +348,12 @@ pub fn cluster_page(props: &Props) -> Html {
         <div class="page page--wide" data-testid="cluster-page">
             <PageHead title={c.id.clone()} {subtitle} {actions} />
             <div class="grid grid--host">
-                <Panel title="Summary">{ summary }</Panel>
-                <Panel title="Notes and labels" class="notes-labels">
+                <Panel title="Summary" class="panel--sections">
+                    { summary }
                     <NotesEditor id={c.id.clone()} notes={c.notes.clone()} admin={admin} on_saved={detail.reload.clone()} embedded=true />
-                    <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()}
-                        embedded=true aside={executors} />
                 </Panel>
+                <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()}
+                    aside={executors} />
             </div>
             <ModulesPanel detail={d.clone()} cluster=true on_action={on_action.clone()} newest={newest.clone()} picked={(*picked).clone()}
                 on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />

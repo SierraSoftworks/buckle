@@ -48,8 +48,9 @@ pub(super) struct ModulesProps {
 
 /// What Buckle manages on a target, workload by workload on a cluster and
 /// module by module on a host: how each reads now, what the run shown did
-/// to it, a cluster's jobs linked into its UI. A row opens (rendered only
-/// once opened) to its checks, that run's steps and its resources.
+/// to it and its resources at a glance. A row opens (rendered only once
+/// opened) to its checks, that run's steps and its resources, a cluster's
+/// jobs linked into its UI.
 #[function_component(ModulesPanel)]
 pub(super) fn modules_panel(props: &ModulesProps) -> Html {
     let cluster = props.cluster;
@@ -149,7 +150,7 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
                         <th scope="col">{ if cluster { "Workload" } else { "Module" } }</th>
                         <th scope="col">{ "Health" }</th>
                         <th scope="col">{ if older { "This run" } else { "Latest run" } }</th>
-                        <th scope="col">{ if cluster { "Jobs" } else { "Resources" } }</th>
+                        <th scope="col">{ "Resources" }</th>
                         <th scope="col">{ "Applied" }</th>
                         <th scope="col"><span class="visually-hidden">{ "Details" }</span></th>
                     </tr></thead>
@@ -278,7 +279,7 @@ fn workload_detail(
                 if resources.is_empty() {
                     <p class="muted small">{ "Nothing applied yet." }</p>
                 } else {
-                    { resource_steps(&resources, &drift, run, now) }
+                    { resource_steps(&resources, &drift, run, d.summary.cluster.as_ref().map(|c| &c.spec), now) }
                 }
             </section>
         </div>
@@ -349,24 +350,7 @@ fn workload_row(
                     <span class="cell-sub mono" data-testid="workload-progress">{ p.clone() }</span>
                 }
             </td>
-            if !cluster {
-                <td>{ resources_cell(d, &r.name, run) }</td>
-            } else {
-            <td>
-                { for r.jobs.iter().map(|j| html! {
-                    <span class="workload-job">
-                        <span class="mono">{ j.key.clone() }</span>
-                        if let Some(url) = &j.url {
-                            { " " }
-                            <a href={url.clone()} target="_blank" rel="noopener noreferrer"
-                                aria-label={format!("Open {} in the cluster's UI", j.key)}>{ "Nomad" }{ icons::external() }</a>
-                        }
-                    </span>
-                }) }
-                if r.jobs.is_empty() { <span class="muted">{ "—" }</span> }
-                if !r.kinds.is_empty() { <span class="cell-sub muted">{ r.kinds.join(", ") }</span> }
-            </td>
-            }
+            <td>{ resources_cell(d, &r.name, run) }</td>
             <td class="nowrap">
                 { match &r.applied {
                     Some((at, rev)) => html! { <>
@@ -391,7 +375,7 @@ fn workload_row(
     }
 }
 
-/// A host module's resources at a glance: how many, how many removal
+/// A module or workload's resources at a glance: how many, how many removal
 /// cleans up, and their worst state where it wants a look.
 fn resources_cell(d: &HostDetail, module: &str, run: Option<&RunReport>) -> Html {
     let own: Vec<ResourceSummary> = d

@@ -296,7 +296,7 @@ pub fn host_page(props: &Props) -> Html {
         <div class="page page--wide">
             <PageHead title={h.id.clone()} {subtitle} {actions} />
             <div class="grid grid--host">
-                <Panel title="Summary">
+                <Panel title="Summary" class="panel--sections">
                     { crate::components::ui::facts_list(vec![
                         ("Platform", html! { { format!("{} · {}", h.platform.clone().unwrap_or_default(), h.arch.clone().unwrap_or_default()) } }),
                         ("Agent", agent_version(h.agent_version.as_deref(), h.upgrade.as_ref(), desired.as_deref(), now)),
@@ -308,11 +308,9 @@ pub fn host_page(props: &Props) -> Html {
                         ("Enrolled", html! { <span title={timestamp(h.first_seen)}>{ relative(h.first_seen, now) }</span> }),
                         ("Health read", html! { <span title={h.health_at.map(timestamp)}>{ relative_opt(h.health_at, now) }</span> }),
                     ]) }
-                </Panel>
-                <Panel title="Notes and labels" class="notes-labels">
                     <NotesEditor id={h.id.clone()} notes={h.notes.clone()} admin={admin} on_saved={detail.reload.clone()} embedded=true />
-                    <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} embedded=true />
                 </Panel>
+                <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
             </div>
             <ModulesPanel detail={d.clone()} on_action={module_actions.clone()} newest={newest.clone()} picked={(*picked).clone()}
                 on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
@@ -501,9 +499,6 @@ pub(super) struct LabelsProps {
     pub admin: bool,
     pub rollout_active: bool,
     pub on_saved: Callback<()>,
-    /// Drawn inside another panel, under a subheading, not as its own.
-    #[prop_or_default]
-    pub embedded: bool,
     /// Shown in place of what the labels would make of the target, which
     /// is then previewed only while there are unsaved changes.
     #[prop_or_default]
@@ -728,14 +723,8 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                 </div>
             </div>
     };
-    if props.embedded {
-        return html! { <section class="panel__section" aria-label="Labels">
-            <h3 class="subhead">{ "Labels" }<span class="muted small">{ " · operator labels win over the agent's own" }</span></h3>
-            { labels }
-        </section> };
-    }
     html! {
-        <Panel title="Labels" subtitle="Operator labels win over the agent's own" class="grid__wide">
+        <Panel title="Labels" subtitle="Operator labels win over the agent's own">
             { labels }
         </Panel>
     }
