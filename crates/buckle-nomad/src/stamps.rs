@@ -81,6 +81,11 @@ impl Owner {
     }
 }
 
+/// The longest description Nomad accepts on an ACL policy (and the
+/// other objects stamped in their description).
+pub const MAX_DESCRIPTION: usize = 256;
+const ELLIPSIS: &str = "...";
+
 impl Stamps {
     /// Reads stamps from an object's `Meta` map.
     pub fn from_meta(meta: Option<&Value>) -> Option<Stamps> {
@@ -130,10 +135,19 @@ impl Stamps {
             "[buckle target={} module={} revision={revision} digest={}]",
             self.target, self.module, self.digest
         );
-        if description.is_empty() {
+        // Nomad rejects descriptions over 256 bytes, so the author's text
+        // gives way to the stamps, which ownership depends on.
+        let room = MAX_DESCRIPTION.saturating_sub(suffix.len() + 1);
+        if description.is_empty() || room == 0 {
             suffix
-        } else {
+        } else if description.len() <= room {
             format!("{description} {suffix}")
+        } else {
+            let mut end = room.saturating_sub(ELLIPSIS.len());
+            while !description.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}{ELLIPSIS} {suffix}", description[..end].trim_end())
         }
     }
 
@@ -222,6 +236,17 @@ mod tests {
             (text.to_owned(), Some(stamps("abc", "d1")))
         );
         assert_eq!(Stamps::from_description(text), (text.to_owned(), None));
+    }
+
+    #[rstest::rstest]
+    #[case::ascii("a".repeat(400))]
+    #[case::multibyte("é".repeat(200))]
+    fn long_descriptions_are_cut_to_fit_and_keep_their_stamps(#[case] text: String) {
+        let stamped = stamps("abc", "d1").describe(&text);
+        assert!(stamped.len() <= MAX_DESCRIPTION, "{} bytes", stamped.len());
+        let (kept, s) = Stamps::from_description(&stamped);
+        assert_eq!(s, Some(stamps("abc", "d1")));
+        assert!(kept.ends_with("..."));
     }
 
     #[rstest::rstest]
