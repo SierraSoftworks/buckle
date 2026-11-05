@@ -201,23 +201,32 @@ pub fn phase_label(all: &[String], hosts: &[String], phases: &Phases) -> Option<
 
 /// The hosts a line covers, by phase where there are phases:
 /// `home: pi-2 · cloud: oci-1, oci-2`.
+/// A target name as a reader says it: a placement's `cluster/workload` key
+/// reads `workload on cluster`.
+pub fn unit_label(key: &str) -> String {
+    match buckle_api::split_placement_key(key) {
+        (cluster, Some(workload)) => format!("{workload} on {cluster}"),
+        (host, None) => host.to_owned(),
+    }
+}
+
 pub fn scope_title(hosts: &[String], phases: &Phases) -> String {
     let mut parts: Vec<String> = phases
         .0
         .iter()
         .filter_map(|(n, h)| {
-            let here: Vec<&str> = h
+            let here: Vec<String> = h
                 .iter()
                 .filter(|x| hosts.contains(x))
-                .map(String::as_str)
+                .map(|x| unit_label(x))
                 .collect();
             (!here.is_empty()).then(|| format!("{n}: {}", here.join(", ")))
         })
         .collect();
-    let elsewhere: Vec<&str> = hosts
+    let elsewhere: Vec<String> = hosts
         .iter()
         .filter(|x| !phases.0.iter().any(|(_, h)| h.contains(x)))
-        .map(String::as_str)
+        .map(|x| unit_label(x))
         .collect();
     if !elsewhere.is_empty() {
         parts.push(elsewhere.join(", "));
