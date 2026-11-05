@@ -158,24 +158,49 @@ describe("every page renders in demo mode", () => {
     await close();
   });
 
-  test("a cluster shows its workloads, executor, Nomad links and a deployment's progress", async () => {
+  test("a cluster shows its workloads with their health, the latest run and the agents able to act for it", async () => {
     const { page, close } = await open("/clusters/home-nomad");
     assert.equal(await heading(page), "home-nomad");
-    for (const panel of ["Summary", "Workloads", "Labels", "Notes", "Health", "Recent runs"]) {
+    for (const panel of ["Summary", "Notes and labels", "Workloads", "Recent runs"]) {
       await page.getByRole("heading", { name: panel, exact: true }).waitFor();
     }
+    // Health and the latest run live in the Workloads card, not cards of their own.
+    for (const panel of ["Health", "Latest run", "Labels", "Notes"]) {
+      assert.equal(await page.locator(".panel__title", { hasText: new RegExp(`^${panel}$`) }).count(), 0, panel);
+    }
+    // The agents its executors selector matches, the last one marked.
+    const executors = page.getByTestId("cluster-executors");
+    assert.equal(await executors.locator("li").count(), 4);
+    assert.match(await executors.locator('li[data-host="pi-1"]').textContent(), /last executor/);
+    assert.equal(await page.getByText("Would land in").count(), 0);
+
     const workloads = page.getByTestId("workloads");
     const atuin = workloads.locator('tr[data-workload="atuin"]');
     assert.equal(await atuin.getAttribute("data-state"), "deploying");
     assert.match(await atuin.getByTestId("workload-progress").textContent(), /server 1\/2 healthy/);
+    assert.match(await atuin.getByTestId("workload-run").textContent(), /running/);
     const link = atuin.getByRole("link", { name: "Open default/atuin in the cluster's UI" });
     assert.equal(await link.getAttribute("href"), "https://nomad.home.example:4646/ui/jobs/atuin@default");
-    assert.equal(await workloads.locator('tr[data-workload="postgresql"]').getAttribute("data-state"), "running");
+    const postgresql = workloads.locator('tr[data-workload="postgresql"]');
+    assert.equal(await postgresql.getAttribute("data-state"), "running");
+    assert.match(await postgresql.getByTestId("workload-checks").textContent(), /1 of 1 check passing/);
     assert.match(await workloads.locator('tr[data-workload="grey"]').textContent(), /no longer selected/);
-    // A row opens the workload's resources, mounted only while open.
-    assert.equal(await workloads.locator(".blueprint").count(), 0);
-    await workloads.locator('tr[data-workload="postgresql"]').click();
-    await workloads.locator(".blueprint").waitFor();
+    // The running workload starts open on its checks, the run's steps and its resources;
+    // a closed row's detail is not in the page.
+    const detail = workloads.locator('tr[data-detail-of="atuin"]');
+    await detail.waitFor();
+    assert.equal(await detail.locator(".checks__item").count(), 2);
+    await detail.locator('.run-step[data-step="nomad.job[default/atuin]"]').waitFor();
+    await detail.locator('.run-step[data-resource="nomad.job[default/atuin]"]').waitFor();
+    await atuin.click();
+    await eventually(async () => assert.equal(await detail.count(), 0));
+    assert.equal(await workloads.locator('tr[data-detail-of="postgresql"]').count(), 0);
+    await postgresql.click();
+    await workloads.locator('tr[data-detail-of="postgresql"] .checks__item').first().waitFor();
+    // An older run from the list replaces what the card shows.
+    await page.locator("tr[data-run] button", { hasText: "Report" }).last().click();
+    await page.getByRole("button", { name: "Show the newest" }).waitFor();
+    assert.match(await postgresql.getByTestId("workload-run").textContent(), /unchanged/);
     assert.equal(await page.getByRole("button", { name: "Forget…" }).count(), 0, "declared in buckle.yaml");
     // A host address lands on the cluster's own page, and the reverse.
     await page.goto(page.url().replace("/clusters/home-nomad", "/hosts/home-nomad"));
@@ -188,22 +213,25 @@ describe("every page renders in demo mode", () => {
     assert.equal(await heading(page), "lab-nomad");
     const grafana = page.getByTestId("workloads").locator('tr[data-workload="grafana"]');
     assert.equal(await grafana.getAttribute("data-state"), "not-applied-yet");
+    assert.match(await page.getByTestId("cluster-executors").textContent(), /No active agent matches/);
     // Added through the API, so it can be forgotten; a declared one cannot.
     await page.getByRole("button", { name: "Forget…" }).waitFor();
     await close();
   });
 
-  test("a host shows facts, its blueprint, current health with its history, drift and runs", async () => {
+  test("a host shows facts, its modules with health and blueprint, drift and runs", async () => {
     const { page, close } = await open("/hosts/hz-3");
     assert.equal(await heading(page), "hz-3");
-    for (const panel of ["Summary", "Labels", "Notes", "Health", "Drift", "Blueprint", "Recent runs", "Facts"]) {
+    for (const panel of ["Summary", "Notes and labels", "Modules", "Drift", "Recent runs", "Facts"]) {
       await page.getByRole("heading", { name: panel, exact: true }).waitFor();
     }
-    // The blueprint opens a module with drift and tags each resource for cleanup or not.
-    const swappiness = page.locator(".blueprint .run-step[data-resource='sysctl.param[vm.swappiness]']");
+    // A module with drift starts open, tagging each resource for cleanup or not.
+    const swappiness = page.locator("#modules .run-step[data-resource='sysctl.param[vm.swappiness]']");
     await swappiness.waitFor();
     assert.match(await swappiness.textContent(), /forget only/);
     // Each check reads once, with a mark per recent rollout.
+    const nomad = page.locator('#modules tr[data-module="nomad"]');
+    if ((await page.locator('#modules tr[data-detail-of="nomad"]').count()) === 0) await nomad.click();
     const api = page.locator('.checks__item[data-check="nomad/api"]');
     assert.equal(await api.count(), 1);
     assert.equal(await api.locator(".check-history__epoch").count(), 3);
@@ -324,7 +352,7 @@ describe("empty and not-permitted states", () => {
       assert.equal(await page.getByRole("button", { name }).count(), 0, name);
     }
     await page.goto(page.url().replace("/rollouts/42", "/hosts/pi-1"));
-    await page.getByRole("heading", { name: "Labels" }).waitFor();
+    await page.getByRole("heading", { name: "Notes and labels" }).waitFor();
     assert.equal(await page.getByRole("button", { name: "Forget…" }).count(), 0);
     assert.equal(await page.getByRole("button", { name: "Add label" }).count(), 0);
     await close();

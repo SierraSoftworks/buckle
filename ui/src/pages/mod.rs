@@ -7,6 +7,7 @@ pub mod cluster;
 pub mod clusters;
 pub mod host;
 pub mod hosts;
+mod modules_card;
 pub mod overview;
 pub mod rollout;
 pub mod rollouts;

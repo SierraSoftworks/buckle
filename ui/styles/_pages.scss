@@ -834,3 +834,53 @@
 .cell-sub.text-warn {
   color: var(--warn);
 }
+
+// Cluster page: notes and labels in one card, beside the agents able to
+// run the cluster's operations.
+.notes-labels {
+  .panel__section + .panel__section {
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--line);
+  }
+
+  .panel__section > .subhead:first-child {
+    margin-top: 0;
+  }
+
+  .labels {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+.cluster-executors__list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+
+  li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+}
+
+// Cluster page: an opened workload's health, run and resources.
+.workloads__run {
+  margin-bottom: 0.75rem;
+}
+
+.workload-detail {
+  display: grid;
+  gap: 0.25rem 1.5rem;
+  padding: 0.25rem 0 0.5rem;
+
+  .subhead {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+}

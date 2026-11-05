@@ -4,8 +4,6 @@
 //! cluster in a rollout is waiting for, and keeping the tally current from
 //! run updates.
 
-use std::collections::BTreeMap;
-
 use buckle_api::{
     ClusterStatus, Deploying, HostCheck, HostDetail, HostRolloutState, ModuleState, RolloutHost,
     RolloutPhase, RunProgress, RunReport, StepState, TargetKind,
@@ -76,90 +74,96 @@ fn is_job(kind: &str) -> bool {
     matches!(kind, "nomad.job")
 }
 
+/// One row from what the detail's resources, checks and the run in
+/// progress (`live`) say of module or workload `name`.
+fn row_of(
+    d: &HostDetail,
+    live: Option<&RunReport>,
+    name: &str,
+    description: &str,
+    needs: &[String],
+    kinds: &[String],
+) -> WorkloadRow {
+    let spec = d.summary.cluster.as_ref().map(|c| &c.spec);
+    let own: Vec<_> = d.resources.iter().filter(|r| r.module == name).collect();
+    let jobs = own
+        .iter()
+        .filter(|r| is_job(&r.kind))
+        .map(|r| Object {
+            kind: r.kind.clone(),
+            key: r.key.clone(),
+            url: spec.and_then(|s| s.job_url(&r.key)),
+        })
+        .collect();
+    let applied = own
+        .iter()
+        .max_by_key(|r| r.applied_at)
+        .map(|r| (r.applied_at, r.revision.clone()));
+    let list: Vec<&HostCheck> = d
+        .health_checks
+        .iter()
+        .filter(|c| c.module == name)
+        .collect();
+    let failing = list
+        .iter()
+        .find(|c| c.required && c.status.eq_ignore_ascii_case("fail"));
+    let passing = list
+        .iter()
+        .filter(|c| c.status.eq_ignore_ascii_case("pass"))
+        .count();
+    let progress: Option<Option<String>> = match live {
+        Some(r) => r
+            .modules
+            .iter()
+            .find(|m| m.name == name && m.state == ModuleState::Running)
+            .map(|m| {
+                m.steps
+                    .iter()
+                    .find(|s| s.state == StepState::Running)
+                    .and_then(|s| s.result.clone())
+            }),
+        None => d
+            .summary
+            .cluster_status
+            .as_ref()
+            .and_then(|s| s.deploying.iter().find(|x| x.workload == name))
+            .map(|x| x.progress.clone()),
+    };
+    let state = if failing.is_some() {
+        WorkloadState::Failing
+    } else if progress.is_some() {
+        WorkloadState::Deploying
+    } else if own.is_empty() && list.is_empty() {
+        WorkloadState::NotApplied
+    } else {
+        WorkloadState::Running
+    };
+    WorkloadRow {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        needs: needs.to_vec(),
+        kinds: kinds.to_vec(),
+        jobs,
+        state,
+        progress: progress
+            .flatten()
+            .map(|p| p.trim_start_matches("deploying: ").to_owned()),
+        checks: (passing, list.len()),
+        reason: failing.and_then(|c| c.reason.clone()),
+        applied,
+    }
+}
+
 /// The cluster's workloads, as the revision declares them, each with what
 /// the detail's resources, checks and the run in progress say of it.
 /// Workloads the cluster still runs that the revision no longer selects
 /// follow, so nothing applied goes unlisted.
 pub fn workload_rows(d: &HostDetail, run: Option<&RunReport>) -> Vec<WorkloadRow> {
-    let spec = d.summary.cluster.as_ref().map(|c| &c.spec);
-    let mut checks: BTreeMap<&str, Vec<&HostCheck>> = BTreeMap::new();
-    for c in &d.health_checks {
-        checks.entry(c.module.as_str()).or_default().push(c);
-    }
     let live = run.filter(|r| !run_finished(r.state));
-    let deploying = |name: &str| -> Option<Option<String>> {
-        if let Some(r) = live {
-            let m = r.modules.iter().find(|m| m.name == name)?;
-            if m.state != ModuleState::Running {
-                return None;
-            }
-            let progress = m
-                .steps
-                .iter()
-                .find(|s| s.state == StepState::Running)
-                .and_then(|s| s.result.clone());
-            return Some(progress);
-        }
-        d.summary
-            .cluster_status
-            .as_ref()?
-            .deploying
-            .iter()
-            .find(|x| x.workload == name)
-            .map(|x| x.progress.clone())
-    };
-    let row = |name: &str, description: &str, needs: &[String], kinds: &[String]| {
-        let own: Vec<_> = d.resources.iter().filter(|r| r.module == name).collect();
-        let jobs = own
-            .iter()
-            .filter(|r| is_job(&r.kind))
-            .map(|r| Object {
-                kind: r.kind.clone(),
-                key: r.key.clone(),
-                url: spec.and_then(|s| s.job_url(&r.key)),
-            })
-            .collect();
-        let applied = own
-            .iter()
-            .max_by_key(|r| r.applied_at)
-            .map(|r| (r.applied_at, r.revision.clone()));
-        let list = checks.get(name).cloned().unwrap_or_default();
-        let failing = list
-            .iter()
-            .find(|c| c.required && c.status.eq_ignore_ascii_case("fail"));
-        let passing = list
-            .iter()
-            .filter(|c| c.status.eq_ignore_ascii_case("pass"))
-            .count();
-        let progress = deploying(name);
-        let state = if failing.is_some() {
-            WorkloadState::Failing
-        } else if progress.is_some() {
-            WorkloadState::Deploying
-        } else if own.is_empty() && list.is_empty() {
-            WorkloadState::NotApplied
-        } else {
-            WorkloadState::Running
-        };
-        WorkloadRow {
-            name: name.to_owned(),
-            description: description.to_owned(),
-            needs: needs.to_vec(),
-            kinds: kinds.to_vec(),
-            jobs,
-            state,
-            progress: progress
-                .flatten()
-                .map(|p| p.trim_start_matches("deploying: ").to_owned()),
-            checks: (passing, list.len()),
-            reason: failing.and_then(|c| c.reason.clone()),
-            applied,
-        }
-    };
     let mut rows: Vec<WorkloadRow> = d
         .workloads
         .iter()
-        .map(|w| row(&w.name, &w.description, &w.needs, &w.resources))
+        .map(|w| row_of(d, live, &w.name, &w.description, &w.needs, &w.resources))
         .collect();
     let mut leftover: Vec<&str> = d
         .resources
@@ -169,11 +173,32 @@ pub fn workload_rows(d: &HostDetail, run: Option<&RunReport>) -> Vec<WorkloadRow
         .collect();
     leftover.dedup();
     for name in leftover {
-        let mut r = row(name, "", &[], &[]);
+        let mut r = row_of(d, live, name, "", &[], &[]);
         r.description = "no longer selected by the revision".into();
         rows.push(r);
     }
     rows
+}
+
+/// A host's modules, the same way: those of `run` in plan order, then any
+/// other it has resources or checks of.
+pub fn module_rows(d: &HostDetail, run: Option<&RunReport>) -> Vec<WorkloadRow> {
+    let live = run.filter(|r| !run_finished(r.state));
+    let mut names: Vec<&str> = Vec::new();
+    let planned = run
+        .into_iter()
+        .flat_map(|r| r.modules.iter().map(|m| m.name.as_str()));
+    let applied = d.resources.iter().map(|r| r.module.as_str());
+    let checked = d.health_checks.iter().map(|c| c.module.as_str());
+    for name in planned.chain(applied).chain(checked) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| row_of(d, live, name, "", &[], &[]))
+        .collect()
 }
 
 /// What a cluster row says at a glance: its workload count, then only the
@@ -366,6 +391,7 @@ mod tests {
             drift: vec![],
             latest_run: None,
             actions: vec![],
+            executors: vec![],
             workloads: vec![
                 w("postgresql", &[]),
                 w("atuin", &["postgresql"]),
@@ -432,6 +458,31 @@ mod tests {
         assert_eq!(atuin.state, WorkloadState::Deploying);
         assert_eq!(atuin.progress.as_deref(), Some("server 1/2 healthy"));
         assert_eq!(row(&rows, "paste").state, WorkloadState::NotApplied);
+    }
+
+    #[test]
+    fn a_host_lists_its_run_modules_first_then_what_it_holds_or_checks() {
+        let mut d = detail();
+        d.workloads.clear();
+        let report: RunReport = serde_json::from_value(serde_json::json!({
+            "id": "run-1", "host": "pi-1", "revision": "r2", "plan_digest": "d",
+            "state": "running", "updated_at": t(6),
+            "modules": [
+                {"name": "paste", "state": "running", "steps": []},
+                {"name": "atuin", "state": "unchanged", "steps": []}
+            ],
+            "removals": [], "counts": buckle_api::RunCounts::default()
+        }))
+        .unwrap();
+        let rows = module_rows(&d, Some(&report));
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["paste", "atuin", "postgresql", "retired"]);
+        assert_eq!(row(&rows, "paste").state, WorkloadState::Deploying);
+        assert_eq!(row(&rows, "postgresql").state, WorkloadState::Failing);
+        assert!(
+            rows.iter().all(|r| r.description.is_empty()),
+            "nothing reads as retired"
+        );
     }
 
     fn progress(module: Option<ModuleState>, step: bool, result: Option<&str>) -> RunProgress {

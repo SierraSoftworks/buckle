@@ -125,6 +125,11 @@ pub struct HostDetail {
     /// For a cluster: the workloads its revision selects for it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<crate::WorkloadView>,
+    /// For a cluster: the host agents able to speak for it (run its
+    /// workloads and operations), active hosts its `executors` selector
+    /// matches or its in-cluster executors, sorted. Empty for a host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executors: Vec<String>,
     /// What an operator can run on the target now, from its applied
     /// revision: each selected module's `actions:` (a cluster's: each
     /// selected workload's implicit and extra actions), in module order.
