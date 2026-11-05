@@ -48,6 +48,7 @@ human-errors = { version = "0.2.4", features = ["pretty"] }
 humantime-serde = "1.1.1"
 indexmap = { version = "2.14", features = ["serde"] }
 inventory = "0.3.25"
+ipnet = "2.12.2"
 minijinja = { version = "3.0.5", features = ["json", "builtins", "loop_controls", "multi_template", "macros", "unicase", "serde"] }
 rand = "0.10.3"
 regex = "1.11"

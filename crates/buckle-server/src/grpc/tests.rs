@@ -103,7 +103,10 @@ async fn server_with(
         whois,
         auth,
         guard,
-        trusting(&["tag:buckle"], &[]),
+        AgentsConfig {
+            tailscale: trusting(&["tag:buckle"], &[]),
+            ..Default::default()
+        },
     )
     .await
 }
@@ -113,7 +116,7 @@ async fn server_full(
     whois: Option<Arc<dyn Whois>>,
     auth: Vec<AgentAuth>,
     guard: SessionGuard,
-    tailscale: crate::config::TailscaleConfig,
+    agents: AgentsConfig,
 ) -> Server {
     let guard = Arc::new(guard);
     let data = tempfile::tempdir().unwrap();
@@ -155,8 +158,7 @@ async fn server_full(
             bootstrap_token: Some("boot".into()),
             registration,
             minimum_agent_version: Some("2.0.0".into()),
-            tailscale,
-            ..Default::default()
+            ..agents
         },
         whois,
         events: events.clone(),
@@ -657,7 +659,10 @@ async fn tailnet_nodes_are_trusted_only_by_tag_or_owner(
         Some(whois),
         vec![AgentAuth::Tailscale],
         SessionGuard::default(),
-        trust,
+        AgentsConfig {
+            tailscale: trust,
+            ..Default::default()
+        },
     )
     .await;
     let (_tx, _stream, reply) = open(s.addr, hello("tail-1", "", "2.0.0")).await;
@@ -1639,4 +1644,126 @@ async fn action_events_and_results_land_in_the_action_run_beside_an_open_apply()
     );
     let events = s.store.call(|db| db.runs().events("act-1")).await.unwrap();
     assert_eq!(events.len(), 1);
+}
+
+/// The agent's own tailnet address, as a proxy forwards it.
+const AGENT_ADDR: &str = "100.64.0.7:41234";
+
+/// Knows the agent by its tailnet address and every other peer (the test's
+/// loopback proxy) as the Tailscale Service host.
+struct ProxiedWhois;
+
+#[async_trait]
+impl Whois for ProxiedWhois {
+    fn covers(&self, _peer: &SocketAddr) -> bool {
+        true
+    }
+    async fn whois(&self, peer: &SocketAddr) -> buckle_core::Result<Option<WhoisIdentity>> {
+        let (node, tag) = if peer.to_string() == AGENT_ADDR {
+            ("tail-1", "tag:buckle")
+        } else {
+            ("connector", "tag:nomad-tailscale")
+        };
+        Ok(Some(WhoisIdentity {
+            node: node.into(),
+            user: None,
+            tags: vec![tag.into()],
+        }))
+    }
+}
+
+/// A TCP proxy in front of `upstream` that opens each connection with a
+/// PROXY v2 header naming `AGENT_ADDR`, or with none when `header` is off.
+async fn tcp_proxy(upstream: SocketAddr, header: bool) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                if header {
+                    let bytes = proxy::encode(AGENT_ADDR.parse().unwrap(), upstream);
+                    server.write_all(&bytes).await.unwrap();
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn proxied_server(trusted: &[&str]) -> Server {
+    server_full(
+        Registration::Auto,
+        Some(Arc::new(ProxiedWhois)),
+        vec![AgentAuth::Tailscale],
+        SessionGuard::default(),
+        AgentsConfig {
+            tailscale: trusting(&["tag:buckle"], &[]),
+            trusted_proxies: trusted
+                .iter()
+                .map(|t| t.to_string().try_into().unwrap())
+                .collect(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[rstest::rstest]
+#[case::by_tag(&["tag:nomad-tailscale"])]
+#[case::by_address(&["127.0.0.0/8"])]
+#[tokio::test]
+async fn a_trusted_proxy_forwards_the_agents_identity(#[case] trusted: &[&str]) {
+    let s = proxied_server(trusted).await;
+    let addr = tcp_proxy(s.addr, true).await;
+    let (_tx, _stream, reply) = open(addr, hello("tail-1", "", "2.0.0")).await;
+    assert_eq!(expect_welcome(reply).status, "active");
+    let audits = s
+        .store
+        .call(|db| db.audit().for_subject("tail-1", 10))
+        .await
+        .unwrap();
+    let registered = audits
+        .iter()
+        .find(|a| a.action == "host.registered")
+        .expect("the registration is audited");
+    assert!(
+        registered.message.contains("proxy"),
+        "{}",
+        registered.message
+    );
+}
+
+#[tokio::test]
+async fn a_trusted_proxy_without_a_header_is_its_own_peer() {
+    let s = proxied_server(&["tag:nomad-tailscale"]).await;
+    let addr = tcp_proxy(s.addr, false).await;
+    let (_tx, _stream, reply) = open(addr, hello("tail-1", "", "2.0.0")).await;
+    assert!(expect_rejected(reply).reason.contains("connector"));
+}
+
+#[rstest::rstest]
+#[case::none_trusted(&[])]
+#[case::other_tag(&["tag:elsewhere"])]
+#[tokio::test]
+async fn an_untrusted_peer_cannot_forward_an_address(#[case] trusted: &[&str]) {
+    let s = proxied_server(trusted).await;
+    let addr = tcp_proxy(s.addr, true).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(hello("tail-1", "", "2.0.0")).await.unwrap();
+    let welcomed = match FleetClient::connect(format!("http://{addr}")).await {
+        Ok(mut client) => match client.session(ReceiverStream::new(rx)).await {
+            Ok(r) => matches!(
+                r.into_inner().message().await,
+                Ok(Some(ServerMessage {
+                    msg: Some(server_message::Msg::Welcome(_))
+                }))
+            ),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    assert!(!welcomed, "the header is not read from an untrusted peer");
 }
