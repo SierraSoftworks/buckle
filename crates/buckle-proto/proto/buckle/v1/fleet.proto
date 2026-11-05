@@ -44,6 +44,7 @@ message AgentMessage {
     LocalRollback rollback = 9;
     UpgradeResult upgrade = 10;
     RebootFailed reboot_failed = 11;
+    ActionResult action = 12;
   }
 }
 
@@ -142,6 +143,8 @@ message ApplyEvent {
   // The target this concerns: a cluster target's name, or empty for the
   // host itself.
   string target = 9;
+  // The RunAction this event belongs to; empty for an Apply's events.
+  string action_id = 10;
 }
 
 // A structured error: what went wrong, the causes beneath it (outermost
@@ -200,6 +203,36 @@ message Reboot {
   string boot_id = 3;
   // What asked for it: `module/kind[key]` or `owner:handler`.
   repeated string requested_by = 4;
+}
+
+// How a RunAction went. Durable like ApplyResult: the agent keeps it until
+// the server acknowledges `report_id`, and re-sends it after every Welcome.
+message ActionResult {
+  string action_id = 1;
+  // The module (a host's) or workload (a cluster's) the action belongs to,
+  // and the action's name.
+  string module = 2;
+  string action = 3;
+  // The revision the action was declared in and ran from.
+  string revision = 4;
+  bool succeeded = 5;
+  google.protobuf.Duration duration = 6;
+  // What the action did, one line (scrubbed).
+  string summary = 7;
+  string error = 8;
+  ErrorDetail error_detail = 9;
+  // The action's run as buckle_core::engine::ApplyOutcome JSON: its step,
+  // handlers and health checks, as a run report shows them.
+  bytes outcome_json = 10;
+  uint64 report_id = 11;
+  // The digest of the action's plan.
+  string plan_digest = 12;
+  uint32 changes = 13;
+  // The action asked for a reboot, as ApplyResult.reboot.
+  Reboot reboot = 14;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 15;
 }
 
 // The reboot an ApplyResult announced could not be started: the host stays
@@ -292,7 +325,27 @@ message ServerMessage {
     Rejected rejected = 9;
     Ack ack = 10;
     HostUpdate host_update = 11;
+    RunAction action = 12;
   }
+}
+
+// Runs a module's action on the host (or a workload's on a cluster target,
+// behind a targeted Assign of `revision`), outside any rollout. The agent
+// plans the action and runs it at once, streaming ApplyEvents that carry
+// `action_id`, and answers with a durable ActionResult.
+message RunAction {
+  // Names the run (its id in the target's runs).
+  string action_id = 1;
+  // The module (or workload) declaring the action, and its name.
+  string module = 2;
+  string action = 3;
+  // The revision to run the action from: the target's applied revision.
+  string revision = 4;
+  // W3C trace context of the span requesting the action, when traced.
+  string traceparent = 5;
+  // The target this concerns: a cluster target's name, or empty for the
+  // host itself.
+  string target = 6;
 }
 
 // The host's record changed while it is connected (approved, paused,

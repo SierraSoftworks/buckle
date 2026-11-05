@@ -110,6 +110,28 @@ impl Shared {
                     .instrument(span)
                     .await
             }
+            Instruction::RunAction {
+                action_id,
+                module,
+                action,
+                revision,
+                traceparent,
+                ..
+            } => {
+                let span = tracing::info_span!(
+                    "agent.action",
+                    buckle.host = %self.host_id,
+                    buckle.target = %target,
+                    buckle.revision = %revision.0,
+                    buckle.module = %module,
+                    buckle.action = %action,
+                    buckle.action_id = %action_id,
+                );
+                set_parent_from_traceparent(&span, traceparent.as_deref());
+                self.target_action(target, action_id, module, action, revision)
+                    .instrument(span)
+                    .await
+            }
             other => {
                 tracing::debug!(%target, instruction = ?std::mem::discriminant(&other), "nothing to do for a cluster target");
             }
@@ -287,6 +309,50 @@ impl Shared {
         .await;
     }
 
+    /// Runs an action of a workload on the cluster and reports it (durably).
+    async fn target_action(
+        &self,
+        target: String,
+        action_id: String,
+        module: String,
+        action: String,
+        revision: RevisionId,
+    ) {
+        let started = Instant::now();
+        let outcome = match self.assignment(&target, &revision).await {
+            Err(err) => super::action_failed(&err, started),
+            Ok(a) => {
+                let (tx, rx) = mpsc::channel(256);
+                let forwarder = tokio::spawn(crate::coalesce::forward_for(
+                    rx,
+                    self.sink.clone(),
+                    revision.clone(),
+                    String::new(),
+                    self.options.event_spacing,
+                    Some(target.clone()),
+                    Some(action_id.clone()),
+                ));
+                let outcome = self.executor.run_action(&a, &module, &action, tx).await;
+                let _ = forwarder.await;
+                outcome
+            }
+        };
+        tracing::info!(%target, succeeded = outcome.succeeded, changes = outcome.changes, "cluster action finished");
+        let report_id = self.next_report_id().await;
+        self.send_durable(
+            Report::ActionResult(crate::transport::ActionRun {
+                report_id,
+                action_id,
+                module,
+                action,
+                revision,
+                outcome,
+            })
+            .about(Some(&target)),
+        )
+        .await;
+    }
+
     async fn run_target_apply(
         &self,
         target: &str,
@@ -300,6 +366,7 @@ impl Shared {
             planned.plan.digest.to_string(),
             self.options.event_spacing,
             Some(target.to_owned()),
+            None,
         ));
         let outcome = self.executor.apply(planned, tx).await;
         let _ = forwarder.await;

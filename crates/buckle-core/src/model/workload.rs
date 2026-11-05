@@ -618,6 +618,60 @@ pub struct WorkloadTimeouts {
     pub rollout: Option<std::time::Duration>,
 }
 
+/// The task kinds a workload's `actions:` may use.
+pub const WORKLOAD_ACTION_KINDS: &[&str] = &["dispatch"];
+
+/// An action every workload with a job offers without declaring it. The
+/// names are scheduler-neutral: on Nomad, `restart` restarts the jobs'
+/// allocations, `stop` stops the jobs and `revert` re-registers each job's
+/// last stable version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImplicitAction {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub confirm: bool,
+}
+
+/// The implicit actions, in the order the UI lists them.
+pub const IMPLICIT_ACTIONS: &[ImplicitAction] = &[
+    ImplicitAction {
+        name: "restart",
+        label: "Restart",
+        description: "Restart the running allocations of the workload's jobs in place.",
+        confirm: false,
+    },
+    ImplicitAction {
+        name: "stop",
+        label: "Stop",
+        description: "Stop the workload's jobs; their volumes and variables stay. The next rollout that changes the workload starts them again.",
+        confirm: true,
+    },
+    ImplicitAction {
+        name: "revert",
+        label: "Roll back",
+        description: "Re-register each job's newest stable version older than the running one.",
+        confirm: true,
+    },
+];
+
+/// `dispatch:`, the workload action kind that dispatches a parameterized
+/// job with fixed meta (and payload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchSpec {
+    /// The parameterized job's id.
+    pub job: String,
+    /// The job's namespace; absent: the workload's, else `default`.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub meta: IndexMap<String, String>,
+    /// The dispatch payload, as text.
+    #[serde(default)]
+    pub payload: Option<String>,
+}
+
 /// `workload.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawWorkload")]
@@ -669,6 +723,11 @@ pub struct WorkloadConfig {
     pub restart_on: Vec<String>,
     #[serde(default)]
     pub removal: WorkloadRemoval,
+    /// Extra actions beside the implicit ones (Restart, Stop and Roll back
+    /// on every job), in a host module's shape; their kinds are the
+    /// workload action kinds (`dispatch`).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub actions: IndexMap<String, super::ActionDecl>,
     /// The former per-kind keys the file used (`job`, `volumes`, …), for the
     /// deprecation warning. They are folded into `resources`.
     #[serde(skip)]
@@ -709,6 +768,8 @@ struct RawWorkload {
     restart_on: Vec<String>,
     #[serde(default)]
     removal: WorkloadRemoval,
+    #[serde(default)]
+    actions: IndexMap<String, super::ActionDecl>,
 
     // ---- the first schema's keys
     #[serde(default)]
@@ -830,6 +891,7 @@ impl TryFrom<RawWorkload> for WorkloadConfig {
             timeouts: raw.timeouts,
             restart_on: raw.restart_on,
             removal: raw.removal,
+            actions: raw.actions,
             legacy_keys,
         })
     }
@@ -847,6 +909,16 @@ impl WorkloadConfig {
             .iter()
             .map(|n| Need::parse(n, Layer::Workload))
             .collect()
+    }
+
+    /// The actions the workload offers without declaring them: none for a
+    /// workload without a job.
+    pub fn implicit_actions(&self) -> &'static [ImplicitAction] {
+        if self.jobs().next().is_some() {
+            IMPLICIT_ACTIONS
+        } else {
+            &[]
+        }
     }
 
     /// The job entries, in order.

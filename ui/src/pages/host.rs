@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 
 use buckle_api::{
-    AgentUpgrade, Connection, HostCheck, HostDetail, HostPatch, HostPreview, HostStatus, RunReport,
-    RunSummary, UpgradeState,
+    ActionInfo, AgentUpgrade, Connection, HostCheck, HostDetail, HostPatch, HostPreview,
+    HostStatus, RunReport, RunSummary, UpgradeState,
 };
 use chrono::{DateTime, Utc};
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
@@ -22,10 +22,10 @@ use yew_router::prelude::*;
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::{
-    BlueprintView, Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind,
-    Loading, PageHead, Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink,
+    ActionsButton, BlueprintView, Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState,
+    JsonTree, Kind, Loading, PageHead, Panel, Pill, Refresh, RouteLink, RunReportView, TraceLink,
     changes::{RunChanges, Took},
-    host_state_pills, use_toast,
+    host_state_pills, use_target_actions, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
 use crate::logic::format::{
@@ -80,6 +80,17 @@ pub fn host_page(props: &Props) -> Html {
             || ()
         });
     }
+    // An action that started: follow the newest run, its own.
+    let target_actions = {
+        let (picked, reload) = (picked.clone(), detail.reload.clone());
+        use_target_actions(
+            props.id.clone(),
+            Callback::from(move |_| {
+                picked.set(None);
+                reload.emit(());
+            }),
+        )
+    };
     let store = use_live();
     // A run that started since the detail was fetched is the newest.
     let newest = live.as_ref().and_then(|d| {
@@ -203,6 +214,11 @@ pub fn host_page(props: &Props) -> Html {
         })
     };
 
+    let on_action = target_actions.on_action.clone();
+    // Actions run on an active, online target, and only for admins.
+    let can_act = admin && h.status == HostStatus::Active && h.connection == Connection::Online;
+    let module_actions = can_act.then(|| on_action.clone());
+
     let refresh = html! { <Refresh loading={detail.loading} reload={detail.reload.clone()} /> };
     let actions = if admin {
         html! { <>
@@ -216,6 +232,9 @@ pub fn host_page(props: &Props) -> Html {
             }
             if h.connection == Connection::Online {
                 <Button onclick={open(Ask::Upgrade)}>{ "Upgrade agent…" }</Button>
+            }
+            if can_act {
+                <ActionsButton actions={d.actions.clone()} on_run={on_action.clone()} testid="host-actions" />
             }
             <Button kind={Kind::Danger} onclick={open(Ask::Forget)}>{ "Forget…" }</Button>
         </> }
@@ -290,7 +309,7 @@ pub fn host_page(props: &Props) -> Html {
                 <NotesEditor id={h.id.clone()} notes={h.notes.clone()} admin={admin} on_saved={detail.reload.clone()} />
                 <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
             </div>
-            { health_panel(&d.health_checks, now, false) }
+            { health_panel(&d.health_checks, now, false, &d.actions, module_actions.as_ref()) }
             if !d.drift.is_empty() || h.drifted {
                 <Panel title="Drift" subtitle="What the latest drift check found different from the applied revision">
                     if d.drift.is_empty() {
@@ -311,7 +330,8 @@ pub fn host_page(props: &Props) -> Html {
             <RunsPanel host={h.id.clone()} latest={d.latest_run.clone()} newest={newest.clone()}
                 picked={(*picked).clone()} on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             <Panel title="Blueprint" subtitle="What Buckle manages on this host, module by module: each resource's state and whether removal cleans it up">
-                <BlueprintView resources={d.resources.clone()} drift={d.drift.clone()} run={d.latest_run.clone()} />
+                <BlueprintView resources={d.resources.clone()} drift={d.drift.clone()} run={d.latest_run.clone()}
+                    actions={d.actions.clone()} on_action={module_actions.clone()} />
             </Panel>
             <Panel title="Recent runs">{ runs(&d, now, (*picked).clone().or(newest.clone()), &{
                 let picked = picked.clone();
@@ -336,6 +356,7 @@ pub fn host_page(props: &Props) -> Html {
                 </RouteLink>
             </p>
             { dialog.unwrap_or_default() }
+            { target_actions.dialog }
         </div>
     }
 }
@@ -377,7 +398,13 @@ fn agent_version(
 /// Each check as it reads now, module by module, with how it fared in the
 /// host's recent rollouts: one mark per rollout, oldest to newest, coloured
 /// by its worst reading.
-pub(super) fn health_panel(checks: &[HostCheck], now: DateTime<Utc>, cluster: bool) -> Html {
+pub(super) fn health_panel(
+    checks: &[HostCheck],
+    now: DateTime<Utc>,
+    cluster: bool,
+    actions: &[ActionInfo],
+    on_action: Option<&Callback<ActionInfo>>,
+) -> Html {
     let mut by_module: BTreeMap<&str, Vec<&HostCheck>> = BTreeMap::new();
     for c in checks {
         by_module.entry(c.module.as_str()).or_default().push(c);
@@ -400,6 +427,10 @@ pub(super) fn health_panel(checks: &[HostCheck], now: DateTime<Utc>, cluster: bo
                             <span class="mono">{ module.to_string() }</span>
                             if let Some(w) = worst { <Pill tone={w.tone()} label={w.label()} /> }
                             <span class="muted small">{ count(n, "check", "checks") }</span>
+                            if let Some(on_run) = on_action {
+                                <ActionsButton actions={crate::logic::actions::of_module(actions, module)}
+                                    on_run={on_run.clone()} testid={format!("actions-{module}")} />
+                            }
                         </h3>
                         <ul class="checks">{ for list.into_iter().map(|c| check_row(c, now)) }</ul>
                     </section>
@@ -475,7 +506,11 @@ pub(super) fn runs(
                             data-run={(!r.id.is_empty()).then(|| r.id.clone())}>
                             <td title={timestamp(r.started_at)}>{ relative(r.started_at, now) }</td>
                             <td class="mono" title={r.revision.clone()}>{ commit(&r.revision) }</td>
-                            <td class="mono" title={r.plan_digest.clone()}>{ short(&r.plan_digest) }</td>
+                            if let Some(action) = &r.action {
+                                <td><span class="badge" title="An operator's action">{ format!("action {action}") }</span></td>
+                            } else {
+                                <td class="mono" title={r.plan_digest.clone()}>{ short(&r.plan_digest) }</td>
+                            }
                             <td>
                                 <Pill tone={outcome_tone(&r.outcome)} label={r.outcome.replace('_', " ")} />
                                 if let Some(e) = &r.error { <ErrorBlock raw={e.clone()} tone={outcome_tone(&r.outcome)} compact=true /> }

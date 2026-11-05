@@ -774,6 +774,7 @@ impl FleetService {
             agent_message::Msg::Result(r) => r.target.clone(),
             agent_message::Msg::Health(r) => r.target.clone(),
             agent_message::Msg::Drift(d) => d.target.clone(),
+            agent_message::Msg::Action(a) => a.target.clone(),
             _ => String::new(),
         };
         let subject: &str = if target.is_empty() { host } else { &target };
@@ -786,6 +787,7 @@ impl FleetService {
         let durable_id = match &msg {
             agent_message::Msg::Result(r) if r.report_id != 0 => Some(r.report_id),
             agent_message::Msg::Rollback(lr) if lr.report_id != 0 => Some(lr.report_id),
+            agent_message::Msg::Action(a) if a.report_id != 0 => Some(a.report_id),
             _ => None,
         };
         let stored: buckle_core::Result<bool> = match &msg {
@@ -853,10 +855,20 @@ impl FleetService {
                     });
                 tracing::debug!(buckle.host = %host, key = %key, event = %event, "apply event");
                 let (digest, revision) = (e.plan_digest.clone(), e.revision.clone());
+                let action_id = e.action_id.clone();
                 let run = self
                     .store
                     .transaction(move |db| {
-                        let run = open_run(db, &h, &revision, &digest, now)?;
+                        let run = if action_id.is_empty() {
+                            open_run(db, &h, &revision, &digest, now)?
+                        } else {
+                            match db.runs().get(&h, &action_id)? {
+                                Some(run) => run,
+                                // Not one this server started: nowhere to
+                                // record it.
+                                None => return Ok(None),
+                            }
+                        };
                         db.runs().record_event(
                             &run.id,
                             &key,
@@ -866,16 +878,88 @@ impl FleetService {
                             &event,
                             now,
                         )?;
-                        Ok(run)
+                        Ok(Some(run))
                     })
                     .await;
                 run.map(|run| {
-                    if let Some(event) = &parsed {
+                    if let (Some(run), Some(event)) = (&run, &parsed) {
                         self.events.publish(LiveEvent::RunProgress {
-                            progress: crate::views::progress(&run, event, now),
+                            progress: crate::views::progress(run, event, now),
                         });
                     }
                     true
+                })
+            }
+            agent_message::Msg::Action(a) => {
+                let duration = a
+                    .duration
+                    .as_ref()
+                    .map(|d| {
+                        chrono::Duration::seconds(d.seconds)
+                            + chrono::Duration::nanoseconds(d.nanos as i64)
+                    })
+                    .unwrap_or_default();
+                let outcome: Option<buckle_core::engine::ApplyOutcome> =
+                    serde_json::from_slice(&a.outcome_json).ok();
+                let label = format!("{}/{}", a.module, a.action);
+                let result = RunRecord {
+                    id: a.action_id.clone(),
+                    host: h.clone(),
+                    rollout: None,
+                    revision: a.revision.clone(),
+                    plan_digest: a.plan_digest.clone(),
+                    started_at: now - duration,
+                    finished_at: now,
+                    outcome: if a.succeeded { "succeeded" } else { "failed" }.into(),
+                    changes: a.changes,
+                    removals: 0,
+                    error: (!a.error.is_empty()).then(|| a.error.clone()),
+                    trace_id: None,
+                    outcome_json: (!a.outcome_json.is_empty())
+                        .then(|| String::from_utf8_lossy(&a.outcome_json).into_owned()),
+                    action: Some(label.clone()),
+                };
+                let pending = durable_id.map(|id| {
+                    (
+                        crate::rollout::pending_report_key(host, id),
+                        crate::rollout::encode_pending_report(host, id, &msg),
+                    )
+                });
+                let stored = self
+                    .store
+                    .transaction(move |db| {
+                        if let Some(id) = durable_id
+                            && !db
+                                .reports()
+                                .first_arrival(&agent, id, "action_result", now)?
+                        {
+                            return Ok(None);
+                        }
+                        if let Some((key, value)) = &pending {
+                            db.kv().set(key, value)?;
+                        }
+                        let mut run = result;
+                        match db.runs().get(&run.host, &run.id)? {
+                            Some(open) => {
+                                run.started_at = open.started_at;
+                                run.trace_id = open.trace_id;
+                                db.runs().finish(&run)?;
+                            }
+                            None => {
+                                db.runs().add(&run)?;
+                            }
+                        }
+                        Ok(Some(run))
+                    })
+                    .await;
+                stored.map(|run| match run {
+                    Some(run) => {
+                        self.events.publish(LiveEvent::RunProgress {
+                            progress: crate::views::finished_progress(&run, outcome.as_ref()),
+                        });
+                        true
+                    }
+                    None => false,
                 })
             }
             agent_message::Msg::Result(r) => {
@@ -911,6 +995,7 @@ impl FleetService {
                     trace_id: None,
                     outcome_json: (!r.outcome_json.is_empty())
                         .then(|| String::from_utf8_lossy(&r.outcome_json).into_owned()),
+                    action: None,
                 };
                 let applied = (r.succeeded && !r.applied_revision.is_empty())
                     .then(|| r.applied_revision.clone());
@@ -1110,6 +1195,7 @@ impl FleetService {
             agent_message::Msg::Drift(d) => !d.plan_digest.is_empty(),
             agent_message::Msg::Health(_)
             | agent_message::Msg::Result(_)
+            | agent_message::Msg::Action(_)
             | agent_message::Msg::Rollback(_)
             | agent_message::Msg::Upgrade(_)
             | agent_message::Msg::RebootFailed(_) => true,
@@ -1171,6 +1257,7 @@ fn open_run(
         error: None,
         trace_id: None,
         outcome_json: None,
+        action: None,
     };
     run.id = db.runs().add(&run)?;
     Ok(run)
@@ -1348,14 +1435,21 @@ impl Fleet for FleetService {
                         now,
                     )?;
                     // A run the new session does not say is still running
-                    // (or reporting) will get no more events or result.
-                    db.runs()
-                        .abandon_unless_unreported(&h, &hello2.unreported_apply_revisions, now)
+                    // (or reporting) will get no more events or result; nor
+                    // will an action (the agent re-sends a finished one's
+                    // result, which completes it again).
+                    let mut closed = db.runs().abandon_actions(&h, now)?;
+                    closed.extend(db.runs().abandon_unless_unreported(
+                        &h,
+                        &hello2.unreported_apply_revisions,
+                        now,
+                    )?);
+                    Ok(closed)
                 })
                 .await
                 .map_err(internal)?
         };
-        if let Some(run) = abandoned {
+        for run in abandoned {
             tracing::info!(buckle.host = %host, run = %run.id, "the agent reconnected without the run's apply; the run is closed as abandoned");
             self.events.publish(LiveEvent::RunProgress {
                 progress: crate::views::finished_progress(&run, None),

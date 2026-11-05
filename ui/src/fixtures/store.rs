@@ -299,6 +299,51 @@ pub fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError> {
     })
 }
 
+pub fn run_action(
+    id: &str,
+    module: &str,
+    action: &str,
+    note: &str,
+) -> Result<buckle_api::ActionStarted, ApiError> {
+    admin()?;
+    with(|s| {
+        let detail = s
+            .details
+            .iter()
+            .find(|d| d.summary.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("No target '{id}'.")))?;
+        if detail.summary.connection == Connection::Offline {
+            return Err(ApiError::Conflict(format!("{id} is offline.")));
+        }
+        let info = detail
+            .actions
+            .iter()
+            .find(|a| a.module == module && a.name == action)
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("{id} offers no action '{action}' of '{module}'."))
+            })?
+            .clone();
+        let noun = match detail.summary.kind {
+            buckle_api::TargetKind::Host => "host",
+            buckle_api::TargetKind::Cluster => "target",
+        };
+        let ran = format!("{} ran {module}/{action} on {id}", actor());
+        s.record(
+            &actor(),
+            &format!("{noun}.action.run"),
+            id,
+            if note.is_empty() {
+                ran
+            } else {
+                format!("{ran}: {note}")
+            },
+        );
+        Ok(buckle_api::ActionStarted {
+            run_id: format!("demo-action-{}-{}", info.module, info.name),
+        })
+    })
+}
+
 pub fn upgrade_host(id: &str, version: Option<&str>) -> Result<HostSummary, ApiError> {
     admin()?;
     with(|s| {

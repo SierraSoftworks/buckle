@@ -49,6 +49,7 @@ same time, even in different modules), and what happens on removal.
 | [`apt.repository`](./packages.md#apt-repository) | Add an apt repository and its signing key. |
 | [`apt.package`](./packages.md#apt-package) | Install, pin, upgrade or remove packages. |
 | [`apt.update`](./packages.md#apt-update) | Refresh the package index when it is stale. |
+| [`apt.upgrade`](./packages.md#apt-upgrade) | Upgrade every upgradable package (for actions). |
 
 ## Services
 

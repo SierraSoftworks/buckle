@@ -1125,3 +1125,68 @@ async fn a_plan_fetches_the_secrets_its_selected_modules_need_first() {
     );
     h.stop().await.expect("clean exit");
 }
+
+fn run_action(action: &str) -> pb::server_message::Msg {
+    pb::server_message::Msg::Action(pb::RunAction {
+        action_id: "act-1".into(),
+        module: "m".into(),
+        action: action.into(),
+        revision: "rev1".into(),
+        ..Default::default()
+    })
+}
+
+#[rstest]
+#[case::runs("rotate", true)]
+#[case::refused_by_the_engine("missing", false)]
+#[tokio::test(start_paused = true)]
+async fn run_action_reports_tagged_events_and_a_durable_result(
+    #[case] action: &str,
+    #[case] runs: bool,
+) {
+    let runner = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    runner.with_plans(&rev("rev1"), vec![plan.clone()]);
+    runner.with_events(vec![ApplyEvent::ModuleStarted { module: "m".into() }]);
+    let mut h = Harness::start(Setup {
+        runner: runner.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    assert!(roll_out(&h, &mut session, "rev1", &plan).await.succeeded);
+
+    session.send(run_action(action)).await;
+    let received = session
+        .collect_until(|m| matches!(m, pb::agent_message::Msg::Action(_)))
+        .await;
+    let result = received
+        .iter()
+        .find_map(|(_, m)| match m {
+            pb::agent_message::Msg::Action(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("an action result");
+    assert_eq!(result.action_id, "act-1");
+    assert_eq!(result.succeeded, runs, "{}", result.error);
+    assert_ne!(result.report_id, 0, "the result is durable");
+    let events: Vec<&pb::ApplyEvent> = received
+        .iter()
+        .filter_map(|(_, m)| match m {
+            pb::agent_message::Msg::Apply(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(!events.is_empty(), runs);
+    assert!(events.iter().all(|e| e.action_id == "act-1"));
+    let ran = runner
+        .calls()
+        .iter()
+        .any(|c| matches!(c, Call::Action { action: a, .. } if a == action));
+    assert_eq!(ran, runs);
+    // An action never changes what is applied.
+    let state = Store::new(h.state_dir()).load_agent_state();
+    assert_eq!(state.applied_revision, Some(rev("rev1")));
+    h.stop().await.expect("clean exit");
+}

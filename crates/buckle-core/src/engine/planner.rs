@@ -1301,6 +1301,105 @@ pub(super) async fn collect_facts(inputs: &Inputs, planner: &Planner<'_>) -> Fac
     facts
 }
 
+/// The resource key of an action's step: `action:<name>`, never a key a
+/// task of the module could have (actions own no resource).
+pub fn action_step_key(action: &str) -> String {
+    format!("action:{action}")
+}
+
+/// Plans `action` of `module` against a facts snapshot and state: one
+/// module plan holding the action's step and the handlers it notifies.
+/// The module must be selected on the host.
+pub(super) async fn plan_action_with(
+    planner: &Planner<'_>,
+    facts: &Facts,
+    state: &State,
+    module: &str,
+    action: &str,
+) -> crate::Result<(RichModulePlan, Vec<String>)> {
+    let contexts = planner.contexts(facts);
+    let selection = planner.select(&contexts)?;
+    let host = &planner.host.id;
+    let Some(loaded) = selection
+        .order
+        .iter()
+        .find(|m| m.config.name == module)
+        .copied()
+    else {
+        let why = match selection.indeterminate.iter().find(|i| i.module == module) {
+            Some(i) => format!("its selection is indeterminate: {}", i.reason),
+            None if planner.revision.module(module).is_some() => {
+                "it is not selected on this host".to_owned()
+            }
+            None => "the revision has no such module".to_owned(),
+        };
+        return Err(crate::error::user(
+            format!("The action {module}/{action} cannot run on {host}: {why}."),
+            &["Actions run on the modules a host applies; check the module's `when`."],
+        ));
+    };
+    if let Some(reason) = selection.broken.get(module) {
+        return Err(crate::error::user(
+            format!("The action {module}/{action} cannot be planned on {host}: {reason}."),
+            &["Fix the module's vars, then run the action again."],
+        ));
+    }
+    let Some(decl) = loaded.config.actions.get(action) else {
+        return Err(crate::error::user(
+            format!("The module '{module}' declares no action '{action}'."),
+            &["The actions a module offers are listed under `actions:` in its module.yaml."],
+        ));
+    };
+    let mut task = decl.task.clone();
+    task.id = Some(action_step_key(action));
+    task.after = None;
+    task.removal = Some(RemovalPolicy::Leave);
+    // A module whose only task is the action: its context, files,
+    // handlers and health, nothing it owns.
+    let synthetic = LoadedModule {
+        config: ModuleConfig {
+            needs: Vec::new(),
+            tasks: vec![task],
+            ..loaded.config.clone()
+        },
+        source: loaded.source.clone(),
+        templates: loaded.templates.clone(),
+    };
+    let ctx = planner.module_context(&contexts, &loaded.config)?;
+    let prepared = planner.prepare(&synthetic, ctx, &contexts, false, state)?;
+    let warnings = prepared.warnings.clone();
+    if !prepared.tasks.iter().any(|t| t.selected) {
+        let why = if prepared.tasks.is_empty() {
+            "its `when` is false here".to_owned()
+        } else {
+            warnings.join("; ")
+        };
+        return Err(crate::error::user(
+            format!("The action {module}/{action} is not available on {host}: {why}."),
+            &["Check the action's `when` against the host's facts and labels."],
+        ));
+    }
+    let rich = planner.plan_module(prepared, &contexts).await?;
+    Ok((rich, warnings))
+}
+
+/// The plan an action's module plan makes: that module alone, no removals.
+pub(super) fn action_plan(
+    planner: &Planner<'_>,
+    rich: &RichModulePlan,
+    warnings: Vec<String>,
+) -> Plan {
+    let mut plan = Plan::new(
+        planner.revision.id.clone(),
+        planner.host.id.clone(),
+        vec![rich.plan.clone()],
+        Vec::new(),
+        Vec::new(),
+    );
+    plan.warnings = warnings;
+    plan
+}
+
 /// Plans the whole revision for the host described by `inputs`.
 pub(super) async fn plan(inputs: &Inputs, revision: &Revision) -> crate::Result<(RichPlan, Facts)> {
     plan_mode(inputs, revision, inputs.drift).await

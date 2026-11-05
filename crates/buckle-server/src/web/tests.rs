@@ -492,6 +492,7 @@ async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
                 error: None,
                 trace_id: None,
                 outcome_json: None,
+                action: None,
             };
             let id = db.runs().add(&run)?;
             use buckle_core::engine::ApplyEvent as E;
@@ -1752,6 +1753,7 @@ async fn trace_ids_come_with_links_when_a_template_is_configured() {
         removals: 0,
         error: None,
         trace_id: Some("feed01".into()),
+        action: None,
     };
     e.store
         .call(move |db| {
@@ -2540,6 +2542,7 @@ async fn run_reports_are_served_per_host_and_per_rollout_host() {
         error: None,
         trace_id: None,
         outcome_json: None,
+        action: None,
     };
     let module = plan.modules[0].module.clone();
     let event = serde_json::to_string(&buckle_core::engine::ApplyEvent::ModuleStarted {
@@ -2719,4 +2722,110 @@ async fn admins_can_validate_a_rejected_revision_again() {
             assert_eq!(body.status, buckle_api::RevisionStatus::Valid);
         }
     }
+}
+
+#[actix_web::test]
+async fn admins_run_the_actions_a_host_offers_with_notes_audited() {
+    use buckle_proto::v1::server_message::Msg as SMsg;
+    let e = env(WebConfig {
+        admin_acl: acl("true"),
+        ..Default::default()
+    })
+    .await;
+    revision(&e, "r1", "version: 2\n").await;
+    let module = e.state.revisions.dir("r1").join("modules/web");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("module.yaml"),
+        "name: web\nactions:\n  restart: { systemd.restart: { name: nginx }, name: Restart nginx }\n  drain: { command.run: { run: [\"true\"] }, confirm: true }\n",
+    )
+    .unwrap();
+    for host in ["pi-1", "pi-2"] {
+        add_host(&e.store, host, HostStatus::Active).await;
+        let h = host.to_owned();
+        e.store
+            .call(move |db| db.hosts().set_applied_revision(&h, "r1"))
+            .await
+            .unwrap();
+    }
+    let (_, mut rx) = e.sessions.attach("pi-1");
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    let run = |host: &str, action: &str, note: &str| {
+        test::TestRequest::post()
+            .uri(&format!("/api/v1/hosts/{host}/actions/web/{action}"))
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(buckle_api::ActionRequest { note: note.into() })
+            .to_request()
+    };
+
+    let detail = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/hosts/pi-1")
+            .to_request(),
+    )
+    .await;
+    let detail: buckle_api::HostDetail = test::read_body_json(detail).await;
+    let offered: Vec<(&str, bool)> = detail
+        .actions
+        .iter()
+        .map(|a| (a.label.as_str(), a.confirm))
+        .collect();
+    assert_eq!(offered, vec![("Restart nginx", false), ("drain", true)]);
+
+    for (host, action, note, status) in [
+        ("pi-1", "drain", "", StatusCode::BAD_REQUEST),
+        ("pi-1", "vacuum", "", StatusCode::NOT_FOUND),
+        ("pi-2", "restart", "", StatusCode::CONFLICT),
+    ] {
+        let resp = test::call_service(&app, run(host, action, note)).await;
+        assert_eq!(resp.status(), status, "{host} {action}");
+    }
+    assert!(rx.try_recv().is_err(), "refused requests send nothing");
+
+    let resp = test::call_service(&app, run("pi-1", "drain", "before maintenance")).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let started: buckle_api::ActionStarted = test::read_body_json(resp).await;
+    match rx.recv().await.and_then(|m| m.msg) {
+        Some(SMsg::Action(a)) => {
+            assert_eq!(
+                (
+                    a.action_id.as_str(),
+                    a.module.as_str(),
+                    a.action.as_str(),
+                    a.revision.as_str()
+                ),
+                (started.run_id.as_str(), "web", "drain", "r1")
+            );
+        }
+        other => panic!("expected a RunAction, got {other:?}"),
+    }
+    let resp = test::call_service(&app, run("pi-1", "restart", "")).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "one action at a time");
+
+    let runs = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/hosts/pi-1/runs")
+            .to_request(),
+    )
+    .await;
+    let runs: buckle_api::Page<buckle_api::RunSummary> = test::read_body_json(runs).await;
+    assert_eq!(runs.items[0].id, started.run_id);
+    assert_eq!(runs.items[0].action.as_deref(), Some("web/drain"));
+
+    let audit = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/audit?filter=action%20%3D%3D%20%22host.action.run%22")
+            .to_request(),
+    )
+    .await;
+    let page: buckle_api::Page<buckle_api::AuditEntry> = test::read_body_json(audit).await;
+    let ran: Vec<&buckle_api::AuditEntry> =
+        page.items.iter().filter(|a| a.outcome == "ok").collect();
+    assert_eq!(ran.len(), 1, "refusals are audited as refused");
+    assert!(ran[0].message.contains("before maintenance"));
 }

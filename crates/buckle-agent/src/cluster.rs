@@ -676,6 +676,153 @@ impl Executor {
         }
     }
 
+    /// Runs `action` of the selected workload `workload` on `a`'s cluster:
+    /// an implicit action (`restart`, `stop`, `revert`) on each job the
+    /// workload owns there, or one of its `actions:` (`dispatch`). One step
+    /// per job; the first failure stops the rest. Nothing is planned or
+    /// recorded.
+    pub async fn run_action(
+        &self,
+        a: &Assignment,
+        workload: &str,
+        action: &str,
+        events: mpsc::Sender<ApplyEvent>,
+    ) -> ApplyOutcome {
+        let started = tokio::time::Instant::now();
+        let started_at = Utc::now();
+        let emit = |e: ApplyEvent| {
+            let events = events.clone();
+            async move {
+                let _ = events.send(e).await;
+            }
+        };
+        let resolved = async {
+            let nomad = self.client(a, Purpose::Deploy, None).await?;
+            let steps = action_steps(&nomad, a, workload, action).await?;
+            Ok::<_, buckle_core::Error>((nomad, steps))
+        }
+        .await;
+        let (nomad, steps) = match resolved {
+            Ok(r) => r,
+            Err(e) => return action_failed(&e, started, started_at),
+        };
+        emit(ApplyEvent::ModuleStarted {
+            module: workload.to_owned(),
+        })
+        .await;
+        let mut outcomes = Vec::new();
+        let mut failure: Option<buckle_core::Error> = None;
+        let mut changes = 0;
+        for step in &steps {
+            let resource = resource_key(workload, step.key.kind.task_kind(), &step.key.key());
+            let id = buckle_core::engine::step_id(&resource);
+            let kind = step.key.kind.task_kind().to_owned();
+            let mut outcome = StepOutcome {
+                id: id.clone(),
+                kind: kind.clone(),
+                name: None,
+                summary: step.summary.clone(),
+                state: StepState::NotRun,
+                result: None,
+                started_at: None,
+                finished_at: None,
+                duration_ms: None,
+                error_detail: None,
+            };
+            if failure.is_some() {
+                outcomes.push(outcome);
+                continue;
+            }
+            emit(ApplyEvent::StepStarted {
+                module: workload.to_owned(),
+                task_id: step.key.key(),
+                id: id.clone(),
+                kind: kind.clone(),
+            })
+            .await;
+            outcome.started_at = Some(Utc::now());
+            let clock = tokio::time::Instant::now();
+            let ran = step.run(&nomad).await;
+            outcome.finished_at = Some(Utc::now());
+            outcome.duration_ms = Some(clock.elapsed().as_millis() as u64);
+            match ran {
+                Ok(summary) => {
+                    changes += 1;
+                    emit(ApplyEvent::StepFinished {
+                        module: workload.to_owned(),
+                        task_id: step.key.key(),
+                        id,
+                        kind,
+                        changed: true,
+                        summary: summary.clone(),
+                    })
+                    .await;
+                    outcome.state = StepState::Changed;
+                    outcome.result = Some(summary);
+                }
+                Err(e) => {
+                    let report = ErrorReport::of(&e);
+                    emit(ApplyEvent::StepFailed {
+                        module: workload.to_owned(),
+                        task_id: step.key.key(),
+                        id,
+                        kind,
+                        error: report.one_line(),
+                        error_detail: Some(report.clone()),
+                    })
+                    .await;
+                    outcome.state = StepState::Failed;
+                    outcome.error_detail = Some(report);
+                    failure = Some(e);
+                }
+            }
+            outcomes.push(outcome);
+        }
+        let status = match (&failure, changes) {
+            (Some(_), _) => ModuleStatus::Failed,
+            (None, 0) => ModuleStatus::Unchanged,
+            (None, _) => ModuleStatus::Applied,
+        };
+        emit(ApplyEvent::ModuleFinished {
+            module: workload.to_owned(),
+            status,
+        })
+        .await;
+        let mut result = ModuleOutcome {
+            changes,
+            duration_ms: started.elapsed().as_millis() as u64,
+            steps: outcomes,
+            started_at: Some(started_at),
+            finished_at: Some(Utc::now()),
+            ..ModuleOutcome::new(workload, status)
+        };
+        if let Some(e) = &failure {
+            result = result.with_error(ErrorReport::of(e));
+        }
+        ApplyOutcome {
+            plan_digest: buckle_core::Digest::of(
+                format!("{}/{workload}/{action}", a.target).as_bytes(),
+            ),
+            succeeded: failure.is_none(),
+            changes,
+            removals: 0,
+            duration_ms: started.elapsed().as_millis() as u64,
+            module_results: vec![result],
+            failed_module: failure.is_some().then(|| workload.to_owned()),
+            rolled_back_modules: Vec::new(),
+            not_started: Vec::new(),
+            health: None,
+            error: failure
+                .as_ref()
+                .map(|e| format!("workload '{workload}': {}", e.description())),
+            error_detail: None,
+            removals_run: Vec::new(),
+            started_at: Some(started_at),
+            finished_at: Some(Utc::now()),
+            reboot: None,
+        }
+    }
+
     /// Runs the implicit checks of `a`'s selected workloads (or of
     /// `modules`): each job runs at its current version with its deployment
     /// healthy, and its Nomad service checks pass. A workload's extra
@@ -748,6 +895,168 @@ impl Executor {
             }
         }
         Ok(HealthReport { scope, results })
+    }
+}
+
+/// One job a workload action runs on.
+struct ActionStep {
+    key: ObjectKey,
+    summary: String,
+    run: ActionRun,
+}
+
+enum ActionRun {
+    Job(buckle_nomad::actions::Action),
+    Dispatch {
+        meta: BTreeMap<String, String>,
+        payload: Option<String>,
+    },
+}
+
+impl ActionStep {
+    async fn run(&self, nomad: &Nomad) -> buckle_core::Result<String> {
+        let (ns, id) = (&self.key.namespace, &self.key.name);
+        match &self.run {
+            ActionRun::Job(action) => buckle_nomad::actions::run(nomad, ns, id, action).await,
+            ActionRun::Dispatch { meta, payload } => {
+                buckle_nomad::actions::dispatch(nomad, ns, id, meta, payload.as_deref()).await
+            }
+        }
+    }
+}
+
+/// What `action` of `workload` runs on: each of the workload's jobs in the
+/// cluster for an implicit action, the named job for a `dispatch`.
+async fn action_steps(
+    nomad: &Nomad,
+    a: &Assignment,
+    workload: &str,
+    action: &str,
+) -> buckle_core::Result<Vec<ActionStep>> {
+    use buckle_nomad::actions::Action;
+    let ctx = a.context();
+    let Some(w) = a
+        .workloads(&ctx)
+        .into_iter()
+        .find(|w| w.config.name == workload)
+    else {
+        return Err(buckle_core::error::user(
+            format!(
+                "The workload {workload} is not selected on {} at revision {}.",
+                a.target,
+                a.revision.id.short()
+            ),
+            &["Run actions of the workloads the cluster's page lists."],
+        ));
+    };
+    if let Some(implicit) = w
+        .config
+        .implicit_actions()
+        .iter()
+        .find(|i| i.name == action)
+    {
+        let job = match implicit.name {
+            "restart" => Action::Restart,
+            "stop" => Action::Stop,
+            _ => Action::Revert,
+        };
+        let cx = Context::new(
+            nomad.clone(),
+            &a.target,
+            "",
+            &a.revision.id.0,
+            a.spec.fingerprints.clone(),
+        );
+        let steps: Vec<ActionStep> = buckle_nomad::primitives::orphans(&cx, &[])
+            .await?
+            .into_iter()
+            .filter(|o| o.module == workload && o.key.kind == Kind::Job)
+            .map(|o| ActionStep {
+                summary: format!("{} job {}", implicit.label.to_lowercase(), o.key.key()),
+                key: o.key,
+                run: ActionRun::Job(job.clone()),
+            })
+            .collect();
+        if steps.is_empty() {
+            return Err(buckle_core::error::user(
+                format!(
+                    "The workload {workload} has no job registered on {}.",
+                    a.target
+                ),
+                &["Apply the workload first."],
+            ));
+        }
+        return Ok(steps);
+    }
+    let Some(decl) = w.config.actions.get(action) else {
+        return Err(buckle_core::error::user(
+            format!("The workload {workload} declares no action '{action}'."),
+            &["Run one of the actions the cluster's page lists for it."],
+        ));
+    };
+    let spec: buckle_core::model::DispatchSpec = serde_yaml::from_value(decl.task.spec.clone())
+        .map_err(|e| {
+            buckle_core::error::wrap_user(
+                e,
+                format!("The action {action} of workload {workload} is invalid."),
+                &["Run `buckle validate`."],
+            )
+        })?;
+    let (templater, ctx, _) = workload_templating(&a.revision, w, &ctx)?;
+    let render = |text: &str| {
+        templater.render_plain(text, &ctx).map_err(|e| {
+            buckle_core::error::wrap_user(
+                e,
+                format!("The action {action} of workload {workload} could not be rendered."),
+                &["Secrets reach a Nomad job through `variables`, never its dispatch."],
+            )
+        })
+    };
+    let ns = match &spec.namespace {
+        Some(ns) => render(ns)?,
+        None => w
+            .config
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+    };
+    let job = render(&spec.job)?;
+    let meta = spec
+        .meta
+        .iter()
+        .map(|(k, v)| Ok((k.clone(), render(v)?)))
+        .collect::<buckle_core::Result<BTreeMap<_, _>>>()?;
+    let payload = spec.payload.as_deref().map(render).transpose()?;
+    Ok(vec![ActionStep {
+        summary: format!("dispatch job {ns}/{job}"),
+        key: ObjectKey::new(Kind::Job, ns, job),
+        run: ActionRun::Dispatch { meta, payload },
+    }])
+}
+
+/// The outcome of an action that failed before it started.
+fn action_failed(
+    error: &buckle_core::Error,
+    started: tokio::time::Instant,
+    started_at: chrono::DateTime<Utc>,
+) -> ApplyOutcome {
+    ApplyOutcome {
+        plan_digest: buckle_core::Digest::of(b""),
+        succeeded: false,
+        changes: 0,
+        removals: 0,
+        duration_ms: started.elapsed().as_millis() as u64,
+        module_results: Vec::new(),
+        failed_module: None,
+        rolled_back_modules: Vec::new(),
+        not_started: Vec::new(),
+        health: None,
+        error: Some(error.description()),
+        error_detail: Some(ErrorReport::of(error)),
+        removals_run: Vec::new(),
+        started_at: Some(started_at),
+        finished_at: Some(Utc::now()),
+        reboot: None,
     }
 }
 
@@ -1032,14 +1341,13 @@ fn implicit_namespace(ns: &str) -> EntitySpec {
     )
 }
 
-/// `workload.yaml`'s Nomad keys with its files read, its `.j2` files and
-/// vars rendered and its variable items rendered (with secret values, kept
-/// sensitive).
-async fn compile(
+/// A templater over `w`'s templates and the workload's context with its
+/// vars rendered.
+fn workload_templating(
     revision: &Revision,
     w: &LoadedWorkload,
     ctx: &HostContext,
-) -> buckle_core::Result<Workload> {
+) -> buckle_core::Result<(Templater, HostContext, buckle_core::selectors::Vars)> {
     let cfg = &w.config;
     let ctx = ctx.in_module(&cfg.name, &cfg.tags);
     let mut templater = Templater::new();
@@ -1054,6 +1362,19 @@ async fn compile(
     )?;
     let vars = buckle_core::engine::render_vars(raw, &cfg.name, &templater, &ctx)?;
     let ctx = ctx.with_vars(vars.clone());
+    Ok((templater, ctx, vars))
+}
+
+/// `workload.yaml`'s Nomad keys with its files read, its `.j2` files and
+/// vars rendered and its variable items rendered (with secret values, kept
+/// sensitive).
+async fn compile(
+    revision: &Revision,
+    w: &LoadedWorkload,
+    ctx: &HostContext,
+) -> buckle_core::Result<Workload> {
+    let cfg = &w.config;
+    let (templater, ctx, vars) = workload_templating(revision, w, ctx)?;
 
     let read = |file: String| {
         let templater = &templater;

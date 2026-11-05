@@ -180,6 +180,14 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
                 revision: non_empty(h.revision).map(RevisionId),
             }
         }
+        Msg::Action(a) => Instruction::RunAction {
+            action_id: a.action_id,
+            module: a.module,
+            action: a.action,
+            revision: RevisionId(a.revision),
+            traceparent: non_empty(a.traceparent),
+            target: non_empty(a.target),
+        },
         Msg::Ping(_) => Instruction::Ping,
         Msg::Upgrade(u) => Instruction::Upgrade {
             version: u.version,
@@ -328,6 +336,7 @@ pub fn apply_event_to_proto(
         .unwrap_or_default();
     pb::ApplyEvent {
         target: String::new(),
+        action_id: String::new(),
         revision: revision.0.clone(),
         plan_digest: plan_digest.to_owned(),
         at: Some(timestamp(at)),
@@ -440,7 +449,34 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             plan_digest,
             at,
             event,
-        } => Msg::Apply(apply_event_to_proto(revision, plan_digest, *at, event)),
+            action_id,
+        } => Msg::Apply(pb::ApplyEvent {
+            action_id: action_id.clone().unwrap_or_default(),
+            ..apply_event_to_proto(revision, plan_digest, *at, event)
+        }),
+        Report::ActionResult(run) => {
+            let outcome = &run.outcome;
+            Msg::Action(pb::ActionResult {
+                target: String::new(),
+                action_id: run.action_id.clone(),
+                module: run.module.clone(),
+                action: run.action.clone(),
+                revision: run.revision.0.clone(),
+                succeeded: outcome.succeeded,
+                duration: Some(prost_types::Duration {
+                    seconds: (outcome.duration_ms / 1000) as i64,
+                    nanos: ((outcome.duration_ms % 1000) * 1_000_000) as i32,
+                }),
+                summary: run.summary(),
+                error: outcome.error.clone().unwrap_or_default(),
+                error_detail: outcome.error_detail.as_ref().map(error_detail_to_proto),
+                outcome_json: json_bytes(outcome),
+                report_id: run.report_id,
+                plan_digest: outcome.plan_digest.to_string(),
+                changes: outcome.changes as u32,
+                reboot: outcome.reboot.as_ref().map(reboot_to_proto),
+            })
+        }
         Report::ApplyResult {
             report_id,
             revision,
@@ -549,6 +585,7 @@ fn set_target(msg: &mut pb::agent_message::Msg, target: &str) {
         Msg::Result(m) => &mut m.target,
         Msg::Health(m) => &mut m.target,
         Msg::Drift(m) => &mut m.target,
+        Msg::Action(m) => &mut m.target,
         _ => return,
     };
     *field = target.to_owned();

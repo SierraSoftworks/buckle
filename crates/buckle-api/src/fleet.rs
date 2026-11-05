@@ -125,6 +125,41 @@ pub struct HostDetail {
     /// For a cluster: the workloads its revision selects for it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<crate::WorkloadView>,
+    /// What an operator can run on the target now, from its applied
+    /// revision: each selected module's `actions:` (a cluster's: each
+    /// selected workload's implicit and extra actions), in module order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionInfo>,
+}
+
+/// An action an operator can run on a target
+/// (`POST /hosts/{id}/actions/{module}/{name}`, with an
+/// [`crate::ActionRequest`] note for the audit log).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionInfo {
+    /// The module (or workload) declaring it.
+    pub module: String,
+    pub name: String,
+    /// What the UI shows: the action's `name:`, else its key.
+    pub label: String,
+    /// The task kind it runs (`apt.upgrade`, `dispatch`, `restart` for an
+    /// implicit workload action).
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Ask the operator to confirm, with a note for the audit log.
+    #[serde(default)]
+    pub confirm: bool,
+    /// An implicit workload action (restart, stop, roll back).
+    #[serde(default)]
+    pub implicit: bool,
+}
+
+/// The run an action request started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionStarted {
+    /// The run's id (`GET /hosts/{id}/runs/{run}`).
+    pub run_id: String,
 }
 
 /// One resource whose live state no longer matches what Buckle applied, as
@@ -179,6 +214,9 @@ pub struct RunSummary {
     /// server knows one (otherwise the UI shows `trace_id` as text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_url: Option<String>,
+    /// For an operator's action, `module/action`; absent for an apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

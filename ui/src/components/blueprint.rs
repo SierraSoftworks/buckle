@@ -3,10 +3,11 @@
 //! state, resource count and how many resources removal would clean up;
 //! modules with a problem open by default.
 
-use buckle_api::{DriftItem, ResourceSummary, RunReport};
+use buckle_api::{ActionInfo, DriftItem, ResourceSummary, RunReport};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
+use super::actions::ActionsButton;
 use super::diff::secret_text;
 use super::icons;
 use super::ui::{Empty, Pill};
@@ -21,6 +22,12 @@ pub struct BlueprintProps {
     pub drift: Vec<DriftItem>,
     #[prop_or_default]
     pub run: Option<RunReport>,
+    /// The target's actions; each module head offers its own.
+    #[prop_or_default]
+    pub actions: Vec<ActionInfo>,
+    /// Runs (or asks to confirm) an action; `None` hides them.
+    #[prop_or_default]
+    pub on_action: Option<Callback<ActionInfo>>,
 }
 
 #[function_component(BlueprintView)]
@@ -71,14 +78,24 @@ pub fn blueprint_view(props: &BlueprintProps) -> Html {
                             overrides.set(next);
                         })
                     };
-                    module_row(m, open, toggle, now)
+                    let actions = props.on_action.as_ref().map(|on_run| html! {
+                        <ActionsButton actions={crate::logic::actions::of_module(&props.actions, &m.name)}
+                            on_run={on_run.clone()} testid={format!("actions-{}", m.name)} />
+                    });
+                    module_row(m, open, toggle, now, actions)
                 }) }
             </ol>
         </div>
     }
 }
 
-fn module_row(m: &Module, open: bool, toggle: Callback<MouseEvent>, now: DateTime<Utc>) -> Html {
+fn module_row(
+    m: &Module,
+    open: bool,
+    toggle: Callback<MouseEvent>,
+    now: DateTime<Utc>,
+    actions: Option<Html>,
+) -> Html {
     let state = m.state();
     let body_id = format!(
         "blueprint-{}",
@@ -101,6 +118,7 @@ fn module_row(m: &Module, open: bool, toggle: Callback<MouseEvent>, now: DateTim
                 <span class="run-module__cleanup muted small" title="Resources deleted from the host if the revision drops them">
                     { format!("{cleanup} tagged for cleanup") }
                 </span>
+                { actions.unwrap_or_default() }
             </div>
             if open {
                 <div class="run-module__body" id={body_id}>

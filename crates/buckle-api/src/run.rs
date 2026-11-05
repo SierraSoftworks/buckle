@@ -241,6 +241,9 @@ pub struct RunReport {
     pub trace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_url: Option<String>,
+    /// For an operator's action, `module/action`; absent for an apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 /// A live update to one step or module of a run in progress; the UI applies it
@@ -444,6 +447,7 @@ mod tests {
             error: None,
             trace_id: None,
             trace_url: None,
+            action: None,
         }
     }
 

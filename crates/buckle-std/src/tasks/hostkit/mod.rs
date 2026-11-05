@@ -965,6 +965,7 @@ mod registry_tests {
             ),
             ("apt.package", json!({"name": "nginx"})),
             ("apt.update", json!({})),
+            ("apt.upgrade", json!({"autoremove": true})),
             ("systemd.unit", json!({"name": "nomad", "enabled": true})),
             (
                 "systemd.dropin",

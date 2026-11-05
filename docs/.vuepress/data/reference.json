@@ -1474,6 +1474,52 @@
       "shape": null
     },
     {
+      "description": "Upgrade every upgradable Debian package (apt-get dist-upgrade); meant for actions.",
+      "details": null,
+      "fields": [
+        {
+          "default": "false",
+          "depth": 0,
+          "description": "Run `apt-get autoremove` afterwards.",
+          "options": [],
+          "path": "autoremove",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "true",
+          "depth": 0,
+          "description": "`dist-upgrade` (default: installs and removes what new dependencies\nneed) rather than `upgrade` (never adds or removes a package).",
+          "options": [],
+          "path": "dist",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        },
+        {
+          "default": "true",
+          "depth": 0,
+          "description": "Run `apt-get update` before upgrading (default true).",
+          "options": [],
+          "path": "update_cache",
+          "required": false,
+          "secret": false,
+          "ty": "boolean"
+        }
+      ],
+      "kind": "apt.upgrade",
+      "locks": [
+        "apt"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "removal_caution": false,
+      "removal_default": "leave",
+      "shape": null
+    },
+    {
       "description": "Extract a tar, tar.gz or zip archive from a URL, host path or module file into a directory.",
       "details": "Extracts a `.tar.gz`, `.tgz`, `.tar` or `.zip` archive into `dest`.\n\n```yaml\n- archive.extract:\n    src: https://example.com/tool-1.2.3-linux-amd64.tar.gz   # URL, absolute host path, or module file\n    dest: /opt/tool\n    strip_components: 1              # drop the archive's top-level directory\n    include: [\"tool\", \"LICENSE\"]     # optional; exact names, `*` globs, or directory prefixes\n    creates: /opt/tool/tool          # skip the task when this exists\n    owner: root\n    group: root\n    mode: \"0755\"                     # applied to extracted files (not directories)\n```\n\n`src` is fetched over HTTP(S) when it starts with `http://` or `https://`,\nread from the host when it is an absolute path, and otherwise read from the\nmodule's `files/` directory. The archive format is detected from its\ncontent, so unusual file names are fine.\n\nWithout `creates`, the plan compares every file in the archive with `dest`\nand is a no-op only when they all match; for a URL that means downloading\nthe archive on every plan, so give remote archives a `creates:` path (which\nmay be relative to `dest`) to skip the work. `creates` must be produced by\nthe archive, or the task fails after extracting.\n\nEntries that would land outside `dest` (absolute paths, `..`) are rejected,\nas is writing beneath a symlink the archive itself created. The archive is\nheld in memory and may not expand beyond 1 GiB. Files keep the archive's\nmodes unless `mode` is set. A symlink entry never replaces an existing\nfile or directory (or a symlink Buckle did not create) unless\n`force: true`; the plan is blocked instead.\n\nRemoval deletes the files Buckle extracted, and the directories it created\nif they are then empty, but only if every file is still exactly as\nextracted; otherwise it leaves everything in place. Files that were\nalready in `dest` before Buckle first extracted over them are not Buckle's\nand are never deleted.",
       "fields": [

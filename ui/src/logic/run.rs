@@ -953,6 +953,7 @@ pub(crate) mod tests {
             error: None,
             trace_id: None,
             trace_url: None,
+            action: None,
         };
         r.recount();
         r
@@ -1415,6 +1416,7 @@ pub(crate) mod tests {
             error: None,
             trace_id: None,
             trace_url: None,
+            action: None,
         };
         let on = |host: &str, run: &str, state: RunState| LiveEvent::RunProgress {
             progress: RunProgress {
@@ -1530,6 +1532,7 @@ pub(crate) mod tests {
             error: None,
             trace_id: None,
             trace_url: None,
+            action: None,
         };
         let mut list = vec![summary("run-1")];
         let mut p = progress(None, None);

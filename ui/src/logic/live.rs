@@ -657,6 +657,7 @@ mod tests {
             drift: vec![],
             latest_run: Some(report),
             workloads: vec![],
+            actions: vec![],
         };
         let event = LiveEvent::RunProgress {
             progress: RunProgress {

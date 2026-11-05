@@ -38,6 +38,10 @@ pub struct RunRecord {
     pub trace_id: Option<String>,
     /// The agent's `ApplyOutcome` as JSON, once the result arrived.
     pub outcome_json: Option<String>,
+    /// For an operator's action, `module/action`; `None` for an apply.
+    /// Action runs never count as the host's applies: they are not open,
+    /// latest or bounding runs for anything apply-related.
+    pub action: Option<String>,
 }
 
 impl RunRecord {
@@ -67,7 +71,7 @@ pub struct Runs<'c> {
     conn: &'c Connection,
 }
 
-const COLUMNS: &str = "run_id, host, rollout, revision, plan_digest, started_at, finished_at, outcome, changes, removals, error, trace_id, outcome_json";
+const COLUMNS: &str = "run_id, host, rollout, revision, plan_digest, started_at, finished_at, outcome, changes, removals, error, trace_id, outcome_json, action";
 
 fn row(r: &Row<'_>) -> rusqlite::Result<RawRun> {
     Ok(RawRun {
@@ -84,6 +88,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<RawRun> {
         error: r.get(10)?,
         trace_id: r.get(11)?,
         outcome_json: r.get(12)?,
+        action: r.get(13)?,
     })
 }
 
@@ -101,6 +106,7 @@ struct RawRun {
     error: Option<String>,
     trace_id: Option<String>,
     outcome_json: Option<String>,
+    action: Option<String>,
 }
 
 impl RawRun {
@@ -119,6 +125,7 @@ impl RawRun {
             error: self.error,
             trace_id: self.trace_id,
             outcome_json: self.outcome_json,
+            action: self.action,
         })
     }
 }
@@ -148,7 +155,7 @@ impl<'c> Runs<'c> {
         };
         self.conn
             .execute(
-                "INSERT INTO runs (run_id, host, rollout, revision, plan_digest, started_at, finished_at, outcome, changes, removals, error, trace_id, outcome_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO runs (run_id, host, rollout, revision, plan_digest, started_at, finished_at, outcome, changes, removals, error, trace_id, outcome_json, action) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     id,
                     run.host,
@@ -163,6 +170,7 @@ impl<'c> Runs<'c> {
                     run.error,
                     run.trace_id,
                     run.outcome_json,
+                    run.action,
                 ],
             )
             .map_err(db_error)?;
@@ -207,7 +215,7 @@ impl<'c> Runs<'c> {
     pub fn open_for_host(&self, host: &str) -> Result<Option<RunRecord>> {
         Ok(self
             .query(
-                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND outcome = ?2 ORDER BY id DESC LIMIT 1"),
+                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND outcome = ?2 AND action IS NULL ORDER BY id DESC LIMIT 1"),
                 params![host, RUNNING],
             )?
             .into_iter()
@@ -220,7 +228,7 @@ impl<'c> Runs<'c> {
     pub fn unresolved(&self, host: &str, plan_digest: &str) -> Result<Option<RunRecord>> {
         Ok(self
             .query(
-                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND plan_digest = ?2 AND outcome_json IS NULL AND (outcome = ?3 OR error = ?4) ORDER BY id DESC LIMIT 1"),
+                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND plan_digest = ?2 AND action IS NULL AND outcome_json IS NULL AND (outcome = ?3 OR error = ?4) ORDER BY id DESC LIMIT 1"),
                 params![host, plan_digest, RUNNING, ABANDONED],
             )?
             .into_iter()
@@ -308,16 +316,53 @@ impl<'c> Runs<'c> {
         Ok((items, total.max(0) as u64))
     }
 
-    /// The newest run of a host (running or finished).
+    /// The newest apply run of a host (running or finished).
     pub fn latest_for_host(&self, host: &str) -> Result<Option<RunRecord>> {
-        Ok(self.page(host, None, 1)?.0.into_iter().next())
+        Ok(self
+            .query(
+                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND action IS NULL ORDER BY id DESC LIMIT 1"),
+                params![host],
+            )?
+            .into_iter()
+            .next())
+    }
+
+    /// Whether an action is running on the host: `module/action` of it.
+    pub fn running_action(&self, host: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT action FROM runs WHERE host = ?1 AND outcome = ?2 AND action IS NOT NULL ORDER BY id DESC LIMIT 1",
+                params![host, RUNNING],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// Closes the host's running action runs: a new session has none in
+    /// flight (a durable result still completes them).
+    pub fn abandon_actions(&self, host: &str, at: DateTime<Utc>) -> Result<Vec<RunRecord>> {
+        let open = self.query(
+            &format!(
+                "SELECT {COLUMNS} FROM runs WHERE host = ?1 AND outcome = ?2 AND action IS NOT NULL"
+            ),
+            params![host, RUNNING],
+        )?;
+        let mut closed = Vec::new();
+        for run in open {
+            self.abandon(&run.id, at)?;
+            if let Some(run) = self.get(host, &run.id)? {
+                closed.push(run);
+            }
+        }
+        Ok(closed)
     }
 
     /// The newest run of `host` that applied `revision`.
     pub fn latest_for_revision(&self, host: &str, revision: &str) -> Result<Option<RunRecord>> {
         Ok(self
             .query(
-                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND revision = ?2 ORDER BY id DESC LIMIT 1"),
+                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND revision = ?2 AND action IS NULL ORDER BY id DESC LIMIT 1"),
                 params![host, revision],
             )?
             .into_iter()
@@ -329,7 +374,7 @@ impl<'c> Runs<'c> {
     pub fn next_after(&self, run: &RunRecord) -> Result<Option<RunRecord>> {
         Ok(self
             .query(
-                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND id > (SELECT id FROM runs WHERE run_id = ?2) ORDER BY id ASC LIMIT 1"),
+                &format!("SELECT {COLUMNS} FROM runs WHERE host = ?1 AND action IS NULL AND id > (SELECT id FROM runs WHERE run_id = ?2) ORDER BY id ASC LIMIT 1"),
                 params![run.host, run.id],
             )?
             .into_iter()
@@ -340,7 +385,7 @@ impl<'c> Runs<'c> {
     pub fn latest_for_rollout_host(&self, rollout: &str, host: &str) -> Result<Option<RunRecord>> {
         Ok(self
             .query(
-                &format!("SELECT {COLUMNS} FROM runs WHERE rollout = ?1 AND host = ?2 ORDER BY id DESC LIMIT 1"),
+                &format!("SELECT {COLUMNS} FROM runs WHERE rollout = ?1 AND host = ?2 AND action IS NULL ORDER BY id DESC LIMIT 1"),
                 params![rollout, host],
             )?
             .into_iter()
@@ -354,7 +399,7 @@ impl<'c> Runs<'c> {
     ) -> Result<std::collections::BTreeMap<String, String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT host, run_id FROM runs WHERE rollout = ?1 ORDER BY id ASC")
+            .prepare("SELECT host, run_id FROM runs WHERE rollout = ?1 AND action IS NULL ORDER BY id ASC")
             .map_err(db_error)?;
         let rows = stmt
             .query_map(params![rollout], |r| {
@@ -458,6 +503,7 @@ mod tests {
             error: None,
             trace_id: None,
             outcome_json: None,
+            action: None,
         }
     }
 

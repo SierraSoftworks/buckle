@@ -135,6 +135,14 @@ enum Op {
         until: Option<chrono::DateTime<chrono::Utc>>,
         traceparent: Option<String>,
     },
+    /// Runs an operator's action (RunAction).
+    Action {
+        action_id: String,
+        module: String,
+        action: String,
+        revision: RevisionId,
+        traceparent: Option<String>,
+    },
     Drift,
     Facts {
         force_report: bool,
@@ -286,6 +294,19 @@ fn failed_outcome(plan: &Plan, error: &buckle_core::Error, started: Instant) -> 
         started_at: None,
         finished_at: None,
         reboot: None,
+    }
+}
+
+/// The outcome of an action that failed before it ran.
+pub(crate) fn action_failed(error: &buckle_core::Error, started: Instant) -> ApplyOutcome {
+    ApplyOutcome {
+        plan_digest: buckle_core::Digest::of(b""),
+        not_started: Vec::new(),
+        ..failed_outcome(
+            &Plan::new(RevisionId::new(""), "", vec![], vec![], vec![]),
+            error,
+            started,
+        )
     }
 }
 
@@ -806,7 +827,12 @@ impl Shared {
                     // the session that asked.
                     Some(other) if other.target().is_some() => {
                         let target = other.target().unwrap_or_default().to_owned();
-                        let bound = !matches!(other, Instruction::Assign { .. });
+                        // An action runs even after a reconnect: its run is
+                        // open on the server until its (durable) result.
+                        let bound = !matches!(
+                            other,
+                            Instruction::Assign { .. } | Instruction::RunAction { .. }
+                        );
                         queue.push(
                             Op::Target { target, instruction: Box::new(other) },
                             bound.then_some(generation),
@@ -1170,6 +1196,27 @@ impl Shared {
                 );
                 self.follow_session(&span);
                 self.drift().instrument(span).await
+            }
+            Op::Action {
+                action_id,
+                module,
+                action,
+                revision,
+                traceparent,
+            } => {
+                let span = tracing::info_span!(
+                    "agent.action",
+                    buckle.host = %self.host_id,
+                    buckle.revision = %revision.0,
+                    buckle.module = %module,
+                    buckle.action = %action,
+                    buckle.action_id = %action_id,
+                );
+                set_parent_from_traceparent(&span, traceparent.as_deref());
+                self.run_action(action_id, module, action, revision)
+                    .instrument(span)
+                    .await;
+                self.reboot_if_pending().await;
             }
             Op::Facts { force_report } => self.facts(force_report).await,
             Op::Upgrade { version, .. } => self.upgrade(version).await,
@@ -1624,6 +1671,80 @@ impl Shared {
             .await;
         }
         outcome
+    }
+
+    /// Plans and runs an operator's action on the host and reports it
+    /// (durably). The applied revision, state and watchdog are untouched.
+    async fn run_action(
+        &self,
+        action_id: String,
+        module: String,
+        action: String,
+        revision: RevisionId,
+    ) {
+        let started = Instant::now();
+        let prepared = async {
+            let rev = self.ensure_revision(&revision, None).await?;
+            self.ensure_secrets(&revision, &rev).await;
+            let mut ctx = self.context(&revision, None, Vec::new(), false).await;
+            // An action never rolls a module back.
+            ctx.stable_revision = None;
+            let (plan, facts) = self
+                .runner
+                .plan_action(rev.clone(), &ctx, &module, &action)
+                .await?;
+            Ok::<_, buckle_core::Error>((rev, ctx, plan, facts))
+        }
+        .await;
+        let mut outcome = match prepared {
+            Err(err) => {
+                tracing::warn!(error = %err.description(), "the action could not be planned");
+                action_failed(&err, started)
+            }
+            Ok((rev, ctx, plan, facts)) => {
+                self.remember_facts(facts).await;
+                let (tx, rx) = mpsc::channel(256);
+                let forwarder = tokio::spawn(coalesce::forward_for(
+                    rx,
+                    self.sink.clone(),
+                    rev.id.clone(),
+                    plan.digest.to_string(),
+                    self.options.event_spacing,
+                    None,
+                    Some(action_id.clone()),
+                ));
+                let result = self
+                    .runner
+                    .run_action(rev, &ctx, &module, &action, &plan, tx)
+                    .await;
+                let _ = forwarder.await;
+                result.unwrap_or_else(|err| {
+                    tracing::error!(error = %err.description(), "the action failed");
+                    failed_outcome(&plan, &err, started)
+                })
+            }
+        };
+        tracing::info!(
+            succeeded = outcome.succeeded,
+            changes = outcome.changes,
+            "action finished"
+        );
+        if let Some(reboot) = outcome.reboot.as_mut() {
+            reboot.boot_id = self.current_boot();
+        }
+        let report_id = self.next_report_id().await;
+        if let Some(reboot) = &outcome.reboot {
+            self.schedule_reboot(report_id, reboot.clone()).await;
+        }
+        self.send_durable(Report::ActionResult(crate::transport::ActionRun {
+            report_id,
+            action_id,
+            module,
+            action,
+            revision,
+            outcome,
+        }))
+        .await;
     }
 
     async fn apply(
@@ -2635,6 +2756,20 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             scope,
             modules,
             until,
+            traceparent,
+        },
+        Instruction::RunAction {
+            action_id,
+            module,
+            action,
+            revision,
+            traceparent,
+            target: _,
+        } => Op::Action {
+            action_id,
+            module,
+            action,
+            revision,
             traceparent,
         },
         Instruction::Upgrade { version, when_idle } => Op::Upgrade { version, when_idle },

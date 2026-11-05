@@ -365,6 +365,7 @@ mod tests {
             health_checks: vec![check("postgresql", "fail"), check("atuin", "pass")],
             drift: vec![],
             latest_run: None,
+            actions: vec![],
             workloads: vec![
                 w("postgresql", &[]),
                 w("atuin", &["postgresql"]),

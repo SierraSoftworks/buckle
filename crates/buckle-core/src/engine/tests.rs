@@ -4390,3 +4390,133 @@ async fn a_reboot_is_collected_for_after_the_run_and_defers_health(
         assert!(outcome.health.unwrap().results.is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+const ACTION_MODULE: &str = r#"
+name: web
+tasks:
+  - test.file: { path: /web/conf, content: v1 }
+handlers:
+  reload: { systemd.reload: { name: web, run: act1 } }
+actions:
+  rotate:
+    test.file: { path: /web/rotated, content: '{{ vars.stamp }}', run: act1 }
+    notify: [reload]
+  noop: { test.file: { path: /web/conf, content: v1 } }
+  never: { test.file: { path: /web/never }, when: 'host.labels.role == "db"' }
+vars: { stamp: s1 }
+health:
+  - test.file_exists: { path: /web/rotated }
+"#;
+
+async fn run_action(inputs: &Inputs, module: &str, action: &str) -> ApplyOutcome {
+    let (plan, _) = Engine::plan_action(inputs, module, action)
+        .await
+        .unwrap_or_else(|e| panic!("plan_action failed: {}", e.message()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let outcome = Engine::run_action(inputs, module, action, &plan, tx)
+        .await
+        .unwrap_or_else(|e| panic!("run_action failed: {}", e.message()));
+    drain.await.unwrap();
+    outcome
+}
+
+#[tokio::test]
+async fn an_action_plans_its_step_and_handlers_alone() {
+    let rev = revision("r1", FLEET, vec![module(ACTION_MODULE)]);
+    let sys = FakeSystem::new();
+    let (plan, _) = Engine::plan_action(&inputs(rev, &sys), "web", "rotate")
+        .await
+        .unwrap();
+    assert_eq!(module_names(&plan), vec!["web"]);
+    let steps: Vec<&str> = plan.steps().map(|s| s.resource.key.as_str()).collect();
+    assert_eq!(
+        steps,
+        vec!["action:rotate"],
+        "the module's tasks are not planned"
+    );
+    assert_eq!(plan.modules[0].handlers[0].handler, "reload");
+    assert!(plan.removals.is_empty());
+}
+
+#[tokio::test]
+async fn an_action_runs_handlers_and_health_and_records_nothing() {
+    let rev = revision("r1", FLEET, vec![module(ACTION_MODULE)]);
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let inputs = inputs_with_store(rev, &sys, store.clone());
+    let outcome = run_action(&inputs, "web", "rotate").await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(outcome.changes, 1);
+    assert_eq!(sys.file_string("/web/rotated").as_deref(), Some("s1"));
+    assert!(sys.file_string("/web/conf").is_none(), "tasks never run");
+    assert!(calls("act1").contains(&"handler web:systemd.reload web".to_owned()));
+    let health = outcome.health.unwrap().results;
+    assert!(
+        !health.is_empty(),
+        "the module's checks ran after the change"
+    );
+    let state = store.load().unwrap();
+    assert!(
+        state.resources.is_empty(),
+        "an action owns nothing: {state:#?}"
+    );
+    assert!(state.module_revisions.is_empty());
+}
+
+#[tokio::test]
+async fn an_action_with_nothing_to_do_changes_nothing() {
+    let rev = revision("r1", FLEET, vec![module(ACTION_MODULE)]);
+    let sys = FakeSystem::new().with_file("/web/conf", b"v1", FilePerms::mode(0o644));
+    let outcome = run_action(&inputs(rev, &sys), "web", "noop").await;
+    assert!(outcome.succeeded);
+    assert_eq!(outcome.changes, 0);
+}
+
+#[rstest]
+#[case::unknown_action("web", "nope", "declares no action")]
+#[case::unknown_module("db", "rotate", "no such module")]
+#[case::when_false("web", "never", "not available")]
+#[tokio::test]
+async fn an_action_that_cannot_run_here_is_a_user_error(
+    #[case] module_name: &str,
+    #[case] action: &str,
+    #[case] needle: &str,
+) {
+    let rev = revision("r1", FLEET, vec![module(ACTION_MODULE)]);
+    let err = Engine::plan_action(&inputs(rev, &FakeSystem::new()), module_name, action)
+        .await
+        .expect_err("the action cannot be planned");
+    assert!(err.is(crate::error::Kind::User));
+    assert!(err.message().contains(needle), "{}", err.message());
+}
+
+#[tokio::test]
+async fn an_action_of_an_unselected_module_is_refused() {
+    let yaml = format!("{ACTION_MODULE}when: 'host.labels.role == \"db\"'\n");
+    let rev = revision("r1", FLEET, vec![module(&yaml)]);
+    let err = Engine::plan_action(&inputs(rev, &FakeSystem::new()), "web", "rotate")
+        .await
+        .expect_err("not selected");
+    assert!(err.message().contains("not selected"), "{}", err.message());
+}
+
+#[tokio::test]
+async fn a_stale_action_plan_is_refused() {
+    let rev = revision("r1", FLEET, vec![module(ACTION_MODULE)]);
+    let sys = FakeSystem::new().with_file("/web/conf", b"v1", FilePerms::mode(0o644));
+    let inputs = inputs(rev, &sys);
+    let (plan, _) = Engine::plan_action(&inputs, "web", "noop").await.unwrap();
+    crate::system::System::remove(&sys, Path::new("/web/conf"), false)
+        .await
+        .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let err = Engine::run_action(&inputs, "web", "noop", &plan, tx)
+        .await
+        .expect_err("the host changed under the plan");
+    assert!(StalePlan::find(&err).is_some());
+}

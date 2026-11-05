@@ -20,10 +20,10 @@ pub mod sse;
 use std::cell::RefCell;
 
 use buckle_api::{
-    ActionRequest, ApproveRequest, AuditEntry, ContinueRequest, CreateTarget, CsrfToken, ErrorBody,
-    ExecutorSpec, Fleet, HostDetail, HostPatch, HostPreview, HostSummary, JoinOptions, JoinRequest,
-    JoinTicket, Me, Page, PlanGroup, RejectRequest, RevisionSummary, RolloutDetail, RolloutSummary,
-    RunReport, RunSummary, StartRollout, UpgradeRequest,
+    ActionRequest, ActionStarted, ApproveRequest, AuditEntry, ContinueRequest, CreateTarget,
+    CsrfToken, ErrorBody, ExecutorSpec, Fleet, HostDetail, HostPatch, HostPreview, HostSummary,
+    JoinOptions, JoinRequest, JoinTicket, Me, Page, PlanGroup, RejectRequest, RevisionSummary,
+    RolloutDetail, RolloutSummary, RunReport, RunSummary, StartRollout, UpgradeRequest,
 };
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::Serialize;
@@ -307,6 +307,23 @@ pub async fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError
         Method::Post,
         &format!("/hosts/{}/{}", enc(id), enc(action)),
         None,
+    )
+    .await
+}
+
+/// Runs `action` of `module` on the target (a host or a cluster), noting
+/// `note` in the audit log; returns the run's id.
+pub async fn run_action(
+    id: &str,
+    module: &str,
+    action: &str,
+    note: String,
+) -> Result<ActionStarted, ApiError> {
+    demo!(demo_store::run_action(id, module, action, &note));
+    write(
+        Method::Post,
+        &format!("/hosts/{}/actions/{}/{}", enc(id), enc(module), enc(action)),
+        Some(&ActionRequest { note }),
     )
     .await
 }
