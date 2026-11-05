@@ -141,8 +141,8 @@ const SHOTS = [
     },
     target: (p) => [
       p.locator("tr", { has: p.getByRole("link", { name: "pi-5", exact: true }) }),
-      // Down to its error and the re-plan on it, above the run report.
-      p.getByTestId("host-replan"),
+      // Down to its error, with the retry at its top right, above the run report.
+      p.locator(".host-row").getByTestId("error-block"),
     ],
     pad: 8,
   },

@@ -26,7 +26,7 @@ use crate::components::{
     Refresh, RouteLink, RunReportView, SplitButton, TraceLink, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
-use crate::logic::controls::{Decision, Standing, decisions};
+use crate::logic::controls::{Decision, Standing, decisions, replan_label};
 use crate::logic::fleet_plan::{Phases, fleet_tally};
 use crate::logic::format::{count, relative, rollout_label, short, since, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
@@ -863,9 +863,16 @@ fn dialog(
             }
         }
         Ask::Host(action, host) => {
+            let retry_label = d
+                .phases
+                .iter()
+                .flat_map(|p| &p.hosts)
+                .find(|h| &h.host == host)
+                .map(|h| replan_label(h.state, h.plan_digest.is_some()))
+                .unwrap_or("Re-plan");
             let (label, danger, body) = match *action {
                 "retry" => (
-                    "Re-plan",
+                    retry_label,
                     false,
                     "Plans the host again as it stands. A host that failed, was held or skipped is then re-applied with the same checks; one still waiting to apply keeps its place and its plan asks for approval again if it changed.",
                 ),
@@ -1157,11 +1164,13 @@ fn host_table(props: &HostTableProps) -> Html {
                                         <span class="cell-sub mono" data-testid="host-activity">{ now.clone() }</span>
                                     }
                                 </td>
-                                <td class="nowrap">
-                                    { host_tally(h, &props.plans).map(|tally| html! { <Changes {tally} /> }).unwrap_or_default() }
-                                    { h.plan_digest.as_deref().map(|d| html! {
-                                        <span class="mono muted small plan-digest" title={format!("plan {d}")}>{ short(d) }</span>
-                                    }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
+                                <td>
+                                    <span class="nowrap">
+                                        { host_tally(h, &props.plans).map(|tally| html! { <Changes {tally} /> }).unwrap_or_default() }
+                                        { h.plan_digest.as_deref().map(|d| html! {
+                                            <span class="mono muted small plan-digest" title={format!("plan {d}")}>{ short(d) }</span>
+                                        }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
+                                    </span>
                                     if h.preview {
                                         <span class="badge" data-testid="plan-preview"
                                             title="Planned at the rollout's start; planned again when its stage opens">{ "preview" }</span>
@@ -1216,7 +1225,8 @@ fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
     let host = || h.host.clone();
     let mut items = Vec::new();
     if can_replan(h.state) {
-        items.push(item("Re-plan…", false, Ask::Host("retry", host())));
+        let label = format!("{}…", replan_label(h.state, h.plan_digest.is_some()));
+        items.push(item(&label, false, Ask::Host("retry", host())));
     }
     if h.state == HostRolloutState::Failed && !h.failed_checks.is_empty() {
         items.push(item(
@@ -1280,19 +1290,20 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         }),
         None,
     );
-    // A host with an error is re-planned from it: this one, or (when it
-    // failed) every failed host of the rollout at once.
+    // A host with an error is retried (or re-planned) from it: this one, or
+    // (when it failed) every failed host of the rollout at once.
     let replan = (props.admin && can_replan(h.state)).then(|| {
         let others = failed(&props.detail).len();
+        let label = replan_label(h.state, h.plan_digest.is_some());
         let run = |a: Ask| {
             let on_run = props.on_run.clone();
             Callback::from(move |_: MouseEvent| on_run.emit(a.clone()))
         };
         html! {
             <div class="error-block__actions" data-testid="host-replan">
-                <Button small=true kind={Kind::Primary} onclick={run(Ask::Host("retry", h.host.clone()))}>{ "Re-plan" }</Button>
+                <Button small=true kind={Kind::Primary} onclick={run(Ask::Host("retry", h.host.clone()))}>{ label }</Button>
                 if others > 1 && h.state == HostRolloutState::Failed {
-                    <Button small=true onclick={run(Ask::Action("retry"))}>{ format!("Re-plan all {others} failed") }</Button>
+                    <Button small=true onclick={run(Ask::Action("retry"))}>{ format!("Retry all {others} failed") }</Button>
                 }
             </div>
         }
@@ -1308,9 +1319,8 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
     });
     html! {
         <div class="host-row">
-            <ErrorBlock error={h.error_detail.clone()} raw={h.error.clone().map(AttrValue::from)} tone={host_error_tone(h)}>
-                { replan.unwrap_or_default() }
-            </ErrorBlock>
+            <ErrorBlock error={h.error_detail.clone()} raw={h.error.clone().map(AttrValue::from)} tone={host_error_tone(h)}
+                actions={replan.unwrap_or_default()} />
             <div class="host-row__ticker">
                 <h4 class="subhead">{ "Through this rollout" }</h4>
                 { match &lifecycle {

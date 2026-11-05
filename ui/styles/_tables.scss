@@ -70,6 +70,8 @@
   display: block;
   color: var(--fg-2);
   font-size: 0.78rem;
+  // A long path breaks rather than widening its column.
+  overflow-wrap: anywhere;
 }
 
 .cell-labels {

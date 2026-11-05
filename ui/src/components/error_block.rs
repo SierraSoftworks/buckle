@@ -28,9 +28,10 @@ pub struct ErrorBlockProps {
     /// Tighter, for a table cell.
     #[prop_or_default]
     pub compact: bool,
-    /// What can be done about it (buttons), at the foot of the block.
+    /// What can be done about it (buttons), top right of the block as on
+    /// every other banner.
     #[prop_or_default]
-    pub children: Html,
+    pub actions: Html,
 }
 
 #[function_component(ErrorBlock)]
@@ -52,6 +53,7 @@ pub fn error_block(props: &ErrorBlockProps) -> Html {
                     <span class="error-block__icon">{ icons::alert() }</span>
                     <p class="error-block__message">{ secret_text(&e.message) }</p>
                     <span class="error-block__kind" title={error_kind_title(e.kind)}>{ error_kind_label(e.kind) }</span>
+                    { props.actions.clone() }
                 </div>
                 if !e.causes.is_empty() {
                     <div class="error-block__section">
@@ -69,14 +71,15 @@ pub fn error_block(props: &ErrorBlockProps) -> Html {
                         </ul>
                     </div>
                 }
-                { props.children.clone() }
             </div>
         },
         (None, Some(raw)) if !raw.trim().is_empty() => html! {
             <div class={classes!(base, "error-block--raw")} data-testid="error-block">
                 { context.unwrap_or_default() }
-                <pre class="error-block__raw">{ secret_text(raw) }</pre>
-                { props.children.clone() }
+                <div class="error-block__head">
+                    <pre class="error-block__raw">{ secret_text(raw) }</pre>
+                    { props.actions.clone() }
+                </div>
             </div>
         },
         _ => html! {},
