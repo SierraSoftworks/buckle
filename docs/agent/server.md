@@ -258,7 +258,7 @@ when the host matches the target's `executors` selector (purposes `read` and `de
 | `sub`, `host` | The requesting host, e.g. `pi-1`. |
 | `aud`, `target` | The cluster target, e.g. `home-nomad`. |
 | `cluster` | The cluster the target is on (differs for a scoped target). |
-| `purpose` | `read`, `deploy` or `drain`. |
+| `purpose` | `read`, `deploy`, `drain` or `acl`. |
 | `rollout` | The rollout the credential serves, when any. |
 
 **Keys.** One ES256 key at `data_dir/identity/signing.key`, generated on first start and
@@ -301,6 +301,16 @@ for purpose in read deploy drain; do
   nomad acl binding-rule create -auth-method buckle -bind-type policy \
     -bind-name "buckle-$purpose" -selector "value.purpose == \"$purpose\""
 done
+```
+
+Nomad serves and writes ACL policies only to management tokens, so a workload that lists a
+`*.policy.hcl` plans and applies it with a separate `acl` credential, which executors request only
+for those workloads. Bind it to a management token; without the rule, such a workload fails to
+plan at login and every other workload is unaffected:
+
+```sh
+nomad acl binding-rule create -auth-method buckle -bind-type management \
+  -selector 'value.purpose == "acl"'
 ```
 
 **Kubernetes trust.** A structured authentication config trusting the issuer, with RBAC bound to

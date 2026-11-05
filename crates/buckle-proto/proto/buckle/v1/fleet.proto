@@ -511,6 +511,9 @@ enum IdentityPurpose {
   IDENTITY_PURPOSE_DEPLOY = 2;
   // Draining the requesting host's own node.
   IDENTITY_PURPOSE_DRAIN = 3;
+  // Reading and writing ACL policies, which Nomad allows only for
+  // management tokens: bound apart so read and deploy stay narrow.
+  IDENTITY_PURPOSE_ACL = 4;
 }
 
 message IssueIdentityRequest {

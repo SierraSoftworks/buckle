@@ -406,6 +406,7 @@ impl Transport for GrpcTransport {
                 Purpose::Read => pb::IdentityPurpose::Read,
                 Purpose::Deploy => pb::IdentityPurpose::Deploy,
                 Purpose::Drain => pb::IdentityPurpose::Drain,
+                Purpose::Acl => pb::IdentityPurpose::Acl,
             } as i32,
             revision: request
                 .revision

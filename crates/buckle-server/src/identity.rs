@@ -39,6 +39,8 @@ pub enum Purpose {
     Deploy,
     /// Draining (and marking ineligible) the requesting host's own node.
     Drain,
+    /// Reading and writing ACL policies (Nomad: a management token).
+    Acl,
 }
 
 impl Purpose {
@@ -47,6 +49,7 @@ impl Purpose {
             Purpose::Read => "read",
             Purpose::Deploy => "deploy",
             Purpose::Drain => "drain",
+            Purpose::Acl => "acl",
         }
     }
 }
@@ -104,7 +107,7 @@ impl ClusterTrust {
         }
         let (selector, role) = match purpose {
             Purpose::Drain => (self.nodes.as_ref(), "a node of"),
-            Purpose::Read | Purpose::Deploy => (
+            Purpose::Read | Purpose::Deploy | Purpose::Acl => (
                 self.executors.as_ref().or(self.nodes.as_ref()),
                 "an executor for",
             ),
@@ -406,6 +409,7 @@ mod tests {
     #[case(Purpose::Read)]
     #[case(Purpose::Deploy)]
     #[case(Purpose::Drain)]
+    #[case(Purpose::Acl)]
     fn a_token_verifies_against_the_published_keys(#[case] purpose: Purpose) {
         let dir = tempfile::tempdir().unwrap();
         let issuer = Issuer::load(dir.path(), &config(), "https://buckle.example".into()).unwrap();
