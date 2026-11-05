@@ -1,6 +1,7 @@
-//! The app bar's bell: how many agents need attention (registrations,
-//! offline agents, version skew, and the live rollout's failed, held or
-//! stale-plan hosts), with the list in a dropdown. The list is only in the
+//! The app bar's bell: how many hosts and clusters need attention
+//! (registrations, offline agents, version skew, failing or held health,
+//! failing workloads, and the live rollout's failed, held or stale-plan
+//! hosts), with the list in a dropdown. The list is only in the
 //! page while the dropdown is open.
 
 use buckle_api::{Fleet, RolloutDetail};
@@ -80,8 +81,8 @@ pub fn attention_bell() -> Html {
     let worst = worst(list.iter().flat_map(|(_, c)| c));
     let label = match list.len() {
         0 => "Nothing needs attention".to_string(),
-        1 => "1 agent needs attention".to_string(),
-        n => format!("{n} agents need attention"),
+        1 => "1 target needs attention".to_string(),
+        n => format!("{n} targets need attention"),
     };
     html! {
         <div class={classes!("bell", (*open).then_some("bell--open"))} ref={node}
@@ -97,14 +98,14 @@ pub fn attention_bell() -> Html {
                 <div class="bell__panel" role="dialog" aria-label="Needs attention" tabindex="-1">
                     <div class="bell__head">
                         <span class="bell__title">{ "Needs attention" }</span>
-                        <span class="muted small">{ "Registrations, offline agents, version skew and stale plans" }</span>
+                        <span class="muted small">{ "Unhealthy hosts and workloads, registrations, offline agents, version skew and stale plans" }</span>
                     </div>
                     if list.is_empty() {
-                        <p class="bell__empty muted">{ "Every agent is registered, connected, current and on a plan its phase approved." }</p>
+                        <p class="bell__empty muted">{ "Every host and workload is healthy, and every agent registered, connected, current and on a plan its phase approved." }</p>
                     } else {
                         <ul class="attention">
                             { for list.into_iter().map(|(host, concerns)| {
-                                let summary = f.hosts.iter().find(|h| h.id == host).cloned();
+                                let summary = f.hosts.iter().chain(&f.clusters).find(|h| h.id == host).cloned();
                                 html! {
                                     <li class={classes!("attention__item", worst_of(&concerns).class())} data-host={host.clone()}>
                                         <span class="attention__mark" aria-hidden="true" />
@@ -132,6 +133,7 @@ fn concerns(
 ) -> Vec<(String, Vec<Concern>)> {
     attention(
         &f.hosts,
+        &f.clusters,
         f.desired_agent_version
             .as_deref()
             .or(f.server_version.as_deref()),

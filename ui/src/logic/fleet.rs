@@ -146,6 +146,12 @@ pub enum Concern {
     Failed { phase: String },
     /// Held at baseline in the active rollout: unhealthy before Buckle touched it.
     Held { phase: String },
+    /// Connected, with a required health check failing now.
+    Unhealthy,
+    /// Connected, with its health held.
+    HealthHeld,
+    /// A cluster whose workloads have a required check failing now.
+    WorkloadsFailing { workloads: Vec<String> },
 }
 
 impl Concern {
@@ -153,8 +159,11 @@ impl Concern {
     pub fn tone(&self) -> super::tone::Tone {
         use super::tone::Tone;
         match self {
-            Concern::Failed { .. } => Tone::Danger,
+            Concern::Failed { .. } | Concern::Unhealthy | Concern::WorkloadsFailing { .. } => {
+                Tone::Danger
+            }
             Concern::Held { .. }
+            | Concern::HealthHeld
             | Concern::StalePlan { .. }
             | Concern::VersionSkew { .. }
             | Concern::Offline { .. } => Tone::Warn,
@@ -187,6 +196,14 @@ impl Concern {
             Concern::StalePlan { phase } => format!("plan changed after {phase} was approved"),
             Concern::Failed { phase } => format!("failed in {phase}"),
             Concern::Held { phase } => format!("held at baseline in {phase}"),
+            Concern::Unhealthy => "health checks failing".into(),
+            Concern::HealthHeld => "health held".into(),
+            Concern::WorkloadsFailing { workloads } => {
+                format!(
+                    "{} failing",
+                    super::format::count(workloads.len(), "workload", "workloads")
+                ) + &format!(": {}", workloads.join(", "))
+            }
         }
     }
 }
@@ -254,10 +271,11 @@ pub fn agents_behind<'a>(hosts: &'a [HostSummary], target: &str) -> Behind<'a> {
     out
 }
 
-/// The agents needing attention, worst first: by their most severe concern,
-/// then by how many they have, then by name.
+/// The hosts and clusters needing attention, worst first: by their most
+/// severe concern, then by how many they have, then by name.
 pub fn attention(
     hosts: &[HostSummary],
+    clusters: &[HostSummary],
     server_version: Option<&str>,
     rollout: Option<&RolloutDetail>,
     now: DateTime<Utc>,
@@ -277,6 +295,14 @@ pub fn attention(
         {
             concerns.push(Concern::Offline { since: h.last_seen });
         }
+        // An offline host's last reading is not a statement about now.
+        if h.status != HostStatus::Pending && h.connection == Connection::Online {
+            match h.health {
+                HealthSummary::Failing => concerns.push(Concern::Unhealthy),
+                HealthSummary::Held => concerns.push(Concern::HealthHeld),
+                _ => {}
+            }
+        }
         if let (Some(running), Some(expected)) = (h.agent_version.as_deref(), expected)
             && running != expected
         {
@@ -287,6 +313,19 @@ pub fn attention(
         }
         if !concerns.is_empty() {
             out.insert(h.id.clone(), concerns);
+        }
+    }
+
+    for c in clusters {
+        let failing = c
+            .cluster_status
+            .as_ref()
+            .map(|s| s.failing.clone())
+            .unwrap_or_default();
+        if !failing.is_empty() {
+            out.entry(c.id.clone())
+                .or_default()
+                .push(Concern::WorkloadsFailing { workloads: failing });
         }
     }
 
@@ -577,7 +616,7 @@ mod tests {
         };
 
         let hosts = vec![host("pi-2"), host("pi-5"), pending, gone, blip, skewed];
-        let list = attention(&hosts, Some("2.0.0"), Some(&rollout), now);
+        let list = attention(&hosts, &[], Some("2.0.0"), Some(&rollout), now);
         let names: Vec<&str> = list.iter().map(|(h, _)| h.as_str()).collect();
         assert_eq!(names, vec!["pi-5", "lab-3", "az-1", "new-1"]);
         assert_eq!(
@@ -593,5 +632,46 @@ mod tests {
             ]
         );
         assert_eq!(list[2].1[0].describe(now), "offline for 25m");
+    }
+
+    #[test]
+    fn attention_lists_unhealthy_hosts_and_failing_workloads() {
+        let now = Utc::now();
+        let mut failing = host("pi-1");
+        failing.health = HealthSummary::Failing;
+        let mut held = host("pi-2");
+        held.health = HealthSummary::Held;
+        let mut stale = host("pi-3");
+        stale.connection = Connection::Offline;
+        stale.health = HealthSummary::Failing;
+        stale.last_seen = Some(now);
+        let clusters = [
+            cluster(3, Some("pi-1"), &["api", "web"], &[]),
+            HostSummary {
+                id: "quiet".into(),
+                ..cluster(1, Some("pi-1"), &[], &[])
+            },
+        ];
+
+        let list = attention(
+            &[failing, held, stale, host("pi-4")],
+            &clusters,
+            Some("2.0.0"),
+            None,
+            now,
+        );
+        let find = |id: &str| list.iter().find(|(h, _)| h == id).map(|(_, c)| c.clone());
+        assert_eq!(find("pi-1"), Some(vec![Concern::Unhealthy]));
+        assert_eq!(find("pi-2"), Some(vec![Concern::HealthHeld]));
+        assert_eq!(
+            find("pi-3"),
+            None,
+            "an offline host's stale reading is not a concern"
+        );
+        assert_eq!(find("pi-4"), None);
+        assert_eq!(find("quiet"), None);
+        let workloads = find("c").expect("the cluster with failing workloads");
+        assert_eq!(workloads[0].tone(), crate::logic::tone::Tone::Danger);
+        assert!(workloads[0].describe(now).contains("api, web"));
     }
 }
