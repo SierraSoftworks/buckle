@@ -639,6 +639,11 @@
   white-space: pre-wrap;
 }
 
+.notes-status {
+  min-height: 1.25rem;
+  margin: 0.35rem 0 0;
+}
+
 .drift {
   & + .drift {
     margin-top: 0.75rem;

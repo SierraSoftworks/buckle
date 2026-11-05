@@ -30,9 +30,33 @@ describe("host labels", () => {
     assert.ok(await page.getByRole("button", { name: "Save labels" }).isDisabled());
 
     await page.getByLabel("Label 1 key").fill("canary");
-    await page.getByRole("button", { name: "Save labels" }).click();
+    // Saving sits in the card's head, offered only while something changed.
+    const head = page.locator(".panel", { has: page.getByRole("heading", { name: "Labels", exact: true }) }).locator(".panel__head");
+    await head.getByRole("button", { name: "Save labels" }).click();
     await page.getByRole("status").filter({ hasText: "Labels of pi-2 saved" }).waitFor();
     await eventually(async () => assert.match(await page.locator(".kv").textContent(), /canary/));
+    await eventually(async () => assert.equal(await head.getByRole("button", { name: "Save labels" }).count(), 0));
+    await close();
+  });
+});
+
+describe("host notes", () => {
+  test("notes save themselves once typing pauses, and when the box loses focus", async () => {
+    const { page, close } = await open("/hosts/pi-2");
+    const notes = page.getByRole("textbox", { name: "Notes" });
+    const status = page.getByTestId("notes-status");
+    await notes.fill("Swapped the SD card.");
+    await eventually(async () => assert.match(await status.textContent(), /^Saved$/));
+    await notes.pressSequentially(" Again.", { delay: 20 });
+    await page.getByRole("heading", { name: "pi-2" }).click();
+    await eventually(async () => assert.match(await status.textContent(), /^Saved$/));
+    // Typing left unsaved is saved on the way out, and is there on the way back.
+    await notes.pressSequentially(" Done.", { delay: 20 });
+    await page.getByRole("link", { name: "Hosts" }).first().click();
+    await page.locator('tr[data-host="pi-2"]').getByRole("link", { name: "pi-2", exact: true }).click();
+    await eventually(async () =>
+      assert.equal(await page.getByRole("textbox", { name: "Notes" }).inputValue(), "Swapped the SD card. Again. Done."),
+    );
     await close();
   });
 });
