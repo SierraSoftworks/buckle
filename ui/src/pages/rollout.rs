@@ -407,7 +407,18 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
                         format!("Rollout {label}: {action} sent."),
                     ),
                     Ask::Host(action, host) => (
-                        api::rollout_host_action(&id, host, action, &note).await,
+                        // Redeploying a host that is done force applies it again.
+                        api::rollout_host_action(
+                            &id,
+                            host,
+                            if *action == "redeploy" {
+                                "force"
+                            } else {
+                                action
+                            },
+                            &note,
+                        )
+                        .await,
                         format!("{host}: {action} sent."),
                     ),
                     Ask::Continue(host, checks) => (
@@ -931,6 +942,11 @@ fn dialog(
                     true,
                     "Counts the host as baked now, without waiting out the rest of its bake window. Refused while one of its checks is failing.",
                 ),
+                "redeploy" => (
+                    "Redeploy",
+                    false,
+                    "Applies the host's plan again now, without approval or a digest check, then bakes it like any other host. Use it to re-run a deploy that already finished. Your note is recorded in the audit log.",
+                ),
                 "force" => (
                     "Force apply",
                     true,
@@ -1242,9 +1258,7 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <td title={timestamp(h.updated_at)}>{ relative(h.updated_at, props.now) }</td>
                                 <td class="row-controls">
                                     if props.admin {
-                                        {{ let (items, face) = host_menu(h, &props.on_ask); html! {
-                                            <SplitButton {items} small=true menu_only={!face} menu_label={format!("Actions for {}", h.host)} testid="host-actions" />
-                                        } }}
+                                        <SplitButton items={host_menu(h, &props.on_ask)} small=true menu_label={format!("More actions for {}", h.host)} testid="host-actions" />
                                     }
                                     <button type="button" class="icon-btn row-toggle" onclick={toggle}
                                         aria-expanded={open.to_string()} aria-label={format!("Details for {}", h.host)}
@@ -1270,11 +1284,12 @@ fn host_table(props: &HostTableProps) -> Html {
 }
 
 /// A host's own decisions, for the menu on its row.
-/// A host's own actions in a rollout, the most likely first: retry what
-/// failed, continue past its failed checks, or skip its bake period, then
-/// the ones that override the rollout. The second is whether the first is
-/// one its state calls for (a face); a routine row shows only its menu.
-fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> (Vec<MenuItem>, bool) {
+/// A host's own actions in a rollout, the most likely first (the split
+/// button's face): retry what failed, continue past its failed checks, skip
+/// its bake period, or redeploy a host already done, then the ones that
+/// override the rollout. A face that overrides the rollout (Skip on a host
+/// still applying) is not drawn red: the dialog says what it does.
+fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
     let item = |label: &str, a: Ask| {
         let on_ask = on_ask.clone();
         MenuItem::new(
@@ -1297,17 +1312,19 @@ fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> (Vec<MenuItem>, bool) {
     if h.state == HostRolloutState::Baking {
         items.push(item("Skip bake period…", Ask::Host("skip-bake", host())));
     }
-    if can_force_apply(h.state) {
+    if h.state == HostRolloutState::Healthy {
+        // Done: applying its plan again is the one thing left to ask.
+        items.push(item("Redeploy…", Ask::Host("redeploy", host())));
+    } else if can_force_apply(h.state) {
         items.push(item("Force apply…", Ask::Host("force", host())).danger());
     }
     if !finished_state(h.state) {
         items.push(item("Skip…", Ask::Host("skip", host())).danger());
     }
-    let face = matches!(
-        h.state,
-        HostRolloutState::Failed | HostRolloutState::Held | HostRolloutState::Baking
-    );
-    (items, face)
+    if let Some(face) = items.first_mut() {
+        face.kind = Kind::Default;
+    }
+    items
 }
 
 #[derive(Properties, PartialEq)]

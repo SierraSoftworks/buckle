@@ -280,6 +280,19 @@ describe("approving a phase", () => {
     await close();
   });
 
+  test("every host row offers an action on its face, and a host already done is redeployed", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const rows = page.getByTestId("host-actions");
+    await rows.first().waitFor();
+    for (const split of await rows.all()) assert.equal(await split.locator(".split__main").count(), 1);
+    const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-1", exact: true }) });
+    await act(row.getByTestId("host-actions"), "Redeploy…");
+    await page.getByRole("dialog", { name: "Redeploy pi-1" }).getByRole("button", { name: "Redeploy pi-1" }).click();
+    await page.getByRole("status").filter({ hasText: "pi-1: redeploy sent." }).waitFor();
+    await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-1"]').getAttribute("data-state"), "applying"));
+    await close();
+  });
+
   test("a baking host's bake can be skipped from its row's menu", async () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-3", exact: true }) });

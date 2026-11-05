@@ -85,10 +85,6 @@ pub struct SplitButtonProps {
     pub menu_label: AttrValue,
     #[prop_or_default]
     pub small: bool,
-    /// Nothing calls for an action yet (a routine row): no face, only the
-    /// chevron, and every action in its menu.
-    #[prop_or_default]
-    pub menu_only: bool,
     #[prop_or_default]
     pub testid: Option<AttrValue>,
 }
@@ -189,11 +185,6 @@ pub fn split_button(props: &SplitButtonProps) -> Html {
     let Some((face, rest)) = props.items.split_first() else {
         return html! {};
     };
-    let menu_items = if props.menu_only {
-        &props.items[..]
-    } else {
-        rest
-    };
     let toggle = {
         let (open, node) = (open.clone(), node.clone());
         Callback::from(move |_: MouseEvent| {
@@ -236,7 +227,7 @@ pub fn split_button(props: &SplitButtonProps) -> Html {
     let menu = (*open).as_ref().map(|at| {
         html! {
             <div class="split__menu" role="menu" style={at.clone()}>
-                { for groups(menu_items).into_iter().map(|(section, items)| html! {
+                { for groups(rest).into_iter().map(|(section, items)| html! {
                     <div class="split__group" role="group" aria-label={section.clone()}>
                         if let Some(s) = &section {
                             <div class="split__section" aria-hidden="true">{ s.clone() }</div>
@@ -263,25 +254,16 @@ pub fn split_button(props: &SplitButtonProps) -> Html {
     html! {
         <div class={classes!("split", open.is_some().then_some("split--open"))} ref={node}
             onfocusout={blur} onkeydown={key} onclick={contain} data-testid={props.testid.clone()}>
-            if props.menu_only {
-                <button type="button" class={classes!("btn", "split__toggle", "split__toggle--alone", small)} onclick={toggle}
-                    aria-haspopup="menu" aria-expanded={open.is_some().to_string()} aria-label={props.menu_label.clone()}
-                    title={props.menu_label.clone()}>
+            <button type="button" class={classes!("btn", "split__main", kind, small, rest.is_empty().then_some("split__main--alone"))}
+                title={face.title.clone()} onclick={face.onclick.clone()}>
+                { face.content() }
+            </button>
+            if !rest.is_empty() {
+                <button type="button" class={classes!("btn", "split__toggle", kind, small)} onclick={toggle}
+                    aria-haspopup="menu" aria-expanded={open.is_some().to_string()} aria-label={props.menu_label.clone()}>
                     { icons::chevron() }
                 </button>
                 { menu.unwrap_or_default() }
-            } else {
-                <button type="button" class={classes!("btn", "split__main", kind, small, rest.is_empty().then_some("split__main--alone"))}
-                    title={face.title.clone()} onclick={face.onclick.clone()}>
-                    { face.content() }
-                </button>
-                if !rest.is_empty() {
-                    <button type="button" class={classes!("btn", "split__toggle", kind, small)} onclick={toggle}
-                        aria-haspopup="menu" aria-expanded={open.is_some().to_string()} aria-label={props.menu_label.clone()}>
-                        { icons::chevron() }
-                    </button>
-                    { menu.unwrap_or_default() }
-                }
             }
         </div>
     }

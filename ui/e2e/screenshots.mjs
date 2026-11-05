@@ -156,7 +156,7 @@ const SHOTS = [
     path: "/rollouts/42",
     setup: async (p) => {
       const row = p.locator("tr", { has: p.getByRole("link", { name: "pi-5", exact: true }) });
-      await row.getByRole("button", { name: "Actions for pi-5" }).click();
+      await row.getByRole("button", { name: "More actions for pi-5" }).click();
       await row.getByRole("menuitem", { name: "Continue with checks waived…" }).click();
       await dialog(p).getByRole("checkbox").check();
     },
