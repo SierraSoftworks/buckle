@@ -41,6 +41,8 @@ pub struct ControllerOptions {
     pub disconnect_timeout: Duration,
     /// How long a host may stay applying without a result before it fails.
     pub apply_timeout: Duration,
+    /// How often an applied cluster's health is read outside rollouts.
+    pub cluster_health_interval: Duration,
 }
 
 /// How often an Apply is re-sent to a host that reconnects without having
@@ -56,6 +58,7 @@ impl Default for ControllerOptions {
         Self {
             disconnect_timeout: Duration::from_secs(600),
             apply_timeout: Duration::from_secs(30 * 60),
+            cluster_health_interval: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -582,6 +585,8 @@ struct Controller {
     ack_waiters: Vec<oneshot::Sender<bool>>,
     /// Pending durable reports found on load, replayed before any input.
     replay: Vec<(String, u64, agent_message::Msg)>,
+    /// When applied clusters' health is next read (outside rollouts).
+    cluster_health_due: DateTime<Utc>,
 }
 
 fn msg(m: server_message::Msg) -> ServerMessage {
@@ -829,6 +834,8 @@ impl Controller {
                 })
                 .await?;
         }
+        let cluster_health_due = now
+            + chrono::Duration::from_std(deps.options.cluster_health_interval).unwrap_or_default();
         Ok(Self {
             store: deps.store,
             link: deps.link,
@@ -858,6 +865,7 @@ impl Controller {
             pending_clear: Vec::new(),
             ack_waiters: Vec::new(),
             replay,
+            cluster_health_due,
         })
     }
 
@@ -4424,6 +4432,7 @@ impl Controller {
         let mut consider = |t: DateTime<Utc>| {
             next = Some(next.map_or(t, |n| n.min(t)));
         };
+        consider(self.cluster_health_due);
         if let Some(t) = self.flush_retry {
             consider(t);
         }
@@ -4636,6 +4645,7 @@ impl Controller {
 
     async fn drive(&mut self) {
         self.on_time().await;
+        self.read_cluster_health().await;
         for _ in 0..64 {
             let mut changed = false;
             for ri in 0..self.live.len() {
@@ -5539,6 +5549,63 @@ impl Controller {
     /// that wait for one, and asks the newly spoken-for ones for their
     /// plans. Run on every pass, so a host that connects or finishes its
     /// own wave is picked up at once.
+    /// Outside rollouts nothing reads a cluster's health: its executors are
+    /// stateless and run no drift pass. Every `cluster_health_interval`, each
+    /// applied cluster no rollout is working on is checked through its last
+    /// executor, while that one is connected and idle (as a host's agent
+    /// checks itself with each drift pass).
+    async fn read_cluster_health(&mut self) {
+        let now = self.now();
+        if now < self.cluster_health_due {
+            return;
+        }
+        self.cluster_health_due = now
+            + chrono::Duration::from_std(self.options.cluster_health_interval)
+                .unwrap_or_default()
+                .max(chrono::Duration::seconds(1));
+        let clusters = match self.store.call(|db| db.hosts().clusters()).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "the clusters could not be listed for their health");
+                return;
+            }
+        };
+        let busy = self.busy_elsewhere(usize::MAX);
+        for c in clusters {
+            if c.status != HostStatus::Active
+                || c.applied_revision.is_none()
+                || self.excluded.contains(&c.id)
+                || self.spoken_for_elsewhere(usize::MAX, &c.id)
+            {
+                continue;
+            }
+            let Some(executor) = self.executors.get(&c.id).cloned() else {
+                continue;
+            };
+            let capable = self
+                .capabilities
+                .get(&executor)
+                .is_some_and(|caps| caps.iter().any(|c| c == TARGETS_CAPABILITY));
+            if !capable || !self.eligible(&executor) || busy.contains(&executor) {
+                continue;
+            }
+            let m = msg(server_message::Msg::Health(RunHealth {
+                target: String::new(),
+                revision: String::new(),
+                request_id: new_id(),
+                scope: HealthScope::Drift as i32,
+                modules: vec![],
+                until: None,
+                traceparent: String::new(),
+            }));
+            self.outbox.push(Out::Targeted {
+                session: executor,
+                msg: Box::new(stamp_target(m, &c.id)),
+                target: c.id,
+            });
+        }
+    }
+
     async fn serve_waiting_executors(&mut self, ri: usize, p: usize, grace: bool) -> bool {
         let open = self.live[ri].record.runtime.phases[p].open_stage;
         let rows: Vec<usize> = self.live[ri]

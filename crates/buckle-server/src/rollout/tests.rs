@@ -4169,6 +4169,46 @@ async fn an_in_cluster_executor_serves_only_its_cluster() {
     assert!(untargeted.is_empty(), "{untargeted:?}");
 }
 
+/// Between rollouts an applied cluster's health is read every interval
+/// through its last executor (at the applied revision), and not while that
+/// executor is away.
+#[rstest::rstest]
+#[case::executor_connected(true)]
+#[case::executor_away(false)]
+#[tokio::test(start_paused = true)]
+async fn an_applied_clusters_health_is_read_between_rollouts(#[case] connected: bool) {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, FLAT)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::Completed).await;
+    h.store
+        .call(|db| db.hosts().set_applied_revision(CLUSTER, "r1"))
+        .await
+        .unwrap();
+    if !connected {
+        h.disconnect("n1");
+    }
+    h.idle(11 * 60).await;
+    let reads = h.sent(|x, m| {
+        x == "n1"
+            && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Drift as i32 && r.target == CLUSTER)
+    });
+    if connected {
+        assert!(reads.len() >= 2, "read every interval: {reads:?}");
+        assert!(
+            reads
+                .iter()
+                .all(|(_, _, m)| matches!(m, SMsg::Health(r) if r.revision == "r1")),
+            "{reads:?}"
+        );
+    } else {
+        assert!(reads.is_empty(), "{reads:?}");
+    }
+}
+
 /// A cluster none of whose candidate executors runs a pipeline per target is
 /// handed nothing, waits through the grace, misses its phase and converges
 /// in the stragglers stage once a capable host connects.

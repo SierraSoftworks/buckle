@@ -6,7 +6,8 @@
 //!   version succeeded (service jobs); batch and system jobs are placed and
 //!   not failing.
 //! * `services`: every Nomad-native service check of the job's running
-//!   allocations passes. Absent when the job registers none.
+//!   allocations (not those being stopped) passes. Absent when the job
+//!   registers none.
 
 use crate::client::{Nomad, seg, with_query};
 use crate::primitives::job::deployment_progress;
@@ -146,14 +147,20 @@ pub fn job_status(job: &Value, allocs: &[Value], deployment: &Value) -> HealthSt
     }
 }
 
-/// The `services` check: Nomad-native service checks of running allocations.
+/// The allocations whose service checks speak for the job: running and
+/// meant to stay so. One Nomad is stopping (a destructive update's old
+/// allocation through its `shutdown_delay`) still passes its checks.
+fn serving(allocs: &[Value]) -> impl Iterator<Item = &Value> {
+    allocs.iter().filter(|a| {
+        a["ClientStatus"].as_str() == Some("running") && a["DesiredStatus"].as_str() == Some("run")
+    })
+}
+
+/// The `services` check: Nomad-native service checks of serving allocations.
 async fn services(nomad: &Nomad, ns: &str, allocs: &[Value]) -> Result<Option<HealthStatus>> {
     let mut total: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut detail: BTreeMap<String, String> = BTreeMap::new();
-    for alloc in allocs
-        .iter()
-        .filter(|a| a["ClientStatus"].as_str() == Some("running"))
-    {
+    for alloc in serving(allocs) {
         let id = alloc["ID"].as_str().unwrap_or_default();
         let url = with_query(
             &format!("/v1/allocation/{}/checks", seg(id)),
@@ -235,6 +242,20 @@ mod tests {
     ) {
         let status = job_status(&job, &allocs, &deployment);
         assert_eq!(status.is_pass(), healthy, "{status:?}");
+    }
+
+    #[rstest::rstest]
+    #[case::running("run", "running", true)]
+    #[case::stopping("stop", "running", false)]
+    #[case::evicted("evict", "running", false)]
+    #[case::pending("run", "pending", false)]
+    fn only_serving_allocations_answer_for_services(
+        #[case] desired: &str,
+        #[case] client: &str,
+        #[case] serves: bool,
+    ) {
+        let allocs = [json!({"DesiredStatus": desired, "ClientStatus": client})];
+        assert_eq!(serving(&allocs).count() == 1, serves);
     }
 
     #[test]
