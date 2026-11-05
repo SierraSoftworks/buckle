@@ -15,8 +15,8 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Empty, ErrorState, HostLink, Kind, Loading, PageHead, Panel, Pill, Refresh, RunAction,
-    icons,
+    Button, Empty, ErrorState, HostLink, Kind, Loading, MenuItem, PageHead, Panel, Pill, Refresh,
+    RunAction, SplitButton, icons,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::clusters::deploying_text;
@@ -88,7 +88,7 @@ pub fn clusters() -> Html {
     };
     let add = {
         let adding = adding.clone();
-        Callback::from(move |_| adding.set(true))
+        Callback::from(move |_: MouseEvent| adding.set(true))
     };
 
     let (body, subtitle) = match (&live, &fleet.error) {
@@ -174,10 +174,10 @@ pub fn clusters() -> Html {
                 actions={html! { <>
                     <Refresh loading={fleet.loading} reload={fleet.reload.clone()} />
                     if auth.is_admin() {
-                        <Button onclick={{ let r = running.clone(); Callback::from(move |_| r.set(true)) }}>{ "Run action…" }</Button>
-                    }
-                    if auth.is_admin() {
-                        <Button kind={Kind::Primary} onclick={add}>{ icons::plus() }{ "Add a cluster…" }</Button>
+                        <SplitButton menu_label="More cluster actions" testid="clusters-actions" items={vec![
+                            MenuItem::new("Add a cluster…", add.clone()).kind(Kind::Primary),
+                            { let r = running.clone(); MenuItem::new("Run action…", Callback::from(move |_| r.set(true))) },
+                        ]} />
                     }
                 </> }} />
             <Panel>{ body }</Panel>

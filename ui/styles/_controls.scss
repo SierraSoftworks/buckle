@@ -123,8 +123,8 @@ $tones: (
   }
 }
 
-// A button with a menu: the expected action on its face, the rest behind
-// the chevron.
+// A button with a menu: the most likely action on its face, the rest
+// behind the chevron, grouped in sections.
 .split {
   position: relative;
   display: inline-flex;
@@ -132,6 +132,10 @@ $tones: (
   &__main {
     border-top-right-radius: 0;
     border-bottom-right-radius: 0;
+
+    &--alone {
+      border-radius: var(--radius);
+    }
   }
 
   &__toggle {
@@ -139,6 +143,15 @@ $tones: (
     padding: 0.35rem 0.45rem;
     border-top-left-radius: 0;
     border-bottom-left-radius: 0;
+
+    &.btn--small {
+      padding: 0.2rem 0.35rem;
+    }
+
+    &--alone {
+      margin-left: 0;
+      border-radius: var(--radius);
+    }
 
     svg {
       transform: rotate(90deg);
@@ -154,19 +167,54 @@ $tones: (
     transform: rotate(-90deg);
   }
 
+  // Which module (or source) an action belongs to, after its name.
+  &__aside {
+    margin-left: 0.15rem;
+    color: var(--muted);
+    font-size: 0.85em;
+  }
+
+  .btn--primary &__aside,
+  .btn--danger &__aside {
+    color: inherit;
+    opacity: 0.75;
+  }
+
+  // Placed against the viewport when opened, so a table cannot clip it.
   &__menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 0;
+    position: fixed;
     z-index: 30;
     display: flex;
     flex-direction: column;
     min-width: 11rem;
+    max-height: min(70vh, 32rem);
+    overflow-y: auto;
     padding: 0.3rem;
     border: 1px solid var(--line-strong);
     border-radius: var(--radius);
     background: var(--surface);
     box-shadow: var(--shadow);
+    text-align: left;
+  }
+
+  &__group {
+    display: flex;
+    flex-direction: column;
+
+    & + & {
+      margin-top: 0.3rem;
+      padding-top: 0.3rem;
+      border-top: 1px solid var(--line);
+    }
+  }
+
+  &__section {
+    padding: 0.25rem 0.65rem 0.15rem;
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
 
   &__item {
@@ -176,6 +224,7 @@ $tones: (
     background: none;
     color: var(--fg);
     font: inherit;
+    font-weight: normal;
     text-align: left;
     cursor: pointer;
     white-space: nowrap;
@@ -183,6 +232,10 @@ $tones: (
     &:hover,
     &:focus-visible {
       background: var(--surface-2);
+    }
+
+    &--caution {
+      color: var(--caution);
     }
 
     &--danger {
@@ -194,7 +247,7 @@ $tones: (
       }
     }
 
-    // The gentle decisions first, a rule before the ones that end or undo.
+    // The gentle actions first, a rule before the ones that end or undo.
     &:not(.split__item--danger) + .split__item--danger {
       margin-top: 0.3rem;
       border-top: 1px solid var(--line);

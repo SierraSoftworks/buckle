@@ -81,27 +81,34 @@ function controls(page) {
   return page.getByTestId("rollout-controls").first();
 }
 
-/** Takes a rollout decision: from the split button's face, else its menu. */
-export async function decide(page, name) {
-  const c = controls(page);
-  await c.waitFor();
-  const face = c.locator(".split__main");
-  if ((await face.textContent()).trim() === name) return face.click();
-  await c.getByRole("button", { name: "More rollout actions" }).click();
-  await c.getByRole("menuitem", { name, exact: true }).click();
+/** Runs an action from a split button: its face when it is the one, else its menu. */
+export async function act(split, name) {
+  const s = split.first();
+  await s.waitFor();
+  const face = s.locator(".split__main");
+  if ((await face.count()) && (await face.textContent()).trim() === name) return face.click();
+  await s.locator(".split__toggle").click();
+  await s.getByRole("menuitem", { name, exact: true }).click();
 }
 
-/** The decisions the split button offers: its face, then its menu. */
-export async function decisions(page) {
-  const c = controls(page);
-  await c.waitFor();
-  const face = (await c.locator(".split__main").textContent()).trim();
-  const toggle = c.getByRole("button", { name: "More rollout actions" });
+/** The actions a split button offers: its face (if any), then its menu. */
+export async function offered(split) {
+  const s = split.first();
+  await s.waitFor();
+  const main = s.locator(".split__main");
+  const face = (await main.count()) ? (await main.textContent()).trim() : null;
+  const toggle = s.locator(".split__toggle");
   if (!(await toggle.count())) return { face, menu: [] };
   await toggle.click();
-  const menu = (await c.getByRole("menuitem").allTextContents()).map((t) => t.trim());
-  await page.keyboard.press("Escape");
+  const menu = (await s.getByRole("menuitem").allTextContents()).map((t) => t.trim());
+  await s.page().keyboard.press("Escape");
   return { face, menu };
 }
+
+/** Takes a rollout decision: from the split button's face, else its menu. */
+export const decide = (page, name) => act(controls(page), name);
+
+/** The decisions the split button offers: its face, then its menu. */
+export const decisions = (page) => offered(controls(page));
 
 export { assert };

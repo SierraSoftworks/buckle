@@ -18,10 +18,11 @@ use super::modules_card::ModulesPanel;
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh, RouteLink, icons,
-    use_target_actions, use_toast,
+    Confirm, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink, SplitButton, icons,
+    target_items, use_target_actions, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
+use crate::logic::controls::{TargetAction, TargetStanding, head_actions};
 use crate::logic::format::{commit, relative_opt, timestamp};
 use crate::logic::live::{apply_fleet, apply_host_detail};
 use crate::logic::run::newest_run;
@@ -50,6 +51,10 @@ pub fn cluster_page(props: &Props) -> Html {
     let live = use_live_value(&detail, apply_host_detail);
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
+    let review = super::rollout::use_approval_wanted(
+        fleet.as_ref().and_then(|f| f.active_rollout.clone()),
+        props.id.clone(),
+    );
     let ask = use_state(|| None::<Ask>);
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
@@ -182,18 +187,33 @@ pub fn cluster_page(props: &Props) -> Html {
 
     let actions = html! { <>
         <Refresh loading={detail.loading} reload={detail.reload.clone()} />
-        // No head menu of actions: each is its workload's own, on its row.
+        // The cluster's own actions; each workload's are on its row.
         if admin {
-            if c.status == HostStatus::Paused {
-                <Button onclick={open(Ask::Resume)}>{ "Resume" }</Button>
-            } else {
-                <Button onclick={open(Ask::Pause)}>{ "Pause…" }</Button>
-            }
-            // A declared cluster follows the repository: it goes when
-            // buckle.yaml stops declaring it.
-            if !declared {
-                <Button kind={Kind::Danger} onclick={open(Ask::Forget)}>{ "Forget…" }</Button>
-            }
+            <SplitButton items={{
+                // A declared cluster follows the repository: it goes when
+                // buckle.yaml stops declaring it.
+                let (own, primary) = head_actions(TargetStanding {
+                    paused: c.status == HostStatus::Paused,
+                    approval_wanted: review.is_some(),
+                    forgettable: !declared,
+                    ..Default::default()
+                });
+                target_items(&own, primary, Vec::new(), |a| match a {
+                    TargetAction::ApproveRollout => {
+                        let (navigator, id) = (navigator.clone(), review.clone().unwrap_or_default());
+                        Callback::from(move |_: MouseEvent| {
+                            if let Some(n) = &navigator {
+                                n.push(&Route::rollout(&id));
+                            }
+                        })
+                    }
+                    TargetAction::Resume => open(Ask::Resume),
+                    TargetAction::Forget => open(Ask::Forget),
+                    TargetAction::Pause => open(Ask::Pause),
+                    // Clusters have no registration or agent of their own.
+                    TargetAction::ApproveRegistration | TargetAction::UpgradeAgent => Callback::noop(),
+                })
+            }} menu_label="More cluster actions" testid="cluster-actions" />
         }
     </> };
     let kind = info

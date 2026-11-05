@@ -168,6 +168,72 @@ pub fn replan_label(state: HostRolloutState, has_plan: bool) -> &'static str {
     }
 }
 
+/// A host's (or cluster's) own actions, as its page head offers them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetAction {
+    ApproveRegistration,
+    /// Review and approve the rollout phase waiting on it.
+    ApproveRollout,
+    UpgradeAgent,
+    Pause,
+    Resume,
+    Forget,
+}
+
+impl TargetAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            TargetAction::ApproveRegistration => "Approve registration…",
+            TargetAction::ApproveRollout => "Approve rollout…",
+            TargetAction::UpgradeAgent => "Upgrade agent…",
+            TargetAction::Pause => "Pause…",
+            TargetAction::Resume => "Resume",
+            TargetAction::Forget => "Forget…",
+        }
+    }
+}
+
+/// What a target's head can offer: its state, and what calls for action.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TargetStanding {
+    pub pending: bool,
+    pub paused: bool,
+    /// A rollout wants an approval for a phase that holds it.
+    pub approval_wanted: bool,
+    /// Its agent can be upgraded (a host, online).
+    pub upgradable: bool,
+    /// Its agent is behind the version the fleet converges to.
+    pub behind: bool,
+    pub forgettable: bool,
+}
+
+/// A target's own actions, the most likely first (the split button's face)
+/// and Forget last: approve its registration, then a rollout waiting on it,
+/// then upgrade an agent that is behind, then pause or resume. The second
+/// is whether the face is what the target's state calls for (a primary
+/// button) rather than the routine choice.
+pub fn head_actions(s: TargetStanding) -> (Vec<TargetAction>, bool) {
+    use TargetAction::*;
+    let upgrade_first = s.upgradable && s.behind;
+    let all: Vec<TargetAction> = [
+        (s.pending, ApproveRegistration),
+        (s.approval_wanted, ApproveRollout),
+        (upgrade_first, UpgradeAgent),
+        (s.paused, Resume),
+        (!s.paused, Pause),
+        (s.upgradable && !upgrade_first, UpgradeAgent),
+        (s.forgettable, Forget),
+    ]
+    .into_iter()
+    .filter_map(|(on, a)| on.then_some(a))
+    .collect();
+    let called_for = matches!(
+        all.first(),
+        Some(ApproveRegistration | ApproveRollout | UpgradeAgent | Resume)
+    );
+    (all, called_for)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +422,72 @@ mod tests {
         ] {
             assert_eq!(replan_label(state, has_plan), want, "{state:?} {has_plan}");
         }
+    }
+
+    #[test]
+    fn a_targets_head_puts_what_its_state_calls_for_first() {
+        use TargetAction::*;
+        let base = TargetStanding {
+            upgradable: true,
+            forgettable: true,
+            ..Default::default()
+        };
+        for (case, s, face, called_for) in [
+            ("routine", base, Pause, false),
+            (
+                "paused",
+                TargetStanding {
+                    paused: true,
+                    ..base
+                },
+                Resume,
+                true,
+            ),
+            (
+                "behind",
+                TargetStanding {
+                    behind: true,
+                    ..base
+                },
+                UpgradeAgent,
+                true,
+            ),
+            (
+                "rollout waiting",
+                TargetStanding {
+                    approval_wanted: true,
+                    behind: true,
+                    ..base
+                },
+                ApproveRollout,
+                true,
+            ),
+            (
+                "pending",
+                TargetStanding {
+                    pending: true,
+                    approval_wanted: true,
+                    ..base
+                },
+                ApproveRegistration,
+                true,
+            ),
+        ] {
+            let (all, primary) = head_actions(s);
+            assert_eq!(all.first(), Some(&face), "{case}");
+            assert_eq!(primary, called_for, "{case}");
+            assert_eq!(all.last(), Some(&Forget), "{case}: forget comes last");
+            assert_eq!(
+                all.iter().filter(|a| **a == UpgradeAgent).count(),
+                1,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_offers_only_what_it_can_do() {
+        let (all, _) = head_actions(TargetStanding::default());
+        assert_eq!(all, vec![TargetAction::Pause]);
     }
 }
