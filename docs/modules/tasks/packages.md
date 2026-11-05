@@ -39,8 +39,11 @@ Add a repository as a deb822 `.sources` file, with its signing key.
 
 <KindReference registry="tasks" kind="apt.repository" />
 
-Applying runs `apt-get update` once, so a following `apt.package` sees the new packages. Removal
-deletes the sources file and key (keeping a sources file edited by hand) and updates again.
+Applying runs `apt-get update` once, so a following `apt.package` sees the new packages. If apt
+rejects the source (another file listing the same URI with a different key, for instance), the
+files it wrote are put back as they were and the error names the conflicting file: remove that
+file in an earlier step. Removal deletes the sources file and key (keeping a sources file edited
+by hand) and updates again.
 
 ## apt.package
 
