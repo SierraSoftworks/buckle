@@ -106,7 +106,8 @@ impl FakeKube {
     }
 
     /// How rollouts end: `complete`, `stuck` (progress deadline exceeded),
-    /// `crashloop` (complete, but a pod is in CrashLoopBackOff), `pending`.
+    /// `crashloop` (complete, but a pod is in CrashLoopBackOff), `pending`,
+    /// `unschedulable` (pending, with a pod no node fits).
     pub fn rollout_outcome(&self, outcome: &str) {
         self.state.lock().unwrap().outcome = outcome.into();
     }
@@ -442,12 +443,21 @@ impl FakeKube {
                         }
                     }
                 }
-                if outcome == "crashloop" && r.kind == "Deployment" {
+                let pod_status = match outcome.as_str() {
+                    "crashloop" => Some(
+                        json!({"containerStatuses": [{"name": "app", "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}),
+                    ),
+                    "unschedulable" => Some(
+                        json!({"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "0/1 nodes are available: 1 Insufficient memory."}]}),
+                    ),
+                    _ => None,
+                };
+                if let Some(pod_status) = pod_status.filter(|_| r.kind == "Deployment") {
                     let labels = obj["spec"]["selector"]["matchLabels"].clone();
                     s.version += 1;
                     let pod = json!({"apiVersion": "v1", "kind": "Pod",
                         "metadata": {"name": format!("{name}-abc"), "namespace": ns, "labels": labels},
-                        "status": {"containerStatuses": [{"name": "app", "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}});
+                        "status": pod_status});
                     s.objects.insert(
                         (
                             "v1".into(),
@@ -536,7 +546,7 @@ fn simulate(obj: &mut Value, outcome: &str) {
             json!({"observedGeneration": generation, "replicas": replicas, "updatedReplicas": 0,
             "conditions": [{"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded", "message": "ReplicaSet has timed out progressing"}]})
         }
-        "pending" => {
+        "pending" | "unschedulable" => {
             json!({"observedGeneration": generation, "replicas": replicas, "updatedReplicas": 0})
         }
         _ => {

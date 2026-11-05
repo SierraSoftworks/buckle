@@ -338,7 +338,9 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
     Ok(Applied::changed(format!("applied {key}")))
 }
 
-/// Polls `path` until `state` reports done, failed, or the rollout timeout.
+/// Polls `path` until `state` reports done, failed, or the rollout timeout;
+/// a controller also fails once its pods stay unplaceable for the placement
+/// timeout.
 async fn wait(
     cx: &Context,
     key: &ObjectKey,
@@ -346,6 +348,7 @@ async fn wait(
     state: impl Fn(&Value) -> Rollout,
 ) -> Result<String> {
     let started = tokio::time::Instant::now();
+    let mut unplaced_since: Option<tokio::time::Instant> = None;
     let mut last = String::new();
     loop {
         let obj = cx.kube.get(path).await?.unwrap_or(Value::Null);
@@ -364,6 +367,30 @@ async fn wait(
                     (cx.progress)(&format!("{key}: {s}"));
                     last = s;
                 }
+                if health::is_rollout(key) {
+                    let unplaced = match health::pods(&cx.kube, key, &obj).await? {
+                        Some(pods) => health::unplaced_pods(&pods),
+                        None => Vec::new(),
+                    };
+                    if unplaced.is_empty() {
+                        unplaced_since = None;
+                    } else if unplaced_since
+                        .get_or_insert_with(tokio::time::Instant::now)
+                        .elapsed()
+                        >= cx.placement_timeout
+                    {
+                        return Err(user(
+                            format!(
+                                "{key} could not be placed for {}s: {}",
+                                cx.placement_timeout.as_secs(),
+                                unplaced.join("; ")
+                            ),
+                            &[
+                                "Free capacity, fix the pods' node selectors, affinities or volumes, or raise the workload's `timeouts.placement`.",
+                            ],
+                        ));
+                    }
+                }
             }
         }
         if started.elapsed() >= cx.rollout_timeout {
@@ -372,7 +399,9 @@ async fn wait(
                     "{key} was still rolling out after {}s ({last}).",
                     cx.rollout_timeout.as_secs()
                 ),
-                &["The rollout continues in the cluster; plan again once it settles."],
+                &[
+                    "The rollout continues in the cluster; plan again once it settles, or raise the workload's `timeouts.rollout`.",
+                ],
             ));
         }
         tokio::time::sleep(cx.poll).await;
