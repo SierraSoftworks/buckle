@@ -12,7 +12,7 @@ use buckle_core::task::{Applied, Artefact, Cx, Task};
 use buckle_core::{Digest, Platforms, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Adds an apt repository as a deb822 `.sources` file and downloads its signing key.
@@ -35,7 +35,9 @@ use std::time::Duration;
 /// each URI, for private repositories; its content never appears in plans.
 ///
 /// Plans diff the rendered sources file; a missing key file is also a change
-/// (the key's contents are not compared). Applying runs `apt-get update` once.
+/// (the key's contents are not compared). Applying runs `apt-get update` once;
+/// when that (or any later step) fails, the files it wrote are put back as they
+/// were, so a source apt rejects never outlives the failed apply.
 /// Removal deletes both files (leaving the sources file in place if it was
 /// edited by hand since Buckle wrote it) and runs `apt-get update`.
 pub struct AptRepository;
@@ -323,64 +325,12 @@ impl Task for AptRepository {
     #[tracing::instrument(name = "task.apt.repository.apply", skip_all, fields(repository = %spec.name))]
     async fn apply(&self, cx: &Cx, spec: &Spec, _planned: &Planned) -> Result<Applied> {
         spec.validate()?;
-        let mut artefacts = Vec::new();
-        if let Some(Key {
-            path,
-            url: Some(url),
-        }) = spec.key()
-        {
-            let response = cx
-                .system
-                .http(HttpRequest::get(url.as_str()).timeout(Duration::from_secs(60)))
-                .await?;
-            if !(200..300).contains(&response.status) {
-                return Err(buckle_core::error::user(
-                    format!(
-                        "Downloading the signing key for apt repository '{}' from {url} returned HTTP {}.",
-                        spec.name, response.status
-                    ),
-                    &["Check the `signed_by` URL; the vendor may have moved the key."],
-                ));
-            }
-            cx.system
-                .write_atomic(
-                    std::path::Path::new(&path),
-                    &response.body,
-                    &FilePerms::mode(0o644),
-                )
-                .await?;
-            artefacts.push(Artefact::File { path: path.into() });
+        let mut undo = Undo::default();
+        match write_and_update(cx, spec, &mut undo).await {
+            Ok(applied) => Ok(applied),
+            Err(err) if undo.is_empty() => Err(err),
+            Err(err) => Err(undo.restore(cx, spec, err).await),
         }
-        if let Some(rendered) = spec.render_auth(cx)? {
-            let path = spec.auth_path();
-            if let Some(dir) = path.parent() {
-                cx.system.mkdir_all(dir, &FilePerms::mode(0o755)).await?;
-            }
-            FileSink
-                .write_rendered(&*cx.system, &path, &rendered, &FilePerms::mode(0o600))
-                .await?;
-            artefacts.push(Artefact::File { path });
-        }
-        let content = spec.render();
-        let sources = spec.sources_path();
-        cx.system
-            .write_atomic(&sources, content.as_bytes(), &FilePerms::mode(0o644))
-            .await?;
-        run_checked(cx, apt_get("update", false)).await?;
-
-        let mut applied = Applied::changed(format!("added apt repository {}", spec.name))
-            .with_shadow(
-                Redacted::plain(content.clone()),
-                Digest::of(content.as_bytes()),
-            );
-        applied = applied.with_artefact(Artefact::File { path: sources });
-        for a in artefacts {
-            applied = applied.with_artefact(a);
-        }
-        Ok(applied.with_artefact(Artefact::Repository {
-            manager: "apt".into(),
-            name: spec.name.clone(),
-        }))
     }
 
     fn describe_removal(&self, record: &ResourceRecord) -> String {
@@ -431,6 +381,183 @@ impl Task for AptRepository {
             record.key.key
         )))
     }
+}
+
+/// Writes the key, credentials and sources file, then runs `apt-get update`.
+/// Every write is recorded in `undo` first, so a failure part-way (most often
+/// apt rejecting the new source) can put the host back as it was.
+async fn write_and_update(cx: &Cx, spec: &Spec, undo: &mut Undo) -> Result<Applied> {
+    let mut artefacts = Vec::new();
+    if let Some(Key {
+        path,
+        url: Some(url),
+    }) = spec.key()
+    {
+        let response = cx
+            .system
+            .http(HttpRequest::get(url.as_str()).timeout(Duration::from_secs(60)))
+            .await?;
+        if !(200..300).contains(&response.status) {
+            return Err(buckle_core::error::user(
+                format!(
+                    "Downloading the signing key for apt repository '{}' from {url} returned HTTP {}.",
+                    spec.name, response.status
+                ),
+                &["Check the `signed_by` URL; the vendor may have moved the key."],
+            ));
+        }
+        let path = PathBuf::from(path);
+        undo.remember(cx, &path).await?;
+        cx.system
+            .write_atomic(&path, &response.body, &FilePerms::mode(0o644))
+            .await?;
+        artefacts.push(Artefact::File { path });
+    }
+    if let Some(rendered) = spec.render_auth(cx)? {
+        let path = spec.auth_path();
+        if let Some(dir) = path.parent() {
+            cx.system.mkdir_all(dir, &FilePerms::mode(0o755)).await?;
+        }
+        undo.remember(cx, &path).await?;
+        FileSink
+            .write_rendered(&*cx.system, &path, &rendered, &FilePerms::mode(0o600))
+            .await?;
+        artefacts.push(Artefact::File { path });
+    }
+    let content = spec.render();
+    let sources = spec.sources_path();
+    undo.remember(cx, &sources).await?;
+    cx.system
+        .write_atomic(&sources, content.as_bytes(), &FilePerms::mode(0o644))
+        .await?;
+    run_checked(cx, apt_get("update", false)).await?;
+
+    let mut applied = Applied::changed(format!("added apt repository {}", spec.name)).with_shadow(
+        Redacted::plain(content.clone()),
+        Digest::of(content.as_bytes()),
+    );
+    applied = applied.with_artefact(Artefact::File { path: sources });
+    for a in artefacts {
+        applied = applied.with_artefact(a);
+    }
+    Ok(applied.with_artefact(Artefact::Repository {
+        manager: "apt".into(),
+        name: spec.name.clone(),
+    }))
+}
+
+/// What a file held before apply wrote it: `None` when apply created it.
+struct Prior {
+    path: PathBuf,
+    before: Option<(Vec<u8>, FilePerms)>,
+}
+
+/// The files a failed apply must put back. A failed task records no resource,
+/// so neither removal nor the module rollback will ever touch these files: a
+/// source apt rejects would otherwise break every later `apt-get update`.
+#[derive(Default)]
+struct Undo(Vec<Prior>);
+
+impl Undo {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    async fn remember(&mut self, cx: &Cx, path: &Path) -> Result<()> {
+        let before = match cx.system.read(path).await? {
+            Some(bytes) => {
+                let meta = cx.system.stat(path).await?;
+                let perms = FilePerms {
+                    mode: meta.as_ref().and_then(|m| m.mode),
+                    owner: meta.as_ref().and_then(|m| m.owner.clone()),
+                    group: meta.and_then(|m| m.group),
+                };
+                Some((bytes, perms))
+            }
+            None => None,
+        };
+        self.0.push(Prior {
+            path: path.to_owned(),
+            before,
+        });
+        Ok(())
+    }
+
+    /// Puts every remembered file back (newest first) and explains `err` with
+    /// what was restored, or which files still need removing by hand.
+    async fn restore(self, cx: &Cx, spec: &Spec, err: buckle_core::Error) -> buckle_core::Error {
+        let mut stuck = Vec::new();
+        for prior in self.0.into_iter().rev() {
+            let done = match &prior.before {
+                Some((bytes, perms)) => cx.system.write_atomic(&prior.path, bytes, perms).await,
+                None => cx.system.remove(&prior.path, false).await.map(|_| ()),
+            };
+            if let Err(e) = done {
+                tracing::warn!(path = %prior.path.display(), error = %e.description(), "could not restore a file after a failed apply");
+                stuck.push(prior.path.display().to_string());
+            }
+        }
+        let mut message = if stuck.is_empty() {
+            format!(
+                "Adding apt repository '{}' failed; the files it wrote were restored to what was there before.",
+                spec.name
+            )
+        } else {
+            format!(
+                "Adding apt repository '{}' failed, and {} could not be restored: delete or fix it by hand, as apt may reject its sources until then.",
+                spec.name,
+                stuck.join(" and ")
+            )
+        };
+        for conflict in conflicts(cx, spec, &err).await {
+            message.push(' ');
+            message.push_str(&conflict);
+        }
+        buckle_core::error::wrap_user(
+            err,
+            message,
+            &["Fix the repository definition (or what conflicts with it) and apply again."],
+        )
+    }
+}
+
+/// When apt refused the new source because another file already lists one of
+/// its URIs with a different key, one sentence per such file.
+async fn conflicts(cx: &Cx, spec: &Spec, err: &buckle_core::Error) -> Vec<String> {
+    if !err
+        .description()
+        .contains("Conflicting values set for option Signed-By")
+    {
+        return Vec::new();
+    }
+    let own = spec.sources_path();
+    let mut files = vec![PathBuf::from("/etc/apt/sources.list")];
+    if let Ok(Some(entries)) = cx
+        .system
+        .list_dir(Path::new("/etc/apt/sources.list.d"))
+        .await
+    {
+        files.extend(entries);
+    }
+    let uris: Vec<&str> = spec
+        .all_uris()
+        .into_iter()
+        .map(|u| u.trim_end_matches('/'))
+        .collect();
+    let mut advice = Vec::new();
+    for file in files.into_iter().filter(|f| *f != own) {
+        let Ok(Some(bytes)) = cx.system.read(&file).await else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(uri) = uris.iter().find(|u| text.contains(**u)) {
+            advice.push(format!(
+                "{} already lists {uri} with a different signing key: remove it (e.g. with `file.absent`) in a step before this `apt.repository`.",
+                file.display()
+            ));
+        }
+    }
+    advice
 }
 
 fn file_artefacts(record: &ResourceRecord) -> Vec<PathBuf> {
@@ -630,6 +757,74 @@ mod tests {
             .unwrap_err();
         assert!(err.description().contains("'gone'") && err.description().contains("404"));
         assert!(!sys.exists("/etc/apt/sources.list.d/gone.sources"));
+    }
+
+    const CONFLICT: &str = "E: Conflicting values set for option Signed-By regarding source https://apt.releases.hashicorp.com/ bookworm: /usr/share/keyrings/old.gpg != /usr/share/keyrings/hashicorp.asc\nE: The list of sources could not be read.\n";
+    const OLD_LIST: &str = "/etc/apt/sources.list.d/hashicorp-old.list";
+
+    /// A host whose `apt-get update` rejects the sources, with `existing` files already in place.
+    fn rejecting_host(existing: &[(&str, &str)]) -> FakeSystem {
+        existing.iter().fold(
+            FakeSystem::new()
+                .on_http("https://apt.releases.hashicorp.com/gpg", |_| HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: KEY.as_bytes().to_vec(),
+                })
+                .on_command_fail("apt-get", &["update"], 100, CONFLICT)
+                .with_file(
+                    OLD_LIST,
+                    "deb [signed-by=/usr/share/keyrings/old.gpg] https://apt.releases.hashicorp.com bookworm main\n",
+                    FilePerms::mode(0o644),
+                ),
+            |sys, (path, content)| sys.with_file(path, *content, FilePerms::mode(0o640)),
+        )
+    }
+
+    #[rstest]
+    #[case::new_repository(&[])]
+    #[case::changed_repository(&[
+        ("/etc/apt/sources.list.d/hashicorp.sources", "Types: deb\nURIs: https://old.example\nSuites: bookworm\n"),
+        ("/usr/share/keyrings/hashicorp.asc", "old key"),
+        ("/etc/apt/auth.conf.d/hashicorp.conf", "machine old.example login a password b\n"),
+    ])]
+    #[tokio::test]
+    async fn a_rejected_source_puts_the_files_back(#[case] existing: &[(&str, &str)]) {
+        let sys = rejecting_host(existing);
+        let cx = cx(&sys);
+        let mut raw = hashicorp();
+        raw["auth"] = json!({"login": "ci", "password": "token"});
+        let s: Spec = spec(raw);
+
+        let err = AptRepository
+            .apply(&cx, &s, &Planned::NoOp)
+            .await
+            .unwrap_err();
+
+        assert!(err.is(buckle_core::error::Kind::User), "{err:?}");
+        assert!(
+            err.description().contains("restored"),
+            "{}",
+            err.description()
+        );
+        assert!(
+            err.description().contains(OLD_LIST),
+            "names the conflicting file: {}",
+            err.description()
+        );
+        assert!(
+            format!("{err:?}").contains("Conflicting values"),
+            "keeps apt's message: {err:?}"
+        );
+        for path in [
+            "/etc/apt/sources.list.d/hashicorp.sources",
+            "/usr/share/keyrings/hashicorp.asc",
+            "/etc/apt/auth.conf.d/hashicorp.conf",
+        ] {
+            let before = existing.iter().find(|(p, _)| *p == path).map(|(_, c)| *c);
+            assert_eq!(sys.file_string(path).as_deref(), before, "{path}");
+        }
+        assert!(sys.exists(OLD_LIST), "other files are not touched");
     }
 
     #[tokio::test]
