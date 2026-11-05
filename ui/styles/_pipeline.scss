@@ -283,6 +283,17 @@
     opacity: 0.5;
   }
 
+  // A cluster: a virtual node, round so it never reads as a host.
+  &--cluster {
+    border-radius: 50%;
+  }
+
+  // Held for an earlier stage or an executor: hollow, whatever it planned.
+  &--waiting {
+    background: transparent;
+    border: 1px dashed var(--info);
+  }
+
   &--waived::after {
     content: "";
     position: absolute;

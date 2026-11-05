@@ -25,7 +25,7 @@ describe("every page renders in demo mode", () => {
     const drawn = await page.locator(".overview__fleet a.block").count();
     const total = Number(await page.locator(".tile--plain .tile__value").textContent());
     // Cluster targets are drawn beside the hosts but are not counted in the total.
-    const clusters = await page.locator('.overview__fleet a.block').filter({ has: page.locator(".block__name", { hasText: /^home-nomad$/ }) }).count();
+    const clusters = await page.locator('.overview__fleet a.block').filter({ has: page.locator(".block__name", { hasText: /-nomad$/ }) }).count();
     assert.equal(drawn - clusters, total, "every host in the fleet is on the map");
     assert.ok(clusters >= 1, "clusters are on the map");
     assert.match(await page.locator(".attention").textContent(), /awaiting registration approval/);
@@ -123,19 +123,73 @@ describe("every page renders in demo mode", () => {
     const { page, close } = await open("/hosts");
     assert.equal(await heading(page), "Hosts");
     await page.getByTestId("hosts-table").waitFor();
-    // Hosts and clusters are separate tables: the filters act on the hosts.
+    // Clusters have their own page.
+    assert.equal(await page.getByTestId("clusters-table").count(), 0);
     const rows = page.getByTestId("hosts-table").locator("tbody tr");
     assert.equal(await rows.first().getAttribute("data-host"), "rpi-new");
     assert.equal(await rows.count(), 27);
-    const clusters = page.getByTestId("clusters-table").locator("tbody tr");
-    assert.equal(await clusters.count(), 1);
-    await clusters.first().getByText("nomad cluster").waitFor();
     await page.getByRole("button", { name: /^Failing/ }).click();
     await eventually(async () => assert.equal(await rows.count(), 2));
     assert.match(page.url(), /show=failing/);
     await page.getByRole("searchbox", { name: "Search hosts" }).fill("hz-");
     await eventually(async () => assert.equal(await rows.count(), 1));
-    await eventually(async () => assert.equal(await clusters.count(), 0));
+    await close();
+  });
+
+  test("clusters list their workloads and executor, those needing a look first", async () => {
+    const { page, close } = await open("/clusters");
+    assert.equal(await heading(page), "Clusters");
+    const rows = page.getByTestId("clusters-table").locator("tbody tr");
+    await rows.first().waitFor();
+    assert.match(await page.locator(".page-head").textContent(), /2 clusters · 4 workloads · 1 needs attention/);
+    // lab-nomad has a workload and no host to speak for it.
+    assert.equal(await rows.first().getAttribute("data-host"), "lab-nomad");
+    assert.match(await rows.first().textContent(), /added through the API/);
+    assert.match(await rows.first().textContent(), /none yet/);
+    const home = page.locator('tr[data-host="home-nomad"]');
+    assert.match(await home.textContent(), /3 workloads/);
+    assert.match(await home.textContent(), /deploying atuin \(server 1\/2 healthy\)/);
+    assert.match(await home.textContent(), /pi-1/);
+    await page.getByRole("button", { name: /Add a cluster/ }).first().waitFor();
+    await page.getByRole("searchbox", { name: "Search clusters" }).fill("site=home");
+    await eventually(async () => assert.equal(await rows.count(), 1));
+    await home.click();
+    await page.waitForURL(/\/clusters\/home-nomad/);
+    await close();
+  });
+
+  test("a cluster shows its workloads, executor, Nomad links and a deployment's progress", async () => {
+    const { page, close } = await open("/clusters/home-nomad");
+    assert.equal(await heading(page), "home-nomad");
+    for (const panel of ["Summary", "Workloads", "Labels", "Notes", "Health", "Recent runs"]) {
+      await page.getByRole("heading", { name: panel, exact: true }).waitFor();
+    }
+    const workloads = page.getByTestId("workloads");
+    const atuin = workloads.locator('tr[data-workload="atuin"]');
+    assert.equal(await atuin.getAttribute("data-state"), "deploying");
+    assert.match(await atuin.getByTestId("workload-progress").textContent(), /server 1\/2 healthy/);
+    const link = atuin.getByRole("link", { name: "Open default/atuin in the cluster's UI" });
+    assert.equal(await link.getAttribute("href"), "https://nomad.home.example:4646/ui/jobs/atuin@default");
+    assert.equal(await workloads.locator('tr[data-workload="postgresql"]').getAttribute("data-state"), "running");
+    assert.match(await workloads.locator('tr[data-workload="grey"]').textContent(), /no longer selected/);
+    // A row opens the workload's resources, mounted only while open.
+    assert.equal(await workloads.locator(".blueprint").count(), 0);
+    await workloads.locator('tr[data-workload="postgresql"]').click();
+    await workloads.locator(".blueprint").waitFor();
+    assert.equal(await page.getByRole("button", { name: "Forget…" }).count(), 0, "declared in buckle.yaml");
+    // A host address lands on the cluster's own page, and the reverse.
+    await page.goto(page.url().replace("/clusters/home-nomad", "/hosts/home-nomad"));
+    await page.waitForURL(/\/clusters\/home-nomad/);
+    await close();
+  });
+
+  test("a cluster without workloads applied waits for an executor", async () => {
+    const { page, close } = await open("/clusters/lab-nomad");
+    assert.equal(await heading(page), "lab-nomad");
+    const grafana = page.getByTestId("workloads").locator('tr[data-workload="grafana"]');
+    assert.equal(await grafana.getAttribute("data-state"), "not-applied-yet");
+    // Added through the API, so it can be forgotten; a declared one cannot.
+    await page.getByRole("button", { name: "Forget…" }).waitFor();
     await close();
   });
 

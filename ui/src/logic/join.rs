@@ -133,6 +133,7 @@ mod tests {
             last_seen: None,
             notes: String::new(),
             upgrade: None,
+            cluster_status: None,
         }
     }
 

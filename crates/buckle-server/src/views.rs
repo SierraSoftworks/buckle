@@ -10,8 +10,8 @@ pub use report::{
 use crate::source::cache::RevisionCache;
 use crate::store::{HostRecord, Store, kv::keys};
 use buckle_api::{
-    DiffKind, HandlerView, HostSummary, ModuleNote, ModuleView, PlanView, RehomeView, RemovalView,
-    StepOutcome, StepView,
+    ClusterStatus, Deploying, DiffKind, HandlerView, HostSummary, ModuleNote, ModuleView, PlanView,
+    RehomeView, RemovalView, StepOutcome, StepView, WorkloadView,
 };
 use buckle_core::engine::Revision;
 use buckle_core::model::RemovalPolicy;
@@ -90,7 +90,109 @@ pub fn host_summary(
         last_seen: host.last_seen,
         notes: host.notes.clone(),
         upgrade: None,
+        cluster_status: None,
     }
+}
+
+/// The workloads `revision` selects for cluster target `host`, as the
+/// cluster page lists them.
+pub fn workload_views(
+    revision: &Revision,
+    host: &HostRecord,
+    facts: &serde_json::Value,
+) -> Vec<WorkloadView> {
+    let ctx = crate::fleet::record_context(host, facts, &revision.fleet);
+    buckle_core::engine::selected_workloads(revision, &ctx)
+        .into_iter()
+        .map(|w| WorkloadView {
+            name: w.config.name.clone(),
+            description: w.config.description.clone(),
+            needs: w.config.needs.clone(),
+            resources: w
+                .config
+                .resources
+                .iter()
+                .map(|r| r.kind.as_str().to_owned())
+                .collect(),
+            removal: format!("{:?}", w.config.removal).to_lowercase(),
+        })
+        .collect()
+}
+
+/// How cluster target `host` stands: its last executor (kv
+/// `executor/<id>`), how many workloads `fleet` selects for it, which of
+/// them fail a required check, and which its run in progress is applying.
+/// `None` for a host.
+pub fn cluster_status(
+    db: &crate::store::Db<'_>,
+    host: &HostRecord,
+    facts: &serde_json::Value,
+    fleet: Option<&Revision>,
+) -> buckle_core::Result<Option<ClusterStatus>> {
+    use buckle_core::engine::ApplyEvent;
+    if host.kind != buckle_api::TargetKind::Cluster {
+        return Ok(None);
+    }
+    let executor = db
+        .kv()
+        .get(&format!("{}{}", keys::EXECUTOR_PREFIX, host.id))?;
+    let workloads = fleet
+        .map(|r| {
+            let ctx = crate::fleet::record_context(host, facts, &r.fleet);
+            buckle_core::engine::selected_workloads(r, &ctx).len() as u32
+        })
+        .unwrap_or_default();
+    let mut failing: Vec<String> = db
+        .health()
+        .checks(&host.id)?
+        .into_iter()
+        .filter(|c| c.required && c.status == "fail")
+        .map(|c| c.module)
+        .collect();
+    failing.sort();
+    failing.dedup();
+
+    // Modules started and not finished in the run in progress, each with
+    // its latest progress message.
+    let mut deploying: Vec<Deploying> = Vec::new();
+    if let Some(run) = db
+        .runs()
+        .latest_for_host(&host.id)?
+        .filter(|r| r.is_running())
+    {
+        for e in db.runs().events(&run.id)? {
+            let Ok(event) = serde_json::from_str::<ApplyEvent>(&e.event) else {
+                continue;
+            };
+            match event {
+                ApplyEvent::ModuleStarted { module } => {
+                    if !deploying.iter().any(|d| d.workload == module) {
+                        deploying.push(Deploying {
+                            workload: module,
+                            progress: None,
+                        });
+                    }
+                }
+                ApplyEvent::ModuleFinished { module, .. } => {
+                    deploying.retain(|d| d.workload != module)
+                }
+                ApplyEvent::StepProgress {
+                    module, message, ..
+                } => {
+                    if let Some(d) = deploying.iter_mut().find(|d| d.workload == module) {
+                        d.progress = Some(message);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(Some(ClusterStatus {
+        executor,
+        workloads,
+        failing,
+        deploying,
+    }))
 }
 
 /// The UI's typed view of an engine plan (design §11).
@@ -319,18 +421,24 @@ pub async fn load_summary(
 ) -> Option<HostSummary> {
     let fleet = reference_revision_synced(store, revisions).await;
     let id = id.to_owned();
-    let (host, facts) = store
+    let rev = fleet.clone();
+    store
         .call(move |db| {
             let Some(h) = db.hosts().target(&id)? else {
                 return Ok(None);
             };
-            let facts = db.hosts().latest_facts(&id)?.map(|(f, _)| f);
-            Ok(Some((h, facts.unwrap_or(serde_json::Value::Null))))
+            let facts = db
+                .hosts()
+                .latest_facts(&id)?
+                .map(|(f, _)| f)
+                .unwrap_or(serde_json::Value::Null);
+            let mut summary = host_summary(&h, &facts, rev.as_deref());
+            summary.cluster_status = cluster_status(db, &h, &facts, rev.as_deref())?;
+            Ok(Some(summary))
         })
         .await
         .ok()
-        .flatten()?;
-    Some(host_summary(&host, &facts, fleet.as_deref()))
+        .flatten()
 }
 
 #[cfg(test)]

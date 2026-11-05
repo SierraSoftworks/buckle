@@ -406,7 +406,7 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
     let registered: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
     let eval = registered["EvalID"].as_str().unwrap_or_default().to_owned();
     let modify = registered["JobModifyIndex"].as_u64().unwrap_or(0);
-    (cx.progress)(&format!("registered {key}"));
+    (cx.progress)("registered; waiting for the deployment");
     let entry = p.entry.clone();
     index::update(&cx.nomad, &cx.target, |e| index::upsert(e, entry.clone())).await?;
     let outcome = follow_deployment(cx, key, &eval, modify, p.waits).await?;
@@ -513,7 +513,7 @@ pub async fn follow_deployment(
         }
         let progress = deployment_progress(&dep);
         if progress != last {
-            (cx.progress)(&format!("{key}: {progress}"));
+            (cx.progress)(&format!("deploying: {progress}"));
             last = progress.clone();
         }
         match dep["Status"].as_str().unwrap_or("running") {

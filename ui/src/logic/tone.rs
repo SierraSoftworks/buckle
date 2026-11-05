@@ -121,6 +121,11 @@ pub struct BlockLook {
 pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook {
     let mut classes = vec!["block", host_state_class(entry.state)];
     let mut label = host_state_label(entry.state).to_string();
+    // A cluster is a virtual node: applied through a host speaking for it.
+    if entry.kind == buckle_api::TargetKind::Cluster {
+        classes.push("block--cluster");
+        label = format!("cluster, {label}");
+    }
 
     if entry.needs_approval
         && !matches!(
@@ -148,7 +153,10 @@ pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook 
             label.push_str(", health failing");
         }
         // A rebooting host is offline by design: the state says so already.
-        if host.connection == Connection::Offline && entry.state != HostRolloutState::Rebooting {
+        if host.connection == Connection::Offline
+            && entry.state != HostRolloutState::Rebooting
+            && entry.kind != buckle_api::TargetKind::Cluster
+        {
             classes.push("block--offline");
             label.push_str(", offline");
         }
@@ -436,6 +444,7 @@ mod tests {
             last_seen: None,
             notes: String::new(),
             upgrade: None,
+            cluster_status: None,
         }
     }
 

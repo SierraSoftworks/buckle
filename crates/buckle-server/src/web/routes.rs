@@ -460,17 +460,22 @@ async fn summaries_of(
             };
             let mut out = Vec::new();
             for h in records {
-                let facts = db.hosts().latest_facts(&h.id)?.map(|(f, _)| f);
-                out.push((h, facts.unwrap_or(serde_json::Value::Null)));
+                let facts = db
+                    .hosts()
+                    .latest_facts(&h.id)?
+                    .map(|(f, _)| f)
+                    .unwrap_or(serde_json::Value::Null);
+                let mut s = crate::views::host_summary(&h, &facts, fleet.as_deref());
+                s.cluster_status = crate::views::cluster_status(db, &h, &facts, fleet.as_deref())?;
+                out.push(s);
             }
             Ok(out)
         })
         .await?;
     Ok(rows
-        .iter()
-        .map(|(h, f)| {
-            let mut s = crate::views::host_summary(h, f, fleet.as_deref());
-            s.upgrade = state.upgrades.get(&h.id);
+        .into_iter()
+        .map(|mut s| {
+            s.upgrade = state.upgrades.get(&s.id);
             s
         })
         .collect())
@@ -761,6 +766,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         Some(run) => Some(stored_report(&state, run).await?),
         None => None,
     };
+    let workloads = cluster_workloads(&state, &summary, facts.as_ref().map(|(f, _)| f)).await;
     Ok(HttpResponse::Ok().json(HostDetail {
         summary,
         facts: facts
@@ -774,7 +780,36 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         health_results: health.into_iter().map(health_dto).collect(),
         health_checks: checks,
         latest_run,
+        workloads,
     }))
+}
+
+/// The workloads a cluster target runs: those its applied revision selects
+/// for it, else the reference revision's. Empty for a host.
+async fn cluster_workloads(
+    state: &AppState,
+    summary: &buckle_api::HostSummary,
+    facts: Option<&serde_json::Value>,
+) -> Vec<buckle_api::WorkloadView> {
+    if summary.kind != TargetKind::Cluster {
+        return Vec::new();
+    }
+    let applied = match &summary.applied_revision {
+        Some(r) => state.revisions.load(r).await.ok(),
+        None => None,
+    };
+    let Some(revision) = (match applied {
+        Some(r) => Some(r),
+        None => crate::views::reference_revision(&state.store, &state.revisions).await,
+    }) else {
+        return Vec::new();
+    };
+    let id = summary.id.clone();
+    let Ok(Some(record)) = state.store.call(move |db| db.hosts().target(&id)).await else {
+        return Vec::new();
+    };
+    let null = serde_json::Value::Null;
+    crate::views::workload_views(&revision, &record, facts.unwrap_or(&null))
 }
 
 async fn host_facts(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {

@@ -314,6 +314,7 @@ pub fn apply_event_to_proto(
         | E::StepFailed { module, .. }
         | E::StepBlocked { module, .. }
         | E::StepSkipped { module, .. }
+        | E::StepProgress { module, .. }
         | E::HandlerRun { module, .. }
         | E::HealthChecked { module, .. } => module.clone(),
         E::RemovalRun { .. } | E::FactsRefreshed { .. } => String::new(),

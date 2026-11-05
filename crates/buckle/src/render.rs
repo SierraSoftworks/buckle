@@ -552,6 +552,12 @@ pub fn render_event(event: &ApplyEvent) -> Option<String> {
         ApplyEvent::FactsRefreshed { providers } => {
             format!("  facts refreshed: {}", providers.join(", "))
         }
+        ApplyEvent::StepProgress {
+            module,
+            id,
+            message,
+            ..
+        } => format!("  … {module}/{id}: {message}"),
     })
 }
 

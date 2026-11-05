@@ -604,6 +604,15 @@ pub enum ApplyEvent {
         kind: String,
         reason: String,
     },
+    /// A step still running says how far it got (a deployment's healthy
+    /// allocations). Never terminal: a later message replaces it.
+    StepProgress {
+        module: String,
+        task_id: String,
+        id: String,
+        kind: String,
+        message: String,
+    },
     HandlerRun {
         module: String,
         handler: String,
@@ -635,7 +644,8 @@ impl ApplyEvent {
             | ApplyEvent::StepFinished { module, id, .. }
             | ApplyEvent::StepFailed { module, id, .. }
             | ApplyEvent::StepBlocked { module, id, .. }
-            | ApplyEvent::StepSkipped { module, id, .. } => Some((module, id)),
+            | ApplyEvent::StepSkipped { module, id, .. }
+            | ApplyEvent::StepProgress { module, id, .. } => Some((module, id)),
             _ => None,
         }
     }

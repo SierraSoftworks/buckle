@@ -148,6 +148,10 @@ pub struct ClusterDecl {
     /// `https://10.0.0.1:6443`). Absent: the executor's local default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
+    /// Where people open the cluster's web UI (`https://nomad.example:4646`),
+    /// for the UI's links to each workload. Absent: `api`, when it is HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<String>,
     /// Which hosts are members of the cluster: what a workload's `module:`
     /// edge and a module's `workload:` edge refer to.
     #[serde(default, skip_serializing_if = "Option::is_none")]

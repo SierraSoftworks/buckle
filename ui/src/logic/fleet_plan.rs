@@ -114,9 +114,14 @@ pub fn fleet_tally(f: &FleetPlan) -> Tally {
 /// How many of the `total` hosts under review a block changes:
 /// `all 12 hosts changed`, or `4 changed · 8 unchanged`.
 pub fn hosts_changed(total: usize, changed: usize) -> String {
+    targets_changed(total, changed, ("host", "hosts"))
+}
+
+/// [`hosts_changed`] for targets named `noun` (`("cluster", "clusters")`).
+pub fn targets_changed(total: usize, changed: usize, (one, many): (&str, &str)) -> String {
     match (total, changed) {
-        (1, 1) => "1 host changed".into(),
-        (t, c) if c >= t => format!("all {t} hosts changed"),
+        (1, 1) => format!("1 {one} changed"),
+        (t, c) if c >= t => format!("all {t} {many} changed"),
         (t, c) => format!("{c} changed · {} unchanged", t - c),
     }
 }

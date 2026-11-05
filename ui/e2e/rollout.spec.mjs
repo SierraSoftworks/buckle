@@ -16,7 +16,7 @@ describe("the rollout pipeline", () => {
     const blocks = page.locator(".pipeline:not(.pipeline--compact) .stage a.block");
     await blocks.first().waitFor();
     const hosts = await blocks.evaluateAll((els) => els.map((e) => e.dataset.host));
-    assert.equal(hosts.length, 25, "the rollout targets 25 hosts");
+    assert.equal(hosts.length, 27, "the rollout targets 25 hosts and 2 clusters");
     assert.equal(new Set(hosts).size, hosts.length, "no host is drawn twice");
     // Stage membership: each host appears under one data-stage only.
     const byStage = await page.locator(".stage").evaluateAll((stages) =>
@@ -78,6 +78,23 @@ describe("the rollout pipeline", () => {
     assert.match(await page.locator('.stage[data-stage="home"] .stage__meta').first().textContent(), /1 failed/);
     await close();
   });
+
+  test("a cluster is its own node, applied through its executor or waiting for its stage", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const home = page.locator('.stage[data-stage="home"] a.block--cluster');
+    await home.waitFor();
+    assert.match(await home.textContent(), /via pi-1/);
+    const lab = page.locator('.stage[data-stage="everything-else"] a.block--cluster');
+    assert.match(await lab.getAttribute("class"), /block--waiting/);
+    assert.match(await lab.textContent(), /waits for lab-1, lab-2, lab-3/);
+    // The host table names what it waits on, and what the deployment is doing.
+    assert.match(await page.locator("tr", { has: page.getByRole("link", { name: "lab-nomad", exact: true }) }).getByTestId("host-waiting").textContent(), /waits for lab-1/);
+    const row = page.locator("tr", { has: page.getByRole("link", { name: "home-nomad", exact: true }) });
+    await eventually(async () => assert.match(await row.getByTestId("host-activity").textContent(), /server 1\/2 healthy/));
+    // Its plan's modules are marked as workloads.
+    await page.locator("#plans").getByTestId("workload-badge").first().waitFor();
+    await close();
+  });
 });
 
 describe("approving a phase", () => {
@@ -98,7 +115,7 @@ describe("approving a phase", () => {
     await pane.getByRole("tab", { name: "By distinct plan" }).click();
     // Every distinct plan of the rollout, whatever its phase, the
     // destructive one flagged, the secret rotation shown only as tokens.
-    assert.equal(await pane.locator("details.plan").count(), 3);
+    assert.equal(await pane.locator("details.plan").count(), 4);
     assert.equal(await pane.locator("details.plan--destructive").count(), 1);
     const hosts = await pane.locator(".plan__hosts").allTextContents();
     assert.ok(hosts.some((h) => /canary: pi-1 · home: pi-2/.test(h)), "hosts are named by phase");

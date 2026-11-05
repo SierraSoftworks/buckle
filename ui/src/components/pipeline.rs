@@ -2,11 +2,13 @@
 //! rounded block coloured by its rollout state and health, the gate before
 //! each stage drawn as a barrier, and the bake countdown on the stage header.
 //! Hover or focus a block for the host's name and detail; follow it to open
-//! the host.
+//! the host. A cluster is a round block (a virtual node): applied through
+//! the host speaking for it, hollow while it waits for an earlier stage or
+//! an executor, and saying which.
 
 use std::collections::BTreeMap;
 
-use buckle_api::{HostRolloutState, HostSummary, RolloutDetail, RolloutHost};
+use buckle_api::{HostRolloutState, HostSummary, RolloutDetail, RolloutHost, TargetKind};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
@@ -16,6 +18,7 @@ use super::link::RouteLink;
 use super::meter::{Meter, stage_segments};
 use super::ui::Pill;
 use crate::app::Route;
+use crate::logic::clusters::{Waiting, tally, waiting};
 use crate::logic::format::{config_duration, relative, short};
 use crate::logic::pipeline::{Gate, GateKind, GateState, OUTSIDE_STAGE, Stage, layout};
 use crate::logic::tone::{
@@ -42,6 +45,12 @@ pub struct PipelineProps {
 #[function_component(Pipeline)]
 pub fn pipeline(props: &PipelineProps) -> Html {
     let p = layout(&props.detail);
+    let has_cluster = props
+        .detail
+        .phases
+        .iter()
+        .flat_map(|ph| &ph.hosts)
+        .any(|h| h.kind == TargetKind::Cluster);
     let stages = p.stages.iter().enumerate().map(|(i, stage)| {
         html! {
             <div class="pipeline__step" role="listitem">
@@ -75,6 +84,16 @@ pub fn pipeline(props: &PipelineProps) -> Html {
                         <span class="block block--legend block--failed block--attention" aria-hidden="true" />
                         { "needs attention" }
                     </li>
+                    if has_cluster {
+                        <li class="legend__item">
+                            <span class="block block--legend block--healthy block--cluster" aria-hidden="true" />
+                            { "cluster" }
+                        </li>
+                        <li class="legend__item">
+                            <span class="block block--legend block--planned block--cluster block--waiting" aria-hidden="true" />
+                            { "waiting for its stage" }
+                        </li>
+                    }
                 </ul>
             }
             if !p.duplicates.is_empty() {
@@ -190,7 +209,7 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
                 <p class="stage__empty muted">{ "No hosts" }</p>
             } else {
                 <div class="stage__blocks" {style} role="list">
-                    { for stage.hosts().map(|h| block(h, props.hosts.get(&h.host), props.activity.get(&h.host), now)) }
+                    { for stage.hosts().map(|h| block(h, props.hosts.get(&h.host), props.activity.get(&h.host), waiting(phase, h), now)) }
                 </div>
             }
         </section>
@@ -218,7 +237,7 @@ fn outside_column(stage: &Stage, props: &PipelineProps) -> Html {
                 { for stage.hosts().map(|h| {
                     let look = outside_block_look(props.hosts.get(&h.host));
                     html! {
-                        <RouteLink to={Route::Host { id: h.host.clone() }}
+                        <RouteLink to={Route::target(&h.host, h.kind)}
                             classes={classes!(look.classes.clone())}
                             label={format!("{}: {}", h.host, look.label)}
                             data_host={h.host.clone()} data_state="outside">
@@ -239,11 +258,27 @@ fn block(
     entry: &RolloutHost,
     host: Option<&HostSummary>,
     activity: Option<&String>,
+    waits: Option<Waiting>,
     now: DateTime<Utc>,
 ) -> Html {
-    let look = block_look(entry, host);
+    let mut look = block_look(entry, host);
     let activity = activity.filter(|_| entry.state == HostRolloutState::Applying);
     let mut detail: Vec<Html> = Vec::new();
+    // A cluster names who speaks for it and how its workloads stand; a
+    // target held for an earlier stage (or an executor) says what for.
+    if entry.kind == TargetKind::Cluster {
+        if let Some(e) = &entry.executor {
+            detail.push(html! { <span>{ "via " }<span class="mono">{ e.clone() }</span></span> });
+        }
+        if let Some(status) = host.and_then(|h| h.cluster_status.as_ref()) {
+            detail.push(html! { <span>{ tally(status).join(" · ") }</span> });
+        }
+    }
+    if let Some(w) = &waits {
+        look.classes.push("block--waiting");
+        look.label.push_str(&format!(", {}", w.describe()));
+        detail.push(html! { <span class="block__note">{ w.describe() }</span> });
+    }
     if let Some(now) = activity {
         detail.push(html! { <span class="block__activity">{ "running " }<span class="mono">{ now.clone() }</span></span> });
     }
@@ -296,7 +331,7 @@ fn block(
     detail.push(html! { <span class="muted">{ format!("updated {}", relative(entry.updated_at, now)) }</span> });
 
     html! {
-        <RouteLink to={Route::Host { id: entry.host.clone() }}
+        <RouteLink to={Route::target(&entry.host, entry.kind)}
             classes={classes!(look.classes.clone())}
             label={match activity {
                 Some(now) => format!("{}: {}, running {now}", entry.host, look.label),

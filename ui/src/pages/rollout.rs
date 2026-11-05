@@ -260,7 +260,15 @@ pub fn rollout_page(props: &Props) -> Html {
                     { " of a newer revision superseded this one while it was queued, so it never started." }
                 </div>
             }
-            <Panel title="Pipeline" subtitle={format!("{} hosts in {} stages · {}/{} done", s.hosts_total, d.phases.len(), s.hosts_done, s.hosts_total)}>
+            <Panel title="Pipeline" subtitle={{
+                let clusters = d.phases.iter().flat_map(|p| &p.hosts).filter(|h| h.kind == buckle_api::TargetKind::Cluster).count();
+                let targets = if clusters == 0 {
+                    format!("{} hosts", s.hosts_total)
+                } else {
+                    format!("{} and {}", count(s.hosts_total as usize - clusters, "host", "hosts"), count(clusters, "cluster", "clusters"))
+                };
+                format!("{targets} in {} stages · {}/{} done", d.phases.len(), s.hosts_done, s.hosts_total)
+            }}>
                 <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
             </Panel>
             { plans_panel }
@@ -648,6 +656,13 @@ fn plans_panel(
             })
             .collect(),
     );
+    let clusters: Vec<String> = d
+        .phases
+        .iter()
+        .flat_map(|p| &p.hosts)
+        .filter(|h| h.kind == buckle_api::TargetKind::Cluster)
+        .map(|h| h.host.clone())
+        .collect();
     let in_phases = d.phases.iter().filter(|p| !p.hosts.is_empty()).count();
     let mut subtitle = format!(
         "{} across {}",
@@ -667,7 +682,7 @@ fn plans_panel(
             { notes }
             if !plans.is_empty() {
                 <PlanViews fleet={d.fleet.clone()} groups={plans.to_vec()} {phases}
-                    open_destructive={!wanting.is_empty()} />
+                    open_destructive={!wanting.is_empty()} clusters={clusters} />
             }
         </Panel>
     }
@@ -1163,6 +1178,11 @@ fn host_table(props: &HostTableProps) -> Html {
                                     if let Some(now) = props.activity.get(&h.host).filter(|_| h.state == HostRolloutState::Applying) {
                                         <span class="cell-sub mono" data-testid="host-activity">{ now.clone() }</span>
                                     }
+                                    if let Some(w) = crate::logic::clusters::waiting(phase, h) {
+                                        <span class="cell-sub" data-testid="host-waiting">{ w.describe() }</span>
+                                    } else if h.kind == buckle_api::TargetKind::Cluster && let Some(e) = &h.executor {
+                                        <span class="cell-sub">{ "via " }<span class="mono">{ e.clone() }</span></span>
+                                    }
                                 </td>
                                 <td>
                                     <span class="nowrap">
@@ -1331,7 +1351,7 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
             <div class="host-row__run" data-testid="rollout-host-run">
                 <h4 class="subhead">{ "Run in this rollout" }</h4>
                 { match (&run.report, &run.error) {
-                    (Some(report), _) => html! { <RunReportView report={report.clone()} in_rollout=true /> },
+                    (Some(report), _) => html! { <RunReportView report={report.clone()} in_rollout=true workloads={props.host.kind == buckle_api::TargetKind::Cluster} /> },
                     (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={run.reload.clone()} /> },
                     (None, None) if !has_run => html! { <p class="muted">{ "No run yet: the host has not started applying in this rollout." }</p> },
                     (None, None) if run.settled => html! { <p class="muted">{ "The server has no run report for this host in this rollout." }</p> },

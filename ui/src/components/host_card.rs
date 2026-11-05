@@ -1,7 +1,8 @@
 //! A host's name as a link that, hovered or focused, summarises the host:
 //! its connection, health and status as pills, then what it runs. The same
 //! card wherever a host is named, so hovering answers "how is it?" and a
-//! click opens the host for everything else.
+//! click opens the host for everything else. A cluster's card tallies its
+//! workloads and names what it is deploying and who speaks for it.
 
 use buckle_api::{Connection, HealthSummary, HostStatus, HostSummary, UpgradeState};
 use chrono::{DateTime, Utc};
@@ -10,7 +11,8 @@ use yew::prelude::*;
 use super::link::RouteLink;
 use super::ui::{HoverTip, Pill};
 use crate::app::Route;
-use crate::logic::format::{commit, relative, relative_opt};
+use crate::logic::clusters::deploying_text;
+use crate::logic::format::{commit, count, relative, relative_opt};
 use crate::logic::tone::{Tone, health_label, health_tone, host_status_label, host_status_tone};
 
 #[derive(Properties, PartialEq)]
@@ -31,9 +33,10 @@ pub fn host_link(props: &HostLinkProps) -> Html {
         .as_ref()
         .map(|h| host_card(h, props.now))
         .unwrap_or_default();
+    let kind = props.host.as_ref().map(|h| h.kind).unwrap_or_default();
     html! {
         <HoverTip link=true {tip}>
-            <RouteLink to={Route::Host { id: props.id.to_string() }} classes={props.classes.clone()}>
+            <RouteLink to={Route::target(&props.id, kind)} classes={props.classes.clone()}>
                 { props.id.clone() }
             </RouteLink>
         </HoverTip>
@@ -66,6 +69,9 @@ pub fn host_state_pills(h: &HostSummary) -> Html {
 }
 
 fn host_card(h: &HostSummary, now: DateTime<Utc>) -> Html {
+    if let Some(c) = &h.cluster {
+        return cluster_card(h, c, now);
+    }
     let platform = [h.platform.as_deref(), h.arch.as_deref()]
         .into_iter()
         .flatten()
@@ -93,6 +99,38 @@ fn host_card(h: &HostSummary, now: DateTime<Utc>) -> Html {
                 <span class="muted">
                     { format!("health read {} · seen {}", relative_opt(h.health_at, now), h.last_seen.map(|s| relative(s, now)).unwrap_or_else(|| "never".into())) }
                 </span>
+            </span>
+        </span>
+    }
+}
+
+fn cluster_card(h: &HostSummary, c: &buckle_api::ClusterInfo, now: DateTime<Utc>) -> Html {
+    let status = h.cluster_status.clone().unwrap_or_default();
+    html! {
+        <span class="host-card" data-testid="host-card">
+            <span class="host-card__head">
+                <strong class="mono">{ h.id.clone() }</strong>
+                { host_state_pills(h) }
+            </span>
+            <span class="host-card__facts">
+                <span>{ count(status.workloads as usize, "workload", "workloads") }
+                    if !status.failing.is_empty() {
+                        { " · " }<span class="text-danger">{ format!("{} failing", status.failing.join(", ")) }</span>
+                    }
+                </span>
+                if !status.deploying.is_empty() {
+                    <span>{ format!("deploying {}", deploying_text(&status.deploying)) }</span>
+                }
+                <span>{ match &status.executor {
+                    Some(e) => html! { <>{ "executor " }<span class="mono">{ e.clone() }</span></> },
+                    None => html! { <span class="muted">{ "no executor yet" }</span> },
+                } }</span>
+                if let Some(api) = c.spec.api.as_deref() { <span class="mono">{ api.to_owned() }</span> }
+                if let Some(r) = &h.applied_revision {
+                    <span>{ "revision " }<span class="mono">{ commit(r) }</span></span>
+                }
+                if !h.groups.is_empty() { <span>{ format!("groups {}", h.groups.join(", ")) }</span> }
+                <span class="muted">{ format!("health read {}", relative_opt(h.health_at, now)) }</span>
             </span>
         </span>
     }

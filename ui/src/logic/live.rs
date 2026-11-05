@@ -62,6 +62,17 @@ pub fn apply_fleet(fleet: &mut Fleet, event: &LiveEvent) {
                 fleet.counts.clusters = fleet.clusters.len() as u32;
             }
         }
+        // What a cluster is deploying follows its run.
+        LiveEvent::RunProgress { progress } => {
+            if let Some(status) = fleet
+                .clusters
+                .iter_mut()
+                .find(|c| c.id == progress.host)
+                .and_then(|c| c.cluster_status.as_mut())
+            {
+                super::clusters::track_deploying(status, progress);
+            }
+        }
         LiveEvent::RolloutChanged { rollout } => {
             if rollout_active(rollout.state) {
                 fleet.active_rollout = Some(rollout.id.clone());
@@ -90,6 +101,11 @@ pub fn apply_host_detail(detail: &mut HostDetail, event: &LiveEvent) {
         LiveEvent::RunProgress { progress } => {
             if let Some(run) = &mut detail.latest_run {
                 super::run::apply_progress(run, progress);
+            }
+            if progress.host == detail.summary.id
+                && let Some(status) = &mut detail.summary.cluster_status
+            {
+                super::clusters::track_deploying(status, progress);
             }
         }
         _ => {}
@@ -328,6 +344,7 @@ mod tests {
             last_seen: None,
             notes: String::new(),
             upgrade: None,
+            cluster_status: None,
         }
     }
 
@@ -639,6 +656,7 @@ mod tests {
             health_checks: vec![],
             drift: vec![],
             latest_run: Some(report),
+            workloads: vec![],
         };
         let event = LiveEvent::RunProgress {
             progress: RunProgress {

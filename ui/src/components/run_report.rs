@@ -37,6 +37,9 @@ pub struct RunReportProps {
     /// Shown inside its own rollout's page: no link back to it.
     #[prop_or_default]
     pub in_rollout: bool,
+    /// A cluster's run: its modules are workloads.
+    #[prop_or_default]
+    pub workloads: bool,
 }
 
 #[function_component(RunReportView)]
@@ -91,13 +94,17 @@ pub fn run_report(props: &RunReportProps) -> Html {
         + r.removals.iter().filter(|x| removal_problem(x)).count();
 
     let body = if r.modules.is_empty() && r.removals.is_empty() {
-        html! { <p class="muted">{ "Nothing was selected for this host: the run had no modules to apply." }</p> }
+        html! { <p class="muted">{ if props.workloads {
+            "Nothing was selected for this cluster: the run had no workloads to apply."
+        } else {
+            "Nothing was selected for this host: the run had no modules to apply."
+        } }</p> }
     } else if modules.is_empty() && removals.is_empty() {
         html! { <p class="muted" data-testid="run-no-problems">{ "Nothing failed or needs attention in this run." }</p> }
     } else {
         html! { <>
             if !modules.is_empty() {
-                <ol class="run-modules" aria-label="Modules in plan order">
+                <ol class="run-modules" aria-label={if props.workloads { "Workloads in plan order" } else { "Modules in plan order" }}>
                     { for modules.iter().map(|m| {
                         let open = is_open(m);
                         let toggle = {
@@ -130,7 +137,7 @@ pub fn run_report(props: &RunReportProps) -> Html {
 
     html! {
         <div class="run" data-run={r.id.clone()} data-state={run_label(r.state).replace(' ', "-")}>
-            { summary(r, now, props.in_rollout) }
+            { summary(r, now, props.in_rollout, if props.workloads { "workloads" } else { "modules" }) }
             <ErrorBlock error={r.error.clone()} context={AttrValue::from("The run")} />
             if !r.modules.is_empty() {
                 <div class="run__toolbar">
@@ -156,7 +163,7 @@ fn removal_problem(x: &RemovalReport) -> bool {
 }
 
 /// The strip at the top: state, step counts, timing, what was applied.
-fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
+fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool, noun: &str) -> Html {
     let s = &r.counts.steps;
     let live = !run_finished(r.state);
     let mut counts = vec![
@@ -233,7 +240,7 @@ fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool) -> Html {
                     aria-valuemin="0" aria-valuemax={total.to_string()} aria-valuenow={done.to_string()}>
                     <span class="progress__bar" style={format!("width: {}%", done * 100 / total)} />
                 </div>
-                <span class="muted small">{ format!("{done} of {} · {modules_done} of {} modules done", count(total as usize, "step", "steps"), r.modules.len()) }</span>
+                <span class="muted small">{ format!("{done} of {} · {modules_done} of {} {noun} done", count(total as usize, "step", "steps"), r.modules.len()) }</span>
             </div>
         }
     </> }

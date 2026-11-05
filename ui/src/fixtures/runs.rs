@@ -11,6 +11,8 @@
 //! * edge-1 needs attention: tailscale's unit is blocked (systemd is not PID 1
 //!   in its container) and docker's selection could not be decided.
 //! * pi-6 rolled itself back to the stable revision.
+//! * home-nomad (a cluster) is applying #42 through pi-1: postgresql is in
+//!   place, atuin's job is following its deployment and paste waits.
 //! * Every other run is clean, or rolled back (the docker 28 run of rollout
 //!   #40), generated from its summary so the run picker has reports to load.
 
@@ -21,7 +23,8 @@ use buckle_api::{
 use chrono::{DateTime, Duration, Utc};
 
 use super::data::{
-    ABORTED_REV, NEW_REV, OLD_REV, PLAN_NOMAD, ROLLED_BACK_REV, STABLE_REV, fake_trace, trace_url,
+    ABORTED_REV, NEW_REV, OLD_REV, PLAN_NOMAD, PLAN_WORKLOADS, ROLLED_BACK_REV, STABLE_REV,
+    fake_trace, trace_url,
 };
 use crate::logic::run::run_finished;
 
@@ -210,7 +213,9 @@ fn report(
         id: run_id(host, revision),
         host: host.into(),
         revision: revision.into(),
-        plan_digest: if revision == NEW_REV {
+        plan_digest: if revision == NEW_REV && host.ends_with("-nomad") {
+            PLAN_WORKLOADS.into()
+        } else if revision == NEW_REV {
             PLAN_NOMAD.into()
         } else {
             format!("{}{}", &revision[8..16], &PLAN_NOMAD[8..])
@@ -1080,9 +1085,89 @@ fn generic(host: &str, s: &RunSummary, now: DateTime<Utc>) -> RunReport {
     )
 }
 
+/// A cluster's run: its workloads in plan order. On the new revision atuin
+/// is following its deployment (the job step's result is its progress);
+/// earlier ones applied cleanly.
+fn workloads_run(host: &str, s: &RunSummary, now: DateTime<Utc>) -> RunReport {
+    let live = s.revision == NEW_REV;
+    let job = |name: &str, state: StepState, result: Option<&str>, ms: u64| {
+        step(
+            "nomad.job",
+            &format!("default/{name}"),
+            &format!("update default/{name}"),
+            state,
+            result,
+            ms,
+        )
+    };
+    let done = |name: &str, extra: Vec<StepReport>| {
+        let mut steps = extra;
+        steps.push(job(name, StepState::Unchanged, None, 140));
+        module(name, ModuleState::Unchanged, steps, vec![])
+    };
+    let postgresql = done(
+        "postgresql",
+        vec![step(
+            "nomad.volume",
+            "default/postgresql-data",
+            "volume default/postgresql-data",
+            StepState::Unchanged,
+            None,
+            90,
+        )],
+    );
+    let (atuin, paste) = if live {
+        (
+            module(
+                "atuin",
+                ModuleState::Running,
+                vec![
+                    step(
+                        "nomad.variable",
+                        "nomad/jobs/atuin",
+                        "update nomad/jobs/atuin",
+                        StepState::Changed,
+                        Some("updated 1 item"),
+                        210,
+                    ),
+                    job(
+                        "atuin",
+                        StepState::Running,
+                        Some("deploying: server 1/2 healthy"),
+                        0,
+                    ),
+                ],
+                vec![],
+            ),
+            module(
+                "paste",
+                ModuleState::Pending,
+                vec![job("paste", StepState::Pending, None, 0)],
+                vec![],
+            ),
+        )
+    } else {
+        (done("atuin", vec![]), done("paste", vec![]))
+    };
+    report(
+        host,
+        &s.revision,
+        if live {
+            RunState::Running
+        } else {
+            RunState::Succeeded
+        },
+        s.started_at,
+        vec![postgresql, atuin, paste],
+        vec![],
+        now,
+    )
+}
+
 /// The report of a run, from its summary.
 pub fn report_for(host: &str, s: &RunSummary, now: DateTime<Utc>) -> RunReport {
     match (host, s.revision.as_str()) {
+        ("home-nomad", _) => workloads_run(host, s, now),
         (LIVE_HOST, NEW_REV) => live(s.started_at, now),
         ("pi-5", NEW_REV) => failed(s.started_at, now),
         ("pi-6", NEW_REV) => local_rollback(s.started_at, now),
@@ -1136,6 +1221,16 @@ pub fn summaries(host: &HostSummary, now: DateTime<Utc>) -> Vec<RunSummary> {
         };
         summary_of(&report_for(id, &skeleton, now), outcome, error)
     };
+    if host.kind == buckle_api::TargetKind::Cluster {
+        return if id == "home-nomad" {
+            vec![
+                entry(NEW_REV, ago(3), "running", None),
+                entry(STABLE_REV, ago(48 * 60), "success", None),
+            ]
+        } else {
+            vec![]
+        };
+    }
     if id == "edge-1" {
         return vec![entry(
             STABLE_REV,

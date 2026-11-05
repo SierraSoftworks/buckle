@@ -612,6 +612,7 @@ mod tests {
             kind: buckle_api::ClusterKind::Nomad,
             description: String::new(),
             api: None,
+            ui: None,
             nodes: Some("host.groups contains \"nomad\"".into()),
             executors: None,
             identity: buckle_api::ClusterSpec::default_identity(),

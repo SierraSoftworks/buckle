@@ -39,6 +39,18 @@ pub fn hosts() -> Html {
     </> })
 }
 
+/// Three nodes joined: a cluster.
+pub fn clusters() -> Html {
+    icon(html! { <>
+        <circle cx="12" cy="5" r="2.5" />
+        <circle cx="5" cy="18" r="2.5" />
+        <circle cx="19" cy="18" r="2.5" />
+        <line x1="10.8" y1="7.2" x2="6.2" y2="15.8" />
+        <line x1="13.2" y1="7.2" x2="17.8" y2="15.8" />
+        <line x1="7.5" y1="18" x2="16.5" y2="18" />
+    </> })
+}
+
 pub fn audit() -> Html {
     icon(html! { <>
         <path d="M9 4h6l1 2h3v14H5V6h3z" />

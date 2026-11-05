@@ -365,6 +365,7 @@ mod tests {
             last_seen: Some(Utc::now()),
             notes: String::new(),
             upgrade: None,
+            cluster_status: None,
         }
     }
 

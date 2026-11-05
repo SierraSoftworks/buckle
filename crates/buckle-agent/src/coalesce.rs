@@ -48,6 +48,11 @@ pub fn coalesce_key(event: &ApplyEvent) -> String {
         ApplyEvent::RemovalRun { resource, .. } => format!("removal:{resource}"),
         ApplyEvent::HealthChecked { module, check, .. } => format!("health:{module}/{check}"),
         ApplyEvent::FactsRefreshed { .. } => "facts".to_owned(),
+        // Kept apart from the step's own events, so a progress message
+        // never replaces its start or end.
+        ApplyEvent::StepProgress {
+            module, task_id, ..
+        } => format!("progress:{module}/{task_id}"),
     }
 }
 

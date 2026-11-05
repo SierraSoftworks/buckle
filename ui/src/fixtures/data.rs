@@ -28,6 +28,7 @@ pub const OLDEST_REV: &str = "0aa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9";
 pub const PLAN_NOMAD: &str = "5b1c9e0244f1a7c3e9b2d8f6a0c4e2b7d9f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9";
 pub const PLAN_GREY: &str = "e07aa3419c2b8d4f6a1e3c5b7d9f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f";
 pub const PLAN_LAB: &str = "a91f3c7e5b2d8f4a6c1e3b5d7f9a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a";
+pub const PLAN_WORKLOADS: &str = "c3d9e1f5a7b2c4d6e8f0a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3";
 
 pub const TRACE: &str = "00af7651c3e94b1a8f0e2d9c4b7a6e15";
 
@@ -348,6 +349,7 @@ pub fn hosts(now: DateTime<Utc>) -> Vec<HostSummary> {
                     _ => String::new(),
                 },
                 upgrade: None,
+                cluster_status: None,
             }
         })
         .collect()
@@ -370,7 +372,7 @@ fn entry(
         plan_digest: digest.map(Into::into),
         plan_changes: digest.map(|d| match d {
             PLAN_GREY => 5,
-            PLAN_LAB => 2,
+            PLAN_LAB | PLAN_WORKLOADS => 2,
             _ => 4,
         }),
         plan_removals: digest.map(|d| if d == PLAN_GREY { 3 } else { 0 }),
@@ -494,6 +496,20 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
             pi6,
             pi7,
             nas,
+            {
+                let mut c = entry(
+                    "home-nomad",
+                    "home",
+                    1,
+                    S::Applying,
+                    Some(PLAN_WORKLOADS),
+                    now,
+                    3,
+                );
+                c.kind = buckle_api::TargetKind::Cluster;
+                c.executor = Some("pi-1".into());
+                c
+            },
         ],
     );
 
@@ -569,8 +585,16 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
                 30,
             ),
             entry("lab-3", "everything-else", 1, S::Pending, None, now, 30),
+            // Added through the API, after the lab hosts it runs on.
+            {
+                let mut c = entry("lab-nomad", "everything-else", 1, S::Pending, None, now, 30);
+                c.kind = buckle_api::TargetKind::Cluster;
+                c.stage = 1;
+                c
+            },
         ],
     );
+    rest.stages = 2;
     // Planned at the rollout's start; planned again when the phase opens.
     for h in rest.hosts.iter_mut().filter(|h| h.plan_digest.is_some()) {
         h.preview = true;
@@ -1164,9 +1188,14 @@ pub fn fleet_plan() -> FleetPlan {
             let plan = g.plan.clone().unwrap_or_default();
             let has = |m: &str| plan.modules.iter().any(|x| x.module == m);
             let (grey, nomad) = (has("cleanup"), has("nomad"));
+            let workloads = g.digest == PLAN_WORKLOADS;
             g.hosts.iter().map(move |h| FleetHost {
                 host: h.clone(),
-                plan: Some(plan_doc(h, &g.digest, grey, nomad)),
+                plan: Some(if workloads {
+                    workload_plan(h)
+                } else {
+                    plan_doc(h, &g.digest, grey, nomad)
+                }),
                 context: json!({
                     "id": h,
                     "labels": {},
@@ -1212,7 +1241,87 @@ pub fn plans() -> Vec<PlanGroup> {
             destructive: false,
             plan: Some(plan_doc("lab-1", PLAN_LAB, false, false)),
         },
+        PlanGroup {
+            digest: PLAN_WORKLOADS.into(),
+            hosts: vec!["home-nomad".into()],
+            changes: 2,
+            removals: 0,
+            destructive: false,
+            plan: Some(workload_plan("home-nomad")),
+        },
     ]
+}
+
+/// The home cluster's plan: atuin's job moves to the new image (Nomad's
+/// diff, with the scheduler's preview in its summary) and its variable
+/// changes; postgresql and paste are in place.
+fn workload_plan(cluster: &str) -> PlanView {
+    let job = |name: &str| step(name, "nomad.job", &format!("default/{name}"), None);
+    PlanView {
+        revision: NEW_REV.into(),
+        host: cluster.into(),
+        digest: PLAN_WORKLOADS.into(),
+        modules: vec![
+            ModuleView {
+                module: "postgresql".into(),
+                needs: vec![],
+                steps: vec![
+                    step(
+                        "postgresql",
+                        "nomad.volume",
+                        "default/postgresql-data",
+                        None,
+                    ),
+                    job("postgresql"),
+                ],
+                handlers: vec![],
+                deferred: false,
+            },
+            ModuleView {
+                module: "atuin".into(),
+                needs: vec!["postgresql".into()],
+                steps: vec![
+                    step(
+                        "atuin",
+                        "nomad.variable",
+                        "nomad/jobs/atuin",
+                        Some((
+                            DiffKind::Update,
+                            "update nomad/jobs/atuin (1 item changed: «secret:atuin_db@7e21»)",
+                        )),
+                    ),
+                    with_diff(
+                        step(
+                            "atuin",
+                            "nomad.job",
+                            "default/atuin",
+                            Some((
+                                DiffKind::Update,
+                                "update default/atuin (server: 2 create/destroy update)",
+                            )),
+                        ),
+                        "  Job \"atuin\" {\n    Task Group \"server\" (2 create/destroy update) {\n      Task \"atuin\" {\n        Config {\n-         image: \"ghcr.io/atuinsh/atuin:18.3.0\"\n+         image: \"ghcr.io/atuinsh/atuin:18.4.0\"\n        }\n      }\n    }\n-   Meta[buckle.revision]: \"5d4a9b2\"\n+   Meta[buckle.revision]: \"7c2e1f0\"\n  }\n",
+                    ),
+                ],
+                handlers: vec![],
+                deferred: false,
+            },
+            ModuleView {
+                module: "paste".into(),
+                needs: vec![],
+                steps: vec![job("paste")],
+                handlers: vec![],
+                deferred: false,
+            },
+        ],
+        removals: vec![],
+        rehomed: vec![],
+        deferred: vec![],
+        held: vec![],
+        indeterminate: vec![],
+        skipped: vec!["grafana: cluster.labels.site == \"lab\"".into()],
+        warnings: vec![],
+    }
 }
 
 /// A finished rollout: every host in its final state.
@@ -1859,53 +1968,196 @@ fn facts(host: &HostSummary) -> Value {
     })
 }
 
-/// The cluster targets the demo fleet declares: one Nomad cluster made of
-/// the nomad hosts.
+/// The demo's cluster targets: the declared home Nomad cluster, healthy and
+/// applying #42 through pi-1, and a lab cluster added through the API that
+/// no host speaks for yet.
 pub fn clusters(now: DateTime<Utc>) -> Vec<HostSummary> {
-    let seed = labels(&[("site", "home"), ("cluster", "home")]);
-    vec![HostSummary {
-        id: "home-nomad".into(),
-        kind: buckle_api::TargetKind::Cluster,
-        cluster: Some(buckle_api::ClusterInfo {
-            spec: buckle_api::ClusterSpec {
-                kind: buckle_api::ClusterKind::Nomad,
-                description: "The home Nomad cluster.".into(),
-                api: Some("http://127.0.0.1:4646".into()),
-                nodes: Some(
-                    "host.groups contains \"nomad-servers\" || host.groups contains \"nomad-clients\""
-                        .into(),
-                ),
-                executors: Some("host.groups contains \"nomad-servers\"".into()),
-                identity: buckle_api::ClusterSpec::default_identity(),
-                cluster: None,
-                scope: Default::default(),
-                trust: None,
-            },
-            declared: true,
-        }),
-        status: HostStatus::Active,
-        connection: Connection::Offline,
-        agent_labels: seed.clone(),
-        labels: BTreeMap::new(),
-        effective_labels: seed,
-        groups: vec![],
-        platform: None,
-        arch: None,
-        agent_version: None,
-        applied_revision: None,
-        health: HealthSummary::Unknown,
-        health_at: None,
-        drifted: false,
-        first_seen: now - Duration::days(30),
-        last_seen: None,
-        notes: String::new(),
-        upgrade: None,
-    }]
+    let cluster =
+        |id: &str, spec: buckle_api::ClusterSpec, declared: bool, seed: &[(&str, &str)]| {
+            let seed = labels(seed);
+            HostSummary {
+                id: id.into(),
+                kind: buckle_api::TargetKind::Cluster,
+                cluster: Some(buckle_api::ClusterInfo { spec, declared }),
+                status: HostStatus::Active,
+                connection: Connection::Offline,
+                agent_labels: seed.clone(),
+                labels: BTreeMap::new(),
+                effective_labels: seed,
+                groups: vec![],
+                platform: None,
+                arch: None,
+                agent_version: None,
+                applied_revision: None,
+                health: HealthSummary::Unknown,
+                health_at: None,
+                drifted: false,
+                first_seen: now - Duration::days(30),
+                last_seen: None,
+                notes: String::new(),
+                upgrade: None,
+                cluster_status: None,
+            }
+        };
+    let nomad =
+        |description: &str, api: &str, ui: Option<&str>, nodes: &str| buckle_api::ClusterSpec {
+            kind: buckle_api::ClusterKind::Nomad,
+            description: description.into(),
+            api: Some(api.into()),
+            ui: ui.map(Into::into),
+            nodes: Some(nodes.into()),
+            executors: Some(nodes.into()),
+            identity: buckle_api::ClusterSpec::default_identity(),
+            cluster: None,
+            scope: Default::default(),
+            trust: None,
+        };
+    let mut home = cluster(
+        "home-nomad",
+        nomad(
+            "The home Nomad cluster.",
+            "http://127.0.0.1:4646",
+            Some("https://nomad.home.example:4646"),
+            "host.groups contains \"nomad\"",
+        ),
+        true,
+        &[("site", "home"), ("cluster", "home")],
+    );
+    home.groups = vec!["home".into()];
+    home.applied_revision = Some(STABLE_REV.into());
+    home.health = HealthSummary::Healthy;
+    home.health_at = Some(now - Duration::minutes(2));
+    home.cluster_status = Some(buckle_api::ClusterStatus {
+        executor: Some("pi-1".into()),
+        workloads: 3,
+        failing: vec![],
+        deploying: vec![buckle_api::Deploying {
+            workload: "atuin".into(),
+            progress: Some("deploying: server 1/2 healthy".into()),
+        }],
+    });
+    let mut lab = cluster(
+        "lab-nomad",
+        nomad(
+            "",
+            "https://nomad.lab.example:4646",
+            None,
+            "host.labels.site == \"lab\"",
+        ),
+        false,
+        &[("site", "lab")],
+    );
+    lab.first_seen = now - Duration::days(2);
+    lab.cluster_status = Some(buckle_api::ClusterStatus {
+        workloads: 1,
+        ..Default::default()
+    });
+    vec![home, lab]
+}
+
+/// What a demo cluster runs: its workloads as the revision declares them,
+/// their applied objects and their checks.
+fn cluster_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
+    let workload =
+        |name: &str, description: &str, needs: &[&str], kinds: &[&str]| buckle_api::WorkloadView {
+            name: name.into(),
+            description: description.into(),
+            needs: needs.iter().map(|n| n.to_string()).collect(),
+            resources: kinds.iter().map(|k| k.to_string()).collect(),
+            removal: "stop".into(),
+        };
+    let home = host.id == "home-nomad";
+    let workloads = if home {
+        vec![
+            workload(
+                "postgresql",
+                "Shared PostgreSQL for the home services.",
+                &[],
+                &["volume", "job"],
+            ),
+            workload(
+                "atuin",
+                "Shell history sync.",
+                &["postgresql"],
+                &["variable", "job"],
+            ),
+            workload("paste", "Pastebin.", &[], &["job"]),
+        ]
+    } else {
+        vec![workload(
+            "grafana",
+            "Dashboards for the lab.",
+            &[],
+            &["job"],
+        )]
+    };
+    let resources = if home {
+        [
+            ("postgresql", "nomad.volume", "default/postgresql-data", 30),
+            ("postgresql", "nomad.job", "default/postgresql", 30),
+            ("atuin", "nomad.variable", "nomad/jobs/atuin", 2),
+            ("atuin", "nomad.job", "default/atuin", 2),
+            ("paste", "nomad.job", "default/paste", 9),
+            // Retired from the revision; removed on the next apply.
+            ("grey", "nomad.job", "default/grey", 60),
+        ]
+        .iter()
+        .map(|(m, k, key, days)| ResourceSummary {
+            module: m.to_string(),
+            kind: k.to_string(),
+            key: key.to_string(),
+            revision: if *days > 40 { OLD_REV } else { STABLE_REV }.into(),
+            applied_at: now - Duration::days(*days),
+            removal: "cleanup".into(),
+        })
+        .collect()
+    } else {
+        vec![]
+    };
+    let check = |module: &str, check: &str, kind: &str| HealthResultDto {
+        scope: "drift".into(),
+        module: module.into(),
+        check: check.into(),
+        kind: kind.into(),
+        required: true,
+        status: "pass".into(),
+        reason: None,
+        at: now - Duration::minutes(2),
+        rollout_id: None,
+    };
+    let health_results = if home {
+        vec![
+            check("postgresql", "job", "nomad.job"),
+            check("atuin", "job", "nomad.job"),
+            check("atuin", "http", "http"),
+            check("paste", "job", "nomad.job"),
+        ]
+    } else {
+        vec![]
+    };
+    let recent_runs = super::runs::summaries(host, now);
+    let latest_run = recent_runs
+        .first()
+        .map(|r| super::runs::report_for(&host.id, r, now));
+    HostDetail {
+        summary: host.clone(),
+        facts: json!({"cluster": {"kind": "nomad", "nodes": if home { 8 } else { 0 }}}),
+        facts_at: home.then(|| now - Duration::minutes(2)),
+        resources,
+        recent_runs,
+        health_checks: host_checks(&health_results, &host.id),
+        health_results,
+        drift: vec![],
+        latest_run,
+        workloads,
+    }
 }
 
 pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
-    let pending =
-        host.status == HostStatus::Pending || host.kind == buckle_api::TargetKind::Cluster;
+    if host.kind == buckle_api::TargetKind::Cluster {
+        return cluster_detail(host, now);
+    }
+    let pending = host.status == HostStatus::Pending;
     let rev = host.applied_revision.clone().unwrap_or_default();
     let resources = if pending {
         vec![]
@@ -2126,6 +2378,7 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         health_results,
         drift,
         latest_run,
+        workloads: vec![],
     }
 }
 
