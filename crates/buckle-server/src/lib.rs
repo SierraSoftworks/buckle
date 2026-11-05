@@ -128,6 +128,7 @@ pub async fn run_with(
             options: rollout::ControllerOptions {
                 disconnect_timeout: config.agents.disconnect_timeout,
                 apply_timeout: config.agents.apply_timeout,
+                ..Default::default()
             },
         },
         cancel.clone(),
