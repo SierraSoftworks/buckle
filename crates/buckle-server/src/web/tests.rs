@@ -425,6 +425,25 @@ async fn hosts_can_be_relabelled_approved_and_previewed() {
 #[actix_web::test]
 async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
     let e = env(WebConfig::default()).await;
+    // The workloads go in before the revision is announced: the controller
+    // loads it (for the cluster's lease) as soon as it is valid.
+    let dir = e.state.revisions.dir("r1");
+    for (name, needs) in [("postgresql", ""), ("atuin", "needs: [postgresql]\n")] {
+        let w = dir.join(format!("workloads/{name}/files"));
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(
+            w.join(format!("{name}.nomad.hcl")),
+            format!("job \"{name}\" {{}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("workloads/{name}/workload.yaml")),
+            format!(
+                "name: {name}\ndescription: the {name} job\n{needs}resources: [{name}.nomad.hcl]\n"
+            ),
+        )
+        .unwrap();
+    }
     revision(
         &e,
         "r1",
@@ -443,23 +462,6 @@ async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
             .call(move |db| db.hosts().set_labels(id, &labels).map(|_| ()))
             .await
             .unwrap();
-    }
-    let dir = e.state.revisions.dir("r1");
-    for (name, needs) in [("postgresql", ""), ("atuin", "needs: [postgresql]\n")] {
-        let w = dir.join(format!("workloads/{name}/files"));
-        std::fs::create_dir_all(&w).unwrap();
-        std::fs::write(
-            w.join(format!("{name}.nomad.hcl")),
-            format!("job \"{name}\" {{}}"),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join(format!("workloads/{name}/workload.yaml")),
-            format!(
-                "name: {name}\ndescription: the {name} job\n{needs}resources: [{name}.nomad.hcl]\n"
-            ),
-        )
-        .unwrap();
     }
     e.store
         .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "r1"))
@@ -696,6 +698,7 @@ async fn cluster_targets_are_declared_or_created_and_listed_beside_hosts() {
         cluster: None,
         scope: Default::default(),
         trust: None,
+        watch: None,
     };
     let create = |body: buckle_api::CreateTarget| {
         test::TestRequest::post()

@@ -21,9 +21,9 @@ The directory name must equal the workload's `name`. `files/` holds the specs th
 list names; files ending in `.j2` are rendered as [templates](./expressions.md#templates) first.
 
 ::: tip Status
-Nomad and Kubernetes workloads are planned, applied and health checked through one of the
-cluster's executors, which needs no cluster state of its own: the server sends the cluster's spec
-and secrets before each request, and ownership is read back from the cluster. A workload's extra
+Nomad and Kubernetes workloads are planned, applied and health checked through the cluster's
+[steward](./fleet.md#stewards), which needs no cluster state of its own: the server sends the
+cluster's spec and secrets before each request, and ownership is read back from the cluster. A workload's extra
 `health` checks, `restart_on` and cluster `scope` are not yet applied by executors.
 :::
 

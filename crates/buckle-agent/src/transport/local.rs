@@ -76,6 +76,13 @@ pub fn log_report(report: &Report) {
             log_report(report)
         }
         Report::Facts(_) => tracing::debug!("facts collected"),
+        Report::TargetStatus { reachable, error } => {
+            tracing::info!(
+                reachable,
+                error = error.as_deref().unwrap_or(""),
+                "cluster reachability"
+            )
+        }
         Report::Heartbeat { busy, .. } => tracing::debug!(busy, "heartbeat"),
         Report::Plan(plan) => tracing::info!(
             revision = %plan.revision.short(),

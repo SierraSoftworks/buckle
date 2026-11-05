@@ -318,6 +318,13 @@ DROP TABLE rollout_hosts;
 ALTER TABLE rollout_hosts_v11 RENAME TO rollout_hosts;
 CREATE INDEX rollout_hosts_host ON rollout_hosts(host, state);
 "#,
+    // 12: a cluster target's steward (the host agent leasing it) and whether
+    // the cluster answers it (`reachable`/`unreachable`, with the error).
+    r#"
+ALTER TABLE hosts ADD COLUMN steward TEXT;
+ALTER TABLE hosts ADD COLUMN reachable TEXT;
+ALTER TABLE hosts ADD COLUMN reachable_error TEXT;
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.

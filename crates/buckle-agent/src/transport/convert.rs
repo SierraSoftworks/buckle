@@ -2,8 +2,8 @@
 //! messages in [`buckle_proto::v1`].
 
 use super::{
-    Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, UpgradeReport, Welcome,
-    WireCluster, WireSecret,
+    Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, UpgradeReport, WatchConfig,
+    Welcome, WireCluster, WireSecret,
 };
 use buckle_core::health::{HealthReport, HealthResult, HealthStatus};
 use buckle_core::plan::RevisionId;
@@ -91,6 +91,27 @@ pub fn reboot_to_proto(reboot: &buckle_core::reboot::RebootRequest) -> pb::Reboo
 }
 
 /// Secrets from a protobuf bundle.
+/// A cluster target as the server described it. The fingerprint key is
+/// moved, not copied: the WireCluster zeroes it on drop.
+fn cluster_from_proto(mut c: pb::ClusterTarget) -> WireCluster {
+    WireCluster {
+        kind: std::mem::take(&mut c.kind),
+        api: std::mem::take(&mut c.api),
+        identity: std::mem::take(&mut c.identity),
+        labels: std::mem::take(&mut c.labels).into_iter().collect(),
+        fingerprint_key: std::mem::take(&mut c.fingerprint_key),
+    }
+}
+
+/// A positive protobuf duration; `None` when absent or not positive.
+fn duration_from_proto(d: Option<&prost_types::Duration>) -> Option<std::time::Duration> {
+    let d = d?;
+    let secs = u64::try_from(d.seconds).ok()?;
+    let nanos = u32::try_from(d.nanos).ok()?;
+    let out = std::time::Duration::new(secs, nanos);
+    (!out.is_zero()).then_some(out)
+}
+
 pub fn secrets_from_proto(bundle: Option<pb::SecretBundle>) -> Vec<WireSecret> {
     bundle
         .map(|b| {
@@ -129,14 +150,24 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             tree_digest: non_empty(a.tree_digest),
             target: non_empty(a.target),
             workload: non_empty(a.workload),
-            cluster: a.cluster.map(|mut c| WireCluster {
-                kind: std::mem::take(&mut c.kind),
-                api: std::mem::take(&mut c.api),
-                identity: std::mem::take(&mut c.identity),
-                labels: std::mem::take(&mut c.labels).into_iter().collect(),
-                // Moved, not copied: the WireCluster zeroes it on drop.
-                fingerprint_key: std::mem::take(&mut c.fingerprint_key),
-            }),
+            cluster: a.cluster.map(cluster_from_proto),
+        },
+        Msg::Lease(l) => {
+            let watch = l.watch.unwrap_or_default();
+            let defaults = WatchConfig::default();
+            Instruction::Lease {
+                target: l.target,
+                cluster: l.cluster.map(cluster_from_proto),
+                applied_revision: non_empty(l.applied_revision).map(RevisionId),
+                watch: WatchConfig {
+                    health: duration_from_proto(watch.health.as_ref()).unwrap_or(defaults.health),
+                    drift: duration_from_proto(watch.drift.as_ref()).unwrap_or(defaults.drift),
+                },
+            }
+        }
+        Msg::Release(r) => Instruction::Release {
+            target: r.target,
+            reason: r.reason,
         },
         Msg::Plan(p) => Instruction::RequestPlan {
             revision: RevisionId(p.revision),
@@ -578,6 +609,12 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             boot_id: boot_id.clone().unwrap_or_default(),
             error: error.clone(),
         }),
+        Report::TargetStatus { reachable, error } => Msg::TargetStatus(pb::TargetStatus {
+            target: String::new(),
+            reachable: *reachable,
+            error: error.clone().unwrap_or_default(),
+            at: Some(timestamp(chrono::Utc::now())),
+        }),
         Report::For {
             target,
             workload,
@@ -605,6 +642,7 @@ fn set_target(msg: &mut pb::agent_message::Msg, target: &str, workload: &str) {
         Msg::Health(m) => (&mut m.target, Some(&mut m.workload)),
         Msg::Drift(m) => (&mut m.target, Some(&mut m.workload)),
         Msg::Action(m) => (&mut m.target, Some(&mut m.workload)),
+        Msg::TargetStatus(m) => (&mut m.target, None),
         _ => return,
     };
     *t = target.to_owned();

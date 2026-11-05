@@ -56,6 +56,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/targets/{id}", web::delete().to(host_forget))
             .route("/targets/{id}/executor", web::get().to(target_executor))
             .route("/targets/{id}/preview", web::post().to(host_preview))
+            .route("/targets/{id}/steward", web::post().to(target_steward))
             .route(
                 "/targets/{id}/actions/{module}/{action}",
                 web::post().to(run_action),
@@ -120,6 +121,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/targets/t/preview"),
     ("GET", "/api/v1/targets/t/executor"),
     ("POST", "/api/v1/targets/t/pause"),
+    ("POST", "/api/v1/targets/t/steward"),
     ("GET", "/api/v1/join"),
     ("POST", "/api/v1/join"),
     ("GET", "/api/v1/join/j"),
@@ -634,6 +636,33 @@ async fn target_executor(state: Data, _: Administrative, path: web::Path<String>
         crate::executor_job::render(&id, &spec, state.joins.settings(), &state.server_version)
             .map_err(ApiError::bad_request)?;
     Ok(HttpResponse::Ok().json(rendered))
+}
+
+/// `POST /targets/{id}/steward`: moves a cluster's lease to the host named
+/// in the body, which must be able to speak for it now.
+async fn target_steward(
+    state: Data,
+    admin: Administrative,
+    path: web::Path<String>,
+    body: web::Json<buckle_api::StewardRequest>,
+) -> ApiResult {
+    let id = path.into_inner();
+    let buckle_api::StewardRequest { host, note } = body.into_inner();
+    if host.is_empty() {
+        return Err(ApiError::bad_request("Name the host to move the lease to."));
+    }
+    state
+        .controller
+        .command(
+            &admin.0.actor(),
+            Command::MoveLease {
+                target: id.clone(),
+                host,
+                note,
+            },
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(summary_or_404(&state, &id).await?))
 }
 
 async fn summary_or_404(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {

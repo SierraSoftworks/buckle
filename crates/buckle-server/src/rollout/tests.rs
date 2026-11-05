@@ -625,6 +625,15 @@ impl Harness {
             .unwrap()
     }
 
+    /// The cluster's steward as its record shows it.
+    async fn steward(&self, target: &str) -> Option<String> {
+        let t = target.to_owned();
+        self.store
+            .call(move |db| Ok(db.hosts().target(&t)?.and_then(|r| r.steward)))
+            .await
+            .unwrap()
+    }
+
     async fn wait(
         &self,
         id: &str,
@@ -4093,6 +4102,8 @@ fn targeted(m: &SMsg) -> Option<&str> {
         SMsg::Plan(p) => Some(p.target.as_str()),
         SMsg::Apply(a) => Some(a.target.as_str()),
         SMsg::Health(h) => Some(h.target.as_str()),
+        SMsg::Lease(l) => Some(l.target.as_str()),
+        SMsg::Release(r) => Some(r.target.as_str()),
         _ => None,
     }
     .filter(|t| !t.is_empty())
@@ -4254,15 +4265,16 @@ async fn an_in_cluster_executor_serves_only_its_cluster() {
     assert!(untargeted.is_empty(), "{untargeted:?}");
 }
 
-/// Between rollouts an applied cluster's health is read every interval (at
-/// the applied revision) through its last executor, or another capable one
-/// while that one is away; with none online, it is not read.
+/// Between rollouts an applied cluster stays leased to its last executor,
+/// which watches it; while that one is away past the disconnect timeout the
+/// lease moves to another capable host (the record follows); with none
+/// online, nobody holds it.
 #[rstest::rstest]
 #[case::last_executor(2, false)]
 #[case::another_while_the_last_is_away(2, true)]
 #[case::none_online(1, true)]
 #[tokio::test(start_paused = true)]
-async fn an_applied_clusters_health_is_read_between_rollouts(
+async fn an_applied_cluster_stays_leased_between_rollouts(
     #[case] nodes: usize,
     #[case] last_away: bool,
 ) {
@@ -4277,6 +4289,15 @@ async fn an_applied_clusters_health_is_read_between_rollouts(
     let id = h.start("r1").await;
     let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
     let last = host(&hosts, CLUSTER).runtime.executor.clone().unwrap();
+    let leased_to = |h: &Harness, to: &str| {
+        h.sent(|x, m| x == to && matches!(m, SMsg::Lease(l) if l.target == CLUSTER))
+    };
+    assert!(
+        !leased_to(&h, &last).is_empty(),
+        "the executor holds the lease"
+    );
+    assert_eq!(h.steward(CLUSTER).await.as_deref(), Some(last.as_str()));
+    // The gRPC route records the applied revision; here, by hand.
     h.store
         .call(|db| db.hosts().set_applied_revision(CLUSTER, "r1"))
         .await
@@ -4285,26 +4306,35 @@ async fn an_applied_clusters_health_is_read_between_rollouts(
         h.disconnect(&last);
     }
     h.idle(11 * 60).await;
-    let reads = h.sent(|_, m| {
-        matches!(m, SMsg::Health(r) if r.scope == HealthScope::Drift as i32 && r.target == CLUSTER)
-    });
     let expected = if last_away {
         names.iter().find(|n| **n != last)
     } else {
         Some(&last)
     };
+    assert_eq!(
+        h.steward(CLUSTER).await.as_deref(),
+        expected.map(String::as_str)
+    );
     match expected {
-        Some(expected) => {
-            assert!(reads.len() >= 2, "read every interval: {reads:?}");
+        Some(other) if last_away => {
+            let moved = leased_to(&h, other);
+            assert_eq!(moved.len(), 1, "{moved:?}");
+            // The lease names the applied revision, behind its Assign.
             assert!(
-                reads
-                    .iter()
-                    .all(|(_, x, m)| x == expected
-                        && matches!(m, SMsg::Health(r) if r.revision == "r1")),
-                "through {expected}: {reads:?}"
+                matches!(&moved[0].2, SMsg::Lease(l) if l.applied_revision == "r1" && l.cluster.is_some()),
+                "{moved:?}"
+            );
+            let released = h.sent(|x, m| x == last && matches!(m, SMsg::Release(_)));
+            assert!(
+                released.is_empty(),
+                "nobody to release while away: {released:?}"
             );
         }
-        None => assert!(reads.is_empty(), "{reads:?}"),
+        Some(same) => {
+            let others = h.sent(|x, m| x != same && matches!(m, SMsg::Lease(_)));
+            assert!(others.is_empty(), "{others:?}");
+        }
+        None => {}
     }
 }
 
@@ -4410,8 +4440,15 @@ async fn a_lost_executor_is_replaced_and_the_cluster_re_planned_through_the_next
             .iter()
             .filter(|a| *a == "rollout.target.executor")
             .count(),
-        3,
-        "picked, lost, picked again: {actions:?}"
+        2,
+        "picked, then moved with the lease: {actions:?}"
+    );
+    // n1 was released (once back) and n2 leased the cluster.
+    let leases = h.sent(|to, m| to == "n2" && matches!(m, SMsg::Lease(l) if l.target == CLUSTER));
+    assert!(
+        !leases.is_empty(),
+        "{:?}",
+        h.sent(|_, m| targeted(m).is_some())
     );
 }
 

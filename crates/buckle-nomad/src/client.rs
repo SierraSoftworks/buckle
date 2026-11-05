@@ -132,6 +132,22 @@ impl Nomad {
         }))
     }
 
+    /// A blocking query: `GET path` that Nomad answers once its index for
+    /// the path passes `index`, or after `wait` (Nomad adds up to a sixteenth
+    /// as jitter; keep `wait` under the transport's request timeout). The
+    /// answer carries the index it was served at, so the next call passes
+    /// it on. `None` on 404.
+    pub async fn get_blocking<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        index: u64,
+        wait: std::time::Duration,
+    ) -> Result<Option<Indexed<T>>> {
+        let path = with_query(path, "index", &index.to_string());
+        let path = with_query(&path, "wait", &format!("{}ms", wait.as_millis()));
+        self.get_indexed(&path).await
+    }
+
     /// `method path` with a JSON body, decoding the JSON answer.
     pub async fn write<B: Serialize + ?Sized, T: DeserializeOwned>(
         &self,

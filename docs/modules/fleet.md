@@ -78,6 +78,7 @@ fleet:
       executors: 'host.groups contains "nomad-servers"'   # which hosts may speak for it; absent: nodes
       identity: buckle_jwt                          # buckle_jwt (default), local, workload or secret://NAME
       labels: { site: home }
+      watch: { health: 60s, drift: 10m }            # how often its steward reads it unprompted (defaults)
       trust:                                        # optional: an executor running inside the cluster
         jwks_url: http://nomad.home:4646/.well-known/jwks.json
         subjects: [default/buckle-executor]
@@ -90,12 +91,36 @@ fleet:
 | Key | Meaning |
 |---|---|
 | `nodes` | A [selector](./expressions.md) over `host.*` choosing the cluster's members: what a workload's `module:` edge and a module's `workload:` edge refer to. |
-| `executors` | Which of the hosts may apply workloads to the cluster. Defaults to `nodes`. |
+| `executors` | Which of the hosts may apply workloads to the cluster, and hold its lease (see [Stewards](#stewards)). Defaults to `nodes`. |
 | `ui` | The cluster's own web UI, for the links beside each workload on the cluster's page (Nomad: `…/ui/jobs/NAME@NAMESPACE`). Defaults to `api` when that is an HTTP URL. |
 | `identity` | How an executor authenticates to the API: a token Buckle issues (`buckle_jwt`, see [identity](../agent/server.md#identity)), the host's own credentials (`local`), the scheduler's workload identity (`workload`), or a declared secret (`secret://NAME`). |
 | `labels` | Seed labels, as an agent's are for a host. Operators may add to them in the UI, and `cluster.labels.*` selects on the result. |
 | `cluster`, `scope` | A *scoped* target is part of another cluster and may touch only the namespaces listed. |
+| `watch` | How often the steward reads the cluster when nothing wakes it: `health` (default `60s`) covers a dropped Nomad long poll, `drift` (default `10m`) re-plans the applied revision. |
 | `trust` | Which workload identities may speak for the cluster from inside it ([in-cluster executors](../agent/server.md#in-cluster-executors)): `jwks_url` the server reads the signing keys from, or `keys` pinned as a JWKS document; an optional `issuer`; `subjects` as `namespace/job` (Nomad, default `default/buckle-executor`) or `sub` (Kubernetes, default `system:serviceaccount:buckle-system:buckle-executor`). Not on a scoped target. |
+
+### Stewards
+
+Each cluster is *leased* to one host agent at a time, its steward, which runs the cluster's
+placements and watches it between rollouts. The server picks it among the connected hosts that
+match `executors`: an [executor running inside the cluster](../agent/server.md#in-cluster-executors)
+first, else the current holder while it still qualifies, else the first by name. The lease is
+sticky across server restarts and survives a disconnect up to `agents.disconnect_timeout`; then
+it moves, and any placement in flight is planned again through the new steward.
+
+The steward watches the cluster from one lane per lease, beside its own host's work:
+
+- **health on change**: Nomad's jobs, allocations and deployments are long polled, and the
+  Kubernetes watch stream is followed (with a full re-sync whenever the executor's identity is
+  re-issued); each change re-reads the applied workloads' health once it settles, and the
+  `watch.health` timer covers a dropped poll;
+- **drift** every `watch.drift`: the applied revision is planned again and a non-empty plan is
+  reported (never corrected);
+- **reachability**: whether the cluster's API answers, shown on its page and reported as it
+  changes.
+
+The cluster's page shows its steward; `POST /api/v1/targets/{id}/steward` with `{"host": …}`
+moves the lease to another qualifying host (an in-cluster executor keeps it while connected).
 
 Declared clusters appear on the UI's Clusters page and under `GET /api/v1/targets`, with their
 spec and seed labels following the repository. Operators can also create clusters that are not in

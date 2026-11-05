@@ -351,7 +351,17 @@ pub struct ActionRequest {
     pub note: String,
 }
 
+/// `POST /api/v1/targets/{id}/steward`: move a cluster's lease to `host`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StewardRequest {
+    pub host: String,
+    #[serde(default)]
+    pub note: String,
+}
+
 /// Server-sent event payloads on `GET /api/v1/events`.
+// Built once and serialised at once: a host summary's size is no concern.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveEvent {

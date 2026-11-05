@@ -41,8 +41,6 @@ pub struct ControllerOptions {
     pub disconnect_timeout: Duration,
     /// How long a host may stay applying without a result before it fails.
     pub apply_timeout: Duration,
-    /// How often an applied cluster's health is read outside rollouts.
-    pub cluster_health_interval: Duration,
 }
 
 /// How often an Apply is re-sent to a host that reconnects without having
@@ -58,7 +56,6 @@ impl Default for ControllerOptions {
         Self {
             disconnect_timeout: Duration::from_secs(600),
             apply_timeout: Duration::from_secs(30 * 60),
-            cluster_health_interval: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -195,6 +192,13 @@ pub enum Command {
         revision: String,
         note: String,
     },
+    /// Move cluster `target`'s lease to `host`, a connected host that may
+    /// speak for it; its placements in flight are re-planned there.
+    MoveLease {
+        target: String,
+        host: String,
+        note: String,
+    },
 }
 
 impl Command {
@@ -216,6 +220,7 @@ impl Command {
             Command::Reject { .. } => "rollout.reject",
             Command::RunAction { .. } => "host.action.run",
             Command::StartAction { .. } => "rollout.action.start",
+            Command::MoveLease { .. } => "target.steward.move",
         }
     }
 }
@@ -279,6 +284,12 @@ enum Input {
     RevisionAdded(String),
     HostChanged(String),
     HostRegistered(String),
+    /// `host` reported on a cluster `target` it does not steward: its lane
+    /// is released unless the lease is (again) its.
+    StaleSteward {
+        host: String,
+        target: String,
+    },
     /// A durable agent report (ApplyResult, LocalRollback) the gRPC layer
     /// stored as pending; `done` is told once the controller's reaction is
     /// persisted (and the pending copy removed), so the report can be acked.
@@ -331,6 +342,14 @@ impl ControllerHandle {
     /// An operator changed a host's status, labels, or forgot it.
     pub fn host_changed(&self, host: &str) {
         let _ = self.tx.send(Input::HostChanged(host.to_owned()));
+    }
+
+    /// `host` sent a watch report about a cluster it does not steward.
+    pub fn stale_steward(&self, host: &str, target: &str) {
+        let _ = self.tx.send(Input::StaleSteward {
+            host: host.to_owned(),
+            target: target.to_owned(),
+        });
     }
 
     /// A durable agent report the gRPC layer stored as pending (see
@@ -577,6 +596,9 @@ enum Out {
         workload: String,
         msg: Box<ServerMessage>,
     },
+    /// The cluster's lease to its steward: a targeted Assign of the applied
+    /// revision (when there is one), then the Lease.
+    Lease { session: String, target: String },
 }
 
 /// A host agent speaks for clusters only once it announces it runs a
@@ -614,15 +636,18 @@ struct Placement {
     after: Vec<String>,
 }
 
-/// The outcome of looking for a cluster's executor.
+/// The outcome of looking for a cluster's executor: its steward, the host
+/// agent holding its lease.
 enum Pick {
     /// This host speaks for the cluster.
     Executor(String),
-    /// Hosts could, but every one is mid-wave: wait for them.
-    Busy,
     /// No connected, capable host matches the cluster's `executors`.
     None,
 }
+
+/// How often the controller re-evaluates which host stewards each cluster
+/// when nothing (a connect, a disconnect, a host change) prompts it.
+const LEASE_INTERVAL: Duration = Duration::from_secs(30);
 
 struct Controller {
     store: Store,
@@ -650,11 +675,26 @@ struct Controller {
     capabilities: HashMap<String, Vec<String>>,
     /// The boot each host's current (or last) session runs in.
     boot_ids: HashMap<String, String>,
-    /// Each cluster's last executor (kv `executor/<cluster>`), so a pick
-    /// stays with the same host while it qualifies.
+    /// Each cluster's steward (kv `executor/<cluster>`): the host agent
+    /// holding its lease, which watches it and runs its placements. Sticky:
+    /// it stays while the host qualifies.
     executors: BTreeMap<String, String>,
-    /// Clusters whose executor changed since the last checkpoint.
+    /// Clusters whose steward changed since the last checkpoint.
     executors_dirty: BTreeSet<String>,
+    /// Clusters whose steward (or lack of one) is to be written to their
+    /// record with the next checkpoint.
+    stewards_dirty: BTreeMap<String, Option<String>>,
+    /// Clusters whose Lease is (re)sent to their steward with the next
+    /// checkpoint: new or moved leases, reconnects, a new applied revision.
+    lease_resend: BTreeSet<String>,
+    /// Leases are re-evaluated on the next drive pass (a connect, a
+    /// disconnect, a host or cluster change) rather than at `leases_due`.
+    leases_dirty: bool,
+    /// When leases are next re-evaluated unprompted.
+    leases_due: DateTime<Utc>,
+    /// Since when each cluster's steward has been disconnected; past the
+    /// disconnect timeout the lease moves.
+    steward_away: BTreeMap<String, DateTime<Utc>>,
     /// Each cluster target's spec as last loaded (its `executors` and
     /// `nodes` selectors), for the executor pick and the stage layout.
     clusters: HashMap<String, buckle_api::ClusterSpec>,
@@ -673,8 +713,6 @@ struct Controller {
     ack_waiters: Vec<oneshot::Sender<bool>>,
     /// Pending durable reports found on load, replayed before any input.
     replay: Vec<(String, u64, agent_message::Msg)>,
-    /// When applied clusters' health is next read (outside rollouts).
-    cluster_health_due: DateTime<Utc>,
 }
 
 fn msg(m: server_message::Msg) -> ServerMessage {
@@ -935,8 +973,6 @@ impl Controller {
                 })
                 .await?;
         }
-        let cluster_health_due = now
-            + chrono::Duration::from_std(deps.options.cluster_health_interval).unwrap_or_default();
         Ok(Self {
             store: deps.store,
             link: deps.link,
@@ -958,6 +994,11 @@ impl Controller {
             boot_ids: HashMap::new(),
             executors,
             executors_dirty: BTreeSet::new(),
+            stewards_dirty: BTreeMap::new(),
+            lease_resend: BTreeSet::new(),
+            leases_dirty: true,
+            leases_due: now,
+            steward_away: BTreeMap::new(),
             clusters: HashMap::new(),
             host_seen,
             flush_retry: None,
@@ -966,7 +1007,6 @@ impl Controller {
             pending_clear: Vec::new(),
             ack_waiters: Vec::new(),
             replay,
-            cluster_health_due,
         })
     }
 
@@ -1321,6 +1361,7 @@ impl Controller {
             Input::RevisionAdded(id) => self.on_revision_added(&id).await,
             Input::HostChanged(host) => self.on_host_changed(&host).await,
             Input::HostRegistered(host) => self.on_host_registered(&host).await,
+            Input::StaleSteward { host, target } => self.on_stale_steward(&host, &target),
             Input::Durable {
                 host,
                 report_id,
@@ -1377,6 +1418,16 @@ impl Controller {
 
     async fn on_connected(&mut self, c: Connected) {
         self.online.insert(c.host.clone());
+        // Leases are re-evaluated (an in-cluster executor that appears takes
+        // its cluster's), and the ones this host holds are re-sent: its
+        // lanes may have ended with its last session.
+        self.leases_dirty = true;
+        for (cluster, steward) in &self.executors {
+            if steward == &c.host {
+                self.lease_resend.insert(cluster.clone());
+                self.steward_away.remove(cluster);
+            }
+        }
         if c.new_session {
             self.capabilities
                 .insert(c.host.clone(), c.capabilities.clone());
@@ -1544,6 +1595,12 @@ impl Controller {
     fn on_disconnected(&mut self, host: &str) {
         let now = self.now();
         self.online.remove(host);
+        for (cluster, steward) in &self.executors {
+            if steward == host {
+                self.steward_away.entry(cluster.clone()).or_insert(now);
+            }
+        }
+        self.leases_dirty = true;
         for ri in 0..self.live.len() {
             let rows: Vec<usize> = (0..self.live[ri].hosts.len())
                 .filter(|&hi| self.row_session(ri, hi).as_deref() == Some(host))
@@ -1744,6 +1801,10 @@ impl Controller {
 
     fn on_apply_result(&mut self, host: &str, result: ApplyResult) {
         let target = result.target.clone();
+        // The cluster's applied revision moved: its steward's watch follows.
+        if !target.is_empty() && result.succeeded {
+            self.lease_resend.insert(target.clone());
+        }
         for ri in 0..self.live.len() {
             if self.live[ri].record.runtime.action.is_some() {
                 continue;
@@ -2104,6 +2165,7 @@ impl Controller {
     }
 
     async fn on_host_changed(&mut self, host: &str) {
+        self.leases_dirty = true;
         let h = host.to_owned();
         let record = self
             .store
@@ -2185,6 +2247,11 @@ impl Controller {
     /// as a failure) and dropped from pending gates.
     fn forget_host(&mut self, host: &str) {
         self.clusters.remove(host);
+        // A forgotten cluster's lease ends; a forgotten host's leases move.
+        if self.executors.contains_key(host) {
+            self.set_steward(host, None, "controller", "the cluster was forgotten");
+        }
+        self.leases_dirty = true;
         for ri in 0..self.live.len() {
             let mut gated = false;
             for p in &mut self.live[ri].record.runtime.phases {
@@ -2686,6 +2753,9 @@ impl Controller {
                     .await
             }
             Command::Start { revision, note } => self.start(&revision, actor, &note).await,
+            Command::MoveLease { target, host, note } => {
+                self.move_lease_to(actor, &target, &host, &note).await
+            }
             Command::StartAction {
                 action,
                 targets,
@@ -3498,10 +3568,18 @@ impl Controller {
                 Ok(out)
             })
             .await?;
-        self.clusters = targets
+        let clusters: HashMap<String, buckle_api::ClusterSpec> = targets
             .iter()
             .filter_map(|(h, _)| h.cluster.as_ref().map(|c| (h.id.clone(), c.spec.clone())))
             .collect();
+        // A cluster that appeared (synced from a revision) or went needs
+        // its lease reviewed.
+        if clusters.len() != self.clusters.len()
+            || clusters.keys().any(|c| !self.clusters.contains_key(c))
+        {
+            self.leases_dirty = true;
+        }
+        self.clusters = clusters;
         Ok(targets)
     }
 
@@ -3633,24 +3711,26 @@ impl Controller {
         Ok(())
     }
 
-    /// Whether cluster `cluster` is rolled by placements: every connected
-    /// host that could execute for it takes one workload at a time
-    /// ([`WORKLOADS_CAPABILITY`]). With none connected, it is (the agents
-    /// that come are current ones); while an older executor is connected the
-    /// cluster is rolled as one row, which that agent understands.
+    /// Whether cluster `cluster` is rolled by placements: its steward takes
+    /// one workload at a time ([`WORKLOADS_CAPABILITY`]), or, with the lease
+    /// unheld, every host that could take it does. With none connected, it
+    /// is (the agents that come are current ones); while an older executor
+    /// holds or could take the lease the cluster is rolled as one row, which
+    /// that agent understands.
     fn placements_supported(
         &self,
         cluster: &str,
         fleet: &buckle_core::model::FleetConfig,
         targets: &[(crate::store::HostRecord, serde_json::Value)],
     ) -> bool {
-        self.able_executors(cluster, fleet, targets)
-            .into_iter()
-            .all(|h| {
-                self.capabilities
-                    .get(h)
-                    .is_some_and(|c| c.iter().any(|c| c == WORKLOADS_CAPABILITY))
-            })
+        if let Some(steward) = self.executors.get(cluster)
+            && self.connected(steward)
+        {
+            return self.has_capability(steward, WORKLOADS_CAPABILITY);
+        }
+        self.steward_candidates(cluster, fleet, targets)
+            .iter()
+            .all(|h| self.has_capability(h, WORKLOADS_CAPABILITY))
     }
 
     /// The workload placements of `record` (a cluster) for `revision`: one
@@ -4852,7 +4932,7 @@ impl Controller {
         let mut consider = |t: DateTime<Utc>| {
             next = Some(next.map_or(t, |n| n.min(t)));
         };
-        consider(self.cluster_health_due);
+        consider(self.leases_due);
         if let Some(t) = self.flush_retry {
             consider(t);
         }
@@ -5065,7 +5145,7 @@ impl Controller {
 
     async fn drive(&mut self) {
         self.on_time().await;
-        self.read_cluster_health().await;
+        self.assign_leases().await;
         for _ in 0..64 {
             let mut changed = false;
             for ri in 0..self.live.len() {
@@ -5427,21 +5507,20 @@ impl Controller {
     }
 
     /// Hosts another live rollout (another rollout's phases, or an open
-    /// stragglers stage) is working on, and hosts executing a cluster's
-    /// apply in any rollout: they are not started here until that is done.
+    /// stragglers stage) is working on: they are not started here until
+    /// that is done. A host stewarding a cluster mid-apply is not busy: the
+    /// cluster's work runs on a lane of its own.
     fn busy_elsewhere(&self, ri: usize) -> HashSet<String> {
         self.live
             .iter()
             .enumerate()
-            .flat_map(|(rj, l)| {
+            .filter(|(rj, _)| *rj != ri)
+            .flat_map(|(_, l)| {
                 l.hosts
                     .iter()
                     .filter(|h| h.state.in_flight() || h.state == HostPhase::RollingBack)
-                    .flat_map(move |h| {
-                        let own = (rj != ri && h.runtime.kind == TargetKind::Host)
-                            .then(|| h.host.clone());
-                        own.into_iter().chain(h.runtime.executor.clone())
-                    })
+                    .filter(|h| h.runtime.kind == TargetKind::Host)
+                    .map(|h| h.host.clone())
             })
             .collect()
     }
@@ -6138,11 +6217,11 @@ impl Controller {
 
     // ------------------------------------------------------------ executors
 
-    /// Picks an executor for each cluster row among `rows` still without
-    /// one (and still to plan or apply), returning the rows that got one.
-    /// A cluster whose candidates are all mid-wave waits for them; one with
-    /// no candidate at all starts the "awaiting executor" grace when `grace`
-    /// (inside a phase; the stragglers stage waits without end).
+    /// Points each cluster row among `rows` still without an executor (and
+    /// still to plan or apply) at its cluster's steward, returning the rows
+    /// that got one. A cluster nobody stewards starts the "awaiting
+    /// executor" grace when `grace` (inside a phase; the stragglers stage
+    /// waits without end).
     async fn assign_executors(&mut self, ri: usize, rows: &[usize], grace: bool) -> Vec<usize> {
         let waiting: Vec<usize> = rows
             .iter()
@@ -6157,19 +6236,16 @@ impl Controller {
         if waiting.is_empty() {
             return Vec::new();
         }
-        let Ok(targets) = self.load_targets(None).await else {
-            return Vec::new();
-        };
+        self.review_leases_if_due().await;
         let now = self.now();
         let mut picked = Vec::new();
         for hi in waiting {
-            match self.pick_executor(ri, hi, &targets) {
+            match self.pick_executor(ri, hi) {
                 Pick::Executor(executor) => {
                     self.set_executor(ri, hi, Some(executor));
                     self.live[ri].hosts[hi].runtime.disconnected_at = None;
                     picked.push(hi);
                 }
-                Pick::Busy => {}
                 Pick::None if grace => {
                     let h = &mut self.live[ri].hosts[hi];
                     if h.runtime.disconnected_at.is_none() {
@@ -6187,68 +6263,6 @@ impl Controller {
     /// that wait for one, and asks the newly spoken-for ones for their
     /// plans. Run on every pass, so a host that connects or finishes its
     /// own wave is picked up at once.
-    /// Outside rollouts nothing reads a cluster's health: its executors are
-    /// stateless and run no drift pass. Every `cluster_health_interval`, each
-    /// applied cluster no rollout is working on is checked through an idle
-    /// executor, its last one first (as a host's agent checks itself with
-    /// each drift pass).
-    async fn read_cluster_health(&mut self) {
-        let now = self.now();
-        if now < self.cluster_health_due {
-            return;
-        }
-        self.cluster_health_due = now
-            + chrono::Duration::from_std(self.options.cluster_health_interval)
-                .unwrap_or_default()
-                .max(chrono::Duration::seconds(1));
-        let targets = match self.load_targets(None).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "the clusters could not be listed for their health");
-                return;
-            }
-        };
-        let clusters: Vec<(String, String)> = targets
-            .iter()
-            .filter(|(c, _)| c.kind == TargetKind::Cluster && c.status == HostStatus::Active)
-            .filter(|(c, _)| !self.excluded.contains(&c.id))
-            .filter(|(c, _)| !self.spoken_for_elsewhere(usize::MAX, &c.id))
-            .filter_map(|(c, _)| Some((c.id.clone(), c.applied_revision.clone()?)))
-            .collect();
-        for (cluster, revision) in clusters {
-            let fleet = match self.revisions.load(&revision).await {
-                Ok(rev) => rev.fleet.clone(),
-                Err(e) => {
-                    tracing::warn!(%cluster, %revision, error = %e, "the applied revision could not be loaded to read the cluster's health");
-                    continue;
-                }
-            };
-            // The last executor while it qualifies, else any other that
-            // does: one away does not leave the cluster's health stale.
-            let Pick::Executor(executor) =
-                self.pick_executor_for(&cluster, &fleet, &targets, false)
-            else {
-                continue;
-            };
-            let m = msg(server_message::Msg::Health(RunHealth {
-                target: String::new(),
-                workload: String::new(),
-                revision: String::new(),
-                request_id: new_id(),
-                scope: HealthScope::Drift as i32,
-                modules: vec![],
-                until: None,
-                traceparent: String::new(),
-            }));
-            self.outbox.push(Out::Targeted {
-                session: executor,
-                msg: Box::new(stamp_target(m, &cluster, "")),
-                target: cluster,
-                workload: String::new(),
-            });
-        }
-    }
-
     async fn serve_waiting_executors(&mut self, ri: usize, p: usize, grace: bool) -> bool {
         let open = self.live[ri].record.runtime.phases[p].open_stage;
         let rows: Vec<usize> = self.live[ri]
@@ -6273,118 +6287,102 @@ impl Controller {
         !picked.is_empty()
     }
 
-    /// A host agent that may speak for cluster row `hi` now: connected and
-    /// active, running an agent with a pipeline per target, matching the
-    /// cluster's `executors` selector, and not mid-wave in any rollout. The
-    /// cluster's last executor is preferred (sticky), then names sort.
-    fn pick_executor(
-        &self,
-        ri: usize,
-        hi: usize,
-        targets: &[(crate::store::HostRecord, serde_json::Value)],
-    ) -> Pick {
-        let live = &self.live[ri];
-        let h = &live.hosts[hi];
-        self.pick_executor_for(
-            &h.host,
-            &live.revision.fleet,
-            targets,
-            h.runtime.kind == TargetKind::Workload,
-        )
+    /// The host agent that speaks for cluster row `hi` now: the cluster's
+    /// steward, while it is connected (leases are assigned by
+    /// [`Controller::assign_leases`] on the same pass).
+    fn pick_executor(&self, ri: usize, hi: usize) -> Pick {
+        let h = &self.live[ri].hosts[hi];
+        match self.executors.get(&h.host) {
+            Some(steward)
+                if self.connected(steward)
+                    && (h.runtime.kind != TargetKind::Workload
+                        || self.has_capability(steward, WORKLOADS_CAPABILITY)) =>
+            {
+                Pick::Executor(steward.clone())
+            }
+            _ => Pick::None,
+        }
     }
 
-    /// The connected host agents that could execute for cluster `target`
-    /// now (busy or not): active, running an agent with a pipeline per
-    /// target, and matching the cluster's `executors` selector (read against
-    /// `fleet`) or running inside it.
-    fn able_executors<'t>(
+    fn has_capability(&self, host: &str, capability: &str) -> bool {
+        self.capabilities
+            .get(host)
+            .is_some_and(|c| c.iter().any(|c| c == capability))
+    }
+
+    /// The hosts that may steward cluster `target` now, in order of
+    /// preference: connected and active, running an agent with a lane per
+    /// target, matching the cluster's `executors` selector (an in-cluster
+    /// executor speaks for its own cluster only, and comes first: its lane
+    /// survives every node's own rollout), then names sort.
+    fn steward_candidates(
         &self,
         target: &str,
         fleet: &buckle_core::model::FleetConfig,
-        targets: &'t [(crate::store::HostRecord, serde_json::Value)],
-    ) -> Vec<&'t str> {
+        targets: &[(crate::store::HostRecord, serde_json::Value)],
+    ) -> Vec<String> {
         let executors = self
             .clusters
             .get(target)
             .and_then(|spec| buckle_core::Filter::new(spec.executors()?).ok());
         let parent = self.clusters.get(target).and_then(|s| s.cluster.as_deref());
-        targets
-            .iter()
-            .filter(|(h, _)| h.kind == TargetKind::Host)
-            .filter(|(h, _)| h.status == HostStatus::Active && !self.excluded.contains(&h.id))
-            .filter(|(h, _)| self.connected(&h.id))
-            .filter(|(h, _)| {
-                self.capabilities
+        let mut inside: Vec<String> = Vec::new();
+        let mut outside: Vec<String> = Vec::new();
+        for (h, facts) in targets {
+            if h.kind != TargetKind::Host
+                || h.status != HostStatus::Active
+                || self.excluded.contains(&h.id)
+                || !self.connected(&h.id)
+                || !self
+                    .capabilities
                     .get(&h.id)
                     .is_some_and(|c| c.iter().any(|c| c == TARGETS_CAPABILITY))
-            })
-            .filter(|(h, facts)| match h.executor_of() {
-                // An in-cluster executor speaks for its own cluster only.
-                Some(c) => c == target || parent == Some(c),
-                None => executors.as_ref().is_some_and(|executors| {
-                    crate::fleet::record_context(h, facts, fleet).matches(executors)
-                }),
-            })
-            .map(|(h, _)| h.id.as_str())
-            .collect()
+            {
+                continue;
+            }
+            match h.executor_of() {
+                Some(c) if c == target || parent == Some(c) => inside.push(h.id.clone()),
+                Some(_) => {}
+                None => {
+                    if executors.as_ref().is_some_and(|executors| {
+                        crate::fleet::record_context(h, facts, fleet).matches(executors)
+                    }) {
+                        outside.push(h.id.clone());
+                    }
+                }
+            }
+        }
+        inside.sort();
+        outside.sort();
+        inside.extend(outside);
+        inside
     }
 
-    /// [`Self::pick_executor`] for cluster `target`, its selectors read
-    /// against `fleet`. For a `placement`, only agents that take placements
-    /// qualify, and the cluster's last executor is waited for while it is
-    /// busy rather than replaced: one agent applies to a cluster at a time.
-    fn pick_executor_for(
+    /// Which host should steward `target`: an in-cluster executor when one
+    /// is connected, else the current steward while it qualifies, else the
+    /// first candidate; `None` when nobody can speak for the cluster.
+    fn choose_steward(
         &self,
         target: &str,
         fleet: &buckle_core::model::FleetConfig,
         targets: &[(crate::store::HostRecord, serde_json::Value)],
-        placement: bool,
-    ) -> Pick {
-        let busy = self.busy_elsewhere(usize::MAX);
-        let inflight: HashSet<&str> = self
-            .live
-            .iter()
-            .flat_map(|l| l.hosts.iter())
-            .filter(|h| h.runtime.kind == TargetKind::Host && h.state.in_flight())
-            .map(|h| h.host.as_str())
-            .collect();
-        let able: Vec<&str> = self
-            .able_executors(target, fleet, targets)
-            .into_iter()
-            .filter(|h| {
-                !placement
-                    || self
-                        .capabilities
-                        .get(*h)
-                        .is_some_and(|c| c.iter().any(|c| c == WORKLOADS_CAPABILITY))
-            })
-            .collect();
-        if able.is_empty() {
-            return Pick::None;
+    ) -> Option<String> {
+        let candidates = self.steward_candidates(target, fleet, targets);
+        let in_cluster = candidates.iter().find(|c| {
+            targets
+                .iter()
+                .any(|(h, _)| &h.id == *c && h.executor_of().is_some())
+        });
+        if let Some(c) = in_cluster {
+            return Some(c.clone());
         }
-        let last = self.executors.get(target).cloned();
-        let mut candidates: Vec<&str> = able
-            .iter()
-            .copied()
-            .filter(|h| !busy.contains(*h) && !inflight.contains(h))
-            .collect();
-        if candidates.is_empty() {
-            return Pick::Busy;
-        }
-        if placement
-            && let Some(last) = last.as_deref()
-            && able.contains(&last)
-            && !candidates.contains(&last)
+        let current = self.executors.get(target);
+        if let Some(c) = current
+            && candidates.contains(c)
         {
-            return Pick::Busy;
+            return Some(c.clone());
         }
-        candidates.sort();
-        candidates
-            .iter()
-            .find(|c| Some(**c) == last.as_deref())
-            .or(candidates.first())
-            .map(|c| Pick::Executor((*c).to_owned()))
-            .unwrap_or(Pick::None)
+        candidates.first().cloned()
     }
 
     /// Records `executor` as cluster row `hi`'s executor (and the cluster's
@@ -6421,37 +6419,35 @@ impl Controller {
     }
 
     /// Cluster row `hi`'s executor stayed away past the disconnect timeout:
-    /// another is picked and the cluster re-planned; with none to pick, the
-    /// cluster fails its wave when it was in flight, else waits.
+    /// the lease moves to another candidate and the row with it (planned
+    /// again when it was in flight); with none to pick, the cluster fails
+    /// its wave when it was in flight, else waits.
     async fn executor_lost(&mut self, ri: usize, hi: usize) {
         let lost = self.live[ri].hosts[hi].runtime.executor.clone();
         let state = self.live[ri].hosts[hi].state;
-        self.set_executor(ri, hi, None);
+        let cluster = self.live[ri].hosts[hi].host.clone();
         let targets = self.load_targets(None).await.unwrap_or_default();
-        let picked = match self.pick_executor(ri, hi, &targets) {
-            Pick::Executor(e) => Some(e),
-            Pick::Busy | Pick::None => None,
-        };
-        match (picked, state) {
-            (Some(executor), _) => {
-                self.set_executor(ri, hi, Some(executor));
-                if state.in_flight() || state == HostPhase::Planned {
-                    let why = format!(
-                        "executor {} lost; re-planning through {}",
-                        lost.unwrap_or_default(),
-                        self.live[ri].hosts[hi]
-                            .runtime
-                            .executor
-                            .clone()
-                            .unwrap_or_default()
-                    );
-                    self.live[ri].hosts[hi].runtime.error = Some(why.clone());
-                    self.replan(ri, hi, "controller");
-                } else {
-                    self.request_plan(ri, hi);
-                }
+        let fleet = self.live[ri].revision.fleet.clone();
+        let picked = self
+            .choose_steward(&cluster, &fleet, &targets)
+            .filter(|c| Some(c) != lost.as_ref());
+        self.set_steward(
+            &cluster,
+            picked.clone(),
+            "controller",
+            "its steward stayed disconnected",
+        );
+        if let Some(to) = picked {
+            // Moved with the lease above, unless the row was pointed
+            // elsewhere already.
+            if self.live[ri].hosts[hi].runtime.executor.as_ref() != Some(&to) {
+                self.repoint_row(ri, hi, to, "controller");
             }
-            (None, s) if s.in_flight() || s == HostPhase::RollingBack => {
+            return;
+        }
+        self.set_executor(ri, hi, None);
+        match state {
+            s if s.in_flight() || s == HostPhase::RollingBack => {
                 let why = format!(
                     "executor {} lost and no other connected host can speak for the cluster",
                     lost.unwrap_or_default()
@@ -6468,7 +6464,7 @@ impl Controller {
                     self.fail_host(ri, hi, &why);
                 }
             }
-            (None, _) => {
+            _ => {
                 // Still to plan or apply when the grace ran out: it misses
                 // its phase like an offline host and converges in the
                 // stragglers stage, where it waits for an executor without
@@ -6726,6 +6722,11 @@ impl Controller {
             .iter()
             .filter_map(|c| self.executors.get(c).map(|e| (c.clone(), e.clone())))
             .collect();
+        let stewards: Vec<(String, Option<String>)> = self
+            .stewards_dirty
+            .iter()
+            .map(|(c, s)| (c.clone(), s.clone()))
+            .collect();
         if !(rollouts.is_empty()
             && hosts.is_empty()
             && audits.is_empty()
@@ -6733,13 +6734,15 @@ impl Controller {
             && stable.is_none()
             && cleared.is_empty()
             && executors.is_empty()
-            && converged.is_empty())
+            && converged.is_empty()
+            && stewards.is_empty())
         {
-            let (r2, h2, a2, n2) = (
+            let (r2, h2, a2, n2, s2) = (
                 rollouts.clone(),
                 hosts.clone(),
                 audits.clone(),
                 runs.clone(),
+                stewards.clone(),
             );
             let result = self
                 .store
@@ -6767,6 +6770,9 @@ impl Controller {
                         db.hosts().set_applied_revision(cluster, revision)?;
                         db.drift().clear(cluster)?;
                     }
+                    for (cluster, steward) in &s2 {
+                        db.hosts().set_steward(cluster, steward.as_deref())?;
+                    }
                     let mut entries = Vec::new();
                     for a in &a2 {
                         entries.push(db.audit().add(a)?);
@@ -6791,6 +6797,14 @@ impl Controller {
                     self.flush_failures = 0;
                     self.pending_clear.clear();
                     self.executors_dirty.clear();
+                    for (cluster, _) in &stewards {
+                        if let Some(host) =
+                            crate::views::load_summary(&self.store, &self.revisions, cluster).await
+                        {
+                            self.events.publish(LiveEvent::HostChanged { host });
+                        }
+                    }
+                    self.stewards_dirty.clear();
                     self.stable_dirty = false;
                     for l in &mut self.live {
                         l.dirty = false;
@@ -6872,6 +6886,11 @@ impl Controller {
                     msg,
                 } => {
                     if !self.send_targeted(&session, &target, &workload, *msg).await {
+                        undeliverable.insert(session);
+                    }
+                }
+                Out::Lease { session, target } => {
+                    if !self.send_lease(&session, &target).await {
                         undeliverable.insert(session);
                     }
                 }
@@ -7021,17 +7040,7 @@ impl Controller {
                 tracing::warn!(target = %target, "not a cluster target; nothing assigned");
                 return None;
             };
-            // The revision's declaration wins over the stored record, which
-            // follows the reference revision.
             let declared = rev.fleet.fleet.clusters.get(target);
-            let kind = declared
-                .map(|d| d.kind.as_str())
-                .unwrap_or(crate::targets::core_kind(spec.kind).as_str())
-                .to_owned();
-            let api = declared
-                .map(|d| d.api.clone())
-                .unwrap_or_else(|| spec.api.clone())
-                .unwrap_or_default();
             let identity = declared
                 .map(|d| d.identity.to_string())
                 .unwrap_or_else(|| spec.identity.clone());
@@ -7042,13 +7051,7 @@ impl Controller {
                 .secrets
                 .for_cluster(&rev, &ctx, secret.as_deref())
                 .await;
-            let cluster = pb::ClusterTarget {
-                kind,
-                api,
-                identity,
-                labels: record.effective_labels().into_iter().collect(),
-                fingerprint_key: self.secrets.fingerprint_key(target),
-            };
+            let cluster = self.cluster_target(target, &record, spec, declared);
             (secrets, Some(cluster))
         };
         Some(msg(server_message::Msg::Assign(Assign {
@@ -7096,6 +7099,404 @@ fn placement_row(
             ..Default::default()
         },
     }
+}
+
+// ------------------------------------------------------------ leases
+
+impl Controller {
+    /// Re-evaluates which host stewards each cluster when prompted (a
+    /// connect, a disconnect, a host or cluster change) or every
+    /// [`LEASE_INTERVAL`], then (re)sends the leases due. A cluster is
+    /// leased to one connected, capable host matching its `executors` (an
+    /// in-cluster executor first); the lease stays with its holder while it
+    /// qualifies, and survives a disconnect up to the disconnect timeout.
+    async fn assign_leases(&mut self) {
+        self.review_leases_if_due().await;
+        for cluster in std::mem::take(&mut self.lease_resend) {
+            if let Some(steward) = self.executors.get(&cluster)
+                && self.connected(steward)
+            {
+                self.outbox.push(Out::Lease {
+                    session: steward.clone(),
+                    target: cluster,
+                });
+            }
+        }
+    }
+
+    /// Reviews the leases when something prompted it or the interval
+    /// passed (also run before an executor pick, so a cluster that just
+    /// appeared is spoken for on the pass that plans it).
+    async fn review_leases_if_due(&mut self) {
+        let now = self.now();
+        if !(self.leases_dirty || now >= self.leases_due) {
+            return;
+        }
+        self.leases_dirty = false;
+        self.leases_due = now + chrono::Duration::from_std(LEASE_INTERVAL).unwrap_or_default();
+        self.review_leases(now).await;
+    }
+
+    /// One pass over every cluster target: see [`Controller::assign_leases`].
+    async fn review_leases(&mut self, now: DateTime<Utc>) {
+        let Ok(targets) = self.load_targets(None).await else {
+            return;
+        };
+        let Some(reference) = crate::views::reference_revision(&self.store, &self.revisions).await
+        else {
+            return;
+        };
+        let fleet = &reference.fleet;
+        let timeout =
+            chrono::Duration::from_std(self.options.disconnect_timeout).unwrap_or_default();
+        let clusters: Vec<String> = targets
+            .iter()
+            .filter(|(h, _)| h.kind == TargetKind::Cluster)
+            .map(|(h, _)| h.id.clone())
+            .collect();
+        for cluster in &clusters {
+            let current = self.executors.get(cluster).cloned();
+            let desired = self.choose_steward(cluster, fleet, &targets);
+            let inside = desired
+                .as_ref()
+                .is_some_and(|d| in_cluster_executor(d, &targets));
+            match (&current, &desired) {
+                (Some(c), Some(d)) if c == d => {}
+                (None, None) => {}
+                (Some(c), _) if !self.connected(c) => {
+                    // Away: the lease holds until the disconnect timeout,
+                    // unless the cluster's own executor connects meanwhile.
+                    let since = *self.steward_away.entry(cluster.clone()).or_insert(now);
+                    if inside {
+                        self.set_steward(
+                            cluster,
+                            desired,
+                            "controller",
+                            "an in-cluster executor is connected",
+                        );
+                    } else if since + timeout <= now {
+                        self.set_steward(
+                            cluster,
+                            desired,
+                            "controller",
+                            "its steward stayed disconnected",
+                        );
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    let reason = if inside {
+                        "an in-cluster executor is connected"
+                    } else {
+                        "its steward no longer qualifies"
+                    };
+                    self.set_steward(cluster, desired, "controller", reason);
+                }
+                (Some(_), None) => self.set_steward(
+                    cluster,
+                    None,
+                    "controller",
+                    "its steward no longer qualifies and no other host can speak for the cluster",
+                ),
+                (None, Some(_)) => {
+                    self.set_steward(cluster, desired, "controller", "no host held its lease")
+                }
+            }
+        }
+        // A lease of a cluster that is gone ends.
+        let stale: Vec<String> = self
+            .executors
+            .keys()
+            .filter(|c| !clusters.contains(c))
+            .cloned()
+            .collect();
+        for cluster in stale {
+            self.set_steward(&cluster, None, "controller", "the cluster was forgotten");
+        }
+    }
+
+    /// Hands cluster `target`'s lease to `steward`, or ends it (`None`):
+    /// the kv entry and the cluster's record follow with the next
+    /// checkpoint, the old holder gets a Release and the new one a Lease,
+    /// and the live rollout rows the old holder spoke for move with it
+    /// (planned again when they had a plan or were in flight).
+    fn set_steward(&mut self, target: &str, steward: Option<String>, actor: &str, reason: &str) {
+        let from = self.executors.get(target).cloned();
+        if from == steward {
+            return;
+        }
+        match &steward {
+            Some(s) => {
+                self.executors.insert(target.to_owned(), s.clone());
+                self.executors_dirty.insert(target.to_owned());
+                self.lease_resend.insert(target.to_owned());
+            }
+            None => {
+                self.executors.remove(target);
+                self.executors_dirty.remove(target);
+                self.lease_resend.remove(target);
+                self.pending_clear
+                    .push(format!("{}{target}", keys::EXECUTOR_PREFIX));
+            }
+        }
+        self.steward_away.remove(target);
+        self.stewards_dirty
+            .insert(target.to_owned(), steward.clone());
+        if let Some(old) = &from
+            && self.connected(old)
+        {
+            self.outbox.push(Out::Msg(
+                old.clone(),
+                Box::new(msg(server_message::Msg::Release(pb::Release {
+                    target: target.to_owned(),
+                    reason: reason.to_owned(),
+                }))),
+            ));
+        }
+        let message = match (&from, &steward) {
+            (None, Some(s)) => format!("{target}: leased to {s} ({reason})"),
+            (Some(f), Some(s)) => format!("{target}: lease moved from {f} to {s} ({reason})"),
+            (Some(f), None) => format!("{target}: lease held by {f} ended ({reason})"),
+            (None, None) => return,
+        };
+        self.audit(
+            actor,
+            "target.steward",
+            target,
+            message,
+            serde_json::json!({
+                "target": target,
+                "steward": steward,
+                "from": from,
+                "reason": reason,
+            }),
+            None,
+        );
+        let Some(old) = from else {
+            return;
+        };
+        for ri in 0..self.live.len() {
+            if self.live[ri].record.is_terminal() && !self.live[ri].record.runtime.stragglers_open {
+                continue;
+            }
+            for hi in 0..self.live[ri].hosts.len() {
+                let h = &self.live[ri].hosts[hi];
+                if h.runtime.kind == TargetKind::Host
+                    || h.host != target
+                    || h.runtime.executor.as_deref() != Some(old.as_str())
+                {
+                    continue;
+                }
+                match &steward {
+                    Some(s) => self.repoint_row(ri, hi, s.clone(), actor),
+                    None => self.set_executor(ri, hi, None),
+                }
+            }
+        }
+    }
+
+    /// Cluster row `hi` is spoken for by `to` from now on. Its plan was the
+    /// old holder's: planned again (a retry when it was in flight), or asked
+    /// for when it was still waiting for one.
+    fn repoint_row(&mut self, ri: usize, hi: usize, to: String, actor: &str) {
+        let state = self.live[ri].hosts[hi].state;
+        let from = self.live[ri].hosts[hi].runtime.executor.clone();
+        self.set_executor(ri, hi, Some(to.clone()));
+        self.live[ri].hosts[hi].runtime.disconnected_at = None;
+        if state.in_flight() || state == HostPhase::Planned {
+            let why = format!(
+                "the lease moved from {} to {to}; re-planning",
+                from.unwrap_or_default()
+            );
+            self.live[ri].hosts[hi].runtime.error = Some(why);
+            self.replan(ri, hi, actor);
+        } else if state == HostPhase::PlanPending {
+            self.request_plan(ri, hi);
+        }
+    }
+
+    /// `host` sent a watch report for `target` without holding its lease
+    /// (its lane outlived a handover, or a lease it never got): released.
+    fn on_stale_steward(&mut self, host: &str, target: &str) {
+        if self.executors.get(target).map(String::as_str) == Some(host) || !self.connected(host) {
+            return;
+        }
+        self.outbox.push(Out::Msg(
+            host.to_owned(),
+            Box::new(msg(server_message::Msg::Release(pb::Release {
+                target: target.to_owned(),
+                reason: "another host stewards the cluster".to_owned(),
+            }))),
+        ));
+    }
+
+    /// An operator moves cluster `target`'s lease to `host`, which must
+    /// qualify now (see [`Controller::steward_candidates`]); an in-cluster
+    /// executor keeps the lease over an outside host.
+    async fn move_lease_to(
+        &mut self,
+        actor: &str,
+        target: &str,
+        host: &str,
+        note: &str,
+    ) -> Result<String, CommandError> {
+        let targets = self
+            .load_targets(None)
+            .await
+            .map_err(CommandError::internal)?;
+        let Some((record, _)) = targets.iter().find(|(h, _)| h.id == target) else {
+            return Err(CommandError::not_found(format!("No target '{target}'.")));
+        };
+        if record.kind != TargetKind::Cluster {
+            return Err(CommandError::invalid(
+                format!("'{target}' is not a cluster; only clusters have a steward."),
+                &[],
+            ));
+        }
+        let Some(reference) = crate::views::reference_revision(&self.store, &self.revisions).await
+        else {
+            return Err(CommandError::conflict(
+                "No valid revision declares the fleet yet.",
+                &["Push a valid revision first."],
+            ));
+        };
+        let candidates = self.steward_candidates(target, &reference.fleet, &targets);
+        if !candidates.iter().any(|c| c == host) {
+            return Err(CommandError::conflict(
+                format!("'{host}' cannot speak for '{target}' now."),
+                &[
+                    "The host must be connected and active, run an agent with a lane per target, and match the cluster's `executors` selector.",
+                ],
+            ));
+        }
+        if !in_cluster_executor(host, &targets)
+            && let Some(inside) = candidates.iter().find(|c| in_cluster_executor(c, &targets))
+        {
+            return Err(CommandError::conflict(
+                format!("'{inside}' runs inside '{target}' and keeps its lease."),
+                &["An in-cluster executor speaks for its cluster while it is connected."],
+            ));
+        }
+        if self.executors.get(target).map(String::as_str) == Some(host) {
+            return Err(CommandError::conflict(
+                format!("'{host}' already speaks for '{target}'."),
+                &[],
+            ));
+        }
+        let reason = if note.is_empty() {
+            "moved by an operator"
+        } else {
+            note
+        };
+        self.set_steward(target, Some(host.to_owned()), actor, reason);
+        Ok(target.to_owned())
+    }
+
+    /// Sends cluster `target`'s lease over `session`: a targeted Assign of
+    /// the applied revision when there is one (the lane's watch checks its
+    /// workloads), then the Lease with how to reach the cluster and how
+    /// often to read it. `false` when the session is gone.
+    async fn send_lease(&mut self, session: &str, target: &str) -> bool {
+        let t = target.to_owned();
+        let found = self.store.call(move |db| db.hosts().target(&t)).await;
+        let Ok(Some(record)) = found else {
+            return true;
+        };
+        let Some(spec) = record.cluster.as_ref().map(|c| c.spec.clone()) else {
+            return true;
+        };
+        let mut applied = record.applied_revision.clone().unwrap_or_default();
+        let mut cluster = None;
+        if !applied.is_empty() {
+            let stable = self.stable.as_deref() == Some(applied.as_str());
+            match self.assign_message(session, target, &applied, stable).await {
+                Some(assign) => {
+                    if let Some(server_message::Msg::Assign(a)) = &assign.msg {
+                        cluster = a.cluster.clone();
+                    }
+                    if !self.link.send(session, assign) {
+                        return false;
+                    }
+                }
+                // The applied revision cannot be loaded any more: the lane
+                // only probes reachability until the next apply.
+                None => applied.clear(),
+            }
+        }
+        let cluster = match cluster {
+            Some(c) => c,
+            None => {
+                let reference =
+                    crate::views::reference_revision(&self.store, &self.revisions).await;
+                let declared = reference
+                    .as_ref()
+                    .and_then(|r| r.fleet.fleet.clusters.get(target));
+                self.cluster_target(target, &record, &spec, declared)
+            }
+        };
+        let watch = spec.watch.map(|w| pb::Watch {
+            health: Some(prost_types::Duration {
+                seconds: w.health_seconds as i64,
+                nanos: 0,
+            }),
+            drift: Some(prost_types::Duration {
+                seconds: w.drift_seconds as i64,
+                nanos: 0,
+            }),
+        });
+        let until = self.now()
+            + chrono::Duration::from_std(self.options.disconnect_timeout).unwrap_or_default();
+        self.link.send(
+            session,
+            msg(server_message::Msg::Lease(pb::Lease {
+                target: target.to_owned(),
+                cluster: Some(cluster),
+                applied_revision: applied,
+                watch,
+                until: Some(timestamp(until)),
+            })),
+        )
+    }
+
+    /// How an executor reaches cluster `target`: the revision's declaration
+    /// (`declared`) wins over the stored record, which follows the
+    /// reference revision.
+    fn cluster_target(
+        &self,
+        target: &str,
+        record: &crate::store::HostRecord,
+        spec: &buckle_api::ClusterSpec,
+        declared: Option<&buckle_core::model::ClusterDecl>,
+    ) -> pb::ClusterTarget {
+        let kind = declared
+            .map(|d| d.kind.as_str())
+            .unwrap_or(crate::targets::core_kind(spec.kind).as_str())
+            .to_owned();
+        let api = declared
+            .map(|d| d.api.clone())
+            .unwrap_or_else(|| spec.api.clone())
+            .unwrap_or_default();
+        let identity = declared
+            .map(|d| d.identity.to_string())
+            .unwrap_or_else(|| spec.identity.clone());
+        pb::ClusterTarget {
+            kind,
+            api,
+            identity,
+            labels: record.effective_labels().into_iter().collect(),
+            fingerprint_key: self.secrets.fingerprint_key(target),
+        }
+    }
+}
+
+/// Whether `host` is an executor running inside a cluster (its agent
+/// authenticated with the cluster's workload identity).
+fn in_cluster_executor(
+    host: &str,
+    targets: &[(crate::store::HostRecord, serde_json::Value)],
+) -> bool {
+    targets
+        .iter()
+        .any(|(h, _)| h.id == host && h.executor_of().is_some())
 }
 
 fn short(s: &str) -> &str {

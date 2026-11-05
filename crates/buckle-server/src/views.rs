@@ -187,8 +187,13 @@ pub fn cluster_status(
             }
         }
     }
+    let steward = host.steward.clone().or(executor);
     Ok(Some(ClusterStatus {
-        executor,
+        executor: steward.clone(),
+        steward,
+        reachable: host.reachable,
+        reachable_error: host.reachable_error.clone(),
+        watched_at: host.health_at,
         workloads,
         failing,
         deploying,

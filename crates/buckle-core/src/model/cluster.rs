@@ -174,6 +174,45 @@ pub struct ClusterDecl {
     /// Which workload identities may speak for the cluster from inside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<ClusterTrust>,
+    /// How often the cluster's steward reads it when nothing wakes it.
+    #[serde(default, skip_serializing_if = "ClusterWatch::is_default")]
+    pub watch: ClusterWatch,
+}
+
+/// How often a cluster's steward (the agent leasing it) reads the cluster
+/// unprompted: health every `health` when no change woke it (Nomad's
+/// blocking queries and Kubernetes' watch do between), and the applied
+/// revision re-planned for drift every `drift`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterWatch {
+    #[serde(default = "ClusterWatch::default_health", with = "humantime_serde")]
+    pub health: std::time::Duration,
+    #[serde(default = "ClusterWatch::default_drift", with = "humantime_serde")]
+    pub drift: std::time::Duration,
+}
+
+impl ClusterWatch {
+    fn default_health() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
+    fn default_drift() -> std::time::Duration {
+        std::time::Duration::from_secs(10 * 60)
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for ClusterWatch {
+    fn default() -> Self {
+        Self {
+            health: Self::default_health(),
+            drift: Self::default_drift(),
+        }
+    }
 }
 
 /// How an in-cluster executor proves it speaks for the cluster: a workload

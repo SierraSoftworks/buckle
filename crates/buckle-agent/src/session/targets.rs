@@ -22,7 +22,13 @@ use tracing::Instrument;
 const BAKE_INTERVAL: Duration = Duration::from_secs(10);
 
 impl Shared {
-    pub(super) async fn target_op(&self, target: String, instruction: Instruction) {
+    /// Runs a targeted instruction. Returns the revision an Apply or
+    /// Rollback left applied on the cluster, when it succeeded.
+    pub(super) async fn target_op(
+        &self,
+        target: String,
+        instruction: Instruction,
+    ) -> Option<RevisionId> {
         let workload = instruction.workload().map(str::to_owned);
         match instruction {
             Instruction::Assign {
@@ -33,7 +39,8 @@ impl Shared {
                 ..
             } => {
                 self.target_assign(target, revision, secrets, tree_digest, cluster)
-                    .await
+                    .await;
+                None
             }
             Instruction::RequestPlan { revision, .. } => {
                 let span = tracing::info_span!(
@@ -45,7 +52,8 @@ impl Shared {
                 );
                 self.target_plan(target, workload, revision)
                     .instrument(span)
-                    .await
+                    .await;
+                None
             }
             Instruction::Apply {
                 revision,
@@ -123,7 +131,8 @@ impl Shared {
                     target, workload, request_id, scope, modules, until, revision,
                 )
                 .instrument(span)
-                .await
+                .await;
+                None
             }
             Instruction::RunAction {
                 action_id,
@@ -145,10 +154,12 @@ impl Shared {
                 set_parent_from_traceparent(&span, traceparent.as_deref());
                 self.target_action(target, workload, action_id, module, action, revision)
                     .instrument(span)
-                    .await
+                    .await;
+                None
             }
             other => {
                 tracing::debug!(%target, instruction = ?std::mem::discriminant(&other), "nothing to do for a cluster target");
+                None
             }
         }
     }
@@ -256,7 +267,8 @@ impl Shared {
 
     /// Plans `revision` afresh (the placement of `workload`, or the whole
     /// cluster) and applies it when it still matches what was approved
-    /// (`binding`); a rollback binds nothing.
+    /// (`binding`); a rollback binds nothing. Returns the revision when it
+    /// is now applied.
     async fn target_apply(
         &self,
         target: String,
@@ -264,7 +276,7 @@ impl Shared {
         revision: RevisionId,
         binding: Binding,
         rollout: Option<String>,
-    ) {
+    ) -> Option<RevisionId> {
         let about = |report: Report| report.about_placement(Some(&target), workload.as_deref());
         let planned = async {
             let a = self.assignment(&target, &revision).await?;
@@ -284,7 +296,7 @@ impl Shared {
                         target: Some(target.clone()),
                     }))
                     .await;
-                return;
+                return None;
             }
         };
         let fresh = &planned.plan;
@@ -307,7 +319,7 @@ impl Shared {
                     approved_digest: approved.cloned().unwrap_or_default(),
                 }))
                 .await;
-            return;
+            return None;
         }
         // Record what really runs when it is not the plan the server holds.
         if !matches!(&binding, Binding::Digest(d) if crate::bundle::digests_match(d, fresh.digest.as_str()))
@@ -324,9 +336,10 @@ impl Shared {
             report_id,
             revision,
             outcome,
-            applied_revision: applied,
+            applied_revision: applied.clone(),
         }))
         .await;
+        applied
     }
 
     /// Runs an action of a workload on the cluster and reports it (durably).
@@ -502,7 +515,7 @@ enum Binding {
 }
 
 /// The cluster as the server described it.
-fn target_spec(cluster: &WireCluster) -> buckle_core::Result<TargetSpec> {
+pub(super) fn target_spec(cluster: &WireCluster) -> buckle_core::Result<TargetSpec> {
     let kind = cluster.kind.parse().map_err(|e: String| {
         buckle_core::error::system(e, &["Upgrade this agent to match the server."])
     })?;

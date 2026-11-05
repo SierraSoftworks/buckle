@@ -342,6 +342,41 @@ impl Executor {
         }
     }
 
+    /// A Nomad client for `a`'s cluster with a `read` credential: what a
+    /// lease holder's watch reads with. The credential cache renews it as
+    /// it nears expiry.
+    pub(crate) async fn read_nomad(&self, a: &Assignment) -> buckle_core::Result<Nomad> {
+        self.client(a, Purpose::Read, None).await
+    }
+
+    /// A Kubernetes client for `a`'s cluster with a `read` credential, and
+    /// when the credential expires (`None` for a credential of the host's
+    /// own that does not): a watch re-syncs when the identity is re-issued.
+    pub(crate) async fn read_kube(
+        &self,
+        a: &Assignment,
+    ) -> buckle_core::Result<(buckle_kube::Kube, Option<chrono::DateTime<Utc>>)> {
+        self.kube_client_with_expiry(a, Purpose::Read, None).await
+    }
+
+    /// Whether the cluster's API answers at all, without a credential (a
+    /// lease holder's probe while nothing is applied yet): Nomad's leader
+    /// and Kubernetes' version endpoints answer anonymous callers.
+    pub(crate) async fn probe(&self, target: &str, spec: &TargetSpec) -> buckle_core::Result<()> {
+        match spec.kind {
+            ClusterKind::Nomad => {
+                let nomad = self.connect.nomad(target, spec)?;
+                let resp = nomad.send("GET", "/v1/status/leader", None).await?;
+                nomad.ok("GET", "/v1/status/leader", resp).map(|_| ())
+            }
+            ClusterKind::Kubernetes => {
+                let kube = self.connect.kubernetes(target, spec)?;
+                let resp = kube.send("GET", "/version", None, None).await?;
+                kube.ok("GET", "/version", resp).map(|_| ())
+            }
+        }
+    }
+
     /// Plans `a`. Pure: reads the cluster, changes nothing. A workload that
     /// cannot be planned is indeterminate (its objects are never orphans);
     /// one that is unreachable fails the plan.

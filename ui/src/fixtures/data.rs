@@ -2049,12 +2049,16 @@ pub fn clusters(now: DateTime<Utc>) -> Vec<HostSummary> {
     home.health_at = Some(now - Duration::minutes(2));
     home.cluster_status = Some(buckle_api::ClusterStatus {
         executor: Some("pi-1".into()),
+        steward: Some("pi-1".into()),
+        reachable: Some(true),
+        watched_at: Some(now - Duration::minutes(2)),
         workloads: 3,
         failing: vec![],
         deploying: vec![buckle_api::Deploying {
             workload: "atuin".into(),
             progress: Some("deploying: server 1/2 healthy".into()),
         }],
+        ..Default::default()
     });
     let mut lab = cluster(
         "lab-nomad",

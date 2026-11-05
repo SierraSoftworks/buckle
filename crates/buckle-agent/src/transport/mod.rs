@@ -312,6 +312,29 @@ pub enum Instruction {
         /// workload is `module`); echoed on the result.
         workload: Option<String>,
     },
+    /// This agent stewards the cluster target: it runs a lane for it that
+    /// serves the cluster's work and watches it (health as it changes,
+    /// drift on a timer, reachability) until a Release. A Lease for a lane
+    /// already open refreshes it.
+    Lease {
+        /// The cluster target.
+        target: String,
+        /// How to reach it.
+        cluster: Option<WireCluster>,
+        /// The revision applied to it (assigned ahead of the Lease), whose
+        /// workloads the watch checks; `None` when nothing is applied yet.
+        applied_revision: Option<RevisionId>,
+        /// How often the lane reads the cluster unprompted.
+        watch: WatchConfig,
+    },
+    /// This agent no longer stewards the cluster target: its lane finishes
+    /// what it is running and stops.
+    Release {
+        /// The cluster target.
+        target: String,
+        /// Why, for the log.
+        reason: String,
+    },
     /// Keepalive from the server; nothing to do.
     Ping,
     /// Install this agent version when idle, then restart.
@@ -348,6 +371,9 @@ impl Instruction {
             | Instruction::Rollback { target, .. }
             | Instruction::RunHealth { target, .. }
             | Instruction::RunAction { target, .. } => target.as_deref(),
+            Instruction::Lease { target, .. } | Instruction::Release { target, .. } => {
+                Some(target.as_str())
+            }
             _ => None,
         }
     }
@@ -363,6 +389,25 @@ impl Instruction {
             | Instruction::RunHealth { workload, .. }
             | Instruction::RunAction { workload, .. } => workload.as_deref(),
             _ => None,
+        }
+    }
+}
+
+/// How often a cluster's lease holder reads it when nothing wakes the lane
+/// ([`Instruction::Lease`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchConfig {
+    /// The health read covering a dropped long poll.
+    pub health: std::time::Duration,
+    /// How often the applied revision is re-planned for drift.
+    pub drift: std::time::Duration,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            health: std::time::Duration::from_secs(60),
+            drift: std::time::Duration::from_secs(10 * 60),
         }
     }
 }
@@ -514,6 +559,14 @@ pub enum Report {
         boot_id: Option<String>,
         /// Why, for the operator.
         error: String,
+    },
+    /// Whether a cluster target's API answers this agent (sent inside
+    /// [`Report::For`]): when a lease starts and whenever it changes.
+    TargetStatus {
+        /// Whether the cluster answered.
+        reachable: bool,
+        /// Why not, when it did not.
+        error: Option<String>,
     },
     /// A report about a cluster target this agent executes for: the inner
     /// report travels with `target` (and, for one placement, `workload`)

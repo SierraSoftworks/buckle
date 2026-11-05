@@ -418,6 +418,7 @@ mod tests {
                         progress: None,
                     })
                     .collect(),
+                ..Default::default()
             }),
             ..host("c")
         }

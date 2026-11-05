@@ -132,7 +132,7 @@ and the fleet stays on the last valid one.
 | `trusted_proxies` | `[]` | TCP proxies in front of the gRPC port (a Tailscale Service host) whose connections may open with a PROXY protocol v2 header; whois then identifies the agent by the forwarded address. Entries are `tag:…` (matched by whois on the proxy), IP addresses or CIDR ranges. Other peers' headers are never read. |
 | `minimum_agent_version` | | Older agents are refused (before anything is recorded, so they can enrol once upgraded). |
 | `desired_version` | server's version | The version the UI offers when an admin upgrades an agent. |
-| `disconnect_timeout` | `10m` | A host disconnected this long in the middle of its wave counts as failed. |
+| `disconnect_timeout` | `10m` | A host disconnected this long in the middle of its wave counts as failed, and a cluster whose steward stays away this long is leased to another host. |
 | `apply_timeout` | `30m` | A host applying this long without a result counts as failed. |
 
 #### In-cluster executors
@@ -148,8 +148,9 @@ identity is accepted when exactly one cluster's [`trust`](../modules/fleet.md#cl
   `nomad_job_id` claims, else `sub`.
 
 The host (its configured `host_id`) is enrolled active on first contact and bound to the cluster:
-it is picked as the executor of that cluster and its scoped targets only, runs no modules of its
-own, and gets no host secrets. Each session issues it a fresh per-host token for its other calls.
+it takes the [lease](../modules/fleet.md#stewards) of that cluster and its scoped targets only
+(over any outside host, as soon as it connects), runs no modules of its own, and gets no host
+secrets. Each session issues it a fresh per-host token for its other calls.
 A server that cannot reach the cluster pins `trust.keys`; the executor relays the key set it
 reads inside the cluster (`workload_identity.jwks_url`), which the server keeps under kv
 `trust/<cluster>/jwks` once the token verified against a key it already trusted and the relayed
@@ -358,6 +359,7 @@ session cookie or behind the same ACLs. Useful endpoints:
 | `GET /api/v1/rollouts`, `GET /api/v1/rollouts/{id}` | Rollouts with their phases, hosts and timeline. |
 | `POST /api/v1/rollouts/{id}/approve` and `…/pause`, `…/resume`, `…/retry`, `…/skip-bake`, `…/rollback`, `…/abort` | Rollout decisions (admin, CSRF-protected, audited). |
 | `POST /api/v1/rollouts/{id}/hosts/{host}/retry`, `…/skip-bake`, `…/force`, `…/skip`, `…/continue` | Host decisions within a rollout (admin, CSRF-protected, audited). |
+| `POST /api/v1/targets/{id}/steward` | Moves a cluster's lease to the host in the body (`{"host": …, "note": …}`), which must qualify now (admin, CSRF-protected, audited). |
 | `GET /api/v1/catalog` | The task kinds, fact providers and health checks this server knows, with their JSON schemas. |
 | `GET /api/v1/events` | Server-sent events for live updates. |
 | `POST /api/v1/webhooks/source` | Git push notifications. |

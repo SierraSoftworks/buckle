@@ -53,7 +53,11 @@ The agent holds one gRPC stream open to the server and reconnects with backoff (
   that changed in between reports a stale plan instead of running something nobody reviewed;
 - runs health checks when the rollout asks (baseline before apply, during bake, before the next
   phase) and on every drift pass;
-- keeps the fleet's stable revision cached, so it can roll a module back without the server.
+- keeps the fleet's stable revision cached, so it can roll a module back without the server;
+- speaks for the clusters the server leases to it, each in a lane of its own beside the host's
+  work: it plans and applies their workloads and, while it holds the lease, watches them (health
+  when the cluster changes, drift every interval, reachability) until the server releases it. See
+  [Stewards](../modules/fleet.md#stewards).
 
 Results are durable: the agent writes each report to disk before sending it and re-sends it until
 the server acknowledges it, so a dropped connection or a server restart never loses a result.

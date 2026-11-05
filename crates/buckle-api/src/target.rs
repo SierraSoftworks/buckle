@@ -145,6 +145,19 @@ pub struct ClusterSpec {
     /// (`agents.auth: workload_identity`). Absent: none may.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<Box<ClusterTrust>>,
+    /// How often the cluster's steward reads it unprompted. Absent: the
+    /// defaults (health every 60s, drift every 10m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<ClusterWatch>,
+}
+
+/// How often a cluster's steward reads it when nothing wakes it, in
+/// seconds: health (the read covering a dropped long poll) and drift (the
+/// applied revision re-planned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterWatch {
+    pub health_seconds: u64,
+    pub drift_seconds: u64,
 }
 
 /// Which workload identities the server accepts as the cluster's in-cluster
@@ -248,9 +261,25 @@ impl ClusterSpec {
 /// it lists the target.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterStatus {
-    /// The host that last spoke for the cluster (applied or planned it).
+    /// The host that last spoke for the cluster (applied or planned it):
+    /// its steward while it has one. Kept for older clients; see `steward`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    /// The host agent holding the cluster's lease: it watches the cluster
+    /// and runs its placements and actions. `None`: no connected host may
+    /// speak for the cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steward: Option<String>,
+    /// Whether the cluster's API answers its steward, as last reported;
+    /// `None` until a steward reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachable: Option<bool>,
+    /// Why the cluster is unreachable, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachable_error: Option<String>,
+    /// When the steward last read the cluster's health (its watch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watched_at: Option<chrono::DateTime<chrono::Utc>>,
     /// How many workloads the reference revision selects for the cluster.
     #[serde(default)]
     pub workloads: u32,

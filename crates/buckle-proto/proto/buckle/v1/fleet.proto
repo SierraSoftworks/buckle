@@ -45,6 +45,7 @@ message AgentMessage {
     UpgradeResult upgrade = 10;
     RebootFailed reboot_failed = 11;
     ActionResult action = 12;
+    TargetStatus target_status = 13;
   }
 }
 
@@ -344,7 +345,56 @@ message ServerMessage {
     Ack ack = 10;
     HostUpdate host_update = 11;
     RunAction action = 12;
+    Lease lease = 13;
+    Release release = 14;
   }
+}
+
+// The server leases a cluster target to this agent: it is the cluster's
+// steward until a Release. The agent opens a lane for the cluster beside its
+// host lane, keeps a credential for it, serves the cluster's plans, applies,
+// health requests and actions there, and watches the cluster between them:
+// health as it changes (Nomad blocking queries, a Kubernetes watch), drift
+// on a timer, and reachability (TargetStatus). A targeted Assign of
+// `applied_revision` precedes the Lease when there is one, so the lane can
+// check and re-plan what is applied. Re-sent after every reconnect and
+// whenever the applied revision or the watch settings change: a lease for a
+// lane the agent already runs refreshes it.
+message Lease {
+  string target = 1;
+  ClusterTarget cluster = 2;
+  // The revision applied to the cluster, whose workloads the watch checks;
+  // empty when nothing is applied yet (the lane only probes reachability).
+  string applied_revision = 3;
+  Watch watch = 4;
+  // When the lease lapses unless renewed. Informational for now: a lease
+  // ends with a Release or the session (the server re-leases on reconnect).
+  google.protobuf.Timestamp until = 5;
+}
+
+// How often the lease holder reads a cluster when nothing wakes it.
+message Watch {
+  // The health read that covers a dropped long poll (Nomad); default 60s.
+  google.protobuf.Duration health = 1;
+  // How often the applied revision is re-planned for drift; default 10m.
+  google.protobuf.Duration drift = 2;
+}
+
+// The agent no longer stewards the cluster: its lane finishes the
+// instruction it is running, drops the rest and stops watching.
+message Release {
+  string target = 1;
+  string reason = 2;
+}
+
+// Whether a cluster target's API answers its steward: sent when a lease
+// starts and whenever reachability changes.
+message TargetStatus {
+  string target = 1;
+  bool reachable = 2;
+  // Why not, when it is not (scrubbed).
+  string error = 3;
+  google.protobuf.Timestamp at = 4;
 }
 
 // Runs a module's action on the host (or a workload's on a cluster target,
