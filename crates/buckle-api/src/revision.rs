@@ -22,6 +22,9 @@ pub struct RevisionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_id: Option<String>,
     pub module_count: u32,
+    /// Workloads under `workloads/`; 0 from servers that predate it.
+    #[serde(default)]
+    pub workload_count: u32,
 }
 
 /// `POST /api/v1/revisions/{id}/rollout`.

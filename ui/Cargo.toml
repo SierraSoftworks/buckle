@@ -50,6 +50,8 @@ web-sys = { version = "0.3", features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Hashes commit authors' emails for their Gravatar.
+sha2 = { version = "0.10", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind", "serde"] }
 # The same expression language the server evaluates `GET /audit?filter=` with,
 # so the filter box can point at a mistake before anything is sent. Without the

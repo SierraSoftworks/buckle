@@ -286,6 +286,11 @@ ALTER TABLE revisions ADD COLUMN validated_by TEXT;
     r#"
 ALTER TABLE runs ADD COLUMN action TEXT;
 "#,
+    // 10: how many workloads a revision declares; NULL until counted (the
+    // server counts older revisions from their trees on start).
+    r#"
+ALTER TABLE revisions ADD COLUMN workload_count INTEGER;
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.

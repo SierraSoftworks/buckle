@@ -219,6 +219,11 @@ pub struct RolloutSummary {
     /// of `revision` (whose phases it follows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<RolloutActionInfo>,
+    /// What the rollout changes across its fleet ([`crate::FleetPlan::changes`]),
+    /// once any host has planned. Lists and the detail carry it; live
+    /// updates leave it out, so a client keeps the one it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<crate::ChangeCounts>,
 }
 
 /// The action an action rollout runs.

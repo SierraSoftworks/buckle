@@ -664,13 +664,30 @@ pub fn start_action_rollout(
 
 pub fn rollouts(offset: u64) -> Result<Page<RolloutSummary>, ApiError> {
     with(|s| {
-        let list: Vec<RolloutSummary> = s.rollouts.iter().map(|r| r.summary.clone()).collect();
+        let list: Vec<RolloutSummary> = s.rollouts.iter().map(with_changes).collect();
         Ok(page(&list, offset, 50))
     })
 }
 
 pub fn rollout(id: &str) -> Result<RolloutDetail, ApiError> {
-    with(|s| s.rollout_mut(id).map(|r| r.clone()))
+    with(|s| {
+        s.rollout_mut(id).map(|r| RolloutDetail {
+            summary: with_changes(r),
+            ..r.clone()
+        })
+    })
+}
+
+/// A rollout's summary with what it changes, as the server fills it in.
+fn with_changes(d: &RolloutDetail) -> RolloutSummary {
+    RolloutSummary {
+        changes: d
+            .fleet
+            .as_ref()
+            .filter(|f| !f.hosts.is_empty())
+            .map(|f| f.changes()),
+        ..d.summary.clone()
+    }
 }
 
 fn event(kind: &str, message: String, host: Option<&str>, phase: Option<&str>) -> RolloutEvent {

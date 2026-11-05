@@ -21,6 +21,8 @@ pub struct RevisionRecord {
     pub status: RevisionStatus,
     pub errors: Vec<String>,
     pub module_count: u32,
+    /// Workloads under `workloads/`; `None` until counted.
+    pub workload_count: Option<u32>,
     /// `git` or `path`.
     pub source: String,
     /// The server version that validated it; `None` before this was recorded.
@@ -32,9 +34,9 @@ pub struct Revisions<'c> {
     conn: &'c Connection,
 }
 
-const COLUMNS: &str = "id, commit_id, author, message, committed_at, created_at, tarball_digest, status, errors, module_count, source, validated_by";
+const COLUMNS: &str = "id, commit_id, author, message, committed_at, created_at, tarball_digest, status, errors, module_count, source, validated_by, workload_count";
 
-fn row(r: &Row<'_>) -> rusqlite::Result<[Option<String>; 12]> {
+fn row(r: &Row<'_>) -> rusqlite::Result<[Option<String>; 13]> {
     Ok([
         r.get(0)?,
         r.get(1)?,
@@ -48,10 +50,12 @@ fn row(r: &Row<'_>) -> rusqlite::Result<[Option<String>; 12]> {
         r.get::<_, i64>(9).map(|n| Some(n.to_string()))?,
         r.get(10)?,
         r.get(11)?,
+        r.get::<_, Option<i64>>(12)
+            .map(|n| n.map(|n| n.to_string()))?,
     ])
 }
 
-fn into_record(c: [Option<String>; 12]) -> Result<RevisionRecord> {
+fn into_record(c: [Option<String>; 13]) -> Result<RevisionRecord> {
     let [
         id,
         commit,
@@ -65,6 +69,7 @@ fn into_record(c: [Option<String>; 12]) -> Result<RevisionRecord> {
         modules,
         source,
         validated_by,
+        workloads,
     ] = c;
     Ok(RevisionRecord {
         id: id.unwrap_or_default(),
@@ -83,6 +88,7 @@ fn into_record(c: [Option<String>; 12]) -> Result<RevisionRecord> {
         module_count: modules.and_then(|m| m.parse().ok()).unwrap_or(0),
         source: source.unwrap_or_default(),
         validated_by,
+        workload_count: workloads.and_then(|w| w.parse().ok()),
     })
 }
 
@@ -95,7 +101,7 @@ impl<'c> Revisions<'c> {
     pub fn upsert(&self, rev: &RevisionRecord) -> Result<()> {
         self.conn
             .execute(
-                &format!("INSERT OR REPLACE INTO revisions ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+                &format!("INSERT OR REPLACE INTO revisions ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"),
                 params![
                     rev.id,
                     rev.commit,
@@ -112,6 +118,7 @@ impl<'c> Revisions<'c> {
                     rev.module_count as i64,
                     rev.source,
                     rev.validated_by,
+                    rev.workload_count.map(i64::from),
                 ],
             )
             .map_err(db_error)?;
@@ -162,6 +169,29 @@ impl<'c> Revisions<'c> {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
         rows.into_iter().map(into_record).collect()
+    }
+
+    /// Valid revisions whose workloads were never counted, newest first.
+    pub fn uncounted_workloads(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM revisions WHERE status = 'valid' AND workload_count IS NULL ORDER BY created_at DESC, rowid DESC")
+            .map_err(db_error)?;
+        stmt.query_map([], |r| r.get(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(db_error)
+    }
+
+    /// Records how many workloads `id` declares.
+    pub fn set_workload_count(&self, id: &str, count: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE revisions SET workload_count = ?2 WHERE id = ?1",
+                params![id, i64::from(count)],
+            )
+            .map_err(db_error)?;
+        Ok(())
     }
 
     /// Total number of revisions.

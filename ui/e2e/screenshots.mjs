@@ -45,7 +45,12 @@ async function openActions(page) {
 const SHOTS = [
   { name: "overview-rollout", path: "/", target: (p) => p.locator(".overview__rollout") },
   { name: "overview-fleet", path: "/", target: (p) => p.locator(".overview__fleet") },
-  { name: "overview-attention", path: "/", target: (p) => panel(p, "Needs attention") },
+  {
+    name: "overview-attention",
+    path: "/",
+    setup: (p) => p.getByTestId("attention-bell").getByRole("button").click(),
+    target: (p) => p.getByTestId("attention-bell").locator(".bell__panel"),
+  },
   {
     name: "hosts-pending",
     path: "/hosts",

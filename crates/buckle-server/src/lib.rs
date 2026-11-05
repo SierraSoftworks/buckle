@@ -148,6 +148,9 @@ pub async fn run_with(
             if let Err(e) = builder.revalidate_stale().await {
                 tracing::warn!(error = %e, "rejected revisions could not be validated again");
             }
+            if let Err(e) = builder.count_workloads().await {
+                tracing::warn!(error = %e, "older revisions' workloads could not be counted");
+            }
         }
     };
     let mut trigger = None;

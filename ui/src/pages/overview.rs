@@ -1,28 +1,27 @@
-//! Overview (design §12): the fleet's health roll-up with the age of each
-//! reading, the latest rollout with what each module changes and its
-//! decisions while it is live, the
-//! whole fleet laid out on that rollout's stages, the last five revisions
-//! with their rollouts, and the agents needing attention.
+//! Overview (design §12): one bar of every host and workload by its state
+//! now, the latest rollout's card with its decisions while it is live, the
+//! whole fleet laid out on that rollout's stages, and the last five
+//! revisions with their rollouts. What needs attention is the app bar's
+//! bell.
 
 use std::collections::BTreeMap;
 
-use buckle_api::{Fleet, PlanGroup, RevisionSummary, RolloutDetail, RolloutState, RolloutSummary};
+use buckle_api::{Fleet, PlanGroup, RevisionSummary, RolloutDetail, RolloutState};
 use yew::prelude::*;
 
 use crate::api;
 use crate::app::{Route, use_auth};
+use crate::components::revision::RolloutProgress;
 use crate::components::{
-    Changes, Commit, CommitCard, Empty, ErrorState, HostLink, Loading, Meter, PageHead, Panel,
-    Pill, Pipeline, Refresh, RevisionLog, RouteLink, Segment, meter::rollout_segments,
-    use_revision_actions,
+    Commit, CommitCard, Empty, ErrorState, Loading, Meter, PageHead, Panel, Pipeline, Refresh,
+    RevisionLog, RouteLink, Segment, use_revision_actions,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
-use crate::logic::fleet::{Bucket, attention, rollup};
-use crate::logic::fleet_plan::{Tally, fleet_tally, hosts_changed, summarise};
-use crate::logic::format::{age, commit, relative, rollout_label};
+use crate::logic::fleet::{FleetStates, fleet_states};
+use crate::logic::format::{commit, count};
 use crate::logic::live::{apply_fleet, apply_revisions, apply_rollout, apply_rollouts};
 use crate::logic::pipeline::{fleet_map, layout};
-use crate::logic::tone::{Tone, rollout_finished, rollout_state_label, rollout_state_tone};
+use crate::logic::tone::{Tone, rollout_finished};
 use crate::pages::rollout::{
     controls, next_approval, phase_approvable, use_rollout_actions, wanting_approval,
 };
@@ -87,10 +86,8 @@ pub fn overview() -> Html {
                 .map(|d| plans.value().cloned().unwrap_or_else(|| d.plans.clone()))
                 .unwrap_or_default();
             html! { <>
-                { tiles(f, now) }
+                { fleet_bar(f) }
                 <Panel title="Latest rollout" class="overview__rollout"
-                    subtitle={rollout_live.as_ref().map(|d| AttrValue::from(format!("Rollout {} · {} · started {}",
-                        rollout_label(&d.summary.id), d.summary.triggered_by, relative(d.summary.started_at, now))))}
                     actions={rollout_live.as_ref().filter(|_| auth.is_admin())
                         .map(|d| controls(d, approvable(d, &plan_groups).as_deref(), &actions.open))
                         .unwrap_or_default()}>
@@ -110,22 +107,17 @@ pub fn overview() -> Html {
                         None => html! { <Empty title="No stages yet" message="The fleet is laid out on a rollout's stages once the first rollout starts." /> },
                     } }
                 </Panel>
-                <div class="grid grid--overview">
-                    <Panel title="Needs attention" subtitle="Registrations, offline agents, version skew and stale plans">
-                        { attention_list(f, rollout_live.as_ref().filter(|d| !rollout_finished(d.summary.state)), now) }
-                    </Panel>
-                    <Panel title="Rollouts" actions={html! { <RouteLink to={Route::Rollouts} classes="btn btn--small btn--subtle">{ "All rollouts" }</RouteLink> }}>
-                        { match (&revisions_live, &revisions.error) {
-                            (Some(list), _) if list.is_empty() => html! { <Empty title="No revisions yet" message="The server has not seen a commit of the configuration repository." /> },
-                            (Some(list), _) => html! {
-                                <RevisionLog revisions={list.clone()} rollouts={rollouts_live.clone().unwrap_or_default()} {now}
-                                    open={revision_actions.open.clone()} limit={Some(5)} />
-                            },
-                            (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={revisions.reload.clone()} /> },
-                            (None, None) => html! { <Loading /> },
-                        } }
-                    </Panel>
-                </div>
+                <Panel title="Rollouts" actions={html! { <RouteLink to={Route::Rollouts} classes="btn btn--small btn--subtle">{ "All rollouts" }</RouteLink> }}>
+                    { match (&revisions_live, &revisions.error) {
+                        (Some(list), _) if list.is_empty() => html! { <Empty title="No revisions yet" message="The server has not seen a commit of the configuration repository." /> },
+                        (Some(list), _) => html! {
+                            <RevisionLog revisions={list.clone()} rollouts={rollouts_live.clone().unwrap_or_default()} {now}
+                                open={revision_actions.open.clone()} limit={Some(5)} />
+                        },
+                        (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={revisions.reload.clone()} /> },
+                        (None, None) => html! { <Loading /> },
+                    } }
+                </Panel>
                 { rollout_live.as_ref().map(|d| actions.dialog(d, &plan_groups)).unwrap_or_default() }
                 { revision_actions.dialog(rollouts_live.as_deref().unwrap_or(&[])) }
             </> }
@@ -157,18 +149,24 @@ fn approvable(d: &RolloutDetail, plans: &[PlanGroup]) -> Option<String> {
         .map(|p| p.name.clone())
 }
 
-/// The latest rollout's card: its commit (which opens it), where it stands
-/// and what each module changes.
+/// The latest rollout's card: its commit (which opens it) with how the
+/// rollout is going, the same card as on Rollouts.
 fn latest(
     d: &RolloutDetail,
     revisions: &[RevisionSummary],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Html {
-    let s = &d.summary;
+    let mut s = d.summary.clone();
+    s.changes = s.changes.or_else(|| {
+        d.fleet
+            .as_ref()
+            .filter(|f| !f.hosts.is_empty())
+            .map(|f| f.changes())
+    });
     html! { <>
-        <CommitCard commit={Commit::of_rollout(s, revisions)} rollout={s.clone()} body=true boxed=true {now} />
-        { rollout_head(s, d.fleet.as_ref().map(fleet_tally)) }
-        { module_changes(d) }
+        <CommitCard commit={Commit::of_rollout(&s, revisions)} rollout={s.clone()} body=true boxed=true {now}>
+            <RolloutProgress rollout={s.clone()} {now} />
+        </CommitCard>
         if let Some(reason) = &s.pause_reason {
             <p class={classes!("note", (s.state == RolloutState::Paused).then_some("note--warn"))}>
                 <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
@@ -177,162 +175,66 @@ fn latest(
     </> }
 }
 
-fn bucket_tone(b: Bucket) -> Tone {
-    match b {
-        Bucket::Healthy => Tone::Ok,
-        Bucket::Failing => Tone::Danger,
-        Bucket::Held | Bucket::Drifted => Tone::Warn,
-        Bucket::Offline | Bucket::Unknown => Tone::Neutral,
-    }
-}
-
-/// The fleet at a glance: its size with how it splits by health, then one
-/// tile per health bucket. Drift is not a health state (a drifted host is
-/// also healthy, failing, …), so its tile stands apart and says so.
-fn tiles(f: &Fleet, now: chrono::DateTime<chrono::Utc>) -> Html {
-    let mut tiles = rollup(&f.hosts);
-    // Health buckets that add up to the fleet first, drift after them.
-    tiles.sort_by_key(|t| t.bucket == Bucket::Drifted);
-    let mut segments: Vec<Segment> = tiles
+/// The fleet at a glance: one bar of every host and workload by its state
+/// now, with the unusual states named beside the counts. Each part links to
+/// the hosts (or clusters) in that state.
+fn fleet_bar(f: &Fleet) -> Html {
+    let s = fleet_states(&f.hosts, &f.clusters);
+    let parts = parts(&s);
+    let segments: Vec<Segment> = parts
         .iter()
-        .filter(|t| t.bucket != Bucket::Drifted)
-        .map(|t| {
-            let label = match t.bucket {
-                Bucket::Unknown => "no reading",
-                b => b.filter(),
-            };
-            Segment::new(t.count, bucket_tone(t.bucket), label)
-        })
+        .map(|(n, tone, label, _)| Segment::new(*n, *tone, label))
         .collect();
-    segments.push(Segment::new(
-        f.counts.pending as usize,
-        Tone::Info,
-        "awaiting approval",
-    ));
-    html! {
-        <div class="tiles" role="group" aria-label="Fleet health">
-            <RouteLink to={Route::Hosts} classes="tile tile--plain tile--fleet" label={format!("{} hosts", f.counts.total)}>
-                <span class="tile__label">{ "Fleet" }</span>
-                <span class="tile__value">{ f.counts.total }</span>
-                <Meter {segments} total={f.counts.total as usize} rest="other" />
-                <span class="tile__age">{ format!("{} online · {} paused · {} pending", f.counts.online, f.counts.paused, f.counts.pending) }</span>
-            </RouteLink>
-            { for tiles.into_iter().map(|t| {
-                let tone = bucket_tone(t.bucket);
-                let ages = match (t.newest, t.oldest) {
-                    (Some(n), Some(o)) if age(Some(n), now) != age(Some(o), now) => format!("readings {}–{} old", age(Some(n), now), age(Some(o), now)),
-                    (Some(n), _) => format!("reading {} old", age(Some(n), now)),
-                    _ => "no readings".into(),
-                };
-                let ages = if t.bucket == Bucket::Offline && t.count > 0 {
-                    ages.replace("readings", "last seen").replace("reading", "last seen")
-                } else { ages };
-                let aside = t.bucket == Bucket::Drifted;
-                let ages = match (aside, t.count) {
-                    (_, 0) => "—".to_string(),
-                    (true, _) => format!("also counted above · {ages}"),
-                    (false, _) => ages,
-                };
-                html! {
-                    <RouteLink to={Route::Hosts} query={vec![("show".to_string(), t.bucket.filter().to_string())]}
-                        classes={classes!("tile", tone.class(), aside.then_some("tile--aside"), (t.count == 0).then_some("tile--zero"))}
-                        label={format!("{} {}: {}", t.count, t.bucket.label(), ages)}
-                        data_state={t.bucket.filter()}>
-                        <span class="tile__label">{ t.bucket.label() }</span>
-                        <span class="tile__value">{ t.count }</span>
-                        <span class="tile__age">{ ages }</span>
-                    </RouteLink>
-                }
-            }) }
-        </div>
-    }
-}
-
-/// What each module of the latest rollout changes, and on how many of its
-/// hosts; modules with nothing to apply are left out.
-fn module_changes(d: &RolloutDetail) -> Html {
-    let Some(f) = &d.fleet else {
-        return html! {};
+    // Deploying is workloads only: those are on the Clusters page.
+    let to = |show: &str| {
+        if show.is_empty() {
+            Route::Clusters
+        } else {
+            Route::Hosts
+        }
     };
-    let total = f.hosts.len();
-    let rows =
-        f.modules.iter().filter_map(|m| {
-            let summary = summarise(m);
-            summary.has_changes().then(|| html! {
-            <li class="module-changes__item" data-module={m.module.clone()}>
-                <span class="mono module-changes__name">{ m.module.clone() }</span>
-                <Changes tally={summary.tally} />
-                <span class="muted small">{ hosts_changed(total, summary.changed.len()) }</span>
-            </li>
-        })
-        });
-    let removals: Vec<_> = f.removals.iter().filter(|r| r.value.cleanup).collect();
-    let removed_on: std::collections::BTreeSet<&String> =
-        removals.iter().flat_map(|r| r.hosts.iter()).collect();
+    let link = |show: &str| match show {
+        "" => Vec::new(),
+        s => vec![("show".to_string(), s.to_string())],
+    };
     html! {
-        <ul class="module-changes" aria-label="Changes by module">
-            { for rows }
-            if !removals.is_empty() {
-                <li class="module-changes__item" data-module="removals">
-                    <span class="module-changes__name muted">{ "removals" }</span>
-                    <Changes tally={Tally { remove: removals.len(), ..Tally::default() }} />
-                    <span class="muted small">{ hosts_changed(total, removed_on.len()) }</span>
-                </li>
-            }
-        </ul>
-    }
-}
-
-fn rollout_head(s: &RolloutSummary, tally: Option<Tally>) -> Html {
-    html! {
-        <div class="rollout-head">
-            <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
-            if let Some(tally) = tally { <Changes {tally} /> }
-            if let Some(p) = &s.current_phase { <span class="muted">{ format!("in {p}") }</span> }
-            <span class="rollout-head__progress">
-                <Meter segments={rollout_segments(s)} total={s.hosts_total as usize} />
-                <span class="muted small">{ format!("{}/{} done", s.hosts_done, s.hosts_total) }</span>
-            </span>
-        </div>
-    }
-}
-
-fn attention_list(
-    f: &Fleet,
-    rollout: Option<&RolloutDetail>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Html {
-    let list = attention(
-        &f.hosts,
-        f.desired_agent_version
-            .as_deref()
-            .or(f.server_version.as_deref()),
-        rollout,
-        now,
-    );
-    if list.is_empty() {
-        return html! { <Empty title="Nothing needs attention" message="Every agent is registered, connected, current and on a plan its phase approved." /> };
-    }
-    html! {
-        <ul class="attention">
-            { for list.into_iter().map(|(host, concerns)| {
-                let summary = f.hosts.iter().find(|h| h.id == host).cloned();
-                let worst = [Tone::Danger, Tone::Warn]
-                    .into_iter()
-                    .find(|t| concerns.iter().any(|c| c.tone() == *t))
-                    .unwrap_or(Tone::Info);
-                html! {
-                    <li class={classes!("attention__item", worst.class())} data-host={host.clone()}>
-                        <span class="attention__mark" aria-hidden="true" />
-                        <HostLink id={host.clone()} host={summary} {now} classes={classes!("attention__host", "mono")} />
-                        <span class="attention__why">
-                            { for concerns.iter().map(|c| html! {
-                                <span class={classes!("attention__concern", c.tone().class())}>{ c.describe(now) }</span>
-                            }) }
-                        </span>
-                    </li>
+        <section class="fleet-bar" aria-label="Fleet health" data-testid="fleet-bar">
+            <div class="fleet-bar__head">
+                <RouteLink to={Route::Hosts} classes="fleet-bar__total">{ count(s.hosts, "host", "hosts") }</RouteLink>
+                if s.workloads > 0 {
+                    <RouteLink to={Route::Clusters} classes="fleet-bar__total">{ count(s.workloads, "workload", "workloads") }</RouteLink>
                 }
-            }) }
-        </ul>
+                <span class="fleet-bar__legend">
+                    { for parts.iter().filter(|(n, ..)| *n > 0).map(|(n, tone, label, show)| html! {
+                        <RouteLink to={to(show)} query={link(show)}
+                            classes={classes!("fleet-bar__part", tone.class())} data_state={*label}>
+                            { format!("{n} {label}") }
+                        </RouteLink>
+                    }) }
+                    if s.drifted > 0 {
+                        <RouteLink to={Route::Hosts} query={link("drifted")}
+                            classes={classes!("fleet-bar__part", "fleet-bar__part--aside", Tone::Warn.class())} data_state="drifted"
+                            title="Drift is not a state of its own: these hosts are also counted above">
+                            { format!("{} drifted", s.drifted) }
+                        </RouteLink>
+                    }
+                </span>
+            </div>
+            <Meter {segments} total={s.total()} rest="other" class="fleet-bar__meter" />
+        </section>
     }
+}
+
+/// The bar's parts in order: each count, its tone, its name and the hosts
+/// filter it links to.
+fn parts(s: &FleetStates) -> [(usize, Tone, &'static str, &'static str); 7] {
+    [
+        (s.healthy, Tone::Ok, "healthy", "healthy"),
+        (s.deploying, Tone::Active, "deploying", ""),
+        (s.held, Tone::Warn, "held", "held"),
+        (s.failing, Tone::Danger, "failing", "failing"),
+        (s.offline, Tone::Neutral, "offline", "offline"),
+        (s.unknown, Tone::Neutral, "no reading", "unknown"),
+        (s.pending, Tone::Info, "awaiting approval", "pending"),
+    ]
 }

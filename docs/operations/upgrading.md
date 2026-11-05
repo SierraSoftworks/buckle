@@ -12,7 +12,7 @@ attention.
    a quiet moment makes the upgrade easy to verify.
 3. **Deploy the new version**: a new image tag (`ghcr.io/sierrasoftworks/buckle:<version>`), job
    version, or binary. Keep one instance; the database is single-writer.
-4. **Check** that agents reconnect (Overview, **Needs attention**) and that the server logs no
+4. **Check** that agents reconnect (the **Needs attention** bell) and that the server logs no
    migration errors.
 
 ```sh
@@ -30,7 +30,7 @@ agents:
   desired_version: "2.3.1"
 ```
 
-Hosts on another version are listed under **Needs attention** on the overview. On each host's page,
+Hosts on another version are listed under the **Needs attention** bell. On each host's page,
 **Upgrade agent…** offers the desired version (or any other):
 
 <Screenshot name="host-upgrade" alt="The Upgrade agent dialog with the version to install" />

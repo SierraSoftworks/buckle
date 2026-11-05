@@ -6,6 +6,8 @@
 use yew::prelude::*;
 use yew_router::prelude::*;
 
+use super::attention::AttentionBell;
+use super::avatar::initials;
 use super::icons;
 use super::link::RouteLink;
 use super::theme::{self, Theme};
@@ -118,6 +120,7 @@ pub fn shell(props: &ShellProps) -> Html {
                 }
                 <span class="app-bar__spacer" />
                 <LinkStatus />
+                <AttentionBell />
                 <button type="button" class="icon-btn" onclick={toggle_theme} data-testid="theme-toggle"
                     aria-label={format!("Switch to the {} theme", theme.other().name())}
                     title={format!("Switch to the {} theme", theme.other().name())}>
@@ -228,12 +231,4 @@ fn user_chip() -> Html {
         },
         _ => html! {},
     }
-}
-
-fn initials(name: &str) -> String {
-    name.split_whitespace()
-        .filter_map(|w| w.chars().next())
-        .take(2)
-        .collect::<String>()
-        .to_uppercase()
 }

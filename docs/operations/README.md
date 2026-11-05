@@ -20,10 +20,12 @@ without them. Destructive actions ask for the rollout, host or commit to be type
 
 ## The overview
 
-The overview is the place to start. The **latest rollout** card shows the revision being rolled out,
-what each module changes, and the decision it is waiting on at its top right.
+The overview is the place to start. Its top bar counts every host and workload by its state right
+now; click a part to list those hosts. The **latest rollout** card is the same card as on Rollouts:
+the rollout's name and commit, then its state, what it changes, the stage it is in and its progress,
+with the decision it is waiting on at its top right.
 
-<Screenshot name="overview-rollout" alt="The latest rollout card, with its commit, state, per-module changes and the Approve split button" />
+<Screenshot name="overview-rollout" alt="The latest rollout card, with its name, commit, state, changes and the Approve split button" />
 
 **Fleet** draws every host once, as a block in the stage of the latest rollout it belongs to, and
 the hosts outside that rollout last. A block's colour is its state; hover it for the host and click
@@ -31,7 +33,8 @@ it to open the host.
 
 <Screenshot name="overview-fleet" alt="The fleet map: one block per host, grouped by rollout stage" />
 
-**Needs attention** lists what an operator should look at: registrations waiting for approval,
-offline agents, agents on an unexpected version and hosts whose plan has gone stale.
+The bell at the top right of every page counts what needs attention: registrations waiting for
+approval, offline agents, agents on an unexpected version, and the live rollout's failed, held or
+stale-plan hosts. Click it for the list.
 
-<Screenshot name="overview-attention" alt="The Needs attention list" />
+<Screenshot name="overview-attention" alt="The bell's Needs attention list" />

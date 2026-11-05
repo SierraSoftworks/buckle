@@ -130,6 +130,7 @@ impl RevisionBuilder {
                 module_count: 0,
                 source,
                 validated_by: None,
+                workload_count: None,
             };
             let outcome = validate_tree(&cache, &mut record)?;
             Ok((record, outcome))
@@ -187,6 +188,44 @@ impl RevisionBuilder {
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(revision = %rec.id, error = %e, "a rejected revision could not be validated again")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Counts the workloads of valid revisions stored before their count
+    /// was kept, from their trees on disk (extracting a tarball where the
+    /// tree is gone). A revision with neither stays uncounted.
+    pub async fn count_workloads(&self) -> Result<()> {
+        let ids = self
+            .store
+            .call(|db| db.revisions().uncounted_workloads())
+            .await?;
+        for id in ids {
+            let cache = self.cache.clone();
+            let i = id.clone();
+            let counted = blocking("Counting a revision's workloads", move || {
+                let (dir, tar) = (cache.dir(&i), cache.tarball(&i));
+                if !dir.join("buckle.yaml").is_file() {
+                    if !tar.is_file() {
+                        return Ok(None);
+                    }
+                    tarball::extract(&tar, &dir)?;
+                }
+                let r = buckle_core::engine::loader::load_dir(&dir, RevisionId::new(i))?;
+                Ok(Some(r.workloads.len() as u32))
+            })
+            .await;
+            match counted {
+                Ok(Some(n)) => {
+                    self.store
+                        .call(move |db| db.revisions().set_workload_count(&id, n))
+                        .await?
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(revision = %id, error = %e, "a revision's workloads could not be counted")
                 }
             }
         }
@@ -270,6 +309,7 @@ fn validate_tree(cache: &RevisionCache, record: &mut RevisionRecord) -> Result<O
             Ok(r) => r,
         };
     record.module_count = revision.modules.len() as u32;
+    record.workload_count = Some(revision.workloads.len() as u32);
     let errors = validate::validate(&revision);
     if !errors.is_empty() {
         record.errors = errors;
@@ -319,6 +359,7 @@ pub fn summary(
         is_stable,
         rollout_id,
         module_count: record.module_count,
+        workload_count: record.workload_count.unwrap_or(0),
     }
 }
 
@@ -483,6 +524,7 @@ mod tests {
             module_count: 0,
             source: "git".into(),
             validated_by: validated_by.map(str::to_owned),
+            workload_count: None,
         };
         store
             .call(move |db| db.revisions().upsert(&rec))
@@ -509,6 +551,64 @@ mod tests {
             .unwrap()
             .unwrap()
             .status
+    }
+
+    #[tokio::test]
+    async fn older_valid_revisions_get_their_workloads_counted_from_disk() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().await.unwrap();
+        let cache = Arc::new(RevisionCache::new(data.path()));
+        for (id, on_disk) in [("counted", true), ("gone", false)] {
+            if on_disk {
+                let dir = cache.dir(id);
+                std::fs::create_dir_all(dir.join("workloads/paste/files")).unwrap();
+                std::fs::write(dir.join("buckle.yaml"), "version: 2\n").unwrap();
+                std::fs::write(
+                    dir.join("workloads/paste/workload.yaml"),
+                    "name: paste\nresources: [paste.nomad.hcl]\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    dir.join("workloads/paste/files/paste.nomad.hcl"),
+                    "job \"paste\" {}",
+                )
+                .unwrap();
+            }
+            let rec = RevisionRecord {
+                id: id.into(),
+                commit: id.into(),
+                author: "Ada".into(),
+                message: "before workloads were counted".into(),
+                committed_at: Utc::now(),
+                created_at: Utc::now(),
+                tarball_digest: None,
+                status: RevisionStatus::Valid,
+                errors: vec![],
+                module_count: 0,
+                source: "git".into(),
+                validated_by: None,
+                workload_count: None,
+            };
+            store
+                .call(move |db| db.revisions().upsert(&rec))
+                .await
+                .unwrap();
+        }
+        let builder = RevisionBuilder::new(store.clone(), cache, EventBus::default());
+        builder.count_workloads().await.unwrap();
+        let count = |id: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .call(move |db| db.revisions().get(id))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .workload_count
+            }
+        };
+        assert_eq!(count("counted").await, Some(1));
+        assert_eq!(count("gone").await, None);
     }
 
     #[tokio::test]

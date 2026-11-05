@@ -1075,6 +1075,7 @@ async fn sse_streams_controller_events() {
         module_count: 0,
         source: "path".into(),
         validated_by: None,
+        workload_count: None,
     };
     e.store
         .call(move |db| db.revisions().upsert(&rec))
@@ -1979,6 +1980,7 @@ async fn revision(e: &Env, id: &str, buckle_yaml: &str) {
         module_count: 0,
         source: "path".into(),
         validated_by: None,
+        workload_count: None,
     };
     e.store
         .call(move |db| db.revisions().upsert(&rec))
@@ -2209,6 +2211,65 @@ async fn plans_are_served_typed_and_deduplicated_by_digest() {
             .iter()
             .any(|s| s.destructive && s.key == "/etc/nomad.d/old.hcl")
     );
+}
+
+#[actix_web::test]
+async fn rollouts_say_what_they_change_once_a_host_has_planned() {
+    let e = env(WebConfig::default()).await;
+    let plan = crate::views::tests::review_plan();
+    let stored = serde_json::to_value(&plan).unwrap();
+    let row = |rollout: &str, plan: Option<serde_json::Value>| crate::store::RolloutHostRecord {
+        rollout: rollout.into(),
+        host: "pi-1".into(),
+        phase: "canary".into(),
+        wave: Some(1),
+        state: crate::rollout::model::HostPhase::Healthy,
+        plan_digest: plan.as_ref().map(|_| plan_digest(&stored)),
+        plan,
+        result: None,
+        health: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        runtime: Default::default(),
+    };
+    let rows = [row("7", Some(stored.clone())), row("8", None)];
+    e.store
+        .call(move |db| {
+            for id in ["7", "8"] {
+                db.rollouts().save(&crate::store::RolloutRecord {
+                    revision: "7c2e1f0".into(),
+                    ..finished_rollout(id, None)
+                })?;
+            }
+            for r in &rows {
+                db.rollouts().save_host(r)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let get = |uri: &str| test::TestRequest::get().uri(uri).to_request();
+    let expected = buckle_api::ChangeCounts {
+        create: 1,
+        modify: 2,
+        remove: 2,
+        blocked: 1,
+    };
+
+    let list: buckle_api::Page<buckle_api::RolloutSummary> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/rollouts")).await).await;
+    let changes = |id: &str| list.items.iter().find(|r| r.id == id).unwrap().changes;
+    assert_eq!(changes("7"), Some(expected));
+    assert_eq!(changes("8"), None, "nothing planned, nothing to say");
+
+    let detail: buckle_api::RolloutDetail =
+        test::read_body_json(test::call_service(&app, get("/api/v1/rollouts/7")).await).await;
+    assert_eq!(detail.summary.changes, Some(expected));
+}
+
+fn plan_digest(plan: &serde_json::Value) -> String {
+    plan["digest"].as_str().unwrap_or("d").to_owned()
 }
 
 // ------------------------------------------------------------ health gates
@@ -2717,6 +2778,7 @@ async fn admins_can_validate_a_rejected_revision_again() {
         module_count: 0,
         source: "git".into(),
         validated_by: Some("0.0.1".into()),
+        workload_count: None,
     };
     e.store
         .call(move |db| db.revisions().upsert(&rec))

@@ -1,6 +1,6 @@
-//! The Overview's roll-up of the fleet (design §07, §12): how many hosts are
-//! healthy, failing, held, offline or drifted, how old those readings are, and
-//! which agents need someone to look at them.
+//! The fleet at a glance (design §07, §12): how many hosts and workloads
+//! are healthy, deploying, failing, held, offline or drifted, and which
+//! agents need someone to look at them.
 
 use std::collections::BTreeMap;
 
@@ -13,50 +13,27 @@ use chrono::{DateTime, Duration, Utc};
 /// How long an agent may be offline before it needs attention.
 pub const OFFLINE_ATTENTION: i64 = 10 * 60;
 
-/// One tile of the roll-up.
+/// Where a host stands now, by its health and connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Bucket {
     Healthy,
     Failing,
     Held,
     Offline,
-    Drifted,
     Unknown,
 }
 
 impl Bucket {
-    pub fn label(self) -> &'static str {
-        match self {
-            Bucket::Healthy => "Healthy",
-            Bucket::Failing => "Failing",
-            Bucket::Held => "Held",
-            Bucket::Offline => "Offline",
-            Bucket::Drifted => "Drifted",
-            Bucket::Unknown => "No reading",
-        }
-    }
-
-    /// The hosts-table filter the tile links to.
+    /// The hosts-table filter for it.
     pub fn filter(self) -> &'static str {
         match self {
             Bucket::Healthy => "healthy",
             Bucket::Failing => "failing",
             Bucket::Held => "held",
             Bucket::Offline => "offline",
-            Bucket::Drifted => "drifted",
             Bucket::Unknown => "unknown",
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tile {
-    pub bucket: Bucket,
-    pub count: usize,
-    /// The newest and oldest readings behind the count: health readings for
-    /// the health buckets, the last contact for offline hosts.
-    pub newest: Option<DateTime<Utc>>,
-    pub oldest: Option<DateTime<Utc>>,
 }
 
 /// Which health bucket a host falls in. An offline host's last reading is not
@@ -86,58 +63,71 @@ pub fn matches_filter(host: &HostSummary, filter: &str) -> bool {
     }
 }
 
-/// The roll-up tiles, always in the same order; `Unknown` only appears when a
-/// host has no reading. Hosts still awaiting registration are not part of the
-/// fleet's health yet and are left out.
-pub fn rollup(hosts: &[HostSummary]) -> Vec<Tile> {
-    let mut tiles: BTreeMap<Bucket, Tile> = [
-        Bucket::Healthy,
-        Bucket::Failing,
-        Bucket::Held,
-        Bucket::Offline,
-        Bucket::Drifted,
-    ]
-    .into_iter()
-    .map(|b| {
-        (
-            b,
-            Tile {
-                bucket: b,
-                count: 0,
-                newest: None,
-                oldest: None,
-            },
-        )
-    })
-    .collect();
+/// The fleet right now: every registered host and every workload of the
+/// clusters, each counted once by its state. Hosts still awaiting
+/// registration count apart (`pending`); drift is orthogonal and counted
+/// on top.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FleetStates {
+    pub hosts: usize,
+    pub workloads: usize,
+    pub healthy: usize,
+    pub deploying: usize,
+    pub held: usize,
+    pub failing: usize,
+    pub offline: usize,
+    pub unknown: usize,
+    pub pending: usize,
+    pub drifted: usize,
+}
 
-    let mut add = |b: Bucket, at: Option<DateTime<Utc>>| {
-        let tile = tiles.entry(b).or_insert(Tile {
-            bucket: b,
-            count: 0,
-            newest: None,
-            oldest: None,
-        });
-        tile.count += 1;
-        if let Some(at) = at {
-            tile.newest = Some(tile.newest.map_or(at, |n| n.max(at)));
-            tile.oldest = Some(tile.oldest.map_or(at, |o| o.min(at)));
-        }
-    };
-
-    for host in hosts.iter().filter(|h| h.status != HostStatus::Pending) {
-        let b = bucket(host);
-        let at = if b == Bucket::Offline {
-            host.last_seen
-        } else {
-            host.health_at
-        };
-        add(b, at);
-        if host.drifted {
-            add(Bucket::Drifted, host.health_at);
-        }
+impl FleetStates {
+    /// Everything the bar spans.
+    pub fn total(&self) -> usize {
+        self.hosts + self.workloads + self.pending
     }
-    tiles.into_values().collect()
+}
+
+pub fn fleet_states(hosts: &[HostSummary], clusters: &[HostSummary]) -> FleetStates {
+    let mut s = FleetStates::default();
+    let add = |s: &mut FleetStates, b: Bucket, n: usize| match b {
+        Bucket::Healthy => s.healthy += n,
+        Bucket::Failing => s.failing += n,
+        Bucket::Held => s.held += n,
+        Bucket::Offline => s.offline += n,
+        Bucket::Unknown => s.unknown += n,
+    };
+    for h in hosts {
+        if h.status == HostStatus::Pending {
+            s.pending += 1;
+            continue;
+        }
+        s.hosts += 1;
+        s.drifted += h.drifted as usize;
+        add(&mut s, bucket(h), 1);
+    }
+    for c in clusters {
+        let status = c.cluster_status.clone().unwrap_or_default();
+        let n = status.workloads as usize;
+        s.workloads += n;
+        // A cluster has no agent of its own (its connection says nothing):
+        // with no host to speak for it, its workloads have no reading.
+        if status.executor.is_none() {
+            add(&mut s, Bucket::Unknown, n);
+            continue;
+        }
+        let failing = status.failing.len().min(n);
+        let deploying = status
+            .deploying
+            .iter()
+            .filter(|d| !status.failing.contains(&d.workload))
+            .count()
+            .min(n - failing);
+        s.failing += failing;
+        s.deploying += deploying;
+        add(&mut s, Bucket::Healthy, n - failing - deploying);
+    }
+    s
 }
 
 /// Why an agent is on the attention list.
@@ -369,36 +359,60 @@ mod tests {
         }
     }
 
+    fn cluster(
+        workloads: u32,
+        executor: Option<&str>,
+        failing: &[&str],
+        deploying: &[&str],
+    ) -> HostSummary {
+        HostSummary {
+            kind: buckle_api::TargetKind::Cluster,
+            connection: Connection::Offline,
+            cluster_status: Some(buckle_api::ClusterStatus {
+                executor: executor.map(Into::into),
+                workloads,
+                failing: failing.iter().map(|w| w.to_string()).collect(),
+                deploying: deploying
+                    .iter()
+                    .map(|w| buckle_api::Deploying {
+                        workload: w.to_string(),
+                        progress: None,
+                    })
+                    .collect(),
+            }),
+            ..host("c")
+        }
+    }
+
     #[test]
-    fn the_rollup_counts_each_host_once_by_health_and_drift_on_top() {
-        let now = Utc::now();
+    fn fleet_states_count_each_host_and_workload_once() {
         let mut failing = host("b");
         failing.health = HealthSummary::Failing;
-        failing.health_at = Some(now - Duration::minutes(3));
         let mut offline = host("c");
         offline.connection = Connection::Offline;
-        offline.health = HealthSummary::Failing; // stale reading, not counted as failing
-        offline.last_seen = Some(now - Duration::hours(2));
+        offline.health = HealthSummary::Failing; // a stale reading is not failing now
         let mut drifted = host("d");
         drifted.drifted = true;
-        drifted.health_at = Some(now - Duration::minutes(14));
         let mut pending = host("e");
         pending.status = HostStatus::Pending;
-        let mut healthy = host("a");
-        healthy.health_at = Some(now - Duration::minutes(2));
+        let hosts = [host("a"), failing, offline, drifted, pending];
+        let clusters = [
+            // `api` fails while it deploys: counted once, as failing.
+            cluster(5, Some("seer"), &["api"], &["api", "web"]),
+            cluster(2, None, &[], &[]),
+        ];
 
-        let tiles = rollup(&[healthy, failing, offline, drifted, pending]);
-        let get = |b| tiles.iter().find(|t| t.bucket == b).unwrap().clone();
-        assert_eq!(get(Bucket::Healthy).count, 2);
-        assert_eq!(get(Bucket::Failing).count, 1);
-        assert_eq!(get(Bucket::Offline).count, 1);
-        assert_eq!(get(Bucket::Drifted).count, 1);
-        assert_eq!(get(Bucket::Held).count, 0);
-        assert!(tiles.iter().all(|t| t.bucket != Bucket::Unknown));
-        let h = get(Bucket::Healthy);
-        assert_eq!(h.newest, Some(now - Duration::minutes(2)));
-        assert_eq!(h.oldest, Some(now - Duration::minutes(14)));
-        assert_eq!(get(Bucket::Offline).oldest, Some(now - Duration::hours(2)));
+        let s = fleet_states(&hosts, &clusters);
+        assert_eq!((s.hosts, s.workloads, s.pending), (4, 7, 1));
+        assert_eq!(s.healthy, 2 + 3);
+        assert_eq!(
+            (s.failing, s.deploying, s.offline, s.unknown),
+            (1 + 1, 1, 1, 2)
+        );
+        assert_eq!(s.drifted, 1);
+        let parts =
+            s.healthy + s.deploying + s.held + s.failing + s.offline + s.unknown + s.pending;
+        assert_eq!(parts, s.total(), "the parts make up the whole");
     }
 
     #[test]
@@ -536,6 +550,7 @@ mod tests {
                 trace_id: None,
                 trace_url: None,
                 action: None,
+                changes: None,
             },
             phases: vec![RolloutPhase {
                 name: "home".into(),
