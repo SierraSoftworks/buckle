@@ -336,7 +336,7 @@ impl FakeKube {
                 ok(obj.clone())
             }
             ("PATCH", Some(name)) => {
-                let dry = q.get("dryRun").is_some();
+                let dry = q.contains_key("dryRun");
                 if r.namespaced
                     && !s.objects.contains_key(&(
                         "v1".into(),

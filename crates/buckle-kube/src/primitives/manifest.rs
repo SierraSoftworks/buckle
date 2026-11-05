@@ -324,7 +324,7 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
     };
     if key.kind == "CustomResourceDefinition" {
         cx.kube.refresh_discovery();
-        wait(cx, key, &path, |obj| health::established(obj)).await?;
+        wait(cx, key, &path, health::established).await?;
         return Ok(Applied::changed(format!("applied {key}")));
     }
     if health::is_rollout(key) {
