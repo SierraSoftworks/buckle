@@ -144,22 +144,35 @@ async fn a_workload_rolls_out_replans_as_no_change_and_is_purged() {
         .expect("the ConfigMap's diff");
     assert!(diff.contains("x = 1") && diff.contains("x = 2"), "{diff}");
 
-    // The object moves between plan and apply: the apply refuses.
-    kube.send(
-        "PATCH",
-        &format!("{path}?fieldManager=someone-else"),
-        Some("application/merge-patch+json"),
-        Some(br#"{"metadata":{"annotations":{"note":"y"}}}"#.to_vec()),
-    )
-    .await
-    .unwrap();
+    // The object moves between plan and apply, but not in a field Buckle
+    // owns (as a controller's status writes do): the apply goes ahead.
+    let patch = |body: &'static str| {
+        let kube = kube.clone();
+        let path = path.clone();
+        async move {
+            kube.send(
+                "PATCH",
+                &format!("{path}?fieldManager=someone-else"),
+                Some("application/merge-patch+json"),
+                Some(body.as_bytes().to_vec()),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    patch(r#"{"metadata":{"annotations":{"note":"y"}}}"#).await;
+    next.apply(&cx).await.unwrap();
+
+    // A field Buckle owns moves: the apply refuses to overwrite it.
+    let next = workload(ns, "c", "x = 2\n").plan(&cx).await.unwrap();
+    patch(r#"{"metadata":{"labels":{"app":"moved"}}}"#).await;
     let err = next.apply(&cx).await.unwrap_err();
     assert!(
         err.description().contains("after it was planned"),
         "{}",
         err.description()
     );
-    workload(ns, "b", "x = 2\n")
+    workload(ns, "c", "x = 2\n")
         .plan(&cx)
         .await
         .unwrap()

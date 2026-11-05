@@ -59,8 +59,32 @@ struct State {
     /// Objects by (gv, plural, namespace, name).
     objects: BTreeMap<(String, String, String, String), Value>,
     outcome: String,
+    /// Status writes still to make before an apply.
+    status_writes: usize,
     requests: Vec<(String, String)>,
     authorization: Vec<String>,
+}
+
+type Key = (String, String, String, String);
+
+impl State {
+    fn key_of(&self, api_version: &str, kind: &str, ns: &str, name: &str) -> Key {
+        let r = self
+            .resources
+            .iter()
+            .find(|r| r.gv == api_version && r.kind == kind)
+            .expect("served kind");
+        let ns = if r.namespaced { ns } else { "" };
+        (r.gv.clone(), r.plural.clone(), ns.into(), name.into())
+    }
+}
+
+fn write_status(s: &mut State, key: &Key, status: &Value) {
+    s.version += 1;
+    let rv = s.version.to_string();
+    let obj = s.objects.get_mut(key).expect("object exists");
+    merge(&mut obj["status"], status);
+    obj["metadata"]["resourceVersion"] = json!(rv);
 }
 
 /// The fake. Cheap to clone; clones share state.
@@ -210,6 +234,22 @@ impl FakeKube {
         obj["metadata"]["managedFields"] = Value::Array(managed);
     }
 
+    /// Writes a controller's status, as the status subresource does: the
+    /// resourceVersion moves, the spec, generation and field owners do not.
+    pub fn write_status(&self, api_version: &str, kind: &str, ns: &str, name: &str, status: Value) {
+        let mut s = self.state.lock().unwrap();
+        let key = s.key_of(api_version, kind, ns, name);
+        write_status(&mut s, &key, &status);
+    }
+
+    /// Has a controller write status to the object just before each of the
+    /// next `n` server-side applies (dry runs included) under a
+    /// resourceVersion, so each one's precondition fails (a Deployment
+    /// reconciling while Buckle plans or applies).
+    pub fn status_writes_before_apply(&self, n: usize) {
+        self.state.lock().unwrap().status_writes = n;
+    }
+
     fn handle(&self, req: &Request) -> Response {
         let mut s = self.state.lock().unwrap();
         s.requests.push((req.method.to_owned(), req.path.clone()));
@@ -349,6 +389,14 @@ impl FakeKube {
                     return status(404, "NotFound", &format!("namespaces \"{ns}\" not found"));
                 }
                 let manager = q.get("fieldManager").cloned().unwrap_or_default();
+                if s.status_writes > 0
+                    && body["metadata"]["resourceVersion"].is_string()
+                    && s.objects.contains_key(&key(&name))
+                {
+                    s.status_writes -= 1;
+                    let n = s.status_writes;
+                    write_status(&mut s, &key(&name), &json!({"reconciles": n}));
+                }
                 let live = s.objects.get(&key(&name)).cloned();
                 if let Some(rv) = body["metadata"]["resourceVersion"].as_str()
                     && live

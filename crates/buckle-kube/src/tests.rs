@@ -195,8 +195,127 @@ async fn an_out_of_band_edit_of_an_owned_field_is_planned_back() {
     assert!(diff_text(&plan.steps[1]).contains("hacked"));
 }
 
+/// A deployed grafana and a plan to move it to 11.4.0.
+async fn planned_upgrade(cx: &Context) -> crate::WorkloadPlan {
+    grafana("grafana:11.3.1")
+        .plan(cx)
+        .await
+        .unwrap()
+        .apply(cx)
+        .await
+        .unwrap();
+    let plan = grafana("grafana:11.4.0").plan(cx).await.unwrap();
+    assert_eq!(plan.changes(), 1, "{:?}", summaries(&plan));
+    plan
+}
+
+fn image(fake: &FakeKube) -> Value {
+    fake.object("apps/v1", "Deployment", "monitoring", "grafana")
+        .unwrap()["spec"]["template"]["spec"]["containers"][0]["image"]
+        .clone()
+}
+
+/// What moves the Deployment between plan and apply, and whether the apply
+/// must refuse.
+#[rstest]
+#[case::controller_status(
+    json!({"status": {"observedGeneration": 1, "readyReplicas": 1}}), "kube-controller-manager", false
+)]
+#[case::another_tools_field(json!({"metadata": {"annotations": {"x": "y"}}}), "kubectl", false)]
+#[case::an_owned_field(
+    json!({"spec": {"template": {"spec": {"containers": [{"name": "grafana", "image": "hacked"}]}}}}),
+    "kubectl-edit",
+    true
+)]
 #[tokio::test]
-async fn an_apply_refuses_an_object_that_moved_after_the_plan() {
+async fn an_apply_refuses_only_an_owned_change_made_after_the_plan(
+    #[case] patch: Value,
+    #[case] manager: &str,
+    #[case] refused: bool,
+) {
+    let fake = FakeKube::new();
+    let cx = cx(&fake, "grafana");
+    let plan = planned_upgrade(&cx).await;
+    if let Some(status) = patch.get("status") {
+        fake.write_status(
+            "apps/v1",
+            "Deployment",
+            "monitoring",
+            "grafana",
+            status.clone(),
+        );
+    } else {
+        fake.edit(
+            "apps/v1",
+            "Deployment",
+            "monitoring",
+            "grafana",
+            manager,
+            patch,
+        );
+    }
+
+    let result = plan.apply(&cx).await;
+    if refused {
+        let err = result.unwrap_err();
+        assert!(
+            err.description()
+                .contains("changed in the cluster after it was planned"),
+            "{}",
+            err.description()
+        );
+        assert_eq!(
+            image(&fake),
+            "hacked",
+            "an unshown change is never overwritten"
+        );
+    } else {
+        result.unwrap();
+        assert_eq!(image(&fake), "grafana:11.4.0");
+    }
+}
+
+/// A controller that keeps writing status while the apply runs: a few
+/// writes are retried through, an endless stream is refused rather than
+/// retried forever.
+#[rstest]
+#[case::reconciling(2, true)]
+#[case::never_settles(100, false)]
+#[tokio::test]
+async fn an_apply_retries_a_controller_that_keeps_writing_status(
+    #[case] writes: usize,
+    #[case] applies: bool,
+) {
+    let fake = FakeKube::new();
+    let cx = cx(&fake, "grafana");
+    let plan = planned_upgrade(&cx).await;
+    fake.status_writes_before_apply(writes);
+
+    let result = plan.apply(&cx).await;
+    assert_eq!(
+        result.is_ok(),
+        applies,
+        "{:?}",
+        result.err().map(|e| e.description())
+    );
+    let expected = if applies {
+        "grafana:11.4.0"
+    } else {
+        "grafana:11.3.1"
+    };
+    assert_eq!(image(&fake), expected);
+}
+
+/// A controller writing status while the plan reads the object: a few
+/// writes are read through, an endless stream fails the plan.
+#[rstest]
+#[case::reconciling(2, true)]
+#[case::never_settles(100, false)]
+#[tokio::test]
+async fn a_plan_reads_through_a_controller_writing_status(
+    #[case] writes: usize,
+    #[case] plans: bool,
+) {
     let fake = FakeKube::new();
     let cx = cx(&fake, "grafana");
     grafana("grafana:11.3.1")
@@ -206,21 +325,60 @@ async fn an_apply_refuses_an_object_that_moved_after_the_plan() {
         .apply(&cx)
         .await
         .unwrap();
-    let plan = grafana("grafana:11.4.0").plan(&cx).await.unwrap();
+    fake.status_writes_before_apply(writes);
+
+    match grafana("grafana:11.4.0").plan(&cx).await {
+        Ok(plan) if plans => assert_eq!(plan.changes(), 1, "{:?}", summaries(&plan)),
+        Err(e) if !plans => assert!(
+            e.description().contains("could not be planned"),
+            "{}",
+            e.description()
+        ),
+        other => panic!(
+            "expected the plan to {}: {:?}",
+            if plans { "succeed" } else { "fail" },
+            other.err().map(|e| e.description())
+        ),
+    }
+}
+
+/// An ignored field moved by its owner after the plan keeps its new value.
+#[tokio::test]
+async fn an_apply_keeps_an_ignored_field_moved_after_the_plan() {
+    let fake = FakeKube::new();
+    let cx = cx(&fake, "grafana");
+    let workload = |image: &str| {
+        let mut spec = ManifestSpec::new("grafana.yaml", deployment(image));
+        spec.ignore =
+            buckle_core::fieldpath::FieldPath::parse_all(&["spec.replicas".into()]).unwrap();
+        Workload::new("grafana", vec![Primitive::Manifest(spec)])
+    };
+    let cx = cx.with_namespace(Some("default"));
+    workload("grafana:11.3.1")
+        .plan(&cx)
+        .await
+        .unwrap()
+        .apply(&cx)
+        .await
+        .unwrap();
+    let plan = workload("grafana:11.4.0").plan(&cx).await.unwrap();
     fake.edit(
         "apps/v1",
         "Deployment",
-        "monitoring",
+        "default",
         "grafana",
-        "kubectl",
-        json!({"metadata": {"annotations": {"x": "y"}}}),
+        "hpa",
+        json!({"spec": {"replicas": 5}}),
     );
-    let err = plan.apply(&cx).await.unwrap_err();
-    assert!(
-        err.description()
-            .contains("changed in the cluster after it was planned"),
-        "{}",
-        err.description()
+
+    plan.apply(&cx).await.unwrap();
+    let d = fake
+        .object("apps/v1", "Deployment", "default", "grafana")
+        .unwrap();
+    assert_eq!(d["spec"]["replicas"], 5);
+    assert_eq!(
+        d["spec"]["template"]["spec"]["containers"][0]["image"],
+        "grafana:11.4.0"
     );
 }
 

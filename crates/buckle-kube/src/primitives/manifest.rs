@@ -5,8 +5,11 @@
 //! it would be, and the fields Buckle owns (before or after) are compared
 //! between the live object and that result, so defaults and other
 //! controllers' fields never show as changes. The apply sends the planned
-//! intent with the live `resourceVersion`, so an object that moved after the
-//! plan is refused rather than overwritten.
+//! intent with the live `resourceVersion`. When the object moved after the
+//! plan (a controller writing status does that constantly), the diff is
+//! taken again: the apply goes ahead under the new `resourceVersion` when
+//! the fields Buckle owns still show the planned change, and is refused
+//! otherwise rather than overwriting a change it has not shown.
 
 use super::{Context, Pending as StepPending, Step, yaml};
 use crate::client::Applied as Apply;
@@ -76,7 +79,25 @@ pub(crate) struct Pending {
     path: Option<String>,
     /// The intent as applied: stamped, with the live resourceVersion.
     body: Value,
+    /// The owned-field diff an update was planned with, compared again
+    /// when the object moved before the apply; `None` for a creation.
+    planned: Option<OwnedDiff>,
+    /// The spec's ignored fields, adopted again from the moved object.
+    ignore: Vec<FieldPath>,
 }
+
+/// The fields Buckle owns on an object, live (`before`) and as the dry run
+/// says they would be (`after`), as plans show them.
+#[derive(Debug, Clone, PartialEq)]
+struct OwnedDiff {
+    before: Value,
+    after: Value,
+}
+
+/// How often a plan or apply takes the diff again after the object moved:
+/// a Deployment's controller can write status more than once while it
+/// reconciles.
+const CONFLICT_RETRIES: usize = 3;
 
 /// A namespace a workload's `namespace` names, created when missing.
 pub fn namespace(name: &str) -> ManifestSpec {
@@ -168,19 +189,27 @@ pub(crate) async fn plan(cx: &Context, spec: &ManifestSpec, created: &[ObjectKey
         return Ok(create(cx, key, Some(path), intent, warnings));
     };
 
-    adopt_all(&spec.ignore, &mut intent, &live);
-    if let Some(rv) = live["metadata"]["resourceVersion"].as_str() {
-        intent["metadata"]["resourceVersion"] = json!(rv);
-    }
-    let dry = dry_run(cx, &key, &path, &intent).await?;
-    let mut set = fields::buckle_owned(&live);
-    fields::union(&mut set, &fields::buckle_owned(&dry));
-    let before = shown(
-        cx,
-        &key,
-        fields::extract(&live, &set).unwrap_or(Value::Null),
-    );
-    let after = shown(cx, &key, fields::extract(&dry, &set).unwrap_or(Value::Null));
+    // A controller's status write between the read and the dry run moves
+    // the resourceVersion: read again rather than fail the plan.
+    let mut live = live;
+    let mut retries = 0;
+    let diff = loop {
+        rebase(&mut intent, &spec.ignore, &live);
+        if let Some(d) = owned_diff(cx, &key, &path, &live, &intent).await? {
+            break d;
+        }
+        retries += 1;
+        match cx.kube.get(&path).await? {
+            Some(l) if retries <= CONFLICT_RETRIES => live = l,
+            _ => {
+                return Err(user(
+                    format!("{key} could not be planned: it kept changing while it was read."),
+                    &["Plan again."],
+                ));
+            }
+        }
+    };
+    let OwnedDiff { before, after } = diff.clone();
     let ours = owner == Owner::Us(object::label_value(&cx.module));
 
     let planned = if before == after && ours {
@@ -212,8 +241,38 @@ pub(crate) async fn plan(cx: &Context, spec: &ManifestSpec, created: &[ObjectKey
         pending: StepPending::Manifest(Pending {
             path: Some(path),
             body: intent,
+            planned: Some(diff),
+            ignore: spec.ignore.clone(),
         }),
     })
+}
+
+/// Points `intent` at `live`: its ignored fields take the live values and
+/// it carries the live `resourceVersion`.
+fn rebase(intent: &mut Value, ignore: &[FieldPath], live: &Value) {
+    adopt_all(ignore, intent, live);
+    if let Some(rv) = live["metadata"]["resourceVersion"].as_str() {
+        intent["metadata"]["resourceVersion"] = json!(rv);
+    }
+}
+
+/// The diff `intent` makes to `live` over the fields Buckle owns on either
+/// side; `None` when `live` moved before the dry run.
+async fn owned_diff(
+    cx: &Context,
+    key: &ObjectKey,
+    path: &str,
+    live: &Value,
+    intent: &Value,
+) -> Result<Option<OwnedDiff>> {
+    let Some(dry) = dry_run(cx, key, path, intent).await? else {
+        return Ok(None);
+    };
+    let mut set = fields::buckle_owned(live);
+    fields::union(&mut set, &fields::buckle_owned(&dry));
+    let before = shown(cx, key, fields::extract(live, &set).unwrap_or(Value::Null));
+    let after = shown(cx, key, fields::extract(&dry, &set).unwrap_or(Value::Null));
+    Ok(Some(OwnedDiff { before, after }))
 }
 
 fn create(
@@ -241,7 +300,12 @@ fn create(
         }),
         key,
         warnings,
-        pending: StepPending::Manifest(Pending { path, body: intent }),
+        pending: StepPending::Manifest(Pending {
+            path,
+            body: intent,
+            planned: None,
+            ignore: Vec::new(),
+        }),
     }
 }
 
@@ -257,10 +321,18 @@ fn crd_scope(created: &[ObjectKey], key: &ObjectKey) -> Option<bool> {
         .then_some(true)
 }
 
-async fn dry_run(cx: &Context, key: &ObjectKey, path: &str, intent: &Value) -> Result<Value> {
+/// The object as `intent` would leave it; `None` when it moved since
+/// `intent`'s resourceVersion was read.
+async fn dry_run(
+    cx: &Context,
+    key: &ObjectKey,
+    path: &str,
+    intent: &Value,
+) -> Result<Option<Value>> {
     let body = serde_json::to_vec(intent).unwrap_or_default();
     match cx.kube.apply(path, body, true).await? {
-        Apply::Object(v) => Ok(v),
+        Apply::Object(v) => Ok(Some(v)),
+        Apply::Conflict(_) if !intent["metadata"]["resourceVersion"].is_null() => Ok(None),
         Apply::Conflict(m) => Err(user(
             format!("{key} could not be planned: {m}"),
             &["Plan again; the object changed while it was read."],
@@ -305,22 +377,29 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
     };
     // Indexed first, so an object that applies is never missed as an orphan.
     index::update(&cx.kube, &cx.target, |e| index::upsert(e, entry.clone())).await?;
-    let applied = match cx
-        .kube
-        .apply(
-            &path,
-            serde_json::to_vec(&p.body).unwrap_or_default(),
-            false,
-        )
-        .await?
-    {
-        Apply::Object(v) => v,
-        Apply::Conflict(_) => {
-            return Err(user(
-                format!("{key} changed in the cluster after it was planned."),
-                &["Plan again: the apply refuses to overwrite a change it has not shown."],
-            ));
+    let mut body = p.body.clone();
+    let mut retries = 0;
+    let applied = loop {
+        let sent = cx
+            .kube
+            .apply(&path, serde_json::to_vec(&body).unwrap_or_default(), false)
+            .await?;
+        // A conflict alone does not mean the plan is stale: any write bumps
+        // the resourceVersion, a controller's status among them.
+        if let Apply::Object(v) = sent {
+            break v;
         }
+        body = loop {
+            retries += 1;
+            if retries > CONFLICT_RETRIES {
+                return Err(moved(key));
+            }
+            match replan(cx, key, &path, p).await? {
+                Replan::Same(rebased) => break rebased,
+                Replan::MovedAgain => continue,
+                Replan::Changed => return Err(moved(key)),
+            }
+        };
     };
     if key.kind == "CustomResourceDefinition" {
         cx.kube.refresh_discovery();
@@ -336,6 +415,47 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
         return Ok(Applied::changed(format!("applied {key}: {summary}")));
     }
     Ok(Applied::changed(format!("applied {key}")))
+}
+
+/// The diff of a moved object, taken again.
+enum Replan {
+    /// The fields Buckle owns show the planned diff: the intent, rebased on
+    /// the object as it is now.
+    Same(Value),
+    /// The object moved again before the diff was taken.
+    MovedAgain,
+    /// The diff is not the one planned (or the object is gone).
+    Changed,
+}
+
+async fn replan(cx: &Context, key: &ObjectKey, path: &str, p: &Pending) -> Result<Replan> {
+    let Some(planned) = &p.planned else {
+        return Ok(Replan::Changed);
+    };
+    let Some(live) = cx.kube.get(path).await? else {
+        return Ok(Replan::Changed);
+    };
+    let mut intent = p.body.clone();
+    rebase(&mut intent, &p.ignore, &live);
+    let Some(mut diff) = owned_diff(cx, key, path, &live, &intent).await? else {
+        return Ok(Replan::MovedAgain);
+    };
+    // Ignored fields belong to another tool (an autoscaler's replicas): they
+    // may move freely, and the rebased intent keeps their new values.
+    adopt_all(&p.ignore, &mut diff.before, &planned.before);
+    adopt_all(&p.ignore, &mut diff.after, &planned.after);
+    Ok(if &diff == planned {
+        Replan::Same(intent)
+    } else {
+        Replan::Changed
+    })
+}
+
+fn moved(key: &ObjectKey) -> buckle_core::Error {
+    user(
+        format!("{key} changed in the cluster after it was planned."),
+        &["Plan again: the apply refuses to overwrite a change it has not shown."],
+    )
 }
 
 /// Polls `path` until `state` reports done, failed, or the rollout timeout;
