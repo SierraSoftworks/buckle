@@ -83,6 +83,12 @@ const POLL: Duration = Duration::from_secs(2);
 /// makes no progress within its `progress_deadline` well before this.
 pub const DEPLOYMENT_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// How long an apply waits on a blocked evaluation before it reports the
+/// job as unplaceable. A destructive update of a job with a static port
+/// blocks until the old allocation lets go of the port, usually within its
+/// `kill_timeout`.
+const PLACEMENT_GRACE: Duration = Duration::from_secs(300);
+
 /// The values the spec is rendered with: its declared vars, its files, and
 /// `pinned` over both.
 fn variables(spec: &JobSpec, pinned: &IndexMap<String, Value>) -> IndexMap<String, Value> {
@@ -394,24 +400,52 @@ pub async fn follow_deployment(
     let deadline = tokio::time::Instant::now() + timeout;
     let ns = &key.namespace;
     if !eval_id.is_empty() {
-        let url = with_query(&format!("/v1/evaluation/{}", seg(eval_id)), "namespace", ns);
+        let mut eval_id = eval_id.to_owned();
+        // A placement Nomad retries: why it failed, and when to stop waiting.
+        let mut unplaced: Option<(String, tokio::time::Instant)> = None;
+        let unplaceable = |why: &str| {
+            user(
+                format!("{key} could not be placed: {why}"),
+                &["Check the job's constraints and the cluster's free resources."],
+            )
+        };
         loop {
+            let url = with_query(
+                &format!("/v1/evaluation/{}", seg(&eval_id)),
+                "namespace",
+                ns,
+            );
             let eval = cx.nomad.get::<Value>(&url).await?.unwrap_or(Value::Null);
             match eval["Status"].as_str().unwrap_or("pending") {
                 "complete" => {
-                    if let Some(failed) =
-                        eval["FailedTGAllocs"].as_object().filter(|f| !f.is_empty())
+                    let Some(failed) = eval["FailedTGAllocs"].as_object().filter(|f| !f.is_empty())
+                    else {
+                        break;
+                    };
+                    let why = failed
+                        .iter()
+                        .map(|(g, m)| format!("{g}: {}", diff::placement_failure(m)))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    // Nomad blocks an evaluation it could not place and
+                    // retries it as capacity frees (a destructive update's
+                    // old allocation releasing a static port, say).
+                    let Some(blocked) = eval["BlockedEval"].as_str().filter(|b| !b.is_empty())
+                    else {
+                        return Err(unplaceable(&why));
+                    };
+                    (cx.progress)(&format!("{key}: waiting to be placed ({why})"));
+                    let since = unplaced.map_or_else(tokio::time::Instant::now, |(_, at)| at);
+                    unplaced = Some((why, since));
+                    eval_id = blocked.to_owned();
+                    continue;
+                }
+                "blocked" => {
+                    if let Some((why, since)) = &unplaced
+                        && since.elapsed() >= PLACEMENT_GRACE
                     {
-                        let reasons: Vec<String> = failed
-                            .iter()
-                            .map(|(g, m)| format!("{g}: {}", diff::placement_failure(m)))
-                            .collect();
-                        return Err(user(
-                            format!("{key} could not be placed: {}", reasons.join("; ")),
-                            &["Check the job's constraints and the cluster's free resources."],
-                        ));
+                        return Err(unplaceable(why));
                     }
-                    break;
                 }
                 "failed" | "canceled" | "cancelled" => {
                     return Err(system(
