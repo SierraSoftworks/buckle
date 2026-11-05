@@ -137,6 +137,17 @@ pub async fn run_with(
     let builder = source::RevisionBuilder::new(store.clone(), revisions.clone(), events.clone())
         .on_added(Arc::new(move |rec| notify.revision_added(&rec.id)));
     let mut tasks = Vec::new();
+    // Revisions an older server rejected may pass this one's validation;
+    // checked before the source is first polled, so a newer commit is
+    // never announced ahead of an older tip.
+    let revalidate = {
+        let builder = builder.clone();
+        async move {
+            if let Err(e) = builder.revalidate_stale().await {
+                tracing::warn!(error = %e, "rejected revisions could not be validated again");
+            }
+        }
+    };
     let mut trigger = None;
     let mut webhook_secret = None;
     if let Some(git) = &config.source.git {
@@ -149,12 +160,20 @@ pub async fn run_with(
         trigger = Some(watcher.trigger());
         webhook_secret = git.webhook_secret.clone();
         tracing::info!(url = %config::redact_url(&git.url), branch = %git.branch, "watching the Git source");
-        tasks.push(tokio::spawn(watcher.run(cancel.clone())));
+        let cancel = cancel.clone();
+        tasks.push(tokio::spawn(async move {
+            revalidate.await;
+            watcher.run(cancel).await
+        }));
     } else if let Some(path) = &config.source.path {
         tracing::info!(path = %path.display(), "watching the source directory");
         let watcher = source::path::PathWatcher::new(path.clone(), builder.clone())
             .with_lock(hooks.source_lock.clone());
-        tasks.push(tokio::spawn(watcher.run(cancel.clone())));
+        let cancel = cancel.clone();
+        tasks.push(tokio::spawn(async move {
+            revalidate.await;
+            watcher.run(cancel).await
+        }));
     } else {
         return Err(buckle_core::error::user(
             "server.yaml configures no source.",
@@ -266,6 +285,7 @@ pub async fn run_with(
     state.joins = joins;
     state.trace_url_template = config.telemetry.trace_url_template.clone();
     state.identity = Some(issuer);
+    state.builder = Some(builder);
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
     if let Some(listening) = &hooks.listening {
         listening.send_replace(Some(Listening {

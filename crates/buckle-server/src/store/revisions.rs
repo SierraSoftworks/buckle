@@ -23,6 +23,8 @@ pub struct RevisionRecord {
     pub module_count: u32,
     /// `git` or `path`.
     pub source: String,
+    /// The server version that validated it; `None` before this was recorded.
+    pub validated_by: Option<String>,
 }
 
 /// Repository over `revisions` and `revision_blobs`.
@@ -30,9 +32,9 @@ pub struct Revisions<'c> {
     conn: &'c Connection,
 }
 
-const COLUMNS: &str = "id, commit_id, author, message, committed_at, created_at, tarball_digest, status, errors, module_count, source";
+const COLUMNS: &str = "id, commit_id, author, message, committed_at, created_at, tarball_digest, status, errors, module_count, source, validated_by";
 
-fn row(r: &Row<'_>) -> rusqlite::Result<[Option<String>; 11]> {
+fn row(r: &Row<'_>) -> rusqlite::Result<[Option<String>; 12]> {
     Ok([
         r.get(0)?,
         r.get(1)?,
@@ -45,10 +47,11 @@ fn row(r: &Row<'_>) -> rusqlite::Result<[Option<String>; 11]> {
         r.get(8)?,
         r.get::<_, i64>(9).map(|n| Some(n.to_string()))?,
         r.get(10)?,
+        r.get(11)?,
     ])
 }
 
-fn into_record(c: [Option<String>; 11]) -> Result<RevisionRecord> {
+fn into_record(c: [Option<String>; 12]) -> Result<RevisionRecord> {
     let [
         id,
         commit,
@@ -61,6 +64,7 @@ fn into_record(c: [Option<String>; 11]) -> Result<RevisionRecord> {
         errors,
         modules,
         source,
+        validated_by,
     ] = c;
     Ok(RevisionRecord {
         id: id.unwrap_or_default(),
@@ -78,6 +82,7 @@ fn into_record(c: [Option<String>; 11]) -> Result<RevisionRecord> {
         errors: from_json(errors.as_deref().unwrap_or("[]"))?,
         module_count: modules.and_then(|m| m.parse().ok()).unwrap_or(0),
         source: source.unwrap_or_default(),
+        validated_by,
     })
 }
 
@@ -90,7 +95,7 @@ impl<'c> Revisions<'c> {
     pub fn upsert(&self, rev: &RevisionRecord) -> Result<()> {
         self.conn
             .execute(
-                &format!("INSERT OR REPLACE INTO revisions ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+                &format!("INSERT OR REPLACE INTO revisions ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
                 params![
                     rev.id,
                     rev.commit,
@@ -106,6 +111,7 @@ impl<'c> Revisions<'c> {
                     to_json(&rev.errors)?,
                     rev.module_count as i64,
                     rev.source,
+                    rev.validated_by,
                 ],
             )
             .map_err(db_error)?;
@@ -136,6 +142,22 @@ impl<'c> Revisions<'c> {
             .map_err(db_error)?;
         let rows = stmt
             .query_map(params![limit, offset], row)
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        rows.into_iter().map(into_record).collect()
+    }
+
+    /// Rejected revisions not validated by server `version`, newest first.
+    pub fn rejected_unless_validated_by(&self, version: &str) -> Result<Vec<RevisionRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM revisions WHERE status = 'rejected' AND validated_by IS NOT ?1 ORDER BY created_at DESC, rowid DESC"
+            ))
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![version], row)
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;

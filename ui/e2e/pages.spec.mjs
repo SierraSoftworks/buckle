@@ -76,7 +76,8 @@ describe("every page renders in demo mode", () => {
     assert.match(await items.first().textContent(), /support bundle/);
     // One control per card: [Running] for the rollout in progress, [Stable] for
     // the release the fleet is on, an orange Rollback for every older one, and
-    // [Corrupt] for a rejected commit, which cannot be deployed.
+    // [Corrupt] for a rejected commit, which cannot be deployed but can be
+    // validated again (a newer server may accept it).
     assert.equal(await items.first().locator(".marker", { hasText: "Running" }).count(), 1);
     assert.equal(await page.locator(".marker", { hasText: "Stable" }).count(), 1);
     const stable = page.locator(".gitlog__item--stable");
@@ -84,7 +85,9 @@ describe("every page renders in demo mode", () => {
     assert.equal(await page.getByRole("button", { name: "Rollback…", exact: true }).count(), 5);
     const rejected = page.locator(".gitlog__item--rejected");
     assert.equal(await rejected.locator(".marker", { hasText: "Corrupt" }).count(), 1);
-    assert.equal(await rejected.locator(".commit__aside .btn").count(), 0);
+    const aside = rejected.locator(".commit__aside .btn");
+    assert.equal(await aside.count(), 1);
+    assert.equal((await aside.textContent()).trim(), "Re-validate");
     // A skipped rollout links to the newer one that superseded it.
     const skipped = items.filter({ hasText: "superseded by" });
     assert.match(await skipped.textContent(), /skipped/);

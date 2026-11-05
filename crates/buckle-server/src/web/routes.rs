@@ -60,6 +60,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/revisions", web::get().to(revisions))
             .route("/revisions/{id}", web::get().to(revision))
             .route("/revisions/{id}/rollout", web::post().to(start_rollout))
+            .route("/revisions/{id}/validate", web::post().to(revalidate))
             .route("/rollouts", web::get().to(rollouts))
             .route("/rollouts/{id}", web::get().to(rollout))
             .route("/rollouts/{id}/plans", web::get().to(rollout_plans))
@@ -116,6 +117,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("GET", "/api/v1/revisions"),
     ("GET", "/api/v1/revisions/r"),
     ("POST", "/api/v1/revisions/r/rollout"),
+    ("POST", "/api/v1/revisions/r/validate"),
     ("GET", "/api/v1/rollouts"),
     ("GET", "/api/v1/rollouts/r"),
     ("GET", "/api/v1/rollouts/r/plans"),
@@ -1230,6 +1232,29 @@ async fn revision(state: Data, _: Authenticated, path: web::Path<String>) -> Api
         .call(move |db| db.revisions().get(&i2))
         .await?
         .ok_or_else(|| ApiError::not_found(format!("No revision '{id}'.")))?;
+    Ok(HttpResponse::Ok().json(revision_summary(&state, &rec).await?))
+}
+
+/// Validates a rejected revision again with this server's rules. The
+/// source's tip is announced when it becomes valid (an automatic rollout
+/// may start); an older revision only changes status.
+async fn revalidate(state: Data, _: Administrative, path: web::Path<String>) -> ApiResult {
+    let id = path.into_inner();
+    let builder = state
+        .builder
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict("This server builds no revisions.".to_owned()))?;
+    let i2 = id.clone();
+    if state
+        .store
+        .call(move |db| db.revisions().get(&i2))
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("No revision '{id}'.")));
+    }
+    let announce = builder.tip().await?.as_deref() == Some(id.as_str());
+    let rec = builder.revalidate(&id, announce).await?;
     Ok(HttpResponse::Ok().json(revision_summary(&state, &rec).await?))
 }
 

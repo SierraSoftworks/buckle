@@ -885,6 +885,7 @@ async fn sse_streams_controller_events() {
         errors: vec![],
         module_count: 0,
         source: "path".into(),
+        validated_by: None,
     };
     e.store
         .call(move |db| db.revisions().upsert(&rec))
@@ -1787,6 +1788,7 @@ async fn revision(e: &Env, id: &str, buckle_yaml: &str) {
         errors: vec![],
         module_count: 0,
         source: "path".into(),
+        validated_by: None,
     };
     e.store
         .call(move |db| db.revisions().upsert(&rec))
@@ -2490,4 +2492,61 @@ async fn the_identity_issuer_publishes_its_keys_without_sign_in() {
     let svc = test::init_service(app(none.state.clone())).await;
     let resp = test::call_service(&svc, get("/.well-known/jwks.json")).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no issuer, no keys");
+}
+
+#[actix_web::test]
+async fn admins_can_validate_a_rejected_revision_again() {
+    let e = env_with(
+        WebConfig {
+            admin_acl: acl("true"),
+            ..Default::default()
+        },
+        |s| {
+            s.builder = Some(crate::source::RevisionBuilder::new(
+                s.store.clone(),
+                s.revisions.clone(),
+                s.events.clone(),
+            ))
+        },
+    )
+    .await;
+    let dir = e.state.revisions.dir("r1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("buckle.yaml"), "version: 2\n").unwrap();
+    let rec = crate::store::RevisionRecord {
+        id: "r1".into(),
+        commit: "r1".into(),
+        author: "a".into(),
+        message: "rejected by an older server".into(),
+        committed_at: chrono::Utc::now(),
+        created_at: chrono::Utc::now(),
+        tarball_digest: None,
+        status: buckle_api::RevisionStatus::Rejected,
+        errors: vec!["unknown field".into()],
+        module_count: 0,
+        source: "git".into(),
+        validated_by: Some("0.0.1".into()),
+    };
+    e.store
+        .call(move |db| db.revisions().upsert(&rec))
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    for (id, want) in [("r1", StatusCode::OK), ("nope", StatusCode::NOT_FOUND)] {
+        let (cookie, token) = csrf(&app).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/revisions/{id}/validate"))
+                .cookie(cookie)
+                .insert_header((auth::CSRF_HEADER, token))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), want, "{id}");
+        if want == StatusCode::OK {
+            let body: buckle_api::RevisionSummary = test::read_body_json(resp).await;
+            assert_eq!(body.status, buckle_api::RevisionStatus::Valid);
+        }
+    }
 }

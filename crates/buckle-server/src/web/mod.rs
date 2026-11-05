@@ -56,6 +56,8 @@ pub struct AppState {
     pub trace_url_template: Option<String>,
     /// The identity issuer whose keys `/.well-known/` publishes.
     pub identity: Option<Arc<crate::identity::Issuer>>,
+    /// Builds revisions, so a rejected one can be validated again.
+    pub builder: Option<crate::source::RevisionBuilder>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -102,6 +104,7 @@ impl AppState {
             sse_recheck: std::time::Duration::from_secs(30),
             trace_url_template: None,
             identity: None,
+            builder: None,
         }
     }
 

@@ -277,6 +277,11 @@ ALTER TABLE hosts ADD COLUMN kind TEXT NOT NULL DEFAULT 'host';
 ALTER TABLE hosts ADD COLUMN cluster TEXT;
 CREATE INDEX hosts_kind ON hosts(kind);
 "#,
+    // 8: the server version that validated a revision, so a rejected one is
+    // validated again once the server is upgraded.
+    r#"
+ALTER TABLE revisions ADD COLUMN validated_by TEXT;
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.
