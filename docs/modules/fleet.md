@@ -203,7 +203,7 @@ Each phase:
 |---|---|---|
 | `name` | **required** | Unique; `stragglers` is reserved. |
 | `select` | **required** | A selector. A host belongs to the **first** phase whose selector matches it, and only that one. |
-| `parallel` | `1` | Hosts applied at once: a count, or a percentage of the phase's hosts (rounded up). |
+| `parallel` | `1` | Hosts applied at once: a count, or a percentage of the phase's hosts (rounded up). Targets whose plan changes nothing run alongside, outside the count. |
 | `approval` | `auto` | `required` stops for an operator to approve the phase's plans; `if_destructive` only when a plan removes or deletes something. |
 | `bake` | `health.bake` | The minimum time to watch health after each host applies. |
 | `max_failures` | `0` | Failed hosts tolerated (a count or a percentage) before the phase pauses. |

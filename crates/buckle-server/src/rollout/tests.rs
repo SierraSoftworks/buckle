@@ -82,6 +82,12 @@ struct Script {
     target_plan_error: Option<String>,
     /// Actions fail.
     action_fail: bool,
+    /// The agent's own plans change nothing (and so do its applies).
+    unchanged: bool,
+    /// Plans for a cluster target change these workloads (a real plan).
+    target_changes: Option<Vec<String>>,
+    /// Every health report for a cluster target has this workload failing.
+    failing_workload: Option<String>,
 }
 
 /// Report ids for the fake agents' durable action results.
@@ -321,13 +327,19 @@ impl Harness {
                             Some(d) if !p.target.is_empty() => d.clone(),
                             _ => s.digest.clone(),
                         },
+                        changes: match &s.target_changes {
+                            Some(w) if !p.target.is_empty() => w.len() as u32,
+                            _ => u32::from(!(s.unchanged && p.target.is_empty())),
+                        },
+                        plan_json: match &s.target_changes {
+                            Some(w) if !p.target.is_empty() => plan_json_changing(w),
+                            _ => b"{}".to_vec(),
+                        },
                         target: p.target.clone(),
                         revision: p.revision,
-                        changes: 1,
                         destructive: s.destructive,
                         removals: u32::from(s.destructive),
                         deferred_modules: s.deferred.clone(),
-                        plan_json: b"{}".to_vec(),
                         approval_digest: s.intent.clone(),
                         ..Default::default()
                     })),
@@ -363,20 +375,29 @@ impl Harness {
                             }));
                             continue;
                         }
+                        let check = |module: &str, fail: bool| pb::HealthResult {
+                            module: module.into(),
+                            check: "http".into(),
+                            kind: "http".into(),
+                            required: true,
+                            passed: !fail,
+                            reason: if fail { "503".into() } else { String::new() },
+                            ..Default::default()
+                        };
+                        let mut results = vec![check("web", fail)];
+                        if let Some(w) = s
+                            .failing_workload
+                            .as_deref()
+                            .filter(|_| !h.target.is_empty())
+                        {
+                            results.push(check(w, true));
+                        }
                         reply(AMsg::Health(HealthReport {
                             target: h.target.clone(),
                             scope: h.scope,
                             request_id: h.request_id,
                             revision: String::new(),
-                            results: vec![pb::HealthResult {
-                                module: "web".into(),
-                                check: "http".into(),
-                                kind: "http".into(),
-                                required: true,
-                                passed: !fail,
-                                reason: if fail { "503".into() } else { String::new() },
-                                ..Default::default()
-                            }],
+                            results,
                         }));
                     }
                     SMsg::Apply(mut a) => {
@@ -450,7 +471,11 @@ impl Harness {
                             continue;
                         }
                         let failed = s.apply_fail.clone();
-                        let changed = s.changed.clone().unwrap_or_else(|| vec!["web".into()]);
+                        let changed = if s.unchanged && a.target.is_empty() {
+                            vec![]
+                        } else {
+                            s.changed.clone().unwrap_or_else(|| vec!["web".into()])
+                        };
                         reply(AMsg::Result(ApplyResult {
                             target: a.target.clone(),
                             revision: a.revision.clone(),
@@ -690,6 +715,24 @@ impl Harness {
         })
         .await
     }
+}
+
+/// A plan's JSON changing one resource of each of `modules`.
+fn plan_json_changing(modules: &[String]) -> Vec<u8> {
+    let modules: Vec<_> = modules
+        .iter()
+        .map(|m| {
+            serde_json::json!({"module": m, "steps": [{
+                "task": {"module": m, "id": "job", "kind": "nomad.job"},
+                "resource": {"module": m, "kind": "nomad.job", "key": m},
+                "planned": {"outcome": "change", "diff": {"kind": "opaque", "summary": "update"}},
+            }]})
+        })
+        .collect();
+    serde_json::to_vec(
+        &serde_json::json!({"revision": "r1", "host": "c", "digest": "d", "modules": modules}),
+    )
+    .unwrap()
 }
 
 /// An agent's `ApplyOutcome` JSON for a run that changed `changed`.
@@ -4867,4 +4910,115 @@ async fn an_action_rollout_is_refused(#[case] busy: bool) {
         }
     );
     assert!(action_runs(&h).is_empty());
+}
+
+/// A target whose plan changes nothing is neither checked before its run
+/// nor gated after it: its health is not the rollout's doing.
+#[tokio::test(start_paused = true)]
+async fn an_unchanged_host_is_not_held_by_its_baseline_or_gate() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        TWO_PHASES.replace(", approval: required", "").as_str(),
+    )
+    .await;
+    h.enrol("c1", "canary").await;
+    h.enrol("w1", "web").await;
+    h.script("c1", |s| {
+        s.unchanged = true;
+        s.baseline_fail = true;
+        s.gate_fail = true;
+    });
+    h.connect("c1", None);
+    h.connect("w1", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    let checked = h.sent(|x, m| {
+        x == "c1"
+            && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Baseline as i32
+                || r.scope == HealthScope::Rollout as i32)
+    });
+    assert!(checked.is_empty(), "{checked:?}");
+}
+
+/// Targets with nothing to change run alongside a phase's waves without
+/// taking a slot of its `parallel`.
+#[tokio::test(start_paused = true)]
+async fn unchanged_targets_start_past_the_parallel_cap() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 1m }\n  phases:\n    - { name: web, select: 'host.groups contains \"web\"', parallel: 1 }\n",
+    )
+    .await;
+    for (w, unchanged) in [("w1", true), ("w2", false), ("w3", true), ("w4", false)] {
+        h.enrol(w, "web").await;
+        h.script(w, |s| {
+            s.unchanged = unchanged;
+            s.silent_apply = true;
+        });
+        h.connect(w, None);
+    }
+    let id = h.start("r1").await;
+    let applying = |hs: &[RolloutHostRecord]| {
+        hs.iter()
+            .filter(|x| x.state == HostPhase::Applying)
+            .map(|x| x.host.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    h.wait(&id, "three applying", |_, hs| applying(hs).len() == 3)
+        .await;
+    h.idle(60).await;
+    let (_, hosts) = h.snapshot(&id).await;
+    let running = applying(&hosts);
+    assert!(
+        running.contains("w1") && running.contains("w3") && running.len() == 3,
+        "both unchanged hosts and one changed one: {running:?}"
+    );
+}
+
+/// A cluster is gated only on the workloads this rollout changes: one
+/// already failing that it leaves alone (or a cluster it changes nothing
+/// on) does not hold it.
+#[rstest::rstest]
+#[case::unrelated_workload(vec!["postgres"], "other", false)]
+#[case::changed_workload(vec!["postgres"], "postgres", true)]
+#[case::nothing_changed(vec![], "postgres", false)]
+#[tokio::test(start_paused = true)]
+async fn a_cluster_is_gated_on_the_workloads_it_changes(
+    #[case] changes: Vec<&str>,
+    #[case] failing: &str,
+    #[case] held: bool,
+) {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, FLAT)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.script("n1", |s| {
+        s.target_changes = Some(changes.iter().map(|c| c.to_string()).collect());
+        s.failing_workload = Some(failing.into());
+    });
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "the cluster settles", |r, hs| {
+            r.state == RolloutState::Completed || host(hs, CLUSTER).state == HostPhase::Held
+        })
+        .await;
+    let state = host(&hosts, CLUSTER).state;
+    if held {
+        assert_eq!(state, HostPhase::Held);
+        assert!(
+            host(&hosts, CLUSTER)
+                .runtime
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains(failing)),
+            "{:?}",
+            host(&hosts, CLUSTER).runtime.error
+        );
+    } else {
+        assert_eq!(state, HostPhase::Healthy);
+    }
 }
