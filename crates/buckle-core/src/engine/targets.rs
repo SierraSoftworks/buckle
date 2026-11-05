@@ -186,6 +186,20 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
             ),
             _ => {}
         }
+        if let Some(kind) = cfg.cluster_kind() {
+            for (cluster, decl) in &revision.fleet.fleet.clusters {
+                if decl.kind != kind && selects(revision, w, cluster, decl) {
+                    report.error(
+                        Some(name),
+                        format!("{file} when"),
+                        format!(
+                            "selects the {} cluster '{cluster}', but its resources are for {kind} clusters; narrow `when` to `cluster.kind == \"{kind}\"`",
+                            decl.kind,
+                        ),
+                    );
+                }
+            }
+        }
         for duplicate in cfg.duplicates() {
             report.error(
                 Some(name),
@@ -462,6 +476,28 @@ fn validate_cluster(
     }
 }
 
+/// Whether `w`'s `when` selects the declared cluster `name`, with the labels
+/// buckle.yaml gives it (labels added through the API are not known here).
+fn selects(revision: &Revision, w: &LoadedWorkload, name: &str, decl: &ClusterDecl) -> bool {
+    let Some(when) = &w.config.when else {
+        return true;
+    };
+    let labels = decl
+        .labels
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone(), serde_json::to_value(v).ok()?)))
+        .collect();
+    let ctx = super::validate::cluster_context(
+        revision,
+        crate::selectors::HostIdentity {
+            id: name.to_owned(),
+            labels,
+        },
+        decl.kind,
+    );
+    ctx.in_module(&w.config.name, &w.config.tags).matches(when)
+}
+
 /// The names of the cluster targets a workload selects, given the contexts to
 /// decide against. Used by `buckle validate --facts` style dry runs and by
 /// tests; the server decides selection for real targets the same way.
@@ -493,6 +529,13 @@ fleet:
       nodes: 'host.groups contains \"nomad\"'
 secrets:
   TOKEN: { env: TOKEN }
+";
+
+    const MIXED_FLEET: &str = "version: 2
+fleet:
+  clusters:
+    home-nomad: { kind: nomad, nodes: 'true', labels: { site: home } }
+    lab: { kind: kubernetes, nodes: 'true', labels: { site: lab } }
 ";
 
     fn load(files: &[(&str, &str)]) -> Revision {
@@ -611,6 +654,14 @@ secrets:
         &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    c: { kind: kubernetes, cluster: p }\n")],
         "which is a nomad cluster"
     )]
+    #[case::nomad_workload_on_kubernetes(
+        &[("buckle.yaml", MIXED_FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
+        "selects the kubernetes cluster 'lab'"
+    )]
+    #[case::kubernetes_workload_by_label(
+        &[("buckle.yaml", MIXED_FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'cluster.labels.site == \"home\"'\nresources: [a.yaml]\n"), ("workloads/a/files/a.yaml", "")],
+        "selects the nomad cluster 'home-nomad'"
+    )]
     fn invalid_configurations_are_reported(#[case] files: &[(&str, &str)], #[case] needle: &str) {
         let errors = errors(files);
         assert!(
@@ -670,6 +721,19 @@ restart_on: [nomad/jobs/paste]
         let report = validate_targets(&rev);
         assert_eq!(report.errors, Vec::new(), "{report}");
         assert_eq!(report.warnings, Vec::new(), "{report}");
+    }
+
+    #[rstest]
+    #[case::by_kind("name: a\nwhen: 'cluster.kind == \"nomad\"'\nresources: [a.nomad.hcl]\n")]
+    #[case::by_label("name: a\nwhen: 'cluster.labels.site == \"home\"'\nresources: [a.nomad.hcl]\n")]
+    #[case::secrets_alone("name: a\nresources: [{ secret: s, items: { A: x } }]\n")]
+    fn workloads_narrowed_to_their_scheduler_are_valid(#[case] workload: &str) {
+        let errors = errors(&[
+            ("buckle.yaml", MIXED_FLEET),
+            ("workloads/a/workload.yaml", workload),
+            ("workloads/a/files/a.nomad.hcl", "job {}"),
+        ]);
+        assert_eq!(errors, Vec::<String>::new());
     }
 
     #[test]
