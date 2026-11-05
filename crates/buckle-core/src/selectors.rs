@@ -145,6 +145,9 @@ pub struct HostContext {
     pub secrets: Arc<SecretStore>,
     pub module: Option<ModuleScope>,
     pub task: Option<TaskScope>,
+    /// Collects what templates rendered in this context emit (see
+    /// [`crate::template::Emitted`]); `None` leaves renders untraced.
+    pub emitted: Option<Arc<crate::template::Emitted>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -231,6 +234,32 @@ impl HostContext {
         c
     }
 
+    /// A copy whose renders are traced into `emitted`.
+    pub fn with_emitted(mut self, emitted: Arc<crate::template::Emitted>) -> Self {
+        self.emitted = Some(emitted);
+        self
+    }
+
+    /// The host values a traced context's templates emitted, by path; `None`
+    /// when renders were not traced.
+    pub fn emitted_paths(&self) -> Option<Vec<String>> {
+        self.emitted.as_ref().map(|e| e.paths(self))
+    }
+
+    /// The target's string values by template path, as the fleet view names
+    /// them: `host.id`, `host.labels.site`, `host.facts.net.ipv4[0]` (always
+    /// under `host`, which is how the server reads every target's context).
+    pub fn host_leaves(&self) -> Vec<(String, String)> {
+        let host = serde_json::json!({
+            "id": self.host.id,
+            "labels": self.host.labels,
+            "facts": self.facts,
+        });
+        let mut out = Vec::new();
+        flatten_leaves("host", &host, &mut out);
+        out
+    }
+
     /// A copy scoped to a task within the current module.
     pub fn in_task(&self, kind: &str, id: &str, tags: &[String]) -> Self {
         let mut c = self.clone();
@@ -306,6 +335,33 @@ impl HostContext {
             root.insert("task".into(), serde_json::to_value(t).unwrap_or_default());
         }
         serde_json::Value::Object(root)
+    }
+}
+
+/// String leaves of `value` by template path. Keys that are not identifiers
+/// are written `["key"]`; buckle-api's fleet plan names paths the same way.
+fn flatten_leaves(path: &str, value: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    match value {
+        serde_json::Value::String(s) => out.push((path.to_owned(), s.clone())),
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let simple = !k.is_empty()
+                    && !k.starts_with(|c: char| c.is_ascii_digit())
+                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                let child = if simple {
+                    format!("{path}.{k}")
+                } else {
+                    format!("{path}[{}]", serde_json::Value::String(k.clone()))
+                };
+                flatten_leaves(&child, v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                flatten_leaves(&format!("{path}[{i}]"), v, out);
+            }
+        }
+        _ => {}
     }
 }
 

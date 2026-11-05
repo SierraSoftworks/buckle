@@ -179,6 +179,12 @@ pub struct Step {
     pub always_runs: bool,
     #[serde(default)]
     pub removal: RemovalPolicy,
+    /// The host values (`host.facts.net.fqdn`) the task's templates emitted
+    /// through expressions, so the fleet view marks only those as fact
+    /// placeholders; `None` when the task's renders were not traced. Not
+    /// part of the plan's digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,10 +513,44 @@ impl Plan {
             #[serde(skip_serializing_if = "<[Held]>::is_empty")]
             held: &'a [Held],
         }
+        // Which host values a step's text came from is display metadata:
+        // hosts with the same plan share a digest whatever their facts.
+        let traced = |m: &ModulePlan| m.steps.iter().any(|s| s.facts.is_some());
+        let untraced = |m: &ModulePlan| ModulePlan {
+            steps: m
+                .steps
+                .iter()
+                .map(|s| Step {
+                    facts: None,
+                    ..s.clone()
+                })
+                .collect(),
+            ..m.clone()
+        };
+        let modules: std::borrow::Cow<'_, [ModulePlan]> = if self.modules.iter().any(traced) {
+            self.modules.iter().map(untraced).collect()
+        } else {
+            (&self.modules[..]).into()
+        };
+        let deferred: std::borrow::Cow<'_, [Deferred]> = if self
+            .deferred
+            .iter()
+            .any(|d| d.preview.as_ref().is_some_and(traced))
+        {
+            self.deferred
+                .iter()
+                .map(|d| Deferred {
+                    preview: d.preview.as_ref().map(untraced),
+                    ..d.clone()
+                })
+                .collect()
+        } else {
+            (&self.deferred[..]).into()
+        };
         Digest::of_json(&Content {
-            modules: &self.modules,
+            modules: &modules,
             removals: &removals,
-            deferred: &self.deferred,
+            deferred: &deferred,
             indeterminate: &indeterminate,
             rehomed: &self.rehomed,
             held: &self.held,
@@ -616,6 +656,7 @@ mod tests {
             notifies: vec![],
             always_runs: false,
             removal: RemovalPolicy::Cleanup,
+            facts: None,
         }
     }
 
@@ -711,6 +752,27 @@ mod tests {
         });
         assert_ne!(base.intent_digest(), added.intent_digest());
         assert_ne!(base.intent_digest(), removing.intent_digest());
+    }
+
+    #[test]
+    fn traced_facts_do_not_split_the_digests() {
+        let untraced = one_step(update("u", "-a\n+seer"));
+        let mut traced = untraced.clone();
+        traced.modules[0].steps[0].facts = Some(vec!["host.id".into()]);
+        traced.deferred.push(Deferred {
+            module: "d".into(),
+            waiting_on: vec![],
+            reason: "r".into(),
+            preview: Some(traced.modules[0].clone()),
+        });
+        let mut deferred = untraced.clone();
+        deferred.deferred.push(Deferred {
+            preview: Some(untraced.modules[0].clone()),
+            ..traced.deferred[0].clone()
+        });
+        traced.modules[0].steps[0].facts = Some(vec!["host.facts.fqdn".into()]);
+        assert_eq!(traced.compute_digest(), deferred.compute_digest());
+        assert_eq!(traced.intent_digest(), deferred.intent_digest());
     }
 
     #[test]

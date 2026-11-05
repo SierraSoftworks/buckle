@@ -855,6 +855,7 @@ mod tests {
             notifies: vec![],
             always_runs: false,
             removal: RemovalPolicy::Cleanup,
+            facts: None,
         }
     }
 

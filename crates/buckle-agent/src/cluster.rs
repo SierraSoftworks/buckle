@@ -1648,6 +1648,7 @@ fn module_plan(
                 notifies: Vec::new(),
                 always_runs: false,
                 removal: RemovalPolicy::Cleanup,
+                facts: None,
             })
             .collect(),
         handlers: Vec::new(),

@@ -123,6 +123,12 @@ pub struct StepView {
     /// Runs on every apply (a command with no idempotency guard).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub always_runs: bool,
+    /// The host values (`host.facts.net.fqdn`) the step's templates emitted
+    /// through expressions: the only ones the fleet view replaces with fact
+    /// placeholders. `None` from agents that do not trace their renders,
+    /// where any varying host value is a candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<Vec<String>>,
 }
 
 impl StepView {
