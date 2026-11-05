@@ -216,11 +216,8 @@ fn row(
             </td>
             <td class="workloads__health">
                 <Meter {segments} total={w.placements.len()} rest="not applied" />
-                if state == WorkloadState::Failing || state == WorkloadState::Deploying {
-                    <span class="cell-sub">
-                        <Pill tone={state_tone(state)} label={state.label()} />
-                        { for reasons.first().map(|r| html! { <span class="muted">{ format!(" {r}") }</span> }) }
-                    </span>
+                if state == WorkloadState::Failing {
+                    { for reasons.first().map(|r| html! { <span class="cell-sub muted">{ r.clone() }</span> }) }
                 }
             </td>
             <td>

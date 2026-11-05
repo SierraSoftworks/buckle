@@ -378,6 +378,21 @@ $tones: (
     min-width: 3px;
     background: var(--tone, var(--neutral));
 
+    // Work in flight: a band of light sweeps along the segment.
+    &.tone-active {
+      position: relative;
+      overflow: hidden;
+
+      &::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.55), transparent);
+        transform: translateX(-100%);
+        animation: meter-sweep 1.6s ease-in-out infinite;
+      }
+    }
+
     &--rest {
       background: transparent;
     }
@@ -1248,6 +1263,12 @@ textarea.input {
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
+}
+
+@keyframes meter-sweep {
+  to {
+    transform: translateX(100%);
+  }
 }
 
 @keyframes pulse {

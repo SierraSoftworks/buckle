@@ -916,8 +916,15 @@
   text-decoration: none;
 }
 
+// The meter sits on the centre line of the row's first line of text.
 .workloads__health .meter {
   width: 120px;
+  margin-block: calc((1lh - 6px) / 2) 0.35rem;
+}
+
+// A card scrolled to by its anchor clears the sticky app bar.
+.panel[id] {
+  scroll-margin-top: calc(var(--bar-h) + 1rem);
 }
 
 .workload-summary {
