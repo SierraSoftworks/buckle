@@ -668,13 +668,14 @@ fn finished_state(s: HostRolloutState) -> bool {
 
 /// The hosts of a phase an approval concerns: before the first approval,
 /// every host not yet finished; after it, those whose plan changed since and
-/// those still without a plan.
+/// those still without a plan. Unchanged hosts count too: the approval gates
+/// the phase, not only its changes, and must cover every plan in it.
 fn approval_hosts(phase: &RolloutPhase) -> Vec<&RolloutHost> {
     let approved = phase.approved_by.is_some();
     phase
         .hosts
         .iter()
-        .filter(|h| !finished_state(h.state) && !units::unchanged(h))
+        .filter(|h| !finished_state(h.state))
         .filter(|h| !approved || h.needs_approval || h.plan_digest.is_none())
         .collect()
 }
@@ -1548,5 +1549,53 @@ fn unit_cell(h: &RolloutHost, target: Option<&HostSummary>, now: DateTime<Utc>) 
             </span>
         },
         None => html! { <HostLink id={h.host.clone()} host={target.cloned()} {now} /> },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn phase(hosts: &[(&str, u32)]) -> RolloutPhase {
+        serde_json::from_value(serde_json::json!({
+            "name": "prod", "state": "awaiting_approval", "parallel": "1", "approval": "required",
+            "bake_seconds": 60, "max_failures": "0", "virtual_stage": false,
+            "hosts": hosts.iter().map(|(h, changes)| serde_json::json!({
+                "host": h, "phase": "prod", "state": "planned", "updated_at": "2026-11-05T00:00:00Z",
+                "plan_digest": format!("d-{h}"), "plan_changes": changes, "plan_removals": 0,
+                "needs_approval": true,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    fn plans(p: &RolloutPhase) -> Vec<PlanGroup> {
+        p.hosts
+            .iter()
+            .map(|h| {
+                serde_json::from_value(serde_json::json!({
+                    "digest": h.plan_digest, "hosts": [h.host], "changes": h.plan_changes,
+                    "removals": 0, "destructive": false,
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// The approval gates the phase, so it binds every plan in it, including
+    /// those that change nothing (the server refuses one that leaves any out).
+    #[test]
+    fn an_approval_binds_unchanged_plans() {
+        for hosts in [&[("a", 0), ("b", 0)][..], &[("a", 0), ("b", 2)]] {
+            let p = phase(hosts);
+            let scope = scope_of(&p, &plans(&p));
+            assert_eq!(
+                scope.digests.len(),
+                hosts.len(),
+                "{hosts:?}: {:?}",
+                scope.digests
+            );
+            assert!(scope.without_plan.is_empty(), "{hosts:?}");
+        }
     }
 }
