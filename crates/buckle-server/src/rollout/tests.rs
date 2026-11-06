@@ -403,7 +403,8 @@ impl Harness {
                             workload: h.workload.clone(),
                             scope: h.scope,
                             request_id: h.request_id,
-                            revision: String::new(),
+                            // As an executor does: the revision it checked.
+                            revision: h.revision,
                             results,
                         }));
                     }
@@ -5527,6 +5528,49 @@ async fn a_removed_workload_is_a_placement_after_the_ones_that_needed_it() {
         ["app", "postgres"],
         "the dependent is removed first: {applies:?}"
     );
+    assert_eq!(applied_revision(&h, CLUSTER).await.as_deref(), Some("r2"));
+}
+
+/// A placement's bake checks the revision it applied, not the cluster's
+/// recorded one (still the previous revision until every placement
+/// converged), so the executor's reports count toward the bake.
+#[tokio::test(start_paused = true)]
+async fn a_placement_bakes_the_revision_it_applied() {
+    let bakes = |h: &Harness| -> Vec<String> {
+        h.sent(|_, m| {
+            targeted(m) == Some(CLUSTER)
+                && matches!(m, SMsg::Health(x) if x.scope == HealthScope::Bake as i32)
+        })
+        .into_iter()
+        .filter_map(|(_, _, m)| match m {
+            SMsg::Health(x) => Some(x.revision),
+            _ => None,
+        })
+        .collect()
+    };
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, TWO_WORKLOADS)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.connect("n1", None);
+    let first = h.start("r1").await;
+    h.wait_state(&first, RolloutState::Completed).await;
+    assert_eq!(applied_revision(&h, CLUSTER).await.as_deref(), Some("r1"));
+    let before = bakes(&h).len();
+
+    let mut files = TWO_WORKLOADS.to_vec();
+    files[3].1 = "job \"app\" { meta { v = 2 } }\n";
+    h.revision_with("r2", ONE_PHASE_ALL, NOMAD_CLUSTER, &files)
+        .await;
+    let id = h.start("r2").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    for w in ["postgres", "app"] {
+        let p = placement(&hosts, CLUSTER, w);
+        assert_eq!(p.state, HostPhase::Healthy, "{w}: {:?}", p.runtime.error);
+    }
+    let asked = bakes(&h).split_off(before);
+    assert!(!asked.is_empty());
+    assert!(asked.iter().all(|r| r == "r2"), "{asked:?}");
     assert_eq!(applied_revision(&h, CLUSTER).await.as_deref(), Some("r2"));
 }
 
