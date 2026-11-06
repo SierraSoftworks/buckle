@@ -369,6 +369,32 @@ fn module_row(
     }
 }
 
+#[derive(Properties, PartialEq)]
+struct StepOutputProps {
+    output: AttrValue,
+}
+
+/// What a step printed (a Nomad task action's stdout and stderr), behind a
+/// toggle: out of the DOM until opened.
+#[function_component(StepOutput)]
+fn step_output(props: &StepOutputProps) -> Html {
+    let open = use_state(|| false);
+    let lines = props.output.trim_end().lines().count();
+    let toggle = {
+        let open = open.clone();
+        Callback::from(move |_: MouseEvent| open.set(!*open))
+    };
+    html! {
+        <div class="run-step__output" data-testid="step-output">
+            <button type="button" class="run-step__output-toggle" aria-expanded={(*open).to_string()} onclick={toggle}>
+                { if *open { "Hide output" } else { "Show output" } }
+                <span class="muted">{ format!(" · {lines} line{}", if lines == 1 { "" } else { "s" }) }</span>
+            </button>
+            if *open { <pre class="run-step__output-text">{ secret_text(props.output.trim_end()) }</pre> }
+        </div>
+    }
+}
+
 fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool, caution: bool) -> Html {
     let slug = step_slug(s.state);
     let running = s.state == StepState::Running;
@@ -398,6 +424,9 @@ fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool, caution: bool) -> Ht
                 if let Some(result) = s.result.as_deref().filter(|t| !t.is_empty()) {
                     <p class="run-step__result">{ secret_text(result) }</p>
                 }
+                if let Some(output) = s.output.as_deref().filter(|t| !t.trim().is_empty()) {
+                    <StepOutput output={AttrValue::from(output.to_owned())} />
+                }
                 <ErrorBlock error={s.error.clone()} tone={error_tone(step_tone(s.state))} />
             </div>
             <span class="run-step__duration">{ took.unwrap_or_default() }</span>
@@ -416,6 +445,7 @@ fn removal_row(x: &RemovalReport, now: DateTime<Utc>, live: bool) -> Html {
         summary: x.summary.clone(),
         state: x.state,
         result: None,
+        output: None,
         diff: None,
         destructive: false,
         handler: false,

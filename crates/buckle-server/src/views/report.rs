@@ -124,6 +124,7 @@ fn bare_step(id: &str, kind: &str, handler: bool) -> StepReport {
         summary: id.to_owned(),
         state: StepState::Pending,
         result: None,
+        output: None,
         diff: None,
         destructive: false,
         handler,
@@ -449,6 +450,7 @@ fn apply_outcome(report: &mut RunReport, outcome: &ApplyOutcome) {
                     s.summary = so.summary.clone();
                 }
                 s.result = so.result.clone().or(s.result.take());
+                s.output = so.output.clone().or(s.output.take());
                 s.started_at = so.started_at.or(s.started_at);
                 s.finished_at = so.finished_at.or(s.finished_at);
                 s.duration_ms = so.duration_ms.or(s.duration_ms);
@@ -1121,6 +1123,7 @@ mod tests {
             summary: "s".into(),
             state,
             result: None,
+            output: None,
             started_at: Some(t(1)),
             finished_at: Some(t(2)),
             duration_ms: Some(1000),

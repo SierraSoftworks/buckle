@@ -2523,6 +2523,7 @@ fn demo_actions(host: &HostSummary, pending: bool) -> Vec<buckle_api::ActionInfo
                 description: Some(description.into()),
                 confirm,
                 implicit: false,
+                instances: None,
             }
         };
     if pending {
@@ -2559,6 +2560,20 @@ fn demo_actions(host: &HostSummary, pending: bool) -> Vec<buckle_api::ActionInfo
                     }
                 })
             })
+            // A Nomad task's `action` block, offered where its group runs
+            // several allocations.
+            .chain(std::iter::once(buckle_api::ActionInfo {
+                implicit: true,
+                instances: Some(buckle_api::ActionInstances::Any),
+                ..action(
+                    "postgresql",
+                    "vacuum",
+                    "vacuum",
+                    "nomad.action",
+                    false,
+                    "Runs `/usr/local/bin/vacuumdb --all --analyze` in task postgres of job postgresql.",
+                )
+            }))
             .collect();
     }
     vec![

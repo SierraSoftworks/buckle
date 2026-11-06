@@ -227,6 +227,37 @@ actions:
 `job` and `meta` are rendered with the workload's vars; `namespace` defaults to the
 workload's. An extra cannot take an implicit action's name, `notify` or `when`.
 
+### Nomad task actions
+
+Each `action` block in a workload's job specs is one more implicit action, named after the block,
+with nothing added to `workload.yaml`:
+
+```hcl
+task "auto-update" {
+  action "check-now" {
+    command = "/usr/bin/pkill"
+    args    = ["-HUP", "-f", "nomad-auto-update -namespace="]
+  }
+}
+```
+
+- **Names.** The label (`check-now`), or `task.label` where two tasks share a label or it is
+  already an implicit or declared action's name. The command line, when written as plain
+  strings, is the action's description.
+- **Allocations.** It runs in one running allocation of its group, or every one of a system job's.
+  Where the group may run several (a system job, or a `count` other than a literal 1) the run
+  dialog offers **One allocation** or **Every allocation**; every allocation runs in turn,
+  stopping at the first non-zero exit.
+- **Output.** Lines show on the step while it runs; the run keeps the last 64 KiB of stdout and
+  stderr, scrubbed of known secrets, under **Show output**. The executor checks the registered
+  job still defines the action first, so one a revision adds runs once that revision is applied.
+- **Access.** Actions run with the executor's `deploy` identity, which needs `alloc-exec` in the
+  job's namespace (`policy = "write"` grants it), and `alloc-node-exec` as well for `raw_exec`
+  tasks.
+
+Specs are read as written: an action inside a `dynamic` block, or in a `.j2` spec whose template
+syntax is not HCL, is not offered.
+
 ## Secrets
 
 A job spec or manifest is stored by the scheduler in clear, so `buckle validate` rejects one that

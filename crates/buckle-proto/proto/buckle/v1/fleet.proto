@@ -429,6 +429,9 @@ message RunAction {
   // With `target`: the one workload placement this concerns. Empty: the
   // whole cluster.
   string workload = 7;
+  // Which of the workload's instances it runs in, for an action offering
+  // the choice (a Nomad task action): "any" or "all". Empty: its default.
+  string instances = 8;
 }
 
 // The host's record changed while it is connected (approved, paused,

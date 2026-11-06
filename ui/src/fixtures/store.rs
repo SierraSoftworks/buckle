@@ -337,6 +337,7 @@ pub fn run_action(
     module: &str,
     action: &str,
     note: &str,
+    instances: Option<buckle_api::ActionInstances>,
 ) -> Result<buckle_api::ActionStarted, ApiError> {
     admin()?;
     with(|s| {
@@ -360,7 +361,12 @@ pub fn run_action(
             buckle_api::TargetKind::Host => "host",
             buckle_api::TargetKind::Cluster | buckle_api::TargetKind::Workload => "target",
         };
-        let ran = format!("{} ran {module}/{action} on {id}", actor());
+        let place = match instances.filter(|_| info.instances.is_some()) {
+            Some(buckle_api::ActionInstances::All) => " (every instance)",
+            Some(buckle_api::ActionInstances::Any) => " (one instance)",
+            None => "",
+        };
+        let ran = format!("{} ran {module}/{action} on {id}{place}", actor());
         s.record(
             &actor(),
             &format!("{noun}.action.run"),
@@ -703,6 +709,7 @@ pub fn start_action_rollout(
             action: body.action.clone(),
             label: found.action.label.clone(),
             selector: body.selector.clone(),
+            instances: body.instances,
         });
         detail.summary.state = RolloutState::Rolling;
         detail.summary.triggered_by = actor();

@@ -62,6 +62,7 @@ similar = "3.2.1"
 thiserror = "2.0.21"
 tokio = { version = "1.50", features = ["macros", "rt", "rt-multi-thread", "fs", "sync", "time", "process", "signal", "io-util", "net"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = { version = "0.1.44", features = ["log"] }
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", features = ["opentelemetry", "testing"] }

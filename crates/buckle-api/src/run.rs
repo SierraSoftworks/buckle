@@ -114,6 +114,10 @@ pub struct StepReport {
     /// What applying it reported, when it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// What it printed, where it ran a command (a Nomad task action): the
+    /// tail of stdout and stderr, scrubbed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<DiffKind>,
     #[serde(default)]
@@ -367,6 +371,7 @@ mod tests {
             summary: format!("copy {id}"),
             state,
             result: None,
+            output: None,
             diff: Some(DiffKind::Update),
             destructive: false,
             handler: false,

@@ -962,6 +962,7 @@ mod tests {
             summary: "run `mkswap /swap`".into(),
             state: StepState::Failed,
             result: None,
+            output: None,
             started_at: None,
             finished_at: None,
             duration_ms: Some(30),

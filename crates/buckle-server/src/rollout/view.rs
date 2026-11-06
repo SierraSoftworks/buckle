@@ -182,6 +182,7 @@ pub fn summary(record: &RolloutRecord, hosts: &[RolloutHostRecord]) -> RolloutSu
                 action: a.action.clone(),
                 label: a.label.clone(),
                 selector: a.selector.clone(),
+                instances: a.instances,
             }),
         changes: None,
     }

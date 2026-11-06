@@ -9,6 +9,7 @@ use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
+use super::actions::InstancesPicker;
 use super::split_button::{MenuItem, SplitButton};
 use super::{Confirm, use_toast};
 use crate::api;
@@ -88,6 +89,7 @@ pub fn run_action(props: &RunActionProps) -> Html {
                     workload: false,
                     selector: (!selector.is_empty()).then_some(selector),
                     note,
+                    instances: None,
                 },
                 f.action.label.clone(),
                 (busy, error, toast, navigator),
@@ -178,6 +180,7 @@ pub fn workload_rollout(props: &WorkloadRolloutProps) -> Html {
     let offered = use_fetch((), |_| async { api::fleet_actions("").await });
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
+    let chosen = use_state(|| props.action.instances);
     let (workload, action) = (props.workload.clone(), props.action.clone());
     let found = offered.data.as_ref().and_then(|d| {
         d.1.iter()
@@ -188,7 +191,7 @@ pub fn workload_rollout(props: &WorkloadRolloutProps) -> Html {
     let on_confirm = {
         let (busy, error, toast, found) =
             (busy.clone(), error.clone(), toast.clone(), found.clone());
-        let (workload, action) = (workload.clone(), action.clone());
+        let (workload, action, instances) = (workload.clone(), action.clone(), *chosen);
         Callback::from(move |note: String| {
             if found.is_none() {
                 error.set(Some(format!(
@@ -204,6 +207,7 @@ pub fn workload_rollout(props: &WorkloadRolloutProps) -> Html {
                     workload: true,
                     selector: None,
                     note,
+                    instances,
                 },
                 format!("{} of {workload}", action.label),
                 (
@@ -234,6 +238,12 @@ pub fn workload_rollout(props: &WorkloadRolloutProps) -> Html {
                 <span class="badge">{ action.kind.clone() }</span>
             </p>
             if let Some(d) = &action.description { <p>{ d.clone() }</p> }
+            if let Some(value) = *chosen {
+                <InstancesPicker {value} on_change={{
+                    let chosen = chosen.clone();
+                    Callback::from(move |v| chosen.set(Some(v)))
+                }} />
+            }
             { match &found {
                 Some(f) => html! { <p class="muted small" data-testid="workload-rollout-targets">{ format!("Runs on {}", f.targets.join(", ")) }</p> },
                 None if !offered.loading => html! { <p class="muted">{ "No cluster running it offers this action now: its clusters must be active, with an applied revision." }</p> },

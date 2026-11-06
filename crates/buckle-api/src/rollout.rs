@@ -289,6 +289,9 @@ pub struct RolloutActionInfo {
     /// The selector the targets were picked by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
+    /// Where each target runs it, when the operator picked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<crate::ActionInstances>,
 }
 
 /// `POST /api/v1/rollouts`: run an action on every target offering it (that
@@ -308,6 +311,10 @@ pub struct StartActionRollout {
     /// Required when the action asks for confirmation.
     #[serde(default)]
     pub note: String,
+    /// Where each target runs it, for an action offering the choice
+    /// ([`crate::ActionInfo::instances`]); absent: its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<crate::ActionInstances>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +398,18 @@ pub struct ContinueRequest {
 pub struct ActionRequest {
     #[serde(default)]
     pub note: String,
+}
+
+/// `POST /api/v1/targets/{id}/actions/{module}/{action}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunActionRequest {
+    /// Required when the action asks for confirmation.
+    #[serde(default)]
+    pub note: String,
+    /// Where an action offering the choice ([`crate::ActionInfo::instances`])
+    /// runs; absent: its default. Ignored by other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<crate::ActionInstances>,
 }
 
 /// `POST /api/v1/targets/{id}/steward`: move a cluster's lease to `host`.

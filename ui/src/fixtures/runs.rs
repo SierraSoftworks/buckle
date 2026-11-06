@@ -72,6 +72,7 @@ fn step(
         summary: summary.into(),
         state,
         result: result.map(Into::into),
+        output: None,
         diff: None,
         destructive: false,
         handler: false,

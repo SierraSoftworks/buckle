@@ -1,12 +1,14 @@
 //! Operator actions a target offers, from the revision it runs: a host's
 //! selected modules' `actions:`, a cluster's selected workloads' implicit
-//! actions and their own. The controller runs one ([`crate::rollout::Command::RunAction`]).
+//! actions (with their Nomad jobs' task `action` blocks) and their own.
+//! The controller runs one ([`crate::rollout::Command::RunAction`]).
 
 use crate::store::HostRecord;
 use buckle_api::{ActionInfo, TargetKind};
 use buckle_core::engine::Revision;
 
-/// The actions `record` offers at `revision`, in module order.
+/// The actions `record` offers at `revision`, in module order: a
+/// workload's implicit actions, then its jobs' task actions, then its own.
 pub fn list(
     revision: &Revision,
     record: &HostRecord,
@@ -28,6 +30,7 @@ pub fn list(
                         description: decl.description.clone(),
                         confirm: decl.confirm,
                         implicit: false,
+                        instances: None,
                     })
                 })
                 .collect()
@@ -48,6 +51,27 @@ pub fn list(
                             description: Some(i.description.to_owned()),
                             confirm: i.confirm,
                             implicit: true,
+                            instances: None,
+                        }
+                    });
+                    let task = w.task_actions.iter().map({
+                        let module = module.clone();
+                        move |t| ActionInfo {
+                            module: module.clone(),
+                            name: t.name.clone(),
+                            label: t.name.clone(),
+                            kind: buckle_core::engine::task_actions::KIND.to_owned(),
+                            description: Some(t.description()),
+                            confirm: false,
+                            implicit: true,
+                            instances: t.choice.then_some(match t.instances {
+                                buckle_core::engine::task_actions::Instances::Any => {
+                                    buckle_api::ActionInstances::Any
+                                }
+                                buckle_core::engine::task_actions::Instances::All => {
+                                    buckle_api::ActionInstances::All
+                                }
+                            }),
                         }
                     });
                     let extra = w.config.actions.iter().map(move |(name, decl)| ActionInfo {
@@ -58,8 +82,9 @@ pub fn list(
                         description: decl.description.clone(),
                         confirm: decl.confirm,
                         implicit: false,
+                        instances: None,
                     });
-                    implicit.chain(extra).collect::<Vec<_>>()
+                    implicit.chain(task).chain(extra).collect::<Vec<_>>()
                 })
                 .collect()
         }

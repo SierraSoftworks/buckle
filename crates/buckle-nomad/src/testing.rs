@@ -34,6 +34,11 @@ struct State {
     tokens: Vec<String>,
     /// The JWTs presented to `/v1/acl/login`.
     logins: Vec<String>,
+    /// Running allocations per job (default one), named `alloc-1`, ….
+    allocs: BTreeMap<(String, String), usize>,
+    /// How task actions end, by action name: output and exit code
+    /// (default: `ran <action> in <alloc>`, 0).
+    task_actions: BTreeMap<String, (String, i64)>,
 }
 
 /// The fake. Cheap to clone; clones share state.
@@ -104,6 +109,24 @@ impl FakeNomad {
         s.index += 1;
         drop(s);
         self.changed.notify_waiters();
+    }
+
+    /// Runs `n` allocations of job `ns`/`id` (one by default).
+    pub fn allocations(&self, ns: &str, id: &str, n: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .allocs
+            .insert((ns.into(), id.into()), n);
+    }
+
+    /// Makes task action `action` print `output` and exit with `code`.
+    pub fn task_action(&self, action: &str, output: &str, code: i64) {
+        self.state
+            .lock()
+            .unwrap()
+            .task_actions
+            .insert(action.into(), (output.into(), code));
     }
 
     /// A stored job, as `GET /v1/job/:id` returns it.
@@ -410,11 +433,23 @@ impl FakeNomad {
                 None => (200, Value::Null),
             },
             ("GET", ["job", id, "allocations"]) => {
+                let n = s
+                    .allocs
+                    .get(&(ns.clone(), (*id).to_owned()))
+                    .copied()
+                    .unwrap_or(1);
                 match s.jobs.get(&(ns.clone(), (*id).to_owned())) {
-                    Some(j) if j["Stop"] != json!(true) => (
-                        200,
-                        json!([{"ID": "alloc-1", "TaskGroup": "api", "JobVersion": j["Version"], "DesiredStatus": "run", "ClientStatus": "running"}]),
-                    ),
+                    Some(j) if j["Stop"] != json!(true) => {
+                        let group = j["TaskGroups"][0]["Name"].as_str().unwrap_or("api");
+                        (
+                            200,
+                            Value::Array(
+                                (1..=n)
+                                    .map(|i| json!({"ID": format!("alloc-{i}"), "TaskGroup": group, "JobVersion": j["Version"], "DesiredStatus": "run", "ClientStatus": "running"}))
+                                    .collect(),
+                            ),
+                        )
+                    }
                     _ => (200, json!([])),
                 }
             }
@@ -562,8 +597,79 @@ impl FakeNomad {
     }
 }
 
+/// A task action's socket: the frames the fake answers with, in order.
+struct FakeSocket {
+    frames: std::collections::VecDeque<String>,
+}
+
+#[async_trait]
+impl crate::transport::Socket for FakeSocket {
+    async fn send(&mut self, _text: String) -> buckle_core::Result<()> {
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> buckle_core::Result<Option<String>> {
+        Ok(self.frames.pop_front())
+    }
+}
+
 #[async_trait]
 impl Transport for FakeNomad {
+    /// `GET /v1/job/:id/action`: the action's output on stdout (base64, as
+    /// Nomad frames it), then its exit; a 404 for an unknown job or an
+    /// allocation it does not run.
+    async fn socket(
+        &self,
+        request: Request,
+    ) -> buckle_core::Result<Box<dyn crate::transport::Socket>> {
+        use base64::Engine as _;
+        tokio::task::yield_now().await;
+        let mut s = self.state.lock().unwrap();
+        s.requests.push(("WS".into(), request.path.clone()));
+        let ns = query_value(&request.path, "namespace").unwrap_or_else(|| "default".into());
+        let action = query_value(&request.path, "action").unwrap_or_default();
+        let alloc = query_value(&request.path, "allocID").unwrap_or_default();
+        let id = request
+            .path
+            .split('?')
+            .next()
+            .and_then(|p| p.strip_prefix("/v1/job/"))
+            .and_then(|p| p.strip_suffix("/action"))
+            .map(|p| {
+                percent_encoding::percent_decode_str(p)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
+        let runs = s
+            .allocs
+            .get(&(ns.clone(), id.clone()))
+            .copied()
+            .unwrap_or(1);
+        let known = s.jobs.contains_key(&(ns, id.clone()))
+            && (1..=runs).any(|i| alloc == format!("alloc-{i}"));
+        if !known {
+            return Err(buckle_core::error::user(
+                format!("Nomad refused the WebSocket (404): job {id} runs no allocation {alloc}"),
+                &[],
+            ));
+        }
+        let (output, code) = s
+            .task_actions
+            .get(&action)
+            .cloned()
+            .unwrap_or_else(|| (format!("ran {action} in {alloc}\n"), 0));
+        let data = base64::engine::general_purpose::STANDARD.encode(output);
+        Ok(Box::new(FakeSocket {
+            frames: [
+                json!({"stdout": {"data": data}}).to_string(),
+                "{}".to_owned(),
+                json!({"exited": true, "result": {"exit_code": code}}).to_string(),
+            ]
+            .into(),
+        }))
+    }
+
     async fn send(&self, request: Request) -> buckle_core::Result<Response> {
         // Let concurrent callers interleave, as they would over a network.
         tokio::task::yield_now().await;

@@ -915,6 +915,7 @@ pub(crate) mod tests {
             summary: format!("copy {id}"),
             state,
             result: None,
+            output: None,
             diff: None,
             destructive: false,
             handler: false,

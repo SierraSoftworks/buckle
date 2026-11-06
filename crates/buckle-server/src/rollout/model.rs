@@ -228,6 +228,9 @@ pub struct RolloutAction {
     /// The selector the targets were picked by, as the operator wrote it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
+    /// Where each target runs it, for an action offering the choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<buckle_api::ActionInstances>,
 }
 
 impl RolloutAction {
@@ -239,9 +242,11 @@ impl RolloutAction {
     /// What every target's "plan" is: one digest, so one approval covers
     /// the phase.
     pub fn digest(&self) -> String {
-        buckle_core::Digest::of(format!("action:{}", self.key()).as_bytes())
-            .as_str()
-            .to_owned()
+        let key = match self.instances {
+            Some(i) => format!("action:{}@{}", self.key(), i.as_str()),
+            None => format!("action:{}", self.key()),
+        };
+        buckle_core::Digest::of(key.as_bytes()).as_str().to_owned()
     }
 }
 

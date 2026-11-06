@@ -424,6 +424,38 @@
     }
   }
 
+  &__output {
+    margin: 0.2rem 0 0;
+  }
+
+  &__output-toggle {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--info);
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+
+  &__output-text {
+    max-height: 24rem;
+    margin: 0.25rem 0 0;
+    padding: 0.4rem 0.55rem;
+    overflow: auto;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--fg);
+    font-size: 0.78rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
   &__duration {
     color: var(--fg-2);
     font-size: 0.78rem;

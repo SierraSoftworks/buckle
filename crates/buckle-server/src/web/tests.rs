@@ -2843,7 +2843,10 @@ async fn admins_run_the_actions_a_host_offers_with_notes_audited() {
             .uri(&format!("/api/v1/hosts/{host}/actions/web/{action}"))
             .cookie(cookie.clone())
             .insert_header((auth::CSRF_HEADER, token.clone()))
-            .set_json(buckle_api::ActionRequest { note: note.into() })
+            .set_json(buckle_api::RunActionRequest {
+                note: note.into(),
+                ..Default::default()
+            })
             .to_request()
     };
 
@@ -2984,6 +2987,7 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
                 workload,
                 selector: Some(selector.into()),
                 note: note.into(),
+                ..Default::default()
             })
             .to_request()
     };
@@ -3016,6 +3020,84 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
 
 /// A `workload.*` selector sees a cluster's actions as its workloads'
 /// placements: it offers the matching workload's actions only.
+/// A workload's jobs' task `action` blocks are offered as its implicit
+/// actions, with the choice of allocations where the group may run several.
+#[actix_web::test]
+async fn task_action_blocks_are_offered_as_workload_actions() {
+    let e = env(WebConfig::default()).await;
+    revision(
+        &e,
+        "r1",
+        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.labels.nomad == true'\n",
+    )
+    .await;
+    let dir = e.state.revisions.dir("r1");
+    let w = dir.join("workloads/otelcol/files");
+    std::fs::create_dir_all(&w).unwrap();
+    std::fs::write(
+        w.join("otelcol.nomad.hcl"),
+        r#"job "otelcol" {
+  type = "system"
+  group "otelcol" {
+    task "otelcol" {
+      action "reload-config" {
+        command = "/bin/kill"
+        args    = ["-HUP", "1"]
+      }
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("workloads/otelcol/workload.yaml"),
+        "name: otelcol\nresources: [otelcol.nomad.hcl]\n",
+    )
+    .unwrap();
+    e.store
+        .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "r1"))
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/fleet").to_request(),
+    )
+    .await;
+    e.store
+        .call(|db| db.hosts().set_applied_revision("home-nomad", "r1"))
+        .await
+        .unwrap();
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/actions").to_request(),
+    )
+    .await;
+    let actions: Vec<buckle_api::FleetAction> = test::read_body_json(resp).await;
+    let reload = actions
+        .iter()
+        .find(|a| a.action.name == "reload-config")
+        .unwrap_or_else(|| panic!("{actions:?}"));
+    assert!(reload.workload && reload.action.implicit && !reload.action.confirm);
+    assert_eq!(reload.action.kind, "nomad.action");
+    assert_eq!(
+        reload.action.instances,
+        Some(buckle_api::ActionInstances::All),
+        "a system job's action runs everywhere unless picked"
+    );
+    assert!(
+        reload
+            .action
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("/bin/kill -HUP 1")
+    );
+    assert_eq!(reload.targets, vec!["home-nomad"]);
+}
+
 #[actix_web::test]
 async fn workload_selectors_pick_the_placements_offering_an_action() {
     let e = env(WebConfig::default()).await;
