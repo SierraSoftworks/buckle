@@ -357,8 +357,9 @@ session cookie or behind the same ACLs. Useful endpoints:
 |---|---|
 | `GET /api/v1/fleet` | Every host with its status, health and applied revision. |
 | `GET /api/v1/rollouts`, `GET /api/v1/rollouts/{id}` | Rollouts with their phases, hosts and timeline. |
-| `POST /api/v1/rollouts/{id}/approve` and `…/pause`, `…/resume`, `…/retry`, `…/skip-bake`, `…/rollback`, `…/abort` | Rollout decisions (admin, CSRF-protected, audited). |
-| `POST /api/v1/rollouts/{id}/hosts/{host}/retry`, `…/skip-bake`, `…/force`, `…/skip`, `…/continue` | Host decisions within a rollout (admin, CSRF-protected, audited). |
+| `POST /api/v1/rollouts/{id}/approve` and `…/pause`, `…/resume`, `…/retry`, `…/expedite`, `…/rollback`, `…/abort` | Rollout decisions (admin, CSRF-protected, audited). |
+| `POST /api/v1/rollouts/{id}/hosts/{host}/retry`, `…/expedite`, `…/force`, `…/skip`, `…/continue` | Host decisions within a rollout (admin, CSRF-protected, audited). |
+| `POST /api/v1/rollouts/{id}/phases/{phase}/expedite` | End the bake of every baking host in one phase (admin, CSRF-protected, audited). |
 | `POST /api/v1/targets/{id}/steward` | Moves a cluster's lease to the host in the body (`{"host": …, "note": …}`), which must qualify now (admin, CSRF-protected, audited). |
 | `POST /api/v1/targets/{id}/drift` | Asks a host, or a cluster's steward, to check for drift now; a body of `{"workload": …}` checks one placement (admin, CSRF-protected, audited). Needs agents that announce `check_drift`. |
 | `GET /api/v1/catalog` | The task kinds, fact providers and health checks this server knows, with their JSON schemas. |

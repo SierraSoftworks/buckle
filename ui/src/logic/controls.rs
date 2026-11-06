@@ -67,7 +67,7 @@ pub enum Decision {
     /// rollout that paused with failed hosts).
     SkipPhase,
     /// Count the baking hosts as baked now.
-    SkipBake,
+    Expedite,
     Rollback,
     Abort,
 }
@@ -81,7 +81,7 @@ impl Decision {
             Decision::Resume => "Resume".into(),
             Decision::Retry => "Retry".into(),
             Decision::SkipPhase => "Skip this phase…".into(),
-            Decision::SkipBake => "Skip bake period…".into(),
+            Decision::Expedite => "Expedite…".into(),
             Decision::Rollback => "Roll back…".into(),
             Decision::Abort => "Abort…".into(),
         }
@@ -134,7 +134,7 @@ pub fn decisions(state: RolloutState, approve: Option<&str>, hosts: Standing) ->
         .chain(hold.iter().cloned())
         .collect();
     if hosts.baking > 0 && state != RolloutState::RollingBack {
-        all.push(Decision::SkipBake);
+        all.push(Decision::Expedite);
     }
     if state == RolloutState::AwaitingApproval {
         all.push(Decision::Reject);
@@ -412,10 +412,10 @@ mod tests {
             (RolloutState::RollingBack, false),
         ] {
             let d = decisions(state, None, baking).unwrap();
-            assert_eq!(d.menu.contains(&SkipBake), offered, "{state:?}");
+            assert_eq!(d.menu.contains(&Expedite), offered, "{state:?}");
         }
         let d = decisions(RolloutState::Baking, None, Standing::default()).unwrap();
-        assert!(!d.menu.contains(&SkipBake));
+        assert!(!d.menu.contains(&Expedite));
     }
 
     #[test]

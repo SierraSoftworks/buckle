@@ -62,6 +62,8 @@ pub(crate) enum Ask {
     /// A rollout action (the API's), or `skip-phase`: resuming past failures.
     Action(&'static str),
     Host(&'static str, String),
+    /// A phase's action (`expedite`) and the phase.
+    Phase(&'static str, String),
     Continue(String, Vec<String>),
 }
 
@@ -468,6 +470,10 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
                         .await,
                         format!("{host}: {action} sent."),
                     ),
+                    Ask::Phase(action, phase) => (
+                        api::rollout_phase_action(&id, phase, action, &note).await,
+                        format!("{phase}: {action} sent."),
+                    ),
                     Ask::Continue(host, checks) => (
                         api::continue_host(
                             &id,
@@ -586,7 +592,7 @@ fn ask_for(d: &Decision) -> Ask {
         Decision::Resume => Ask::Action("resume"),
         Decision::Retry => Ask::Action("retry"),
         Decision::SkipPhase => Ask::Action("skip-phase"),
-        Decision::SkipBake => Ask::Action("skip-bake"),
+        Decision::Expedite => Ask::Action("expedite"),
         Decision::Rollback => Ask::Action("rollback"),
         Decision::Abort => Ask::Action("abort"),
     }
@@ -963,7 +969,7 @@ fn dialog(
                 "skip-phase" => ("Skip this phase of", "Skip this phase", true, format!(
                     "Accepts {} in {phase} as failures and carries on to the next phase without them. They stay failed in this rollout until retried from their rows.",
                     count(failed.len(), "failed host", "failed hosts")), None),
-                "skip-bake" => ("Skip the bake of", "Skip bake period", true, format!(
+                "expedite" => ("Expedite", "Expedite rollout", true, format!(
                     "Counts {} ({}) as baked now, without waiting out the rest of the bake window. A host whose checks are failing keeps baking.",
                     count(baking.len(), "baking host", "baking hosts"), baking.join(", ")), None),
                 "rollback" => ("Roll back", "Roll back", true, format!(
@@ -992,8 +998,8 @@ fn dialog(
                     false,
                     "Plans the host again as it stands. A host that failed, was held or skipped is then re-applied with the same checks; one still waiting to apply keeps its place and its plan asks for approval again if it changed.",
                 ),
-                "skip-bake" => (
-                    "Skip the bake of",
+                "expedite" => (
+                    "Expedite",
                     true,
                     "Counts the host as baked now, without waiting out the rest of its bake window. Refused while one of its checks is failing.",
                 ),
@@ -1013,15 +1019,30 @@ fn dialog(
                     "Excludes the host from this rollout; it converges later as a straggler or with the next rollout.",
                 ),
             };
-            let confirm_label = match *action {
-                "skip-bake" => "Skip bake period".to_string(),
-                _ => format!("{label} {host}"),
-            };
+            let confirm_label = format!("{label} {host}");
             html! {
                 <Confirm title={format!("{label} {host}")} {confirm_label} {danger} note=true
                     note_placeholder={if *action == "skip" { "Reason (recorded with the skip)" } else { "" }}
                     {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
                     <p>{ body }</p>
+                </Confirm>
+            }
+        }
+        Ask::Phase(_, phase) => {
+            let baking: Vec<String> = d
+                .phases
+                .iter()
+                .filter(|p| p.name == *phase)
+                .flat_map(|p| &p.hosts)
+                .filter(|h| h.state == HostRolloutState::Baking)
+                .map(units::key)
+                .collect();
+            html! {
+                <Confirm title={format!("Expedite {phase}")} confirm_label={format!("Expedite {phase}")} danger=true note=true
+                    {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                    <p>{ format!(
+                        "Counts {} in {phase} ({}) as baked now, without waiting out the rest of their bake windows. A host whose checks are failing keeps baking.",
+                        count(baking.len(), "baking host", "baking hosts"), baking.join(", ")) }</p>
                 </Confirm>
             }
         }
@@ -1253,6 +1274,8 @@ fn host_table(props: &HostTableProps) -> Html {
         let c = st.counts.clone();
         // Said once on the stage's heading instead of on each of its rows.
         let all_need_approval = c.needs_approval == c.total;
+        let baking = props.admin && st.hosts().any(|h| h.state == HostRolloutState::Baking);
+        let on_ask = props.on_ask.clone();
         step_groups(st, all).into_iter().enumerate().map(move |(i, (step, rows, hidden))| {
             let first = i == 0;
             let key = match step {
@@ -1275,6 +1298,11 @@ fn host_table(props: &HostTableProps) -> Html {
                             }
                             if hidden > 0 {
                                 <span class="muted small" data-testid="hidden-unchanged">{ format!("{hidden} unchanged not shown") }</span>
+                            }
+                            if first && baking {
+                                <span class="group-head__controls">
+                                    <SplitButton items={stage_menu(&phase.name, &on_ask)} small=true menu_label={format!("More actions for {}", phase.name)} testid="stage-actions" />
+                                </span>
                             }
                         </span>
                     </th>
@@ -1333,7 +1361,7 @@ fn host_table(props: &HostTableProps) -> Html {
                                     if h.needs_attention {
                                         <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>
                                     }
-                                    if let Some(until) = h.bake_until.filter(|u| *u > props.now) {
+                                    if let Some(until) = h.bake_until.filter(|u| h.state == HostRolloutState::Baking && *u > props.now) {
                                         <span class="small muted">{ " " }<Countdown {until} /></span>
                                     }
                                     if let Some(r) = awaited_reboot(h, props.now) {
@@ -1400,10 +1428,20 @@ fn host_table(props: &HostTableProps) -> Html {
     }
 }
 
+/// A stage's own actions, on its heading in the Targets card: expedite its
+/// baking rows (end their bakes now).
+fn stage_menu(phase: &str, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
+    let (on_ask, a) = (on_ask.clone(), Ask::Phase("expedite", phase.to_owned()));
+    vec![MenuItem::new(
+        "Expedite…",
+        Callback::from(move |_: MouseEvent| on_ask.emit(a.clone())),
+    )]
+}
+
 /// A host's own decisions, for the menu on its row.
 /// A host's own actions in a rollout, the most likely first (the split
 /// button's face): retry what failed, continue past its failed checks, skip
-/// its bake period, or redeploy a host already done, then the ones that
+/// expedite its bake, or redeploy a host already done, then the ones that
 /// override the rollout. A face that overrides the rollout (Skip on a host
 /// still applying) is not drawn red: the dialog says what it does.
 fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
@@ -1427,7 +1465,7 @@ fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
         ));
     }
     if h.state == HostRolloutState::Baking {
-        items.push(item("Skip bake period…", Ask::Host("skip-bake", host())));
+        items.push(item("Expedite…", Ask::Host("expedite", host())));
     }
     if h.state == HostRolloutState::Healthy {
         // Done: applying its plan again is the one thing left to ask.

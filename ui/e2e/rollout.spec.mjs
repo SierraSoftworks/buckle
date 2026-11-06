@@ -327,7 +327,7 @@ describe("approving a phase", () => {
     assert.equal(face, "Pause", "no approval while an earlier phase runs");
     assert.ok(!menu.some((m) => m.startsWith("Approve")));
     assert.ok(!menu.includes("Reject…"));
-    for (const want of ["Retry", "Skip bake period…", "Roll back…", "Abort…"]) assert.ok(menu.includes(want), want);
+    for (const want of ["Retry", "Expedite…", "Roll back…", "Abort…"]) assert.ok(menu.includes(want), want);
     await close();
   });
 
@@ -354,13 +354,24 @@ describe("approving a phase", () => {
     await close();
   });
 
-  test("a baking host's bake can be skipped from its row's menu", async () => {
+  test("a baking host is expedited from its row's menu", async () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-3", exact: true }) });
-    await act(row.getByTestId("host-actions"), "Skip bake period…");
-    await page.getByRole("dialog", { name: "Skip the bake of pi-3" }).getByRole("button", { name: "Skip bake period" }).click();
-    await page.getByRole("status").filter({ hasText: "pi-3: skip-bake sent." }).waitFor();
+    await act(row.getByTestId("host-actions"), "Expedite…");
+    await page.getByRole("dialog", { name: "Expedite pi-3" }).getByRole("button", { name: "Expedite pi-3" }).click();
+    await page.getByRole("status").filter({ hasText: "pi-3: expedite sent." }).waitFor();
     await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-3"]').getAttribute("data-state"), "healthy"));
+    await close();
+  });
+
+  test("a baking stage is expedited from its heading in the Targets card", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const head = page.locator('tr.table__group[data-stage="home"]');
+    await act(head.getByTestId("stage-actions"), "Expedite…");
+    await page.getByRole("dialog", { name: "Expedite home" }).getByRole("button", { name: "Expedite home" }).click();
+    await page.getByRole("status").filter({ hasText: "home: expedite sent." }).waitFor();
+    await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-3"]').getAttribute("data-state"), "healthy"));
+    await eventually(async () => assert.equal(await head.getByTestId("stage-actions").count(), 0, "nothing left to skip"));
     await close();
   });
 

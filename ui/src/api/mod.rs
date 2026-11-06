@@ -524,6 +524,28 @@ pub async fn rollout_action(id: &str, action: &str, note: &str) -> Result<Rollou
     .await
 }
 
+/// `expedite` every baking row of one phase.
+pub async fn rollout_phase_action(
+    id: &str,
+    phase: &str,
+    action: &str,
+    note: &str,
+) -> Result<RolloutDetail, ApiError> {
+    demo!(demo_store::rollout_phase_action(id, phase, action, note));
+    let body = ActionRequest { note: note.into() };
+    write(
+        Method::Post,
+        &format!(
+            "/rollouts/{}/phases/{}/{}",
+            enc(id),
+            enc(phase),
+            enc(action)
+        ),
+        Some(&body),
+    )
+    .await
+}
+
 /// `retry`, `skip` or `force` one host of a paused rollout.
 pub async fn rollout_host_action(
     id: &str,

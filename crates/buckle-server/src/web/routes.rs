@@ -91,6 +91,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 "/rollouts/{id}/hosts/{host}/{action}",
                 web::post().to(rollout_host_action),
             )
+            .route(
+                "/rollouts/{id}/phases/{phase}/{action}",
+                web::post().to(rollout_phase_action),
+            )
             .route("/rollouts/{id}/{action}", web::post().to(rollout_action))
             .route("/events", web::get().to(events))
             .route("/catalog", web::get().to(catalog))
@@ -147,6 +151,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/rollouts/r/hosts/h/skip"),
     ("POST", "/api/v1/rollouts/r/hosts/h/continue"),
     ("POST", "/api/v1/rollouts/r/hosts/h/force"),
+    ("POST", "/api/v1/rollouts/r/phases/p/expedite"),
     ("GET", "/api/v1/events"),
     ("GET", "/api/v1/catalog"),
     ("GET", "/api/v1/audit"),
@@ -2079,10 +2084,11 @@ async fn rollout_action(
         "pause" => Command::Pause { rollout, note },
         "resume" => Command::Resume { rollout, note },
         "retry" => Command::RetryFailed { rollout, note },
-        "skip-bake" => Command::SkipBake {
+        "expedite" => Command::Expedite {
             rollout,
             host: None,
             workload: String::new(),
+            phase: None,
             note,
         },
         "rollback" => Command::Rollback { rollout, note },
@@ -2128,13 +2134,38 @@ async fn rollout_host_action(
             workload,
             note,
         },
-        "skip-bake" => Command::SkipBake {
+        "expedite" => Command::Expedite {
             rollout,
             host: Some(host),
             workload,
+            phase: None,
             note,
         },
         _ => return Err(ApiError::not_found(format!("No host action '{action}'."))),
+    };
+    state.controller.command(&admin.0.actor(), command).await?;
+    Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))
+}
+
+/// `expedite` every baking row of one phase.
+async fn rollout_phase_action(
+    state: Data,
+    admin: Administrative,
+    path: web::Path<(String, String, String)>,
+    body: Option<web::Json<ActionRequest>>,
+) -> ApiResult {
+    let (id, phase, action) = path.into_inner();
+    let id = resolve_rollout(&state, id).await?;
+    let note = body.map(|b| b.into_inner().note).unwrap_or_default();
+    let command = match action.as_str() {
+        "expedite" => Command::Expedite {
+            rollout: id.clone(),
+            host: None,
+            workload: String::new(),
+            phase: Some(phase),
+            note,
+        },
+        _ => return Err(ApiError::not_found(format!("No phase action '{action}'."))),
     };
     state.controller.command(&admin.0.actor(), command).await?;
     Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))

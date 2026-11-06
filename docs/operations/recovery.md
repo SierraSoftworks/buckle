@@ -27,7 +27,7 @@ Every host decision is also in the **⋮** menu on the host's row.
 |---|---|---|
 | **Retry** / **Re-plan** | Plans the host again as it stands; a host that failed past its plan (Retry) is then re-applied with the same checks. Re-plan is offered on any host whose plan is not applied yet. | You fixed the cause: a secret, a repository, an identity, the host itself. |
 | **Continue with checks waived…** | Retries with the named failing checks waived for this host in this rollout. They still run and report. | A check is wrong or flaky, not the change. |
-| **Skip bake period…** | Counts a baking host as baked now. Refused while one of its checks is failing. | The change is verified and the bake window only delays the rollout. |
+| **Expedite…** | Counts a baking host as baked now. Refused while one of its checks is failing. | The change is verified and the bake window only delays the rollout. |
 | **Force apply…** | Applies whatever the host plans now, without approval, digest check or a passing baseline. | A plan keeps changing between attempts, or a host held at baseline must go ahead. |
 | **Skip…** | Excludes the host from the rollout; it converges later as a straggler or with the next rollout. | The host is broken for unrelated reasons, or is being retired. |
 
@@ -42,13 +42,13 @@ With `on_failure: pause` (the default), a phase that exceeds `max_failures` paus
 Fix the cause, then **Retry** from the split button: every failed host is re-planned, and the
 rollout carries on in the same phase once its failures are cleared.
 
-<Screenshot name="rollout-actions" alt="The rollout split button's menu: Pause, Retry, Skip bake period, Roll back and Abort" />
+<Screenshot name="rollout-actions" alt="The rollout split button's menu: Pause, Retry, Expedite, Roll back and Abort" />
 
 | Decision | What happens |
 |---|---|
 | **Retry** | Re-plans and re-applies every failed host. Also in the menu of a running rollout. |
 | **Skip this phase…** | Accepts the failed hosts as failures and moves on to the next phase; they stay failed until retried. Shown as **Resume** when nothing failed. |
-| **Skip bake period…** | Counts every baking host as baked now, except those with a failing check. |
+| **Expedite…** | Counts every baking host as baked now, except those with a failing check. Each stage heading in the Targets card offers the same for that stage's hosts. |
 | **Roll back…** | Applies the previous stable revision to every host this rollout updated, newest phase first. |
 | **Abort…** | Stops the rollout where it is, with its state recorded. Hosts already updated keep the new revision. |
 | **Reject…** | Only at an approval gate: ends the rollout with a reason; nothing in the waiting phase is applied. |

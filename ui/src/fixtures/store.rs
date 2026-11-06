@@ -923,7 +923,7 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
                     s
                 }
             }
-            ("skip-bake", s)
+            ("expedite", s)
                 if !crate::logic::tone::rollout_finished(s)
                     && hosts(HostRolloutState::Baking) > 0 =>
             {
@@ -932,7 +932,7 @@ pub fn rollout_action(id: &str, action: &str, note: &str) -> Result<RolloutDetai
                     .iter_mut()
                     .flat_map(|p| p.hosts.iter_mut())
                     .filter(|h| h.state == HostRolloutState::Baking)
-                    .for_each(skip_bake);
+                    .for_each(expedite);
                 s
             }
             (
@@ -1087,9 +1087,66 @@ fn replan(h: &mut buckle_api::RolloutHost) {
     h.failed_checks.clear();
 }
 
-fn skip_bake(h: &mut buckle_api::RolloutHost) {
+fn expedite(h: &mut buckle_api::RolloutHost) {
     h.state = HostRolloutState::Healthy;
     h.bake_until = None;
+}
+
+pub fn rollout_phase_action(
+    id: &str,
+    phase: &str,
+    action: &str,
+    note: &str,
+) -> Result<RolloutDetail, ApiError> {
+    admin()?;
+    with(|s| {
+        let detail = s.rollout_mut(id)?;
+        let before = detail.events.len();
+        let p = detail
+            .phases
+            .iter_mut()
+            .find(|p| p.name == phase)
+            .ok_or_else(|| ApiError::NotFound(format!("Rollout {id} has no phase '{phase}'.")))?;
+        if action != "expedite" {
+            return Err(ApiError::NotFound(format!("No phase action '{action}'.")));
+        }
+        let baking: Vec<&mut buckle_api::RolloutHost> = p
+            .hosts
+            .iter_mut()
+            .filter(|h| h.state == HostRolloutState::Baking)
+            .collect();
+        if baking.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "No host in {phase} is baking, so there is nothing to expedite."
+            )));
+        }
+        let mut changed = Vec::new();
+        for h in baking {
+            expedite(h);
+            h.updated_at = Utc::now();
+            changed.push(h.clone());
+        }
+        p.bake_until = None;
+        let message = format!("{} expedited {phase}. {note}", actor());
+        detail.events.push(event(
+            "rollout.operator",
+            message.clone(),
+            None,
+            Some(phase),
+        ));
+        let snapshot = detail.clone();
+        s.outbox.extend(
+            changed
+                .into_iter()
+                .map(|host| LiveEvent::RolloutHostChanged {
+                    rollout_id: id.into(),
+                    host,
+                }),
+        );
+        s.outbox.extend(timeline(&snapshot, before));
+        s.record(&actor(), "rollout.phase", phase, message);
+        Ok(snapshot)
+    })
 }
 
 pub fn rollout_host_action(
@@ -1111,7 +1168,7 @@ pub fn rollout_host_action(
                     | HostRolloutState::Skipped
                     | HostRolloutState::Pending,
                 ) => replan(h),
-                ("skip-bake", HostRolloutState::Baking) => skip_bake(h),
+                ("expedite", HostRolloutState::Baking) => expedite(h),
                 ("skip", _) => {
                     h.state = HostRolloutState::Skipped;
                     h.error = Some(format!("Skipped by {}: {note}", actor()));
