@@ -335,6 +335,8 @@ pub fn hosts(now: DateTime<Utc>) -> Vec<HostSummary> {
                     now - Duration::minutes(s.offline_mins.unwrap_or(0) + 1 + (i as i64 * 7) % 14)
                 }),
                 drifted: s.drifted,
+                drift_at: (!s.applied.is_empty() && !offline)
+                    .then(|| now - Duration::minutes(3 + (i as i64 * 5) % 11)),
                 first_seen: now
                     - if s.id == "edge-1" {
                         Duration::minutes(20)
@@ -2083,6 +2085,7 @@ pub fn clusters(now: DateTime<Utc>) -> Vec<HostSummary> {
                 health: HealthSummary::Unknown,
                 health_at: None,
                 drifted: false,
+                drift_at: None,
                 first_seen: now - Duration::days(30),
                 last_seen: None,
                 notes: String::new(),

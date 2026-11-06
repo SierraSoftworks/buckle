@@ -377,6 +377,51 @@ pub fn run_action(
     })
 }
 
+/// The demo answers a drift check at once: the target reads as checked now.
+pub fn check_drift(id: &str, workload: Option<&str>) -> Result<HostSummary, ApiError> {
+    admin()?;
+    with(|s| {
+        let now = Utc::now();
+        let scope = match workload {
+            Some(w) => format!("{w} on {id}"),
+            None => id.to_owned(),
+        };
+        if let Some(host) = s.hosts.iter_mut().find(|h| h.id == id) {
+            if host.connection == Connection::Offline {
+                return Err(ApiError::Conflict(format!("{id} is offline.")));
+            }
+            host.drift_at = Some(now);
+            s.record(
+                &actor(),
+                "host.drift.check",
+                id,
+                format!("{} asked {scope} to check for drift", actor()),
+            );
+            return Ok(s.host_changed(id).expect("the host exists"));
+        }
+        let cluster = s
+            .clusters
+            .iter_mut()
+            .find(|h| h.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("No target '{id}'.")))?;
+        cluster.drift_at = Some(now);
+        let cluster = cluster.clone();
+        if let Some(d) = s.details.iter_mut().find(|d| d.summary.id == id) {
+            d.summary = cluster.clone();
+        }
+        s.record(
+            &actor(),
+            "target.drift.check",
+            id,
+            format!("{} asked {scope} to check for drift", actor()),
+        );
+        s.outbox.push(LiveEvent::HostChanged {
+            host: cluster.clone(),
+        });
+        Ok(cluster)
+    })
+}
+
 pub fn upgrade_host(id: &str, version: Option<&str>) -> Result<HostSummary, ApiError> {
     admin()?;
     with(|s| {

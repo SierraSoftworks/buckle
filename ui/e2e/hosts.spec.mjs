@@ -262,3 +262,38 @@ describe("action rollouts", () => {
     await close();
   });
 });
+
+describe("drift checks", () => {
+  const toast = (page, text) => page.getByRole("status").filter({ hasText: text }).waitFor();
+
+  for (const [path, split, name] of [
+    ["/hosts/pi-1", "host-actions", "pi-1"],
+    ["/clusters/home-nomad", "cluster-actions", "home-nomad"],
+  ]) {
+    test(`${name}'s head checks it for drift, and its summary says when`, async () => {
+      const { page, close } = await open(path);
+      const actions = page.getByTestId(split);
+      await act(actions, "Check drift");
+      await toast(page, `Asked ${name} to check for drift.`);
+      await eventually(async () => assert.match(await page.getByTestId("drift-at").textContent(), /^(now|\d+s ago)$/));
+      await close();
+    });
+  }
+
+  test("a workload is checked on every placement from its head, or on one from its row", async () => {
+    const { page, close } = await open("/workloads/paste?cluster=home-nomad");
+    const asked = page.getByRole("status").filter({ hasText: /Asked (home-nomad|\d+ clusters) to check paste for drift\./ });
+    await act(page.getByTestId("workload-actions"), "Check drift");
+    await asked.first().waitFor();
+    await act(page.getByTestId("actions-home-nomad-paste"), "Check drift");
+    await eventually(async () => assert.equal(await asked.count(), 2));
+    await close();
+  });
+
+  test("a cluster's workload rows check their own placement", async () => {
+    const { page, close } = await open("/clusters/home-nomad");
+    await act(page.getByTestId("workloads").getByTestId("actions-paste"), "Check drift");
+    await toast(page, "Asked home-nomad to check paste for drift.");
+    await close();
+  });
+});

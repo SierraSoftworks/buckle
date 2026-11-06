@@ -28,7 +28,10 @@ pub mod theme;
 pub mod toast;
 pub mod ui;
 
-pub use actions::{ActionsButton, action_items, target_items, use_actions, use_target_actions};
+pub use actions::{
+    ActionsButton, action_items, drift_item, target_items, use_actions, use_drift_check,
+    use_target_actions,
+};
 pub use changes::Changes;
 pub use commit::{Commit, CommitCard};
 pub use countdown::Countdown;

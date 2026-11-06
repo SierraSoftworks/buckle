@@ -175,6 +175,8 @@ pub enum TargetAction {
     /// Review and approve the rollout phase waiting on it.
     ApproveRollout,
     UpgradeAgent,
+    /// Run a drift pass now (a cluster: on its steward).
+    CheckDrift,
     Pause,
     Resume,
     Forget,
@@ -186,6 +188,7 @@ impl TargetAction {
             TargetAction::ApproveRegistration => "Approve registration…",
             TargetAction::ApproveRollout => "Approve rollout…",
             TargetAction::UpgradeAgent => "Upgrade agent…",
+            TargetAction::CheckDrift => "Check drift",
             TargetAction::Pause => "Pause…",
             TargetAction::Resume => "Resume",
             TargetAction::Forget => "Forget…",
@@ -204,12 +207,16 @@ pub struct TargetStanding {
     pub upgradable: bool,
     /// Its agent is behind the version the fleet converges to.
     pub behind: bool,
+    /// It can check for drift now: something is applied and its agent (a
+    /// cluster's steward) is online.
+    pub checkable: bool,
     pub forgettable: bool,
 }
 
 /// A target's own actions, the most likely first (the split button's face)
 /// and Forget last: approve its registration, then a rollout waiting on it,
-/// then upgrade an agent that is behind, then pause or resume. The second
+/// then upgrade an agent that is behind, then resume, then check for drift
+/// (the routine choice, ahead of pausing), then pause. The second
 /// is whether the face is what the target's state calls for (a primary
 /// button) rather than the routine choice.
 pub fn head_actions(s: TargetStanding) -> (Vec<TargetAction>, bool) {
@@ -220,6 +227,7 @@ pub fn head_actions(s: TargetStanding) -> (Vec<TargetAction>, bool) {
         (s.approval_wanted, ApproveRollout),
         (upgrade_first, UpgradeAgent),
         (s.paused, Resume),
+        (s.checkable, CheckDrift),
         (!s.paused, Pause),
         (s.upgradable && !upgrade_first, UpgradeAgent),
         (s.forgettable, Forget),
@@ -435,6 +443,25 @@ mod tests {
         };
         for (case, s, face, called_for) in [
             ("routine", base, Pause, false),
+            (
+                "checkable",
+                TargetStanding {
+                    checkable: true,
+                    ..base
+                },
+                CheckDrift,
+                false,
+            ),
+            (
+                "paused, checkable",
+                TargetStanding {
+                    paused: true,
+                    checkable: true,
+                    ..base
+                },
+                Resume,
+                true,
+            ),
             (
                 "paused",
                 TargetStanding {

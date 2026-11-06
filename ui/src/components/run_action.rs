@@ -277,6 +277,10 @@ pub struct WorkloadActionsProps {
     /// What its placements offer ([`crate::logic::workloads::FleetWorkload::actions`]).
     pub actions: Vec<ActionInfo>,
     pub on_action: Callback<(String, ActionInfo)>,
+    /// Set where its placements can be checked for drift: a "Check drift"
+    /// item after its actions, asking every one of them.
+    #[prop_or_default]
+    pub on_check_drift: Option<Callback<()>>,
     #[prop_or_default]
     pub small: bool,
     #[prop_or_default]
@@ -284,7 +288,8 @@ pub struct WorkloadActionsProps {
 }
 
 /// A workload's actions across all its placements as one split button, the
-/// first on its face; nothing when it offers none.
+/// first on its face, then checking every placement for drift where
+/// offered; nothing when it offers neither.
 #[function_component(WorkloadActions)]
 pub fn workload_actions(props: &WorkloadActionsProps) -> Html {
     let items = props
@@ -306,6 +311,12 @@ pub fn workload_actions(props: &WorkloadActionsProps) -> Html {
                     .unwrap_or_default()
             ))
         })
+        .chain(props.on_check_drift.as_ref().map(|check| {
+            super::drift_item(
+                check,
+                &format!("Check every cluster running {} for drift", props.workload),
+            )
+        }))
         .collect::<Vec<_>>();
     html! {
         <SplitButton {items} small={props.small} menu_label={format!("More {} actions", props.workload)}

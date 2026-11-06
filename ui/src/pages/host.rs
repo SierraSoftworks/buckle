@@ -26,7 +26,7 @@ use crate::components::{
     Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind, Loading, MenuItem,
     PageHead, Panel, Pill, Refresh, RouteLink, SplitButton, TraceLink, action_items,
     changes::{RunChanges, Took},
-    host_state_pills, target_items, use_target_actions, use_toast,
+    host_state_pills, target_items, use_drift_check, use_target_actions, use_toast,
 };
 use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
 use crate::logic::controls::{TargetAction, TargetStanding, head_actions};
@@ -95,6 +95,7 @@ pub fn host_page(props: &Props) -> Html {
             }),
         )
     };
+    let check_drift = use_drift_check(detail.reload.clone());
     let store = use_live();
     // A run that started since the detail was fetched is the newest.
     let newest = live.as_ref().and_then(|d| {
@@ -235,6 +236,9 @@ pub fn host_page(props: &Props) -> Html {
                     .upgradable
                     .is_empty()
             }),
+            checkable: h.connection == Connection::Online
+                && h.status != HostStatus::Pending
+                && h.applied_revision.is_some(),
             forgettable: true,
         });
         let modules: Vec<MenuItem> = if can_act {
@@ -253,6 +257,10 @@ pub fn host_page(props: &Props) -> Html {
                 })
             }
             TargetAction::UpgradeAgent => open(Ask::Upgrade),
+            TargetAction::CheckDrift => {
+                let (check, id) = (check_drift.clone(), h.id.clone());
+                Callback::from(move |_: MouseEvent| check.emit((vec![id.clone()], None)))
+            }
             TargetAction::Pause => open(Ask::Pause),
             TargetAction::Resume => open(Ask::Resume),
             TargetAction::Forget => open(Ask::Forget),
@@ -335,6 +343,7 @@ pub fn host_page(props: &Props) -> Html {
                         ("Groups", html! { <>{ for h.groups.iter().map(|g| html! { <span class="badge">{ g.clone() }</span> }) }</> }),
                         ("Enrolled", html! { <span title={timestamp(h.first_seen)}>{ relative(h.first_seen, now) }</span> }),
                         ("Health read", html! { <span title={h.health_at.map(timestamp)}>{ relative_opt(h.health_at, now) }</span> }),
+                        ("Drift checked", html! { <span title={h.drift_at.map(timestamp)} data-testid="drift-at">{ relative_opt(h.drift_at, now) }</span> }),
                     ]) }
                     <NotesEditor id={h.id.clone()} notes={h.notes.clone()} admin={admin} on_saved={detail.reload.clone()} embedded=true />
                 </Panel>

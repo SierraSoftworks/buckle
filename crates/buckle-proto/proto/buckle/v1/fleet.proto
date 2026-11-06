@@ -347,7 +347,19 @@ message ServerMessage {
     RunAction action = 12;
     Lease lease = 13;
     Release release = 14;
+    CheckDrift check_drift = 15;
   }
+}
+
+// Check for drift now, as the agent's own drift pass does (and correcting
+// it where its `drift.correct` says so), and report it. Sent to agents that
+// announce the `check_drift` capability. For a cluster target it goes to the
+// cluster's steward, whose lane re-plans the applied revision.
+message CheckDrift {
+  // The cluster target to check; empty for the host itself.
+  string target = 1;
+  // With `target`: only this workload's placement. Empty: the whole cluster.
+  string workload = 2;
 }
 
 // The server leases a cluster target to this agent: it is the cluster's

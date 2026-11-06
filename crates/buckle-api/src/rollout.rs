@@ -367,6 +367,16 @@ pub struct StewardRequest {
     pub note: String,
 }
 
+/// `POST /api/v1/{hosts|targets}/{id}/drift`: check the target for drift
+/// now; for a cluster, only `workload`'s placement when named.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftCheckRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
+    #[serde(default)]
+    pub note: String,
+}
+
 /// Server-sent event payloads on `GET /api/v1/events`.
 // Built once and serialised at once: a host summary's size is no concern.
 #[allow(clippy::large_enum_variant)]

@@ -65,12 +65,21 @@ impl<'c> Drift<'c> {
         plan_json: &[u8],
         at: DateTime<Utc>,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE hosts SET drifted = ?2 WHERE host_id = ?1",
-                params![host, drifted],
-            )
-            .map_err(db_error)?;
+        self.record_for(host, None, drifted, plan_json, at)
+    }
+
+    /// [`Drift::record`] for a report scoped to one `workload` of a
+    /// cluster (a placement's drift check): only that workload's items are
+    /// replaced, and the cluster stays drifted while any other's remain.
+    /// Without a workload the report covers the whole target.
+    pub fn record_for(
+        &self,
+        host: &str,
+        workload: Option<&str>,
+        drifted: bool,
+        plan_json: &[u8],
+        at: DateTime<Utc>,
+    ) -> Result<()> {
         let items = if drifted {
             match serde_json::from_slice::<Plan>(plan_json) {
                 Ok(plan) => items_of(&plan),
@@ -82,7 +91,32 @@ impl<'c> Drift<'c> {
         } else {
             Vec::new()
         };
-        self.replace(host, &items, at)
+        let items: Vec<DriftItem> = items
+            .into_iter()
+            .filter(|i| workload.is_none_or(|w| i.module == w))
+            .collect();
+        self.replace(host, workload, &items, at)?;
+        let flagged = match workload {
+            None => drifted,
+            Some(_) => {
+                let others: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM host_drift WHERE host_id = ?1",
+                        params![host],
+                        |r| r.get(0),
+                    )
+                    .map_err(db_error)?;
+                others > 0 || (drifted && items.is_empty())
+            }
+        };
+        self.conn
+            .execute(
+                "UPDATE hosts SET drifted = ?2, drift_at = ?3 WHERE host_id = ?1",
+                params![host, flagged, ts(at)],
+            )
+            .map_err(db_error)?;
+        Ok(())
     }
 
     /// Forgets the host's drift: an apply succeeded, so what it applied is
@@ -100,16 +134,28 @@ impl<'c> Drift<'c> {
         Ok(())
     }
 
-    fn replace(&self, host: &str, items: &[DriftItem], at: DateTime<Utc>) -> Result<()> {
+    /// Replaces the host's items (only `workload`'s, when named) with
+    /// `items`.
+    fn replace(
+        &self,
+        host: &str,
+        workload: Option<&str>,
+        items: &[DriftItem],
+        at: DateTime<Utc>,
+    ) -> Result<()> {
         let existing: Vec<(String, String, String)> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT module, kind, key FROM host_drift WHERE host_id = ?1")
+                .prepare(
+                    "SELECT module, kind, key FROM host_drift WHERE host_id = ?1 AND (?2 IS NULL OR module = ?2)",
+                )
                 .map_err(db_error)?;
-            stmt.query_map(params![host], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .map_err(db_error)?
-                .collect::<rusqlite::Result<_>>()
-                .map_err(db_error)?
+            stmt.query_map(params![host, workload], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(db_error)?
         };
         for (module, kind, key) in &existing {
             let still = items
@@ -345,6 +391,57 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(state(&store).await, (false, vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_placement_check_replaces_only_its_workloads_drift() {
+        let store = store_with_host().await;
+        let plan = serde_json::to_vec(&drift_plan(true)).unwrap();
+        store
+            .call(move |db| db.drift().record("pi-1", true, &plan, Utc::now()))
+            .await
+            .unwrap();
+
+        // "app" checked clean: the other workloads' drift stays.
+        store
+            .call(|db| {
+                db.drift()
+                    .record_for("pi-1", Some("app"), false, &[], Utc::now())
+            })
+            .await
+            .unwrap();
+        let (drifted, items) = state(&store).await;
+        assert!(drifted, "the other workloads still drift");
+        assert!(items.iter().all(|i| i.module != "app"));
+        assert!(items.iter().any(|i| i.module == "common"));
+
+        // A scoped plan's items of other workloads are not taken as theirs.
+        let plan = serde_json::to_vec(&drift_plan(true)).unwrap();
+        store
+            .call(move |db| {
+                db.drift()
+                    .record_for("pi-1", Some("app"), true, &plan, Utc::now())
+            })
+            .await
+            .unwrap();
+        let (_, items) = state(&store).await;
+        assert_eq!(items.len(), 3);
+
+        for w in ["app", "common", "grey"] {
+            store
+                .call(move |db| {
+                    db.drift()
+                        .record_for("pi-1", Some(w), false, &[], Utc::now())
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(state(&store).await, (false, vec![]));
+        let at = store
+            .call(|db| Ok(db.hosts().get("pi-1")?.expect("host").drift_at))
+            .await
+            .unwrap();
+        assert!(at.is_some(), "the report's time is kept");
     }
 
     #[tokio::test]

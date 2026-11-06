@@ -316,6 +316,21 @@ pub async fn move_steward(id: &str, host: &str, note: String) -> Result<HostSumm
     .await
 }
 
+/// Asks a target to check for drift now: a host, or a cluster through its
+/// steward (only `workload`'s placement when named). The report follows.
+pub async fn check_drift(id: &str, workload: Option<String>) -> Result<HostSummary, ApiError> {
+    demo!(demo_store::check_drift(id, workload.as_deref()));
+    write(
+        Method::Post,
+        &format!("/targets/{}/drift", enc(id)),
+        Some(&buckle_api::DriftCheckRequest {
+            workload,
+            note: String::new(),
+        }),
+    )
+    .await
+}
+
 pub async fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError> {
     demo!(demo_store::host_action(id, action));
     write::<(), _>(

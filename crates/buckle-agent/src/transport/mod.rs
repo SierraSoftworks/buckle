@@ -335,6 +335,14 @@ pub enum Instruction {
         /// Why, for the log.
         reason: String,
     },
+    /// Run a drift pass now, as the timer would: the host's own, or (with
+    /// `target`) the cluster lane's, scoped to one placement with `workload`.
+    CheckDrift {
+        /// The cluster target to check; `None` for the host itself.
+        target: Option<String>,
+        /// With `target`: only this workload's placement.
+        workload: Option<String>,
+    },
     /// Keepalive from the server; nothing to do.
     Ping,
     /// Install this agent version when idle, then restart.

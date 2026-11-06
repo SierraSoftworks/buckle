@@ -129,6 +129,7 @@ mod tests {
             health: HealthSummary::Unknown,
             health_at: None,
             drifted: false,
+            drift_at: None,
             first_seen,
             last_seen: None,
             notes: String::new(),

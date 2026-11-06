@@ -86,6 +86,7 @@ pub fn host_summary(
         health: host.health,
         health_at: host.health_at,
         drifted: host.drifted,
+        drift_at: host.drift_at,
         first_seen: host.first_seen,
         last_seen: host.last_seen,
         notes: host.notes.clone(),

@@ -361,3 +361,58 @@ async fn drift_is_planned_every_interval_and_reported_only_as_a_report() {
     );
     h.stop().await.expect("clean exit");
 }
+
+#[rstest::rstest]
+#[case::whole_cluster(None)]
+#[case::one_placement(Some("grafana"))]
+#[tokio::test(start_paused = true)]
+async fn a_drift_check_the_server_asks_for_runs_on_the_lane_at_once(
+    #[case] workload: Option<&str>,
+) {
+    let kube = buckle_kube::testing::FakeKube::new();
+    let mut h = Harness::start(Setup {
+        kube: Some(kube.clone()),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    apply_cluster(
+        &h,
+        &mut session,
+        KUBE,
+        "kubernetes",
+        "rev1",
+        &grafana_files(),
+    )
+    .await;
+    session
+        .send(lease(KUBE, "kubernetes", "rev1", 600, 3600))
+        .await;
+    kube.edit(
+        "apps/v1",
+        "Deployment",
+        "monitoring",
+        "grafana",
+        "kubectl",
+        serde_json::json!({"spec": {"template": {"spec": {"containers": [{"name": "grafana", "image": "grafana:0.0.1"}]}}}}),
+    );
+
+    let asked = tokio::time::Instant::now();
+    session
+        .send(SMsg::CheckDrift(pb::CheckDrift {
+            target: KUBE.into(),
+            workload: workload.unwrap_or_default().into(),
+        }))
+        .await;
+    let reported = session.expect(drift).await;
+    assert!(
+        asked.elapsed() < Duration::from_secs(60),
+        "ran {:?} after it was asked for, not on the timer",
+        asked.elapsed()
+    );
+    assert_eq!(reported.target, KUBE);
+    assert_eq!(reported.workload, workload.unwrap_or_default());
+    assert!(reported.changes > 0 && !reported.corrected, "{reported:?}");
+    h.stop().await.expect("clean exit");
+}

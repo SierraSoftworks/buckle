@@ -325,6 +325,11 @@ ALTER TABLE hosts ADD COLUMN steward TEXT;
 ALTER TABLE hosts ADD COLUMN reachable TEXT;
 ALTER TABLE hosts ADD COLUMN reachable_error TEXT;
 "#,
+    // 13: when the latest drift report arrived, so an operator who asked
+    // for a drift check sees it answered.
+    r#"
+ALTER TABLE hosts ADD COLUMN drift_at TEXT;
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.

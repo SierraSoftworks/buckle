@@ -854,6 +854,15 @@ impl Shared {
                     Some(Instruction::Release { target, reason }) => {
                         self.lanes.dispatch(&self, &target, lanes::LaneOp::Release { reason });
                     }
+                    // An operator asked for a drift check: the host's runs
+                    // in its queue as the timer's would; a cluster's on the
+                    // lane that watches it.
+                    Some(Instruction::CheckDrift { target: None, .. }) => {
+                        queue.push(Op::Drift, None);
+                    }
+                    Some(Instruction::CheckDrift { target: Some(target), workload }) => {
+                        self.lanes.dispatch(&self, &target, lanes::LaneOp::CheckDrift { workload });
+                    }
                     // Work for a cluster target this host speaks for runs on
                     // the cluster's lane. As for the host's own work, all
                     // but the Assign belong to the session that asked.
@@ -2815,6 +2824,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
         | Instruction::HostUpdate(_)
         | Instruction::Lease { .. }
         | Instruction::Release { .. }
+        | Instruction::CheckDrift { .. }
         | Instruction::Rejected { .. } => return None,
     })
 }

@@ -38,6 +38,9 @@ pub struct HostRecord {
     pub health: HealthSummary,
     pub health_at: Option<DateTime<Utc>>,
     pub drifted: bool,
+    /// When the latest drift report arrived (for a cluster, of any of its
+    /// placements); `None` before the first.
+    pub drift_at: Option<DateTime<Utc>>,
     /// For a cluster: the host agent holding its lease (its steward).
     pub steward: Option<String>,
     /// For a cluster: whether its API answers the steward, as last reported;
@@ -99,7 +102,7 @@ pub struct Hosts<'c> {
     conn: &'c Connection,
 }
 
-const COLUMNS: &str = "host_id, agent_labels, labels, status, notes, token_hash, platform, arch, agent_version, applied_revision, last_plan_digest, connection, auth_method, first_seen, last_seen, health, health_at, drifted, kind, cluster, steward, reachable, reachable_error";
+const COLUMNS: &str = "host_id, agent_labels, labels, status, notes, token_hash, platform, arch, agent_version, applied_revision, last_plan_digest, connection, auth_method, first_seen, last_seen, health, health_at, drifted, kind, cluster, steward, reachable, reachable_error, drift_at";
 
 pub(crate) fn status_str(s: HostStatus) -> &'static str {
     match s {
@@ -160,6 +163,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<RawHost> {
         steward: r.get(20)?,
         reachable: r.get(21)?,
         reachable_error: r.get(22)?,
+        drift_at: r.get(23)?,
     })
 }
 
@@ -187,6 +191,7 @@ struct RawHost {
     steward: Option<String>,
     reachable: Option<String>,
     reachable_error: Option<String>,
+    drift_at: Option<String>,
 }
 
 impl RawHost {
@@ -220,6 +225,7 @@ impl RawHost {
             health: parse_health(&self.health),
             health_at: parse_ts_opt(self.health_at)?,
             drifted: self.drifted,
+            drift_at: parse_ts_opt(self.drift_at)?,
             steward: self.steward.filter(|s| !s.is_empty()),
             reachable: match self.reachable.as_deref() {
                 Some("reachable") => Some(true),

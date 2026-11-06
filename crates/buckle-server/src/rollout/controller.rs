@@ -199,6 +199,13 @@ pub enum Command {
         host: String,
         note: String,
     },
+    /// Ask `target` (a cluster: its steward, for one `workload`'s placement
+    /// when named) to check for drift now; replies with the session asked.
+    CheckDrift {
+        target: String,
+        workload: Option<String>,
+        note: String,
+    },
 }
 
 impl Command {
@@ -221,6 +228,7 @@ impl Command {
             Command::RunAction { .. } => "host.action.run",
             Command::StartAction { .. } => "rollout.action.start",
             Command::MoveLease { .. } => "target.steward.move",
+            Command::CheckDrift { .. } => "host.drift.check",
         }
     }
 }
@@ -611,6 +619,10 @@ pub const TARGETS_CAPABILITY: &str = "targets";
 /// instruction names; a cluster whose executors predate that is rolled as
 /// one row, as before.
 pub const WORKLOADS_CAPABILITY: &str = "workloads";
+
+/// An agent runs a drift pass when asked (`CheckDrift`) only once it
+/// announces it; older agents keep to their own timer.
+pub const CHECK_DRIFT_CAPABILITY: &str = "check_drift";
 
 /// How a placement row may start: its needs on the cluster are met, or not.
 enum Readiness {
@@ -2495,6 +2507,90 @@ impl Controller {
         Ok(run_id)
     }
 
+    /// Asks `target` to check for drift now (see [`Command::CheckDrift`]):
+    /// a host over its own session, a cluster over its steward's. Refused
+    /// with nothing applied to check, or without a connected agent that
+    /// understands the request.
+    async fn check_drift(
+        &mut self,
+        actor: &str,
+        target: String,
+        workload: Option<String>,
+        note: String,
+    ) -> Result<String, CommandError> {
+        let t = target.clone();
+        let record = self
+            .store
+            .call(move |db| db.hosts().target(&t))
+            .await
+            .map_err(CommandError::internal)?
+            .ok_or_else(|| CommandError::not_found(format!("No target '{target}'.")))?;
+        let workload = workload.filter(|w| !w.is_empty());
+        if workload.is_some() && record.kind == TargetKind::Host {
+            return Err(CommandError::invalid(
+                format!("{target} is a host; only a cluster has workload placements."),
+                &["Check the whole host instead."],
+            ));
+        }
+        if record.applied_revision.is_none() {
+            return Err(CommandError::conflict(
+                format!("Nothing is applied to {target} yet, so there is no drift to check."),
+                &["Check again once a rollout has applied a revision to it."],
+            ));
+        }
+        let (session, noun) = match record.kind {
+            TargetKind::Host => (Some(target.clone()), "host"),
+            TargetKind::Cluster | TargetKind::Workload => {
+                (self.executors.get(&target).cloned(), "target")
+            }
+        };
+        let session = session.filter(|s| self.eligible(s)).ok_or_else(|| {
+            CommandError::conflict(
+                match record.kind {
+                    TargetKind::Host => format!("{target} is offline."),
+                    _ => format!("No steward of {target} is connected."),
+                },
+                &["Check again once its agent reconnects."],
+            )
+        })?;
+        if !self
+            .capabilities
+            .get(&session)
+            .is_some_and(|c| c.iter().any(|c| c == CHECK_DRIFT_CAPABILITY))
+        {
+            return Err(CommandError::conflict(
+                format!("{session}'s agent cannot check for drift on request."),
+                &["Upgrade its agent; until then it checks on its own timer."],
+            ));
+        }
+        let m = msg(server_message::Msg::CheckDrift(pb::CheckDrift {
+            target: match record.kind {
+                TargetKind::Host => String::new(),
+                TargetKind::Cluster | TargetKind::Workload => target.clone(),
+            },
+            workload: workload.clone().unwrap_or_default(),
+        }));
+        self.outbox.push(Out::Msg(session.clone(), Box::new(m)));
+        let scope = match &workload {
+            Some(w) => format!("{w} on {target}"),
+            None => target.clone(),
+        };
+        let message = if note.is_empty() {
+            format!("{actor} asked {scope} to check for drift")
+        } else {
+            format!("{actor} asked {scope} to check for drift: {note}")
+        };
+        self.audit(
+            actor,
+            &format!("{noun}.drift.check"),
+            &target,
+            message,
+            serde_json::json!({"workload": workload, "session": session, "note": note}),
+            None,
+        );
+        Ok(session)
+    }
+
     /// Starts an action rollout (see [`Command::StartAction`]): refused
     /// while another rollout is under way or queued, and without a stable
     /// revision (whose phases it follows).
@@ -2777,6 +2873,11 @@ impl Controller {
             Command::MoveLease { target, host, note } => {
                 self.move_lease_to(actor, &target, &host, &note).await
             }
+            Command::CheckDrift {
+                target,
+                workload,
+                note,
+            } => self.check_drift(actor, target, workload, note).await,
             Command::StartAction {
                 action,
                 targets,

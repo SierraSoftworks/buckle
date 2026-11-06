@@ -20,7 +20,7 @@ use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
     Button, Confirm, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh, RouteLink,
-    SplitButton, icons, target_items, use_target_actions, use_toast,
+    SplitButton, icons, target_items, use_drift_check, use_target_actions, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::controls::{TargetAction, TargetStanding, head_actions};
@@ -81,6 +81,7 @@ pub fn cluster_page(props: &Props) -> Html {
             }),
         )
     };
+    let check_drift = use_drift_check(detail.reload.clone());
     let store = use_live();
     let newest = live.as_ref().and_then(|d| {
         let events = detail
@@ -120,13 +121,12 @@ pub fn cluster_page(props: &Props) -> Html {
     let active = fleet.as_ref().and_then(|f| f.active_rollout.clone());
     // Actions run on an active cluster through its steward, while it is
     // connected, and only for admins.
-    let can_act = admin
-        && c.status == HostStatus::Active
-        && status
-            .steward
-            .as_deref()
-            .and_then(|e| by_id.get(e))
-            .is_some_and(|h| h.connection == Connection::Online);
+    let steward_online = status
+        .steward
+        .as_deref()
+        .and_then(|e| by_id.get(e))
+        .is_some_and(|h| h.connection == Connection::Online);
+    let can_act = admin && c.status == HostStatus::Active && steward_online;
     // Where the lease may move: a connected agent able to hold it, other
     // than the steward.
     let candidates: Vec<String> = d
@@ -141,6 +141,11 @@ pub fn cluster_page(props: &Props) -> Html {
         .cloned()
         .collect();
     let on_action = can_act.then(|| target_actions.on_action.clone());
+    // A placement's drift check, on its row, while the steward is online.
+    let on_check_drift = (admin && steward_online && c.applied_revision.is_some()).then(|| {
+        let (check, id) = (check_drift.clone(), c.id.clone());
+        Callback::from(move |w: String| check.emit((vec![id.clone()], Some(w))))
+    });
 
     let open = |a: Ask| {
         let (ask, error) = (ask.clone(), error.clone());
@@ -219,6 +224,7 @@ pub fn cluster_page(props: &Props) -> Html {
                 let (own, primary) = head_actions(TargetStanding {
                     paused: c.status == HostStatus::Paused,
                     approval_wanted: review.is_some(),
+                    checkable: steward_online && c.applied_revision.is_some(),
                     forgettable: !declared,
                     ..Default::default()
                 });
@@ -230,6 +236,10 @@ pub fn cluster_page(props: &Props) -> Html {
                                 n.push(&Route::rollout(&id));
                             }
                         })
+                    }
+                    TargetAction::CheckDrift => {
+                        let (check, id) = (check_drift.clone(), c.id.clone());
+                        Callback::from(move |_: MouseEvent| check.emit((vec![id.clone()], None)))
                     }
                     TargetAction::Resume => open(Ask::Resume),
                     TargetAction::Forget => open(Ask::Forget),
@@ -377,6 +387,10 @@ pub fn cluster_page(props: &Props) -> Html {
             "Health read",
             html! { <span title={c.health_at.map(timestamp)}>{ relative_opt(c.health_at, now) }</span> },
         ),
+        (
+            "Drift checked",
+            html! { <span title={c.drift_at.map(timestamp)} data-testid="drift-at">{ relative_opt(c.drift_at, now) }</span> },
+        ),
     ]);
 
     let executors = html! {
@@ -434,7 +448,7 @@ pub fn cluster_page(props: &Props) -> Html {
                 <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()}
                     aside={executors} />
             </div>
-            <ModulesPanel detail={d.clone()} cluster=true on_action={on_action.clone()} newest={newest.clone()} picked={(*picked).clone()}
+            <ModulesPanel detail={d.clone()} cluster=true on_action={on_action.clone()} on_check_drift={on_check_drift.clone()} newest={newest.clone()} picked={(*picked).clone()}
                 on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             <Panel title="Recent runs">{ runs(&d, now, shown, &show_run) }</Panel>
             <p class="muted small">

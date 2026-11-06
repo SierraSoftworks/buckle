@@ -38,8 +38,15 @@ fn json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
 /// `approval_digest` (an approval binds the plan's intent), `targets` (it
 /// runs a pipeline per cluster target it executes for) and `workloads` (it
 /// plans, applies and checks one workload placement of a cluster at a time
-/// when an instruction names one, and echoes the workload on its reports).
-pub const CAPABILITIES: &[&str] = &["force_plan", "approval_digest", "targets", "workloads"];
+/// when an instruction names one, and echoes the workload on its reports)
+/// and `check_drift` (it runs a drift pass when the server asks).
+pub const CAPABILITIES: &[&str] = &[
+    "force_plan",
+    "approval_digest",
+    "targets",
+    "workloads",
+    "check_drift",
+];
 
 /// The protobuf Hello.
 pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
@@ -168,6 +175,10 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
         Msg::Release(r) => Instruction::Release {
             target: r.target,
             reason: r.reason,
+        },
+        Msg::CheckDrift(c) => Instruction::CheckDrift {
+            target: non_empty(c.target),
+            workload: non_empty(c.workload),
         },
         Msg::Plan(p) => Instruction::RequestPlan {
             revision: RevisionId(p.revision),
