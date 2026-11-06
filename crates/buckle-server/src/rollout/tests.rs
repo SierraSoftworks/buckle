@@ -92,6 +92,8 @@ struct Script {
     target_changes: Option<Vec<String>>,
     /// Every health report for a cluster target has this workload failing.
     failing_workload: Option<String>,
+    /// The agent's own plans are real plans changing these modules.
+    host_changes: Option<Vec<String>>,
 }
 
 /// Report ids for the fake agents' durable action results.
@@ -332,12 +334,14 @@ impl Harness {
                             Some(d) if !p.target.is_empty() => d.clone(),
                             _ => s.digest.clone(),
                         },
-                        changes: match &s.target_changes {
-                            Some(w) if !p.target.is_empty() => w.len() as u32,
+                        changes: match (&s.target_changes, &s.host_changes) {
+                            (Some(w), _) if !p.target.is_empty() => w.len() as u32,
+                            (_, Some(m)) if p.target.is_empty() => m.len() as u32,
                             _ => u32::from(!(s.unchanged && p.target.is_empty())),
                         },
-                        plan_json: match &s.target_changes {
-                            Some(w) if !p.target.is_empty() => plan_json_changing(w),
+                        plan_json: match (&s.target_changes, &s.host_changes) {
+                            (Some(w), _) if !p.target.is_empty() => plan_json_changing(w),
+                            (_, Some(m)) if p.target.is_empty() => plan_json_changing(m),
                             _ => b"{}".to_vec(),
                         },
                         target: p.target.clone(),
@@ -2419,6 +2423,78 @@ async fn a_phase_over_budget_does_not_complete_while_a_failure_stands() {
             .as_deref()
             .unwrap()
             .contains("decommissioning")
+    );
+}
+
+/// A retry plans only what the failed attempt left to do; the row keeps the
+/// plan that attempt applied, so the rollout still shows both changes, and
+/// the attempt's run report still finds its plan.
+#[tokio::test(start_paused = true)]
+async fn a_retried_host_keeps_what_its_failed_attempt_applied() {
+    let mut h = Harness::new().await;
+    h.revision("r1", ONE_PHASE_TWO_WIDE).await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    h.script("a", |s| {
+        s.digest = "d1".into();
+        s.host_changes = Some(vec!["web".into(), "db".into()]);
+        s.apply_fail = Some(vec![]);
+    });
+    let id = h.start("r1").await;
+    h.wait(&id, "a failed", |_, hs| {
+        host(hs, "a").state == HostPhase::Failed
+    })
+    .await;
+    h.script("a", |s| {
+        s.digest = "d2".into();
+        s.host_changes = Some(vec!["db".into()]);
+        s.apply_fail = None;
+    });
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: "a".into(),
+        workload: String::new(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (r, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.plan_digest.as_deref(), Some("d2"));
+    assert_eq!(
+        a.runtime.plan_changes,
+        Some(1),
+        "the retry plans what is left"
+    );
+    let [first] = a.runtime.earlier.as_slice() else {
+        panic!("one earlier attempt: {:?}", a.runtime.earlier);
+    };
+    assert_eq!((first.attempt, first.digest.as_str()), (1, "d1"));
+    assert_eq!(first.state, HostPhase::Failed);
+
+    let view = super::view::host(&r, a, &[]);
+    assert_eq!(view.earlier.len(), 1);
+    let total = view.total.expect("a total across attempts");
+    assert_eq!(
+        total.modify, 2,
+        "both modules the rollout changed: {total:?}"
+    );
+    let plan = super::view::rollout_plan(a).unwrap();
+    let modules: Vec<_> = plan.modules.iter().map(|m| m.module.as_str()).collect();
+    assert!(
+        modules.contains(&"web") && modules.contains(&"db"),
+        "{modules:?}"
+    );
+
+    let i = id.clone();
+    let kept = h
+        .store
+        .call(move |db| db.rollouts().plan_of(&i, "a", "d1"))
+        .await
+        .unwrap();
+    assert!(
+        kept.is_some(),
+        "the failed attempt's run still finds its plan"
     );
 }
 

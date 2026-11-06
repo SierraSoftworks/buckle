@@ -142,6 +142,11 @@ impl StepView {
         self.outcome == StepOutcome::Change
     }
 
+    /// Whether `other` is this step in another plan of the same module.
+    pub fn same_task(&self, other: &StepView) -> bool {
+        self.kind == other.kind && self.key == other.key && self.task == other.task
+    }
+
     /// `module/kind[key]`-style display without the module.
     pub fn resource(&self) -> String {
         format!("{}[{}]", self.kind, self.key)
@@ -219,11 +224,140 @@ impl PlanView {
     pub fn changes(&self) -> usize {
         self.steps().filter(|s| s.is_change()).count()
     }
+
+    /// Folds in what an `earlier` plan of the same target changed, so that
+    /// the plan of a retry (or of a later step) still shows what the
+    /// attempts before it applied: a step this plan leaves as it is takes
+    /// the earlier plan's change of it, and steps, modules, handlers and
+    /// removals only the earlier plan holds are added. What this plan
+    /// changes itself is kept as it is.
+    pub fn absorb(&mut self, earlier: &PlanView) {
+        for em in &earlier.modules {
+            let Some(m) = self.modules.iter_mut().find(|m| m.module == em.module) else {
+                if em.steps.iter().any(StepView::is_change) || !em.handlers.is_empty() {
+                    self.modules.push(em.clone());
+                }
+                continue;
+            };
+            for es in em.steps.iter().filter(|s| s.is_change()) {
+                match m.steps.iter_mut().find(|s| s.same_task(es)) {
+                    Some(s) if !s.is_change() => *s = es.clone(),
+                    Some(_) => {}
+                    None => m.steps.push(es.clone()),
+                }
+            }
+            for h in &em.handlers {
+                if !m.handlers.iter().any(|x| x.handler == h.handler) {
+                    m.handlers.push(h.clone());
+                }
+            }
+        }
+        for r in &earlier.removals {
+            if !self.removals.iter().any(|x| x.resource() == r.resource()) {
+                self.removals.push(r.clone());
+            }
+        }
+        for r in &earlier.rehomed {
+            if !self
+                .rehomed
+                .iter()
+                .any(|x| x.from == r.from && x.to == r.to)
+            {
+                self.rehomed.push(r.clone());
+            }
+        }
+        for w in &earlier.warnings {
+            if !self.warnings.contains(w) {
+                self.warnings.push(w.clone());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn step(task: &str, outcome: StepOutcome, summary: &str) -> StepView {
+        StepView {
+            kind: "file".into(),
+            key: format!("/etc/{task}"),
+            task: task.into(),
+            outcome,
+            summary: summary.into(),
+            diff: (outcome == StepOutcome::Change).then_some(DiffKind::Update),
+            ..StepView::default()
+        }
+    }
+
+    fn module(name: &str, steps: Vec<StepView>) -> ModuleView {
+        ModuleView {
+            module: name.into(),
+            steps,
+            ..ModuleView::default()
+        }
+    }
+
+    #[test]
+    fn a_plan_absorbs_what_an_earlier_plan_changed() {
+        use StepOutcome::{Change, NoOp};
+        let earlier = PlanView {
+            modules: vec![
+                module(
+                    "web",
+                    vec![step("a", Change, "first"), step("b", Change, "first")],
+                ),
+                module("db", vec![step("c", Change, "first")]),
+                module("idle", vec![step("d", NoOp, "")]),
+            ],
+            removals: vec![RemovalView {
+                module: "web".into(),
+                kind: "file".into(),
+                key: "/old".into(),
+                cleanup: true,
+                ..RemovalView::default()
+            }],
+            ..PlanView::default()
+        };
+        let mut plan = PlanView {
+            digest: "current".into(),
+            modules: vec![module(
+                "web",
+                vec![
+                    step("a", NoOp, ""),
+                    step("b", Change, "retry"),
+                    step("e", Change, "retry"),
+                ],
+            )],
+            ..PlanView::default()
+        };
+        plan.absorb(&earlier);
+
+        assert_eq!(plan.digest, "current", "it stays the current plan");
+        let summary = |task: &str| {
+            plan.steps()
+                .find(|s| s.task == task)
+                .map(|s| (s.outcome, s.summary.as_str()))
+        };
+        assert_eq!(summary("a"), Some((Change, "first")), "applied before");
+        assert_eq!(summary("b"), Some((Change, "retry")), "still to apply");
+        assert_eq!(summary("e"), Some((Change, "retry")));
+        assert_eq!(summary("c"), Some((Change, "first")), "an earlier module");
+        assert!(
+            plan.modules.iter().all(|m| m.module != "idle"),
+            "a module the earlier plan left alone adds nothing"
+        );
+        assert_eq!(plan.removals.len(), 1);
+        let counts = crate::ChangeCounts::of_plan(&plan);
+        assert_eq!((counts.modify, counts.remove), (4, 1));
+
+        let before = plan.clone();
+        plan.absorb(&earlier);
+        assert_eq!(
+            plan, before,
+            "absorbing the same plan again changes nothing"
+        );
+    }
 
     #[test]
     fn a_plan_round_trips_and_leaves_empty_sections_off_the_wire() {

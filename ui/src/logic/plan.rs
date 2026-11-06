@@ -69,9 +69,14 @@ pub fn plan_tally(plan: &PlanView) -> Tally {
     .sum(Tally::of_steps(plan.steps()))
 }
 
-/// What a host's plan in a rollout changes: from its plan where the server
-/// holds a copy, else from the counts the host reported.
+/// What a host's plan in a rollout changes: everything its attempts applied
+/// when it was planned again (a retry plans only what is left), else from
+/// its plan where the server holds a copy, else from the counts the host
+/// reported.
 pub fn host_tally(h: &RolloutHost, plans: &[PlanGroup]) -> Option<Tally> {
+    if let Some(total) = h.total {
+        return Some(total.into());
+    }
     let digest = h.plan_digest.as_deref()?;
     let held = plans
         .iter()
@@ -89,6 +94,31 @@ pub fn host_tally(h: &RolloutHost, plans: &[PlanGroup]) -> Option<Tally> {
         }
         (None, None) => None,
     }
+}
+
+/// The runs a target had in a rollout, oldest first, for choosing which
+/// one its row shows: `(value, label)` for each earlier attempt (`"0"`,
+/// `"1"`, … into `RolloutHost::earlier`), then `("latest", "Latest")`.
+/// Empty when it had only the one. A target that applied in more than one
+/// step names the step too.
+pub fn attempt_options(h: &RolloutHost) -> Vec<(String, String)> {
+    if h.earlier.is_empty() {
+        return Vec::new();
+    }
+    let steps = h.earlier.iter().any(|a| a.step != h.step);
+    h.earlier
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let label = if steps {
+                format!("Step {} · attempt {}", a.step + 1, a.attempt)
+            } else {
+                format!("Attempt {}", a.attempt)
+            };
+            (i.to_string(), label)
+        })
+        .chain(std::iter::once(("latest".to_owned(), "Latest".to_owned())))
+        .collect()
 }
 
 /// What approving a phase binds: the distinct plans its hosts would apply.
@@ -254,6 +284,61 @@ mod tests {
         assert_eq!(host_tally(&host_entry(None), &[group]), None);
     }
 
+    fn attempt(n: u32, step: u32) -> buckle_api::RolloutAttempt {
+        buckle_api::RolloutAttempt {
+            attempt: n,
+            step,
+            digest: format!("d{n}"),
+            changes: Some(4),
+            removals: Some(0),
+            state: HostRolloutState::Failed,
+            error: None,
+            at: Utc::now(),
+            run_id: None,
+        }
+    }
+
+    #[test]
+    fn a_retried_hosts_tally_is_everything_its_attempts_changed() {
+        let mut h = host_entry(Some("d2"));
+        h.plan_changes = Some(0);
+        h.plan_removals = Some(0);
+        assert!(crate::logic::units::unchanged(&h));
+        h.earlier = vec![attempt(1, 0)];
+        h.total = Some(buckle_api::ChangeCounts {
+            modify: 4,
+            ..Default::default()
+        });
+        assert_eq!(host_tally(&h, &[]).map(|t| t.modify), Some(4));
+        assert!(
+            !crate::logic::units::unchanged(&h),
+            "the rollout changed it, if not in its latest attempt"
+        );
+    }
+
+    #[test]
+    fn attempts_are_offered_oldest_first_then_the_latest() {
+        let labels = |earlier: Vec<buckle_api::RolloutAttempt>, step: u32| {
+            let mut h = host_entry(Some("d"));
+            h.earlier = earlier;
+            h.step = step;
+            attempt_options(&h)
+                .into_iter()
+                .map(|(_, l)| l)
+                .collect::<Vec<_>>()
+        };
+        assert!(labels(vec![], 0).is_empty(), "one run needs no choice");
+        assert_eq!(
+            labels(vec![attempt(1, 0), attempt(2, 0)], 0),
+            ["Attempt 1", "Attempt 2", "Latest"]
+        );
+        assert_eq!(
+            labels(vec![attempt(1, 0)], 1),
+            ["Step 1 · attempt 1", "Latest"],
+            "an earlier step is named"
+        );
+    }
+
     fn host_entry(digest: Option<&str>) -> RolloutHost {
         RolloutHost {
             host: "pi-1".into(),
@@ -278,6 +363,8 @@ mod tests {
             preview: false,
             drifted_from: None,
             removal: false,
+            earlier: vec![],
+            total: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,
@@ -338,6 +425,8 @@ mod tests {
             preview: false,
             drifted_from: None,
             removal: false,
+            earlier: vec![],
+            total: None,
             needs_approval: true,
             needs_attention: false,
             error_detail: None,

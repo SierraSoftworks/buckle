@@ -170,6 +170,21 @@ fn is_zero(n: &u32) -> bool {
 }
 
 impl ChangeCounts {
+    /// What one plan changes on its host: its steps by shape, and the
+    /// removals that run (one that only forgets its record changes nothing).
+    pub fn of_plan(plan: &PlanView) -> Self {
+        let removals = ChangeCounts {
+            remove: plan.removals.iter().filter(|r| r.cleanup).count() as u32,
+            ..Default::default()
+        };
+        plan.steps().map(Self::of_step).fold(removals, Self::sum)
+    }
+
+    /// Nothing changes.
+    pub fn is_empty(&self) -> bool {
+        self.create + self.modify + self.remove == 0
+    }
+
     /// One host's version of a step; a step already in place counts for nothing.
     fn of_step(s: &StepView) -> Self {
         let mut c = ChangeCounts::default();

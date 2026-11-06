@@ -432,6 +432,19 @@
   &__run {
     margin-top: 0.75rem;
   }
+
+  // The subhead with, when it was planned again, which attempt's run shows.
+  &__run-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1rem;
+    margin-bottom: 0.5rem;
+
+    .subhead {
+      margin: 0;
+    }
+  }
 }
 
 // A host's way through a rollout: state segments on a bar, its events as

@@ -7,8 +7,8 @@
 use super::bake::{self, BakeWindow};
 use super::link::HostLink;
 use super::model::{
-    GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, RebootWait, RolloutAction,
-    RolloutHostRecord, RolloutRecord, RolloutRuntime, STRAGGLERS,
+    GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, PlanAttempt, RebootWait,
+    RolloutAction, RolloutHostRecord, RolloutRecord, RolloutRuntime, STRAGGLERS,
 };
 use super::stages;
 use super::view;
@@ -3302,6 +3302,9 @@ impl Controller {
                     HostPhase::Healthy => "again",
                     _ => "with whatever it plans now",
                 };
+                if state != HostPhase::Held {
+                    self.keep_applied_plan(ri, hi);
+                }
                 self.command_audit(
                     actor,
                     "rollout.host.force",
@@ -4394,6 +4397,7 @@ impl Controller {
     /// is also released to apply (a retry); one still waiting to start (to
     /// plan, planned) only gets a fresh plan and keeps its place.
     fn replan(&mut self, ri: usize, hi: usize, actor: &str) {
+        self.keep_applied_plan(ri, hi);
         {
             let h = &mut self.live[ri].hosts[hi];
             let retry = !matches!(h.state, HostPhase::PlanPending | HostPhase::Planned);
@@ -4417,6 +4421,38 @@ impl Controller {
         self.set_host_state(ri, hi, HostPhase::PlanPending, "re-planning");
         self.request_plan(ri, hi);
         self.unpause_if_cleared(ri, actor);
+    }
+
+    /// Keeps the plan row `hi` applied in its current attempt (or step)
+    /// before it is planned again, so that the rollout still shows what it
+    /// changed: a retry plans only what is left to do. A row whose attempt
+    /// never sent its Apply changed nothing, and keeps nothing.
+    fn keep_applied_plan(&mut self, ri: usize, hi: usize) {
+        let now = self.now();
+        if self.live[ri].record.runtime.action.is_some() {
+            return;
+        }
+        let h = &mut self.live[ri].hosts[hi];
+        if h.runtime.apply_started_at.is_none() {
+            return;
+        }
+        let Some(digest) = h.plan_digest.clone() else {
+            return;
+        };
+        h.runtime.earlier.push(PlanAttempt {
+            attempt: h.runtime.attempts + 1,
+            stage: h.runtime.stage,
+            digest,
+            plan: h.plan.clone(),
+            changes: h.runtime.plan_changes,
+            removals: h.runtime.plan_removals,
+            state: h.state,
+            error: h.runtime.error.clone(),
+            at: now,
+        });
+        // Its Apply is accounted for: a later attempt that fails before
+        // applying keeps nothing more.
+        h.runtime.apply_started_at = None;
     }
 
     fn pause(&mut self, ri: usize, kind: &str, reason: String, host: Option<String>) {
@@ -5023,6 +5059,7 @@ impl Controller {
             self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
             return;
         };
+        self.keep_applied_plan(ri, hi);
         let (host, from) = {
             let h = &mut self.live[ri].hosts[hi];
             let from = h.runtime.stage;
@@ -7013,13 +7050,17 @@ impl Controller {
                     for h in &hosts {
                         if let Some(l) = self.live.iter().find(|l| l.record.id == h.rollout) {
                             let mut host = view::host(&l.record, h, &l.approvals);
-                            host.run_id = run_ids.get(&h.rollout).and_then(|ids| {
+                            let ids = run_ids.get(&h.rollout);
+                            host.run_id = ids.and_then(|ids| {
                                 ids.get(
                                     &h.host,
                                     host.workload.as_deref(),
                                     host.plan_digest.as_deref(),
                                 )
                             });
+                            for a in &mut host.earlier {
+                                a.run_id = ids.and_then(|ids| ids.of_plan(&h.host, &a.digest));
+                            }
                             self.events.publish(LiveEvent::RolloutHostChanged {
                                 rollout_id: h.rollout.clone(),
                                 host,

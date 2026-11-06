@@ -363,6 +363,29 @@ impl<'c> Rollouts<'c> {
         raw.map(h_record).transpose()
     }
 
+    /// The plan `plan_digest` of `host` in `rollout`: a row's current plan,
+    /// else one a row applied in an earlier attempt or step.
+    pub fn plan_of(
+        &self,
+        rollout: &str,
+        host: &str,
+        plan_digest: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        if let Some(plan) = self
+            .host_by_plan(rollout, host, plan_digest)?
+            .and_then(|h| h.plan)
+        {
+            return Ok(Some(plan));
+        }
+        Ok(self
+            .hosts(rollout)?
+            .into_iter()
+            .filter(|h| h.host == host)
+            .flat_map(|h| h.runtime.earlier)
+            .find(|a| a.digest == plan_digest)
+            .and_then(|a| a.plan))
+    }
+
     /// The rollout whose plan `plan_digest` `host` is about to apply or
     /// applying: the newest one holding that plan for the host in a state
     /// that leads to an apply. Used to attach a run to its rollout.
