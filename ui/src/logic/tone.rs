@@ -130,17 +130,10 @@ pub fn block_look(entry: &RolloutHost, host: Option<&HostSummary>) -> BlockLook 
         classes.push("block--cluster");
         label = format!("cluster, {label}");
     }
-    // Nothing to change: solid grey, so the eye lands on what moves. A
-    // unit that failed or was held keeps its colour.
-    if super::units::unchanged(entry)
-        && !entry.needs_attention
-        && !matches!(
-            entry.state,
-            HostRolloutState::Failed | HostRolloutState::Held | HostRolloutState::RolledBack
-        )
-    {
-        classes.push("block--unchanged");
-        label.push_str(", unchanged");
+    // Nothing to change: drawn by its state like any other (an unchanged
+    // unit that is up to date reads healthy), and said so for readers.
+    if super::units::unchanged(entry) {
+        label.push_str(", plan changes nothing");
     }
     if entry.removal {
         classes.push("block--removal");

@@ -536,7 +536,7 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
                 c.executor = Some("pi-1".into());
                 c
             },
-            // Nothing changes for these two: grey, and done at once.
+            // Nothing changes for these two: done at once.
             unchanged(placement(
                 "home-nomad",
                 "postgresql",

@@ -79,7 +79,7 @@ describe("the rollout pipeline", () => {
     await close();
   });
 
-  test("workloads follow the hosts in a section per cluster, waiting ones hollow and unchanged ones grey", async () => {
+  test("workloads follow the hosts in a section per cluster, waiting ones hollow and unchanged ones by their state", async () => {
     const { page, close } = await open("/rollouts/42");
     const home = page.locator('.stage[data-stage="home"]');
     const section = home.locator('.stage__cluster[data-cluster="home-nomad"]');
@@ -90,7 +90,10 @@ describe("the rollout pipeline", () => {
     assert.equal(order.indexOf("atuin"), order.length - 4, "workloads after every host");
     const atuin = section.locator('a.block[data-workload="atuin"]');
     assert.match(await atuin.textContent(), /on home-nomad.*via pi-1/s);
-    assert.equal(await section.locator("a.block--unchanged").count(), 2, "postgresql and paste change nothing");
+    // postgresql and paste change nothing: drawn by their state, and counted.
+    for (const w of ["postgresql", "paste"]) {
+      assert.match(await section.locator(`a.block[data-workload="${w}"]`).getAttribute("class"), /block--healthy/);
+    }
     assert.match(await home.locator(".stage__meta").first().textContent(), /2 unchanged/);
     // A workload that left the configuration is removed: struck through, and said so.
     const grey = section.locator('a.block[data-workload="grey"]');

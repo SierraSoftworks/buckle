@@ -328,13 +328,6 @@
     );
   }
 
-  // Its plan changes nothing: solid grey whatever its state, so the eye
-  // lands on what moves.
-  &--unchanged {
-    background: var(--unchanged);
-    border-color: transparent;
-  }
-
   &--waived::after {
     content: "";
     position: absolute;

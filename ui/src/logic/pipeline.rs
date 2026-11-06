@@ -83,7 +83,7 @@ pub struct StageCounts {
     pub needs_approval: usize,
     pub skipped: usize,
     pub rolled_back: usize,
-    /// Units whose plan changes nothing (drawn grey).
+    /// Units whose plan changes nothing.
     pub unchanged: usize,
 }
 
