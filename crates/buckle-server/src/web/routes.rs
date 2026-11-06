@@ -1189,10 +1189,11 @@ async fn run_action(
     state: Data,
     admin: Administrative,
     path: web::Path<(String, String, String)>,
-    body: Option<web::Json<ActionRequest>>,
+    body: Option<web::Json<buckle_api::RunActionRequest>>,
 ) -> ApiResult {
     let (id, module, action) = path.into_inner();
-    let note = body.map(|b| b.into_inner().note).unwrap_or_default();
+    let body = body.map(|b| b.into_inner()).unwrap_or_default();
+    let note = body.note;
     let summary = summary_or_404(&state, &id).await?;
     let revision = summary.applied_revision.clone().ok_or_else(|| {
         ApiError::conflict(format!(
@@ -1230,6 +1231,8 @@ async fn run_action(
             info.label
         )));
     }
+    // Only an action offering the choice takes one.
+    let instances = body.instances.filter(|_| info.instances.is_some());
     let run_id = state
         .controller
         .command(
@@ -1239,6 +1242,7 @@ async fn run_action(
                 module,
                 action,
                 revision,
+                instances,
                 note,
             },
         )
@@ -1341,6 +1345,7 @@ async fn start_action_rollout(
                     label: found.action.label.clone(),
                     confirm: found.action.confirm,
                     selector: raw,
+                    instances: body.instances.filter(|_| found.action.instances.is_some()),
                 },
                 targets,
                 note: body.note,

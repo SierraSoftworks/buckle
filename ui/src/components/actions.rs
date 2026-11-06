@@ -2,13 +2,38 @@
 //! rest in its menu. A click runs the action, or asks first when it wants
 //! confirmation, with a note for the audit log.
 
-use buckle_api::ActionInfo;
+use buckle_api::{ActionInfo, ActionInstances};
 use yew::prelude::*;
 
 use super::split_button::{MenuItem, SplitButton};
-use super::{Confirm, use_toast};
+use super::{Confirm, Segmented, use_toast};
 use crate::api;
-use crate::logic::actions::{Click, click, label, spans_modules};
+use crate::logic::actions::{
+    Click, INSTANCE_CHOICES, click, label, parse_instances, spans_modules,
+};
+
+#[derive(Properties, PartialEq)]
+pub struct InstancesPickerProps {
+    pub value: ActionInstances,
+    pub on_change: Callback<ActionInstances>,
+}
+
+/// Where an action offering the choice runs: one allocation or every one.
+#[function_component(InstancesPicker)]
+pub fn instances_picker(props: &InstancesPickerProps) -> Html {
+    let options = INSTANCE_CHOICES
+        .iter()
+        .map(|(v, l)| (AttrValue::from(v.as_str()), AttrValue::from(*l)))
+        .collect::<Vec<_>>();
+    html! {
+        <div class="field">
+            <span class="field__label">{ "Runs in" }</span>
+            <Segmented label="Where it runs" testid="action-instances" {options}
+                value={AttrValue::from(props.value.as_str())}
+                on_change={props.on_change.reform(|v: AttrValue| parse_instances(&v))} />
+        </div>
+    }
+}
 use crate::logic::controls::TargetAction;
 
 /// A target's actions as split button items, in declaration order: named
@@ -169,13 +194,16 @@ pub struct AnyTargetActions {
 pub fn use_actions(on_started: Callback<()>) -> AnyTargetActions {
     let toast = use_toast();
     let ask = use_state(|| None::<(String, ActionInfo)>);
+    let chosen = use_state(|| None::<ActionInstances>);
     let busy = use_state(|| false);
     let error = use_state(|| None::<String>);
 
-    // Runs an action with the note given (empty when it asks no confirmation).
+    // Runs an action with the note given (empty when it asks no
+    // confirmation), where the dialog says when it offers the choice.
     let start = {
-        let (ask, busy, error) = (ask.clone(), busy.clone(), error.clone());
+        let (ask, busy, error, chosen) = (ask.clone(), busy.clone(), error.clone(), chosen.clone());
         Callback::from(move |(id, a, note): (String, ActionInfo, String)| {
+            let instances = a.instances.map(|d| (*chosen).unwrap_or(d));
             let (ask, busy, error, toast, on_started) = (
                 ask.clone(),
                 busy.clone(),
@@ -185,7 +213,7 @@ pub fn use_actions(on_started: Callback<()>) -> AnyTargetActions {
             );
             busy.set(true);
             wasm_bindgen_futures::spawn_local(async move {
-                let result = api::run_action(&id, &a.module, &a.name, note).await;
+                let result = api::run_action(&id, &a.module, &a.name, note, instances).await;
                 busy.set(false);
                 match result {
                     Ok(_) => {
@@ -200,10 +228,12 @@ pub fn use_actions(on_started: Callback<()>) -> AnyTargetActions {
         })
     };
     let on_action = {
-        let (ask, error, start) = (ask.clone(), error.clone(), start.clone());
+        let (ask, error, start, chosen) =
+            (ask.clone(), error.clone(), start.clone(), chosen.clone());
         Callback::from(move |(id, a): (String, ActionInfo)| match click(&a) {
-            Click::Confirm => {
+            Click::Confirm | Click::Choose => {
                 error.set(None);
+                chosen.set(a.instances);
                 ask.set(Some((id, a)));
             }
             Click::Run => start.emit((id, a, String::new())),
@@ -218,15 +248,23 @@ pub fn use_actions(on_started: Callback<()>) -> AnyTargetActions {
             let ask = ask.clone();
             Callback::from(move |_| ask.set(None))
         };
+        let picker = a.instances.map(|d| {
+            let chosen = chosen.clone();
+            html! {
+                <InstancesPicker value={(*chosen).unwrap_or(d)}
+                    on_change={Callback::from(move |v| chosen.set(Some(v)))} />
+            }
+        });
         html! {
-            <Confirm title={format!("{} on {id}", a.label)} confirm_label={a.label.clone()} danger=true
-                note_required=true note_placeholder="Why, for the audit log" busy={*busy}
+            <Confirm title={format!("{} on {id}", a.label)} confirm_label={a.label.clone()} danger={a.confirm}
+                note=true note_required={a.confirm} note_placeholder="Why, for the audit log" busy={*busy}
                 error={(*error).clone()} on_confirm={confirm} on_cancel={cancel}>
                 <p>
                     <span class="badge mono">{ format!("{}/{}", a.module, a.name) }</span>{ " " }
                     <span class="badge">{ a.kind.clone() }</span>
                 </p>
                 if let Some(d) = &a.description { <p>{ d.clone() }</p> }
+                { picker.unwrap_or_default() }
                 <p class="muted">{ "It runs now, from the applied revision; its run appears below." }</p>
             </Confirm>
         }

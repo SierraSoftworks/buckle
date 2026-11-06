@@ -21,6 +21,7 @@ chrono.workspace = true
 ciborium.workspace = true
 filt-rs.workspace = true
 futures.workspace = true
+hcl-rs.workspace = true
 hex.workspace = true
 hmac.workspace = true
 human-errors.workspace = true

@@ -141,6 +141,7 @@ impl Shared {
                 action,
                 revision,
                 traceparent,
+                instances,
                 ..
             } => {
                 let span = tracing::info_span!(
@@ -153,9 +154,11 @@ impl Shared {
                     buckle.action_id = %action_id,
                 );
                 set_parent_from_traceparent(&span, traceparent.as_deref());
-                self.target_action(target, workload, action_id, module, action, revision)
-                    .instrument(span)
-                    .await;
+                self.target_action(
+                    target, workload, action_id, module, action, instances, revision,
+                )
+                .instrument(span)
+                .await;
                 None
             }
             other => {
@@ -344,6 +347,7 @@ impl Shared {
     }
 
     /// Runs an action of a workload on the cluster and reports it (durably).
+    #[allow(clippy::too_many_arguments)]
     async fn target_action(
         &self,
         target: String,
@@ -351,6 +355,7 @@ impl Shared {
         action_id: String,
         module: String,
         action: String,
+        instances: Option<buckle_core::engine::task_actions::Instances>,
         revision: RevisionId,
     ) {
         let started = Instant::now();
@@ -370,7 +375,10 @@ impl Shared {
                         action_id: Some(action_id.clone()),
                     },
                 ));
-                let outcome = self.executor.run_action(&a, &module, &action, tx).await;
+                let outcome = self
+                    .executor
+                    .run_action(&a, &module, &action, instances, tx)
+                    .await;
                 let _ = forwarder.await;
                 outcome
             }

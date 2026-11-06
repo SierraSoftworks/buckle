@@ -277,7 +277,9 @@ signs); delete `retired.key` and restart again once a TTL has passed.
 binding rule per purpose; the agent logs in at `/v1/acl/login` with auth method `buckle`. Created
 once with a management token, alongside the `buckle-read`, `buckle-deploy` and `buckle-drain`
 ACL policies the rules bind to. Executors plan and apply with `deploy` (Nomad's job plan needs
-`submit-job`; it has no plan-only capability) and run health checks with `read`. Health reads
+`submit-job`; it has no plan-only capability), run workload actions with `deploy` too (a task
+`action` block needs `alloc-exec`, which namespace `write` grants, and `alloc-node-exec` for
+`raw_exec` tasks) and run health checks with `read`. Health reads
 Buckle's index variable, which a namespace `read` policy does not grant, so `buckle-read` adds
 variable reads:
 

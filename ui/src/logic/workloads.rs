@@ -210,6 +210,7 @@ mod tests {
             description: None,
             confirm: true,
             implicit: true,
+            instances: None,
         }
     }
 

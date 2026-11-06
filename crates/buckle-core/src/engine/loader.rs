@@ -152,11 +152,24 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
                     }
                 }
             }
+            let found = config
+                .jobs()
+                .filter_map(|j| j.file.as_deref())
+                .filter(|f| {
+                    files
+                        .iter()
+                        .any(|known| known.as_path() == std::path::Path::new(f))
+                })
+                .filter_map(|f| std::fs::read_to_string(files_dir.join(f)).ok())
+                .flat_map(|text| super::task_actions::discover(&text))
+                .collect();
+            let task_actions = super::task_actions::name(&config, found);
             workloads.push(LoadedWorkload {
                 config,
                 source: Arc::new(DirSource::new(files_dir)),
                 files,
                 templates,
+                task_actions,
             });
         }
     }

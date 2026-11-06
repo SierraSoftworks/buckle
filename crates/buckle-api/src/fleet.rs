@@ -159,9 +159,36 @@ pub struct ActionInfo {
     /// Ask the operator to confirm, with a note for the audit log.
     #[serde(default)]
     pub confirm: bool,
-    /// An implicit workload action (restart, stop, roll back).
+    /// An implicit workload action (restart, stop, roll back, a Nomad
+    /// task's `action` block).
     #[serde(default)]
     pub implicit: bool,
+    /// Set where the operator may pick which of the workload's instances it
+    /// runs in (a Nomad task action whose group may run several
+    /// allocations): the default. Absent: it runs where it always does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<ActionInstances>,
+}
+
+/// Which of a workload's instances (a Nomad task group's running
+/// allocations) an action runs in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionInstances {
+    /// One of them, picked by Buckle.
+    #[default]
+    Any,
+    /// Each of them, one after another.
+    All,
+}
+
+impl ActionInstances {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionInstances::Any => "any",
+            ActionInstances::All => "all",
+        }
+    }
 }
 
 /// An action and the targets offering it now

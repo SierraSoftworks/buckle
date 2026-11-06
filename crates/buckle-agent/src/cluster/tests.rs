@@ -83,6 +83,15 @@ fn workload_files(name: &str, yaml: &str) -> Vec<(String, String)> {
 }
 
 fn revision(id: &str, files: &[(String, String)]) -> Arc<Revision> {
+    revision_with(id, files, |_| {})
+}
+
+/// [`revision`], edited after it loads.
+fn revision_with(
+    id: &str,
+    files: &[(String, String)],
+    edit: impl FnOnce(&mut Revision),
+) -> Arc<Revision> {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("buckle.yaml"), FLEET).unwrap();
     for (path, content) in files {
@@ -92,7 +101,9 @@ fn revision(id: &str, files: &[(String, String)]) -> Arc<Revision> {
     }
     // The loader reads files lazily: keep the directory for the test's life.
     let path = dir.keep();
-    Arc::new(buckle_core::engine::loader::load_dir(&path, RevisionId::new(id)).unwrap())
+    let mut rev = buckle_core::engine::loader::load_dir(&path, RevisionId::new(id)).unwrap();
+    edit(&mut rev);
+    Arc::new(rev)
 }
 
 fn assignment(revision: Arc<Revision>, identity: ClusterIdentity, key: u8) -> Assignment {
@@ -820,11 +831,27 @@ fn assignments_keep_a_few_revisions_per_target() {
 // ------------------------------------------------------------ actions
 
 async fn run_action(ex: &Executor, a: &Assignment, workload: &str, action: &str) -> ApplyOutcome {
+    run_action_on(ex, a, workload, action, None).await.0
+}
+
+/// Runs an action where `instances` says, with the events it sent.
+async fn run_action_on(
+    ex: &Executor,
+    a: &Assignment,
+    workload: &str,
+    action: &str,
+    instances: Option<Instances>,
+) -> (ApplyOutcome, Vec<ApplyEvent>) {
     let (tx, mut rx) = mpsc::channel(256);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let outcome = ex.run_action(a, workload, action, tx).await;
-    drain.await.unwrap();
-    outcome
+    let drain = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(e) = rx.recv().await {
+            seen.push(e);
+        }
+        seen
+    });
+    let outcome = ex.run_action(a, workload, action, instances, tx).await;
+    (outcome, drain.await.unwrap())
 }
 
 fn with_backfill() -> Vec<(String, String)> {
@@ -919,6 +946,116 @@ async fn an_implicit_action_needs_a_registered_job() {
             .unwrap_or_default()
             .contains("no job registered")
     );
+}
+
+/// `paste`, whose job offers `stats` on its `paste` task when `offered`
+/// (the API form the fake parses), with the task action its HCL would
+/// declare: `choice` where its group may run several allocations.
+fn with_task_action(offered: bool, choice: bool) -> Assignment {
+    let mut files = workload_files("paste", "");
+    let actions = if offered {
+        serde_json::json!([{"Name": "stats", "Command": "/stats"}])
+    } else {
+        serde_json::json!([])
+    };
+    files[1].1 = serde_json::json!({
+        "ID": "paste", "Type": "service",
+        "TaskGroups": [{"Name": "api", "Count": 2, "Tasks": [{"Name": "paste", "Config": {"image": "paste:1"}, "Actions": actions}]}],
+    })
+    .to_string();
+    let rev = revision_with("r1", &files, |rev| {
+        rev.workloads[0].task_actions = vec![TaskAction {
+            name: "stats".into(),
+            job: "paste".into(),
+            group: "api".into(),
+            task: "paste".into(),
+            action: "stats".into(),
+            command: Some("/stats".into()),
+            instances: Instances::Any,
+            choice,
+        }];
+    });
+    assignment(rev, ClusterIdentity::BuckleJwt, 7)
+}
+
+#[rstest]
+#[case::default(None, true, 1)]
+#[case::any(Some(Instances::Any), true, 1)]
+#[case::all(Some(Instances::All), true, 2)]
+#[case::no_choice(Some(Instances::All), false, 1)]
+#[tokio::test]
+async fn task_actions_run_in_one_or_every_allocation(
+    #[case] instances: Option<Instances>,
+    #[case] choice: bool,
+    #[case] runs: usize,
+) {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = with_task_action(true, choice);
+    assert!(apply(&ex, &a).await.succeeded);
+    fake.allocations("default", "paste", 2);
+
+    let (outcome, events) = run_action_on(&ex, &a, "paste", "stats", instances).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    let steps = &outcome.module_results[0].steps;
+    assert_eq!(steps.len(), runs);
+    for (i, step) in steps.iter().enumerate() {
+        let alloc = format!("alloc-{}", i + 1);
+        assert_eq!(step.kind, "nomad.action");
+        assert!(
+            step.output.as_deref().unwrap_or_default().contains(&alloc),
+            "{step:?}"
+        );
+    }
+    let sockets = fake
+        .requests()
+        .into_iter()
+        .filter(|(m, _)| m == "WS")
+        .count();
+    assert_eq!(sockets, runs);
+    assert!(
+        events.iter().any(|e| matches!(e, ApplyEvent::StepProgress { message, .. } if message.starts_with("ran stats"))),
+        "each line shows while it runs: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_task_action_that_exits_non_zero_fails_with_its_output_scrubbed() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = with_task_action(true, true);
+    assert!(apply(&ex, &a).await.succeeded);
+    fake.task_action("stats", &format!("connecting with {SECRET}\nrefused\n"), 2);
+
+    let outcome = run_action(&ex, &a, "paste", "stats").await;
+    assert!(!outcome.succeeded);
+    assert!(outcome.error.unwrap_or_default().contains("exited 2"));
+    let output = outcome.module_results[0].steps[0]
+        .output
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        output.contains("refused") && !output.contains(SECRET),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn a_task_action_the_registered_job_lacks_does_not_run() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = with_task_action(false, true);
+    assert!(apply(&ex, &a).await.succeeded);
+
+    let outcome = run_action(&ex, &a, "paste", "stats").await;
+    assert!(!outcome.succeeded);
+    assert!(
+        outcome
+            .error
+            .unwrap_or_default()
+            .contains("no action stats"),
+    );
+    assert!(fake.requests().iter().all(|(m, _)| m != "WS"));
 }
 
 /// A plan scoped to one workload placement plans that workload alone and

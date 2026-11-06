@@ -2824,6 +2824,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
             traceparent,
             target: _,
             workload: _,
+            instances: _,
         } => Op::Action {
             action_id,
             module,

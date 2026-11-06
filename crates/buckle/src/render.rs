@@ -838,6 +838,7 @@ mod tests {
             summary: format!("create {id}"),
             state,
             result: matches!(state, StepState::Changed).then(|| format!("wrote {id}")),
+            output: None,
             started_at: None,
             finished_at: None,
             duration_ms: matches!(

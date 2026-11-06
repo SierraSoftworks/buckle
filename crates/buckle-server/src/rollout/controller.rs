@@ -191,6 +191,8 @@ pub enum Command {
         module: String,
         action: String,
         revision: String,
+        /// Where it runs, for an action offering the choice.
+        instances: Option<buckle_api::ActionInstances>,
         note: String,
     },
     /// Move cluster `target`'s lease to `host`, a connected host that may
@@ -2390,6 +2392,7 @@ impl Controller {
     /// Starts an operator's action on `target` (see [`Command::RunAction`]):
     /// refused while the target is applying in a rollout, paused, offline
     /// (a cluster: without a connected executor) or running another action.
+    #[allow(clippy::too_many_arguments)]
     async fn run_action(
         &mut self,
         actor: &str,
@@ -2397,6 +2400,7 @@ impl Controller {
         module: String,
         action: String,
         revision: String,
+        instances: Option<buckle_api::ActionInstances>,
         note: String,
     ) -> Result<String, CommandError> {
         let applying = self.live.iter().any(|l| {
@@ -2491,6 +2495,7 @@ impl Controller {
             traceparent: traceparent_of(&span).unwrap_or_default(),
             target: String::new(),
             workload: String::new(),
+            instances: instances.map(|i| i.as_str().to_owned()).unwrap_or_default(),
         }));
         self.outbox.push(match record.kind {
             TargetKind::Host => Out::Msg(session, Box::new(m)),
@@ -2505,17 +2510,26 @@ impl Controller {
             TargetKind::Host => "host",
             TargetKind::Cluster | TargetKind::Workload => "target",
         };
-        let message = if note.is_empty() {
-            format!("{actor} ran {label} on {target}")
-        } else {
-            format!("{actor} ran {label} on {target}: {note}")
+        let place = match instances {
+            Some(buckle_api::ActionInstances::All) => " (every instance)",
+            Some(buckle_api::ActionInstances::Any) => " (one instance)",
+            None => "",
         };
+        let message = if note.is_empty() {
+            format!("{actor} ran {label} on {target}{place}")
+        } else {
+            format!("{actor} ran {label} on {target}{place}: {note}")
+        };
+        let mut detail = serde_json::json!({"module": label.split('/').next(), "action": label, "note": note, "run": run_id});
+        if let Some(i) = instances {
+            detail["instances"] = serde_json::json!(i.as_str());
+        }
         self.audit(
             actor,
             &format!("{noun}.action.run"),
             &target,
             message,
-            serde_json::json!({"module": label.split('/').next(), "action": label, "note": note, "run": run_id}),
+            detail,
             trace_id_of(&span),
         );
         Ok(run_id)
@@ -2791,6 +2805,10 @@ impl Controller {
                 traceparent: traceparent_of(&span).unwrap_or_default(),
                 target: String::new(),
                 workload,
+                instances: action
+                    .instances
+                    .map(|i| i.as_str().to_owned())
+                    .unwrap_or_default(),
             }),
         );
     }
@@ -2878,9 +2896,10 @@ impl Controller {
                 module,
                 action,
                 revision,
+                instances,
                 note,
             } => {
-                self.run_action(actor, target, module, action, revision, note)
+                self.run_action(actor, target, module, action, revision, instances, note)
                     .await
             }
             Command::Start { revision, note } => self.start(&revision, actor, &note).await,

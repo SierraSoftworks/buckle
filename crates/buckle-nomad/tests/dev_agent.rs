@@ -9,7 +9,7 @@ use buckle_core::health::HealthStatus;
 use buckle_core::plan::{Diff, Planned};
 use buckle_core::secrets::{InstallKey, Rendered};
 use buckle_nomad::primitives::*;
-use buckle_nomad::{Nomad, Removal, Workload, health, index, stamps};
+use buckle_nomad::{Nomad, Removal, Workload, actions, health, index, stamps};
 use std::sync::Arc;
 
 fn nomad() -> Option<Nomad> {
@@ -297,4 +297,91 @@ capability {
     assert_eq!(found.len(), 1);
     assert!(found[0].id.is_some());
     found[0].remove(&cx, Removal::Purge).await.unwrap();
+}
+
+/// A task's `action` block runs in its allocation over Nomad's action
+/// WebSocket: output and exit code come back, and the spec Buckle reads
+/// names the same action.
+#[tokio::test]
+async fn a_task_action_runs_in_an_allocation() {
+    let nomad = nomad_or_skip!();
+    let cx = cx(&nomad, "it-action", "r1");
+    let hcl = JOB.replace("JOB_ID", "buckle-it-action").replace(
+        "      resources {",
+        r#"      action "hello" {
+        command = "/bin/sh"
+        args    = ["-c", "echo hello; echo from-stderr >&2"]
+      }
+      action "fail" {
+        command = "/bin/sh"
+        args    = ["-c", "echo nope; exit 3"]
+      }
+      resources {"#,
+    );
+    let found = buckle_core::engine::task_actions::discover(&hcl);
+    assert_eq!(
+        found.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        ["hello", "fail"]
+    );
+    let spec = JobSpec {
+        hcl,
+        ..job("buckle-it-action", "3600")
+    };
+    let w = Workload::new("it", vec![Primitive::Job(spec)]);
+    w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
+
+    let id = "buckle-it-action";
+    assert!(
+        actions::defines(&nomad, "default", id, "sleep", "hello")
+            .await
+            .unwrap()
+    );
+    let allocs = actions::running_allocations(&nomad, "default", id, "api")
+        .await
+        .unwrap();
+    assert_eq!(allocs.len(), 1, "{allocs:?}");
+    let mut lines = Vec::new();
+    let run = actions::run_task(
+        &nomad,
+        "default",
+        id,
+        "sleep",
+        "hello",
+        &allocs[0],
+        4096,
+        &mut |l| lines.push(l.to_owned()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.exit_code, 0, "{}", run.output);
+    assert!(
+        run.output.contains("hello") && run.output.contains("from-stderr"),
+        "{}",
+        run.output
+    );
+    assert!(lines.iter().any(|l| l == "hello"), "{lines:?}");
+
+    let failed = actions::run_task(
+        &nomad,
+        "default",
+        id,
+        "sleep",
+        "fail",
+        &allocs[0],
+        4096,
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed.exit_code, 3);
+    assert!(failed.output.contains("nope"), "{}", failed.output);
+
+    Orphan {
+        key: ObjectKey::new(Kind::Job, "default", id),
+        module: "it".into(),
+        id: None,
+    }
+    .remove(&cx, Removal::Purge)
+    .await
+    .unwrap();
 }

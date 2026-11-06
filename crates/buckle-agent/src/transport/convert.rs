@@ -237,6 +237,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             traceparent: non_empty(a.traceparent),
             target: non_empty(a.target),
             workload: non_empty(a.workload),
+            instances: buckle_core::engine::task_actions::Instances::parse(&a.instances),
         },
         Msg::Ping(_) => Instruction::Ping,
         Msg::Upgrade(u) => Instruction::Upgrade {

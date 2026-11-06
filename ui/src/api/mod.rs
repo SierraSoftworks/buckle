@@ -348,12 +348,13 @@ pub async fn run_action(
     module: &str,
     action: &str,
     note: String,
+    instances: Option<buckle_api::ActionInstances>,
 ) -> Result<ActionStarted, ApiError> {
-    demo!(demo_store::run_action(id, module, action, &note));
+    demo!(demo_store::run_action(id, module, action, &note, instances));
     write(
         Method::Post,
         &format!("/hosts/{}/actions/{}/{}", enc(id), enc(module), enc(action)),
-        Some(&ActionRequest { note }),
+        Some(&buckle_api::RunActionRequest { note, instances }),
     )
     .await
 }

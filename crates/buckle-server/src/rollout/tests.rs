@@ -747,6 +747,7 @@ impl Harness {
                 label: "Upgrade packages".into(),
                 confirm,
                 selector: None,
+                instances: None,
             },
             targets: targets
                 .iter()
@@ -4964,6 +4965,7 @@ async fn an_action_is_refused_while_its_target_applies_in_a_rollout() {
             module: "m".into(),
             action: "restart".into(),
             revision: "r1".into(),
+            instances: None,
             note: String::new(),
         })
         .await
@@ -5167,6 +5169,7 @@ async fn a_cluster_action_rollout_runs_on_its_workloads_placement(#[case] no_wor
                 label: "Restart".into(),
                 confirm: false,
                 selector: None,
+                instances: Some(buckle_api::ActionInstances::All),
             },
             targets: BTreeMap::from([(CLUSTER.to_string(), "r1".to_string())]),
             note: String::new(),
@@ -5189,6 +5192,7 @@ async fn a_cluster_action_rollout_runs_on_its_workloads_placement(#[case] no_wor
         (sent.target.as_str(), sent.workload.as_str()),
         (CLUSTER, "postgres")
     );
+    assert_eq!(sent.instances, "all", "the operator's pick travels with it");
 }
 
 #[rstest::rstest]

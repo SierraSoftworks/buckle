@@ -1,7 +1,7 @@
 //! How a target's actions (`HostDetail.actions`) are offered: which ones a
 //! module head shows, how each is labelled, and what a click does.
 
-use buckle_api::{ActionInfo, FleetAction};
+use buckle_api::{ActionInfo, ActionInstances, FleetAction};
 
 /// What clicking an action does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,23 +10,41 @@ pub enum Click {
     Run,
     /// Opens a confirmation that asks for a note for the audit log.
     Confirm,
+    /// Opens a dialog to pick where it runs (one instance or every one),
+    /// asking no note.
+    Choose,
 }
 
 pub fn click(a: &ActionInfo) -> Click {
-    if a.confirm {
-        Click::Confirm
-    } else {
-        Click::Run
+    match (a.confirm, a.instances) {
+        (true, _) => Click::Confirm,
+        (false, Some(_)) => Click::Choose,
+        (false, None) => Click::Run,
     }
 }
 
-/// The action's label on a button or menu item: an ellipsis when it asks
-/// for confirmation. Where a list spans modules, the module follows as the
+/// The action's label on a button or menu item: an ellipsis when a click
+/// opens a dialog. Where a list spans modules, the module follows as the
 /// item's muted aside.
 pub fn label(a: &ActionInfo) -> String {
     match click(a) {
-        Click::Confirm => format!("{}…", a.label),
+        Click::Confirm | Click::Choose => format!("{}…", a.label),
         Click::Run => a.label.clone(),
+    }
+}
+
+/// The choices of where an action runs, as a segmented toggle offers them
+/// (`value`, label).
+pub const INSTANCE_CHOICES: [(ActionInstances, &str); 2] = [
+    (ActionInstances::Any, "One allocation"),
+    (ActionInstances::All, "Every allocation"),
+];
+
+/// `any` / `all` back to the choice; anything else is the default.
+pub fn parse_instances(value: &str) -> ActionInstances {
+    match value {
+        "all" => ActionInstances::All,
+        _ => ActionInstances::Any,
     }
 }
 
@@ -86,18 +104,31 @@ mod tests {
             description: None,
             confirm,
             implicit: false,
+            instances: None,
         }
     }
 
     #[test]
     fn actions_are_labelled_by_what_a_click_does() {
-        for (confirm, expected, does) in [
-            (false, "Restart", Click::Run),
-            (true, "Restart…", Click::Confirm),
+        for (confirm, instances, expected, does) in [
+            (false, None, "Restart", Click::Run),
+            (true, None, "Restart…", Click::Confirm),
+            (false, Some(ActionInstances::All), "Restart…", Click::Choose),
+            (true, Some(ActionInstances::Any), "Restart…", Click::Confirm),
         ] {
-            let a = action("web", "Restart", confirm);
+            let a = ActionInfo {
+                instances,
+                ..action("web", "Restart", confirm)
+            };
             assert_eq!(label(&a), expected);
             assert_eq!(click(&a), does);
+        }
+    }
+
+    #[test]
+    fn instance_choices_round_trip() {
+        for (value, _) in INSTANCE_CHOICES {
+            assert_eq!(parse_instances(value.as_str()), value);
         }
     }
 

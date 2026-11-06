@@ -110,6 +110,28 @@ impl Nomad {
         Ok(resp)
     }
 
+    /// Upgrades `GET path` to a WebSocket (Nomad's exec and action
+    /// endpoints), with this client's token and region.
+    pub async fn socket(&self, path: &str) -> Result<Box<dyn transport::Socket>> {
+        let mut headers = Vec::new();
+        if let Some(token) = &self.token {
+            headers.push(("X-Nomad-Token".to_owned(), token.expose_secret().to_owned()));
+        }
+        let path = match &self.region {
+            Some(region) => with_query(path, "region", region),
+            None => path.to_owned(),
+        };
+        self.transport
+            .socket(Request {
+                method: "GET",
+                path,
+                headers,
+                body: None,
+            })
+            .await
+            .map_err(|e| self.scrub(e))
+    }
+
     /// `GET path`, decoding JSON; `None` on 404.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
         Ok(self.get_indexed(path).await?.map(|i| i.value))

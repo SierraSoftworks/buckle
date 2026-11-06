@@ -311,6 +311,9 @@ pub enum Instruction {
         /// With `target`: the placement the action belongs to (its
         /// workload is `module`); echoed on the result.
         workload: Option<String>,
+        /// Where an action offering the choice runs (a task action's
+        /// allocations); `None`: its default.
+        instances: Option<buckle_core::engine::task_actions::Instances>,
     },
     /// This agent stewards the cluster target: it runs a lane for it that
     /// serves the cluster's work and watches it (health as it changes,

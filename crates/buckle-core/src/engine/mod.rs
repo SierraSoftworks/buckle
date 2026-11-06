@@ -22,6 +22,7 @@ mod graph;
 pub mod loader;
 mod planner;
 pub mod targets;
+pub mod task_actions;
 pub mod validate;
 
 #[cfg(test)]
@@ -50,6 +51,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// The most of a step's [`StepOutcome::output`] a run keeps: its tail.
+pub const OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// A loaded revision: the fleet config plus every module and workload and
 /// their files.
@@ -94,6 +98,9 @@ pub struct LoadedWorkload {
     pub files: Vec<PathBuf>,
     /// Templates under `files/` keyed by relative path.
     pub templates: Vec<(PathBuf, String)>,
+    /// The `action` blocks of its job specs, named: implicit actions of
+    /// the workload ([`task_actions`]).
+    pub task_actions: Vec<task_actions::TaskAction>,
 }
 
 impl std::fmt::Debug for LoadedWorkload {
@@ -451,6 +458,10 @@ pub struct StepOutcome {
     /// What applying it reported, when it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// What it printed, where it ran a command (a Nomad task action): the
+    /// last [`OUTPUT_LIMIT`] bytes of stdout and stderr, scrubbed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,6 +482,7 @@ impl StepOutcome {
             summary: planned_summary(&step.planned),
             state,
             result: None,
+            output: None,
             started_at: None,
             finished_at: None,
             duration_ms: None,
@@ -487,6 +499,7 @@ impl StepOutcome {
             summary: run.summary.clone(),
             state,
             result: None,
+            output: None,
             started_at: None,
             finished_at: None,
             duration_ms: None,

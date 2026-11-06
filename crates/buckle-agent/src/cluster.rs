@@ -19,6 +19,7 @@ mod kubernetes;
 
 use crate::identity::{Credential, Credentials, IdentityRequest, Login, Purpose};
 use crate::transport::Transport;
+use buckle_core::engine::task_actions::{Instances, TaskAction};
 use buckle_core::engine::{
     ApplyEvent, ApplyOutcome, LoadedWorkload, ModuleOutcome, ModuleStatus, RemovalOutcome,
     Revision, StepOutcome, StepState,
@@ -724,14 +725,17 @@ impl Executor {
 
     /// Runs `action` of the selected workload `workload` on `a`'s cluster:
     /// an implicit action (`restart`, `stop`, `revert`) on each job the
-    /// workload owns there, or one of its `actions:` (`dispatch`). One step
-    /// per job; the first failure stops the rest. Nothing is planned or
-    /// recorded.
+    /// workload owns there, one of its jobs' task `action` blocks in one or
+    /// every running allocation (`instances`; absent: the action's
+    /// default), or one of its `actions:` (`dispatch`). One step per job
+    /// (per allocation for a task action); the first failure stops the
+    /// rest. Nothing is planned or recorded.
     pub async fn run_action(
         &self,
         a: &Assignment,
         workload: &str,
         action: &str,
+        instances: Option<Instances>,
         events: mpsc::Sender<ApplyEvent>,
     ) -> ApplyOutcome {
         let started = tokio::time::Instant::now();
@@ -744,7 +748,7 @@ impl Executor {
         };
         let resolved = async {
             let nomad = self.client(a, Purpose::Deploy, None).await?;
-            let steps = action_steps(&nomad, a, workload, action).await?;
+            let steps = action_steps(&nomad, a, workload, action, instances).await?;
             Ok::<_, buckle_core::Error>((nomad, steps))
         }
         .await;
@@ -759,10 +763,11 @@ impl Executor {
         let mut outcomes = Vec::new();
         let mut failure: Option<buckle_core::Error> = None;
         let mut changes = 0;
+        let redactor = buckle_core::secrets::redact::Redactor::new(&a.secrets);
         for step in &steps {
-            let resource = resource_key(workload, step.key.kind.task_kind(), &step.key.key());
+            let resource = resource_key(workload, step.kind(), &step.resource());
             let id = buckle_core::engine::step_id(&resource);
-            let kind = step.key.kind.task_kind().to_owned();
+            let kind = step.kind().to_owned();
             let mut outcome = StepOutcome {
                 id: id.clone(),
                 kind: kind.clone(),
@@ -770,6 +775,7 @@ impl Executor {
                 summary: step.summary.clone(),
                 state: StepState::NotRun,
                 result: None,
+                output: None,
                 started_at: None,
                 finished_at: None,
                 duration_ms: None,
@@ -788,7 +794,19 @@ impl Executor {
             .await;
             outcome.started_at = Some(Utc::now());
             let clock = tokio::time::Instant::now();
-            let ran = step.run(&nomad).await;
+            // Each line of a task action's output shows on the step while
+            // it runs; a full channel drops a line, never the run.
+            let mut on_line = |line: &str| {
+                let _ = events.try_send(ApplyEvent::StepProgress {
+                    module: workload.to_owned(),
+                    task_id: step.key.key(),
+                    id: id.clone(),
+                    kind: kind.clone(),
+                    message: redactor.redact(line).into_inner(),
+                });
+            };
+            let (ran, output) = step.run(&nomad, &mut on_line).await;
+            outcome.output = output.map(|o| redactor.redact(&o).into_inner());
             outcome.finished_at = Some(Utc::now());
             outcome.duration_ms = Some(clock.elapsed().as_millis() as u64);
             match ran {
@@ -944,7 +962,8 @@ impl Executor {
     }
 }
 
-/// One job a workload action runs on.
+/// One job (or, for a task action, one allocation) a workload action
+/// runs on.
 struct ActionStep {
     key: ObjectKey,
     summary: String,
@@ -957,15 +976,89 @@ enum ActionRun {
         meta: BTreeMap<String, String>,
         payload: Option<String>,
     },
+    /// A task's `action` block, in one allocation.
+    Task {
+        task: String,
+        action: String,
+        alloc: String,
+    },
 }
 
 impl ActionStep {
-    async fn run(&self, nomad: &Nomad) -> buckle_core::Result<String> {
+    fn kind(&self) -> &'static str {
+        match &self.run {
+            ActionRun::Task { .. } => buckle_core::engine::task_actions::KIND,
+            _ => self.key.kind.task_kind(),
+        }
+    }
+
+    /// The step's key within the workload: the job's, and for a task action
+    /// the task, action and allocation too.
+    fn resource(&self) -> String {
+        match &self.run {
+            ActionRun::Task {
+                task,
+                action,
+                alloc,
+            } => format!(
+                "{}/{task}/{action}@{}",
+                self.key.key(),
+                buckle_nomad::actions::short(alloc)
+            ),
+            _ => self.key.key(),
+        }
+    }
+
+    /// Runs the step: its summary or error, and what it printed.
+    async fn run(
+        &self,
+        nomad: &Nomad,
+        on_line: &mut (dyn FnMut(&str) + Send),
+    ) -> (buckle_core::Result<String>, Option<String>) {
         let (ns, id) = (&self.key.namespace, &self.key.name);
         match &self.run {
-            ActionRun::Job(action) => buckle_nomad::actions::run(nomad, ns, id, action).await,
-            ActionRun::Dispatch { meta, payload } => {
-                buckle_nomad::actions::dispatch(nomad, ns, id, meta, payload.as_deref()).await
+            ActionRun::Job(action) => (
+                buckle_nomad::actions::run(nomad, ns, id, action).await,
+                None,
+            ),
+            ActionRun::Dispatch { meta, payload } => (
+                buckle_nomad::actions::dispatch(nomad, ns, id, meta, payload.as_deref()).await,
+                None,
+            ),
+            ActionRun::Task {
+                task,
+                action,
+                alloc,
+            } => {
+                let short = buckle_nomad::actions::short(alloc);
+                match buckle_nomad::actions::run_task(
+                    nomad,
+                    ns,
+                    id,
+                    task,
+                    action,
+                    alloc,
+                    buckle_core::engine::OUTPUT_LIMIT,
+                    on_line,
+                )
+                .await
+                {
+                    Err(e) => (Err(e), None),
+                    Ok(run) if run.exit_code == 0 => (
+                        Ok(format!("ran {action} in allocation {short}")),
+                        Some(run.output),
+                    ),
+                    Ok(run) => (
+                        Err(buckle_core::error::user(
+                            format!(
+                                "{action} exited {} in allocation {short} of job {id}.",
+                                run.exit_code
+                            ),
+                            &["Its output is on the step."],
+                        )),
+                        Some(run.output),
+                    ),
+                }
             }
         }
     }
@@ -978,6 +1071,7 @@ async fn action_steps(
     a: &Assignment,
     workload: &str,
     action: &str,
+    instances: Option<Instances>,
 ) -> buckle_core::Result<Vec<ActionStep>> {
     use buckle_nomad::actions::Action;
     let ctx = a.context();
@@ -1034,6 +1128,9 @@ async fn action_steps(
         }
         return Ok(steps);
     }
+    if let Some(t) = w.task_actions.iter().find(|t| t.name == action) {
+        return task_action_steps(nomad, a, workload, t, instances).await;
+    }
     let Some(decl) = w.config.actions.get(action) else {
         return Err(buckle_core::error::user(
             format!("The workload {workload} declares no action '{action}'."),
@@ -1078,6 +1175,92 @@ async fn action_steps(
         key: ObjectKey::new(Kind::Job, ns, job),
         run: ActionRun::Dispatch { meta, payload },
     }])
+}
+
+/// What task action `t` of `workload` runs on: one running allocation of
+/// its group, or (`Instances::All`) each of them, of the job the workload
+/// owns, once its registered version offers the action.
+async fn task_action_steps(
+    nomad: &Nomad,
+    a: &Assignment,
+    workload: &str,
+    t: &TaskAction,
+    instances: Option<Instances>,
+) -> buckle_core::Result<Vec<ActionStep>> {
+    let cx = Context::new(
+        nomad.clone(),
+        &a.target,
+        "",
+        &a.revision.id.0,
+        a.spec.fingerprints.clone(),
+    );
+    let Some(key) = buckle_nomad::primitives::orphans(&cx, &[])
+        .await?
+        .into_iter()
+        .find(|o| o.module == workload && o.key.kind == Kind::Job && o.key.name == t.job)
+        .map(|o| o.key)
+    else {
+        return Err(buckle_core::error::user(
+            format!(
+                "The workload {workload} has no job {} registered on {}.",
+                t.job, a.target
+            ),
+            &["Apply the workload first."],
+        ));
+    };
+    if !buckle_nomad::actions::defines(nomad, &key.namespace, &key.name, &t.task, &t.action).await?
+    {
+        return Err(buckle_core::error::user(
+            format!(
+                "Job {} on {} has no action {} on task {} in its registered version.",
+                key.key(),
+                a.target,
+                t.action,
+                t.task
+            ),
+            &["Roll out the workload's revision that adds it, then run it again."],
+        ));
+    }
+    let mut allocs =
+        buckle_nomad::actions::running_allocations(nomad, &key.namespace, &key.name, &t.group)
+            .await?;
+    if allocs.is_empty() {
+        return Err(buckle_core::error::user(
+            format!(
+                "Group {} of job {} runs no allocation on {} to run {} in.",
+                t.group,
+                key.key(),
+                a.target,
+                t.action
+            ),
+            &["Check the job in Nomad; the action runs in a running allocation."],
+        ));
+    }
+    let instances = if t.choice {
+        instances.unwrap_or(t.instances)
+    } else {
+        t.instances
+    };
+    if instances == Instances::Any {
+        allocs.truncate(1);
+    }
+    Ok(allocs
+        .into_iter()
+        .map(|alloc| ActionStep {
+            summary: format!(
+                "run {} in allocation {} of job {}",
+                t.action,
+                buckle_nomad::actions::short(&alloc),
+                key.key()
+            ),
+            key: key.clone(),
+            run: ActionRun::Task {
+                task: t.task.clone(),
+                action: t.action.clone(),
+                alloc,
+            },
+        })
+        .collect())
 }
 
 /// The outcome of an action that failed before it started.

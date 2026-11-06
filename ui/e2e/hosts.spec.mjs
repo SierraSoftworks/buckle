@@ -255,6 +255,18 @@ describe("action rollouts", () => {
     });
   }
 
+  test("a Nomad task action asks where it runs and runs there, without a note", async () => {
+    const { page, close } = await open("/workloads/postgresql?cluster=home-nomad");
+    await act(page.getByTestId("actions-home-nomad-postgresql"), "vacuum…");
+    const dialog = page.getByRole("dialog", { name: "vacuum on home-nomad" });
+    const picker = dialog.getByTestId("action-instances");
+    assert.equal(await picker.getByRole("radio", { checked: true }).textContent(), "One allocation");
+    await picker.getByRole("radio", { name: "Every allocation" }).click();
+    await dialog.getByRole("button", { name: "vacuum", exact: true }).click();
+    await page.getByRole("status").filter({ hasText: "vacuum started on home-nomad" }).waitFor();
+    await close();
+  });
+
   test("a placement's row still runs its action on that cluster alone", async () => {
     const { page, close } = await open("/workloads/paste?cluster=home-nomad");
     const { face } = await offered(page.getByTestId("actions-home-nomad-paste"));
