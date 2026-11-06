@@ -12,8 +12,11 @@
 //!   lines a diff removes, which no template rendered, and the short fields
 //!   (key, name, summary) are matched by value, and only against the values
 //!   the step's templates emitted ([`StepView::facts`]). Plans from agents
-//!   that trace nothing fall back to every varying value. A step one host
-//!   alone plans has nothing to be compared with and reads as planned.
+//!   that trace nothing fall back to every varying value. A placeholder
+//!   then earns its place only where the hosts holding the text differ in
+//!   that value: where they agree, or one host alone holds the text (a step
+//!   only it plans, a variant, removal or warning of its own), it reads as
+//!   they planned it.
 //! * Variants: a step whose tokenised plan still differs between hosts keeps
 //!   one variant per distinct plan, each with its hosts.
 //! * Exemplars: every fact path used in a token comes with a sample of its
@@ -254,29 +257,51 @@ impl FleetPlan {
             .into_iter()
             .map(|path| samples(&path, hosts, &leaves))
             .collect();
-        out.literal_where_alone();
+        out.settle_tokens();
         out
     }
 
-    /// A step that one host alone plans has nothing to be compared with,
-    /// so it reads as that host planned it, without placeholders.
-    fn literal_where_alone(&mut self) {
+    /// A placeholder earns its place only where the hosts holding the text
+    /// differ in that value. Where they agree, or one host alone holds the
+    /// text (a step only it plans, or its own variant, handler, removal,
+    /// note or warning), it reads as they planned it, and entries that then
+    /// read alike are shared.
+    fn settle_tokens(&mut self) {
         let facts = std::mem::take(&mut self.facts);
+        let text = |hosts: &[String], text: &str| settled(&facts, hosts, text);
         for m in &mut self.modules {
             for s in &mut m.steps {
-                let host = {
-                    let mut hosts = s.changed_hosts().chain(s.unchanged.iter());
-                    match (hosts.next(), hosts.next()) {
-                        (Some(host), None) => host.clone(),
-                        _ => continue,
-                    }
-                };
-                s.key = render(&facts, &host, &s.key);
-                for v in &mut s.variants {
-                    v.value = render_step(&facts, &host, &v.value);
-                }
+                let hosts: Vec<String> = s
+                    .changed_hosts()
+                    .chain(s.unchanged.iter())
+                    .cloned()
+                    .collect();
+                s.key = text(&hosts, &s.key);
+                settle(&mut s.variants, |hosts, v| map_step(v, |t| text(hosts, t)));
             }
+            settle(&mut m.handlers, |hosts, h| HandlerView {
+                summary: text(hosts, &h.summary),
+                ..h.clone()
+            });
         }
+        settle(&mut self.removals, |hosts, r| RemovalView {
+            key: text(hosts, &r.key),
+            summary: text(hosts, &r.summary),
+            ..r.clone()
+        });
+        settle(&mut self.rehomed, |hosts, r| RehomeView {
+            from: text(hosts, &r.from),
+            to: text(hosts, &r.to),
+            summary: text(hosts, &r.summary),
+            ..r.clone()
+        });
+        for notes in [&mut self.deferred, &mut self.held, &mut self.indeterminate] {
+            settle(notes, |hosts, n| ModuleNote {
+                reason: text(hosts, &n.reason),
+                ..n.clone()
+            });
+        }
+        settle(&mut self.warnings, |hosts, w| text(hosts, w));
         let used = self.token_paths();
         self.facts = facts
             .into_iter()
@@ -547,14 +572,41 @@ fn render(facts: &[FactSamples], host: &str, text: &str) -> String {
 }
 
 fn render_step(facts: &[FactSamples], host: &str, step: &StepView) -> StepView {
-    let r = |t: &String| render(facts, host, t);
+    map_step(step, |t| render(facts, host, t))
+}
+
+/// `step` with each of its texts passed through `r`.
+fn map_step(step: &StepView, r: impl Fn(&String) -> String) -> StepView {
     StepView {
         key: r(&step.key),
-        name: step.name.as_ref().map(r),
+        name: step.name.as_ref().map(&r),
         summary: r(&step.summary),
-        unified: step.unified.as_ref().map(r),
-        preview: step.preview.as_ref().map(r),
+        unified: step.unified.as_ref().map(&r),
+        preview: step.preview.as_ref().map(&r),
         ..step.clone()
+    }
+}
+
+/// `text` as the `hosts` holding it read it: a token stays where their
+/// values differ, and reads as their one value where they agree.
+fn settled(facts: &[FactSamples], hosts: &[String], text: &str) -> String {
+    replace_tokens(text, |path| {
+        let values = &facts.iter().find(|f| f.path == path)?.values;
+        let mut held = hosts.iter().map(|h| values.get(h));
+        let first = held.next().flatten()?;
+        held.all(|v| v == Some(first)).then(|| first.clone())
+    })
+}
+
+/// Each entry of `list` settled by `settle` for the hosts holding it, and
+/// entries that then read alike shared.
+fn settle<T: PartialEq + Clone>(list: &mut Vec<Shared<T>>, settle: impl Fn(&[String], &T) -> T) {
+    for mut entry in std::mem::take(list) {
+        entry.value = settle(&entry.hosts, &entry.value);
+        match list.iter_mut().find(|s| s.value == entry.value) {
+            Some(s) => s.hosts.extend(entry.hosts),
+            None => list.push(entry),
+        }
     }
 }
 
@@ -1203,6 +1255,92 @@ mod tests {
             )
         );
         assert!(plan.facts.is_empty());
+    }
+
+    /// A host with a user called `nomad`: the word in a warning or a
+    /// removal it alone raises is not that user, however the fleet varies.
+    fn with_user(mut h: FleetHost, user: &str, warning: &str) -> FleetHost {
+        h.context["facts"]["users"] = json!({"names": [user]});
+        h.plan.as_mut().unwrap().warnings.push(warning.to_owned());
+        h
+    }
+
+    fn removal(h: &mut FleetHost, key: &str, summary: &str) {
+        h.plan.as_mut().unwrap().removals.push(crate::RemovalView {
+            key: key.into(),
+            summary: summary.into(),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn text_one_host_alone_holds_reads_as_planned() {
+        let text = "removal: nomad/command.run[nomad-eligible] — released";
+        let mut seer = with_user(host("seer", "10.0.0.1", vec![]), "nomad", text);
+        let mut prophet = with_user(
+            host("prophet", "10.0.0.2", vec![]),
+            "alice",
+            "x is kept on prophet",
+        );
+        // A removal seer alone has, named like its user; one both have,
+        // whose summary names each host.
+        removal(&mut seer, "nomad-eligible", "released");
+        removal(&mut seer, "shared", "released on seer");
+        removal(&mut prophet, "shared", "released on prophet");
+        let plan = FleetPlan::build(&[seer, prophet]);
+        assert_eq!(plan.warnings[0].value, text);
+        assert_eq!(plan.warnings[0].hosts, ["seer"]);
+        assert_eq!(plan.warnings[1].value, "x is kept on prophet");
+        assert_eq!(plan.removals[0].value.key, "nomad-eligible");
+        assert_eq!(plan.removals[0].hosts, ["seer"]);
+        assert_eq!(
+            plan.removals[1].value.summary,
+            "released on \u{ab}fact:host.id\u{bb}"
+        );
+        assert_eq!(plan.removals[1].hosts, ["seer", "prophet"]);
+        let paths: Vec<&str> = plan.facts.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["host.id"]);
+    }
+
+    /// An untraced step whose text names a user one host has: the hosts'
+    /// variants coincide once the placeholder is set aside, and are shared.
+    #[test]
+    fn single_host_variants_read_as_planned_and_are_shared() {
+        let step = || vec![change("eligible", "/etc/eligible", "+nomad-eligible\n")];
+        let plan = FleetPlan::build(&[
+            with_user(host("seer", "10.0.0.1", step()), "nomad", "w"),
+            with_user(host("prophet", "10.0.0.2", step()), "alice", "w"),
+        ]);
+        let variants = &plan.modules[0].steps[0].variants;
+        assert_eq!(variants.len(), 1, "{variants:#?}");
+        assert_eq!(variants[0].hosts, ["seer", "prophet"]);
+        assert_eq!(
+            variants[0].value.unified.as_deref(),
+            Some("+nomad-eligible\n")
+        );
+        assert!(plan.facts.is_empty());
+    }
+
+    /// Hosts that share a warning and agree on the value it names read the
+    /// value, however the rest of the fleet varies; a differing value keeps
+    /// its placeholder.
+    #[test]
+    fn a_token_the_holding_hosts_agree_on_reads_literal() {
+        let text = "removal: nomad/command.run[nomad-eligible] — released";
+        let mut seer = with_user(host("seer", "10.0.0.1", vec![]), "nomad", text);
+        let mut prophet = with_user(host("prophet", "10.0.0.2", vec![]), "nomad", text);
+        let sierra = with_user(host("sierra", "10.0.0.3", vec![]), "alice", "w");
+        removal(&mut seer, "shared", "released on seer");
+        removal(&mut prophet, "shared", "released on prophet");
+        let plan = FleetPlan::build(&[seer, prophet, sierra]);
+        assert_eq!(plan.warnings[0].value, text);
+        assert_eq!(plan.warnings[0].hosts, ["seer", "prophet"]);
+        assert_eq!(
+            plan.removals[0].value.summary,
+            "released on \u{ab}fact:host.id\u{bb}"
+        );
+        let paths: Vec<&str> = plan.facts.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["host.id"]);
     }
 
     #[test]
