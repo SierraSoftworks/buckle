@@ -40,6 +40,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+mod bakes;
 mod lanes;
 mod targets;
 
@@ -215,6 +216,8 @@ struct Shared {
     connected: AtomicBool,
     generation: AtomicU64,
     session_cancel: Mutex<CancellationToken>,
+    /// Bakes in progress, stopped by the instruction that supersedes them.
+    bakes: bakes::Bakes,
     stop: CancellationToken,
     data: tokio::sync::Mutex<Data>,
     watchdog: Mutex<Option<Watchdog>>,
@@ -455,6 +458,7 @@ impl Agent {
                 connected: AtomicBool::new(false),
                 generation: AtomicU64::new(0),
                 session_cancel: Mutex::new(CancellationToken::new()),
+                bakes: bakes::Bakes::default(),
                 stop: CancellationToken::new(),
                 data: tokio::sync::Mutex::new(Data::default()),
                 watchdog: Mutex::new(None),
@@ -827,7 +831,7 @@ impl Shared {
                     break SessionEnd::Closed { welcomed: false };
                 }
                 _ = self.stop.cancelled() => break SessionEnd::Shutdown,
-                instruction = session.instructions.recv() => match instruction {
+                instruction = session.instructions.recv() => match instruction.inspect(|i| self.bakes.observe(i)) {
                     None => break SessionEnd::Closed { welcomed },
                     Some(Instruction::Welcome(welcome)) => {
                         self.on_welcome(welcome, queue).await;
@@ -2026,6 +2030,12 @@ impl Shared {
             .lock()
             .map(|t| t.clone())
             .unwrap_or_default();
+        // A bake ends early once the server sends this host its next
+        // rollout instruction (see `bakes`).
+        let superseded = match (scope, until) {
+            (HealthScope::Bake, Some(_)) => self.bakes.token(None, None, &request_id),
+            _ => CancellationToken::new(),
+        };
         let settle = rev.fleet.rollout.settle;
         let waived = self.data.lock().await.agent.waived_checks.clone();
         let mut schedule = CheckSchedule::default();
@@ -2106,6 +2116,10 @@ impl Shared {
             tokio::select! {
                 _ = tokio::time::sleep_until(next) => {}
                 _ = cancel.cancelled() => break,
+                _ = superseded.cancelled() => {
+                    tracing::info!(request = %request_id, "the server moved past this bake; ending it");
+                    break;
+                }
             }
         }
     }

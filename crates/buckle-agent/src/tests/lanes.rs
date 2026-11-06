@@ -416,3 +416,66 @@ async fn a_drift_check_the_server_asks_for_runs_on_the_lane_at_once(
     assert!(reported.changes > 0 && !reported.corrected, "{reported:?}");
     h.stop().await.expect("clean exit");
 }
+
+fn targeted_health(
+    target: &str,
+    request_id: &str,
+    scope: pb::HealthScope,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> SMsg {
+    SMsg::Health(pb::RunHealth {
+        target: target.into(),
+        workload: String::new(),
+        revision: "rev1".into(),
+        request_id: request_id.into(),
+        scope: scope as i32,
+        modules: vec![],
+        until: until.map(crate::transport::convert::timestamp),
+        traceparent: String::new(),
+    })
+}
+
+/// A cluster's bake the server moved past ends at once, so the next phase's
+/// gate is answered on the lane without waiting out the old window.
+#[tokio::test(start_paused = true)]
+async fn a_cluster_bake_ends_when_the_server_moves_past_it() {
+    let nomad = buckle_nomad::testing::FakeNomad::new();
+    let mut h = Harness::start(Setup {
+        cluster: Some(nomad.clone()),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    apply_cluster(&h, &mut session, NOMAD, "nomad", "rev1", &paste_files()).await;
+
+    let until = chrono::Utc::now() + chrono::Duration::minutes(15);
+    session
+        .send(targeted_health(
+            NOMAD,
+            "bake-1",
+            pb::HealthScope::Bake,
+            Some(until),
+        ))
+        .await;
+    assert_eq!(session.expect(health_report).await.request_id, "bake-1");
+    let since = tokio::time::Instant::now();
+    session
+        .send(targeted_health(
+            NOMAD,
+            "gate-1",
+            pb::HealthScope::Rollout,
+            None,
+        ))
+        .await;
+    let gate = session
+        .expect(|m| health_report(m).filter(|r| r.request_id == "gate-1"))
+        .await;
+    assert_eq!(gate.target, NOMAD);
+    assert!(
+        since.elapsed() < Duration::from_secs(120),
+        "answered only after {:?}",
+        since.elapsed()
+    );
+    h.stop().await.expect("clean exit");
+}

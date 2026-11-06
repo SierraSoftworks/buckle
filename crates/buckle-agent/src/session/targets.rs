@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 /// How often a bake re-checks a cluster's workloads.
@@ -481,6 +482,13 @@ impl Shared {
             .lock()
             .map(|t| t.clone())
             .unwrap_or_default();
+        let superseded = match (scope, until) {
+            (HealthScope::Bake, Some(_)) => {
+                self.bakes
+                    .token(Some(&target), workload.as_deref(), &request_id)
+            }
+            _ => CancellationToken::new(),
+        };
         loop {
             let report = match self
                 .executor
@@ -499,6 +507,10 @@ impl Shared {
             tokio::select! {
                 _ = tokio::time::sleep_until((now + BAKE_INTERVAL).min(deadline)) => {}
                 _ = cancel.cancelled() => break,
+                _ = superseded.cancelled() => {
+                    tracing::info!(%target, request = %request_id, "the server moved past this bake; ending it");
+                    break;
+                }
             }
         }
     }
