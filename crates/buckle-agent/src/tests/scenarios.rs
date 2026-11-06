@@ -324,6 +324,82 @@ async fn waived_checks_and_force_reach_the_runner() {
     h.stop().await.expect("clean exit");
 }
 
+fn run_health(
+    request_id: &str,
+    scope: pb::HealthScope,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> pb::server_message::Msg {
+    pb::server_message::Msg::Health(pb::RunHealth {
+        target: String::new(),
+        workload: String::new(),
+        revision: String::new(),
+        request_id: request_id.into(),
+        scope: scope as i32,
+        modules: vec![],
+        until: until.map(crate::transport::convert::timestamp),
+        traceparent: String::new(),
+    })
+}
+
+/// A bake the server moved past (expedited, so it sends the next phase's
+/// gate, or a newer bake) ends at once: the next request is answered
+/// without waiting out the old window, and the old bake samples no more.
+#[rstest]
+#[case::gate("gate-1", pb::HealthScope::Rollout, false)]
+#[case::newer_bake("bake-2", pb::HealthScope::Bake, true)]
+#[tokio::test(start_paused = true)]
+async fn a_bake_ends_when_the_server_moves_past_it(
+    #[case] next: &str,
+    #[case] scope: pb::HealthScope,
+    #[case] bakes: bool,
+) {
+    let runner = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 1);
+    runner.with_plans(&rev("rev1"), vec![plan.clone()]);
+    let mut h = Harness::start(Setup {
+        runner: runner.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    roll_out(&h, &mut session, "rev1", &plan).await;
+
+    let window = chrono::Duration::minutes(15);
+    session
+        .send(run_health(
+            "bake-1",
+            pb::HealthScope::Bake,
+            Some(chrono::Utc::now() + window),
+        ))
+        .await;
+    assert_eq!(session.expect(health_report).await.request_id, "bake-1");
+    let since = Instant::now();
+    session
+        .send(run_health(
+            next,
+            scope,
+            bakes.then(|| chrono::Utc::now() + window),
+        ))
+        .await;
+    let answered = session
+        .expect(|m| health_report(m).filter(|r| r.request_id == next))
+        .await;
+    assert_eq!(answered.scope, scope as i32);
+    assert!(
+        since.elapsed() < Duration::from_secs(120),
+        "answered only after {:?}",
+        since.elapsed()
+    );
+    let old = tokio::time::timeout(
+        Duration::from_secs(20 * 60),
+        session.expect(|m| health_report(m).filter(|r| r.request_id == "bake-1")),
+    )
+    .await;
+    assert!(old.is_err(), "the old bake kept sampling: {old:?}");
+    h.stop().await.expect("clean exit");
+}
+
 #[tokio::test(start_paused = true)]
 async fn bake_health_repeats_until_the_deadline_then_stops() {
     let runner = FakeRunner::new();
