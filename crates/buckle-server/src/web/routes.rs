@@ -803,10 +803,7 @@ async fn stored_report(
         .store
         .call(move |db| {
             let plan = match &r.rollout {
-                Some(rollout) => db
-                    .rollouts()
-                    .host_by_plan(rollout, &r.host, &r.plan_digest)?
-                    .and_then(|h| h.plan),
+                Some(rollout) => db.rollouts().plan_of(rollout, &r.host, &r.plan_digest)?,
                 None => None,
             };
             let until = db.runs().next_after(&r)?.map(|n| n.started_at);
@@ -1694,6 +1691,9 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
         if h.run_id.is_none() {
             h.run_id = run_ids.get(&h.host, h.workload.as_deref(), h.plan_digest.as_deref());
         }
+        for a in &mut h.earlier {
+            a.run_id = run_ids.of_plan(&h.host, &a.digest);
+        }
     }
     detail.summary = state.link_rollout(detail.summary);
     // The audit trail comes newest first; the timeline reads oldest first,
@@ -1762,7 +1762,7 @@ fn union_plan(
         .iter()
         .map(|h| buckle_api::FleetHost {
             host: crate::rollout::view::row_key(h),
-            plan: crate::views::stored_plan_view(h.plan.as_ref())
+            plan: crate::rollout::view::rollout_plan(h)
                 .filter(|p| p.revision.is_empty() || p.revision == revision),
             context: contexts.get(&h.host).cloned().unwrap_or_default(),
         })
@@ -1801,12 +1801,7 @@ async fn fill_health_checks(
     }
     let plans: HashMap<&str, Option<buckle_api::PlanView>> = hosts
         .iter()
-        .map(|h| {
-            (
-                h.host.as_str(),
-                crate::views::stored_plan_view(h.plan.as_ref()),
-            )
-        })
+        .map(|h| (h.host.as_str(), crate::rollout::view::rollout_plan(h)))
         .collect();
     // Hosts without a plan are judged by their labels and facts.
     let unplanned: Vec<String> = plans

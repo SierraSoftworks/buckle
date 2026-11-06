@@ -46,10 +46,13 @@ pub fn is_placement(h: &RolloutHost) -> bool {
     h.workload.is_some() || h.kind == TargetKind::Workload
 }
 
-/// A unit whose plan changes and removes nothing: it rolls without a
-/// gate, bake or slot, and the Targets card hides it until asked.
+/// A unit whose plan changes and removes nothing, nor did an attempt
+/// before it: it rolls without a gate, bake or slot, and the Targets card
+/// hides it until asked.
 pub fn unchanged(h: &RolloutHost) -> bool {
-    h.plan_changes == Some(0) && h.plan_removals.unwrap_or(0) == 0
+    h.plan_changes == Some(0)
+        && h.plan_removals.unwrap_or(0) == 0
+        && h.total.is_none_or(|t| t.is_empty())
 }
 
 /// Units counted by kind, hosts first: `2 failed hosts (pi-1, pi-2) and

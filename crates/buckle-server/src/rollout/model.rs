@@ -432,6 +432,31 @@ pub struct HostRuntime {
     /// starts (a removal's dependents, by the applied revision's `needs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<String>,
+    /// Plans the row applied before it was planned again (a retry, a force
+    /// apply, its next step), oldest first, so that the rollout still shows
+    /// everything it changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<PlanAttempt>,
+}
+
+/// A plan a row applied in an earlier attempt or step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanAttempt {
+    /// From 1.
+    pub attempt: u32,
+    #[serde(default)]
+    pub stage: u32,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<serde_json::Value>,
+    #[serde(default)]
+    pub changes: Option<u32>,
+    #[serde(default)]
+    pub removals: Option<u32>,
+    pub state: HostPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub at: DateTime<Utc>,
 }
 
 impl HostRuntime {

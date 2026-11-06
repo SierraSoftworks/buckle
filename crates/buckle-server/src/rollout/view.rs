@@ -96,7 +96,49 @@ pub fn host(
         preview: h.runtime.preview && h.plan_digest.is_some(),
         drifted_from: h.runtime.drifted_from.clone(),
         removal: h.runtime.removal,
+        earlier: h
+            .runtime
+            .earlier
+            .iter()
+            .map(|a| buckle_api::RolloutAttempt {
+                attempt: a.attempt,
+                step: a.stage,
+                digest: a.digest.clone(),
+                changes: a.changes,
+                removals: a.removals,
+                state: a.state.api(),
+                error: a.error.clone(),
+                at: a.at,
+                run_id: None,
+            })
+            .collect(),
+        total: (!h.runtime.earlier.is_empty())
+            .then(|| rollout_plan(h))
+            .flatten()
+            .map(|p| buckle_api::ChangeCounts::of_plan(&p)),
     }
+}
+
+/// Row `h`'s plan as the rollout's record of it: its current plan with what
+/// its earlier attempts and steps of the same revision applied folded in
+/// ([`buckle_api::PlanView::absorb`]), so that a retry, which plans only
+/// what is left, does not hide what the rollout already changed. The
+/// current plan alone stays what approvals and plan groups bind.
+pub fn rollout_plan(h: &RolloutHostRecord) -> Option<buckle_api::PlanView> {
+    let mut out = crate::views::stored_plan_view(h.plan.as_ref());
+    for earlier in h
+        .runtime
+        .earlier
+        .iter()
+        .filter_map(|a| crate::views::stored_plan_view(a.plan.as_ref()))
+    {
+        match &mut out {
+            Some(p) if p.revision == earlier.revision => p.absorb(&earlier),
+            Some(_) => {}
+            None => out = Some(earlier),
+        }
+    }
+    out
 }
 
 /// The rollout summary.
@@ -172,11 +214,16 @@ pub fn row_key(h: &RolloutHostRecord) -> String {
 }
 
 /// Whether a finished row changed nothing: its plan had no changes and no
-/// removals, so it was counted rather than rolled.
+/// removals, nor had any plan it applied before, so it was counted rather
+/// than rolled.
 fn unchanged(h: &RolloutHostRecord) -> bool {
     h.runtime.plan_changes == Some(0)
         && h.runtime.plan_removals == Some(0)
         && h.runtime.deferred_modules.is_empty()
+        && h.runtime
+            .earlier
+            .iter()
+            .all(|a| a.changes == Some(0) && a.removals == Some(0))
 }
 
 /// The full rollout as the detail page shows it. `audit` is the audit trail

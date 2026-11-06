@@ -668,6 +668,13 @@ impl RolloutRunIds {
         self.by_host.is_empty()
     }
 
+    /// The run of `host` that applied plan `digest`.
+    pub fn of_plan(&self, host: &str, digest: &str) -> Option<String> {
+        self.by_plan
+            .get(&(host.to_owned(), digest.to_owned()))
+            .cloned()
+    }
+
     /// The run a rollout row is on: a placement's is the run of its own
     /// plan (a cluster runs one per placement), a host's its newest.
     pub fn get(&self, host: &str, workload: Option<&str>, plan: Option<&str>) -> Option<String> {

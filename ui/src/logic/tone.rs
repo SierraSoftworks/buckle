@@ -438,6 +438,8 @@ mod tests {
             preview: false,
             drifted_from: None,
             removal: false,
+            earlier: vec![],
+            total: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,

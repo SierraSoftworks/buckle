@@ -394,6 +394,8 @@ fn entry(
         preview: false,
         drifted_from: None,
         removal: false,
+        earlier: vec![],
+        total: None,
         needs_approval: false,
         needs_attention: false,
         error_detail: None,
@@ -495,6 +497,25 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
         seconds: 900,
         module: Some("nomad".into()),
         unchanged: false,
+    });
+    // Retried: its first attempt applied most of the plan before nomad's
+    // template failed, so the retry plans only what was left.
+    pi3.plan_digest = Some("4e2a91c7".into());
+    pi3.plan_changes = Some(1);
+    pi3.earlier = vec![buckle_api::RolloutAttempt {
+        attempt: 1,
+        step: 0,
+        digest: PLAN_NOMAD.into(),
+        changes: Some(4),
+        removals: Some(0),
+        state: S::Failed,
+        error: Some("nomad failed at file.template[/etc/nomad.d/nomad.hcl]: the validator rejected the rendered file".into()),
+        at: now - Duration::minutes(5),
+        run_id: None,
+    }];
+    pi3.total = Some(buckle_api::ChangeCounts {
+        modify: 4,
+        ..Default::default()
     });
     let mut pi5 = entry("pi-5", "home", 1, S::Failed, Some(PLAN_NOMAD), now, 4);
     pi5.failed_module = Some("nomad".into());

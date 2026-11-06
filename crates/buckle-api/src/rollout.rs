@@ -143,6 +143,40 @@ pub struct RolloutHost {
     /// the workload owned on the cluster.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub removal: bool,
+    /// Plans the target applied earlier in this rollout, oldest first: an
+    /// attempt before a retry (or force apply), or an earlier step. The
+    /// current plan (`plan_digest`) is not among them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<RolloutAttempt>,
+    /// What the rollout changes on the target across its attempts and
+    /// steps: the current plan with what the earlier ones applied folded in
+    /// (see [`crate::PlanView::absorb`]). Only set with `earlier`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<crate::ChangeCounts>,
+}
+
+/// A plan a rollout target applied before it was planned again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutAttempt {
+    /// The target's attempt the plan belonged to, from 1.
+    pub attempt: u32,
+    /// The dependency step it applied in (see [`RolloutHost::step`]).
+    #[serde(default)]
+    pub step: u32,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removals: Option<u32>,
+    /// Where the attempt ended (failed, healthy, …).
+    pub state: HostRolloutState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When it was planned again.
+    pub at: DateTime<Utc>,
+    /// The attempt's run, for `GET /hosts/{host}/runs/{run}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// A reboot a rollout host's run asked for.

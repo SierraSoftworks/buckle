@@ -31,7 +31,7 @@ use crate::logic::fleet_plan::{Phases, fleet_tally};
 use crate::logic::format::{count, relative, rollout_label, short, since, timestamp};
 use crate::logic::live::{apply_fleet, apply_rollout};
 use crate::logic::pipeline::{self, GateKind, GateState, host_checks, layout};
-use crate::logic::plan::{ApprovalScope, approval_scope, host_tally};
+use crate::logic::plan::{ApprovalScope, approval_scope, attempt_options, host_tally};
 use crate::logic::run::RolloutActivity;
 use crate::logic::ticker::{Source, Ticker, ticker};
 use crate::logic::tone::{
@@ -1520,6 +1520,21 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
         }),
         None,
     );
+    // A target planned again (a retry, a force apply, its next step) keeps
+    // what its earlier attempts applied: each one's run can be shown in
+    // place of the latest.
+    let attempts = attempt_options(h);
+    let chosen = use_state(|| AttrValue::from("latest"));
+    let earlier = chosen.parse::<usize>().ok().and_then(|i| h.earlier.get(i));
+    let earlier_run = use_run_report(
+        earlier
+            .and_then(|a| a.run_id.clone())
+            .map(|run| RunSource::Host {
+                host: h.host.clone(),
+                run,
+            }),
+        None,
+    );
     // A host with an error is retried (or re-planned) from it: this one, or
     // (when it failed) every failed host of the rollout at once.
     let replan = (props.admin && can_replan(h.state)).then(|| {
@@ -1561,7 +1576,28 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
                 } }
             </div>
             <div class="host-row__run" data-testid="rollout-host-run">
-                <h4 class="subhead">{ "Run in this rollout" }</h4>
+                <div class="host-row__run-head">
+                    <h4 class="subhead">{ if attempts.is_empty() { "Run in this rollout" } else { "Runs in this rollout" } }</h4>
+                    if !attempts.is_empty() {
+                        <Segmented label="Attempt shown" testid="host-attempts" value={(*chosen).clone()}
+                            options={attempts.iter().map(|(v, l)| (AttrValue::from(v.clone()), AttrValue::from(l.clone()))).collect::<Vec<_>>()}
+                            on_change={{ let chosen = chosen.clone(); Callback::from(move |v| chosen.set(v)) }} />
+                    }
+                </div>
+                if let Some(a) = earlier {
+                    <p class="small muted" data-testid="host-attempt">
+                        { format!("{} · planned again {} · ", host_state_label(a.state), relative(a.at, props.now)) }
+                        { attempt_changes(a) }
+                        <span class="mono plan-digest" title={format!("plan {}", a.digest)}>{ short(&a.digest) }</span>
+                    </p>
+                    if let Some(e) = &a.error { <p class="small" data-testid="host-attempt-error">{ e.clone() }</p> }
+                    { match (&earlier_run.report, &earlier_run.error) {
+                        (Some(report), _) => html! { <RunReportView report={report.clone()} in_rollout=true workloads={props.host.kind != buckle_api::TargetKind::Host} /> },
+                        (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={earlier_run.reload.clone()} /> },
+                        (None, None) if a.run_id.is_none() || earlier_run.settled => html! { <p class="muted">{ "The server has no run report for this attempt." }</p> },
+                        (None, None) => html! { <Loading label="Loading the run…" /> },
+                    } }
+                } else {
                 { match (&run.report, &run.error) {
                     (Some(report), _) => html! { <RunReportView report={report.clone()} in_rollout=true workloads={props.host.kind != buckle_api::TargetKind::Host} /> },
                     (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={run.reload.clone()} /> },
@@ -1569,8 +1605,18 @@ fn host_detail_row(props: &HostDetailRowProps) -> Html {
                     (None, None) if run.settled => html! { <p class="muted">{ "The server has no run report for this host in this rollout." }</p> },
                     (None, None) => html! { <Loading label="Loading the run…" /> },
                 } }
+                }
             </div>
         </div>
+    }
+}
+
+/// What an earlier attempt's plan changed, as its host counted it.
+fn attempt_changes(a: &buckle_api::RolloutAttempt) -> String {
+    match (a.changes, a.removals.unwrap_or(0)) {
+        (Some(0), 0) => "no changes · ".to_owned(),
+        (Some(c), _) => format!("{} · ", count(c as usize, "change", "changes")),
+        (None, _) => String::new(),
     }
 }
 
