@@ -17,7 +17,7 @@ use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
     Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink, WorkloadActions,
-    use_actions, use_workload_rollout,
+    use_actions, use_drift_check, use_workload_rollout,
 };
 use crate::hooks::{use_fetch, use_live_value};
 use crate::logic::format::{count, rollout_label};
@@ -45,6 +45,7 @@ pub fn workload_page(props: &Props) -> Html {
         .and_then(|q| q.cluster);
     let data = use_fetch((), |_| cluster_details());
     let rollouts = use_workload_rollout();
+    let check_drift = use_drift_check(data.reload.clone());
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
     let active = fleet.as_ref().and_then(|f| f.active_rollout.clone());
@@ -108,6 +109,17 @@ pub fn workload_page(props: &Props) -> Html {
                 .map(|v| (d.summary.id.as_str(), v))
         })
         .collect();
+    // Every placement whose steward can check it now.
+    let checkable: Vec<String> = details
+        .iter()
+        .filter(|d| w.placements.iter().any(|p| p.cluster == d.summary.id))
+        .filter(|d| can_check(d, &hosts))
+        .map(|d| d.summary.id.clone())
+        .collect();
+    let on_check_drift = (!checkable.is_empty()).then(|| {
+        let (check, name) = (check_drift.clone(), w.name.clone());
+        Callback::from(move |_| check.emit((checkable.clone(), Some(name.clone()))))
+    });
     let needed_by = w.needed_by(&all);
     let link = |n: &str| match n.strip_prefix("module:") {
         Some(m) => {
@@ -138,7 +150,7 @@ pub fn workload_page(props: &Props) -> Html {
                     // Across every placement; a placement's own run from its row.
                     if auth.is_admin() {
                         <WorkloadActions workload={w.name.clone()} actions={w.actions.clone()}
-                            on_action={rollouts.on_action.clone()} testid="workload-actions" />
+                            on_action={rollouts.on_action.clone()} {on_check_drift} testid="workload-actions" />
                     }
                 </> }} />
             { rollouts.dialog.clone() }
@@ -182,6 +194,18 @@ pub fn workload_page(props: &Props) -> Html {
     }
 }
 
+/// Whether a cluster's placements can be checked for drift now: something
+/// is applied and its steward is online.
+fn can_check(d: &HostDetail, hosts: &BTreeMap<String, HostSummary>) -> bool {
+    d.summary.applied_revision.is_some()
+        && d.summary
+            .cluster_status
+            .as_ref()
+            .and_then(|s| s.steward.as_deref())
+            .and_then(|e| hosts.get(e))
+            .is_some_and(|h| h.connection == Connection::Online)
+}
+
 fn gloo_utils_document() -> web_sys::Document {
     web_sys::window()
         .and_then(|w| w.document())
@@ -208,6 +232,7 @@ fn placements(props: &PlacementsProps) -> Html {
         let reload = props.reload.clone();
         use_actions(Callback::from(move |_| reload.emit(())))
     };
+    let check_drift = use_drift_check(props.reload.clone());
     let can_act = |d: &HostDetail| {
         props.admin
             && d.summary.status == HostStatus::Active
@@ -235,9 +260,13 @@ fn placements(props: &PlacementsProps) -> Html {
                         { for props.details.iter().map(|d| {
                             let id = d.summary.id.clone();
                             let on_action = can_act(d).then(|| actions.on_action.reform(move |a| (id.clone(), a)));
+                            let on_check_drift = (props.admin && can_check(d, &props.hosts)).then(|| {
+                                let (check, id, w) = (check_drift.clone(), d.summary.id.clone(), props.workload.clone());
+                                Callback::from(move |_| check.emit((vec![id.clone()], Some(w.clone()))))
+                            });
                             html! {
                                 <PlacementRow key={d.summary.id.clone()} detail={d.clone()} workload={props.workload.clone()}
-                                    {on_action} focus={props.details.len() == 1 || props.focus.as_deref() == Some(d.summary.id.as_str())} />
+                                    {on_action} {on_check_drift} focus={props.details.len() == 1 || props.focus.as_deref() == Some(d.summary.id.as_str())} />
                             }
                         }) }
                     </tbody>

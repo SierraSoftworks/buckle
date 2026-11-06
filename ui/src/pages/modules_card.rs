@@ -41,6 +41,10 @@ pub(super) struct ModulesProps {
     pub cluster: bool,
     /// Set where the operator may run the workloads' actions.
     pub on_action: Option<Callback<ActionInfo>>,
+    /// Set where the operator may check a workload's placement for drift
+    /// (named by the click).
+    #[prop_or_default]
+    pub on_check_drift: Option<Callback<String>>,
     /// The newest run heard of (a run may have started since the detail).
     pub newest: Option<String>,
     /// The run the reader picked; `None` follows the newest.
@@ -189,10 +193,8 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
                                 .filter(|x| resource_module(&x.resource) == Some(r.name.as_str()))
                                 .collect();
                             html! { <>
-                                { workload_row(d, r, cluster, false, module, run, is_open, toggle, now, live, props.on_action.as_ref().map(|on_run| html! {
-                                    <ActionsButton actions={of_module(&d.actions, &r.name)} on_run={on_run.clone()}
-                                        testid={format!("actions-{}", r.name)} />
-                                })) }
+                                { workload_row(d, r, cluster, false, module, run, is_open, toggle, now, live,
+                                    row_actions(d, &r.name, props.on_action.as_ref(), props.on_check_drift.as_ref().map(|c| { let n = r.name.clone(); c.reform(move |_| n.clone()) }), format!("actions-{}", r.name))) }
                                 if is_open {
                                     <tr class="table__detail" key={format!("{}-detail", r.name)} data-detail-of={r.name.clone()}>
                                         <td colspan="6">
@@ -223,9 +225,33 @@ pub(super) struct PlacementProps {
     pub workload: String,
     /// Set where the operator may run the workload's actions there.
     pub on_action: Option<Callback<ActionInfo>>,
+    /// Set where the operator may check the placement for drift.
+    #[prop_or_default]
+    pub on_check_drift: Option<Callback<()>>,
     /// Opened at first (the cluster the page was opened for).
     #[prop_or_default]
     pub focus: bool,
+}
+
+/// A row's split button: its module's actions where the operator may run
+/// them, then checking it for drift where offered; nothing when neither.
+fn row_actions(
+    d: &HostDetail,
+    name: &str,
+    on_action: Option<&Callback<ActionInfo>>,
+    on_check_drift: Option<Callback<()>>,
+    testid: String,
+) -> Option<Html> {
+    if on_action.is_none() && on_check_drift.is_none() {
+        return None;
+    }
+    let actions = on_action
+        .map(|_| of_module(&d.actions, name))
+        .unwrap_or_default();
+    let on_run = on_action.cloned().unwrap_or_default();
+    Some(html! {
+        <ActionsButton {actions} {on_run} {on_check_drift} {testid} />
+    })
 }
 
 /// One placement of a workload as a row of its page's Placements table:
@@ -278,12 +304,13 @@ pub(super) fn placement_row(props: &PlacementProps) -> Html {
                 .collect()
         })
         .unwrap_or_default();
-    let actions = props.on_action.as_ref().map(|on_run| {
-        html! {
-            <ActionsButton actions={of_module(&d.actions, &r.name)} on_run={on_run.clone()}
-                testid={format!("actions-{}-{}", d.summary.id, r.name)} />
-        }
-    });
+    let actions = row_actions(
+        d,
+        &r.name,
+        props.on_action.as_ref(),
+        props.on_check_drift.clone(),
+        format!("actions-{}-{}", d.summary.id, r.name),
+    );
     html! { <>
         { workload_row(d, &r, true, true, module, run, is_open, toggle, now, live, actions) }
         if is_open {

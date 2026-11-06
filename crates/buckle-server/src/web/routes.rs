@@ -42,6 +42,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/hosts/{id}/runs/{run}", web::get().to(host_run))
             .route("/hosts/{id}/preview", web::post().to(host_preview))
             .route("/hosts/{id}/upgrade", web::post().to(host_upgrade))
+            .route("/hosts/{id}/drift", web::post().to(check_drift))
             .route(
                 "/hosts/{id}/actions/{module}/{action}",
                 web::post().to(run_action),
@@ -57,6 +58,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/targets/{id}/executor", web::get().to(target_executor))
             .route("/targets/{id}/preview", web::post().to(host_preview))
             .route("/targets/{id}/steward", web::post().to(target_steward))
+            .route("/targets/{id}/drift", web::post().to(check_drift))
             .route(
                 "/targets/{id}/actions/{module}/{action}",
                 web::post().to(run_action),
@@ -663,6 +665,32 @@ async fn target_steward(
         )
         .await?;
     Ok(HttpResponse::Ok().json(summary_or_404(&state, &id).await?))
+}
+
+/// Asks a target to check for drift now (a cluster: through its steward,
+/// for one workload's placement when named). The report arrives later and
+/// moves the target's `drift_at`.
+async fn check_drift(
+    state: Data,
+    admin: Administrative,
+    path: web::Path<String>,
+    body: Option<web::Json<buckle_api::DriftCheckRequest>>,
+) -> ApiResult {
+    let id = path.into_inner();
+    let buckle_api::DriftCheckRequest { workload, note } =
+        body.map(|b| b.into_inner()).unwrap_or_default();
+    state
+        .controller
+        .command(
+            &admin.0.actor(),
+            Command::CheckDrift {
+                target: id.clone(),
+                workload,
+                note,
+            },
+        )
+        .await?;
+    Ok(HttpResponse::Accepted().json(summary_or_404(&state, &id).await?))
 }
 
 async fn summary_or_404(state: &AppState, id: &str) -> Result<buckle_api::HostSummary, ApiError> {

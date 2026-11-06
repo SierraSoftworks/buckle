@@ -1151,8 +1151,12 @@ impl FleetService {
                 let drifted =
                     !d.plan_digest.is_empty() && (d.changes + d.removals) > 0 && !d.corrected;
                 let plan = d.plan_json.clone();
+                let workload = Some(d.workload.clone()).filter(|w| !w.is_empty());
                 self.store
-                    .call(move |db| db.drift().record(&h, drifted, &plan, now))
+                    .call(move |db| {
+                        db.drift()
+                            .record_for(&h, workload.as_deref(), drifted, &plan, now)
+                    })
                     .await
                     .map(|()| true)
             }
@@ -1249,19 +1253,19 @@ impl FleetService {
                 }
             }
         }
-        // A drift pass with an empty digest found nothing; only a real
-        // drift is worth telling the UI about.
-        let notify_ui = match &msg {
-            agent_message::Msg::Drift(d) => !d.plan_digest.is_empty(),
-            agent_message::Msg::Health(_)
-            | agent_message::Msg::Result(_)
-            | agent_message::Msg::Action(_)
-            | agent_message::Msg::Rollback(_)
-            | agent_message::Msg::Upgrade(_)
-            | agent_message::Msg::RebootFailed(_)
-            | agent_message::Msg::TargetStatus(_) => true,
-            _ => false,
-        };
+        // Every drift report moves when drift was last checked (and may
+        // clear what an earlier one found).
+        let notify_ui = matches!(
+            msg,
+            agent_message::Msg::Drift(_)
+                | agent_message::Msg::Health(_)
+                | agent_message::Msg::Result(_)
+                | agent_message::Msg::Action(_)
+                | agent_message::Msg::Rollback(_)
+                | agent_message::Msg::Upgrade(_)
+                | agent_message::Msg::RebootFailed(_)
+                | agent_message::Msg::TargetStatus(_)
+        );
         if matches!(
             msg,
             agent_message::Msg::Plan(_)

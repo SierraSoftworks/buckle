@@ -60,6 +60,10 @@ pub struct HostSummary {
     /// When the health reading was taken.
     pub health_at: Option<DateTime<Utc>>,
     pub drifted: bool,
+    /// When the latest drift check reported (for a cluster, of any of its
+    /// placements); absent before the first, and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift_at: Option<DateTime<Utc>>,
     pub first_seen: DateTime<Utc>,
     pub last_seen: Option<DateTime<Utc>>,
     #[serde(default)]

@@ -349,6 +349,7 @@ mod tests {
             health,
             health_at: None,
             drifted: false,
+            drift_at: None,
             first_seen: Utc::now(),
             last_seen: None,
             notes: String::new(),

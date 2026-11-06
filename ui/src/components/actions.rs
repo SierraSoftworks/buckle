@@ -76,17 +76,67 @@ pub fn target_items(
 pub struct ActionsButtonProps {
     pub actions: Vec<ActionInfo>,
     pub on_run: Callback<ActionInfo>,
+    /// Set where the row may check its module (a placement) for drift: a
+    /// "Check drift" item after its actions.
+    #[prop_or_default]
+    pub on_check_drift: Option<Callback<()>>,
     #[prop_or_default]
     pub testid: Option<AttrValue>,
 }
 
-/// A module's actions as one split button; nothing when there are none.
+/// A module's actions as one split button, then checking it for drift
+/// where offered; nothing when there is neither.
 #[function_component(ActionsButton)]
 pub fn actions_button(props: &ActionsButtonProps) -> Html {
-    html! {
-        <SplitButton items={action_items(&props.actions, &props.on_run, None)} small=true
-            menu_label="More actions" testid={props.testid.clone()} />
+    let mut items = action_items(&props.actions, &props.on_run, None);
+    if let Some(check) = &props.on_check_drift {
+        items.push(drift_item(
+            check,
+            "Re-plan it against what is running now and report what differs",
+        ));
     }
+    html! {
+        <SplitButton {items} small=true menu_label="More actions" testid={props.testid.clone()} />
+    }
+}
+
+/// The "Check drift" item a split button offers, running `check` on click.
+pub fn drift_item(check: &Callback<()>, title: &str) -> MenuItem {
+    MenuItem::new(
+        crate::logic::controls::TargetAction::CheckDrift.label(),
+        check.reform(|_: MouseEvent| ()),
+    )
+    .title(title.to_owned())
+}
+
+/// What a page's drift checks do: ask each named target (a cluster, for the
+/// named workload's placement) to check for drift now, toast the outcome,
+/// then `on_asked` (to reload what the check reports).
+#[hook]
+pub fn use_drift_check(on_asked: Callback<()>) -> Callback<(Vec<String>, Option<String>)> {
+    let toast = use_toast();
+    Callback::from(move |(targets, workload): (Vec<String>, Option<String>)| {
+        let (toast, on_asked) = (toast.clone(), on_asked.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut asked = Vec::new();
+            for id in &targets {
+                match api::check_drift(id, workload.clone()).await {
+                    Ok(_) => asked.push(id.clone()),
+                    Err(e) => toast.error(format!("{id} could not check for drift: {e}")),
+                }
+            }
+            if asked.is_empty() {
+                return;
+            }
+            toast.ok(match (&workload, asked.as_slice()) {
+                (Some(w), [one]) => format!("Asked {one} to check {w} for drift."),
+                (Some(w), many) => format!("Asked {} clusters to check {w} for drift.", many.len()),
+                (None, [one]) => format!("Asked {one} to check for drift."),
+                (None, many) => format!("Asked {} targets to check for drift.", many.len()),
+            });
+            on_asked.emit(());
+        });
+    })
 }
 
 /// A page's action runner: what a click on an [`ActionsButton`] does, and

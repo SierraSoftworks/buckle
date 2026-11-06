@@ -1,6 +1,6 @@
 //! Controller scenarios driven by scripted fake hosts on tokio's paused clock.
 
-use super::controller::{TARGETS_CAPABILITY, WORKLOADS_CAPABILITY};
+use super::controller::{CHECK_DRIFT_CAPABILITY, TARGETS_CAPABILITY, WORKLOADS_CAPABILITY};
 use super::model::{HostPhase, RolloutHostRecord, RolloutRecord, STRAGGLERS};
 use super::*;
 use crate::clock::{Clock, TokioClock};
@@ -593,6 +593,7 @@ impl Harness {
                     "approval_digest".into(),
                     TARGETS_CAPABILITY.into(),
                     WORKLOADS_CAPABILITY.into(),
+                    CHECK_DRIFT_CAPABILITY.into(),
                 ]
             },
             boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
@@ -5461,4 +5462,109 @@ async fn an_older_executor_rolls_the_cluster_as_one_row() {
     );
     // The whole cluster's result names the applied revision itself (the
     // server records it on arrival, outside this harness).
+}
+
+// ---------------------------------------------------------------- drift checks
+
+fn drift_checks(h: &Harness) -> Vec<(String, pb::CheckDrift)> {
+    h.sent(|_, m| matches!(m, SMsg::CheckDrift(_)))
+        .into_iter()
+        .filter_map(|(_, to, m)| match m {
+            SMsg::CheckDrift(c) => Some((to, c)),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn set_applied(h: &Harness, target: &str) {
+    let t = target.to_owned();
+    h.store
+        .call(move |db| db.hosts().set_applied_revision(&t, "r1"))
+        .await
+        .unwrap();
+}
+
+fn check(target: &str, workload: Option<&str>) -> Command {
+    Command::CheckDrift {
+        target: target.into(),
+        workload: workload.map(str::to_owned),
+        note: String::new(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drift_check_reaches_the_hosts_own_agent() {
+    let mut h = Harness::new().await;
+    h.revision("r1", ONE_PHASE_ALL).await;
+    h.enrol("a", "web").await;
+    h.connect("a", Some("r1"));
+    set_applied(&h, "a").await;
+    h.command(check("a", None)).await.expect("asked");
+    h.idle(1).await;
+    let sent = drift_checks(&h);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, "a");
+    assert!(sent[0].1.target.is_empty(), "about the host itself");
+}
+
+#[rstest::rstest]
+#[case::nothing_applied("applied", CommandErrorKind::Conflict)]
+#[case::offline("offline", CommandErrorKind::Conflict)]
+#[case::old_agent("legacy", CommandErrorKind::Conflict)]
+#[case::workload_of_a_host("workload", CommandErrorKind::Invalid)]
+#[case::unknown("unknown", CommandErrorKind::NotFound)]
+#[tokio::test(start_paused = true)]
+async fn a_drift_check_is_refused_when_it_cannot_run(
+    #[case] why: &str,
+    #[case] kind: CommandErrorKind,
+) {
+    let mut h = Harness::new().await;
+    h.revision("r1", ONE_PHASE_ALL).await;
+    h.enrol("a", "web").await;
+    if why == "legacy" {
+        h.script("a", |s| s.legacy_agent = true);
+    }
+    if why != "offline" {
+        h.connect("a", Some("r1"));
+    }
+    if why != "applied" {
+        set_applied(&h, "a").await;
+    }
+    let (target, workload) = match why {
+        "unknown" => ("nope", None),
+        "workload" => ("a", Some("postgres")),
+        _ => ("a", None),
+    };
+    let refused = h
+        .command(check(target, workload))
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.kind, kind, "{refused:?}");
+    h.idle(1).await;
+    assert!(drift_checks(&h).is_empty());
+}
+
+#[rstest::rstest]
+#[case::whole_cluster(None)]
+#[case::one_placement(Some("postgres"))]
+#[tokio::test(start_paused = true)]
+async fn a_clusters_drift_check_goes_to_its_steward(#[case] workload: Option<&str>) {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, FLAT)
+        .await;
+    for n in ["n1", "n2"] {
+        h.enrol(n, "nomad").await;
+        h.connect(n, None);
+    }
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::Completed).await;
+    set_applied(&h, CLUSTER).await;
+    let steward = h.steward(CLUSTER).await.expect("leased");
+    h.command(check(CLUSTER, workload)).await.expect("asked");
+    h.idle(1).await;
+    let sent = drift_checks(&h);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, steward);
+    assert_eq!(sent[0].1.target, CLUSTER);
+    assert_eq!(sent[0].1.workload, workload.unwrap_or_default());
 }

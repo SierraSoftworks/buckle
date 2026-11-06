@@ -48,6 +48,10 @@ With `drift.correct: true` (the default) the agent puts it back and the drift is
 `false` it is only reported. Unattended correction never removes anything. To keep a manual change,
 put it in the configuration, or pause the host while you work.
 
+**Check drift** (host and cluster page heads) runs that pass now instead of waiting for the timer;
+**Drift checked** in the summary moves when its report arrives. A cluster is checked by its steward,
+report-only; a workload's head checks every placement and each placement row checks its own.
+
 ## Health
 
 **Health** lists each applied module's checks with their latest result. A required check that fails

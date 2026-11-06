@@ -56,6 +56,9 @@ pub(super) enum LaneOp {
     Lease(LeaseTerms),
     /// The server took the lease away.
     Release { reason: String },
+    /// An operator asked for a drift pass now: the whole cluster, or one
+    /// workload's placement.
+    CheckDrift { workload: Option<String> },
 }
 
 /// What a lease says.
@@ -101,7 +104,8 @@ impl Lanes {
             lanes.remove(target);
         }
         if !lanes.contains_key(target) {
-            if matches!(op, LaneOp::Release { .. }) {
+            if matches!(op, LaneOp::Release { .. } | LaneOp::CheckDrift { .. }) {
+                tracing::warn!(%target, "not checking drift: this agent does not steward the cluster");
                 return;
             }
             tracing::info!(%target, "opening a lane for the cluster");
@@ -229,6 +233,13 @@ impl Lane {
                         break;
                     }
                     Some(LaneOp::Lease(terms)) => self.lease(terms).await,
+                    Some(LaneOp::CheckDrift { workload }) => {
+                        if self.watch.is_some() {
+                            self.read_drift(workload.as_deref()).await;
+                        } else {
+                            tracing::warn!(target = %self.target, "not checking drift: the cluster is not leased to this agent");
+                        }
+                    }
                     Some(LaneOp::Instruction { instruction, generation }) => {
                         self.queued.fetch_sub(1, Ordering::SeqCst);
                         self.instruction(instruction, generation).await;
@@ -251,7 +262,7 @@ impl Lane {
                     None => {}
                 },
                 _ = tokio::time::sleep_until(health_due), if watching => self.read_health().await,
-                _ = tokio::time::sleep_until(drift_due), if watching => self.read_drift().await,
+                _ = tokio::time::sleep_until(drift_due), if watching => self.read_drift(None).await,
             }
         }
         self.watch = None;
@@ -461,20 +472,24 @@ impl Lane {
         }
     }
 
-    /// Plans the applied revision against the cluster and reports what
-    /// differs (report-only: nothing is corrected).
-    async fn read_drift(&mut self) {
+    /// Plans the applied revision against the cluster (only `workload`'s
+    /// objects and orphans, when named) and reports what differs
+    /// (report-only: nothing is corrected). A whole-cluster pass restarts
+    /// the drift timer.
+    async fn read_drift(&mut self, workload: Option<&str>) {
         let Some(w) = &mut self.watch else { return };
-        w.drift_due = Instant::now() + w.config.drift;
+        if workload.is_none() {
+            w.drift_due = Instant::now() + w.config.drift;
+        }
         let Some(a) = self.applied_assignment().await else {
             return;
         };
-        let span = tracing::info_span!(parent: None, "agent.drift", buckle.host = %self.shared.host_id, buckle.target = %self.target, buckle.revision = %a.revision.id.0, buckle.plan.digest = tracing::field::Empty);
+        let span = tracing::info_span!(parent: None, "agent.drift", buckle.host = %self.shared.host_id, buckle.target = %self.target, buckle.workload = workload.unwrap_or(""), buckle.revision = %a.revision.id.0, buckle.plan.digest = tracing::field::Empty);
         self.shared.follow_session(&span);
         match self
             .shared
             .executor
-            .plan(&a, None, None)
+            .plan(&a, None, workload)
             .instrument(span.clone())
             .await
         {
@@ -494,7 +509,7 @@ impl Lane {
                             plan: drifted.then_some(plan),
                             corrected: false,
                         }
-                        .about(Some(&self.target)),
+                        .about_placement(Some(&self.target), workload),
                     )
                     .await;
             }

@@ -477,6 +477,47 @@ async fn a_restarted_agent_corrects_drift_as_soon_as_it_connects() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_drift_check_the_server_asks_for_runs_at_once() {
+    let runner = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 2);
+    let drift = plan_with_changes(&rev("rev1"), 1);
+    runner.with_plans(
+        &rev("rev1"),
+        vec![plan.clone(), plan.clone(), drift.clone()],
+    );
+    let mut h = Harness::start(Setup {
+        runner: runner.clone(),
+        yaml: "drift: { interval: 1h }\n".into(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    roll_out(&h, &mut session, "rev1", &plan).await;
+
+    let asked = tokio::time::Instant::now();
+    session
+        .send(pb::server_message::Msg::CheckDrift(
+            pb::CheckDrift::default(),
+        ))
+        .await;
+    let reported = session
+        .expect(|m| match m {
+            pb::agent_message::Msg::Drift(d) => Some(d.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(
+        asked.elapsed() < Duration::from_secs(60),
+        "ran {:?} after it was asked for",
+        asked.elapsed()
+    );
+    assert_eq!((reported.revision.as_str(), reported.changes), ("rev1", 1));
+    assert!(reported.target.is_empty(), "about the host itself");
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
 async fn no_drift_sends_an_empty_drift_report_with_health() {
     let runner = FakeRunner::new();
     let plan = plan_with_changes(&rev("rev1"), 2);
