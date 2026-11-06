@@ -4514,13 +4514,17 @@ async fn retrying_a_rollout_without_failures_is_refused() {
 
 const LONG_BAKE: &str = "  settle: 10m\n  health: { bake: 1h }\n  phases:\n    - { name: web, select: 'true', parallel: 2 }\n";
 
-/// Skipping a bake (one host's, or every baking host's) counts it as baked
-/// at once, instead of waiting out the window.
+/// Skipping a bake (one host's, a phase's, or every baking host's) counts it
+/// as baked at once, instead of waiting out the window.
 #[rstest::rstest]
-#[case::one_host(Some("a"))]
-#[case::rollout(None)]
+#[case::one_host(Some("a"), None)]
+#[case::phase(None, Some("web"))]
+#[case::rollout(None, None)]
 #[tokio::test(start_paused = true)]
-async fn skipping_a_bake_finishes_the_host_now(#[case] target: Option<&str>) {
+async fn skipping_a_bake_finishes_the_host_now(
+    #[case] target: Option<&str>,
+    #[case] phase: Option<&str>,
+) {
     let mut h = Harness::new().await;
     h.revision("r1", LONG_BAKE).await;
     for x in ["a", "b"] {
@@ -4536,6 +4540,7 @@ async fn skipping_a_bake_finishes_the_host_now(#[case] target: Option<&str>) {
         rollout: id.clone(),
         host: target.map(String::from),
         workload: String::new(),
+        phase: phase.map(String::from),
         note: String::new(),
     })
     .await
@@ -4550,6 +4555,91 @@ async fn skipping_a_bake_finishes_the_host_now(#[case] target: Option<&str>) {
         };
         assert_eq!(host(&hosts, x).state, want, "{x}");
     }
+}
+
+/// A skipped bake no longer holds its phase: the phase bakes only until its
+/// last row still baking does.
+#[tokio::test(start_paused = true)]
+async fn a_skipped_bake_no_longer_counts_towards_the_phase_bake() {
+    let mut h = Harness::new().await;
+    h.revision("r1", LONG_BAKE).await;
+    h.enrol("a", "web").await;
+    h.enrol("b", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "a baking", |_, hs| {
+        host(hs, "a").state == HostPhase::Baking
+    })
+    .await;
+    h.idle(600).await;
+    h.connect("b", None);
+    let (_, hosts) = h
+        .wait(&id, "b baking", |r, hs| {
+            host(hs, "b").state == HostPhase::Baking && r.runtime.phases[0].bake_until.is_some()
+        })
+        .await;
+    let (a_until, b_until) = (
+        host(&hosts, "a").runtime.bake_until.unwrap(),
+        host(&hosts, "b").runtime.bake_until.unwrap(),
+    );
+    assert!(b_until > a_until);
+    h.wait(&id, "phase baking until b", |r, _| {
+        r.runtime.phases[0].bake_until == Some(b_until)
+    })
+    .await;
+    h.command(Command::SkipBake {
+        rollout: id.clone(),
+        host: Some("b".into()),
+        workload: String::new(),
+        phase: None,
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "phase baking until a", |r, _| {
+        r.runtime.phases[0].bake_until == Some(a_until)
+    })
+    .await;
+}
+
+/// A phase's bake can be skipped only for a phase that exists and has a
+/// baking row.
+#[rstest::rstest]
+#[case::unknown("nope", CommandErrorKind::NotFound)]
+#[case::not_baking("db", CommandErrorKind::Conflict)]
+#[tokio::test(start_paused = true)]
+async fn skipping_a_phase_bake_needs_a_baking_phase(
+    #[case] phase: &str,
+    #[case] want: CommandErrorKind,
+) {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 1h }\n  phases:\n    - { name: web, select: 'host.groups contains \"web\"' }\n    - { name: db, select: 'host.groups contains \"db\"' }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.enrol("d", "db").await;
+    h.connect("a", None);
+    h.connect("d", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "baking", |_, hs| {
+        host(hs, "a").state == HostPhase::Baking
+    })
+    .await;
+    let err = h
+        .command(Command::SkipBake {
+            rollout: id.clone(),
+            host: None,
+            workload: String::new(),
+            phase: Some(phase.into()),
+            note: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, want);
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Baking);
 }
 
 /// A bake with failing checks is not skipped: skipping never passes a
@@ -4573,6 +4663,7 @@ async fn a_bake_with_failing_checks_cannot_be_skipped() {
                 rollout: id.clone(),
                 host: target,
                 workload: String::new(),
+                phase: None,
                 note: String::new(),
             })
             .await

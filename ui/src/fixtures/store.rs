@@ -1047,6 +1047,63 @@ fn skip_bake(h: &mut buckle_api::RolloutHost) {
     h.bake_until = None;
 }
 
+pub fn rollout_phase_action(
+    id: &str,
+    phase: &str,
+    action: &str,
+    note: &str,
+) -> Result<RolloutDetail, ApiError> {
+    admin()?;
+    with(|s| {
+        let detail = s.rollout_mut(id)?;
+        let before = detail.events.len();
+        let p = detail
+            .phases
+            .iter_mut()
+            .find(|p| p.name == phase)
+            .ok_or_else(|| ApiError::NotFound(format!("Rollout {id} has no phase '{phase}'.")))?;
+        if action != "skip-bake" {
+            return Err(ApiError::NotFound(format!("No phase action '{action}'.")));
+        }
+        let baking: Vec<&mut buckle_api::RolloutHost> = p
+            .hosts
+            .iter_mut()
+            .filter(|h| h.state == HostRolloutState::Baking)
+            .collect();
+        if baking.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "No host in {phase} is baking, so there is no bake to skip."
+            )));
+        }
+        let mut changed = Vec::new();
+        for h in baking {
+            skip_bake(h);
+            h.updated_at = Utc::now();
+            changed.push(h.clone());
+        }
+        p.bake_until = None;
+        let message = format!("{} skipped the bake of {phase}. {note}", actor());
+        detail.events.push(event(
+            "rollout.operator",
+            message.clone(),
+            None,
+            Some(phase),
+        ));
+        let snapshot = detail.clone();
+        s.outbox.extend(
+            changed
+                .into_iter()
+                .map(|host| LiveEvent::RolloutHostChanged {
+                    rollout_id: id.into(),
+                    host,
+                }),
+        );
+        s.outbox.extend(timeline(&snapshot, before));
+        s.record(&actor(), "rollout.phase", phase, message);
+        Ok(snapshot)
+    })
+}
+
 pub fn rollout_host_action(
     id: &str,
     host: &str,

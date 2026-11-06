@@ -364,6 +364,17 @@ describe("approving a phase", () => {
     await close();
   });
 
+  test("a stage's bake can be skipped from its heading in the Targets card", async () => {
+    const { page, close } = await open("/rollouts/42");
+    const head = page.locator('tr.table__group[data-stage="home"]');
+    await act(head.getByTestId("stage-actions"), "Skip bake period…");
+    await page.getByRole("dialog", { name: "Skip the bake of home" }).getByRole("button", { name: "Skip bake period" }).click();
+    await page.getByRole("status").filter({ hasText: "home: skip-bake sent." }).waitFor();
+    await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-3"]').getAttribute("data-state"), "healthy"));
+    await eventually(async () => assert.equal(await head.getByTestId("stage-actions").count(), 0, "nothing left to skip"));
+    await close();
+  });
+
   test("retrying a paused rollout re-plans its failed hosts", async () => {
     const { page, close } = await open("/rollouts/42");
     await decide(page, "Pause");

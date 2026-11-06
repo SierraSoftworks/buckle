@@ -141,6 +141,11 @@
   .meter {
     width: 140px;
   }
+
+  // The stage's own controls, at the heading's far end.
+  &__controls {
+    margin-left: auto;
+  }
 }
 
 .table--hosts td:first-child {

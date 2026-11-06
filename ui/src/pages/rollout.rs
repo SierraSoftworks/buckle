@@ -62,6 +62,8 @@ pub(crate) enum Ask {
     /// A rollout action (the API's), or `skip-phase`: resuming past failures.
     Action(&'static str),
     Host(&'static str, String),
+    /// A phase's action (`skip-bake`) and the phase.
+    Phase(&'static str, String),
     Continue(String, Vec<String>),
 }
 
@@ -467,6 +469,10 @@ pub(crate) fn use_rollout_actions(id: String, set: Callback<RolloutDetail>) -> R
                         )
                         .await,
                         format!("{host}: {action} sent."),
+                    ),
+                    Ask::Phase(action, phase) => (
+                        api::rollout_phase_action(&id, phase, action, &note).await,
+                        format!("{phase}: {action} sent."),
                     ),
                     Ask::Continue(host, checks) => (
                         api::continue_host(
@@ -1025,6 +1031,24 @@ fn dialog(
                 </Confirm>
             }
         }
+        Ask::Phase(_, phase) => {
+            let baking: Vec<String> = d
+                .phases
+                .iter()
+                .filter(|p| p.name == *phase)
+                .flat_map(|p| &p.hosts)
+                .filter(|h| h.state == HostRolloutState::Baking)
+                .map(units::key)
+                .collect();
+            html! {
+                <Confirm title={format!("Skip the bake of {phase}")} confirm_label="Skip bake period" danger=true note=true
+                    {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
+                    <p>{ format!(
+                        "Counts {} in {phase} ({}) as baked now, without waiting out the rest of their bake windows. A host whose checks are failing keeps baking.",
+                        count(baking.len(), "baking host", "baking hosts"), baking.join(", ")) }</p>
+                </Confirm>
+            }
+        }
         Ask::Continue(host, checks) => html! {
             <Confirm title={format!("Continue {host} with checks waived")} confirm_label={format!("Waive {} and continue", count(checks.len(), "check", "checks"))}
                 danger=true note=true acknowledge={AttrValue::from("I understand these checks still run and report, but no longer count for this host in this rollout.")}
@@ -1253,6 +1277,8 @@ fn host_table(props: &HostTableProps) -> Html {
         let c = st.counts.clone();
         // Said once on the stage's heading instead of on each of its rows.
         let all_need_approval = c.needs_approval == c.total;
+        let baking = props.admin && st.hosts().any(|h| h.state == HostRolloutState::Baking);
+        let on_ask = props.on_ask.clone();
         step_groups(st, all).into_iter().enumerate().map(move |(i, (step, rows, hidden))| {
             let first = i == 0;
             let key = match step {
@@ -1275,6 +1301,11 @@ fn host_table(props: &HostTableProps) -> Html {
                             }
                             if hidden > 0 {
                                 <span class="muted small" data-testid="hidden-unchanged">{ format!("{hidden} unchanged not shown") }</span>
+                            }
+                            if first && baking {
+                                <span class="group-head__controls">
+                                    <SplitButton items={stage_menu(&phase.name, &on_ask)} small=true menu_label={format!("More actions for {}", phase.name)} testid="stage-actions" />
+                                </span>
                             }
                         </span>
                     </th>
@@ -1333,7 +1364,7 @@ fn host_table(props: &HostTableProps) -> Html {
                                     if h.needs_attention {
                                         <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>
                                     }
-                                    if let Some(until) = h.bake_until.filter(|u| *u > props.now) {
+                                    if let Some(until) = h.bake_until.filter(|u| h.state == HostRolloutState::Baking && *u > props.now) {
                                         <span class="small muted">{ " " }<Countdown {until} /></span>
                                     }
                                     if let Some(r) = awaited_reboot(h, props.now) {
@@ -1398,6 +1429,16 @@ fn host_table(props: &HostTableProps) -> Html {
             </table>
         </div>
     }
+}
+
+/// A stage's own actions, on its heading in the Targets card: skip the bake
+/// of its baking rows.
+fn stage_menu(phase: &str, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
+    let (on_ask, a) = (on_ask.clone(), Ask::Phase("skip-bake", phase.to_owned()));
+    vec![MenuItem::new(
+        "Skip bake period…",
+        Callback::from(move |_: MouseEvent| on_ask.emit(a.clone())),
+    )]
 }
 
 /// A host's own decisions, for the menu on its row.

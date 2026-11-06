@@ -179,10 +179,15 @@ fn column(stage: &Stage, props: &PipelineProps) -> Html {
         tally.push(format!("{} unchanged", c.unchanged));
     }
     // The phase's own deadline, or while it has none, the latest of its
-    // baking hosts': the stage is baked when its last host is.
-    let until = phase
-        .bake_until
-        .or_else(|| stage.hosts().filter_map(|h| h.bake_until).max());
+    // baking hosts': the stage is baked when its last host is, and a host
+    // done baking (or whose bake was skipped) no longer holds it.
+    let until = phase.bake_until.or_else(|| {
+        stage
+            .hosts()
+            .filter(|h| h.state == HostRolloutState::Baking)
+            .filter_map(|h| h.bake_until)
+            .max()
+    });
     let bake = match until {
         Some(until) if until > now => html! { <Countdown {until} prefix="bake" /> },
         _ if phase.bake_seconds > 0 => {
@@ -318,7 +323,10 @@ fn block(
     } else if let Some(digest) = &entry.plan_digest {
         detail.push(html! { <span class="mono">{ format!("plan {}", short(digest)) }</span> });
     }
-    if let Some(until) = entry.bake_until.filter(|u| *u > now) {
+    if let Some(until) = entry
+        .bake_until
+        .filter(|u| entry.state == HostRolloutState::Baking && *u > now)
+    {
         let why = match entry.bake.as_ref().and_then(|b| b.module.as_deref()) {
             Some(module) => format!("baking for {module}, "),
             None => "baking, ".to_owned(),
