@@ -1337,7 +1337,19 @@ impl Controller {
         };
         let target = self.row_target(ri, hi);
         let workload = self.live[ri].hosts[hi].workload.clone();
-        let m = Box::new(stamp_target(msg(m), &target, &workload));
+        let mut m = stamp_target(msg(m), &target, &workload);
+        // A target's checks once this rollout applied to it are of the
+        // revision it applied: a placement's cluster records its applied
+        // revision only once every placement converged, so until then it
+        // names the revision being replaced (whose reports a bake ignores).
+        if let Some(server_message::Msg::Health(h)) = &mut m.msg
+            && !target.is_empty()
+            && h.revision.is_empty()
+            && self.live[ri].hosts[hi].runtime.applied
+        {
+            h.revision = self.live[ri].hosts[hi].runtime.revision.clone();
+        }
+        let m = Box::new(m);
         self.outbox.push(if target.is_empty() {
             Out::Msg(session, m)
         } else {
@@ -7144,8 +7156,9 @@ impl Controller {
 
     /// Sends `m` (scoped to `workload`'s placement, or the whole cluster) for
     /// the cluster `target` over `session`, behind a targeted Assign of the
-    /// revision it concerns (for health, the cluster's applied revision,
-    /// which the request then names); `false` when the session is gone.
+    /// revision it concerns (for health, the one it names, else the
+    /// cluster's applied revision, which the request then names); `false`
+    /// when the session is gone.
     async fn send_targeted(
         &mut self,
         session: &str,
@@ -7158,6 +7171,7 @@ impl Controller {
             Some(server_message::Msg::Apply(a)) => a.revision.clone(),
             Some(server_message::Msg::Rollback(r)) => r.revision.clone(),
             Some(server_message::Msg::Action(a)) => a.revision.clone(),
+            Some(server_message::Msg::Health(h)) if !h.revision.is_empty() => h.revision.clone(),
             Some(server_message::Msg::Health(_)) => {
                 let t = target.to_owned();
                 self.store
