@@ -10,10 +10,10 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::api::{self, ApiError};
-use crate::app::Route;
+use crate::app::{Route, use_auth};
 use crate::components::{
     Empty, ErrorState, Loading, Meter, PageHead, Panel, Pill, Refresh, RouteLink, Segment,
-    Segmented,
+    Segmented, WorkloadActions, use_workload_rollout,
 };
 use crate::hooks::{use_fetch, use_now};
 use crate::logic::clusters::WorkloadState;
@@ -53,6 +53,10 @@ fn attention(w: &FleetWorkload) -> bool {
 #[function_component(Workloads)]
 pub fn workloads() -> Html {
     let now = use_now(15);
+    let auth = use_auth();
+    let rollouts = use_workload_rollout();
+    // A row's actions roll out across its placements.
+    let on_action = auth.is_admin().then(|| rollouts.on_action.clone());
     let location = use_location();
     let navigator = use_navigator();
     let query: Query = location
@@ -155,8 +159,9 @@ pub fn workloads() -> Html {
                                 <th scope="col">{ "Clusters" }</th>
                                 <th scope="col">{ "Revision" }</th>
                                 <th scope="col">{ "Health read" }</th>
+                                if on_action.is_some() { <th scope="col"><span class="visually-hidden">{ "Actions" }</span></th> }
                             </tr></thead>
-                            <tbody>{ for rows.into_iter().map(|w| row(w, &on_open, now)) }</tbody>
+                            <tbody>{ for rows.into_iter().map(|w| row(w, &on_open, on_action.as_ref(), now)) }</tbody>
                         </table>
                     </div>
                 }
@@ -171,6 +176,7 @@ pub fn workloads() -> Html {
                 subtitle={html! { { if subtitle.is_empty() { "What the fleet's clusters run.".to_string() } else { subtitle } } }}
                 actions={html! { <Refresh loading={data.loading} reload={data.reload.clone()} /> }} />
             <Panel>{ body }</Panel>
+            { rollouts.dialog }
         </div>
     }
 }
@@ -190,6 +196,7 @@ pub(crate) fn placement_chip(name: &str, cluster: &str, state: WorkloadState) ->
 fn row(
     w: &FleetWorkload,
     on_open: &Callback<(MouseEvent, String)>,
+    on_action: Option<&Callback<(String, buckle_api::ActionInfo)>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Html {
     let onclick = {
@@ -233,6 +240,12 @@ fn row(
                 if w.drifted() { { " " }<Pill tone={Tone::Warn} label="drifted" /> }
             </td>
             <td class="nowrap" title={w.read_at().map(timestamp)}>{ relative_opt(w.read_at(), now) }</td>
+            if let Some(on_action) = on_action {
+                <td class="row-controls">
+                    <WorkloadActions workload={w.name.clone()} actions={w.actions.clone()} on_action={on_action.clone()}
+                        small=true testid={format!("workload-actions-{}", w.name)} />
+                </td>
+            }
         </tr>
     }
 }

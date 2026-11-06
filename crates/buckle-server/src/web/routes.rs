@@ -1263,10 +1263,15 @@ async fn start_action_rollout(
     let offered = crate::actions::fleet(&state.store, &state.revisions, selector.as_ref()).await?;
     let found = offered
         .into_iter()
-        .find(|f| f.action.module == body.module && f.action.name == body.action)
+        .find(|f| {
+            f.workload == body.workload
+                && f.action.module == body.module
+                && f.action.name == body.action
+        })
         .ok_or_else(|| {
             ApiError::not_found(format!(
-                "No target{} offers the action '{}' of '{}'.",
+                "No {}{} offers the action '{}' of '{}'.",
+                if body.workload { "cluster" } else { "host" },
                 if raw.is_some() {
                     " the selector matches"
                 } else {

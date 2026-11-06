@@ -263,6 +263,10 @@ pub struct RolloutActionInfo {
 pub struct StartActionRollout {
     pub module: String,
     pub action: String,
+    /// The action is the workload `module`'s, run on the clusters running
+    /// it (one placement each); else a host module's.
+    #[serde(default)]
+    pub workload: bool,
     /// A filter over the targets' context (`labels.role == "web"`); absent
     /// for every target offering the action.
     #[serde(default, skip_serializing_if = "Option::is_none")]

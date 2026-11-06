@@ -51,14 +51,26 @@ pub fn fleet_key(f: &FleetAction) -> String {
     format!("{}/{}", f.action.module, f.action.name)
 }
 
-/// The Run action dialog's button: what starts, on how many targets.
+/// The Run action dialog's button: what starts, on how many hosts (or, for
+/// a workload's action, clusters).
 pub fn rollout_label(f: &FleetAction) -> String {
     let n = f.targets.len();
+    let (one, many) = if f.workload {
+        ("cluster", "clusters")
+    } else {
+        ("host", "hosts")
+    };
     format!(
         "Run {} on {n} {}",
         f.action.label,
-        if n == 1 { "target" } else { "targets" }
+        if n == 1 { one } else { many }
     )
+}
+
+/// A workload-wide action's label: it always opens a dialog (it starts a
+/// rollout across the workload's placements).
+pub fn rollout_item_label(a: &ActionInfo) -> String {
+    format!("{}…", a.label)
 }
 
 #[cfg(test)]
@@ -108,12 +120,14 @@ mod tests {
 
     #[test]
     fn a_fleet_action_says_what_starts_and_where() {
-        for (targets, expected) in [
-            (vec!["a"], "Run Restart on 1 target"),
-            (vec!["a", "b"], "Run Restart on 2 targets"),
+        for (targets, workload, expected) in [
+            (vec!["a"], false, "Run Restart on 1 host"),
+            (vec!["a", "b"], false, "Run Restart on 2 hosts"),
+            (vec!["a", "b"], true, "Run Restart on 2 clusters"),
         ] {
             let f = FleetAction {
                 action: action("web", "Restart", false),
+                workload,
                 targets: targets.into_iter().map(str::to_owned).collect(),
             };
             assert_eq!(rollout_label(&f), expected);

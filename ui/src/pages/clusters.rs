@@ -16,7 +16,7 @@ use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
     Button, Empty, ErrorState, HostLink, Kind, Loading, MenuItem, PageHead, Panel, Pill, Refresh,
-    RunAction, SplitButton, icons,
+    SplitButton, icons,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::clusters::deploying_text;
@@ -63,7 +63,6 @@ pub fn clusters() -> Html {
     let fleet = use_fetch((), |_| api::fleet());
     let live = use_live_value(&fleet, apply_fleet);
     let adding = use_state(|| false);
-    let running = use_state(|| false);
 
     let on_search = {
         let navigator = navigator.clone();
@@ -176,14 +175,10 @@ pub fn clusters() -> Html {
                     if auth.is_admin() {
                         <SplitButton menu_label="More cluster actions" testid="clusters-actions" items={vec![
                             MenuItem::new("Add a cluster…", add.clone()).kind(Kind::Primary),
-                            { let r = running.clone(); MenuItem::new("Run action…", Callback::from(move |_| r.set(true))) },
                         ]} />
                     }
                 </> }} />
             <Panel>{ body }</Panel>
-            if auth.is_admin() && *running {
-                <RunAction on_close={{ let r = running.clone(); Callback::from(move |_| r.set(false)) }} />
-            }
             if auth.is_admin() && *adding {
                 <super::add_cluster::AddCluster on_close={{
                     let (a, reload) = (adding.clone(), fleet.reload.clone());

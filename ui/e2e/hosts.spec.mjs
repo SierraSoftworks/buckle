@@ -208,17 +208,57 @@ describe("actions", () => {
 });
 
 describe("action rollouts", () => {
-  test("Run action… picks an action and its targets, and opens the rollout it starts", async () => {
+  test("Run action… on Hosts picks a module action and its hosts, and opens the rollout it starts", async () => {
     const { page, close } = await open("/hosts");
     await act(page.getByTestId("hosts-actions"), "Run action…");
-    const dialog = page.getByRole("dialog", { name: "Run an action across the fleet" });
-    await dialog.getByRole("combobox", { name: "Action" }).selectOption({ label: "common · Upgrade packages" });
+    const dialog = page.getByRole("dialog", { name: "Run a module action across hosts" });
+    const action = dialog.getByRole("combobox", { name: "Action" });
+    await eventually(async () => assert.ok((await action.locator("option").count()) > 0));
+    // Workloads' actions run from the Workloads pages instead.
+    const options = await action.locator("option").allTextContents();
+    assert.ok(options.every((o) => !/^(atuin|paste|postgresql) ·/.test(o)), options.join(", "));
+    await action.selectOption({ label: "common · Upgrade packages" });
     await eventually(async () =>
       assert.match(await dialog.getByTestId("run-action-targets").textContent(), /Runs on .+/),
     );
-    await dialog.getByRole("button", { name: /^Run Upgrade packages on \d+ targets?$/ }).click();
+    await dialog.getByRole("button", { name: /^Run Upgrade packages on \d+ hosts?$/ }).click();
     await page.getByTestId("rollout-action").waitFor();
     assert.match(await page.getByTestId("rollout-action").textContent(), /Upgrade packages/);
+    await close();
+  });
+
+  test("Clusters offer no fleet-wide Run action", async () => {
+    const { page, close } = await open("/clusters");
+    const { face, menu } = await offered(page.getByTestId("clusters-actions"));
+    assert.ok(![face, ...menu].includes("Run action…"));
+    await close();
+  });
+
+  for (const [path, split] of [
+    ["/workloads", (page) => page.getByTestId("workload-actions-paste")],
+    ["/workloads/paste", (page) => page.getByTestId("workload-actions")],
+  ]) {
+    test(`a workload's action rolls out across its placements from ${path}`, async () => {
+      const { page, close } = await open(path);
+      const { face, menu } = await offered(split(page));
+      assert.equal(face, "Restart…");
+      assert.ok(menu.includes("Stop…"), menu.join(", "));
+      await act(split(page), "Restart…");
+      const dialog = page.getByRole("dialog", { name: "Restart paste on every cluster" });
+      await eventually(async () =>
+        assert.match(await dialog.getByTestId("workload-rollout-targets").textContent(), /Runs on .*home-nomad/),
+      );
+      await dialog.getByRole("button", { name: /^Run Restart on \d+ clusters?$/ }).click();
+      await page.getByTestId("rollout-action").waitFor();
+      assert.match(await page.getByTestId("rollout-action").textContent(), /Restart/);
+      await close();
+    });
+  }
+
+  test("a placement's row still runs its action on that cluster alone", async () => {
+    const { page, close } = await open("/workloads/paste?cluster=home-nomad");
+    const { face } = await offered(page.getByTestId("actions-home-nomad-paste"));
+    assert.equal(face, "Restart");
     await close();
   });
 });
