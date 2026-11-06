@@ -16,7 +16,8 @@ use super::workloads::{cluster_details, placement_chip};
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink, use_actions,
+    Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink, WorkloadActions,
+    use_actions, use_workload_rollout,
 };
 use crate::hooks::{use_fetch, use_live_value};
 use crate::logic::format::{count, rollout_label};
@@ -43,6 +44,7 @@ pub fn workload_page(props: &Props) -> Html {
         .and_then(|l| l.query::<Query>().ok())
         .and_then(|q| q.cluster);
     let data = use_fetch((), |_| cluster_details());
+    let rollouts = use_workload_rollout();
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
     let active = fleet.as_ref().and_then(|f| f.active_rollout.clone());
@@ -131,7 +133,15 @@ pub fn workload_page(props: &Props) -> Html {
         <div class="page page--wide">
             <PageHead title={w.name.clone()}
                 subtitle={html! { { if w.description.is_empty() { format!("A workload on {}", count(w.placements.len(), "cluster", "clusters")) } else { w.description.clone() } } }}
-                actions={html! { <Refresh loading={data.loading} reload={data.reload.clone()} /> }} />
+                actions={html! { <>
+                    <Refresh loading={data.loading} reload={data.reload.clone()} />
+                    // Across every placement; a placement's own run from its row.
+                    if auth.is_admin() {
+                        <WorkloadActions workload={w.name.clone()} actions={w.actions.clone()}
+                            on_action={rollouts.on_action.clone()} testid="workload-actions" />
+                    }
+                </> }} />
+            { rollouts.dialog.clone() }
             <Panel title="Summary">
                 <dl class="workload-summary">
                     <dt>{ "Runs on" }</dt>

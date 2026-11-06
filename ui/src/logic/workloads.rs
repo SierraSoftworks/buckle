@@ -2,7 +2,7 @@
 //! entry per workload with one placement per cluster, read with the same
 //! row logic the cluster page's Workloads card uses.
 
-use buckle_api::{HostDetail, RunReport};
+use buckle_api::{ActionInfo, HostDetail, RunReport};
 use chrono::{DateTime, Utc};
 
 use super::clusters::{WorkloadRow, WorkloadState, workload_rows};
@@ -25,6 +25,10 @@ pub struct FleetWorkload {
     pub description: String,
     pub needs: Vec<String>,
     pub placements: Vec<Placement>,
+    /// The actions any of its placements offers, once each by name, in the
+    /// order its clusters declare them: what a workload-wide action rollout
+    /// can run.
+    pub actions: Vec<ActionInfo>,
 }
 
 impl FleetWorkload {
@@ -86,8 +90,19 @@ pub fn gather(clusters: &[(HostDetail, Option<RunReport>)]) -> Vec<FleetWorkload
                 .find(|v| v.name == placement.row.name)
                 .map(|v| v.needs.clone())
                 .unwrap_or_default();
+            let actions: Vec<ActionInfo> = d
+                .actions
+                .iter()
+                .filter(|a| a.module == placement.row.name)
+                .cloned()
+                .collect();
             match out.iter_mut().find(|w| w.name == placement.row.name) {
                 Some(w) => {
+                    for a in actions {
+                        if !w.actions.iter().any(|b| b.name == a.name) {
+                            w.actions.push(a);
+                        }
+                    }
                     if w.description.is_empty() {
                         w.description = placement.row.description.clone();
                     }
@@ -103,6 +118,7 @@ pub fn gather(clusters: &[(HostDetail, Option<RunReport>)]) -> Vec<FleetWorkload
                     description: placement.row.description.clone(),
                     needs,
                     placements: vec![placement],
+                    actions,
                 }),
             }
         }
@@ -128,7 +144,7 @@ pub fn matches(w: &FleetWorkload, q: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buckle_api::{DriftItem, HostCheck, HostSummary, WorkloadView};
+    use buckle_api::{ActionInfo, DriftItem, HostCheck, HostSummary, WorkloadView};
 
     fn cluster(id: &str, workloads: &[(&str, &[&str])], failing: &[&str]) -> HostDetail {
         let summary: HostSummary = serde_json::from_value(serde_json::json!({
@@ -185,6 +201,18 @@ mod tests {
         }
     }
 
+    fn action(module: &str, name: &str) -> ActionInfo {
+        ActionInfo {
+            module: module.into(),
+            name: name.into(),
+            label: name.into(),
+            kind: name.into(),
+            description: None,
+            confirm: true,
+            implicit: true,
+        }
+    }
+
     #[test]
     fn a_workload_on_several_clusters_is_one_entry_worst_first() {
         let all = gather(&[
@@ -213,6 +241,20 @@ mod tests {
         assert!(paste.drifted());
         let pg = all.iter().find(|w| w.name == "postgresql").unwrap();
         assert_eq!(pg.needed_by(&all), vec!["paste"]);
+    }
+
+    #[test]
+    fn a_workload_offers_its_placements_actions_once_each() {
+        let mut home = cluster("home", &[("paste", &[]), ("grafana", &[])], &[]);
+        home.actions = vec![action("paste", "restart"), action("grafana", "restart")];
+        let mut lab = cluster("lab", &[("paste", &[])], &[]);
+        lab.actions = vec![action("paste", "restart"), action("paste", "dispatch")];
+        let all = gather(&[(home, None), (lab, None)]);
+        let paste = all.iter().find(|w| w.name == "paste").unwrap();
+        let names: Vec<&str> = paste.actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["restart", "dispatch"]);
+        let grafana = all.iter().find(|w| w.name == "grafana").unwrap();
+        assert!(grafana.actions.iter().all(|a| a.module == "grafana"));
     }
 
     #[test]

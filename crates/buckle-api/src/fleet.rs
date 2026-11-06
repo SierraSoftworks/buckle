@@ -165,6 +165,10 @@ pub struct ActionInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetAction {
     pub action: ActionInfo,
+    /// A workload's action, offered by the clusters running it; else a host
+    /// module's.
+    #[serde(default)]
+    pub workload: bool,
     /// The targets offering it (that the selector matches), by name.
     pub targets: Vec<String>,
 }

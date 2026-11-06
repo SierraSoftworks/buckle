@@ -180,9 +180,12 @@ available from a paused rollout.
 
 ## Action rollouts
 
-**Run action…** on the Hosts and Clusters pages runs one [action](../modules/README.md#actions)
-across the fleet as a rollout: pick the action, and optionally narrow its targets with a selector
-(`host.labels.role == "web"`). The rollout follows the stable revision's phases as a revision's
+**Run action…** on the Hosts page runs one module's [action](../modules/README.md#actions)
+across the fleet as a rollout: pick the action, and optionally narrow its hosts with a selector
+(`host.labels.role == "web"`). A workload's actions roll out from the Workloads pages instead: a
+row's menu on the Workloads list, or the head of the workload's page, runs one across every
+cluster running it (each placement row keeps its own, which runs on that cluster at once). The
+rollout follows the stable revision's phases as a revision's
 would, with the same approvals, waves of `parallel`, baseline and bake checks, failure budgets,
 pause and abort, and reboots.
 
@@ -190,8 +193,8 @@ pause and abort, and reboots.
   matches, frozen when the rollout starts. Each runs the action from the revision it runs.
 - **Workloads**: a workload's action moves each cluster as that workload's placement, one row per
   cluster, phased by its `workload.*` and the cluster's `cluster.*` as a revision's placement
-  would be. The selector sees the placement too: `workload.labels.tier == "web"` picks the
-  clusters running such a workload and offers only its actions.
+  would be. Through the API (`POST /api/v1/rollouts` with `workload: true`) the selector sees the
+  placement too: `workload.labels.tier == "web"` picks the clusters running such a workload.
 - **Approval**: every target has the same plan (the action), so one approval covers a phase. An
   `if_destructive` phase asks for one when the action is declared with `confirm: true`.
 - **Ending**: the rollout completes without promoting anything, and has no stragglers stage. It

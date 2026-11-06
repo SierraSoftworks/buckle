@@ -2933,7 +2933,8 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
         |_| {},
     )
     .await;
-    revision(&e, "r1", "version: 2\n").await;
+    // The tree is complete before the revision is recorded: the controller
+    // may load (and cache) it as soon as it is.
     let module = e.state.revisions.dir("r1").join("modules/web");
     std::fs::create_dir_all(&module).unwrap();
     std::fs::write(
@@ -2941,6 +2942,7 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
         "name: web\nactions:\n  drain: { command.run: { run: [\"true\"] }, confirm: true }\n",
     )
     .unwrap();
+    revision(&e, "r1", "version: 2\n").await;
     for (host, role) in [("pi-1", "web"), ("pi-2", "web"), ("pi-3", "db")] {
         add_host(&e.store, host, HostStatus::Active).await;
         let (h, role) = (host.to_owned(), role.to_owned());
@@ -2969,8 +2971,9 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
     let listed: Vec<buckle_api::FleetAction> = test::read_body_json(listed).await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].targets, vec!["pi-1", "pi-2"]);
+    assert!(!listed[0].workload, "a host module's action");
 
-    let start = |action: &str, note: &str| {
+    let start = |action: &str, note: &str, workload: bool| {
         test::TestRequest::post()
             .uri("/api/v1/rollouts")
             .cookie(cookie.clone())
@@ -2978,19 +2981,22 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
             .set_json(buckle_api::StartActionRollout {
                 module: "web".into(),
                 action: action.into(),
+                workload,
                 selector: Some(selector.into()),
                 note: note.into(),
             })
             .to_request()
     };
-    for (action, note, status) in [
-        ("drain", "", StatusCode::BAD_REQUEST),
-        ("vacuum", "why", StatusCode::NOT_FOUND),
+    for (action, note, workload, status) in [
+        ("drain", "", false, StatusCode::BAD_REQUEST),
+        ("vacuum", "why", false, StatusCode::NOT_FOUND),
+        // No cluster runs a workload `web`: the module's action is not it.
+        ("drain", "why", true, StatusCode::NOT_FOUND),
     ] {
-        let resp = test::call_service(&app, start(action, note)).await;
-        assert_eq!(resp.status(), status, "{action}");
+        let resp = test::call_service(&app, start(action, note, workload)).await;
+        assert_eq!(resp.status(), status, "{action} (workload: {workload})");
     }
-    let resp = test::call_service(&app, start("drain", "before maintenance")).await;
+    let resp = test::call_service(&app, start("drain", "before maintenance", false)).await;
     let status = resp.status();
     let body = test::read_body(resp).await;
     assert_eq!(
@@ -3060,6 +3066,7 @@ async fn workload_selectors_pick_the_placements_offering_an_action() {
             let resp =
                 test::call_service(app, test::TestRequest::get().uri(&uri).to_request()).await;
             let actions: Vec<buckle_api::FleetAction> = test::read_body_json(resp).await;
+            assert!(actions.iter().all(|a| a.workload), "workloads' actions");
             actions
                 .into_iter()
                 .map(|a| (a.action.module, a.targets))

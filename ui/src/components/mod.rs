@@ -43,7 +43,7 @@ pub use modal::Confirm;
 pub use pipeline::Pipeline;
 pub use plan::PlanGroupView;
 pub use revision::{RevisionLog, use_revision_actions};
-pub use run_action::RunAction;
+pub use run_action::{RunAction, WorkloadActions, use_workload_rollout};
 pub use run_report::RunReportView;
 pub use segmented::Segmented;
 pub use split_button::{MenuItem, SplitButton};

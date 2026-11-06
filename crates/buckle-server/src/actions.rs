@@ -67,7 +67,9 @@ pub fn list(
 }
 
 /// Every action the fleet's active targets offer now (each from the
-/// revision it runs), with the targets offering it that `selector` matches.
+/// revision it runs), with the targets offering it that `selector` matches:
+/// hosts' module actions apart from clusters' workload actions, even where
+/// a module and a workload share a name.
 /// The selector sees a target as the stable revision's phases do: a host as
 /// itself, a cluster's workload action as that workload's placement
 /// (`workload.*` beside `cluster.*`), so `workload.labels.tier == "web"`
@@ -108,25 +110,32 @@ pub async fn fleet(
         };
         let seen_by = stable.as_deref().unwrap_or(&rev);
         let ctx = crate::fleet::record_context(record, facts, &seen_by.fleet);
+        let workload = record.kind != TargetKind::Host;
         for a in list(&rev, record, facts) {
             if let Some(selector) = selector
                 && !offers_to(selector, record.kind, &ctx, seen_by, &rev, &a.module)
             {
                 continue;
             }
-            match out
-                .iter_mut()
-                .find(|f| f.action.module == a.module && f.action.name == a.name)
-            {
+            match out.iter_mut().find(|f| {
+                f.workload == workload && f.action.module == a.module && f.action.name == a.name
+            }) {
                 Some(f) => f.targets.push(record.id.clone()),
                 None => out.push(buckle_api::FleetAction {
                     action: a,
+                    workload,
                     targets: vec![record.id.clone()],
                 }),
             }
         }
     }
-    out.sort_by(|a, b| (&a.action.module, &a.action.name).cmp(&(&b.action.module, &b.action.name)));
+    out.sort_by(|a, b| {
+        (a.workload, &a.action.module, &a.action.name).cmp(&(
+            b.workload,
+            &b.action.module,
+            &b.action.name,
+        ))
+    });
     Ok(out)
 }
 

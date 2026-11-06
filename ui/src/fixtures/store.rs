@@ -588,21 +588,26 @@ pub fn fleet_actions(selector: &str) -> Result<Vec<buckle_api::FleetAction>, Api
             if d.summary.status != HostStatus::Active || !demo_selects(selector, &d.summary) {
                 continue;
             }
+            let workload = d.summary.kind != buckle_api::TargetKind::Host;
             for a in &d.actions {
-                match out
-                    .iter_mut()
-                    .find(|f| f.action.module == a.module && f.action.name == a.name)
-                {
+                match out.iter_mut().find(|f| {
+                    f.workload == workload && f.action.module == a.module && f.action.name == a.name
+                }) {
                     Some(f) => f.targets.push(d.summary.id.clone()),
                     None => out.push(buckle_api::FleetAction {
                         action: a.clone(),
+                        workload,
                         targets: vec![d.summary.id.clone()],
                     }),
                 }
             }
         }
         out.sort_by(|a, b| {
-            (&a.action.module, &a.action.name).cmp(&(&b.action.module, &b.action.name))
+            (a.workload, &a.action.module, &a.action.name).cmp(&(
+                b.workload,
+                &b.action.module,
+                &b.action.name,
+            ))
         });
         Ok(out)
     })
@@ -615,7 +620,11 @@ pub fn start_action_rollout(
     let selector = body.selector.clone().unwrap_or_default();
     let found = fleet_actions(&selector)?
         .into_iter()
-        .find(|f| f.action.module == body.module && f.action.name == body.action)
+        .find(|f| {
+            f.workload == body.workload
+                && f.action.module == body.module
+                && f.action.name == body.action
+        })
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "No target offers the action '{}' of '{}'.",
@@ -663,6 +672,15 @@ pub fn start_action_rollout(
             };
             phase.approved_by = None;
             phase.hosts.retain(|h| found.targets.contains(&h.host));
+            if body.workload {
+                // One placement of the workload per cluster, as the server freezes them.
+                let mut seen = std::collections::BTreeSet::new();
+                phase.hosts.retain(|h| seen.insert(h.host.clone()));
+                for h in &mut phase.hosts {
+                    h.workload = Some(body.module.clone());
+                    h.kind = buckle_api::TargetKind::Workload;
+                }
+            }
             for h in &mut phase.hosts {
                 h.state = HostRolloutState::Planned;
                 h.error = None;
