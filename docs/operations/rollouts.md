@@ -31,8 +31,8 @@ according to `rollout.supersede`.
 Every targeted agent sends a plan, then each phase applies in waves of `parallel` hosts. The
 pipeline shows each phase as a stage: its hosts first as square blocks, then a section per cluster
 (headed by the cluster's name) with each workload as a round block, wrapping inside the stage. A
-unit whose plan changes nothing is solid grey; one waiting for an earlier step, a need or its
-cluster's steward is hollow and says what it waits for on hover. An approval gate sits before each
+unit is coloured by its state, also when its plan changes nothing (the stage counts those); one
+waiting for an earlier step, a need or its cluster's steward is hollow and says what it waits for on hover. An approval gate sits before each
 stage that needs one: approved, needs approval, or waiting. The health check between stages is
 drawn only when it holds the rollout (paused).
 

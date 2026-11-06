@@ -5,7 +5,7 @@
 //! the host. A stage's hosts come first; each cluster's workloads follow
 //! in a section under the cluster's name, as round blocks: hollow while a
 //! workload waits for an earlier step, a need or its cluster's steward,
-//! and saying which. A unit whose plan changes nothing is solid grey.
+//! and saying which.
 
 use std::collections::BTreeMap;
 
@@ -49,7 +49,6 @@ pub fn pipeline(props: &PipelineProps) -> Html {
     let p = layout(&props.detail);
     let units = || props.detail.phases.iter().flat_map(|ph| &ph.hosts);
     let has_cluster = units().any(|h| h.kind != TargetKind::Host);
-    let has_unchanged = units().any(units::unchanged);
     let has_removal = units().any(|h| h.removal);
     let stages = p.stages.iter().enumerate().map(|(i, stage)| {
         html! {
@@ -98,12 +97,6 @@ pub fn pipeline(props: &PipelineProps) -> Html {
                         <li class="legend__item">
                             <span class="block block--legend block--planned block--cluster block--removal" aria-hidden="true" />
                             { "removing" }
-                        </li>
-                    }
-                    if has_unchanged {
-                        <li class="legend__item">
-                            <span class="block block--legend block--unchanged" aria-hidden="true" />
-                            { "unchanged" }
                         </li>
                     }
                 </ul>

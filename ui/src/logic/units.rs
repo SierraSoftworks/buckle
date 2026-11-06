@@ -47,7 +47,7 @@ pub fn is_placement(h: &RolloutHost) -> bool {
 }
 
 /// A unit whose plan changes and removes nothing: it rolls without a
-/// gate, bake or slot, and the pipeline draws it grey.
+/// gate, bake or slot, and the Targets card hides it until asked.
 pub fn unchanged(h: &RolloutHost) -> bool {
     h.plan_changes == Some(0) && h.plan_removals.unwrap_or(0) == 0
 }
