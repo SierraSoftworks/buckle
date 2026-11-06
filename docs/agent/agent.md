@@ -69,8 +69,9 @@ resolves secrets itself (see [Secrets](../modules/secrets.md#local-mode)).
 
 ### Drift
 
-Every `drift.interval` the agent re-plans the revision it applied and runs its modules' health
-checks. A non-empty plan is drift: something changed under Buckle. With `drift.correct: true` the
+Once on start, as soon as its first session is established, and then every `drift.interval`, the
+agent re-plans the revision it applied and runs its modules' health checks, so what changed while
+it was down (a reboot, say) is corrected straight away. A non-empty plan is drift: something changed under Buckle. With `drift.correct: true` the
 agent applies the correction and reports it; otherwise it only reports, and the host shows as
 drifted in the UI. Unattended drift correction never removes anything.
 
@@ -117,7 +118,7 @@ telemetry:
 | `tls.insecure_plaintext` | `false` | Allow an `http://` server URL. Combining it with an `https://` URL is refused. |
 | `labels` | `{}` | Seed labels reported on connect, [typed like YAML scalars](./README.md#labels). Labels an operator sets in the UI override these. |
 | `state_dir` | `/var/lib/buckle` | Resource records, cached facts, revisions and secrets (`C:\ProgramData\buckle` on Windows). Mode 0700. |
-| `drift.interval` | `15m` | How often to re-plan the applied revision and run health checks. |
+| `drift.interval` | `15m` | How often to re-plan the applied revision and run health checks (also once on start). |
 | `drift.correct` | `true` | Apply drift corrections; `false` only reports them. |
 | `vars` | `{}` | Host-specific variable overrides: the last, highest-precedence [vars](../modules/fleet.md#vars) layer. |
 | `telemetry.otlp_endpoint` | | Where to export traces, metrics and logs. `--otel-endpoint` and `OTEL_EXPORTER_OTLP_*` take precedence. |

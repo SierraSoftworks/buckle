@@ -430,6 +430,53 @@ async fn drift_is_reported_and_corrected_when_configured(#[case] correct: bool) 
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_restarted_agent_corrects_drift_as_soon_as_it_connects() {
+    let runner = FakeRunner::new();
+    let drift = plan_with_changes(&rev("rev1"), 1);
+    runner.with_plans(&rev("rev1"), vec![drift.clone()]);
+    let mut h = Harness::start(Setup {
+        runner: runner.clone(),
+        yaml: "drift: { interval: 1h, correct: true }\n".into(),
+        prepare: Some(Box::new(|state_dir: &Path| {
+            let store = Store::new(state_dir);
+            store.ensure().expect("ensure");
+            crate::bundle::extract_atomic(
+                &bundle(FLEET_YAML),
+                &store.revision_dir(&rev("rev1")).expect("dir"),
+            )
+            .expect("extract");
+            store
+                .save_agent_state(&crate::store::AgentState {
+                    applied_revision: Some(rev("rev1")),
+                    ..Default::default()
+                })
+                .expect("agent state");
+        })),
+        ..Default::default()
+    })
+    .await;
+    let started = Instant::now();
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+
+    let reported = session
+        .expect(|m| match m {
+            pb::agent_message::Msg::Drift(d) => Some(d.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "drift ran {:?} after start, not on connect",
+        started.elapsed()
+    );
+    assert_eq!(reported.revision, "rev1");
+    assert!(reported.corrected);
+    assert_eq!(runner.applies().len(), 1);
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
 async fn no_drift_sends_an_empty_drift_report_with_health() {
     let runner = FakeRunner::new();
     let plan = plan_with_changes(&rev("rev1"), 2);
