@@ -52,6 +52,47 @@ pub fn unchanged(h: &RolloutHost) -> bool {
     h.plan_changes == Some(0) && h.plan_removals.unwrap_or(0) == 0
 }
 
+/// Units counted by kind, hosts first: `2 failed hosts (pi-1, pi-2) and
+/// 1 failed workload (grafana on nomad)`. `adjective` qualifies each noun
+/// ("failed"); `names` lists who is counted.
+pub fn tally(units: &[&RolloutHost], adjective: &str, names: bool) -> String {
+    let mut kinds: [(&str, &str, Vec<String>); 3] = [
+        ("host", "hosts", vec![]),
+        ("cluster", "clusters", vec![]),
+        ("workload", "workloads", vec![]),
+    ];
+    for h in units {
+        let (slot, label) = match cluster(h) {
+            Some(c) => (2, format!("{} on {c}", name(h))),
+            None if is_placement(h) => (2, h.host.clone()),
+            None if h.kind == TargetKind::Cluster => (1, h.host.clone()),
+            None => (0, h.host.clone()),
+        };
+        kinds[slot].2.push(label);
+    }
+    let adj = |n: &str| match adjective {
+        "" => n.to_string(),
+        a => format!("{a} {n}"),
+    };
+    let parts: Vec<String> = kinds
+        .iter()
+        .filter(|(_, _, of)| !of.is_empty())
+        .map(|(one, many, of)| {
+            let n = crate::logic::format::count(of.len(), &adj(one), &adj(many));
+            if names {
+                format!("{n} ({})", of.join(", "))
+            } else {
+                n
+            }
+        })
+        .collect();
+    match parts.as_slice() {
+        [] => format!("no {}", adj("hosts")),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +119,28 @@ mod tests {
             ("pi-1", "pi-1", None)
         );
         assert!(!same(&p, &unit("nomad", Some("loki"), None)));
+    }
+
+    #[test]
+    fn tallies_count_hosts_and_workloads_apart() {
+        let (a, b, g) = (
+            unit("pi-1", None, None),
+            unit("pi-2", None, None),
+            unit("nomad", Some("grafana"), None),
+        );
+        let cases: [(&[&RolloutHost], &str); 4] = [
+            (
+                &[&a, &g, &b],
+                "2 failed hosts (pi-1, pi-2) and 1 failed workload (grafana on nomad)",
+            ),
+            (&[&g], "1 failed workload (grafana on nomad)"),
+            (&[&a], "1 failed host (pi-1)"),
+            (&[], "no failed hosts"),
+        ];
+        for (units, want) in cases {
+            assert_eq!(tally(units, "failed", true), want);
+        }
+        assert_eq!(tally(&[&a, &g], "", false), "1 host and 1 workload");
     }
 
     #[test]

@@ -297,7 +297,7 @@ pub fn rollout_page(props: &Props) -> Html {
                         <span class="muted">{ if failed(&d).is_empty() {
                             " Resume, roll back or abort the rollout."
                         } else {
-                            " Retry the failed hosts once their cause is fixed, act on each from its row's menu, or skip this phase, roll back or abort the rollout."
+                            " Retry what failed once its cause is fixed, act on each from its row's menu, or skip this phase, roll back or abort the rollout."
                         } }</span>
                     }
                 </div>
@@ -598,22 +598,21 @@ fn ask_for(d: &Decision) -> Ask {
     }
 }
 
-/// The rollout's hosts in `state`, by name.
-fn hosts_in(d: &RolloutDetail, state: HostRolloutState) -> Vec<&str> {
+/// The rollout's units (hosts and placements) in `state`.
+fn hosts_in(d: &RolloutDetail, state: HostRolloutState) -> Vec<&RolloutHost> {
     d.phases
         .iter()
         .flat_map(|p| &p.hosts)
         .filter(|h| h.state == state)
-        .map(|h| h.host.as_str())
         .collect()
 }
 
-/// The failed hosts a rollout-wide retry re-plans.
-pub(crate) fn failed(d: &RolloutDetail) -> Vec<&str> {
+/// The failed units a rollout-wide retry re-plans.
+pub(crate) fn failed(d: &RolloutDetail) -> Vec<&RolloutHost> {
     hosts_in(d, HostRolloutState::Failed)
 }
 
-fn baking(d: &RolloutDetail) -> Vec<&str> {
+fn baking(d: &RolloutDetail) -> Vec<&RolloutHost> {
     hosts_in(d, HostRolloutState::Baking)
 }
 
@@ -964,17 +963,17 @@ fn dialog(
                 "pause" => ("Pause", "Pause rollout", false, "Nothing new starts while paused; hosts mid-apply finish their apply.".to_string(), None),
                 "resume" => ("Resume", "Resume rollout", false, "The rollout carries on from where it paused.".to_string(), None),
                 "retry" => ("Retry", "Retry", false, format!(
-                    "Re-plans and re-applies {} ({}); the same checks apply, and a host whose plan changed asks for approval again. A rollout paused on these failures carries on once they are cleared.",
-                    count(failed.len(), "failed host", "failed hosts"), failed.join(", ")), None),
+                    "Re-plans and re-applies {}; the same checks apply, and anything whose plan changed asks for approval again. A rollout paused on these failures carries on once they are cleared.",
+                    units::tally(&failed, "failed", true)), None),
                 "skip-phase" => ("Skip this phase of", "Skip this phase", true, format!(
                     "Accepts {} in {phase} as failures and carries on to the next phase without them. They stay failed in this rollout until retried from their rows.",
-                    count(failed.len(), "failed host", "failed hosts")), None),
+                    units::tally(&failed, "failed", false)), None),
                 "expedite" => ("Expedite", "Expedite rollout", true, format!(
-                    "Counts {} ({}) as baked now, without waiting out the rest of the bake window. A host whose checks are failing keeps baking.",
-                    count(baking.len(), "baking host", "baking hosts"), baking.join(", ")), None),
+                    "Counts {} as baked now, without waiting out the rest of the bake window. Anything whose checks are failing keeps baking.",
+                    units::tally(&baking, "baking", true)), None),
                 "rollback" => ("Roll back", "Roll back", true, format!(
-                    "Applies the previous stable revision to every host this rollout updated ({}), newest phase first. Rolling back is applying, including removal of what this revision added; an irreversible task rolls back only as far as its kind can.",
-                    count(updated(d), "host", "hosts")), Some(name.clone())),
+                    "Applies the previous stable revision to everything this rollout updated ({}), newest phase first. Rolling back is applying, including removal of what this revision added; an irreversible task rolls back only as far as its kind can.",
+                    units::tally(&updated(d), "", false)), Some(name.clone())),
                 _ => ("Abort", "Abort rollout", true, "Stops the rollout where it is, with its state recorded. Hosts already updated keep the new revision.".to_string(), Some(name.clone())),
             };
             html! {
@@ -1057,7 +1056,7 @@ fn dialog(
     }
 }
 
-fn updated(d: &RolloutDetail) -> usize {
+fn updated(d: &RolloutDetail) -> Vec<&RolloutHost> {
     d.phases
         .iter()
         .flat_map(|p| &p.hosts)
@@ -1071,7 +1070,7 @@ fn updated(d: &RolloutDetail) -> usize {
                     | HostRolloutState::Failed
             )
         })
-        .count()
+        .collect()
 }
 
 /// The rollout's own events, newest first, each at its time from the start.
