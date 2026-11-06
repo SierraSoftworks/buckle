@@ -233,6 +233,10 @@ struct Shared {
     use_bootstrap: AtomicBool,
     /// The identity of the current boot (read on start).
     boot_id: Mutex<Option<String>>,
+    /// The drift pass owed on start, run after the first Welcome so that
+    /// what changed while the agent was down (a reboot, a stopped service) is
+    /// corrected without waiting a whole `drift.interval`.
+    startup_drift: AtomicBool,
     /// Signalled whenever the server acknowledges reports.
     acked: Notify,
     /// Runs the cluster targets this host executes for.
@@ -461,6 +465,7 @@ impl Agent {
                 stopping: AtomicBool::new(false),
                 session_span: Mutex::new(None),
                 boot_id: Mutex::new(None),
+                startup_drift: AtomicBool::new(true),
                 acked: Notify::new(),
                 lanes: lanes::Lanes::default(),
             }),
@@ -827,6 +832,11 @@ impl Shared {
                     Some(Instruction::Welcome(welcome)) => {
                         self.on_welcome(welcome, queue).await;
                         welcomed = true;
+                        // Queued behind the facts refresh, so it plans with
+                        // this boot's facts and the server's secrets.
+                        if self.startup_drift.swap(false, Ordering::SeqCst) {
+                            queue.push(Op::Drift, None);
+                        }
                     }
                     Some(Instruction::Rejected { reason, retry }) => {
                         break SessionEnd::Rejected { reason, retry };
