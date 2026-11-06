@@ -346,7 +346,10 @@ pub fn run_action(
             .iter()
             .find(|d| d.summary.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("No target '{id}'.")))?;
-        if detail.summary.connection == Connection::Offline {
+        // A cluster never connects itself: its executor runs the action.
+        if detail.summary.kind == buckle_api::TargetKind::Host
+            && detail.summary.connection == Connection::Offline
+        {
             return Err(ApiError::Conflict(format!("{id} is offline.")));
         }
         let info = detail
