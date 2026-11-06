@@ -509,7 +509,7 @@ pub async fn rollout_action(id: &str, action: &str, note: &str) -> Result<Rollou
     .await
 }
 
-/// `skip-bake` every baking row of one phase.
+/// `expedite` every baking row of one phase.
 pub async fn rollout_phase_action(
     id: &str,
     phase: &str,

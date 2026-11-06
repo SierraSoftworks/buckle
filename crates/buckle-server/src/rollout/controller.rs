@@ -141,7 +141,7 @@ pub enum Command {
     },
     /// End the bake of a baking host (`host`), of every baking row of a
     /// phase (`phase`), or of every baking row, now: it counts as baked.
-    SkipBake {
+    Expedite {
         rollout: String,
         host: Option<String>,
         workload: String,
@@ -213,9 +213,9 @@ impl Command {
             Command::Abort { .. } => "rollout.abort",
             Command::Retry { .. } => "rollout.host.retry",
             Command::RetryFailed { .. } => "rollout.retry",
-            Command::SkipBake { host: Some(_), .. } => "rollout.host.skip_bake",
-            Command::SkipBake { phase: Some(_), .. } => "rollout.phase.skip_bake",
-            Command::SkipBake { .. } => "rollout.skip_bake",
+            Command::Expedite { host: Some(_), .. } => "rollout.host.expedite",
+            Command::Expedite { phase: Some(_), .. } => "rollout.phase.expedite",
+            Command::Expedite { .. } => "rollout.expedite",
             Command::Skip { .. } => "rollout.host.skip",
             Command::Continue { .. } => "rollout.host.continue",
             Command::Force { .. } => "rollout.host.force",
@@ -3011,13 +3011,13 @@ impl Controller {
                 }
                 Ok(rollout)
             }
-            Command::SkipBake {
+            Command::Expedite {
                 rollout,
                 host,
                 workload,
                 phase,
                 note,
-            } => self.skip_bake(actor, rollout, host, workload, phase, note),
+            } => self.expedite(actor, rollout, host, workload, phase, note),
             Command::Continue {
                 rollout,
                 host,
@@ -3226,7 +3226,7 @@ impl Controller {
     /// failing keeps baking, so that skipping a bake never passes a
     /// regression. A skipped row's window ends now, so it no longer counts
     /// towards its phase's bake.
-    fn skip_bake(
+    fn expedite(
         &mut self,
         actor: &str,
         rollout: String,
@@ -3241,7 +3241,7 @@ impl Controller {
             || record.state == RolloutState::RollingBack
         {
             return Err(CommandError::conflict(
-                "This rollout cannot skip a bake in its current state.",
+                "This rollout cannot be expedited in its current state.",
                 &[],
             ));
         }
@@ -3251,7 +3251,7 @@ impl Controller {
                 let name = buckle_api::placement_key(target, Some(&workload));
                 if self.live[ri].hosts[hi].state != HostPhase::Baking {
                     return Err(CommandError::conflict(
-                        format!("Host '{name}' is not baking, so there is no bake to skip."),
+                        format!("Host '{name}' is not baking, so there is nothing to expedite."),
                         &[],
                     ));
                 }
@@ -3281,9 +3281,11 @@ impl Controller {
         if rows.is_empty() {
             return Err(CommandError::conflict(
                 match &phase {
-                    Some(p) => format!("No host in {p} is baking, so there is no bake to skip."),
+                    Some(p) => {
+                        format!("No host in {p} is baking, so there is nothing to expedite.")
+                    }
                     None => {
-                        "No host in this rollout is baking, so there is no bake to skip.".into()
+                        "No host in this rollout is baking, so there is nothing to expedite.".into()
                     }
                 },
                 &[],
@@ -3301,7 +3303,7 @@ impl Controller {
         if skipped.is_empty() {
             return Err(CommandError::conflict(
                 format!(
-                    "{} {} failing checks, so the bake cannot be skipped.",
+                    "{} {} failing checks, so it cannot be expedited.",
                     kept.join(", "),
                     if kept.len() == 1 { "has" } else { "have" }
                 ),
@@ -3310,15 +3312,15 @@ impl Controller {
         }
         let (action, subject) = match (&host, &phase) {
             (Some(h), _) => (
-                "rollout.host.skip_bake",
+                "rollout.host.expedite",
                 buckle_api::placement_key(h, Some(&workload)),
             ),
             (None, Some(p)) => (
-                "rollout.phase.skip_bake",
+                "rollout.phase.expedite",
                 format!("{p}: {} host(s): {}", skipped.len(), skipped.join(", ")),
             ),
             (None, None) => (
-                "rollout.skip_bake",
+                "rollout.expedite",
                 format!("{} host(s): {}", skipped.len(), skipped.join(", ")),
             ),
         };
@@ -3331,7 +3333,7 @@ impl Controller {
             actor,
             action,
             ri,
-            format!("{actor} skipped the bake of {subject}{kept_note}. {note}"),
+            format!("{actor} expedited {subject}{kept_note}. {note}"),
             serde_json::json!({"hosts": skipped, "failing": kept, "phase": phase, "note": note}),
         );
         let now = self.now();

@@ -62,7 +62,7 @@ pub(crate) enum Ask {
     /// A rollout action (the API's), or `skip-phase`: resuming past failures.
     Action(&'static str),
     Host(&'static str, String),
-    /// A phase's action (`skip-bake`) and the phase.
+    /// A phase's action (`expedite`) and the phase.
     Phase(&'static str, String),
     Continue(String, Vec<String>),
 }
@@ -592,7 +592,7 @@ fn ask_for(d: &Decision) -> Ask {
         Decision::Resume => Ask::Action("resume"),
         Decision::Retry => Ask::Action("retry"),
         Decision::SkipPhase => Ask::Action("skip-phase"),
-        Decision::SkipBake => Ask::Action("skip-bake"),
+        Decision::Expedite => Ask::Action("expedite"),
         Decision::Rollback => Ask::Action("rollback"),
         Decision::Abort => Ask::Action("abort"),
     }
@@ -969,7 +969,7 @@ fn dialog(
                 "skip-phase" => ("Skip this phase of", "Skip this phase", true, format!(
                     "Accepts {} in {phase} as failures and carries on to the next phase without them. They stay failed in this rollout until retried from their rows.",
                     count(failed.len(), "failed host", "failed hosts")), None),
-                "skip-bake" => ("Skip the bake of", "Skip bake period", true, format!(
+                "expedite" => ("Expedite", "Expedite rollout", true, format!(
                     "Counts {} ({}) as baked now, without waiting out the rest of the bake window. A host whose checks are failing keeps baking.",
                     count(baking.len(), "baking host", "baking hosts"), baking.join(", ")), None),
                 "rollback" => ("Roll back", "Roll back", true, format!(
@@ -998,8 +998,8 @@ fn dialog(
                     false,
                     "Plans the host again as it stands. A host that failed, was held or skipped is then re-applied with the same checks; one still waiting to apply keeps its place and its plan asks for approval again if it changed.",
                 ),
-                "skip-bake" => (
-                    "Skip the bake of",
+                "expedite" => (
+                    "Expedite",
                     true,
                     "Counts the host as baked now, without waiting out the rest of its bake window. Refused while one of its checks is failing.",
                 ),
@@ -1019,10 +1019,7 @@ fn dialog(
                     "Excludes the host from this rollout; it converges later as a straggler or with the next rollout.",
                 ),
             };
-            let confirm_label = match *action {
-                "skip-bake" => "Skip bake period".to_string(),
-                _ => format!("{label} {host}"),
-            };
+            let confirm_label = format!("{label} {host}");
             html! {
                 <Confirm title={format!("{label} {host}")} {confirm_label} {danger} note=true
                     note_placeholder={if *action == "skip" { "Reason (recorded with the skip)" } else { "" }}
@@ -1041,7 +1038,7 @@ fn dialog(
                 .map(units::key)
                 .collect();
             html! {
-                <Confirm title={format!("Skip the bake of {phase}")} confirm_label="Skip bake period" danger=true note=true
+                <Confirm title={format!("Expedite {phase}")} confirm_label={format!("Expedite {phase}")} danger=true note=true
                     {busy} {error} on_confirm={confirm} on_cancel={close.clone()}>
                     <p>{ format!(
                         "Counts {} in {phase} ({}) as baked now, without waiting out the rest of their bake windows. A host whose checks are failing keeps baking.",
@@ -1431,12 +1428,12 @@ fn host_table(props: &HostTableProps) -> Html {
     }
 }
 
-/// A stage's own actions, on its heading in the Targets card: skip the bake
-/// of its baking rows.
+/// A stage's own actions, on its heading in the Targets card: expedite its
+/// baking rows (end their bakes now).
 fn stage_menu(phase: &str, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
-    let (on_ask, a) = (on_ask.clone(), Ask::Phase("skip-bake", phase.to_owned()));
+    let (on_ask, a) = (on_ask.clone(), Ask::Phase("expedite", phase.to_owned()));
     vec![MenuItem::new(
-        "Skip bake period…",
+        "Expedite…",
         Callback::from(move |_: MouseEvent| on_ask.emit(a.clone())),
     )]
 }
@@ -1444,7 +1441,7 @@ fn stage_menu(phase: &str, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
 /// A host's own decisions, for the menu on its row.
 /// A host's own actions in a rollout, the most likely first (the split
 /// button's face): retry what failed, continue past its failed checks, skip
-/// its bake period, or redeploy a host already done, then the ones that
+/// expedite its bake, or redeploy a host already done, then the ones that
 /// override the rollout. A face that overrides the rollout (Skip on a host
 /// still applying) is not drawn red: the dialog says what it does.
 fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
@@ -1468,7 +1465,7 @@ fn host_menu(h: &RolloutHost, on_ask: &Callback<Ask>) -> Vec<MenuItem> {
         ));
     }
     if h.state == HostRolloutState::Baking {
-        items.push(item("Skip bake period…", Ask::Host("skip-bake", host())));
+        items.push(item("Expedite…", Ask::Host("expedite", host())));
     }
     if h.state == HostRolloutState::Healthy {
         // Done: applying its plan again is the one thing left to ask.

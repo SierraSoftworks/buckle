@@ -149,7 +149,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/rollouts/r/hosts/h/skip"),
     ("POST", "/api/v1/rollouts/r/hosts/h/continue"),
     ("POST", "/api/v1/rollouts/r/hosts/h/force"),
-    ("POST", "/api/v1/rollouts/r/phases/p/skip-bake"),
+    ("POST", "/api/v1/rollouts/r/phases/p/expedite"),
     ("GET", "/api/v1/events"),
     ("GET", "/api/v1/catalog"),
     ("GET", "/api/v1/audit"),
@@ -2056,7 +2056,7 @@ async fn rollout_action(
         "pause" => Command::Pause { rollout, note },
         "resume" => Command::Resume { rollout, note },
         "retry" => Command::RetryFailed { rollout, note },
-        "skip-bake" => Command::SkipBake {
+        "expedite" => Command::Expedite {
             rollout,
             host: None,
             workload: String::new(),
@@ -2106,7 +2106,7 @@ async fn rollout_host_action(
             workload,
             note,
         },
-        "skip-bake" => Command::SkipBake {
+        "expedite" => Command::Expedite {
             rollout,
             host: Some(host),
             workload,
@@ -2119,7 +2119,7 @@ async fn rollout_host_action(
     Ok(HttpResponse::Ok().json(rollout_detail(&state, &id).await?))
 }
 
-/// `skip-bake` every baking row of one phase.
+/// `expedite` every baking row of one phase.
 async fn rollout_phase_action(
     state: Data,
     admin: Administrative,
@@ -2130,7 +2130,7 @@ async fn rollout_phase_action(
     let id = resolve_rollout(&state, id).await?;
     let note = body.map(|b| b.into_inner().note).unwrap_or_default();
     let command = match action.as_str() {
-        "skip-bake" => Command::SkipBake {
+        "expedite" => Command::Expedite {
             rollout: id.clone(),
             host: None,
             workload: String::new(),

@@ -4536,7 +4536,7 @@ async fn skipping_a_bake_finishes_the_host_now(
         hs.iter().all(|x| x.state == HostPhase::Baking)
     })
     .await;
-    h.command(Command::SkipBake {
+    h.command(Command::Expedite {
         rollout: id.clone(),
         host: target.map(String::from),
         workload: String::new(),
@@ -4587,7 +4587,7 @@ async fn a_skipped_bake_no_longer_counts_towards_the_phase_bake() {
         r.runtime.phases[0].bake_until == Some(b_until)
     })
     .await;
-    h.command(Command::SkipBake {
+    h.command(Command::Expedite {
         rollout: id.clone(),
         host: Some("b".into()),
         workload: String::new(),
@@ -4628,7 +4628,7 @@ async fn skipping_a_phase_bake_needs_a_baking_phase(
     })
     .await;
     let err = h
-        .command(Command::SkipBake {
+        .command(Command::Expedite {
             rollout: id.clone(),
             host: None,
             workload: String::new(),
@@ -4659,7 +4659,7 @@ async fn a_bake_with_failing_checks_cannot_be_skipped() {
     .await;
     for target in [Some("a".to_string()), None] {
         let err = h
-            .command(Command::SkipBake {
+            .command(Command::Expedite {
                 rollout: id.clone(),
                 host: target,
                 workload: String::new(),
