@@ -1,6 +1,7 @@
 //! A person's round avatar: their Gravatar (an identicon for an address
 //! Gravatar does not know), over their initials, which show while it loads
 //! or when it cannot (offline, or demo mode, which never leaves the page).
+//! Claude has its spark instead.
 
 use sha2::{Digest, Sha256};
 use yew::prelude::*;
@@ -13,6 +14,9 @@ pub struct AvatarProps {
 
 #[function_component(Avatar)]
 pub fn avatar(props: &AvatarProps) -> Html {
+    if crate::logic::message::is_claude(&props.author) {
+        return html! { <span class="avatar avatar--claude" aria-hidden="true">{ super::icons::claude() }</span> };
+    }
     let (name, email) = split_author(&props.author);
     let src = email
         .filter(|_| !crate::fixtures::is_demo())

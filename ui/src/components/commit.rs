@@ -3,18 +3,21 @@
 //! rollout's colour, then its subject with a check mark for a valid commit
 //! (a cross for a rejected one), who wrote it and when. The whole card opens
 //! that rollout; `actions` are its rollout controls, at the right of the
-//! commit hash.
+//! commit hash. The body is re-flowed to the card's width, its trailers
+//! become co-authors (Claude's linking its sessions), and a long one
+//! collapses behind "Read more".
 
 use buckle_api::{RevisionStatus, RevisionSummary, RolloutSummary};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
 
-use super::avatar::Avatar;
+use super::avatar::{Avatar, split_author};
 use super::icons;
 use super::link::RouteLink;
-use super::ui::Copyable;
+use super::ui::{Copyable, HoverTip};
 use crate::app::Route;
-use crate::logic::format::{commit, count, first_line, relative, rollout_label, timestamp};
+use crate::logic::format::{commit, count, relative, rollout_label, timestamp};
+use crate::logic::message::{Block, Message, is_claude};
 use crate::logic::tone::{revision_status_tone, rollout_state_label, rollout_state_tone};
 
 /// What a card shows of a commit: a revision where one is known, else what a
@@ -95,7 +98,8 @@ pub struct CommitCardProps {
 #[function_component(CommitCard)]
 pub fn commit_card(props: &CommitCardProps) -> Html {
     let c = &props.commit;
-    let subject = first_line(&c.message).to_string();
+    let msg = use_memo(c.message.clone(), |m| Message::parse(m));
+    let open = use_state(|| false);
     let rejected = c.status == Some(RevisionStatus::Rejected);
     let target = props.rollout.as_ref().filter(|_| props.link);
     let status = c.status.map(|s| {
@@ -111,7 +115,6 @@ pub fn commit_card(props: &CommitCardProps) -> Html {
             <span class={classes!("commit__status", revision_status_tone(s).class())} aria-label={label} {title}>{ icon }</span>
         }
     });
-    let body = c.message.lines().skip(1).collect::<Vec<_>>().join("\n");
     // The rollout's name leads the subject, in the rollout's colour.
     let name = props.rollout.as_ref().map(|r| html! {
         <span class={classes!("commit__rollout", rollout_state_tone(r.state).class())}
@@ -125,6 +128,45 @@ pub fn commit_card(props: &CommitCardProps) -> Html {
             .filter(|w| *w > 0)
             .map(|w| count(w as usize, "workload", "workloads")),
     ];
+    let subject = msg.subject.clone();
+    // Claude's sessions hang from the first Claude among the authors.
+    let everyone = msg.authors(c.author.as_deref());
+    let claude = everyone.iter().position(|a| is_claude(a));
+    let authors = everyone.iter().enumerate().map(|(i, a)| {
+        let sessions = if Some(i) == claude {
+            msg.sessions.as_slice()
+        } else {
+            &[]
+        };
+        author(a, sessions)
+    });
+    let body = props.body.then(|| {
+        let collapsed = msg.long() && !*open;
+        let toggle = {
+            let open = open.clone();
+            Callback::from(move |_: MouseEvent| open.set(!*open))
+        };
+        let blocks = if collapsed { &msg.body[..msg.preview()] } else { &msg.body[..] };
+        html! {
+            if !msg.body.is_empty() || !msg.trailers.is_empty() {
+                <div class={classes!("commit__body", collapsed.then_some("commit__body--collapsed"))}>
+                    <div class="commit__text">
+                        { for blocks.iter().map(block) }
+                        if !collapsed && !msg.trailers.is_empty() {
+                            <dl class="commit__trailers muted">
+                                { for msg.trailers.iter().map(|(k, v)| html! { <div><dt>{ k.clone() }</dt><dd>{ v.clone() }</dd></div> }) }
+                            </dl>
+                        }
+                    </div>
+                    if msg.long() {
+                        <button type="button" class="commit__more" aria-expanded={(!collapsed).to_string()} onclick={toggle}>
+                            { if collapsed { "Read more…" } else { "Show less" } }
+                        </button>
+                    }
+                </div>
+            }
+        }
+    });
     html! {
         <div class={classes!("commit", target.is_some().then_some("commit--link"), props.boxed.then_some("commit--boxed"), rejected.then_some("commit--rejected"))}
             data-commit={c.sha.clone()}>
@@ -140,11 +182,11 @@ pub fn commit_card(props: &CommitCardProps) -> Html {
                     { status.unwrap_or_default() }
                 </div>
                 <div class="commit__meta muted">
-                    if let Some(a) = &c.author { <span class="commit__author"><Avatar author={a.clone()} />{ a.split(" <").next().unwrap_or(a).to_string() }</span> }
+                    { for authors }
                     if let Some(at) = c.at { <span title={timestamp(at)}>{ relative(at, props.now) }</span> }
                     { for sizes.into_iter().flatten().map(|s| html! { <span>{ s }</span> }) }
                 </div>
-                if props.body && !body.trim().is_empty() { <p class="commit__body">{ body.trim().to_string() }</p> }
+                { body.unwrap_or_default() }
                 { props.children.clone() }
             </div>
             <div class="commit__aside">
@@ -152,5 +194,58 @@ pub fn commit_card(props: &CommitCardProps) -> Html {
                 if props.actions != Html::default() { <div class="commit__actions">{ props.actions.clone() }</div> }
             </div>
         </div>
+    }
+}
+
+/// An author in the meta line; Claude's entry opens its session, or, with
+/// several, lists them on hover.
+fn author(a: &str, sessions: &[String]) -> Html {
+    let (name, email) = split_author(a);
+    let title = email.map(|e| format!("{name} <{e}>"));
+    let face = html! { <><Avatar author={a.to_string()} />{ name.to_string() }</> };
+    match sessions {
+        [] => html! { <span class="commit__author" {title}>{ face }</span> },
+        [one] => html! {
+            <a class="commit__author commit__author--link" href={one.clone()} target="_blank" rel="noopener noreferrer"
+                title={format!("{name}: open its session")}>{ face }</a>
+        },
+        many => {
+            let tip = html! { <>
+                <span class="tip__head">{ format!("{name}: {} sessions", many.len()) }</span>
+                { for many.iter().map(|s| html! {
+                    <a class="commit__session mono" href={s.clone()} target="_blank" rel="noopener noreferrer">{ session_label(s) }</a>
+                }) }
+            </> };
+            html! {
+                <span class="commit__author commit__author--link">
+                    <HoverTip {tip} label={format!("{name}: {} sessions", many.len())}>{ face }</HoverTip>
+                </span>
+            }
+        }
+    }
+}
+
+/// A session link's last path segment: `…/code/session_01Ab` → `session_01Ab`.
+fn session_label(url: &str) -> String {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
+
+fn block(b: &Block) -> Html {
+    match b {
+        Block::Para(t) => html! { <p>{ t.clone() }</p> },
+        Block::List {
+            ordered: false,
+            items,
+        } => html! { <ul>{ for items.iter().map(|i| html! { <li>{ i.clone() }</li> }) }</ul> },
+        Block::List {
+            ordered: true,
+            items,
+        } => html! { <ol>{ for items.iter().map(|i| html! { <li>{ i.clone() }</li> }) }</ol> },
+        Block::Code(t) => html! { <pre><code>{ t.clone() }</code></pre> },
+        Block::Rule => html! { <hr /> },
     }
 }

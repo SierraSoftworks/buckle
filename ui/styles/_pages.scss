@@ -276,6 +276,28 @@
   &__author {
     display: inline-flex;
     align-items: center;
+
+    // Above the card's link: Claude's sessions open from here.
+    &--link {
+      position: relative;
+      z-index: 1;
+      color: inherit;
+      text-decoration: none;
+
+      &:hover {
+        color: var(--brand);
+      }
+    }
+  }
+
+  &__session {
+    color: var(--brand);
+    text-decoration: none;
+    overflow-wrap: anywhere;
+
+    &:hover {
+      text-decoration: underline;
+    }
   }
 
   // The rollout's name, leading the subject in the rollout's colour.
@@ -285,10 +307,98 @@
     font-weight: 650;
   }
 
+  // Re-flowed to the card's width; long bodies show their first block,
+  // faded, until "Read more".
   &__body {
     margin: 0.35rem 0 0;
     color: var(--fg-2);
-    white-space: pre-wrap;
+    max-width: 75ch;
+  }
+
+  &__text {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    overflow-wrap: anywhere;
+
+    p,
+    ul,
+    ol,
+    pre,
+    dl {
+      margin: 0;
+    }
+
+    ul,
+    ol {
+      padding-left: 1.25rem;
+    }
+
+    ul {
+      list-style: disc;
+    }
+
+    ol {
+      list-style: decimal;
+    }
+
+    pre {
+      padding: 0.4rem 0.55rem;
+      border-radius: var(--radius);
+      background: var(--surface-2);
+      font-size: 0.8rem;
+      overflow-x: auto;
+    }
+
+    hr {
+      width: 100%;
+      margin: 0.1rem 0;
+      border: 0;
+      border-top: 1px solid var(--line);
+    }
+  }
+
+  &__body--collapsed &__text {
+    max-height: 7.5em;
+    max-height: 5lh;
+    overflow: hidden;
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 2lh), rgb(0 0 0 / 20%));
+  }
+
+  &__trailers {
+    display: flex;
+    flex-direction: column;
+    font-size: 0.78rem;
+
+    div {
+      display: flex;
+      gap: 0.3rem;
+    }
+
+    dt::after {
+      content: ":";
+    }
+
+    dd {
+      margin: 0;
+    }
+  }
+
+  &__more {
+    position: relative;
+    z-index: 1;
+    margin-top: 0.15rem;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--brand);
+    font: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
+
+    &:hover {
+      text-decoration: underline;
+    }
   }
 
   &__aside {
