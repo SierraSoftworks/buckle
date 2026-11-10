@@ -333,18 +333,18 @@ describe("every page renders in demo mode", () => {
     const body = squash.locator(".commit__body");
     await body.waitFor();
     // Trailers never show as text; a long body shows its start until expanded.
-    assert.doesNotMatch(await page.locator(".gitlog").textContent(), /Co-Authored-By|Claude-Session/i);
+    assert.doesNotMatch(await page.locator(".gitlog").textContent(), /Co-Authored-By|Claude-Session|Signed-off-by/i);
     assert.doesNotMatch(await body.textContent(), /support bundle/);
     await body.getByRole("button", { name: "Read more…" }).click();
     assert.match(await body.textContent(), /support bundle/);
     assert.match(await body.locator("pre").textContent(), /vault kv get/);
-    assert.match(await body.locator(".commit__trailers").textContent(), /Signed-off-by/);
     assert.match(page.url(), /\/rollouts(\?.*)?$/, "expanding stays on the page");
     await body.getByRole("button", { name: "Show less" }).click();
     assert.doesNotMatch(await body.textContent(), /support bundle/);
-    // Each author once, Claude with its spark and its sessions on hover.
+    // Each author (co-authors and sign-offs) once, Claude last with its
+    // spark and its sessions on hover.
     const meta = squash.locator(".commit__meta");
-    assert.match(await meta.textContent(), /Alice Operator.*Bob Builder.*Claude/);
+    assert.match(await meta.textContent(), /Alice Operator.*Bob Builder.*Carol Reviewer.*Claude/);
     assert.equal(await meta.locator(".avatar--claude").count(), 1);
     await meta.locator(".commit__author", { hasText: "Claude" }).hover();
     assert.equal(await page.locator('.tip__pop a[href*="claude.ai/code/session_"]').count(), 2);

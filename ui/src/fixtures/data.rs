@@ -1852,7 +1852,7 @@ Claude-Session: https://claude.ai/code/session_01DemoTokenRotation
 
 Co-authored-by: Bob Builder <bob@example.com>
 Co-authored-by: Claude <noreply@anthropic.com>
-Signed-off-by: Alice Operator <alice@example.com>";
+Signed-off-by: Carol Reviewer <carol@example.com>";
 
 pub fn audit(now: DateTime<Utc>) -> Vec<AuditEntry> {
     let e = |id: u64,

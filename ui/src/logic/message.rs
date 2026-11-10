@@ -23,7 +23,8 @@ pub enum Block {
 pub struct Message {
     pub subject: String,
     pub body: Vec<Block>,
-    /// `Co-authored-by` values in order of appearance, unique per person.
+    /// `Co-authored-by` and `Signed-off-by` values in order of appearance,
+    /// unique per person.
     pub coauthors: Vec<String>,
     /// `Claude-Session` links, unique.
     pub sessions: Vec<String>,
@@ -68,7 +69,7 @@ impl Message {
         };
         for (k, v) in p.trailers {
             match k.to_ascii_lowercase().as_str() {
-                "co-authored-by" => {
+                "co-authored-by" | "signed-off-by" => {
                     if !m.coauthors.iter().any(|a| same_person(a, &v)) {
                         m.coauthors.push(v);
                     }
@@ -442,7 +443,8 @@ mod tests {
             m.coauthors,
             [
                 "Claude Opus 5.5 <noreply@anthropic.com>",
-                "Bob <bob@example.com>"
+                "Bob <bob@example.com>",
+                "Ada <ada@example.com>"
             ]
         );
         assert_eq!(
@@ -452,7 +454,7 @@ mod tests {
                 "https://claude.ai/code/session_b"
             ]
         );
-        assert_eq!(m.trailers.len(), 2);
+        assert_eq!(m.trailers, [("Change-Id".to_string(), "I123".to_string())]);
     }
 
     #[test]
@@ -488,7 +490,8 @@ mod tests {
             ("A short reason.", false),
             (&"word ".repeat(80), true),
             ("a\n\nb\n\nc", true),
-            ("a\n\nSigned-off-by: Ada <ada@example.com>", true),
+            ("a\n\nChange-Id: I123", true),
+            ("a\n\nSigned-off-by: Ada <ada@example.com>", false),
             ("a\n\nCo-authored-by: Ada <ada@example.com>", false),
         ] {
             assert_eq!(
