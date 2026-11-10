@@ -185,10 +185,10 @@ fn fleet_bar(f: &Fleet) -> Html {
         .iter()
         .map(|(n, tone, label, _)| Segment::new(*n, *tone, label))
         .collect();
-    // Deploying is workloads only: those are on the Clusters page.
+    // Deploying is workloads only: those are on the Workloads page.
     let to = |show: &str| {
         if show.is_empty() {
-            Route::Clusters
+            Route::Workloads
         } else {
             Route::Hosts
         }
@@ -202,7 +202,7 @@ fn fleet_bar(f: &Fleet) -> Html {
             <div class="fleet-bar__head">
                 <RouteLink to={Route::Hosts} classes="fleet-bar__total">{ count(s.hosts, "host", "hosts") }</RouteLink>
                 if s.workloads > 0 {
-                    <RouteLink to={Route::Clusters} classes="fleet-bar__total">{ count(s.workloads, "workload", "workloads") }</RouteLink>
+                    <RouteLink to={Route::Workloads} classes="fleet-bar__total">{ count(s.workloads, "workload", "workloads") }</RouteLink>
                 }
                 <span class="fleet-bar__legend">
                     { for parts.iter().filter(|(n, ..)| *n > 0).map(|(n, tone, label, show)| html! {
