@@ -173,6 +173,20 @@ pub fn hover_tip(props: &HoverTipProps) -> Html {
         let at = at.clone();
         Callback::from(move |_: Event| at.set(None))
     };
+    // Focus moving into the popover (onto a link it holds) keeps it open.
+    let blur = {
+        let (hide, node) = (hide.clone(), node.clone());
+        Callback::from(move |e: FocusEvent| {
+            let inside = e
+                .related_target()
+                .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Node>(t).ok())
+                .zip(node.cast::<web_sys::Node>())
+                .is_some_and(|(t, n)| n.contains(Some(&t)));
+            if !inside {
+                hide.emit(e.into());
+            }
+        })
+    };
     if props.tip == Html::default() {
         return props.children.clone();
     }
@@ -184,7 +198,7 @@ pub fn hover_tip(props: &HoverTipProps) -> Html {
     html! {
         <span {class} {tabindex} ref={node} aria-label={label}
             onmouseenter={enter} onfocusin={focus}
-            onmouseleave={hide.reform(|e: MouseEvent| e.into())} onfocusout={hide.reform(|e: FocusEvent| e.into())}>
+            onmouseleave={hide.reform(|e: MouseEvent| e.into())} onfocusout={blur}>
             { props.children.clone() }
             if let Some((x, y)) = *at {
                 <span class="tip__pop" role="tooltip" style={format!("left: {x:.0}px; top: {:.0}px", y + 4.0)}>

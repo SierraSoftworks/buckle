@@ -728,7 +728,7 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
             id: "42".into(),
             name: None,
             revision: NEW_REV.into(),
-            revision_message: "nomad 1.9.3, rotate nomad_server".into(),
+            revision_message: NEW_MESSAGE.into(),
             state: RolloutState::Rolling,
             started_at: now - Duration::minutes(34),
             finished_at: None,
@@ -1761,7 +1761,7 @@ pub fn revisions(now: DateTime<Utc>) -> Vec<RevisionSummary> {
         r(
             NEW_REV,
             "Alice Operator <alice@example.com>",
-            "nomad 1.9.3, rotate nomad_server\n\nThe old server token leaked into a support bundle.",
+            NEW_MESSAGE,
             Duration::minutes(36),
             RevisionStatus::Valid,
             Some("42"),
@@ -1771,7 +1771,7 @@ pub fn revisions(now: DateTime<Utc>) -> Vec<RevisionSummary> {
         r(
             STABLE_REV,
             "Alice Operator <alice@example.com>",
-            "caddy: add the grey upstream",
+            "caddy: add the grey upstream\n\nThe grey box serves the media apps now; caddy proxies them\nthrough it rather than straight to each container.\n\nClaude-Session: https://claude.ai/code/session_01DemoCaddyUpstream\n\nCo-authored-by: Claude <noreply@anthropic.com>",
             Duration::days(2) + Duration::minutes(5),
             RevisionStatus::Valid,
             Some("41"),
@@ -1824,6 +1824,35 @@ pub fn revisions(now: DateTime<Utc>) -> Vec<RevisionSummary> {
         ),
     ]
 }
+
+/// A squash merge as GitHub writes it: each commit's text and trailers,
+/// then the merge's own co-authors.
+const NEW_MESSAGE: &str = "nomad 1.9.3, rotate nomad_server (#212)
+
+* nomad: bump the servers and clients to 1.9.3
+
+1.9.3 fixes the allocation GC stall the Pis hit after a node
+restart. Clients go first, as the upgrade guide asks, so the
+servers never schedule onto a client older than themselves.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DemoNomadUpgrade
+
+* nomad_server: rotate the server token
+
+The old server token leaked into a support bundle. The new one
+is read from the vault path, so nothing else changes:
+
+    vault kv get -field=token secret/nomad/server
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DemoTokenRotation
+
+---------
+
+Co-authored-by: Bob Builder <bob@example.com>
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Carol Reviewer <carol@example.com>";
 
 pub fn audit(now: DateTime<Utc>) -> Vec<AuditEntry> {
     let e = |id: u64,

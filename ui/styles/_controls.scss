@@ -322,6 +322,16 @@ $tones: (
     line-height: 1.4;
     white-space: normal;
     cursor: default;
+
+    // Bridges the gap to the trigger, so the pointer can reach a link inside.
+    &::before {
+      content: "";
+      position: absolute;
+      bottom: 100%;
+      left: 0;
+      right: 0;
+      height: 6px;
+    }
   }
 
   &__head {
@@ -956,6 +966,15 @@ textarea.input {
   overflow: hidden;
   // A card's link covers it: a click on the avatar is a click on the card.
   pointer-events: none;
+
+  &--claude {
+    background: none;
+
+    .icon {
+      width: 100%;
+      height: 100%;
+    }
+  }
 
   &__img {
     position: absolute;

@@ -96,7 +96,7 @@ describe("every page renders in demo mode", () => {
     // The same card as the Overview's: the rollout's name leads the subject.
     assert.equal((await items.first().locator(".commit__rollout").textContent()).trim(), "#42");
     // The message body is part of the card.
-    assert.match(await items.first().textContent(), /support bundle/);
+    assert.match(await items.first().textContent(), /allocation GC stall/);
     // One control per card: [Running] for the rollout in progress, [Stable] for
     // the release the fleet is on, an orange Rollback for every older one, and
     // [Corrupt] for a rejected commit, which cannot be deployed but can be
@@ -324,6 +324,34 @@ describe("every page renders in demo mode", () => {
     assert.doesNotMatch(await page.locator(".tree").textContent(), /distribution/);
     await page.locator(".tree summary", { hasText: "os" }).click();
     assert.match(await page.locator(".tree").textContent(), /distribution/);
+    await close();
+  });
+
+  test("commit cards re-flow long messages and credit their co-authors", async () => {
+    const { page, close } = await open("/rollouts");
+    const squash = page.locator(".gitlog__item").first();
+    const body = squash.locator(".commit__body");
+    await body.waitFor();
+    // Trailers never show as text; a long body shows its start until expanded.
+    assert.doesNotMatch(await page.locator(".gitlog").textContent(), /Co-Authored-By|Claude-Session|Signed-off-by/i);
+    assert.doesNotMatch(await body.textContent(), /support bundle/);
+    await body.getByRole("button", { name: "Read more…" }).click();
+    assert.match(await body.textContent(), /support bundle/);
+    assert.match(await body.locator("pre").textContent(), /vault kv get/);
+    assert.match(page.url(), /\/rollouts(\?.*)?$/, "expanding stays on the page");
+    await body.getByRole("button", { name: "Show less" }).click();
+    assert.doesNotMatch(await body.textContent(), /support bundle/);
+    // Each author (co-authors and sign-offs) once, Claude last with its
+    // spark and its sessions on hover.
+    const meta = squash.locator(".commit__meta");
+    assert.match(await meta.textContent(), /Alice Operator.*Bob Builder.*Carol Reviewer.*Claude/);
+    assert.equal(await meta.locator(".avatar--claude").count(), 1);
+    await meta.locator(".commit__author", { hasText: "Claude" }).hover();
+    assert.equal(await page.locator('.tip__pop a[href*="claude.ai/code/session_"]').count(), 2);
+    // One session: Claude's entry links straight to it; a short body has no toggle.
+    const stable = page.locator(".gitlog__item--stable");
+    assert.match(await stable.locator("a.commit__author").getAttribute("href"), /session_01DemoCaddyUpstream$/);
+    assert.equal(await stable.getByRole("button", { name: "Read more…" }).count(), 0);
     await close();
   });
 

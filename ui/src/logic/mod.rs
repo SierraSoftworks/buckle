@@ -17,6 +17,7 @@ pub mod health;
 pub mod join;
 pub mod labels;
 pub mod live;
+pub mod message;
 pub mod pipeline;
 pub mod plan;
 pub mod run;

@@ -110,6 +110,27 @@ pub fn external() -> Html {
     </> })
 }
 
+/// Claude's spark, in its own colour: Claude's avatar wherever it authors.
+pub fn claude() -> Html {
+    html! {
+        <svg class="icon icon--claude" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#d97757"
+            stroke-width="2.6" stroke-linecap="round" aria-hidden="true" focusable="false">
+        <line x1="12.0" y1="9.8" x2="12.0" y2="2.0" />
+        <line x1="13.1" y1="10.1" x2="16.3" y2="4.6" />
+        <line x1="13.9" y1="10.9" x2="20.3" y2="7.2" />
+        <line x1="14.2" y1="12.0" x2="20.2" y2="12.0" />
+        <line x1="13.9" y1="13.1" x2="20.7" y2="17.0" />
+        <line x1="13.1" y1="13.9" x2="16.4" y2="19.6" />
+        <line x1="12.0" y1="14.2" x2="12.0" y2="21.4" />
+        <line x1="10.9" y1="13.9" x2="7.8" y2="19.3" />
+        <line x1="10.1" y1="13.1" x2="3.5" y2="16.9" />
+        <line x1="9.8" y1="12.0" x2="3.4" y2="12.0" />
+        <line x1="10.1" y1="10.9" x2="4.0" y2="7.4" />
+        <line x1="10.9" y1="10.1" x2="7.8" y2="4.8" />
+        </svg>
+    }
+}
+
 pub fn lock() -> Html {
     icon(html! { <>
         <rect x="5" y="11" width="14" height="10" rx="2" />
