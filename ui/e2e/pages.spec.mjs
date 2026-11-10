@@ -14,6 +14,7 @@ describe("every page renders in demo mode", () => {
     const legend = await bar.locator(".fleet-bar__legend").textContent();
     for (const want of [/\d+ healthy/, /\d+ failing/, /\d+ held/, /\d+ offline/, /\d+ drifted/]) assert.match(legend, want);
     assert.match(await bar.textContent(), /\d+ hosts.*\d+ workloads/);
+    assert.match(await bar.getByRole("link", { name: /\d+ workloads/ }).getAttribute("href"), /\/workloads$/);
     // The latest rollout: its name leads the subject, and the card carries
     // its state, what it changes and its progress. Its controls sit at the
     // top right of the card they act on.
