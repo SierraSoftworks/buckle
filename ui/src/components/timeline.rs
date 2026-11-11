@@ -61,7 +61,14 @@ pub fn timeline(props: &TimelineProps) -> Html {
 /// bolt where a commit has its check mark), a meta line, then `progress`;
 /// `module/action` at the right, where a commit has its hash. The diamond
 /// and the action colour set it apart from the commits.
-fn entry(key: String, kind: &'static str, title: Html, meta: Html, progress: Html, aside: Html) -> Html {
+fn entry(
+    key: String,
+    kind: &'static str,
+    title: Html,
+    meta: Html,
+    progress: Html,
+    aside: Html,
+) -> Html {
     html! {
         <li {key} class="gitlog__item gitlog__item--action" data-action={kind}>
             <span class="gitlog__diamond" aria-hidden="true" />
@@ -125,7 +132,8 @@ fn action_rollout(x: &RolloutSummary, now: DateTime<Utc>) -> Html {
             { a.label.clone() }
         </RouteLink>
     };
-    let meta = html! { <>{ operator(Some(&x.triggered_by)) }{ when(x.started_at, now) }{ scope }</> };
+    let meta =
+        html! { <>{ operator(Some(&x.triggered_by)) }{ when(x.started_at, now) }{ scope }</> };
     let aside = html! { <>{ action_key(&a.module, &a.action) }{ review.unwrap_or_default() }</> };
     entry(
         format!("rollout-{}", x.id),
