@@ -168,6 +168,23 @@
     }
   }
 
+  // An operator's action: a hollow diamond in the action colour.
+  &__diamond {
+    position: relative;
+    z-index: 1;
+    width: 10px;
+    height: 10px;
+    margin: 0.35rem 0 0 calc(0.7rem - 5px);
+    transform: rotate(45deg);
+    border: 2px solid var(--action);
+    border-radius: 2px;
+    background: var(--surface);
+  }
+
+  &__item--action {
+    padding: 0.4rem 0;
+  }
+
   &__dot {
     position: relative;
     z-index: 1;
@@ -1069,4 +1086,55 @@ tr[id] {
 // A pill that opens what it names.
 .pill-link {
   text-decoration: none;
+}
+
+// An operator's action on the Rollouts timeline: one line between the
+// commits, who ran what where, how it went and when.
+.action-line {
+  &__main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.25rem 0.5rem;
+    font-size: 0.84rem;
+  }
+
+  &.commit--link:hover .commit__subject {
+    color: var(--action);
+  }
+
+  &__icon {
+    display: inline-flex;
+    color: var(--action);
+
+    svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+      stroke-width: 1;
+    }
+  }
+
+  &__key {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 0 0.3rem;
+    color: var(--fg-2);
+    font-size: 0.8rem;
+    white-space: nowrap;
+  }
+
+  &__target {
+    color: var(--fg);
+  }
+
+  &__error {
+    max-width: 28rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }

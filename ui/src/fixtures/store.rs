@@ -30,6 +30,8 @@ pub(super) struct State {
     pub clusters: Vec<HostSummary>,
     pub details: Vec<HostDetail>,
     pub rollouts: Vec<RolloutDetail>,
+    /// One-off action runs, newest first.
+    pub action_runs: Vec<buckle_api::ActionRun>,
     pub revisions: Vec<RevisionSummary>,
     pub audit: Vec<AuditEntry>,
     /// Events the demo produced, for the live provider to deliver.
@@ -62,6 +64,11 @@ impl State {
             clusters,
             details,
             rollouts,
+            action_runs: if empty {
+                vec![]
+            } else {
+                data::action_runs(now)
+            },
             revisions: if empty { vec![] } else { data::revisions(now) },
             audit: if empty { vec![] } else { data::audit(now) },
             outbox: Vec::new(),
@@ -107,7 +114,10 @@ impl State {
     pub(super) fn rollout_mut(&mut self, id: &str) -> Result<&mut RolloutDetail, ApiError> {
         self.rollouts
             .iter_mut()
-            .find(|r| r.summary.id == id)
+            // By id, or by name as the server resolves `/rollouts/<name>`.
+            .find(|r| {
+                r.summary.id == id || buckle_api::rollout_name(&r.summary.id).as_deref() == Some(id)
+            })
             .ok_or_else(|| ApiError::NotFound(format!("No rollout '{id}'.")))
     }
 }
@@ -360,6 +370,7 @@ pub fn run_action(
                 ApiError::NotFound(format!("{id} offers no action '{action}' of '{module}'."))
             })?
             .clone();
+        let kind = detail.summary.kind;
         let noun = match detail.summary.kind {
             buckle_api::TargetKind::Host => "host",
             buckle_api::TargetKind::Cluster | buckle_api::TargetKind::Workload => "target",
@@ -380,9 +391,31 @@ pub fn run_action(
                 format!("{ran}: {note}")
             },
         );
-        Ok(buckle_api::ActionStarted {
-            run_id: format!("demo-action-{}-{}", info.module, info.name),
-        })
+        let run_id = format!(
+            "demo-action-{}-{}-{}",
+            info.module,
+            info.name,
+            s.action_runs.len()
+        );
+        let now = Utc::now();
+        s.action_runs.insert(
+            0,
+            buckle_api::ActionRun {
+                id: run_id.clone(),
+                target: id.into(),
+                kind,
+                module: info.module.clone(),
+                action: info.name.clone(),
+                label: Some(info.label.clone()),
+                actor: Some(actor()),
+                state: buckle_api::RunState::Succeeded,
+                started_at: now,
+                finished_at: Some(now + chrono::Duration::seconds(3)),
+                error: None,
+                trace_url: None,
+            },
+        );
+        Ok(buckle_api::ActionStarted { run_id })
     })
 }
 
@@ -765,6 +798,28 @@ pub fn start_action_rollout(
             rollout: summary.clone(),
         });
         Ok(summary)
+    })
+}
+
+pub fn action_runs(before: Option<&str>) -> Result<Page<buckle_api::ActionRun>, ApiError> {
+    with(|s| {
+        let start = match before {
+            Some(b) => s
+                .action_runs
+                .iter()
+                .position(|r| r.id == b)
+                .map_or(s.action_runs.len(), |i| i + 1),
+            None => 0,
+        };
+        let items: Vec<_> = s.action_runs.iter().skip(start).take(50).cloned().collect();
+        let next = (start + items.len() < s.action_runs.len())
+            .then(|| items.last().map(|r| r.id.clone()))
+            .flatten();
+        Ok(Page {
+            items,
+            next,
+            total: s.action_runs.len() as u64,
+        })
     })
 }
 

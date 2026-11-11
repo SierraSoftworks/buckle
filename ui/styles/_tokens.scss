@@ -39,6 +39,8 @@
   --mute-soft: rgba(169, 139, 240, 0.16);
   --neutral-soft: rgba(125, 136, 150, 0.16);
   --brand-soft: rgba(217, 162, 74, 0.14);
+  // An operator's action on the Rollouts timeline.
+  --action: #e27bc6;
 
   --diff-add: rgba(76, 191, 127, 0.13);
   --diff-del: rgba(239, 107, 99, 0.14);
@@ -80,6 +82,7 @@
   --mute-soft: rgba(107, 79, 196, 0.12);
   --neutral-soft: rgba(106, 116, 130, 0.12);
   --brand-soft: rgba(154, 106, 31, 0.12);
+  --action: #a8358b;
 
   --diff-add: rgba(29, 138, 79, 0.12);
   --diff-del: rgba(196, 55, 46, 0.1);

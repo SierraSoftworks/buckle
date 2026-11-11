@@ -4964,6 +4964,7 @@ async fn an_action_is_refused_while_its_target_applies_in_a_rollout() {
             target: "a".into(),
             module: "m".into(),
             action: "restart".into(),
+            label: "Restart".into(),
             revision: "r1".into(),
             instances: None,
             note: String::new(),

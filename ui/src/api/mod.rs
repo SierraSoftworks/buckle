@@ -371,6 +371,16 @@ pub async fn fleet_actions(selector: &str) -> Result<Vec<buckle_api::FleetAction
     }
 }
 
+/// A page of operators' one-off action runs across the fleet, newest first,
+/// after the run `before` when given.
+pub async fn action_runs(before: Option<String>) -> Result<Page<buckle_api::ActionRun>, ApiError> {
+    demo!(demo_store::action_runs(before.as_deref()));
+    match before {
+        Some(b) => get(&format!("/actions/runs?limit=50&before={}", enc(&b))).await,
+        None => get("/actions/runs?limit=50").await,
+    }
+}
+
 /// Starts an action rollout over the targets offering the action.
 pub async fn start_action_rollout(body: StartActionRollout) -> Result<RolloutSummary, ApiError> {
     demo!(demo_store::start_action_rollout(&body));

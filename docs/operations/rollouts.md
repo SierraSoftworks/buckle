@@ -15,7 +15,11 @@ The server sees it within `source.git.poll`, or at once with a webhook to
 parse, or whose modules, phases, secret references or templates do not check out, is **rejected**
 with the errors, and nothing rolls out.
 
-<Screenshot name="rollouts-list" alt="Rollouts: a running commit, a rejected commit with its validation errors, the stable revision and an older one" />
+Operators' [actions](#action-rollouts) stand between the commits as one line each, by when they
+ran: who ran which action where, how it went and how long it took. The head's toggle shows
+**All**, only the **Repo**'s commits, or only the **Actions**.
+
+<Screenshot name="rollouts-list" alt="Rollouts: a running commit, an action run on one host, a rejected commit with its validation errors, and an action rollout" />
 
 Run `buckle validate` in CI so that a rejection is a failed check on a pull request rather than a
 surprise after merging.
@@ -202,3 +206,6 @@ pause and abort, and reboots.
 
 An action rollout starts only while no other rollout is under way. A revision rollout started
 during one waits for it (or replaces it, under `supersede: replace`).
+
+Action rollouts, and actions run on one target from its page, appear on the Rollouts timeline
+between the commits (`GET /api/v1/actions/runs` lists the one-off runs across the fleet).

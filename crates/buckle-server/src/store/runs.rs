@@ -66,6 +66,17 @@ pub struct RunEvent {
     pub at: DateTime<Utc>,
 }
 
+/// A one-off action run (outside any rollout) with who ran it, for the
+/// fleet-wide listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionRunRecord {
+    pub run: RunRecord,
+    /// The target's kind (`host`, `cluster`); empty for a forgotten target.
+    pub kind: String,
+    pub actor: Option<String>,
+    pub label: Option<String>,
+}
+
 /// Repository over `runs` and `run_events`.
 pub struct Runs<'c> {
     conn: &'c Connection,
@@ -310,6 +321,62 @@ impl<'c> Runs<'c> {
             .query_row(
                 "SELECT COUNT(*) FROM runs WHERE host = ?1",
                 params![host],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
+        Ok((items, total.max(0) as u64))
+    }
+
+    /// Records who ran the action run `run_id` and what the action is called.
+    pub fn set_origin(&self, run_id: &str, actor: &str, label: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET actor = ?2, action_label = ?3 WHERE run_id = ?1",
+                params![run_id, actor, label],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// A page of one-off action runs across every target (an action
+    /// rollout's runs belong to its rollout), newest first, after the run
+    /// `before` when given, and how many there are.
+    pub fn actions(&self, before: Option<&str>, limit: u32) -> Result<(Vec<ActionRunRecord>, u64)> {
+        let cols = COLUMNS
+            .split(", ")
+            .map(|c| format!("r.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {cols}, COALESCE(h.kind, ''), r.actor, r.action_label FROM runs r LEFT JOIN hosts h ON h.host_id = r.host \
+             WHERE r.action IS NOT NULL AND r.rollout IS NULL \
+             AND (?1 IS NULL OR r.id < COALESCE((SELECT id FROM runs WHERE run_id = ?1), 0)) \
+             ORDER BY r.id DESC LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![before, limit], |r| {
+                Ok((row(r)?, r.get::<_, String>(14)?, r.get(15)?, r.get(16)?))
+            })
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let items = rows
+            .into_iter()
+            .map(|(raw, kind, actor, label)| {
+                Ok(ActionRunRecord {
+                    run: raw.record()?,
+                    kind,
+                    actor,
+                    label,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE action IS NOT NULL AND rollout IS NULL",
+                [],
                 |r| r.get(0),
             )
             .map_err(db_error)?;
@@ -587,6 +654,46 @@ mod tests {
         assert_eq!(got.outcome, "failed");
         assert_eq!(got.rollout.as_deref(), Some("ro-1"), "the rollout is kept");
         assert!(got.outcome_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn one_off_action_runs_are_listed_across_targets_newest_first() {
+        let store = Store::in_memory().await.unwrap();
+        let (page, rest) = store
+            .call(|db| {
+                let runs = db.runs();
+                let action = |host: &str, key: &str, at: i64, rollout: Option<&str>| RunRecord {
+                    rollout: rollout.map(Into::into),
+                    action: Some(key.into()),
+                    ..run(host, "succeeded", at)
+                };
+                runs.add(&run("pi-1", "succeeded", 0))?;
+                let reboot = runs.add(&action("pi-1", "common/reboot", 10, None))?;
+                runs.set_origin(&reboot, "alice", "Reboot")?;
+                runs.add(&action("pi-2", "web/restart", 20, Some("ro-2")))?;
+                runs.add(&action("pi-2", "web/drain", 30, None))?;
+                let page = runs.actions(None, 1)?;
+                let rest = runs.actions(Some(&page.0[0].run.id), 10)?;
+                Ok((page, rest))
+            })
+            .await
+            .unwrap();
+        let keys = |p: &(Vec<ActionRunRecord>, u64)| {
+            p.0.iter()
+                .map(|r| r.run.action.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(&page),
+            vec!["web/drain"],
+            "newest first, no applies or rollout runs"
+        );
+        assert_eq!(page.1, 2);
+        assert_eq!(keys(&rest), vec!["common/reboot"]);
+        assert_eq!(
+            (rest.0[0].actor.as_deref(), rest.0[0].label.as_deref()),
+            (Some("alice"), Some("Reboot"))
+        );
     }
 
     #[tokio::test]

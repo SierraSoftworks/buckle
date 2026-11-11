@@ -27,7 +27,7 @@ pub use kv::Kv;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
-pub use runs::{ABANDONED, RUNNING, RolloutRunIds, RunEvent, RunRecord, Runs};
+pub use runs::{ABANDONED, ActionRunRecord, RUNNING, RolloutRunIds, RunEvent, RunRecord, Runs};
 
 use buckle_core::Result;
 use chrono::{DateTime, Utc};
@@ -329,6 +329,12 @@ ALTER TABLE hosts ADD COLUMN reachable_error TEXT;
     // for a drift check sees it answered.
     r#"
 ALTER TABLE hosts ADD COLUMN drift_at TEXT;
+"#,
+    // 14: who ran an operator's action and what it is called, so the
+    // Rollouts timeline can list one-off action runs across the fleet.
+    r#"
+ALTER TABLE runs ADD COLUMN actor TEXT;
+ALTER TABLE runs ADD COLUMN action_label TEXT;
 "#,
 ];
 

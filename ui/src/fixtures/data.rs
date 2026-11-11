@@ -1690,6 +1690,26 @@ fn skipped(id: &str, rev: &str, message: &str, by: &str, at: DateTime<Utc>) -> R
 pub fn rollouts(now: DateTime<Utc>) -> Vec<RolloutDetail> {
     vec![
         active_rollout(now),
+        action_rollout(
+            "c41d7e2a9f0b4e6c",
+            ("caddy", "reload", "Reload caddy"),
+            Some("module:caddy"),
+            RolloutState::Completed,
+            (3, 3, 0),
+            "Alice Operator <alice@example.com>",
+            now - Duration::hours(26),
+            Some(4),
+        ),
+        action_rollout(
+            "9b3f0c5d1e7a4b28",
+            ("grafana", "restart", "Restart"),
+            Some("workload:grafana"),
+            RolloutState::Aborted,
+            (2, 1, 1),
+            "Bob Builder <bob@example.com>",
+            now - Duration::days(3) - Duration::hours(4),
+            Some(7),
+        ),
         finished(
             "41",
             STABLE_REV,
@@ -1722,6 +1742,85 @@ pub fn rollouts(now: DateTime<Utc>) -> Vec<RolloutDetail> {
             now,
         ),
     ]
+}
+
+/// Operators' one-off action runs, newest first.
+pub fn action_runs(now: DateTime<Utc>) -> Vec<buckle_api::ActionRun> {
+    let run = |id: &str,
+               target: &str,
+               (module, action, label): (&str, &str, &str),
+               by: &str,
+               ago: Duration,
+               took: i64,
+               state: buckle_api::RunState,
+               error: Option<&str>| buckle_api::ActionRun {
+        id: id.into(),
+        target: target.into(),
+        kind: buckle_api::TargetKind::Host,
+        module: module.into(),
+        action: action.into(),
+        label: Some(label.into()),
+        actor: Some(by.into()),
+        state,
+        started_at: now - ago,
+        finished_at: Some(now - ago + Duration::seconds(took)),
+        error: error.map(Into::into),
+        trace_url: None,
+    };
+    vec![
+        run(
+            "action-run-2",
+            "pi-1",
+            ("tailscale", "reauth", "Re-authenticate"),
+            "Bob Builder <bob@example.com>",
+            Duration::hours(2) + Duration::minutes(20),
+            14,
+            buckle_api::RunState::Succeeded,
+            None,
+        ),
+        run(
+            "action-run-1",
+            "nas",
+            ("common", "reboot", "Reboot"),
+            "Alice Operator <alice@example.com>",
+            Duration::days(2) + Duration::hours(3),
+            96,
+            buckle_api::RunState::Failed,
+            Some("nas did not come back within 5m"),
+        ),
+    ]
+}
+
+/// A finished rollout of an operator's action.
+#[allow(clippy::too_many_arguments)]
+fn action_rollout(
+    id: &str,
+    (module, action, label): (&str, &str, &str),
+    selector: Option<&str>,
+    state: RolloutState,
+    (total, done, failed): (u32, u32, u32),
+    by: &str,
+    started: DateTime<Utc>,
+    took_mins: Option<i64>,
+) -> RolloutDetail {
+    let mut d = finished(id, STABLE_REV, label, state, 1, started + Duration::days(1));
+    d.summary.revision_message = format!("{label} ({module}/{action})");
+    d.summary.action = Some(buckle_api::RolloutActionInfo {
+        module: module.into(),
+        action: action.into(),
+        label: label.into(),
+        selector: selector.map(Into::into),
+        instances: None,
+    });
+    d.summary.triggered_by = by.into();
+    d.summary.started_at = started;
+    d.summary.finished_at = took_mins.map(|m| started + Duration::minutes(m));
+    d.summary.hosts_total = total;
+    d.summary.hosts_done = done;
+    d.summary.hosts_failed = failed;
+    d.summary.current_phase = None;
+    d.fleet = None;
+    d
 }
 
 pub fn revisions(now: DateTime<Utc>) -> Vec<RevisionSummary> {
