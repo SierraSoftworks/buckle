@@ -181,10 +181,6 @@
     background: var(--surface);
   }
 
-  &__item--action {
-    padding: 0.4rem 0;
-  }
-
   &__dot {
     position: relative;
     z-index: 1;
@@ -1088,20 +1084,14 @@ tr[id] {
   text-decoration: none;
 }
 
-// An operator's action on the Rollouts timeline: one line between the
-// commits, who ran what where, how it went and when.
-.action-line {
-  &__main {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.25rem 0.5rem;
-    font-size: 0.84rem;
+// An operator's action on the Rollouts timeline, shaped like a commit's
+// card: its rollout's name and the bolt in the action colour.
+.action-entry {
+  &.commit--link:hover .commit__subject {
+    color: var(--action);
   }
 
-  &.commit--link:hover .commit__subject {
+  &__rollout {
     color: var(--action);
   }
 

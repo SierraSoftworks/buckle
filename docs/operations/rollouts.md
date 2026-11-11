@@ -15,7 +15,7 @@ The server sees it within `source.git.poll`, or at once with a webhook to
 parse, or whose modules, phases, secret references or templates do not check out, is **rejected**
 with the errors, and nothing rolls out.
 
-Operators' [actions](#action-rollouts) stand between the commits as one line each, by when they
+Operators' [actions](#action-rollouts) stand between the commits, shaped like them, by when they
 ran: who ran which action where, how it went and how long it took. The head's toggle shows
 **All**, only the **Repo**'s commits, or only the **Actions**.
 

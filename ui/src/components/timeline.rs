@@ -1,8 +1,8 @@
 //! The Rollouts timeline ([`crate::logic::timeline`]): each commit as its
-//! card, and between them each operator's action as one line on the rail,
-//! marked with a diamond and a bolt in the action colour: who ran what,
-//! where, how it went and how long it took, with `module/action` where a
-//! commit has its hash. A line opens its rollout, or the target it ran on.
+//! card, and between them each operator's action shaped like one: title,
+//! who ran it, how it went. A diamond on the rail, a bolt and the action
+//! colour set it apart; `module/action` stands where a commit has its hash.
+//! An action rollout opens its rollout, a run on one target that target.
 
 use buckle_api::{ActionRun, RevisionSummary, RolloutState, RolloutSummary};
 use chrono::{DateTime, Utc};
@@ -11,16 +11,13 @@ use yew::prelude::*;
 use super::avatar::{Avatar, split_author};
 use super::changes::Took;
 use super::icons;
-use super::meter::rollout_segments;
-use super::revision::{RevisionAsk, revision_item};
-use super::{Meter, Pill, RouteLink};
+use super::revision::{RevisionAsk, RolloutProgress, revision_item};
+use super::{Pill, RouteLink};
 use crate::app::Route;
-use crate::logic::format::{
-    count, relative, rollout_label, rollout_note, short_duration, timestamp,
-};
+use crate::logic::format::{count, relative, rollout_label, short_duration, timestamp};
 use crate::logic::run::{run_label, run_tone};
 use crate::logic::timeline::{Entry, Show, entries};
-use crate::logic::tone::{rollout_finished, rollout_state_label, rollout_state_tone};
+use crate::logic::tone::rollout_state_label;
 
 #[derive(Properties, PartialEq)]
 pub struct TimelineProps {
@@ -60,22 +57,22 @@ pub fn timeline(props: &TimelineProps) -> Html {
     }
 }
 
-/// An action's line on the rail: diamond, bolt, who ran it, then `body`;
-/// `aside` at the right, where a commit has its hash.
-fn line(key: String, kind: &'static str, by: Option<&str>, body: Html, aside: Html) -> Html {
-    let person = by.map(|by| {
-        let (name, email) = split_author(by);
-        let title = email.map(|e| format!("{name} <{e}>"));
-        html! { <><span class="commit__author" {title}><Avatar author={by.to_string()} />{ name.to_string() }</span><span class="muted">{ "ran" }</span></> }
-    });
+/// An action on the rail, shaped like a commit's card: its title (with a
+/// bolt where a commit has its check mark), a meta line, then `progress`;
+/// `module/action` at the right, where a commit has its hash. The diamond
+/// and the action colour set it apart from the commits.
+fn entry(key: String, kind: &'static str, title: Html, meta: Html, progress: Html, aside: Html) -> Html {
     html! {
         <li {key} class="gitlog__item gitlog__item--action" data-action={kind}>
             <span class="gitlog__diamond" aria-hidden="true" />
-            <div class="action-line commit commit--link">
-                <div class="action-line__main">
-                    <span class="action-line__icon" title="An operator's action">{ icons::bolt() }</span>
-                    { person.unwrap_or_default() }
-                    { body }
+            <div class="action-entry commit commit--link">
+                <div class="commit__main">
+                    <div class="commit__line">
+                        { title }
+                        <span class="action-entry__icon" title="An operator's action">{ icons::bolt() }</span>
+                    </div>
+                    <div class="commit__meta muted">{ meta }</div>
+                    { progress }
                 </div>
                 <div class="commit__aside">{ aside }</div>
             </div>
@@ -83,16 +80,27 @@ fn line(key: String, kind: &'static str, by: Option<&str>, body: Html, aside: Ht
     }
 }
 
+/// Who ran an action, as a commit names its author.
+fn operator(by: Option<&str>) -> Html {
+    let Some(by) = by else {
+        return html! {};
+    };
+    let (name, email) = split_author(by);
+    let title = email.map(|e| format!("{name} <{e}>"));
+    html! { <span class="commit__author" {title}><Avatar author={by.to_string()} />{ name.to_string() }</span> }
+}
+
 fn action_key(module: &str, action: &str) -> Html {
-    html! { <span class="action-line__key mono" title="module/action">{ format!("{module}/{action}") }</span> }
+    html! { <span class="action-entry__key mono" title="module/action">{ format!("{module}/{action}") }</span> }
 }
 
 fn when(at: DateTime<Utc>, now: DateTime<Utc>) -> Html {
-    html! { <span class="muted" title={timestamp(at)}>{ relative(at, now) }</span> }
+    html! { <span title={timestamp(at)}>{ relative(at, now) }</span> }
 }
 
-/// An action rolled out across the fleet: its rollout's name in the
-/// rollout's colour, then the action, its targets, state and progress.
+/// An action rolled out across the fleet, as a commit's rollout is drawn:
+/// its rollout's name (in the action colour) and the action; who ran it,
+/// when and on which targets; then the rollout's progress.
 fn action_rollout(x: &RolloutSummary, now: DateTime<Utc>) -> Html {
     let Some(a) = &x.action else {
         return html! {};
@@ -100,53 +108,37 @@ fn action_rollout(x: &RolloutSummary, now: DateTime<Utc>) -> Html {
     let targets = count(x.hosts_total as usize, "target", "targets");
     let scope = match &a.selector {
         Some(s) => {
-            html! { <>{ format!("on {targets} matching ") }<span class="mono">{ s.clone() }</span></> }
+            html! { <span>{ format!("{targets} matching ") }<span class="mono">{ s.clone() }</span></span> }
         }
-        None => html! { { format!("on {targets}") } },
+        None => html! { <span>{ targets }</span> },
     };
-    let finished = rollout_finished(x.state);
-    let took = x
-        .finished_at
-        .filter(|_| finished)
-        .map(|f| short_duration(f.signed_duration_since(x.started_at).num_seconds()));
-    let phase = x.current_phase.as_ref().filter(|_| !finished);
     let review = (x.state == RolloutState::AwaitingApproval).then(|| {
         html! {
             <RouteLink to={Route::rollout(&x.id)} classes="btn btn--small btn--info"
                 title="This rollout is waiting for an approval">{ "Review…" }</RouteLink>
         }
     });
-    let body = html! { <>
+    let title = html! {
         <RouteLink to={Route::rollout(&x.id)} classes="commit__subject" title={format!("Open rollout {}", rollout_label(&x.id))}>
-            <span class={classes!("commit__rollout", rollout_state_tone(x.state).class())}>{ rollout_label(&x.id) }</span>
+            <span class="commit__rollout action-entry__rollout"
+                title={format!("Rollout {} {}", rollout_label(&x.id), rollout_state_label(x.state))}>{ rollout_label(&x.id) }</span>
             { a.label.clone() }
         </RouteLink>
-        <span class="muted">{ scope }</span>
-        <Pill tone={rollout_state_tone(x.state)} label={rollout_state_label(x.state)} title={rollout_note(x).map(AttrValue::from)} />
-        if let Some(p) = phase { <span class="muted">{ format!("in {p}") }</span> }
-        if x.hosts_total > 0 {
-            <span class="rollout-line__progress">
-                <Meter segments={rollout_segments(x)} total={x.hosts_total as usize} class="rollout-line__meter" />
-                <span class="muted">
-                    { format!("{}/{}", x.hosts_done, x.hosts_total) }
-                    if x.hosts_failed > 0 { <span class="text-danger">{ format!(" · {} failed", x.hosts_failed) }</span> }
-                </span>
-            </span>
-        }
-        if let Some(t) = took { <Took label={t} /> }
-        { when(x.started_at, now) }
-    </> };
+    };
+    let meta = html! { <>{ operator(Some(&x.triggered_by)) }{ when(x.started_at, now) }{ scope }</> };
     let aside = html! { <>{ action_key(&a.module, &a.action) }{ review.unwrap_or_default() }</> };
-    line(
+    entry(
         format!("rollout-{}", x.id),
         "rollout",
-        Some(&x.triggered_by),
-        body,
+        title,
+        meta,
+        html! { <RolloutProgress rollout={x.clone()} {now} /> },
         aside,
     )
 }
 
-/// An action run on one target: it opens that target.
+/// An action run on one target: the action, then who ran it where, when,
+/// how it went and how long it took. It opens that target.
 fn action_run(r: &ActionRun, now: DateTime<Utc>) -> Html {
     let to = Route::target(&r.target, r.kind);
     let label = r
@@ -156,19 +148,23 @@ fn action_run(r: &ActionRun, now: DateTime<Utc>) -> Html {
     let took = r
         .finished_at
         .map(|f| short_duration(f.signed_duration_since(r.started_at).num_seconds()));
-    let body = html! { <>
-        <RouteLink to={to.clone()} classes="commit__subject" title={format!("Open {}", r.target)}>{ label }</RouteLink>
-        <span class="muted">{ "on " }<span class="action-line__target">{ r.target.clone() }</span></span>
-        <Pill tone={run_tone(r.state)} label={run_label(r.state)} title={r.error.clone().map(AttrValue::from)} />
-        if let Some(e) = &r.error { <span class="action-line__error text-danger" title={e.clone()}>{ e.clone() }</span> }
-        if let Some(t) = took { <Took label={t} /> }
+    let title = html! {
+        <RouteLink to={to} classes="commit__subject" title={format!("Open {}", r.target)}>{ label }</RouteLink>
+    };
+    let meta = html! { <>
+        { operator(r.actor.as_deref()) }
         { when(r.started_at, now) }
+        <span>{ "on " }<span class="action-entry__target">{ r.target.clone() }</span></span>
+        <Pill tone={run_tone(r.state)} label={run_label(r.state)} title={r.error.clone().map(AttrValue::from)} />
+        if let Some(t) = took { <Took label={t} /> }
+        if let Some(e) = &r.error { <span class="action-entry__error text-danger" title={e.clone()}>{ e.clone() }</span> }
     </> };
-    line(
+    entry(
         format!("run-{}", r.id),
         "run",
-        r.actor.as_deref(),
-        body,
+        title,
+        meta,
+        html! {},
         action_key(&r.module, &r.action),
     )
 }
