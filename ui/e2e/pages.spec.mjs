@@ -137,8 +137,16 @@ describe("every page renders in demo mode", () => {
     assert.deepEqual(kinds.slice(0, 3), ["commit", "run", "commit"]);
     assert.ok(kinds.includes("rollout"), "action rollouts are on the timeline");
     const run = actions.filter({ hasText: "Re-authenticate" });
-    assert.match(await run.textContent(), /Bob Builder\s*ran\s*Re-authenticate\s*on pi-1.*succeeded/);
-    assert.equal((await run.locator(".action-line__key").textContent()).trim(), "tailscale/reauth");
+    // Shaped like a commit: the action, then who ran it where and how it went.
+    assert.equal((await run.locator(".commit__subject").textContent()).trim(), "Re-authenticate");
+    assert.match(await run.locator(".commit__meta").textContent(), /Bob Builder.*on pi-1.*succeeded/);
+    assert.equal((await run.locator(".action-entry__key").textContent()).trim(), "tailscale/reauth");
+    // An action rollout as a commit's: name and action, who and how many
+    // targets, then the rollout's progress.
+    const rollout = actions.filter({ hasText: "Reload caddy" });
+    assert.match(await rollout.locator(".commit__subject").textContent(), /^\S+\.\S+\.\S+\s*Reload caddy$/);
+    assert.match(await rollout.locator(".commit__meta").textContent(), /Alice Operator.*3 targets/);
+    assert.match(await rollout.locator(".rollout-line").textContent(), /completed.*3\/3 done/);
     const failed = actions.filter({ hasText: "Reboot" });
     assert.match(await failed.textContent(), /failed.*did not come back/);
 
@@ -167,7 +175,7 @@ describe("every page renders in demo mode", () => {
     await page.getByRole("status").filter({ hasText: "Upgrade packages started on lab-3" }).waitFor();
     await page.getByRole("link", { name: "Rollouts", exact: true }).first().click();
     const run = page.locator('.gitlog__item--action[data-action="run"]').first();
-    await eventually(async () => assert.match(await run.textContent(), /ran\s*Upgrade packages\s*on lab-3/));
+    await eventually(async () => assert.match(await run.textContent(), /Upgrade packages.*on lab-3/));
     await close();
   });
 
