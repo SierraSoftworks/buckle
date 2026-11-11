@@ -290,3 +290,8 @@ pub fn logo() -> Html {
         </svg>
     }
 }
+
+/// An operator's action.
+pub fn bolt() -> Html {
+    icon(html! { <polygon points="13 2 4 14 11 14 10 22 19 10 12 10 13 2" /> })
+}

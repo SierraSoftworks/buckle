@@ -25,6 +25,7 @@ pub mod segmented;
 pub mod shell;
 pub mod split_button;
 pub mod theme;
+pub mod timeline;
 pub mod toast;
 pub mod ui;
 

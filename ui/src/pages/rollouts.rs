@@ -1,127 +1,203 @@
 //! Rollouts (design §12): the configuration repository's commits, newest
 //! first, each with how its rollout is going and the one control that fits
 //! where it stands: [Stable], Rollback, Review or [Running]. Revisions and
-//! rollouts are one history, so there is one page for both.
+//! rollouts are one history, so there is one page for both, and operators'
+//! actions (rolled out across the fleet, or run on one target) stand between
+//! the commits on the same timeline. The head's toggle shows all of it, only
+//! the repository's commits, or only the actions.
 
 use buckle_api::{LiveEvent, Page};
+use serde::{Deserialize, Serialize};
 use yew::prelude::*;
+use yew_router::prelude::{use_location, use_navigator};
 
 use crate::api;
 use crate::app::Route;
+use crate::components::timeline::Timeline;
 use crate::components::{
-    Button, Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RevisionLog, RouteLink,
-    use_revision_actions,
+    Button, Empty, ErrorState, Loading, PageHead, Panel, Refresh, Segmented, use_revision_actions,
 };
 use crate::hooks::{Fetch, use_fetch, use_live_value, use_now};
-use crate::logic::format::relative;
 use crate::logic::live::{apply_revisions, apply_rollouts};
-use crate::logic::tone::{rollout_state_label, rollout_state_tone};
+use crate::logic::timeline::{Show, apply_action_runs, complete_since, starts_action_run};
+use crate::store::use_live;
+
+/// The toggle's choice, kept in the URL so a link shows what its sender saw
+/// (`?show=actions`).
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ShowQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    show: Option<String>,
+}
 
 #[function_component(Rollouts)]
 pub fn rollouts() -> Html {
     let now = use_now(30);
     let actions = use_revision_actions();
+    let live = use_live();
+    let show = Show::parse(
+        use_location()
+            .and_then(|l| l.query::<ShowQuery>().ok())
+            .and_then(|q| q.show)
+            .as_deref(),
+    );
+    let on_show = {
+        let navigator = use_navigator();
+        Callback::from(move |v: AttrValue| {
+            if let Some(n) = &navigator {
+                let show = Show::parse(Some(v.as_str())).as_query().map(Into::into);
+                let _ = n.replace_with_query(&Route::Rollouts, &ShowQuery { show });
+            }
+        })
+    };
 
     let revisions = use_fetch((), |_| api::revisions(0));
     let rollouts = use_fetch((), |_| api::rollouts(0));
+    let runs = use_fetch((), |_| api::action_runs(None));
     let (revs, revs_more) = use_pages(&revisions, |p, e| apply_revisions(&mut p.items, e));
     let (rolls, rolls_more) = use_pages(&rollouts, |p, e| apply_rollouts(&mut p.items, e));
+    let (acts, acts_more) = use_pages(&runs, |p, e| apply_action_runs(&mut p.items, e));
 
-    // Older pages of both lists come together, so an older revision finds
-    // its rollout.
+    // An action run started somewhere since the runs were fetched: fetch
+    // them again to show it.
+    {
+        let started = runs.data.as_ref().is_some_and(|d| {
+            live.log
+                .since(d.0)
+                .is_some_and(|events| events.iter().any(|e| starts_action_run(e)))
+        });
+        let reload = runs.reload.clone();
+        use_effect_with(started, move |started| {
+            if *started {
+                reload.emit(());
+            }
+            || ()
+        });
+    }
+
+    // Which lists the view draws on, and so which still have older pages:
+    // the timeline stops where the first of those runs out.
+    let (commits, acted) = (show != Show::Actions, show != Show::Repo);
+    let since = complete_since([
+        (
+            commits && revs_more.next().is_some(),
+            revs.as_ref().and_then(|l| l.last()).map(|r| r.created_at),
+        ),
+        (
+            show == Show::All && rolls_more.next().is_some(),
+            rolls.as_ref().and_then(|l| l.last()).map(|r| r.started_at),
+        ),
+        (
+            acted && acts_more.next().is_some(),
+            acts.as_ref().and_then(|l| l.last()).map(|r| r.started_at),
+        ),
+    ]);
+    let older = (commits && revs_more.next().is_some())
+        || (acted && (rolls_more.next().is_some() || acts_more.next().is_some()));
+
+    // Older pages of every list come together, so an older revision finds
+    // its rollout and the timeline stays in order.
     let more_busy = use_state(|| false);
     let load_more = {
-        let (revs_more, rolls_more, busy) =
-            (revs_more.clone(), rolls_more.clone(), more_busy.clone());
+        let (revs_more, rolls_more, acts_more, busy) = (
+            revs_more.clone(),
+            rolls_more.clone(),
+            acts_more.clone(),
+            more_busy.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
-            let (revs_more, rolls_more, busy) =
-                (revs_more.clone(), rolls_more.clone(), busy.clone());
+            let (revs_more, rolls_more, acts_more, busy) = (
+                revs_more.clone(),
+                rolls_more.clone(),
+                acts_more.clone(),
+                busy.clone(),
+            );
             busy.set(true);
             wasm_bindgen_futures::spawn_local(async move {
                 futures::join!(
-                    revs_more.fetch(|o| async move { api::revisions(o).await }),
-                    rolls_more.fetch(|o| async move { api::rollouts(o).await }),
+                    revs_more
+                        .fetch(|o| async move { api::revisions(o.parse().unwrap_or(0)).await }),
+                    rolls_more
+                        .fetch(|o| async move { api::rollouts(o.parse().unwrap_or(0)).await }),
+                    acts_more.fetch(|b| async move { api::action_runs(Some(b)).await }),
                 );
                 busy.set(false);
             });
         })
     };
 
-    let body = match (&revs, &revisions.error) {
-        (Some(l), _) if l.is_empty() => html! {
+    // A server without the action runs listing leaves them out of All.
+    let (state, error, retry) = match show {
+        Show::Actions => (
+            rolls
+                .as_ref()
+                .zip(acts.as_ref())
+                .map(|(r, a)| r.iter().any(|x| x.action.is_some()) || !a.is_empty()),
+            rollouts.error.clone().or(runs.error.clone()),
+            {
+                let (a, b) = (rollouts.reload.clone(), runs.reload.clone());
+                Callback::from(move |_| {
+                    a.emit(());
+                    b.emit(());
+                })
+            },
+        ),
+        _ => (
+            revs.as_ref().map(|l| !l.is_empty()),
+            revisions.error.clone(),
+            revisions.reload.clone(),
+        ),
+    };
+    let body = match (state, error) {
+        (Some(false), _) if show == Show::Actions => html! {
+            <Empty title="No actions yet" message="Actions run from Run action… on the Hosts and Workloads pages, or from a target's page." />
+        },
+        (Some(false), _) => html! {
             <Empty title="No revisions yet" message="Revisions appear as the server's source watcher sees commits (or a webhook tells it)." />
         },
-        (Some(l), _) => html! { <>
-            <RevisionLog revisions={l.clone()} rollouts={rolls.clone().unwrap_or_default()} {now} open={actions.open.clone()} />
-            if revs_more.next().is_some() {
-                <div class="more"><Button onclick={load_more} busy={*more_busy}>{ "Load older revisions" }</Button></div>
+        (Some(true), _) => html! { <>
+            <Timeline revisions={revs.clone().unwrap_or_default()} rollouts={rolls.clone().unwrap_or_default()}
+                runs={acts.clone().unwrap_or_default()} {show} {since} {now} open={actions.open.clone()} />
+            if older {
+                <div class="more"><Button onclick={load_more} busy={*more_busy}>{ "Load older" }</Button></div>
             }
         </> },
-        (None, Some(e)) => {
-            html! { <ErrorState error={e.clone()} retry={revisions.reload.clone()} /> }
-        }
+        (None, Some(e)) => html! { <ErrorState error={e} {retry} /> },
         (None, None) => html! { <Loading label="Loading rollouts…" /> },
     };
 
+    let subtitle = match show {
+        Show::All => {
+            "Commits of the configuration repository and operators' actions, newest first, with how each one went."
+        }
+        Show::Repo => {
+            "Commits of the configuration repository, newest first, with how each one's rollout is going."
+        }
+        Show::Actions => "Actions operators ran, across the fleet or on one target, newest first.",
+    };
+    let reload_all = {
+        let (a, b, c) = (
+            revisions.reload.clone(),
+            rollouts.reload.clone(),
+            runs.reload.clone(),
+        );
+        Callback::from(move |_| {
+            a.emit(());
+            b.emit(());
+            c.emit(());
+        })
+    };
     html! {
         <div class="page">
-            <PageHead title="Rollouts" subtitle={html! { "Commits of the configuration repository, newest first, with how each one's rollout is going." }}
-                actions={html! { <Refresh loading={revisions.loading || rollouts.loading} reload={{
-                    let (a, b) = (revisions.reload.clone(), rollouts.reload.clone());
-                    Callback::from(move |_| { a.emit(()); b.emit(()); })
-                }} /> }} />
+            <PageHead title="Rollouts" subtitle={html! { subtitle }}
+                actions={html! { <>
+                    <Segmented label="Show" testid="rollouts-show" value={show.as_query().unwrap_or("all")} on_change={on_show}
+                        options={vec![("all".into(), "All".into()), ("repo".into(), "Repo".into()), ("actions".into(), "Actions".into())]} />
+                    <Refresh loading={revisions.loading || rollouts.loading || runs.loading} reload={reload_all} />
+                </> }} />
             <Panel>{ body }</Panel>
-            { action_rollouts(rolls.as_deref().unwrap_or_default(), now) }
             { actions.dialog(&rolls.unwrap_or_default()) }
         </div>
-    }
-}
-
-/// Rollouts of an action rather than a revision (Run action… on the Hosts
-/// and Clusters pages), newest first; nothing when there are none.
-fn action_rollouts(
-    rolls: &[buckle_api::RolloutSummary],
-    now: chrono::DateTime<chrono::Utc>,
-) -> Html {
-    let rows: Vec<&buckle_api::RolloutSummary> =
-        rolls.iter().filter(|r| r.action.is_some()).collect();
-    if rows.is_empty() {
-        return html! {};
-    }
-    html! {
-        <Panel title="Action rollouts" subtitle="Actions run across the fleet through the stable revision's phases">
-            <div class="table-wrap">
-                <table class="table" data-testid="action-rollouts">
-                    <thead><tr>
-                        <th scope="col">{ "Rollout" }</th>
-                        <th scope="col">{ "Action" }</th>
-                        <th scope="col">{ "State" }</th>
-                        <th scope="col">{ "Targets" }</th>
-                        <th scope="col">{ "Started" }</th>
-                    </tr></thead>
-                    <tbody>
-                        { for rows.into_iter().map(|r| {
-                            let a = r.action.as_ref().expect("filtered on its action");
-                            html! {
-                                <tr key={r.id.clone()}>
-                                    <td><RouteLink to={Route::Rollout { id: r.id.clone() }}>{ r.name.clone().unwrap_or_else(|| r.id.clone()) }</RouteLink></td>
-                                    <td>
-                                        <span class="strong">{ a.label.clone() }</span>
-                                        <span class="cell-sub mono">{ format!("{}/{}", a.module, a.action) }</span>
-                                        if let Some(sel) = &a.selector { <span class="cell-sub mono">{ sel.clone() }</span> }
-                                    </td>
-                                    <td><Pill tone={rollout_state_tone(r.state)} label={rollout_state_label(r.state)} /></td>
-                                    <td>{ format!("{} of {}", r.hosts_done, r.hosts_total) }
-                                        if r.hosts_failed > 0 { <span class="cell-sub text-warn">{ format!("{} failed", r.hosts_failed) }</span> }
-                                    </td>
-                                    <td class="muted">{ format!("{} · {}", r.triggered_by, relative(r.started_at, now)) }</td>
-                                </tr>
-                            }
-                        }) }
-                    </tbody>
-                </table>
-            </div>
-        </Panel>
     }
 }
 
@@ -137,16 +213,17 @@ impl<T: Clone + 'static> More<T> {
         self.next.as_ref()
     }
 
-    /// Appends the page after the last one, if there is one.
+    /// Appends the page after the last one, if there is one: `get` is
+    /// handed the list's cursor (an offset, or the last item's id).
     async fn fetch<F, Fut>(&self, get: F)
     where
-        F: FnOnce(u64) -> Fut,
+        F: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = Result<Page<T>, crate::api::ApiError>>,
     {
-        let Some(offset) = self.next.as_ref().and_then(|n| n.parse::<u64>().ok()) else {
+        let Some(cursor) = (*self.next).clone() else {
             return;
         };
-        if let Ok(p) = get(offset).await {
+        if let Ok(p) = get(cursor).await {
             let mut all = (*self.extra).clone();
             all.extend(p.items);
             self.extra.set(all);

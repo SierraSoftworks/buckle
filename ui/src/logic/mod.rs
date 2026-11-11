@@ -22,6 +22,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod run;
 pub mod ticker;
+pub mod timeline;
 pub mod tone;
 pub mod units;
 pub mod workloads;

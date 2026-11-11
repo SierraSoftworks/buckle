@@ -268,6 +268,35 @@ pub struct RunSummary {
     pub action: Option<String>,
 }
 
+/// An operator's action run on one target outside any rollout, as
+/// `GET /actions/runs` lists them across the fleet, newest first. An action
+/// rollout's runs are its rollout's, so they are not listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionRun {
+    /// The run's id, the key for `GET /hosts/{target}/runs/{id}`.
+    pub id: String,
+    pub target: String,
+    pub kind: crate::TargetKind,
+    pub module: String,
+    pub action: String,
+    /// What the action is called; absent for runs recorded before servers
+    /// kept it (show `module/action`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Who ran it; absent for runs recorded before servers kept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub state: crate::run::RunState,
+    pub started_at: DateTime<Utc>,
+    /// When it finished; absent while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_url: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResultDto {
     pub scope: String,

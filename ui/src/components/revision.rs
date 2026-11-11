@@ -323,32 +323,43 @@ pub fn revision_log(props: &RevisionLogProps) -> Html {
         <ol class={classes!("gitlog", props.limit.is_some().then_some("gitlog--compact"))}>
             { for props.revisions.iter().take(shown).map(|r| {
                 let rollout = r.rollout_id.as_ref().and_then(|id| props.rollouts.iter().find(|x| &x.id == id));
-                let rejected = r.status == RevisionStatus::Rejected;
-                html! {
-                    <li class={classes!("gitlog__item", rejected.then_some("gitlog__item--rejected"), r.is_stable.then_some("gitlog__item--stable"))} data-revision={r.id.clone()}>
-                        <span class="gitlog__dot" aria-hidden="true" />
-                        <CommitCard commit={Commit::from(r)} rollout={rollout.cloned()} body=true now={props.now}
-                            actions={html! { <RevisionControls revision={r.clone()} rollout={rollout.cloned()} {stable_at} open={props.open.clone()} /> }}>
-                            if rejected {
-                                <div class="errors" aria-label="Validation errors">
-                                    { for r.validation_errors.iter().map(|e| html! {
-                                        <ErrorBlock error={crate::logic::error_text::parse(e)} />
-                                    }) }
-                                    if r.validation_errors.is_empty() { <p class="muted">{ "Rejected without a reason recorded." }</p> }
-                                </div>
-                            }
-                            { match rollout {
-                                Some(x) => html! { <RolloutProgress rollout={x.clone()} now={props.now} /> },
-                                None if r.rollout_id.is_none() && !rejected => html! { <div class="rollout-line muted">{ "not rolled out" }</div> },
-                                None => html! {},
-                            } }
-                        </CommitCard>
-                    </li>
-                }
+                revision_item(r, rollout, stable_at, props.now, &props.open)
             }) }
             if props.revisions.len() > shown {
                 <li class="gitlog__more muted">{ format!("and {}", count(props.revisions.len() - shown, "older revision", "older revisions")) }</li>
             }
         </ol>
+    }
+}
+
+/// One revision of the log: its commit card with its rollout's progress.
+pub fn revision_item(
+    r: &RevisionSummary,
+    rollout: Option<&RolloutSummary>,
+    stable_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    open: &Callback<RevisionAsk>,
+) -> Html {
+    let rejected = r.status == RevisionStatus::Rejected;
+    html! {
+        <li key={format!("rev-{}", r.id)} class={classes!("gitlog__item", rejected.then_some("gitlog__item--rejected"), r.is_stable.then_some("gitlog__item--stable"))} data-revision={r.id.clone()}>
+            <span class="gitlog__dot" aria-hidden="true" />
+            <CommitCard commit={Commit::from(r)} rollout={rollout.cloned()} body=true {now}
+                actions={html! { <RevisionControls revision={r.clone()} rollout={rollout.cloned()} {stable_at} open={open.clone()} /> }}>
+                if rejected {
+                    <div class="errors" aria-label="Validation errors">
+                        { for r.validation_errors.iter().map(|e| html! {
+                            <ErrorBlock error={crate::logic::error_text::parse(e)} />
+                        }) }
+                        if r.validation_errors.is_empty() { <p class="muted">{ "Rejected without a reason recorded." }</p> }
+                    </div>
+                }
+                { match rollout {
+                    Some(x) => html! { <RolloutProgress rollout={x.clone()} {now} /> },
+                    None if r.rollout_id.is_none() && !rejected => html! { <div class="rollout-line muted">{ "not rolled out" }</div> },
+                    None => html! {},
+                } }
+            </CommitCard>
+        </li>
     }
 }

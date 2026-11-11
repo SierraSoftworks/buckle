@@ -2906,6 +2906,35 @@ async fn admins_run_the_actions_a_host_offers_with_notes_audited() {
     assert_eq!(runs.items[0].id, started.run_id);
     assert_eq!(runs.items[0].action.as_deref(), Some("web/drain"));
 
+    let listed = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/actions/runs")
+            .to_request(),
+    )
+    .await;
+    let listed: buckle_api::Page<buckle_api::ActionRun> = test::read_body_json(listed).await;
+    let ran = &listed.items[0];
+    assert_eq!(
+        (
+            ran.id.as_str(),
+            ran.target.as_str(),
+            ran.module.as_str(),
+            ran.action.as_str(),
+            ran.label.as_deref(),
+            ran.finished_at
+        ),
+        (
+            started.run_id.as_str(),
+            "pi-1",
+            "web",
+            "drain",
+            Some("drain"),
+            None
+        )
+    );
+    assert!(ran.actor.is_some(), "who ran it is kept");
+
     let audit = test::call_service(
         &app,
         test::TestRequest::get()

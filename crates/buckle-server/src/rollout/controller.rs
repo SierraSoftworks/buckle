@@ -190,6 +190,8 @@ pub enum Command {
         target: String,
         module: String,
         action: String,
+        /// What the action is called, kept with its run.
+        label: String,
         revision: String,
         /// Where it runs, for an action offering the choice.
         instances: Option<buckle_api::ActionInstances>,
@@ -2399,6 +2401,7 @@ impl Controller {
         target: String,
         module: String,
         action: String,
+        name: String,
         revision: String,
         instances: Option<buckle_api::ActionInstances>,
         note: String,
@@ -2483,8 +2486,12 @@ impl Controller {
             outcome_json: None,
             action: Some(label.clone()),
         };
+        let by = actor.to_owned();
         self.store
-            .call(move |db| db.runs().add(&run).map(|_| ()))
+            .call(move |db| {
+                let id = db.runs().add(&run)?;
+                db.runs().set_origin(&id, &by, &name)
+            })
             .await
             .map_err(CommandError::internal)?;
         let m = msg(server_message::Msg::Action(pb::RunAction {
@@ -2895,12 +2902,15 @@ impl Controller {
                 target,
                 module,
                 action,
+                label,
                 revision,
                 instances,
                 note,
             } => {
-                self.run_action(actor, target, module, action, revision, instances, note)
-                    .await
+                self.run_action(
+                    actor, target, module, action, label, revision, instances, note,
+                )
+                .await
             }
             Command::Start { revision, note } => self.start(&revision, actor, &note).await,
             Command::MoveLease { target, host, note } => {

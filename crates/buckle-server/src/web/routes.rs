@@ -75,6 +75,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/rollouts", web::get().to(rollouts))
             .route("/rollouts", web::post().to(start_action_rollout))
             .route("/actions", web::get().to(fleet_actions))
+            .route("/actions/runs", web::get().to(action_runs))
             .route("/rollouts/{id}", web::get().to(rollout))
             .route("/rollouts/{id}/plans", web::get().to(rollout_plans))
             .route(
@@ -115,6 +116,7 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("GET", "/api/v1/hosts/h/state"),
     ("GET", "/api/v1/hosts/h/health"),
     ("GET", "/api/v1/hosts/h/runs"),
+    ("GET", "/api/v1/actions/runs"),
     ("POST", "/api/v1/hosts/h/preview"),
     ("POST", "/api/v1/hosts/h/approve"),
     ("POST", "/api/v1/hosts/h/pause"),
@@ -1028,6 +1030,47 @@ async fn host_runs(
     Ok(HttpResponse::Ok().json(Page { items, next, total }))
 }
 
+/// A page of operators' one-off action runs across the fleet, newest first.
+async fn action_runs(state: Data, _: Authenticated, q: web::Query<RunsQuery>) -> ApiResult {
+    let q = q.into_inner();
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let (rows, total) = state
+        .store
+        .call(move |db| db.runs().actions(q.before.as_deref(), limit))
+        .await?;
+    let next = (rows.len() as u32 == limit)
+        .then(|| rows.last().map(|r| r.run.id.clone()))
+        .flatten();
+    let items: Vec<buckle_api::ActionRun> = rows
+        .into_iter()
+        .map(|r| action_run_dto(&state, r))
+        .collect();
+    Ok(HttpResponse::Ok().json(Page { items, next, total }))
+}
+
+fn action_run_dto(state: &AppState, r: crate::store::ActionRunRecord) -> buckle_api::ActionRun {
+    let running = r.run.is_running();
+    let key = r.run.action.clone().unwrap_or_default();
+    let (module, action) = key.split_once('/').unwrap_or((key.as_str(), ""));
+    buckle_api::ActionRun {
+        id: r.run.id.clone(),
+        target: r.run.host.clone(),
+        kind: match r.kind.as_str() {
+            "cluster" => buckle_api::TargetKind::Cluster,
+            _ => buckle_api::TargetKind::Host,
+        },
+        module: module.to_owned(),
+        action: action.to_owned(),
+        label: r.label,
+        actor: r.actor,
+        state: crate::views::run_state(&r.run, true),
+        started_at: r.run.started_at,
+        finished_at: (!running).then_some(r.run.finished_at),
+        error: r.run.error.clone(),
+        trace_url: state.trace_url(r.run.trace_id.as_deref()),
+    }
+}
+
 /// One run of a host, module by module and step by step.
 async fn host_run(state: Data, _: Authenticated, path: web::Path<(String, String)>) -> ApiResult {
     let (id, run) = path.into_inner();
@@ -1241,6 +1284,7 @@ async fn run_action(
                 target: id.clone(),
                 module,
                 action,
+                label: info.label.clone(),
                 revision,
                 instances,
                 note,

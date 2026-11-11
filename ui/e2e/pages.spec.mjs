@@ -2,7 +2,7 @@
 // and its admin controls only for admins.
 
 import { describe, test } from "node:test";
-import { assert, decide, decisions, eventually, heading, offered, open } from "./helpers.mjs";
+import { act, assert, decide, decisions, eventually, heading, offered, open } from "./helpers.mjs";
 
 describe("every page renders in demo mode", () => {
   test("overview shows the fleet in one bar and the latest rollout's card", async () => {
@@ -86,7 +86,8 @@ describe("every page renders in demo mode", () => {
   test("rollouts are the commit history, each with its rollout's progress and controls", async () => {
     const { page, close } = await open("/rollouts");
     assert.equal(await heading(page), "Rollouts");
-    const items = page.locator(".gitlog__item");
+    // Commits; operators' actions stand between them (tested below).
+    const items = page.locator(".gitlog__item:not(.gitlog__item--action)");
     await items.first().waitFor();
     assert.equal(await items.count(), 8);
     // A rollout line under each rolled-out commit: its state and progress.
@@ -122,6 +123,51 @@ describe("every page renders in demo mode", () => {
     await items.first().locator(".commit__subject").click();
     assert.equal(await heading(page), "Rollout #42");
     assert.match(page.url(), /\/rollouts\/42$/);
+    await close();
+  });
+
+  test("actions stand between the commits by when they ran, and the head's toggle narrows the timeline", async () => {
+    const { page, close } = await open("/rollouts");
+    const entries = page.locator(".gitlog__item");
+    const actions = page.locator(".gitlog__item--action");
+    await actions.first().waitFor();
+    // Newest first by when each started: the action run of 2h ago stands
+    // between rollout #42 (34m ago) and the commit of 3h ago.
+    const kinds = await entries.evaluateAll((els) => els.map((e) => e.dataset.action ?? "commit"));
+    assert.deepEqual(kinds.slice(0, 3), ["commit", "run", "commit"]);
+    assert.ok(kinds.includes("rollout"), "action rollouts are on the timeline");
+    const run = actions.filter({ hasText: "Re-authenticate" });
+    assert.match(await run.textContent(), /Bob Builder\s*ran\s*Re-authenticate\s*on pi-1.*succeeded/);
+    assert.equal((await run.locator(".action-line__key").textContent()).trim(), "tailscale/reauth");
+    const failed = actions.filter({ hasText: "Reboot" });
+    assert.match(await failed.textContent(), /failed.*did not come back/);
+
+    const toggle = page.getByTestId("rollouts-show");
+    await toggle.getByRole("radio", { name: "Actions" }).click();
+    await page.waitForURL(/[?&]show=actions/);
+    await eventually(async () => assert.equal(await entries.count(), await actions.count()));
+    assert.ok((await actions.count()) >= 3);
+    await toggle.getByRole("radio", { name: "Repo" }).click();
+    await page.waitForURL(/[?&]show=repo/);
+    await eventually(async () => assert.equal(await actions.count(), 0));
+    assert.equal(await entries.count(), 8);
+    await toggle.getByRole("radio", { name: "All" }).click();
+    await eventually(async () => assert.doesNotMatch(page.url(), /show=/));
+
+    // An action rollout's line opens its rollout.
+    await actions.filter({ hasText: "Reload caddy" }).locator(".commit__subject").click();
+    assert.match(await heading(page), /^Rollout /);
+    assert.match(await page.getByTestId("rollout-action").textContent(), /Reload caddy/);
+    await close();
+  });
+
+  test("an action run on a host joins the timeline", async () => {
+    const { page, close } = await open("/hosts/lab-3");
+    await act(page.getByTestId("host-actions"), "Upgrade packages common");
+    await page.getByRole("status").filter({ hasText: "Upgrade packages started on lab-3" }).waitFor();
+    await page.getByRole("link", { name: "Rollouts", exact: true }).first().click();
+    const run = page.locator('.gitlog__item--action[data-action="run"]').first();
+    await eventually(async () => assert.match(await run.textContent(), /ran\s*Upgrade packages\s*on lab-3/));
     await close();
   });
 
