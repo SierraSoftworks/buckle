@@ -714,25 +714,32 @@ textarea.input {
 }
 
 .page-head {
-  display: flex;
-  flex-wrap: wrap;
-  // Actions are anchored at the top right, beside the title.
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
+  // Actions are anchored at the top right, beside the title; the subtitle
+  // (a rollout's commit card) spans the full width beneath both.
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 1rem;
   margin-bottom: 1.25rem;
 
+  &__text {
+    display: contents;
+  }
+
   &__title {
+    grid-area: 1 / 1;
     font-size: 1.45rem;
     letter-spacing: -0.02em;
   }
 
   &__subtitle {
+    grid-area: 2 / 1 / auto / -1;
     margin-top: 0.3rem;
     color: var(--fg-2);
   }
 
   &__actions {
+    grid-area: 1 / 2;
     display: flex;
     flex-wrap: wrap;
     gap: 0.5rem;
