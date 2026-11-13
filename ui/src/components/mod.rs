@@ -53,6 +53,5 @@ pub use segmented::Segmented;
 pub use split_button::{MenuItem, SplitButton};
 pub use toast::{ToastHost, use_toast};
 pub use ui::{
-    Button, Empty, ErrorState, HoverTip, Kind, Loading, PageHead, Panel, Pill, Refresh,
-    TraceLink,
+    Button, Empty, ErrorState, HoverTip, Kind, Loading, PageHead, Panel, Pill, Refresh, TraceLink,
 };

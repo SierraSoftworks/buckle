@@ -7,10 +7,10 @@
 //! rest is a click away, or all of it with "expand all". The same view shows
 //! a run in progress, so a live update only changes states.
 
+use crate::components::ui::Badge;
 use buckle_api::{ModuleReport, RemovalReport, RunReport, StepReport, StepState};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
-use crate::components::ui::Badge;
 
 use super::changes::{Changes, Took};
 use super::diff::secret_text;

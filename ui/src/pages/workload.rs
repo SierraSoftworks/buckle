@@ -7,9 +7,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::components::ui::Badge;
 use buckle_api::{Connection, HostDetail, HostRolloutState, HostStatus, HostSummary};
 use yew::prelude::*;
-use crate::components::ui::Badge;
 use yew_router::prelude::*;
 
 use super::modules_card::PlacementRow;

@@ -352,33 +352,33 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
             };
             (
                 html! { <>
-                    { method_choice }
-                    <yewi::Field label="Host name" hint={html! { { if method_now == Some(JoinMethod::Tailscale) {
-                            "Its tailnet node name. Leave blank to use the host's hostname."
-                        } else {
-                            "Leave blank to use the host's hostname. A name binds the command to that host."
-                        } } }}>
-    <yewi::TextInput mono=true placeholder="its hostname" value={(*host).clone()} on_input={on_host} />
-</yewi::Field>
-                    { tag_choice }
-                    <yewi::Field group=true label="Labels" hint="The agent's own labels: they decide its groups and rollout phase.">
-                        <div class="kv-rows" role="group" aria-label="Labels">
-                            { for labels.iter().enumerate().map(|(i, row)| html! {
-                                <div class="kv-row">
-                                    <yewi::TextInput mono=true placeholder="key" attrs={yewi::attrs! { "aria-label" => format!("Label {} key", i + 1) }}
-                                        value={row.key.clone()} on_input={edit(i, true)} />
-                                    <span aria-hidden="true">{ "=" }</span>
-                                    <yewi::TextInput mono=true placeholder="value" attrs={yewi::attrs! { "aria-label" => format!("Label {} value", i + 1) }}
-                                        value={row.value.clone()} on_input={edit(i, false)} />
-                                    <yewi::IconButton icon={yewi::icons::X} size={yewi::Size::Small} variant={yewi::ButtonVariant::Subtle}
-                                        label={format!("Remove label {}", i + 1)} on_click={remove(i)} />
-                                </div>
-                            }) }
-                            <Button small=true kind={Kind::Subtle} onclick={add}>{ icons::plus() }{ "Add label" }</Button>
-                        </div>
-                    </yewi::Field>
-                    if let Some(p) = problem { <Note kind={NoteKind::Danger}>{ p }</Note> }
-                </> },
+                                    { method_choice }
+                                    <yewi::Field label="Host name" hint={html! { { if method_now == Some(JoinMethod::Tailscale) {
+                                            "Its tailnet node name. Leave blank to use the host's hostname."
+                                        } else {
+                                            "Leave blank to use the host's hostname. A name binds the command to that host."
+                                        } } }}>
+                    <yewi::TextInput mono=true placeholder="its hostname" value={(*host).clone()} on_input={on_host} />
+                </yewi::Field>
+                                    { tag_choice }
+                                    <yewi::Field group=true label="Labels" hint="The agent's own labels: they decide its groups and rollout phase.">
+                                        <div class="kv-rows" role="group" aria-label="Labels">
+                                            { for labels.iter().enumerate().map(|(i, row)| html! {
+                                                <div class="kv-row">
+                                                    <yewi::TextInput mono=true placeholder="key" attrs={yewi::attrs! { "aria-label" => format!("Label {} key", i + 1) }}
+                                                        value={row.key.clone()} on_input={edit(i, true)} />
+                                                    <span aria-hidden="true">{ "=" }</span>
+                                                    <yewi::TextInput mono=true placeholder="value" attrs={yewi::attrs! { "aria-label" => format!("Label {} value", i + 1) }}
+                                                        value={row.value.clone()} on_input={edit(i, false)} />
+                                                    <yewi::IconButton icon={yewi::icons::X} size={yewi::Size::Small} variant={yewi::ButtonVariant::Subtle}
+                                                        label={format!("Remove label {}", i + 1)} on_click={remove(i)} />
+                                                </div>
+                                            }) }
+                                            <Button small=true kind={Kind::Subtle} onclick={add}>{ icons::plus() }{ "Add label" }</Button>
+                                        </div>
+                                    </yewi::Field>
+                                    if let Some(p) = problem { <Note kind={NoteKind::Danger}>{ p }</Note> }
+                                </> },
                 html! { <>
                     <Button kind={Kind::Subtle} onclick={go(Step::Platform)}>{ "Back" }</Button>
                     <Button kind={Kind::Primary} busy={*busy} disabled={!matches!(draft, Some(Ok(_)))} onclick={create.clone()}>

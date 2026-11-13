@@ -8,13 +8,13 @@
 
 use std::collections::BTreeMap;
 
+use crate::components::ui::Badge;
 use buckle_api::{
     AgentUpgrade, Connection, HostCheck, HostDetail, HostPatch, HostPreview, HostStatus,
     UpgradeState,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
-use crate::components::ui::Badge;
 
 use crate::components::ui::{Note, NoteKind};
 use yew_router::prelude::*;

@@ -15,7 +15,8 @@ use yewi::{Banner, NavTarget, Size, TabLink, TabNav, TabsVariant, Tone, attrs};
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, MenuItem, PageHead, Refresh, RouteLink, RunAction, SplitButton, host_state_pills, icons, use_toast,
+    Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, MenuItem, PageHead, Refresh,
+    RouteLink, RunAction, SplitButton, host_state_pills, icons, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{agents_behind, expected_version, matches_filter, same_version};

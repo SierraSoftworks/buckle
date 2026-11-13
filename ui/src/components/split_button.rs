@@ -65,7 +65,6 @@ impl MenuItem {
             ..self
         }
     }
-
 }
 
 #[derive(Properties, PartialEq)]

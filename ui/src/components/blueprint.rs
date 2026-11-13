@@ -2,11 +2,11 @@
 //! module's resources drawn like the run report's steps, each with its
 //! state against drift and the latest run, and whether removal cleans it up.
 
+use crate::components::ui::Badge;
+use crate::logic::tone::Tone;
 use buckle_api::{ClusterSpec, DriftItem, ResourceSummary, RunReport};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
-use crate::logic::tone::Tone;
-use crate::components::ui::Badge;
 
 use super::diff::secret_text;
 use super::icons;

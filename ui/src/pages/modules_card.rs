@@ -591,13 +591,30 @@ fn run_picker(props: &PickerProps) -> Html {
         })
     };
     let picker = (!runs.is_empty()).then(|| {
-        let listed = shown.as_ref().is_some_and(|s| runs.iter().any(|r| &r.id == s));
-        let unlisted = shown.clone().filter(|_| !listed).map(|s| (AttrValue::from(s), AttrValue::from("newest")));
-        let options = unlisted.into_iter().chain(runs.iter().enumerate().map(|(i, r)| {
-            let state = r.state.map(run_label).map(str::to_string).unwrap_or_else(|| r.outcome.replace('_', " "));
-            let label = format!("{}{} · {state} · {}", if i == 0 { "newest · " } else { "" }, relative(r.started_at, now), commit(&r.revision));
-            (AttrValue::from(r.id.clone()), AttrValue::from(label))
-        })).collect::<std::rc::Rc<[_]>>();
+        let listed = shown
+            .as_ref()
+            .is_some_and(|s| runs.iter().any(|r| &r.id == s));
+        let unlisted = shown
+            .clone()
+            .filter(|_| !listed)
+            .map(|s| (AttrValue::from(s), AttrValue::from("newest")));
+        let options = unlisted
+            .into_iter()
+            .chain(runs.iter().enumerate().map(|(i, r)| {
+                let state = r
+                    .state
+                    .map(run_label)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| r.outcome.replace('_', " "));
+                let label = format!(
+                    "{}{} · {state} · {}",
+                    if i == 0 { "newest · " } else { "" },
+                    relative(r.started_at, now),
+                    commit(&r.revision)
+                );
+                (AttrValue::from(r.id.clone()), AttrValue::from(label))
+            }))
+            .collect::<std::rc::Rc<[_]>>();
         html! {
             <label class="run-picker">
                 <span class="muted small">{ "Run" }</span>

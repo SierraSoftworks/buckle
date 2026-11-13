@@ -4,9 +4,9 @@
 //! selector matches; a workload's actions run across its placements from
 //! the Workloads views ([`use_workload_rollout`]).
 
+use crate::components::ui::Badge;
 use buckle_api::{ActionInfo, FleetAction, StartActionRollout};
 use yew::prelude::*;
-use crate::components::ui::Badge;
 use yew_router::prelude::*;
 
 use super::actions::InstancesPicker;
@@ -104,27 +104,27 @@ pub fn run_action(props: &RunActionProps) -> Html {
     let listed_error = offered.error.as_ref().map(|e| e.to_string());
 
     html! {
-        <Confirm title="Run a module action across hosts" confirm_label={label} danger={confirm}
-            note=true note_required={confirm} note_placeholder="Why, for the audit log"
-            busy={*busy} error={(*error).clone().or(listed_error)} {on_confirm} {on_cancel}>
-            <yewi::Field label="Targets">
-    <yewi::TextInput mono=true placeholder={"every host offering the action, or a selector: host.labels.role == \"web\""} value={(*selector).clone()} on_input={on_selector} />
-</yewi::Field>
-            <yewi::Field label="Action">
-                <yewi::NativeSelect on_change={on_pick} disabled={actions.is_empty()}
-                    value={current.as_ref().map(fleet_key).unwrap_or_default()}
-                    options={actions.iter().map(|f| (AttrValue::from(fleet_key(f)), AttrValue::from(format!("{} · {}", f.action.module, f.action.label)))).collect::<std::rc::Rc<[_]>>()} />
-            </yewi::Field>
-            if actions.is_empty() && !offered.loading {
-                <p class="muted">{ "No host the selector matches offers a module action." }</p>
-            }
-            if let Some(f) = &current {
-                if let Some(d) = &f.action.description { <p>{ d.clone() }</p> }
-                <p class="muted small" data-testid="run-action-targets">{ format!("Runs on {}", f.targets.join(", ")) }</p>
-            }
-            <p class="muted">{ "Each host runs it from the revision it runs, through the stable revision's phases: approvals, waves, baseline and bake, and failure budgets. Workloads' actions are on the Workloads pages." }</p>
-        </Confirm>
-    }
+            <Confirm title="Run a module action across hosts" confirm_label={label} danger={confirm}
+                note=true note_required={confirm} note_placeholder="Why, for the audit log"
+                busy={*busy} error={(*error).clone().or(listed_error)} {on_confirm} {on_cancel}>
+                <yewi::Field label="Targets">
+        <yewi::TextInput mono=true placeholder={"every host offering the action, or a selector: host.labels.role == \"web\""} value={(*selector).clone()} on_input={on_selector} />
+    </yewi::Field>
+                <yewi::Field label="Action">
+                    <yewi::NativeSelect on_change={on_pick} disabled={actions.is_empty()}
+                        value={current.as_ref().map(fleet_key).unwrap_or_default()}
+                        options={actions.iter().map(|f| (AttrValue::from(fleet_key(f)), AttrValue::from(format!("{} · {}", f.action.module, f.action.label)))).collect::<std::rc::Rc<[_]>>()} />
+                </yewi::Field>
+                if actions.is_empty() && !offered.loading {
+                    <p class="muted">{ "No host the selector matches offers a module action." }</p>
+                }
+                if let Some(f) = &current {
+                    if let Some(d) = &f.action.description { <p>{ d.clone() }</p> }
+                    <p class="muted small" data-testid="run-action-targets">{ format!("Runs on {}", f.targets.join(", ")) }</p>
+                }
+                <p class="muted">{ "Each host runs it from the revision it runs, through the stable revision's phases: approvals, waves, baseline and bake, and failure budgets. Workloads' actions are on the Workloads pages." }</p>
+            </Confirm>
+        }
 }
 
 type Starting = (

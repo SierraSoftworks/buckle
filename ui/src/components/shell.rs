@@ -30,7 +30,11 @@ type NavItem = (&'static str, IconData, Route);
 
 const NAV: &[NavItem] = &[
     ("Overview", yi::LAYOUT_DASHBOARD, Route::Overview),
-    ("Rollouts", yi::CHART_NO_AXES_COLUMN_DECREASING, Route::Rollouts),
+    (
+        "Rollouts",
+        yi::CHART_NO_AXES_COLUMN_DECREASING,
+        Route::Rollouts,
+    ),
     ("Hosts", yi::SERVER, Route::Hosts),
     ("Workloads", yi::LAYERS, Route::Workloads),
     ("Clusters", yi::WAYPOINTS, Route::Clusters),

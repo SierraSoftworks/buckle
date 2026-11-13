@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::components::ui::Badge;
 use buckle_api::{ClusterStatus, HealthSummary, HostStatus, HostSummary};
 use serde::{Deserialize, Serialize};
 use yew::prelude::*;
-use crate::components::ui::Badge;
 use yew_router::prelude::*;
 
 use crate::api;

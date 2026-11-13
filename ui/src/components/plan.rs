@@ -2,13 +2,13 @@
 //! share it, what changes module by module with unified diffs, destructive
 //! steps and removals called out, deferred modules with their reason.
 
+use crate::components::ui::Badge;
+use crate::logic::tone::Tone;
 use buckle_api::{
     DiffKind, HandlerView, ModuleNote, PlanGroup, PlanView, RehomeView, RemovalView, StepOutcome,
     StepView,
 };
 use yew::prelude::*;
-use crate::logic::tone::Tone;
-use crate::components::ui::Badge;
 
 use super::changes::Changes;
 use super::diff::{DiffView, secret_text};

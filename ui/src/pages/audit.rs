@@ -12,8 +12,7 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::app::Route;
 use crate::components::{
-    Button, Empty, ErrorState, JsonTree, Loading, PageHead, Pill, Refresh, RouteLink,
-    TraceLink,
+    Button, Empty, ErrorState, JsonTree, Loading, PageHead, Pill, Refresh, RouteLink, TraceLink,
 };
 use crate::hooks::{use_fetch, use_now};
 use crate::logic::filter::{and, equals};

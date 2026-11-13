@@ -2,9 +2,9 @@
 //! rest in its menu. A click runs the action, or asks first when it wants
 //! confirmation, with a note for the audit log.
 
+use crate::components::ui::Badge;
 use buckle_api::{ActionInfo, ActionInstances};
 use yew::prelude::*;
-use crate::components::ui::Badge;
 
 use super::split_button::{MenuItem, SplitButton};
 use super::{Confirm, Segmented, use_toast};
@@ -27,12 +27,12 @@ pub fn instances_picker(props: &InstancesPickerProps) -> Html {
         .map(|(v, l)| (AttrValue::from(v.as_str()), AttrValue::from(*l)))
         .collect::<Vec<_>>();
     html! {
-        <yewi::Field group=true label="Runs in">
-            <Segmented label="Where it runs" testid="action-instances" {options}
-                value={AttrValue::from(props.value.as_str())}
-                on_change={props.on_change.reform(|v: AttrValue| parse_instances(&v))} />
-</yewi::Field>
-    }
+            <yewi::Field group=true label="Runs in">
+                <Segmented label="Where it runs" testid="action-instances" {options}
+                    value={AttrValue::from(props.value.as_str())}
+                    on_change={props.on_change.reform(|v: AttrValue| parse_instances(&v))} />
+    </yewi::Field>
+        }
 }
 use crate::logic::controls::TargetAction;
 

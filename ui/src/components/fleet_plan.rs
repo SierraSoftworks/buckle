@@ -5,10 +5,10 @@
 
 use std::rc::Rc;
 
+use crate::components::ui::Badge;
+use crate::logic::tone::Tone;
 use buckle_api::{FleetPlan, FleetStep, PlanGroup, Shared};
 use yew::prelude::*;
-use crate::logic::tone::Tone;
-use crate::components::ui::Badge;
 
 use crate::components::ui::{Note, NoteKind};
 

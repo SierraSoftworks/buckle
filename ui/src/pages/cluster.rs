@@ -9,9 +9,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::components::ui::Badge;
 use buckle_api::{Connection, HostStatus, HostSummary};
 use yew::prelude::*;
-use crate::components::ui::Badge;
 use yew_router::prelude::*;
 
 use super::clusters::{cluster_state_pills, steward_cell};
