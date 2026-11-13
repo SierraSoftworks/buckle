@@ -89,6 +89,12 @@ pub struct RolloutHost {
     pub failed_checks: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waived_checks: Vec<String>,
+    /// Required checks already failing before the rollout touched the
+    /// target (its latest baseline reading, taken before approval or at its
+    /// start). An approval accepts them as the target's starting state: they
+    /// are waived for the run, so only regressions hold or fail it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baseline_failing: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub updated_at: DateTime<Utc>,

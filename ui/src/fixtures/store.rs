@@ -913,6 +913,12 @@ pub fn approve(id: &str, request: &ApproveRequest) -> Result<RolloutDetail, ApiE
                 .is_some_and(|d| request.plan_digests.contains(d))
             {
                 h.needs_approval = false;
+                // As the server: a held target starts again from its baseline.
+                if h.state == HostRolloutState::Held {
+                    h.state = HostRolloutState::Planned;
+                    h.error = None;
+                    h.failed_checks.clear();
+                }
                 covered += 1;
             }
         }

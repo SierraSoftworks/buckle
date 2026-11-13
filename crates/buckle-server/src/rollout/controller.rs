@@ -2032,8 +2032,28 @@ impl Controller {
                 {
                     self.live[ri].hosts[hi].health =
                         serde_json::to_value(HealthView::from(&report)).ok();
-                    let failures = self.failures_of(ri, hi, &report.results);
+                    let failing = self.failures_of(ri, hi, &report.results);
+                    // Checks an approval accepted as already failing are the
+                    // target's starting state, not a reason to hold it: they
+                    // are waived for the run, so only regressions count.
+                    let (expected, failures): (Vec<String>, Vec<String>) =
+                        failing.iter().cloned().partition(|c| {
+                            self.live[ri].hosts[hi]
+                                .runtime
+                                .accepted_baseline
+                                .contains(c)
+                        });
+                    self.live[ri].hosts[hi].runtime.baseline_failing = failing;
                     if failures.is_empty() {
+                        if !expected.is_empty() {
+                            let h = &mut self.live[ri].hosts[hi];
+                            tracing::info!(buckle.host = %h.host, checks = ?expected, "applying past an approved failing baseline");
+                            for c in expected {
+                                if !h.runtime.waived_checks.contains(&c) {
+                                    h.runtime.waived_checks.push(c);
+                                }
+                            }
+                        }
                         self.send_apply(ri, hi);
                     } else {
                         self.live[ri].hosts[hi].runtime.failed_checks = failures.clone();
@@ -2051,6 +2071,19 @@ impl Controller {
                             BaselinePolicy::Ignore => self.send_apply(ri, hi),
                         }
                     }
+                }
+                // A reading taken while the plan waits for approval: what
+                // already fails, for its approver to see (and accept).
+                (HealthScope::Baseline, HostPhase::Planned)
+                    if self.live[ri].hosts[hi].runtime.request_id.as_deref()
+                        == Some(report.request_id.as_str()) =>
+                {
+                    let failing = self.failures_of(ri, hi, &report.results);
+                    let h = &mut self.live[ri].hosts[hi];
+                    h.health = serde_json::to_value(HealthView::from(&report)).ok();
+                    h.runtime.request_id = None;
+                    h.runtime.baseline_failing = failing;
+                    self.touch_host(ri, hi);
                 }
                 // A bake report belongs to this rollout's bake of the host:
                 // its revision and request (when the agent names them).
@@ -3534,11 +3567,14 @@ impl Controller {
             ));
         }
         let hosts = self.live[ri].phase_hosts(pi);
+        // Rows still to start (planned, or held at their baseline): one
+        // already applying or past it has nothing left to approve.
         let planned: Vec<(String, String)> = hosts
             .iter()
             .filter_map(|&i| {
                 let h = &self.live[ri].hosts[i];
-                (!h.state.finished()).then(|| h.plan_digest.clone().map(|d| (h.host.clone(), d)))?
+                matches!(h.state, HostPhase::Planned | HostPhase::Held)
+                    .then(|| h.plan_digest.clone().map(|d| (view::row_key(h), d)))?
             })
             .collect();
         if planned.is_empty() {
@@ -3604,21 +3640,78 @@ impl Controller {
         for &i in &hosts {
             self.live[ri].dirty_hosts.insert(i);
         }
+        let accepted = self.accept_baselines(ri, &hosts, &digests);
+        let also = if accepted.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", accepting the failing baseline of {}",
+                accepted.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
         self.command_audit(
             actor,
             "rollout.approve",
             ri,
             format!(
-                "{actor} approved phase '{phase}' ({}). {note}",
+                "{actor} approved phase '{phase}' ({}){also}. {note}",
                 digests
                     .iter()
                     .map(|d| short(d))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            serde_json::json!({"phase": phase, "plan_digests": digests, "note": note}),
+            serde_json::json!({"phase": phase, "plan_digests": digests, "accepted_baseline": accepted, "note": note}),
         );
         Ok(id)
+    }
+
+    /// An approval covering rows `hosts` (by `digests`) accepts the checks
+    /// each already fails as its starting state: those a pre-approval
+    /// reading found, or that hold it at its baseline. A held row goes back
+    /// to planned, to start again from a fresh baseline. Returns the
+    /// accepted checks by row.
+    fn accept_baselines(
+        &mut self,
+        ri: usize,
+        hosts: &[usize],
+        digests: &[String],
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut accepted = BTreeMap::new();
+        for &i in hosts {
+            let h = &mut self.live[ri].hosts[i];
+            if !h.plan_digest.as_ref().is_some_and(|d| digests.contains(d)) {
+                continue;
+            }
+            let held = h.state == HostPhase::Held && h.runtime.held_at_baseline;
+            let failing = match h.state {
+                _ if held => h.runtime.failed_checks.clone(),
+                HostPhase::Planned => h.runtime.baseline_failing.clone(),
+                _ => continue,
+            };
+            for c in &failing {
+                if !h.runtime.accepted_baseline.contains(c) {
+                    h.runtime.accepted_baseline.push(c.clone());
+                }
+            }
+            if !failing.is_empty() {
+                accepted.insert(view::row_key(h), failing);
+            }
+            if held {
+                h.runtime.held_at_baseline = false;
+                h.runtime.error = None;
+                h.runtime.failed_checks.clear();
+                h.runtime.request_id = None;
+                h.runtime.released = true;
+                self.set_host_state(
+                    ri,
+                    i,
+                    HostPhase::Planned,
+                    "failing baseline accepted by an approval",
+                );
+            }
+        }
+        accepted
     }
 
     // ------------------------------------------------------------ rollout lifecycle
@@ -4654,6 +4747,26 @@ impl Controller {
         self.send_baseline(ri, hi);
     }
 
+    /// Asks for a baseline reading of row `hi` while its plan waits for an
+    /// approval (once per plan), so that the approval shows, and accepts as
+    /// its starting state, what already fails before the rollout touches it.
+    fn probe_baseline(&mut self, ri: usize, hi: usize, busy: &HashSet<String>) {
+        let h = &self.live[ri].hosts[hi];
+        let wanted = h.state == HostPhase::Planned
+            && h.plan_digest.is_some()
+            && h.runtime.baseline_probed != h.plan_digest
+            && !self.unchanged(ri, hi)
+            && self.row_eligible(ri, hi)
+            && !self.row_session(ri, hi).is_some_and(|s| busy.contains(&s))
+            && !self.approved(ri, hi);
+        if !wanted {
+            return;
+        }
+        let h = &mut self.live[ri].hosts[hi];
+        h.runtime.baseline_probed = h.plan_digest.clone();
+        self.send_baseline(ri, hi);
+    }
+
     fn send_baseline(&mut self, ri: usize, hi: usize) {
         let request_id = new_id();
         self.live[ri].hosts[hi].runtime.request_id = Some(request_id.clone());
@@ -5551,6 +5664,7 @@ impl Controller {
             let mut inflight = hosts.iter().filter(|&&i| self.takes_slot(ri, i)).count();
             let busy = self.busy_elsewhere(ri);
             for &hi in &hosts {
+                self.probe_baseline(ri, hi, &busy);
                 // A target with nothing to change starts past the cap.
                 let slot = !self.unchanged(ri, hi);
                 if slot && inflight >= cap {
@@ -6428,7 +6542,7 @@ impl Controller {
                         .all(|&h| live.hosts[h].state == HostPhase::Baking);
                 let waiting_approval = !any_flight
                     && hosts.iter().any(|&h| {
-                        live.hosts[h].state == HostPhase::Planned
+                        matches!(live.hosts[h].state, HostPhase::Planned | HostPhase::Held)
                             && view::needs_approval(Some(phase), &live.hosts[h], &live.approvals)
                     });
                 if waiting_approval {

@@ -30,6 +30,11 @@ pub fn needs_approval(
     host: &RolloutHostRecord,
     approvals: &[ApprovalRecord],
 ) -> bool {
+    // A target held at its baseline waits for an approval of its failing
+    // checks as its starting state, whatever the phase's policy.
+    if host.state == HostPhase::Held && host.runtime.held_at_baseline {
+        return true;
+    }
     let Some(phase) = phase else { return false };
     let required = match phase.approval {
         ApprovalPolicy::Auto => false,
@@ -64,7 +69,7 @@ pub fn host(
         .runtime
         .phase_index
         .and_then(|i| record.runtime.phases.get(i));
-    let waiting = matches!(h.state, HostPhase::Planned);
+    let waiting = matches!(h.state, HostPhase::Planned | HostPhase::Held);
     RolloutHost {
         host: h.host.clone(),
         workload: (!h.workload.is_empty()).then(|| h.workload.clone()),
@@ -77,6 +82,7 @@ pub fn host(
         failed_module: h.runtime.failed_module.clone(),
         failed_checks: h.runtime.failed_checks.clone(),
         waived_checks: h.runtime.waived_checks.clone(),
+        baseline_failing: h.runtime.baseline_failing.clone(),
         error: h.runtime.error.clone(),
         updated_at: h.updated_at,
         bake_until: h.runtime.bake_until,
