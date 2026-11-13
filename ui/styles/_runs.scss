@@ -621,10 +621,10 @@
 
 // A host page's run section: the picker beside the title, or under it when
 // there is no room.
-.run-panel > .panel__head {
+.run-panel > .yi-panel__header {
   flex-wrap: wrap;
 
-  .panel__actions {
+  .yi-panel__actions {
     flex-wrap: wrap;
     min-width: 0;
   }

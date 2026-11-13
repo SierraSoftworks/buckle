@@ -97,6 +97,32 @@ pub fn target_items(
         .collect()
 }
 
+/// Where a target's audit entries are listed: the audit log filtered to it.
+pub fn audit_target(subject: &str) -> yewi::NavTarget {
+    yewi::NavTarget::route(crate::app::Route::Audit)
+        .query([("filter", crate::logic::filter::equals("subject", subject))])
+}
+
+/// "Audit entries" as an item of a target's menu, opening its audit log.
+pub fn audit_item(navigator: Option<yew_router::prelude::Navigator>, subject: &str) -> MenuItem {
+    let filter = crate::logic::filter::equals("subject", subject);
+    MenuItem::new(
+        "Audit entries",
+        Callback::from(move |_: MouseEvent| {
+            if let Some(n) = &navigator {
+                let _ = n.push_with_query(&crate::app::Route::Audit, &[("filter", filter.clone())]);
+            }
+        }),
+    )
+}
+
+/// The same for a reader without a menu of actions: a link in the page's head.
+pub fn audit_link(subject: &str) -> Html {
+    html! {
+        <yewi::Button variant={yewi::ButtonVariant::Subtle} href={audit_target(subject)}>{ "Audit entries" }</yewi::Button>
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct ActionsButtonProps {
     pub actions: Vec<ActionInfo>,

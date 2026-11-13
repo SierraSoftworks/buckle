@@ -241,11 +241,15 @@ pub fn host_page(props: &Props) -> Html {
                 && h.applied_revision.is_some(),
             forgettable: true,
         });
-        let modules: Vec<MenuItem> = if can_act {
+        let mut modules: Vec<MenuItem> = if can_act {
             action_items(&d.actions, &on_action, Some("Module actions"))
         } else {
             Vec::new()
         };
+        modules.push(crate::components::actions::audit_item(
+            navigator.clone(),
+            &h.id,
+        ));
         let items = target_items(&own, primary, modules, |a| match a {
             TargetAction::ApproveRegistration => open(Ask::Approve),
             TargetAction::ApproveRollout => {
@@ -267,7 +271,7 @@ pub fn host_page(props: &Props) -> Html {
         });
         html! { <SplitButton {items} menu_label="More host actions" testid="host-actions" /> }
     } else {
-        html! {}
+        crate::components::actions::audit_link(&h.id)
     };
     let actions = html! { <>{ refresh }{ actions }</> };
 
@@ -383,11 +387,6 @@ pub fn host_page(props: &Props) -> Html {
                     <JsonTree value={d.facts.clone()} open={1} />
                 }
             </Panel>
-            <p class="muted small">
-                <RouteLink to={Route::Audit} query={vec![("filter".to_string(), crate::logic::filter::equals("subject", &h.id))]}>
-                    { format!("Audit entries for {}", h.id) }
-                </RouteLink>
-            </p>
             { dialog.unwrap_or_default() }
             { target_actions.dialog }
         </div>

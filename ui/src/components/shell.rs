@@ -74,7 +74,7 @@ pub fn shell(props: &ShellProps) -> Html {
         <UserArea />
     </> };
     let bar = html! {
-        <AppBar class="shell__bar" {brand} {actions} menu_label="Navigation">
+        <AppBar class="shell__bar" {brand} {actions} menu_label="Navigation" wrap={super::search::searchable(&route)}>
             if crate::fixtures::is_demo() {
                 <Badge tone={Tone::Info} title="Every answer comes from the built-in fixtures. Add ?demo=off to leave.">{ "demo" }</Badge>
             }

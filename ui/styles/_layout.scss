@@ -17,31 +17,7 @@
   margin-inline: auto;
 }
 
-// On a phone the bar has no room for the box beside everything else, so it
-// takes a second row. (yewi 0.3 has this as `AppBar::wrap`.)
 @media (max-width: $small) {
-  .shell__bar:has(.shell__search) {
-    flex-wrap: wrap;
-    block-size: auto;
-    min-block-size: var(--yi-app-bar-height);
-
-    > :not(.yi-app-bar__start) {
-      min-block-size: var(--yi-app-bar-height);
-    }
-
-    > .yi-app-bar__actions {
-      margin-inline-start: auto;
-    }
-
-    > .yi-app-bar__start {
-      flex: none;
-      order: 1;
-      inline-size: 100%;
-      min-block-size: var(--yi-app-bar-height);
-      margin-block-start: calc(var(--yi-space-sm) * -1);
-    }
-  }
-
   // The word is on every page's badge in demo mode; the box needs the row.
   .shell__bar .badge {
     display: none;

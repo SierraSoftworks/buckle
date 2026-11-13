@@ -229,7 +229,7 @@ pub fn cluster_page(props: &Props) -> Html {
                     forgettable: !declared,
                     ..Default::default()
                 });
-                target_items(&own, primary, Vec::new(), |a| match a {
+                target_items(&own, primary, vec![crate::components::actions::audit_item(navigator.clone(), &c.id)], |a| match a {
                     TargetAction::ApproveRollout => {
                         let (navigator, id) = (navigator.clone(), review.clone().unwrap_or_default());
                         Callback::from(move |_: MouseEvent| {
@@ -249,6 +249,8 @@ pub fn cluster_page(props: &Props) -> Html {
                     TargetAction::ApproveRegistration | TargetAction::UpgradeAgent => Callback::noop(),
                 })
             }} menu_label="More cluster actions" testid="cluster-actions" />
+        } else {
+            { crate::components::actions::audit_link(&c.id) }
         }
     </> };
     let kind = info
@@ -448,11 +450,6 @@ pub fn cluster_page(props: &Props) -> Html {
             <ModulesPanel detail={d.clone()} cluster=true on_action={on_action.clone()} on_check_drift={on_check_drift.clone()} newest={newest.clone()} picked={(*picked).clone()}
                 on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             <Panel title="Recent runs">{ runs(&d, now, shown, &show_run) }</Panel>
-            <p class="muted small">
-                <RouteLink to={Route::Audit} query={vec![("filter".to_string(), crate::logic::filter::equals("subject", &c.id))]}>
-                    { format!("Audit entries for {}", c.id) }
-                </RouteLink>
-            </p>
             { dialog.unwrap_or_default() }
             { target_actions.dialog }
         </div>

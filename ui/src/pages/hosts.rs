@@ -259,6 +259,7 @@ pub fn hosts() -> Html {
             html! { <>
                 if !pending.is_empty() {
                     <Banner tone={Tone::Info} class="pending" attrs={attrs! { "data-testid" => "pending-registrations" }}>
+                        <div class="pending__body">
                         <strong>{ format!("{} awaiting registration approval: ", pending.len()) }</strong>
                         { for pending.iter().map(|h| {
                             let id = h.id.clone();
@@ -273,6 +274,7 @@ pub fn hosts() -> Html {
                                 </span>
                             }
                         }) }
+                        </div>
                     </Banner>
                 }
                 <div class="toolbar">

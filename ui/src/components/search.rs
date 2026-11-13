@@ -46,6 +46,11 @@ fn search(route: &Route) -> Option<Search> {
     }
 }
 
+/// Whether the page at `route` is searched from the app bar.
+pub fn searchable(route: &Route) -> bool {
+    search(route).is_some()
+}
+
 /// What each audit field holds, for the box's suggestions.
 fn audit_fields() -> Rc<[QueryField]> {
     AUDIT_FIELDS
