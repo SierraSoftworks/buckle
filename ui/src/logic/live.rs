@@ -661,7 +661,10 @@ mod tests {
             selector: None,
             instances: None,
         });
-        apply_revisions(&mut revisions, &LiveEvent::RolloutChanged { rollout: action });
+        apply_revisions(
+            &mut revisions,
+            &LiveEvent::RolloutChanged { rollout: action },
+        );
         assert_eq!(revisions[0].id, "new");
         assert_eq!(revisions[1].rollout_id.as_deref(), Some("43"));
     }
