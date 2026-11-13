@@ -182,7 +182,8 @@ pub fn apply_revisions(list: &mut Vec<RevisionSummary>, event: &LiveEvent) {
                 None => list.insert(0, revision.clone()),
             }
         }
-        LiveEvent::RolloutChanged { rollout } => {
+        // An action rollout runs under a revision without rolling it out.
+        LiveEvent::RolloutChanged { rollout } if rollout.action.is_none() => {
             if let Some(r) = list.iter_mut().find(|r| r.id == rollout.revision) {
                 r.rollout_id = Some(rollout.id.clone());
             }
@@ -652,6 +653,15 @@ mod tests {
                 rollout: summary("43", RolloutState::Planning),
             },
         );
+        let mut action = summary("44", RolloutState::Planning);
+        action.action = Some(buckle_api::RolloutActionInfo {
+            module: "m".into(),
+            action: "a".into(),
+            label: "A".into(),
+            selector: None,
+            instances: None,
+        });
+        apply_revisions(&mut revisions, &LiveEvent::RolloutChanged { rollout: action });
         assert_eq!(revisions[0].id, "new");
         assert_eq!(revisions[1].rollout_id.as_deref(), Some("43"));
     }
