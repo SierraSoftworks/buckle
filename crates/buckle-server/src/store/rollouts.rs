@@ -256,11 +256,12 @@ impl<'c> Rollouts<'c> {
             .collect())
     }
 
-    /// The latest rollout of a revision.
+    /// The latest rollout of a revision. Action rollouts record the
+    /// revision they ran under but roll none of it out, so they are not one.
     pub fn latest_for_revision(&self, revision: &str) -> Result<Option<RolloutRecord>> {
         self.conn
             .query_row(
-                &format!("SELECT {R_COLUMNS} FROM rollouts WHERE revision = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1"),
+                &format!("SELECT {R_COLUMNS} FROM rollouts WHERE revision = ?1 AND json_extract(detail, '$.action') IS NULL ORDER BY started_at DESC, rowid DESC LIMIT 1"),
                 params![revision],
                 r_row,
             )
@@ -571,6 +572,31 @@ mod tests {
             hosts.iter().map(|h| h.host.as_str()).collect::<Vec<_>>(),
             vec!["pi-1"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_revisions_latest_rollout_is_never_an_action_run_under_it() {
+        let store = Store::in_memory().await.unwrap();
+        let latest = store
+            .call(|db| {
+                db.rollouts()
+                    .save(&rollout("apply", "rev", RolloutState::Completed))?;
+                let mut action = rollout("action", "rev", RolloutState::Baking);
+                action.started_at += chrono::Duration::minutes(5);
+                action.runtime.action = Some(crate::rollout::model::RolloutAction {
+                    module: "m".into(),
+                    action: "a".into(),
+                    label: "A".into(),
+                    confirm: false,
+                    selector: None,
+                    instances: None,
+                });
+                db.rollouts().save(&action)?;
+                db.rollouts().latest_for_revision("rev")
+            })
+            .await
+            .unwrap();
+        assert_eq!(latest.map(|r| r.id).as_deref(), Some("apply"));
     }
 
     #[tokio::test]
