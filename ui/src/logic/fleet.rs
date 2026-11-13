@@ -556,6 +556,7 @@ mod tests {
             failed_module: None,
             failed_checks: vec![],
             waived_checks: vec![],
+            baseline_failing: vec![],
             error: None,
             updated_at: now,
             bake_until: None,

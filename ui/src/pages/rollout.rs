@@ -672,16 +672,36 @@ fn finished_state(s: HostRolloutState) -> bool {
 }
 
 /// The hosts of a phase an approval concerns: before the first approval,
-/// every host not yet finished; after it, those whose plan changed since and
-/// those still without a plan. Unchanged hosts count too: the approval gates
-/// the phase, not only its changes, and must cover every plan in it.
+/// every host not yet finished nor under way; after it, those whose plan
+/// changed since, those held at a failing baseline and those still without a
+/// plan. Unchanged hosts count too: the approval gates the phase, not only
+/// its changes, and must cover every plan in it.
 fn approval_hosts(phase: &RolloutPhase) -> Vec<&RolloutHost> {
     let approved = phase.approved_by.is_some();
     phase
         .hosts
         .iter()
-        .filter(|h| !finished_state(h.state))
+        .filter(|h| !finished_state(h.state) && !under_way(h.state))
         .filter(|h| !approved || h.needs_approval || h.plan_digest.is_none())
+        .collect()
+}
+
+/// Applying or past it: nothing left to approve.
+fn under_way(s: HostRolloutState) -> bool {
+    matches!(
+        s,
+        HostRolloutState::Applying | HostRolloutState::Rebooting | HostRolloutState::Baking
+    )
+}
+
+/// The targets an approval covers that already fail checks before the
+/// rollout touches them, with those checks: approving accepts them as their
+/// starting state, so they proceed and only regressions hold them.
+fn failing_baselines(hosts: &[&RolloutHost]) -> Vec<String> {
+    hosts
+        .iter()
+        .filter(|h| !h.baseline_failing.is_empty())
+        .map(|h| format!("{} ({})", units::key(h), h.baseline_failing.join(", ")))
         .collect()
 }
 
@@ -815,10 +835,10 @@ fn approval(
             })
         });
     let names = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
-    let policy = if phase.approval == "if_destructive" {
-        "if_destructive, and a plan here is destructive"
-    } else {
-        "required"
+    let policy = match phase.approval.as_str() {
+        "if_destructive" => "if_destructive, and a plan here is destructive",
+        "required" => "required",
+        _ => "auto, but a target is held at a failing baseline",
     };
     let why_not = if !running.is_empty() {
         Some(format!(
@@ -912,6 +932,7 @@ fn dialog(
                 Callback::from(move |note: String| run.emit((bind.clone(), note)))
             };
             let hosts = scope.hosts.len();
+            let failing = failing_baselines(&approval_hosts(phase));
             let ack = (scope.destructive > 0).then(|| {
                 AttrValue::from(format!(
                     "I have reviewed the {} destructive {}, including {}.",
@@ -938,6 +959,15 @@ fn dialog(
                         </li>
                         <li>{ "Binds digests " }{ for scope.digests.iter().map(|g| html! { <code class="mono">{ format!("{} ", short(g)) }</code> }) }</li>
                     </ul>
+                    if !failing.is_empty() {
+                        <Note kind={NoteKind::Warn} testid="approval-baseline">
+                            { format!("Already failing before this rollout: {}. Approving accepts these checks as {} starting state: {} instead of being held, and only checks that start failing count against {}.",
+                                failing.join("; "),
+                                if failing.len() == 1 { "its" } else { "their" },
+                                if failing.len() == 1 { "it proceeds" } else { "they proceed" },
+                                if failing.len() == 1 { "it" } else { "them" }) }
+                        </Note>
+                    }
                     if !scope.without_plan.is_empty() {
                         <p class="muted">{ format!("Not covered (no plan yet): {}.", scope.without_plan.join(", ")) }</p>
                     }
@@ -1676,5 +1706,27 @@ mod tests {
             );
             assert!(scope.without_plan.is_empty(), "{hosts:?}");
         }
+    }
+
+    /// After the phase's approval, a target held at a failing baseline asks
+    /// again (and is named with its failing checks), while one under way has
+    /// nothing left to approve.
+    #[test]
+    fn a_held_target_is_approved_with_its_failing_baseline() {
+        let mut p = phase(&[("a", 1), ("b", 1), ("c", 1)]);
+        p.approved_by = Some("ben".into());
+        for h in &mut p.hosts {
+            h.needs_approval = false;
+        }
+        p.hosts[0].state = HostRolloutState::Held;
+        p.hosts[0].needs_approval = true;
+        p.hosts[0].baseline_failing = vec!["web/http".into()];
+        p.hosts[1].state = HostRolloutState::Baking;
+        p.hosts[1].needs_approval = true;
+        let scope = scope_of(&p, &plans(&p));
+        assert_eq!(scope.hosts, vec!["a".to_string()]);
+        let failing = failing_baselines(&approval_hosts(&p));
+        assert_eq!(failing.len(), 1);
+        assert!(failing[0].contains('a') && failing[0].contains("web/http"));
     }
 }

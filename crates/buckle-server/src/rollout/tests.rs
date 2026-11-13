@@ -989,6 +989,94 @@ async fn a_failing_baseline_holds_the_host_until_forced() {
     assert!(h.applies()[0].2.force);
 }
 
+/// A target already failing a check before the rollout proceeds once an
+/// approval accepts that check as its starting state: read before the
+/// approval where the phase asks for one (so the approver sees it), else
+/// held at its baseline until approved. The check, still failing, is waived
+/// for the run, so it neither holds the start nor fails the bake.
+#[rstest::rstest]
+#[case::approval_required(", approval: required", true)]
+#[case::held_then_approved("", false)]
+#[tokio::test(start_paused = true)]
+async fn an_approval_accepts_a_failing_baseline_as_the_starting_state(
+    #[case] approval: &str,
+    #[case] read_before_approval: bool,
+) {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        &format!("  health: {{ bake: 30s }}\n  phases:\n    - {{ name: web, select: 'true'{approval} }}\n"),
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| {
+        s.baseline_fail = true;
+        s.bake_fail = true;
+    });
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "approval wanted with a failing baseline", |r, hs| {
+            r.state == RolloutState::AwaitingApproval
+                && !host(hs, "a").runtime.baseline_failing.is_empty()
+        })
+        .await;
+    let a = host(&hosts, "a");
+    assert_eq!(a.runtime.baseline_failing, vec!["web/http".to_string()]);
+    let expected = if read_before_approval {
+        HostPhase::Planned
+    } else {
+        HostPhase::Held
+    };
+    assert_eq!(a.state, expected);
+    let (r, _) = h.snapshot(&id).await;
+    let phase = r.runtime.phases.first();
+    assert!(view::host(&r, a, &[]).needs_approval);
+    assert!(view::needs_approval(phase, a, &[]));
+    assert!(h.applies().is_empty());
+
+    approve_web(&mut h, &id).await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(host(&hosts, "a").state, HostPhase::Healthy);
+    let applies = h.applies();
+    assert_eq!(applies.len(), 1);
+    assert!(!applies[0].2.force, "approved, not forced");
+    assert_eq!(applies[0].2.waived_checks, vec!["web/http".to_string()]);
+}
+
+/// An approval accepts only what already failed when it was given: a check
+/// that starts failing afterwards holds the target again.
+#[tokio::test(start_paused = true)]
+async fn a_baseline_failure_after_approval_still_holds_the_target() {
+    let mut h = Harness::new().await;
+    h.revision(
+        "r1",
+        "  health: { bake: 30s }\n  phases:\n    - { name: web, select: 'true', approval: required }\n",
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "a healthy reading before approval", |r, hs| {
+        let a = host(hs, "a");
+        r.state == RolloutState::AwaitingApproval
+            && a.runtime.baseline_probed.is_some()
+            && a.runtime.request_id.is_none()
+    })
+    .await;
+    h.script("a", |s| s.baseline_fail = true);
+    approve_web(&mut h, &id).await;
+    let (_, hosts) = h
+        .wait(&id, "held", |_, hs| host(hs, "a").state == HostPhase::Held)
+        .await;
+    assert_eq!(
+        host(&hosts, "a").runtime.failed_checks,
+        vec!["web/http".to_string()]
+    );
+    h.idle(600).await;
+    assert!(h.applies().is_empty(), "a new failure is not accepted");
+}
+
 #[tokio::test(start_paused = true)]
 async fn max_failures_zero_pauses_on_the_first_failure() {
     let mut h = Harness::new().await;
@@ -2712,8 +2800,19 @@ async fn a_failed_checkpoint_keeps_its_audit_outbox_and_finished_rollout() {
     h.enrol("a", "web").await;
     h.connect("a", None);
     let id = h.start("r1").await;
-    h.wait_state(&id, RolloutState::AwaitingApproval).await;
-
+    // The baseline read for the approval goes out (and is answered) first.
+    h.wait(&id, "approval wanted, baseline read", |r, hs| {
+        let a = host(hs, "a");
+        r.state == RolloutState::AwaitingApproval
+            && a.runtime.baseline_probed.is_some()
+            && a.runtime.request_id.is_none()
+    })
+    .await;
+    let sent = || {
+        h.sent(|_, m| matches!(m, SMsg::Health(_) | SMsg::Apply(_)))
+            .len()
+    };
+    let before = sent();
     h.fail_checkpoints(true).await;
     let refused = h
         .command(Command::Approve {
@@ -2726,11 +2825,7 @@ async fn a_failed_checkpoint_keeps_its_audit_outbox_and_finished_rollout() {
         .unwrap_err();
     assert_eq!(refused.kind, CommandErrorKind::Internal, "{refused}");
     h.idle(30).await;
-    assert!(
-        h.sent(|_, m| matches!(m, SMsg::Health(_) | SMsg::Apply(_)))
-            .is_empty(),
-        "nothing is sent before its state is saved"
-    );
+    assert_eq!(sent(), before, "nothing is sent before its state is saved");
     h.fail_checkpoints(false).await;
     h.wait(&id, "baking", |_, hs| {
         host(hs, "a").state == HostPhase::Baking

@@ -382,6 +382,7 @@ fn entry(
         failed_module: None,
         failed_checks: vec![],
         waived_checks: vec![],
+        baseline_failing: vec![],
         error: None,
         updated_at: now - Duration::minutes(mins_ago),
         bake_until: None,
@@ -618,6 +619,10 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
     // Its plan changed between the rollout's start and the phase opening.
     if let Some(hz) = cloud_hosts.iter_mut().find(|h| h.host == "hz-3") {
         hz.drifted_from = Some(PLAN_NOMAD.into());
+    }
+    // Already unhealthy before the rollout: its approval accepts that.
+    if let Some(hz) = cloud_hosts.iter_mut().find(|h| h.host == "hz-5") {
+        hz.baseline_failing = vec!["nomad/api".into()];
     }
     let mut az = entry("az-1", "cloud", 2, S::PlanPending, None, now, 25);
     az.error =

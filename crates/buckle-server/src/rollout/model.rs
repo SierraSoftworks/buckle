@@ -382,6 +382,20 @@ pub struct HostRuntime {
     /// the stragglers stage on promotion.
     #[serde(default)]
     pub held_at_baseline: bool,
+    /// Required checks failing in the row's latest baseline reading: one
+    /// taken while its plan awaits approval (so the approver sees them), or
+    /// the one at its start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baseline_failing: Vec<String>,
+    /// The plan digest a pre-approval baseline reading was asked for: one
+    /// per plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_probed: Option<String>,
+    /// Checks an approval accepted as failing before the run (they were in
+    /// `baseline_failing` when it was given): still failing at the row's
+    /// start, they are waived instead of holding it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_baseline: Vec<String>,
     /// The intent digest of the host's current plan
     /// (`PlanResult.approval_digest`), from agents that report one. An
     /// approval binding it covers re-plans that differ only in content.
