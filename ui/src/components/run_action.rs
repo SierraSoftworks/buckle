@@ -5,8 +5,8 @@
 //! the Workloads views ([`use_workload_rollout`]).
 
 use buckle_api::{ActionInfo, FleetAction, StartActionRollout};
-use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
+use crate::components::ui::Badge;
 use yew_router::prelude::*;
 
 use super::actions::InstancesPicker;
@@ -50,15 +50,11 @@ pub fn run_action(props: &RunActionProps) -> Html {
 
     let on_selector = {
         let selector = selector.clone();
-        Callback::from(move |e: InputEvent| {
-            selector.set(e.target_unchecked_into::<HtmlInputElement>().value())
-        })
+        Callback::from(move |value: String| selector.set(value))
     };
     let on_pick = {
         let picked = picked.clone();
-        Callback::from(move |e: Event| {
-            picked.set(Some(e.target_unchecked_into::<HtmlSelectElement>().value()))
-        })
+        Callback::from(move |value: String| picked.set(Some(value)))
     };
     let on_confirm = {
         let (busy, error, toast, current, selector) = (
@@ -111,22 +107,14 @@ pub fn run_action(props: &RunActionProps) -> Html {
         <Confirm title="Run a module action across hosts" confirm_label={label} danger={confirm}
             note=true note_required={confirm} note_placeholder="Why, for the audit log"
             busy={*busy} error={(*error).clone().or(listed_error)} {on_confirm} {on_cancel}>
-            <label class="field">
-                <span class="field__label">{ "Targets" }</span>
-                <input class="input mono" type="text" aria-label="Selector" spellcheck="false"
-                    placeholder={"every host offering the action, or a selector: host.labels.role == \"web\""}
-                    value={(*selector).clone()} oninput={on_selector} />
-            </label>
-            <label class="field">
-                <span class="field__label">{ "Action" }</span>
-                <select class="input" aria-label="Action" onchange={on_pick} disabled={actions.is_empty()}>
-                    { for actions.iter().map(|f| {
-                        let key = fleet_key(f);
-                        let selected = current.as_ref().is_some_and(|c| fleet_key(c) == key);
-                        html! { <option value={key} {selected}>{ format!("{} · {}", f.action.module, f.action.label) }</option> }
-                    }) }
-                </select>
-            </label>
+            <yewi::Field label="Targets">
+    <yewi::TextInput mono=true placeholder={"every host offering the action, or a selector: host.labels.role == \"web\""} value={(*selector).clone()} on_input={on_selector} />
+</yewi::Field>
+            <yewi::Field label="Action">
+                <yewi::NativeSelect on_change={on_pick} disabled={actions.is_empty()}
+                    value={current.as_ref().map(fleet_key).unwrap_or_default()}
+                    options={actions.iter().map(|f| (AttrValue::from(fleet_key(f)), AttrValue::from(format!("{} · {}", f.action.module, f.action.label)))).collect::<std::rc::Rc<[_]>>()} />
+            </yewi::Field>
             if actions.is_empty() && !offered.loading {
                 <p class="muted">{ "No host the selector matches offers a module action." }</p>
             }
@@ -234,8 +222,8 @@ pub fn workload_rollout(props: &WorkloadRolloutProps) -> Html {
             danger={action.confirm} note=true note_required={action.confirm} note_placeholder="Why, for the audit log"
             busy={*busy} error={(*error).clone().or(listed_error)} {on_confirm} {on_cancel}>
             <p>
-                <span class="badge mono">{ format!("{workload}/{}", action.name) }</span>{ " " }
-                <span class="badge">{ action.kind.clone() }</span>
+                <Badge mono=true>{ format!("{workload}/{}", action.name) }</Badge>{ " " }
+                <Badge>{ action.kind.clone() }</Badge>
             </p>
             if let Some(d) = &action.description { <p>{ d.clone() }</p> }
             if let Some(value) = *chosen {

@@ -1,11 +1,30 @@
-//! The small pieces every page is built from. All text goes through Yew's
-//! escaping interpolation, so a host name, a commit message or a plan diff
-//! cannot inject markup into the page an operator is reading.
+//! The small pieces every page is built from, as yewi draws them. Each takes
+//! what Buckle has to hand (its own [`Tone`], an [`ApiError`]) and renders
+//! the yewi component for it, so a state looks the same wherever it appears.
+//! All text goes through Yew's escaping interpolation, so a host name, a
+//! commit message or a plan diff cannot inject markup into the page an
+//! operator is reading.
 
 use yew::prelude::*;
+use yewi::attrs;
 
 use crate::api::ApiError;
 use crate::logic::tone::Tone;
+
+impl Tone {
+    /// The yewi tone drawn for this one. Rolled back has no tone of its own
+    /// there: it is drawn neutral and coloured by its `tone-mute` class.
+    pub fn yi(self) -> yewi::Tone {
+        match self {
+            Tone::Ok => yewi::Tone::Ok,
+            Tone::Warn => yewi::Tone::Warn,
+            Tone::Danger => yewi::Tone::Danger,
+            Tone::Active => yewi::Tone::Active,
+            Tone::Info => yewi::Tone::Info,
+            Tone::Mute | Tone::Neutral => yewi::Tone::Neutral,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Kind {
@@ -18,6 +37,22 @@ pub enum Kind {
     Subtle,
     /// Rolling the fleet back: orange.
     Caution,
+}
+
+impl Kind {
+    pub fn variant(self) -> yewi::ButtonVariant {
+        match self {
+            Kind::Default => yewi::ButtonVariant::Default,
+            Kind::Primary => yewi::ButtonVariant::Primary,
+            Kind::Danger | Kind::Caution => yewi::ButtonVariant::Danger,
+            Kind::Subtle => yewi::ButtonVariant::Subtle,
+        }
+    }
+
+    /// The class that recolours a danger button orange.
+    pub fn class(self) -> Option<&'static str> {
+        (self == Kind::Caution).then_some("button--caution")
+    }
 }
 
 #[derive(Properties, PartialEq)]
@@ -34,6 +69,7 @@ pub struct ButtonProps {
     pub small: bool,
     #[prop_or_default]
     pub title: Option<AttrValue>,
+    /// The accessible name, where it says more than the button's text.
     #[prop_or_default]
     pub label: Option<AttrValue>,
     #[prop_or_default]
@@ -42,24 +78,16 @@ pub struct ButtonProps {
 
 #[function_component(Button)]
 pub fn button(props: &ButtonProps) -> Html {
-    let class = classes!(
-        "btn",
-        match props.kind {
-            Kind::Default => None,
-            Kind::Primary => Some("btn--primary"),
-            Kind::Danger => Some("btn--danger"),
-            Kind::Subtle => Some("btn--subtle"),
-            Kind::Caution => Some("btn--caution"),
-        },
-        props.small.then_some("btn--small"),
-        props.busy.then_some("btn--busy"),
-    );
+    let extra = [("title", &props.title), ("aria-label", &props.label)]
+        .into_iter()
+        .filter_map(|(k, v)| v.clone().map(|v| (k, v)));
     html! {
-        <button type="button" {class} onclick={props.onclick.clone()}
-            disabled={props.disabled || props.busy} title={props.title.clone()}
-            aria-label={props.label.clone()} aria-busy={props.busy.then_some("true")}>
+        <yewi::Button variant={props.kind.variant()} class={classes!(props.kind.class())}
+            size={if props.small { yewi::Size::Small } else { yewi::Size::Medium }}
+            disabled={props.disabled} loading={props.busy} on_click={props.onclick.clone()}
+            attrs={yewi::Attrs::new(extra)}>
             { props.children.clone() }
-        </button>
+        </yewi::Button>
     }
 }
 
@@ -75,10 +103,42 @@ pub struct PillProps {
 #[function_component(Pill)]
 pub fn pill(props: &PillProps) -> Html {
     html! {
-        <span class={classes!("pill", props.tone.class())} title={props.title.clone()}>
-            <span class="pill__dot" aria-hidden="true" />
+        <yewi::Pill tone={props.tone.yi()} class={classes!("pill", props.tone.class())}
+            attrs={props.title.clone().map(|t| attrs! { "title" => t }).unwrap_or_default()}>
             { props.label.clone() }
-        </span>
+        </yewi::Pill>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+pub struct BadgeProps {
+    #[prop_or(Tone::Neutral)]
+    pub tone: Tone,
+    #[prop_or_default]
+    pub mono: bool,
+    #[prop_or_default]
+    pub title: Option<AttrValue>,
+    #[prop_or_default]
+    pub testid: Option<AttrValue>,
+    #[prop_or_default]
+    pub class: Classes,
+    #[prop_or_default]
+    pub children: Html,
+}
+
+/// A small squared label: a kind, a group or a qualifier, where a [`Pill`]
+/// says a state.
+#[function_component(Badge)]
+pub fn badge(props: &BadgeProps) -> Html {
+    let extra = [("title", &props.title), ("data-testid", &props.testid)]
+        .into_iter()
+        .filter_map(|(k, v)| v.clone().map(|v| (k, v)));
+    html! {
+        <yewi::Tag tone={props.tone.yi()} mono={props.mono}
+            class={classes!("badge", props.tone.class(), props.class.clone())}
+            attrs={yewi::Attrs::new(extra)}>
+            { props.children.clone() }
+        </yewi::Tag>
     }
 }
 
@@ -107,18 +167,16 @@ pub struct NoteProps {
 /// by its kind, its text in the body colour, then its aside.
 #[function_component(Note)]
 pub fn note(props: &NoteProps) -> Html {
-    let (class, icon) = match props.kind {
-        NoteKind::Info => ("note--info", super::icons::info()),
-        NoteKind::Warn => ("note--warn", super::icons::alert()),
-        NoteKind::Danger => ("note--danger", super::icons::alert()),
+    let tone = match props.kind {
+        NoteKind::Info => yewi::Tone::Info,
+        NoteKind::Warn => yewi::Tone::Warn,
+        NoteKind::Danger => yewi::Tone::Danger,
     };
     html! {
-        <div class={classes!("note", class)} data-testid={props.testid.clone()}
-            role={(props.kind == NoteKind::Danger).then_some("alert")}>
-            <span class="note__icon">{ icon }</span>
-            <div class="note__text">{ props.children.clone() }</div>
-            { props.aside.clone() }
-        </div>
+        <yewi::Banner {tone} class="note" actions={props.aside.clone()}
+            attrs={props.testid.clone().map(|t| attrs! { "data-testid" => t }).unwrap_or_default()}>
+            <span class="note__text">{ props.children.clone() }</span>
+        </yewi::Banner>
     }
 }
 
@@ -137,80 +195,22 @@ pub struct HoverTipProps {
     pub link: bool,
 }
 
-/// A popover under its trigger while it is hovered or focused, positioned
-/// against the viewport so that a scrolling table does not clip it.
+/// A popover under its trigger while it is hovered or focused, in the top
+/// layer so that a scrolling table does not clip it.
 #[function_component(HoverTip)]
 pub fn hover_tip(props: &HoverTipProps) -> Html {
-    let at = use_state(|| None::<(f64, f64)>);
-    // Measured through a ref: Yew delegates events, so an event's current
-    // target is the root, not this trigger.
-    let node = use_node_ref();
-    let show = {
-        let (at, node) = (at.clone(), node.clone());
-        move || {
-            if let Some(el) = node.cast::<web_sys::Element>() {
-                let r = el.get_bounding_client_rect();
-                // Kept on screen: the popover is at most `TIP_WIDTH` wide.
-                let width = web_sys::window()
-                    .and_then(|w| w.inner_width().ok())
-                    .and_then(|w| w.as_f64())
-                    .unwrap_or(f64::MAX);
-                at.set(Some((
-                    r.left().min(width - TIP_WIDTH - 8.0).max(8.0),
-                    r.bottom(),
-                )));
-            }
-        }
-    };
-    let (enter, focus) = {
-        let (a, b) = (show.clone(), show);
-        (
-            Callback::from(move |_: MouseEvent| a()),
-            Callback::from(move |_: FocusEvent| b()),
-        )
-    };
-    let hide = {
-        let at = at.clone();
-        Callback::from(move |_: Event| at.set(None))
-    };
-    // Focus moving into the popover (onto a link it holds) keeps it open.
-    let blur = {
-        let (hide, node) = (hide.clone(), node.clone());
-        Callback::from(move |e: FocusEvent| {
-            let inside = e
-                .related_target()
-                .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Node>(t).ok())
-                .zip(node.cast::<web_sys::Node>())
-                .is_some_and(|(t, n)| n.contains(Some(&t)));
-            if !inside {
-                hide.emit(e.into());
-            }
-        })
-    };
     if props.tip == Html::default() {
         return props.children.clone();
     }
-    let (class, tabindex, label) = if props.link {
-        ("tip-link", None, None)
-    } else {
-        ("tip", Some("0"), props.label.clone())
-    };
     html! {
-        <span {class} {tabindex} ref={node} aria-label={label}
-            onmouseenter={enter} onfocusin={focus}
-            onmouseleave={hide.reform(|e: MouseEvent| e.into())} onfocusout={blur}>
+        <yewi::Popover trigger={yewi::PopoverTrigger::Hover} placement={yewi::Placement::BottomStart}
+            arrow=false focusable={!props.link} label={props.label.clone()}
+            class={if props.link { "tip-link" } else { "tip" }} surface_class="tip__pop"
+            content={props.tip.clone()}>
             { props.children.clone() }
-            if let Some((x, y)) = *at {
-                <span class="tip__pop" role="tooltip" style={format!("left: {x:.0}px; top: {:.0}px", y + 4.0)}>
-                    { props.tip.clone() }
-                </span>
-            }
-        </span>
+        </yewi::Popover>
     }
 }
-
-/// The widest a [`HoverTip`] popover grows (`.tip__pop`'s `max-width`).
-const TIP_WIDTH: f64 = 360.0;
 
 #[derive(Properties, PartialEq)]
 pub struct PanelProps {
@@ -228,27 +228,17 @@ pub struct PanelProps {
     pub children: Html,
 }
 
-/// A hairline-bordered section with an optional heading row.
+/// A section of a page: its heading row, then its content flat on the page.
+/// The content of a page is not boxed; a [`yewi::Card`] is for the one thing
+/// on it that should stand apart.
 #[function_component(Panel)]
 pub fn panel(props: &PanelProps) -> Html {
-    let heading = props.title.as_ref().map(|title| {
-        html! {
-            <header class="panel__head">
-                <div>
-                    <h2 class="panel__title">{ title.clone() }</h2>
-                    if let Some(sub) = &props.subtitle {
-                        <p class="panel__subtitle">{ sub.clone() }</p>
-                    }
-                </div>
-                <div class="panel__actions">{ props.actions.clone() }</div>
-            </header>
-        }
-    });
     html! {
-        <section class={classes!("panel", props.class.clone())} id={props.id.clone()}>
-            { heading.unwrap_or_default() }
-            <div class="panel__body">{ props.children.clone() }</div>
-        </section>
+        <yewi::Panel fill={yewi::PanelFill::Plain} level={2} id={props.id.clone()}
+            class={classes!("panel", props.class.clone())}
+            title={props.title.clone()} subtitle={props.subtitle.clone()} actions={props.actions.clone()}>
+            { props.children.clone() }
+        </yewi::Panel>
     }
 }
 
@@ -264,13 +254,8 @@ pub struct PageHeadProps {
 #[function_component(PageHead)]
 pub fn page_head(props: &PageHeadProps) -> Html {
     html! {
-        <header class="page-head">
-            <div class="page-head__text">
-                <h1 class="page-head__title">{ props.title.clone() }</h1>
-                <div class="page-head__subtitle">{ props.subtitle.clone() }</div>
-            </div>
-            <div class="page-head__actions">{ props.actions.clone() }</div>
-        </header>
+        <yewi::PageHeader class="page-head" title={props.title.clone()}
+            subtitle={props.subtitle.clone()} actions={props.actions.clone()} />
     }
 }
 
@@ -282,12 +267,7 @@ pub struct LoadingProps {
 
 #[function_component(Loading)]
 pub fn loading(props: &LoadingProps) -> Html {
-    html! {
-        <div class="state state--loading" role="status" aria-live="polite">
-            <span class="spinner" aria-hidden="true" />
-            { props.label.clone() }
-        </div>
-    }
+    html! { <yewi::Loading layout={yewi::LoadingLayout::Block} label={props.label.clone()} /> }
 }
 
 #[derive(Properties, PartialEq)]
@@ -304,13 +284,9 @@ pub struct EmptyProps {
 #[function_component(Empty)]
 pub fn empty(props: &EmptyProps) -> Html {
     html! {
-        <div class="state state--empty">
-            <p class="state__title">{ props.title.clone() }</p>
-            if let Some(message) = &props.message {
-                <p class="state__message">{ message.clone() }</p>
-            }
-            { props.children.clone() }
-        </div>
+        <yewi::EmptyState title={props.title.clone()} actions={props.children.clone()}>
+            { props.message.clone() }
+        </yewi::EmptyState>
     }
 }
 
@@ -333,15 +309,7 @@ pub fn error_state(props: &ErrorProps) -> Html {
         _ => ("Something went wrong", props.retry.clone()),
     };
     html! {
-        <div class="state state--error" role="alert">
-            <p class="state__title">{ title }</p>
-            <p class="state__message">{ props.error.to_string() }</p>
-            if let Some(retry) = retry {
-                <Button small=true onclick={Callback::from(move |_| retry.emit(()))}>
-                    { super::icons::refresh() }{ "Try again" }
-                </Button>
-            }
-        </div>
+        <yewi::ErrorState {title} on_retry={retry}>{ props.error.to_string() }</yewi::ErrorState>
     }
 }
 
@@ -355,16 +323,10 @@ pub struct CopyProps {
 /// A monospace value with a copy button beside it.
 #[function_component(Copyable)]
 pub fn copyable(props: &CopyProps) -> Html {
-    let text = props.text.clone();
-    let onclick = Callback::from(move |_: MouseEvent| crate::util::copy(&text));
     html! {
-        <span class="copyable">
-            <code class="mono">{ props.label.clone().unwrap_or_else(|| props.text.clone()) }</code>
-            <button type="button" class="icon-btn" {onclick}
-                aria-label={format!("Copy {}", props.text)} title="Copy">
-                { super::icons::copy() }
-            </button>
-        </span>
+        <yewi::Copyable value={props.text.clone()} label={format!("Copy {}", props.text)}>
+            { props.label.clone().unwrap_or_else(|| props.text.clone()) }
+        </yewi::Copyable>
     }
 }
 
@@ -405,21 +367,18 @@ pub struct RefreshProps {
 pub fn refresh(props: &RefreshProps) -> Html {
     let reload = props.reload.clone();
     html! {
-        <Button small=true kind={Kind::Subtle} busy={props.loading} label="Refresh" title="Refresh"
-            onclick={Callback::from(move |_| reload.emit(()))}>
-            { super::icons::refresh() }
-        </Button>
+        <yewi::IconButton icon={yewi::icons::REFRESH_CW} label="Refresh" variant={yewi::ButtonVariant::Subtle}
+            loading={props.loading} on_click={Callback::from(move |_| reload.emit(()))} />
     }
 }
 
-/// `<dl>` rows.
+/// A term and its value, row by row.
 pub fn facts_list(rows: Vec<(&'static str, Html)>) -> Html {
     html! {
-        <dl class="kv">
-            { for rows.into_iter().map(|(k, v)| html! { <>
-                <dt>{ k }</dt>
-                <dd>{ v }</dd>
-            </> }) }
-        </dl>
+        <yewi::DescriptionList class="kv">
+            { for rows.into_iter().map(|(k, v)| html! {
+                <yewi::DescriptionItem term={html! { k }}>{ v }</yewi::DescriptionItem>
+            }) }
+        </yewi::DescriptionList>
     }
 }

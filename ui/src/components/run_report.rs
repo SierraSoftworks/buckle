@@ -10,13 +10,14 @@
 use buckle_api::{ModuleReport, RemovalReport, RunReport, StepReport, StepState};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
+use crate::components::ui::Badge;
 
 use super::changes::{Changes, Took};
 use super::diff::secret_text;
 use super::error_block::ErrorBlock;
 use super::icons;
 use super::link::RouteLink;
-use super::ui::{Pill, TraceLink};
+use super::ui::{Button, Kind, Pill, TraceLink};
 use crate::app::Route;
 use crate::hooks::use_now;
 use crate::logic::fleet_plan::Tally;
@@ -142,14 +143,13 @@ pub fn run_report(props: &RunReportProps) -> Html {
             if !r.modules.is_empty() {
                 <div class="run__toolbar">
                     <div class="chips" role="group" aria-label="Filter modules">
-                        <button type="button" class={classes!("chip", problems_only.then_some("chip--active"))}
-                            aria-pressed={problems_only.to_string()} onclick={toggle_problems}>
+                        <yewi::Button size={yewi::Size::Small} pressed={Some(*problems_only)} on_click={toggle_problems}>
                             { "Problems only" }<span class="chip__count">{ problems }</span>
-                        </button>
+                        </yewi::Button>
                     </div>
                     <div class="run__expand">
-                        <button type="button" class="btn btn--subtle btn--small" onclick={set_all(true)}>{ "Expand all" }</button>
-                        <button type="button" class="btn btn--subtle btn--small" onclick={set_all(false)}>{ "Collapse all" }</button>
+                        <Button small=true kind={Kind::Subtle} onclick={set_all(true)}>{ "Expand all" }</Button>
+                        <Button small=true kind={Kind::Subtle} onclick={set_all(false)}>{ "Collapse all" }</Button>
                     </div>
                 </div>
             }
@@ -412,11 +412,11 @@ fn step_row(s: &StepReport, now: DateTime<Utc>, live: bool, caution: bool) -> Ht
             <div class="run-step__main">
                 <div class="run-step__head">
                     if let Some(name) = &s.name { <span class="run-step__name">{ name.clone() }</span> }
-                    <span class="badge run-step__kind">{ s.kind.clone() }</span>
+                    <Badge class="run-step__kind">{ s.kind.clone() }</Badge>
                     <span class="run-step__key mono">{ step_key(&s.kind, &s.id).to_string() }</span>
-                    if s.destructive { <span class="badge badge--danger">{ icons::alert() }{ "destructive" }</span> }
+                    if s.destructive { <Badge tone={Tone::Danger}>{ icons::alert() }{ "destructive" }</Badge> }
                     if caution {
-                        <span class="badge badge--warn" title="This kind's removal can take unrelated things down (dependent packages, files owned by a user).">{ icons::alert() }{ "caution" }</span>
+                        <Badge tone={Tone::Warn} title="This kind's removal can take unrelated things down (dependent packages, files owned by a user).">{ icons::alert() }{ "caution" }</Badge>
                     }
                     <span class="run-step__state">{ step_label(s.state) }</span>
                 </div>
@@ -495,7 +495,7 @@ fn health_bucket(b: &Bucket<'_>, t0: DateTime<Utc>) -> Html {
                 <li class="hbar__check" data-check={c.reading.check.clone()} data-state={c.state.slug()}>
                     <Pill tone={check_status_tone(&c.reading.status)} label={c.reading.status.clone()} />
                     <span class="mono">{ c.reading.check.clone() }</span>
-                    <span class="badge">{ c.reading.scope.clone() }</span>
+                    <Badge>{ c.reading.scope.clone() }</Badge>
                     if !c.reading.required { <span class="muted small">{ "informational" }</span> }
                     if let Some(reason) = &c.reading.reason { <span class="hbar__reason">{ reason.clone() }</span> }
                     if c.carried {

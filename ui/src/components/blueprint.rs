@@ -5,6 +5,8 @@
 use buckle_api::{ClusterSpec, DriftItem, ResourceSummary, RunReport};
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
+use crate::logic::tone::Tone;
+use crate::components::ui::Badge;
 
 use super::diff::secret_text;
 use super::icons;
@@ -39,16 +41,16 @@ fn resource_row(r: &Resource, spec: Option<&ClusterSpec>, now: DateTime<Utc>) ->
             <span class={classes!("run-step__glyph", r.state.tone().class())} aria-hidden="true">{ r.state.glyph() }</span>
             <div class="run-step__main">
                 <div class="run-step__head">
-                    <span class="badge run-step__kind">{ r.kind.clone() }</span>
+                    <Badge class="run-step__kind">{ r.kind.clone() }</Badge>
                     <span class="run-step__key mono">{ r.key.clone() }</span>
                     if let (Some(url), Some(spec)) = (url, spec) {
                         <a href={url} target="_blank" rel="noopener noreferrer"
                             aria-label={format!("Open {} in the cluster's UI", r.key)}>{ ui_name(spec) }{ icons::external() }</a>
                     }
                     if r.cleanup {
-                        <span class="badge badge--warn" title="Deleted from the host if the revision drops it">{ "cleanup" }</span>
+                        <Badge tone={Tone::Warn} title="Deleted from the host if the revision drops it">{ "cleanup" }</Badge>
                     } else {
-                        <span class="badge" title="Left on the host, only forgotten, if the revision drops it">{ "forget only" }</span>
+                        <Badge title="Left on the host, only forgotten, if the revision drops it">{ "forget only" }</Badge>
                     }
                     <span class="run-step__state">{ r.state.label() }</span>
                 </div>

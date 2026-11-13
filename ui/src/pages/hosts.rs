@@ -8,15 +8,14 @@
 
 use buckle_api::{Connection, HostStatus, HostSummary};
 use serde::{Deserialize, Serialize};
-use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
+use yewi::{Banner, NavTarget, Size, TabLink, TabNav, TabsVariant, Tone, attrs};
 
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
-    Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, MenuItem, PageHead, Panel,
-    Refresh, RouteLink, RunAction, SplitButton, host_state_pills, icons, use_toast,
+    Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, MenuItem, PageHead, Refresh, RouteLink, RunAction, SplitButton, host_state_pills, icons, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{agents_behind, expected_version, matches_filter, same_version};
@@ -44,6 +43,15 @@ const FILTERS: &[(&str, &str)] = &[
     ("drifted", "Drifted"),
     ("paused", "Paused"),
 ];
+
+/// A query as the pairs of its URL.
+fn pairs(q: &Query) -> Vec<(&'static str, String)> {
+    [("show", &q.show), ("q", &q.q), ("join", &q.join)]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k, v.clone()))
+        .collect()
+}
 
 fn search_matches(h: &HostSummary, q: &str) -> bool {
     let q = q.trim().to_lowercase();
@@ -92,17 +100,6 @@ pub fn hosts() -> Html {
             }
         }
     };
-    let on_search = {
-        let (set_query, query) = (set_query.clone(), query.clone());
-        Callback::from(move |e: InputEvent| {
-            let value = e.target_unchecked_into::<HtmlInputElement>().value();
-            set_query(Query {
-                q: value,
-                ..query.clone()
-            });
-        })
-    };
-
     let approve = {
         let (approving, busy, error, toast, reload) = (
             approving.clone(),
@@ -248,22 +245,19 @@ pub fn hosts() -> Html {
                 .iter()
                 .filter(|h| h.status == HostStatus::Pending)
                 .collect();
-            let chips = FILTERS.iter().map(|(key, label)| {
+            let tabs = FILTERS.iter().map(|(key, label)| {
                 let n = f.hosts.iter().filter(|h| matches_filter(h, key)).count();
-                let selected = *key == show;
-                let (set_query, query) = (set_query.clone(), query.clone());
-                let key = key.to_string();
+                let to = Query { show: if *key == "all" { String::new() } else { key.to_string() }, ..query.clone() };
                 html! {
-                    <button type="button" class={classes!("chip", selected.then_some("chip--active"))}
-                        aria-pressed={selected.to_string()}
-                        onclick={Callback::from(move |_| set_query(Query { show: key.clone(), ..query.clone() }))}>
-                        { *label }<span class="chip__count">{ n }</span>
-                    </button>
+                    <TabLink href={NavTarget::route(Route::Hosts).query(pairs(&to))} current={*key == show}
+                        count={n.to_string()}>
+                        { *label }
+                    </TabLink>
                 }
             });
             html! { <>
                 if !pending.is_empty() {
-                    <div class="banner banner--info" role="status" data-testid="pending-registrations">
+                    <Banner tone={Tone::Info} class="pending" attrs={attrs! { "data-testid" => "pending-registrations" }}>
                         <strong>{ format!("{} awaiting registration approval: ", pending.len()) }</strong>
                         { for pending.iter().map(|h| {
                             let id = h.id.clone();
@@ -278,18 +272,15 @@ pub fn hosts() -> Html {
                                 </span>
                             }
                         }) }
-                    </div>
+                    </Banner>
                 }
                 <div class="toolbar">
-                    <div class="chips" role="group" aria-label="Show">{ for chips }</div>
-                    <input class="input toolbar__search" type="search" placeholder="Search hosts, labels, groups"
-                        aria-label="Search hosts" value={query.q.clone()} oninput={on_search} />
+                    <TabNav label="Show" variant={TabsVariant::Pill} size={Size::Small}>{ for tabs }</TabNav>
                 </div>
                 if rows.is_empty() {
                     <Empty title="No hosts match" message="Clear the search or choose another filter." />
                 } else {
-                    <div class="table-wrap">
-                        <table class="table" data-testid="hosts-table">
+                    <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true attrs={yewi::attrs! { "data-testid" => "hosts-table" }}>
                             <thead><tr>
                                 <th scope="col">{ "Host" }</th>
                                 <th scope="col">{ "State" }</th>
@@ -302,8 +293,7 @@ pub fn hosts() -> Html {
                                 stable: f.stable_revision.as_deref(),
                                 agent: expected_version(&f.hosts, target.as_deref()),
                             }, &on_open, now)) }</tbody>
-                        </table>
-                    </div>
+                    </yewi::SimpleTable>
                 }
             </> }
         }
@@ -311,7 +301,7 @@ pub fn hosts() -> Html {
 
     html! {
         <div class="page page--wide">
-            <PageHead title="Hosts" subtitle={html! { "Every enrolled agent. Label changes apply to the next rollout's selection." }}
+            <PageHead title="Hosts" subtitle={html! { "Label changes apply to the next rollout's selection." }}
                 actions={html! { <>
                     <Refresh loading={fleet.loading} reload={fleet.reload.clone()} />
                     if auth.is_admin() {
@@ -332,7 +322,7 @@ pub fn hosts() -> Html {
                         } />
                     }
                 </> }} />
-            <Panel>{ body }</Panel>
+            { body }
             if auth.is_admin() && *running {
                 <RunAction on_close={{ let r = running.clone(); Callback::from(move |_| r.set(false)) }} />
             }
@@ -409,7 +399,7 @@ fn row(
         Callback::from(move |e: MouseEvent| on_open.emit((e, id.clone())))
     };
     html! {
-        <tr data-host={h.id.clone()} class="row-click" {onclick}>
+        <tr data-host={h.id.clone()} class="yi-table__row yi-table__row--clickable" {onclick}>
             <td class="nowrap"><HostLink id={h.id.clone()} host={h.clone()} {now} /></td>
             <td class="cell-state nowrap" title={h.health_at.map(|at| format!("health read {} ago ({})", age(Some(at), now), timestamp(at)))}>
                 { host_state_pills(h) }

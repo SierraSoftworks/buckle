@@ -1,16 +1,18 @@
-// Controls and small furniture: buttons, pills, badges, inputs, panels,
-// states, dialogs and toasts.
+// Controls and small furniture. yewi draws the controls themselves (buttons,
+// pills, inputs, dialogs, toasts, menus); what is here is the handful of
+// things that are Buckle's own, and the few places a yewi control is tuned
+// to a state yewi has no name for.
 @use 'sass:list';
 @use 'tokens' as *;
 
 $tones: (
-  ok: (var(--ok), var(--ok-soft)),
-  warn: (var(--warn), var(--warn-soft)),
-  danger: (var(--danger), var(--danger-soft)),
-  active: (var(--active), var(--active-soft)),
-  info: (var(--info), var(--info-soft)),
-  mute: (var(--mute), var(--mute-soft)),
-  neutral: (var(--neutral), var(--neutral-soft)),
+  ok: (var(--yi-ok), var(--yi-ok-soft)),
+  warn: (var(--yi-warn), var(--yi-warn-soft)),
+  danger: (var(--yi-danger), var(--yi-danger-soft)),
+  active: (var(--yi-active), var(--yi-active-soft)),
+  info: (var(--yi-info), var(--yi-info-soft)),
+  mute: (var(--bk-mute), var(--bk-mute-soft)),
+  neutral: (var(--yi-neutral), var(--yi-neutral-soft)),
 );
 
 @each $name, $pair in $tones {
@@ -20,328 +22,165 @@ $tones: (
   }
 }
 
-.btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  min-height: 32px;
-  padding: 0.35rem 0.8rem;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius);
-  background: var(--surface-2);
-  color: var(--fg);
-  font: inherit;
-  font-weight: 500;
-  text-decoration: none;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background var(--transition), border-color var(--transition);
+// Rolled back has no tone in yewi: a neutral pill takes the colour here.
+.yi-pill.tone-mute {
+  --yi-pill-tone: var(--bk-mute);
+  --yi-pill-soft: var(--bk-mute-soft);
 
-  &:hover:not(:disabled) {
-    background: var(--surface-3);
-    color: var(--fg);
-  }
-
-  &:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
-  }
-
-  &--primary {
-    background: var(--brand);
-    border-color: var(--brand);
-    color: var(--on-brand);
-
-    &:hover:not(:disabled) {
-      background: var(--brand-strong);
-      color: var(--on-brand);
-    }
-  }
-
-  // Rolling back: orange.
-  &--caution {
-    background: var(--caution);
-    border-color: var(--caution);
-    color: var(--on-caution);
-
-    &:hover:not(:disabled) {
-      background: var(--caution-strong);
-      border-color: var(--caution-strong);
-      color: var(--on-caution);
-    }
-  }
-
-  // Reviewing what is proposed: blue.
-  &--info {
-    background: var(--active);
-    border-color: var(--active);
-    color: #fff;
-
-    &:hover:not(:disabled) {
-      background: var(--info);
-      border-color: var(--info);
-      color: #fff;
-    }
-  }
-
-  &--danger {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 45%, transparent);
-    background: var(--danger-soft);
-
-    &:hover:not(:disabled) {
-      background: var(--danger);
-      color: #fff;
-    }
-  }
-
-  &--subtle {
-    background: transparent;
-    border-color: transparent;
-    color: var(--fg-2);
-  }
-
-  &--small {
-    min-height: 26px;
-    padding: 0.15rem 0.55rem;
-    font-size: 0.82rem;
-  }
-
-  &--busy {
-    position: relative;
-    cursor: progress;
-
-    &::after {
-      content: "";
-      width: 0.8em;
-      height: 0.8em;
-      border: 2px solid currentColor;
-      border-right-color: transparent;
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
-    }
+  > .yi-status-dot {
+    --yi-status-dot-color: var(--bk-mute);
   }
 }
 
-// A button with a menu: the most likely action on its face, the rest
-// behind the chevron, grouped in sections.
-.split {
-  position: relative;
-  display: inline-flex;
-
-  &__main {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-
-    &--alone {
-      border-radius: var(--radius);
-    }
-  }
-
-  &__toggle {
-    margin-left: -1px;
-    padding: 0.35rem 0.45rem;
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-
-    &.btn--small {
-      padding: 0.2rem 0.35rem;
-    }
-
-    svg {
-      transform: rotate(90deg);
-      transition: transform var(--transition);
-    }
-  }
-
-  &__main.btn--primary + &__toggle {
-    border-left-color: color-mix(in srgb, var(--on-brand) 30%, transparent);
-  }
-
-  &--open &__toggle svg {
-    transform: rotate(-90deg);
-  }
-
-  // Which module (or source) an action belongs to, after its name.
-  &__aside {
-    margin-left: 0.15rem;
-    color: var(--muted);
-    font-size: 0.85em;
-  }
-
-  .btn--primary &__aside,
-  .btn--danger &__aside {
-    color: inherit;
-    opacity: 0.75;
-  }
-
-  // Placed against the viewport when opened, so a table cannot clip it.
-  &__menu {
-    position: fixed;
-    z-index: 30;
-    display: flex;
-    flex-direction: column;
-    min-width: 11rem;
-    max-height: min(70vh, 32rem);
-    overflow-y: auto;
-    padding: 0.3rem;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius);
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    text-align: left;
-  }
-
-  &__group {
-    display: flex;
-    flex-direction: column;
-
-    & + & {
-      margin-top: 0.3rem;
-      padding-top: 0.3rem;
-      border-top: 1px solid var(--line);
-    }
-  }
-
-  &__section {
-    padding: 0.25rem 0.65rem 0.15rem;
-    color: var(--muted);
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-
-  &__item {
-    padding: 0.4rem 0.65rem;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--fg);
-    font: inherit;
-    font-weight: normal;
-    text-align: left;
-    cursor: pointer;
-    white-space: nowrap;
-
-    &:hover,
-    &:focus-visible {
-      background: var(--surface-2);
-    }
-
-    &--caution {
-      color: var(--caution);
-    }
-
-    &--danger {
-      color: var(--danger);
-
-      &:hover,
-      &:focus-visible {
-        background: var(--danger-soft);
-      }
-    }
-
-    // The gentle actions first, a rule before the ones that end or undo.
-    &:not(.split__item--danger) + .split__item--danger {
-      margin-top: 0.3rem;
-      border-top: 1px solid var(--line);
-      border-top-left-radius: 0;
-      border-top-right-radius: 0;
-    }
-  }
+// A value that came from a secret.
+.yi-pill.badge--secret {
+  --yi-pill-tone: var(--yi-accent-text);
+  --yi-pill-soft: var(--yi-accent-soft);
 }
 
-.icon-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  border: 1px solid transparent;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--fg-2);
-  cursor: pointer;
-
-  &:hover {
-    background: var(--surface-2);
-    color: var(--fg);
-  }
+// Rolling back: a danger button in the orange that is neither the amber
+// accent nor the red of an abort.
+.yi-button.button--caution,
+.button--caution > .yi-button {
+  --yi-button-bg: var(--bk-caution);
+  --yi-button-bg-hover: var(--bk-caution-strong);
+  --yi-button-fg: var(--bk-on-caution);
+  --yi-button-border: transparent;
 }
 
+.menu-item--caution {
+  color: var(--bk-caution);
+}
+
+// A button that reads as a link in a line of text: narrowing the audit
+// filter to a cell's value.
 .link-btn {
   padding: 0;
   border: none;
   background: none;
-  color: var(--fg);
+  color: var(--yi-fg);
   font: inherit;
   cursor: pointer;
-  text-decoration: underline dotted var(--line-strong);
+  text-decoration: underline dotted var(--yi-line-strong);
   text-underline-offset: 3px;
 
   &:hover {
-    color: var(--brand);
+    color: var(--yi-accent-text);
+  }
+
+  &:focus-visible {
+    @include focus-ring;
   }
 
   &--aside {
     margin-left: 0.5rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 }
 
-// A popover under its trigger (`HoverTip`), fixed to the viewport so a
-// scrolling table does not clip it.
+// What a `HoverTip` shows: a host's card, a gate's checks.
 .tip {
   display: inline-flex;
   cursor: help;
-  border-radius: 999px;
+}
 
-  &:focus-visible {
-    outline: 2px solid var(--brand);
-    outline-offset: 1px;
+.tip-link {
+  display: inline-flex;
+}
+
+.tip__pop {
+  max-width: 360px;
+  font-size: var(--yi-text-sm);
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.tip__head {
+  font-weight: 600;
+}
+
+// A page's sections sit flat on it, a heading and then the content, with
+// room between one and the next.
+.panel {
+  --yi-panel-padding-inline: 0;
+  --yi-panel-padding-block: 0;
+
+  & + & {
+    margin-top: var(--yi-space-2xl);
   }
 
-  &__pop {
-    position: fixed;
-    z-index: 50;
-    display: flex;
-    flex-direction: column;
-    gap: 0.3rem;
-    max-width: 360px;
-    padding: 0.5rem 0.65rem;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius);
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    color: var(--fg);
-    font-family: var(--font-sans);
-    font-size: 0.78rem;
-    font-weight: 400;
-    line-height: 1.4;
-    white-space: normal;
-    cursor: default;
-
-    // Bridges the gap to the trigger, so the pointer can reach a link inside.
-    &::before {
-      content: "";
-      position: absolute;
-      bottom: 100%;
-      left: 0;
-      right: 0;
-      height: 6px;
-    }
-  }
-
-  &__head {
-    font-weight: 600;
+  > .yi-panel__body {
+    padding-block-start: var(--yi-space-md);
   }
 }
 
-// A link that summarises what it names on hover (a host's card).
-.tip-link {
+// Several facts in one line of a page's or a section's head.
+.banner__item {
   display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.note {
+  margin: var(--yi-space-sm) 0;
+
+  .note__text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+}
+
+// Whether live updates are flowing, in the app bar.
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--yi-fg-muted);
+  font-size: var(--yi-text-sm);
+}
+
+// Claude's spark, where a person has their avatar.
+.avatar {
+  flex: none;
+  margin-right: 0.35rem;
+  // A card's link covers it: a click on the avatar is a click on the card.
+  pointer-events: none;
+
+  &.yi-avatar {
+    --yi-avatar-size: 18px;
+  }
+
+  &--claude {
+    display: inline-grid;
+    width: 18px;
+    height: 18px;
+
+    .icon {
+      width: 100%;
+      height: 100%;
+    }
+  }
+}
+
+.user {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+
+  &__role {
+    color: var(--yi-fg-subtle);
+    font-size: var(--yi-text-xs);
+  }
+}
+
+// What a confirmation will do, item by item.
+.confirm__facts {
+  margin: 0.5rem 0;
+  padding-left: 1.1rem;
+
+  li {
+    margin: 0.2rem 0;
+  }
 }
 
 .host-card {
@@ -367,8 +206,8 @@ $tones: (
     flex-direction: column;
     gap: 0.1rem;
     padding-top: 0.35rem;
-    border-top: 1px solid var(--line);
-    color: var(--fg-2);
+    border-top: 1px solid var(--yi-line);
+    color: var(--yi-fg-muted);
   }
 }
 
@@ -380,13 +219,13 @@ $tones: (
   min-width: 60px;
   height: 6px;
   border-radius: 3px;
-  background: var(--surface-3);
+  background: var(--yi-line);
   overflow: hidden;
 
   &__seg {
     display: block;
     min-width: 3px;
-    background: var(--tone, var(--neutral));
+    background: var(--tone, var(--yi-neutral));
 
     // Work in flight: a band of light sweeps along the segment.
     &.tone-active {
@@ -423,232 +262,28 @@ $tones: (
   }
 }
 
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  padding: 0.05rem 0.5rem;
-  border-radius: 999px;
-  background: var(--tone-soft, var(--neutral-soft));
-  color: var(--tone, var(--neutral));
-  font-size: 0.78rem;
-  font-weight: 550;
-  white-space: nowrap;
-  line-height: 1.6;
-
-  &__dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-}
-
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.25rem;
-  margin: 0.1rem 0.25rem 0.1rem 0;
-  padding: 0 0.4rem;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  color: var(--fg-2);
-  font-size: 0.75rem;
-  line-height: 1.6;
-  white-space: nowrap;
-
-  .icon {
-    width: 12px;
-    height: 12px;
-  }
-
-  &--ok {
-    color: var(--ok);
-    border-color: color-mix(in srgb, var(--ok) 40%, transparent);
-  }
-
-  &--warn {
-    color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 40%, transparent);
-  }
-
-  &--danger {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 45%, transparent);
-    background: var(--danger-soft);
-  }
-
-  &--info {
-    color: var(--info);
-    border-color: color-mix(in srgb, var(--info) 40%, transparent);
-  }
-
-  &--secret {
-    color: var(--brand);
-    border-color: color-mix(in srgb, var(--brand) 40%, transparent);
-  }
-}
-
 .label {
   display: inline-block;
   margin: 0.1rem 0.25rem 0.1rem 0;
   padding: 0 0.35rem;
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  color: var(--fg-2);
-  font-family: var(--font-mono);
+  border-radius: var(--yi-radius-sm);
+  background: var(--yi-tone-1);
+  color: var(--yi-fg-muted);
+  font-family: var(--yi-font-mono);
   font-size: 0.75rem;
   white-space: nowrap;
 
   &--server {
-    background: var(--brand-soft);
-    color: var(--fg);
-  }
-}
-
-.input {
-  width: 100%;
-  min-height: 32px;
-  padding: 0.35rem 0.6rem;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius);
-  background: var(--bg);
-  color: var(--fg);
-  font: inherit;
-
-  &:focus {
-    outline: none;
-    border-color: var(--brand);
-    box-shadow: 0 0 0 3px var(--brand-soft);
-  }
-
-  &--invalid,
-  &[aria-invalid="true"] {
-    border-color: var(--danger);
-  }
-}
-
-textarea.input {
-  resize: vertical;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
-  margin: 0.5rem 0;
-
-  &__label {
-    color: var(--fg-2);
-    font-size: 0.8rem;
-    font-weight: 500;
+    background: var(--yi-accent-soft);
+    color: var(--yi-fg);
   }
 }
 
 .chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem;
-}
-
-.chip {
-  display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  padding: 0.2rem 0.6rem;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--fg-2);
-  font: inherit;
-  font-size: 0.8rem;
-  cursor: pointer;
-
-  &:hover {
-    color: var(--fg);
-    border-color: var(--line-strong);
-  }
-
-  &--active {
-    background: var(--surface-2);
-    color: var(--fg);
-    border-color: var(--line-strong);
-  }
-
-  &__count {
-    color: var(--fg-3);
-    font-variant-numeric: tabular-nums;
-  }
-}
-
-.tabs {
-  display: flex;
-  gap: 0.2rem;
-  border-bottom: 1px solid var(--line);
-  margin-bottom: 0.75rem;
-
-  &__tab {
-    display: inline-flex;
-    gap: 0.4rem;
-    padding: 0.45rem 0.75rem;
-    border: none;
-    border-bottom: 2px solid transparent;
-    background: none;
-    color: var(--fg-2);
-    font: inherit;
-    font-weight: 500;
-    cursor: pointer;
-    margin-bottom: -1px;
-
-    &:hover {
-      color: var(--fg);
-    }
-
-    &--active {
-      color: var(--fg);
-      border-bottom-color: var(--brand);
-    }
-  }
-}
-
-// Two or three views of one card, in its head (Changed / All).
-.segmented {
-  display: inline-flex;
-  padding: 2px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--surface-2);
-
-  &__option {
-    padding: 0.2rem 0.65rem;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--fg-2);
-    font: inherit;
-    font-size: 0.78rem;
-    font-weight: 500;
-    cursor: pointer;
-
-    &:hover {
-      color: var(--fg);
-    }
-
-    &--on {
-      background: var(--surface);
-      color: var(--fg);
-      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
-    }
-  }
-}
-
-.tabs--small {
-  margin-bottom: 0.5rem;
-
-  .tabs__tab {
-    padding: 0.3rem 0.6rem;
-    font-size: 0.8rem;
-  }
 }
 
 .toolbar {
@@ -659,90 +294,8 @@ textarea.input {
   gap: 0.75rem;
   margin-bottom: 0.75rem;
 
-  .tabs {
-    margin: 0;
-    border: none;
-  }
-
   &__search {
     max-width: 280px;
-  }
-}
-
-.panel {
-  margin-bottom: 1rem;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  min-width: 0;
-
-  &__head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 0.85rem 1rem 0;
-  }
-
-  &__title {
-    font-size: 0.95rem;
-  }
-
-  &__subtitle {
-    margin: 0.15rem 0 0;
-    color: var(--fg-2);
-    font-size: 0.8rem;
-  }
-
-  &__actions {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  &__body {
-    padding: 0.85rem 1rem 1rem;
-    min-width: 0;
-  }
-
-  &--approval {
-    border-color: color-mix(in srgb, var(--info) 45%, var(--line));
-  }
-}
-
-.grid > .panel {
-  margin: 0;
-}
-
-.page-head {
-  // Actions are anchored at the top right, beside the title; the subtitle
-  // (a rollout's commit card) spans the full width beneath both.
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
-  column-gap: 1rem;
-  margin-bottom: 1.25rem;
-
-  &__text {
-    display: contents;
-  }
-
-  &__title {
-    grid-area: 1 / 1;
-    font-size: 1.45rem;
-    letter-spacing: -0.02em;
-  }
-
-  &__subtitle {
-    grid-area: 2 / 1 / auto / -1;
-    margin-top: 0.3rem;
-    color: var(--fg-2);
-  }
-
-  &__actions {
-    grid-area: 1 / 2;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
   }
 }
 
@@ -753,157 +306,15 @@ textarea.input {
   gap: 0.6rem;
 }
 
-.state {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.35rem;
-  padding: 1.25rem 0.25rem;
-  color: var(--fg-2);
-
-  &--loading {
-    flex-direction: row;
-    align-items: center;
-    gap: 0.6rem;
-  }
-
-  &__title {
-    margin: 0;
-    color: var(--fg);
-    font-weight: 600;
-  }
-
-  &__message {
-    margin: 0 0 0.4rem;
-    max-width: 60ch;
-  }
-
-  &--error .state__title {
-    color: var(--danger);
-  }
-}
-
-.spinner {
-  width: 14px;
-  height: 14px;
-  border: 2px solid var(--line-strong);
-  border-top-color: var(--brand);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.banner {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem 0.9rem;
-  margin-bottom: 1rem;
-  padding: 0.6rem 0.9rem;
-  border: 1px solid var(--line);
-  border-left-width: 3px;
-  border-radius: var(--radius);
-  background: var(--surface);
-
-  &--info {
-    border-left-color: var(--info);
-  }
-
-  &--warn {
-    border-left-color: var(--warn);
-    background: var(--warn-soft);
-  }
-
-  &__item {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-  }
-}
-
-// Every banner (`components::ui::Note`): a rule and icon in its kind's
-// colour, the text in the body colour, an aside (hosts, phases) at the end.
-.note {
-  --note-tone: var(--info);
-  display: flex;
-  align-items: flex-start;
-  gap: 0.5rem;
-  margin: 0.5rem 0;
-  padding: 0.45rem 0.7rem;
-  border-left: 3px solid var(--note-tone);
-  background: var(--info-soft);
-  border-radius: var(--radius-sm);
-  color: var(--fg);
-  font-size: 0.85rem;
-
-  &--warn {
-    --note-tone: var(--warn);
-    background: var(--warn-soft);
-  }
-
-  &--danger {
-    --note-tone: var(--danger);
-    background: var(--danger-soft);
-  }
-
-  &__icon {
-    display: inline-flex;
-    flex: none;
-    margin-top: 0.1rem;
-    color: var(--note-tone);
-  }
-
-  &__text {
-    flex: 1;
-    min-width: 0;
-    overflow-wrap: anywhere;
-  }
-
-  > .scope {
-    flex: none;
-  }
-}
-
-.kv {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  gap: 0.35rem 1rem;
-  margin: 0;
-
-  dt {
-    color: var(--fg-2);
-  }
-
-  dd {
-    margin: 0;
-  }
-}
-
-.copyable {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.2rem;
-
-  .icon-btn {
-    width: 24px;
-    height: 24px;
-  }
-}
-
 .trace-link {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
-  color: var(--fg-2);
+  color: var(--yi-fg-muted);
   text-decoration: none;
 
   &:hover {
-    color: var(--brand);
+    color: var(--yi-accent-text);
   }
 }
 
@@ -911,336 +322,21 @@ textarea.input {
   display: inline-flex;
   align-items: center;
   padding: 0 0.3rem;
-  border: 1px solid color-mix(in srgb, var(--brand) 45%, transparent);
-  border-radius: var(--radius-sm);
-  background: var(--brand-soft);
-  color: var(--fg);
+  border: 1px solid color-mix(in srgb, var(--yi-accent-text) 45%, transparent);
+  border-radius: var(--yi-radius-sm);
+  background: var(--yi-accent-soft);
+  color: var(--yi-fg);
   white-space: nowrap;
 
   .icon {
     width: 11px;
     height: 11px;
     margin-right: 0.2rem;
-    color: var(--brand);
+    color: var(--yi-accent-text);
   }
 
   &__fp {
-    color: var(--fg-2);
-  }
-}
-
-.live {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  color: var(--fg-2);
-  font-size: 0.78rem;
-
-  &__dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--neutral);
-  }
-
-  &--open .live__dot {
-    background: var(--ok);
-    box-shadow: 0 0 0 3px var(--ok-soft);
-  }
-
-  &--connecting .live__dot,
-  &--retrying .live__dot {
-    background: var(--warn);
-    animation: pulse 1.4s ease-in-out infinite;
-  }
-}
-
-// A person's round avatar: their initials, under their Gravatar once it loads.
-.avatar {
-  position: relative;
-  display: inline-grid;
-  place-items: center;
-  flex: none;
-  width: 18px;
-  height: 18px;
-  margin-right: 0.35rem;
-  border-radius: 50%;
-  background: var(--surface-3);
-  color: var(--fg-2);
-  font-size: 0.55rem;
-  font-weight: 700;
-  line-height: 1;
-  overflow: hidden;
-  // A card's link covers it: a click on the avatar is a click on the card.
-  pointer-events: none;
-
-  &--claude {
-    background: none;
-
-    .icon {
-      width: 100%;
-      height: 100%;
-    }
-  }
-
-  &__img {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-}
-
-// The app bar's bell: what needs attention, in a dropdown.
-.bell {
-  position: relative;
-
-  &__button {
-    position: relative;
-  }
-
-  &__count {
-    position: absolute;
-    top: -2px;
-    right: -3px;
-    min-width: 16px;
-    height: 16px;
-    padding: 0 4px;
-    border-radius: 8px;
-    background: var(--tone);
-    color: var(--on-brand);
-    font-size: 0.65rem;
-    font-weight: 700;
-    line-height: 16px;
-    text-align: center;
-    font-variant-numeric: tabular-nums;
-  }
-
-  &--open &__button {
-    background: var(--surface-2);
-    color: var(--fg);
-  }
-
-  &__panel {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
-    z-index: 30;
-    width: min(28rem, calc(100vw - 2rem));
-    max-height: min(70vh, 32rem);
-    overflow: auto;
-    padding: 0.6rem 0.85rem 0.4rem;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius-lg);
-    background: var(--surface);
-    box-shadow: var(--shadow);
-  }
-
-  &__head {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-    padding-bottom: 0.45rem;
-    border-bottom: 1px solid var(--line);
-  }
-
-  &__title {
-    font-weight: 650;
-  }
-
-  &__empty {
-    margin: 0.6rem 0;
-    font-size: 0.85rem;
-  }
-
-  // On a narrow screen the bell is far from the right edge: the list spans
-  // the screen under the app bar instead.
-  @media (max-width: $narrow) {
-    &__panel {
-      position: fixed;
-      top: calc(var(--bar-h) + 4px);
-      left: 0.5rem;
-      right: 0.5rem;
-      width: auto;
-    }
-  }
-}
-
-.user {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-
-  &__avatar {
-    display: grid;
-    place-items: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    background: var(--brand);
-    color: var(--on-brand);
-    font-size: 0.72rem;
-    font-weight: 700;
-  }
-
-  &__meta {
-    display: flex;
-    flex-direction: column;
-    line-height: 1.2;
-  }
-
-  &__name {
-    font-size: 0.82rem;
-    font-weight: 550;
-  }
-
-  &__role {
-    color: var(--fg-3);
-    font-size: 0.72rem;
-  }
-}
-
-.modal {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  display: grid;
-  place-items: center;
-  padding: 1rem;
-  background: var(--scrim);
-
-  &__dialog {
-    width: min(560px, 100%);
-    max-height: calc(100vh - 2rem);
-    display: flex;
-    flex-direction: column;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius-lg);
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    outline: none;
-
-    &--wide {
-      width: min(860px, 100%);
-    }
-  }
-
-  &__head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 0.9rem 1rem 0.5rem;
-  }
-
-  &__title {
-    font-size: 1.05rem;
-  }
-
-  &__body {
-    padding: 0 1rem;
-    overflow-y: auto;
-  }
-
-  &__foot {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.5rem;
-    padding: 0.9rem 1rem;
-    border-top: 1px solid var(--line);
-    margin-top: 0.75rem;
-  }
-}
-
-.confirm {
-  &__facts {
-    margin: 0.5rem 0;
-    padding-left: 1.1rem;
-
-    li {
-      margin: 0.2rem 0;
-    }
-  }
-
-  &__ack {
-    display: flex;
-    gap: 0.5rem;
-    align-items: flex-start;
-    margin: 0.75rem 0;
-    padding: 0.5rem 0.6rem;
-    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
-    border-radius: var(--radius);
-    background: var(--warn-soft);
-    cursor: pointer;
-
-    input {
-      margin-top: 0.2rem;
-    }
-  }
-
-  &__error {
-    color: var(--danger);
-  }
-
-  // The name to type, as a chip that copies itself on a click.
-  &__word {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.25rem;
-    margin: 0 0.1rem;
-    padding: 0.05rem 0.35rem;
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    background: var(--surface-2);
-    color: var(--fg);
-    cursor: copy;
-
-    &:hover {
-      border-color: var(--brand);
-    }
-
-    &-icon {
-      display: inline-flex;
-      color: var(--fg-2);
-
-      svg {
-        width: 12px;
-        height: 12px;
-      }
-    }
-  }
-}
-
-.toasts {
-  position: fixed;
-  right: 1rem;
-  bottom: 1rem;
-  z-index: 60;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  max-width: min(420px, calc(100vw - 2rem));
-}
-
-.toast {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.5rem;
-  padding: 0.6rem 0.5rem 0.6rem 0.8rem;
-  border: 1px solid var(--line-strong);
-  border-left: 3px solid var(--ok);
-  border-radius: var(--radius);
-  background: var(--surface);
-  box-shadow: var(--shadow);
-
-  &--error {
-    border-left-color: var(--danger);
-  }
-
-  &__text {
-    flex: 1;
-    padding-top: 0.2rem;
+    color: var(--yi-fg-muted);
   }
 }
 
@@ -1249,13 +345,13 @@ textarea.input {
   min-width: 80px;
   height: 5px;
   border-radius: 3px;
-  background: var(--surface-3);
+  background: var(--yi-line);
   overflow: hidden;
 
   &__bar {
     display: block;
     height: 100%;
-    background: var(--ok);
+    background: var(--yi-ok);
   }
 }
 
@@ -1284,7 +380,7 @@ textarea.input {
 
 .subhead {
   margin: 0.75rem 0 0.4rem;
-  color: var(--fg-2);
+  color: var(--yi-fg-muted);
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.05em;
@@ -1303,41 +399,6 @@ textarea.input {
   }
 }
 
-@media (max-width: $narrow) {
-  .user__meta,
-  .live__label {
-    display: none;
-  }
-}
-
-@media (max-width: $small) {
-  .app-bar {
-    gap: 0.4rem;
-    padding: 0 0.6rem;
-  }
-
-  .app-bar .badge {
-    display: none;
-  }
-}
-
-// A labelled checkbox that changes what a list shows.
-.toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  margin-top: 0.5rem;
-  color: var(--fg-2);
-  font-size: 0.85rem;
-  cursor: pointer;
-}
-
-// Add an agent: a short wizard inside a modal.
-.field__hint {
-  color: var(--fg-3);
-  font-size: 0.78rem;
-}
-
 .wizard {
   display: flex;
   flex-direction: column;
@@ -1348,7 +409,7 @@ textarea.input {
     gap: 1.25rem;
     margin: 0 0 0.25rem;
     padding: 0 0 0.6rem;
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--yi-line);
     list-style: none;
     font-size: 0.85rem;
   }
@@ -1357,16 +418,16 @@ textarea.input {
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
 
     &--current {
-      color: var(--fg);
+      color: var(--yi-fg);
       font-weight: 600;
 
       .wizard__num {
-        border-color: var(--brand);
-        background: var(--brand);
-        color: var(--bg);
+        border-color: var(--yi-accent-text);
+        background: var(--yi-accent-solid);
+        color: var(--yi-bg);
       }
     }
   }
@@ -1376,7 +437,7 @@ textarea.input {
     place-items: center;
     width: 1.3rem;
     height: 1.3rem;
-    border: 1px solid var(--line-strong);
+    border: 1px solid var(--yi-line-strong);
     border-radius: 999px;
     font-size: 0.72rem;
   }
@@ -1402,7 +463,7 @@ textarea.input {
   &__notes {
     margin: 0;
     padding-left: 1.1rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.85rem;
 
     li + li {
@@ -1424,27 +485,27 @@ textarea.input {
   align-items: flex-start;
   gap: 0.2rem;
   padding: 0.7rem 0.85rem;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg);
-  color: var(--fg);
+  border: 1px solid var(--yi-line);
+  border-radius: var(--yi-radius-control);
+  background: var(--yi-bg);
+  color: var(--yi-fg);
   font: inherit;
   text-align: left;
   cursor: pointer;
 
   &:hover {
-    border-color: var(--line-strong);
+    border-color: var(--yi-line-strong);
   }
 
   &:focus-visible {
     outline: none;
-    box-shadow: 0 0 0 3px var(--brand-soft);
+    box-shadow: 0 0 0 3px var(--yi-accent-soft);
   }
 
   &--selected {
-    border-color: var(--brand);
-    background: var(--brand-soft);
-    box-shadow: inset 0 0 0 1px var(--brand);
+    border-color: var(--yi-accent-text);
+    background: var(--yi-accent-soft);
+    box-shadow: inset 0 0 0 1px var(--yi-accent-text);
   }
 
   &__title {
@@ -1452,15 +513,15 @@ textarea.input {
   }
 
   &__sub {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.8rem;
   }
 }
 
 .join-command {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--surface-2);
+  border: 1px solid var(--yi-line);
+  border-radius: var(--yi-radius-control);
+  background: var(--yi-tone-1);
   overflow: hidden;
 
   &__bar {
@@ -1468,8 +529,8 @@ textarea.input {
     align-items: center;
     justify-content: space-between;
     padding: 0.25rem 0.4rem 0.25rem 0.85rem;
-    border-bottom: 1px solid var(--line);
-    color: var(--fg-3);
+    border-bottom: 1px solid var(--yi-line);
+    color: var(--yi-fg-subtle);
     font-size: 0.8rem;
   }
 
@@ -1482,4 +543,19 @@ textarea.input {
     white-space: pre;
     overflow-x: auto;
   }
+}
+
+@media (max-width: $narrow) {
+  .live__label {
+    display: none;
+  }
+}
+
+// The word a confirmation asks to be typed: a click copies it.
+.confirm-host {
+  display: contents;
+}
+
+.confirm .yi-confirm__word {
+  cursor: copy;
 }

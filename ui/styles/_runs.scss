@@ -8,16 +8,16 @@
 .error-block {
   margin: 0.45rem 0;
   padding: 0.55rem 0.75rem;
-  border: 1px solid color-mix(in srgb, var(--tone, var(--danger)) 30%, var(--line));
-  border-left: 3px solid var(--tone, var(--danger));
-  border-radius: var(--radius-sm);
-  background: var(--tone-soft, var(--danger-soft));
+  border: 1px solid color-mix(in srgb, var(--tone, var(--yi-danger)) 30%, var(--yi-line));
+  border-left: 3px solid var(--tone, var(--yi-danger));
+  border-radius: var(--yi-radius-sm);
+  background: var(--tone-soft, var(--yi-danger-soft));
   font-size: 0.84rem;
   line-height: 1.45;
 
   &__context {
     margin: 0 0 0.2rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.76rem;
     overflow-wrap: anywhere;
   }
@@ -31,14 +31,14 @@
   &__icon {
     display: inline-flex;
     padding-top: 0.1rem;
-    color: var(--tone, var(--danger));
+    color: var(--tone, var(--yi-danger));
   }
 
   &__message {
     flex: 1;
     min-width: 0;
     margin: 0;
-    color: var(--fg);
+    color: var(--yi-fg);
     font-weight: 600;
     overflow-wrap: anywhere;
   }
@@ -46,9 +46,9 @@
   &__kind {
     flex-shrink: 0;
     padding: 0 0.4rem;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius-sm);
-    color: var(--fg-2);
+    border: 1px solid var(--yi-line-strong);
+    border-radius: var(--yi-radius-sm);
+    color: var(--yi-fg-muted);
     font-size: 0.68rem;
     font-weight: 600;
     letter-spacing: 0.05em;
@@ -58,8 +58,8 @@
   }
 
   &--system &__kind {
-    border-color: color-mix(in srgb, var(--warn) 50%, transparent);
-    color: var(--warn);
+    border-color: color-mix(in srgb, var(--yi-warn) 50%, transparent);
+    color: var(--yi-warn);
   }
 
   &__section {
@@ -68,7 +68,7 @@
 
   &__label {
     margin: 0 0 0.1rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.7rem;
     font-weight: 600;
     letter-spacing: 0.05em;
@@ -87,7 +87,7 @@
   }
 
   &__causes li::marker {
-    color: var(--fg-3);
+    color: var(--yi-fg-subtle);
     font-variant-numeric: tabular-nums;
   }
 
@@ -95,7 +95,7 @@
     flex: 1;
     min-width: 0;
     margin: 0;
-    color: var(--fg);
+    color: var(--yi-fg);
     font-size: 0.8rem;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -142,7 +142,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 0.25rem 0.75rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 
   &__progress {
@@ -156,7 +156,7 @@
     }
 
     .progress__bar {
-      background: var(--active);
+      background: var(--yi-active);
       transition: width 300ms ease;
     }
   }
@@ -201,20 +201,20 @@
 
   &--zero {
     background: transparent;
-    color: var(--fg-3);
+    color: var(--yi-fg-subtle);
     font-weight: 450;
   }
 }
 
 .run-modules {
   list-style: none;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg);
+  border: 1px solid var(--yi-line);
+  border-radius: var(--yi-radius-control);
+  background: var(--yi-bg);
 }
 
 .run-module {
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--yi-line);
   border-left: 3px solid transparent;
 
   &:last-child {
@@ -223,20 +223,20 @@
 
   &--failed,
   &--unhealthy {
-    border-left-color: var(--danger);
+    border-left-color: var(--yi-danger);
   }
 
   &--blocked,
   &--indeterminate {
-    border-left-color: var(--warn);
+    border-left-color: var(--yi-warn);
   }
 
   &--rolled-back {
-    border-left-color: var(--mute);
+    border-left-color: var(--bk-mute);
   }
 
   &--running {
-    border-left-color: var(--active);
+    border-left-color: var(--yi-active);
   }
 
   // The heading: the toggle (chevron, state, name), then right-aligned
@@ -250,7 +250,7 @@
     cursor: pointer;
 
     &:hover {
-      background: var(--surface-2);
+      background: var(--yi-tone-1);
     }
   }
 
@@ -264,7 +264,7 @@
     padding: 0.45rem 0 0.45rem 0.5rem;
     border: none;
     background: none;
-    color: var(--fg);
+    color: var(--yi-fg);
     font: inherit;
     text-align: left;
     cursor: pointer;
@@ -284,8 +284,8 @@
 
   &__chevron {
     display: inline-flex;
-    color: var(--fg-3);
-    transition: transform var(--transition);
+    color: var(--yi-fg-subtle);
+    transition: transform var(--yi-duration-fast) var(--yi-ease);
 
     .icon {
       width: 14px;
@@ -313,18 +313,18 @@
   &--not-started &__name,
   &--skipped &__name,
   &--pending &__name {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-weight: 500;
   }
 
   &__current {
-    color: var(--active);
+    color: var(--yi-active);
     font-size: 0.8rem;
     overflow-wrap: anywhere;
   }
 
   &__note {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.8rem;
   }
 
@@ -343,7 +343,7 @@
 
   &__sub {
     margin: 0.6rem 0 0.2rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.7rem;
     font-weight: 600;
     letter-spacing: 0.05em;
@@ -361,8 +361,8 @@
   align-items: baseline;
   gap: 0.15rem 0.6rem;
   padding: 0.35rem 0.4rem;
-  border-bottom: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  border-bottom: 1px solid var(--yi-line);
+  border-radius: var(--yi-radius-sm);
   font-size: 0.84rem;
 
   &:last-child {
@@ -371,7 +371,7 @@
 
   &__glyph {
     color: var(--tone);
-    font-family: var(--font-mono);
+    font-family: var(--yi-font-mono);
     font-weight: 700;
     text-align: center;
   }
@@ -396,12 +396,12 @@
   }
 
   &__key {
-    color: var(--fg);
+    color: var(--yi-fg);
     overflow-wrap: anywhere;
   }
 
   &__state {
-    color: var(--fg-3);
+    color: var(--yi-fg-subtle);
     font-size: 0.74rem;
   }
 
@@ -412,15 +412,15 @@
   }
 
   &__summary {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 
   &__result {
-    color: var(--fg);
+    color: var(--yi-fg);
 
     &::before {
       content: "↳ ";
-      color: var(--fg-3);
+      color: var(--yi-fg-subtle);
     }
   }
 
@@ -432,7 +432,7 @@
     padding: 0;
     border: none;
     background: none;
-    color: var(--info);
+    color: var(--yi-info);
     font: inherit;
     font-size: 0.78rem;
     cursor: pointer;
@@ -447,56 +447,56 @@
     margin: 0.25rem 0 0;
     padding: 0.4rem 0.55rem;
     overflow: auto;
-    border: 1px solid var(--line);
-    border-radius: var(--radius-sm);
-    background: var(--surface-2);
-    color: var(--fg);
+    border: 1px solid var(--yi-line);
+    border-radius: var(--yi-radius-sm);
+    background: var(--yi-tone-1);
+    color: var(--yi-fg);
     font-size: 0.78rem;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
 
   &__duration {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.78rem;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
 
   &--running {
-    background: var(--active-soft);
+    background: var(--yi-active-soft);
 
     .run-step__glyph {
       animation: pulse 1.2s ease-in-out infinite;
     }
 
     .run-step__state {
-      color: var(--active);
+      color: var(--yi-active);
       font-weight: 600;
     }
   }
 
   &--failed {
-    background: var(--danger-soft);
+    background: var(--yi-danger-soft);
 
     .run-step__state {
-      color: var(--danger);
+      color: var(--yi-danger);
       font-weight: 600;
     }
   }
 
   &--blocked .run-step__state {
-    color: var(--warn);
+    color: var(--yi-warn);
     font-weight: 600;
   }
 
   &--rolled-back .run-step__state {
-    color: var(--mute);
+    color: var(--bk-mute);
   }
 
   &--pending .run-step__key,
   &--unchanged .run-step__key {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 
   &--skipped,
@@ -504,9 +504,9 @@
     .run-step__name,
     .run-step__key,
     .run-step__summary {
-      color: var(--fg-3);
+      color: var(--yi-fg-subtle);
       text-decoration: line-through;
-      text-decoration-color: color-mix(in srgb, var(--fg-3) 60%, transparent);
+      text-decoration-color: color-mix(in srgb, var(--yi-fg-subtle) 60%, transparent);
     }
   }
 }
@@ -523,11 +523,11 @@
     flex: 1;
     min-width: 2px;
     border-radius: 1px;
-    background: var(--tone, var(--fg-3));
+    background: var(--tone, var(--yi-fg-subtle));
     outline-offset: 1px;
 
     &--empty {
-      background: var(--surface-2);
+      background: var(--yi-tone-1);
     }
 
     &:hover,
@@ -581,11 +581,11 @@
     width: max-content;
     max-width: min(28rem, 85vw);
     padding: 0.5rem 0.6rem;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius);
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    color: var(--fg);
+    border: 1px solid var(--yi-line-strong);
+    border-radius: var(--yi-radius-control);
+    background: var(--yi-surface);
+    box-shadow: var(--yi-shadow-overlay);
+    color: var(--yi-fg);
     font-size: 0.8rem;
     pointer-events: none;
   }
@@ -605,7 +605,7 @@
 
   &__reason {
     flex-basis: 100%;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 }
 
@@ -613,9 +613,9 @@
   margin-top: 0.25rem;
 
   .run-steps {
-    border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--line));
-    border-radius: var(--radius);
-    background: var(--bg);
+    border: 1px solid color-mix(in srgb, var(--yi-danger) 35%, var(--yi-line));
+    border-radius: var(--yi-radius-control);
+    background: var(--yi-bg);
   }
 }
 
@@ -636,12 +636,8 @@
   gap: 0.4rem;
   min-width: 0;
 
-  .input {
-    width: auto;
+  .yi-native-select {
     max-width: min(22rem, 100%);
-    min-height: 28px;
-    padding: 0.15rem 0.4rem;
-    font-size: 0.82rem;
   }
 }
 
@@ -650,7 +646,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 0.2rem 0.4rem;
-  color: var(--warn);
+  color: var(--yi-warn);
   font-size: 0.8rem;
 }
 
@@ -690,29 +686,29 @@
 // states only a blueprint has.
 .blueprint {
   .run-module--drifted {
-    border-left-color: var(--warn);
+    border-left-color: var(--yi-warn);
   }
 
   .run-module--removing,
   .run-module--applying {
-    border-left-color: var(--active);
+    border-left-color: var(--yi-active);
   }
 
   .run-step--drifted .run-step__state {
-    color: var(--warn);
+    color: var(--yi-warn);
     font-weight: 600;
   }
 
   .run-step--applying,
   .run-step--removing {
     .run-step__state {
-      color: var(--active);
+      color: var(--yi-active);
       font-weight: 600;
     }
   }
 
   .run-step--removing .run-step__key {
     text-decoration: line-through;
-    text-decoration-color: color-mix(in srgb, var(--fg-3) 60%, transparent);
+    text-decoration-color: color-mix(in srgb, var(--yi-fg-subtle) 60%, transparent);
   }
 }

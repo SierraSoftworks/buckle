@@ -20,25 +20,6 @@ pub fn demo_href(path: &str) -> String {
     }
 }
 
-/// A value from `localStorage`. A browser that refuses storage is treated as
-/// having nothing stored.
-pub fn stored(key: &str) -> Option<String> {
-    window()
-        .local_storage()
-        .ok()
-        .flatten()
-        .and_then(|s| s.get_item(key).ok().flatten())
-}
-
-pub fn store(key: &str, value: Option<&str>) {
-    if let Some(storage) = window().local_storage().ok().flatten() {
-        let _ = match value {
-            Some(v) => storage.set_item(key, v),
-            None => storage.remove_item(key),
-        };
-    }
-}
-
 /// A value between 0 and 1 for jitter.
 pub fn random() -> f64 {
     js_sys::Math::random()

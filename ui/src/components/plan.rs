@@ -7,6 +7,8 @@ use buckle_api::{
     StepView,
 };
 use yew::prelude::*;
+use crate::logic::tone::Tone;
+use crate::components::ui::Badge;
 
 use super::changes::Changes;
 use super::diff::{DiffView, secret_text};
@@ -41,7 +43,7 @@ pub fn plan_group(props: &PlanGroupProps) -> Html {
                 if g.removals > 0 { { " · " }{ count(g.removals as usize, "removal", "removals") } }
             </span>
             if g.destructive {
-                <span class="badge badge--danger">{ icons::alert() }{ format!("{destructive} destructive") }</span>
+                <Badge tone={Tone::Danger}>{ icons::alert() }{ format!("{destructive} destructive") }</Badge>
             }
         </summary>
     };
@@ -161,7 +163,7 @@ pub fn note(n: &ModuleNote, glyph: &str, class: &str, scope: Html) -> Html {
             if !n.waiting_on.is_empty() {
                 <span class="muted small">{ format!("waits for {}", n.waiting_on.join(", ")) }</span>
             }
-            if n.plan_error { <span class="badge badge--danger">{ "plan error" }</span> }
+            if n.plan_error { <Badge tone={Tone::Danger}>{ "plan error" }</Badge> }
             { scope }
         </li>
     }
@@ -263,10 +265,10 @@ pub fn module_head_of(
     html! { <>
         <h4 class="plan-module__name mono">{ module.to_string() }</h4>
         if let Some(clusters) = clusters {
-            <span class="badge badge--info" data-testid="workload-badge"
-                title={format!("a workload, applied to {}", clusters.join(", "))}>{ "workload" }</span>
+            <Badge tone={Tone::Info} testid="workload-badge"
+                title={format!("a workload, applied to {}", clusters.join(", "))}>{ "workload" }</Badge>
         }
-        if deferred { <span class="badge" title={DEFERRED_BADGE}>{ "deferred" }</span> }
+        if deferred { <Badge title={DEFERRED_BADGE}>{ "deferred" }</Badge> }
         if !needs.is_empty() { <span class="muted">{ format!("needs: {}", needs.join(", ")) }</span> }
         <span class="plan-module__aside"><Changes tally={changes} />{ hosts }</span>
     </> }
@@ -315,10 +317,10 @@ pub fn removal(r: &RemovalView, scope: Html) -> Html {
             { mark(if r.cleanup { Mark::Remove } else { Mark::Forget }) }
             <span class="mono step__resource">{ secret_text(&r.resource()) }</span>
             <span class="step__summary">{ secret_text(&r.summary) }</span>
-            if r.cleanup { <span class="badge badge--danger">{ "removal" }</span> }
-            else { <span class="badge">{ "forget only" }</span> }
+            if r.cleanup { <Badge tone={Tone::Danger}>{ "removal" }</Badge> }
+            else { <Badge>{ "forget only" }</Badge> }
             if r.caution && r.cleanup {
-                <span class="badge badge--warn" title="This kind's removal can take unrelated things down (dependent packages, files owned by a user).">{ icons::alert() }{ "caution" }</span>
+                <Badge tone={Tone::Warn} title="This kind's removal can take unrelated things down (dependent packages, files owned by a user).">{ icons::alert() }{ "caution" }</Badge>
             }
             { scope }
         </li>
@@ -331,7 +333,7 @@ pub fn rehome(r: &RehomeView, scope: Html) -> Html {
             <span class="step__glyph" aria-hidden="true">{ "→" }</span>
             <span class="mono step__resource">{ secret_text(&format!("{} → {}", r.from, r.to)) }</span>
             <span class="step__summary">{ secret_text(&r.summary) }</span>
-            <span class="badge">{ r.how.clone() }</span>
+            <Badge>{ r.how.clone() }</Badge>
             { scope }
         </li>
     }
@@ -362,10 +364,10 @@ pub fn step_line(s: &StepView, extra: Html) -> Html {
         { mark(Mark::of(s)) }
         <span class="mono step__resource">{ secret_text(&s.resource()) }</span>
         <span class="step__summary">{ secret_text(&summary) }</span>
-        if s.destructive { <span class="badge badge--danger">{ icons::alert() }{ "destructive" }</span> }
-        if !s.locks.is_empty() { <span class="badge" title="resource locks">{ format!("lock: {}", s.locks.join(", ")) }</span> }
+        if s.destructive { <Badge tone={Tone::Danger}>{ icons::alert() }{ "destructive" }</Badge> }
+        if !s.locks.is_empty() { <Badge title="resource locks">{ format!("lock: {}", s.locks.join(", ")) }</Badge> }
         if !s.notifies.is_empty() { <span class="muted small">{ format!("→ notify {}", s.notifies.join(", ")) }</span> }
-        if s.always_runs { <span class="badge badge--warn">{ "always runs" }</span> }
+        if s.always_runs { <Badge tone={Tone::Warn}>{ "always runs" }</Badge> }
         { extra }
     </> }
 }

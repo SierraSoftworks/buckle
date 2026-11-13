@@ -7,6 +7,8 @@ use std::rc::Rc;
 
 use buckle_api::{FleetPlan, FleetStep, PlanGroup, Shared};
 use yew::prelude::*;
+use crate::logic::tone::Tone;
+use crate::components::ui::Badge;
 
 use crate::components::ui::{Note, NoteKind};
 
@@ -225,25 +227,21 @@ fn fleet_step_view(props: &FleetStepProps) -> Html {
     let extra = html! { <>
         { scope_within(&props.all, &props.module, &changed, &phases) }
         if s.variants.len() > 1 {
-            <span class="badge badge--info" title="The change differs between hosts beyond their facts.">
+            <Badge tone={Tone::Info} title="The change differs between hosts beyond their facts.">
                 { format!("varies: {} versions", s.variants.len()) }
-            </span>
+            </Badge>
         }
     </> };
     let tabs = (s.variants.len() > 1).then(|| html! {
-        <div class="tabs tabs--small step__variants" role="tablist" aria-label="Versions of this change">
-            { for s.variants.iter().enumerate().map(|(i, v)| {
-                let variant = variant.clone();
-                html! {
-                    <button type="button" role="tab" aria-selected={(i == index).to_string()}
-                        class={classes!("tabs__tab", (i == index).then_some("tabs__tab--active"))}
-                        title={v.hosts.join(", ")}
-                        onclick={Callback::from(move |_| variant.set(i))}>
-                        { format!("Version {} · {}", i + 1, count(v.hosts.len(), "host", "hosts")) }
-                    </button>
-                }
+        <yewi::SegmentedControl class="step__variants" size={yewi::Size::Small} label="Versions of this change"
+            value={index.to_string()}
+            on_change={{ let variant = variant.clone(); Callback::from(move |v: AttrValue| variant.set(v.parse().unwrap_or(0))) }}>
+            { for s.variants.iter().enumerate().map(|(i, v)| html! {
+                <yewi::Segment value={i.to_string()} attrs={yewi::attrs! { "title" => v.hosts.join(", ") }}>
+                    { format!("Version {} · {}", i + 1, count(v.hosts.len(), "host", "hosts")) }
+                </yewi::Segment>
             }) }
-        </div>
+        </yewi::SegmentedControl>
     });
     html! {
         <li class={step_class(&chosen.value)} data-resource={s.resource()}>

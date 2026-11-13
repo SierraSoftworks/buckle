@@ -6,18 +6,17 @@
 
 use buckle_api::{AuditEntry, LiveEvent, PROGRESS_ACTIONS};
 use serde::{Deserialize, Serialize};
-use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::api;
 use crate::app::Route;
 use crate::components::{
-    Button, Empty, ErrorState, JsonTree, Loading, PageHead, Panel, Pill, Refresh, RouteLink,
+    Button, Empty, ErrorState, JsonTree, Loading, PageHead, Pill, Refresh, RouteLink,
     TraceLink,
 };
-use crate::hooks::{use_debounced, use_fetch, use_now};
-use crate::logic::filter::{AUDIT_FIELDS, Check, and, check, equals};
+use crate::hooks::{use_fetch, use_now};
+use crate::logic::filter::{and, equals};
 use crate::logic::format::{relative, subject_rollout_name, timestamp};
 use crate::logic::tone::outcome_tone;
 use crate::store::use_live;
@@ -79,44 +78,10 @@ pub fn audit() -> Html {
         .and_then(|l| l.query::<Query>().ok())
         .unwrap_or_default();
     let (applied, progress) = (query.filter.clone(), query.progress);
-    let draft = use_state(|| applied.clone());
-    let settled = use_debounced((*draft).clone(), 250);
     let more = use_state(Vec::<AuditEntry>::new);
     let next = use_state(|| None::<u64>);
     let loading_more = use_state(|| false);
     let expanded = use_state(|| None::<u64>);
-
-    // The URL follows the box once the expression is worth sending.
-    {
-        let navigator = navigator.clone();
-        let applied = applied.clone();
-        use_effect_with(settled.clone(), move |expr| {
-            let ok = matches!(check(expr), Check::Valid | Check::Unchecked | Check::Empty);
-            if ok
-                && *expr != applied
-                && let Some(n) = navigator
-            {
-                let _ = n.replace_with_query(
-                    &Route::Audit,
-                    &Query {
-                        filter: expr.clone(),
-                        progress,
-                    },
-                );
-            }
-            || ()
-        });
-    }
-    // And the box follows the URL (a link, or the back button).
-    {
-        let draft = draft.clone();
-        use_effect_with(applied.clone(), move |a| {
-            if *draft != *a {
-                draft.set(a.clone());
-            }
-            || ()
-        });
-    }
 
     let page = use_fetch((applied.clone(), progress), |(f, progress)| async move {
         api::audit(&f, None, progress).await
@@ -149,14 +114,19 @@ pub fn audit() -> Html {
         });
     }
 
+    // A filter the page applies goes to the URL, where the app bar's filter
+    // box and the list both read it.
     let set_filter = {
-        let draft = draft.clone();
-        Callback::from(move |value: String| draft.set(value))
+        let navigator = navigator.clone();
+        Callback::from(move |filter: String| {
+            if let Some(n) = &navigator {
+                let _ = n.replace_with_query(&Route::Audit, &Query { filter, progress });
+            }
+        })
     };
     let toggle_progress = {
         let (navigator, applied) = (navigator.clone(), applied.clone());
-        Callback::from(move |e: Event| {
-            let progress = e.target_unchecked_into::<HtmlInputElement>().checked();
+        Callback::from(move |progress: bool| {
             if let Some(n) = &navigator {
                 let _ = n.replace_with_query(
                     &Route::Audit,
@@ -168,15 +138,9 @@ pub fn audit() -> Html {
             }
         })
     };
-    let oninput = {
-        let set_filter = set_filter.clone();
-        Callback::from(move |e: InputEvent| {
-            set_filter.emit(e.target_unchecked_into::<HtmlInputElement>().value())
-        })
-    };
     let narrow = |field: &'static str, value: String| {
-        let (draft, set_filter) = (draft.clone(), set_filter.clone());
-        Callback::from(move |_: MouseEvent| set_filter.emit(and(&draft, &equals(field, &value))))
+        let (applied, set_filter) = (applied.clone(), set_filter.clone());
+        Callback::from(move |_: MouseEvent| set_filter.emit(and(&applied, &equals(field, &value))))
     };
     let load_more = {
         let (more, next, loading_more, applied) = (
@@ -206,22 +170,6 @@ pub fn audit() -> Html {
         })
     };
 
-    let status = match check(&draft) {
-        Check::Empty => {
-            html! { <span class="filter__hint muted">{ format!("Fields: {}", AUDIT_FIELDS.join(", ")) }</span> }
-        }
-        Check::Valid => html! { <span class="filter__hint text-ok">{ "Valid filter" }</span> },
-        Check::Unchecked => {
-            html! { <span class="filter__hint muted">{ "Uses `matches`; the server will check the pattern." }</span> }
-        }
-        Check::Invalid { message, advice } => html! {
-            <span class="filter__hint text-danger" role="alert" data-testid="filter-error">
-                { message }{ if advice.is_empty() { String::new() } else { format!(" {}", advice.join(" ")) } }
-            </span>
-        },
-    };
-    let invalid = matches!(check(&draft), Check::Invalid { .. });
-
     let rows = page.value().map(|p| {
         let mut items = p.items.clone();
         items.extend(more.iter().cloned());
@@ -234,14 +182,12 @@ pub fn audit() -> Html {
         },
         (Some((items, total)), _) => html! { <>
             if fresh > 0 {
-                <div class="banner banner--info" role="status">
-                    { format!("{fresh} new {} since this page loaded. ", if fresh == 1 { "entry" } else { "entries" }) }
-                    <Button small=true onclick={{ let r = page.reload.clone(); Callback::from(move |_| r.emit(())) }}>{ "Show" }</Button>
-                </div>
+                <yewi::Banner actions={html! { <Button small=true onclick={{ let r = page.reload.clone(); Callback::from(move |_| r.emit(())) }}>{ "Show" }</Button> }}>
+                    { format!("{fresh} new {} since this page loaded.", if fresh == 1 { "entry" } else { "entries" }) }
+                </yewi::Banner>
             }
             <p class="muted small">{ format!("{} of {total} entries", items.len()) }</p>
-            <div class="table-wrap">
-                <table class="table table--audit" data-testid="audit-table">
+            <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true class="table--audit" attrs={yewi::attrs! { "data-testid" => "audit-table" }}>
                     <thead><tr>
                         <th scope="col">{ "When" }</th><th scope="col">{ "Actor" }</th><th scope="col">{ "Action" }</th>
                         <th scope="col">{ "Outcome" }</th><th scope="col">{ "Subject" }</th><th scope="col">{ "Message" }</th>
@@ -287,14 +233,13 @@ pub fn audit() -> Html {
                                 </tr>
                                 if open {
                                     if let Some(detail) = &e.detail {
-                                        <tr class="table__detail" key={format!("{}-d", e.id)}><td colspan="7"><JsonTree value={detail.clone()} open={3} /></td></tr>
+                                        <tr class="yi-table__detail" key={format!("{}-d", e.id)}><td colspan="7"><JsonTree value={detail.clone()} open={3} /></td></tr>
                                     }
                                 }
                             </> }
                         }) }
                     </tbody>
-                </table>
-            </div>
+            </yewi::SimpleTable>
             if next.is_some() {
                 <div class="more"><Button onclick={load_more} busy={*loading_more}>{ "Load older entries" }</Button></div>
             }
@@ -305,34 +250,29 @@ pub fn audit() -> Html {
 
     html! {
         <div class="page page--wide">
-            <PageHead title="Audit" subtitle={html! { "Every operator action and controller transition." }}
+            <PageHead title="Audit"
                 actions={html! { <Refresh loading={page.loading} reload={page.reload.clone()} /> }} />
-            <Panel>
-                <div class="filter">
-                    <label class="field">
-                        <span class="field__label">{ "Filter (filt-rs)" }</span>
-                        <input class={classes!("input", "mono", invalid.then_some("input--invalid"))} type="search"
-                            value={(*draft).clone()} {oninput} spellcheck="false" autocomplete="off"
-                            placeholder={r#"actor == "alice" && action startswith "rollout.""#}
-                            aria-invalid={invalid.to_string()} data-testid="audit-filter" />
-                    </label>
-                    { status }
-                    <div class="chips" role="group" aria-label="Examples">
-                        { for EXAMPLES.iter().map(|(label, expr)| {
-                            let set_filter = set_filter.clone();
-                            html! { <button type="button" class="chip" title={expr.to_string()} onclick={Callback::from(move |_| set_filter.emit(expr.to_string()))}>{ *label }</button> }
-                        }) }
-                        if !draft.is_empty() {
-                            <button type="button" class="chip" onclick={{ let s = set_filter.clone(); Callback::from(move |_| s.emit(String::new())) }}>{ "Clear" }</button>
+            <div class="toolbar">
+                <div class="chips" role="group" aria-label="Example filters">
+                    <span class="muted small">{ "Examples" }</span>
+                    { for EXAMPLES.iter().map(|(label, expr)| {
+                        let set_filter = set_filter.clone();
+                        html! {
+                            <yewi::Button size={yewi::Size::Small} pressed={Some(applied == *expr)} attrs={yewi::attrs! { "title" => *expr }}
+                                on_click={Callback::from(move |_| set_filter.emit(expr.to_string()))}>{ *label }</yewi::Button>
                         }
-                    </div>
-                    <label class="toggle" title="Controller transitions that only show a host moving through a rollout's ordinary steps: planned, baseline, applying, baking.">
-                        <input type="checkbox" checked={progress} onchange={toggle_progress} data-testid="audit-progress" />
-                        <span>{ "Show rollout progress (planned, applying, baking…)" }</span>
-                    </label>
+                    }) }
+                    if !applied.is_empty() {
+                        <yewi::Button size={yewi::Size::Small} variant={yewi::ButtonVariant::Subtle}
+                            on_click={{ let s = set_filter.clone(); Callback::from(move |_| s.emit(String::new())) }}>{ "Clear" }</yewi::Button>
+                    }
                 </div>
-                { body }
-            </Panel>
+                <yewi::ToggleSwitch checked={progress} on_change={toggle_progress} size={yewi::Size::Small}
+                    attrs={yewi::attrs! { "data-testid" => "audit-progress", "title" => "Controller transitions that only show a host moving through a rollout's ordinary steps: planned, baseline, applying, baking." }}>
+                    { "Show rollout progress" }
+                </yewi::ToggleSwitch>
+            </div>
+            { body }
         </div>
     }
 }

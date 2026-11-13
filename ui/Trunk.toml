@@ -2,6 +2,14 @@
 target = "index.html"
 dist = "dist"
 
+# `build.rs` writes the yewi fonts into `fonts/` while cargo runs, which is after
+# Trunk resolves the assets in `index.html`, so a `copy-dir` link fails on a
+# clean checkout. Stage them once the build has finished instead.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["-c", "cp -R fonts \"$TRUNK_STAGING_DIR/fonts\""]
+
 [watch]
 watch = ["src", "styles", "styles.scss", "index.html"]
 

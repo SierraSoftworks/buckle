@@ -7,7 +7,6 @@ use buckle_api::{
     ActionInfo, DriftItem, HostCheck, HostDetail, ModuleReport, ModuleState, RemovalReport,
     ResourceSummary, RunReport, RunSummary,
 };
-use web_sys::HtmlSelectElement;
 use yew::prelude::*;
 
 use super::host::check_row;
@@ -19,7 +18,6 @@ use crate::components::changes::Took;
 use crate::components::run_report::{health_bar, module_steps, removal_steps, run_summary};
 use crate::components::{
     ActionsButton, Button, Changes, Empty, ErrorBlock, ErrorState, Kind, Loading, Panel, Pill,
-    icons,
 };
 use crate::hooks::{RunSource, use_fetch, use_now, use_run_report};
 use crate::logic::actions::of_module;
@@ -150,8 +148,7 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
         }
     } else {
         html! {
-            <div class="table-wrap">
-                <table class="table table--workloads" data-testid={many}>
+            <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true class="table--workloads" attrs={yewi::attrs! { "data-testid" => many }}>
                     <thead><tr>
                         <th scope="col">{ if cluster { "Workload" } else { "Module" } }</th>
                         <th scope="col">{ "Health" }</th>
@@ -196,7 +193,7 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
                                 { workload_row(d, r, cluster, false, module, run, is_open, toggle, now, live,
                                     row_actions(d, &r.name, props.on_action.as_ref(), props.on_check_drift.as_ref().map(|c| { let n = r.name.clone(); c.reform(move |_| n.clone()) }), format!("actions-{}", r.name))) }
                                 if is_open {
-                                    <tr class="table__detail" key={format!("{}-detail", r.name)} data-detail-of={r.name.clone()}>
+                                    <tr class="yi-table__detail" key={format!("{}-detail", r.name)} data-detail-of={r.name.clone()}>
                                         <td colspan="6">
                                             { workload_detail(d, r, cluster, module, &gone, run, now, live) }
                                         </td>
@@ -205,8 +202,7 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
                             </> }
                         }) }
                     </tbody>
-                </table>
-            </div>
+            </yewi::SimpleTable>
         }
     };
     html! {
@@ -314,7 +310,7 @@ pub(super) fn placement_row(props: &PlacementProps) -> Html {
     html! { <>
         { workload_row(d, &r, true, true, module, run, is_open, toggle, now, live, actions) }
         if is_open {
-            <tr class="table__detail" key={format!("{}-detail", d.summary.id)} data-detail-of={r.name.clone()} data-host={d.summary.id.clone()}>
+            <tr class="yi-table__detail" key={format!("{}-detail", d.summary.id)} data-detail-of={r.name.clone()} data-host={d.summary.id.clone()}>
                 <td colspan="6">{ workload_detail(d, &r, true, module, &gone, run, now, live) }</td>
             </tr>
         }
@@ -426,7 +422,7 @@ fn workload_row(
     actions: Option<Html>,
 ) -> Html {
     html! {
-        <tr key={r.name.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))}
+        <tr key={r.name.clone()} class={classes!("yi-table__row", "yi-table__row--clickable", open.then_some("yi-table__row--expanded"))}
             id={placement.then(|| format!("on-{}", d.summary.id))} data-host={placement.then(|| d.summary.id.clone())}
             data-workload={cluster.then(|| r.name.clone())} data-module={(!cluster).then(|| r.name.clone())}
             data-state={r.state.label().replace(' ', "-")} onclick={toggle.clone()}>
@@ -497,11 +493,9 @@ fn workload_row(
                 <span class="row-controls__actions" onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
                     { actions.unwrap_or_default() }
                 </span>
-                <button type="button" class="icon-btn row-toggle" onclick={toggle}
-                    aria-expanded={open.to_string()} aria-label={format!("Details of {}", r.name)}
-                    title={if open { "Hide details" } else { "Show health, run and resources" }}>
-                    { icons::chevron() }
-                </button>
+                <yewi::IconButton icon={yewi::icons::CHEVRON_RIGHT} class="row-toggle" size={yewi::Size::Small}
+                    variant={yewi::ButtonVariant::Subtle} on_click={toggle} label={format!("Details of {}", r.name)}
+                    attrs={yewi::attrs! { "aria-expanded" => open.to_string(), "title" => if open { "Hide details" } else { "Show health, run and resources" } }} />
             </td>
         </tr>
     }
@@ -590,42 +584,25 @@ fn run_picker(props: &PickerProps) -> Html {
             </span>
         }
     });
-    // The select shows the run shown, also after "Show the newest" or a
-    // recent-runs row changed it (an option's `selected` attribute does not
-    // move a select the reader has already changed).
-    let select = use_node_ref();
-    {
-        let select = select.clone();
-        let value = shown.clone().unwrap_or_default();
-        use_effect_with((value, runs.len()), move |(value, _)| {
-            if let Some(el) = select.cast::<HtmlSelectElement>() {
-                el.set_value(value);
-            }
-            || ()
-        });
-    }
-    let onchange = {
+    let on_change = {
         let (on_pick, newest) = (props.on_pick.clone(), props.newest.clone());
-        Callback::from(move |e: Event| {
-            let run = e.target_unchecked_into::<HtmlSelectElement>().value();
+        Callback::from(move |run: String| {
             on_pick.emit((Some(&run) != newest.as_ref()).then_some(run));
         })
     };
     let picker = (!runs.is_empty()).then(|| {
         let listed = shown.as_ref().is_some_and(|s| runs.iter().any(|r| &r.id == s));
+        let unlisted = shown.clone().filter(|_| !listed).map(|s| (AttrValue::from(s), AttrValue::from("newest")));
+        let options = unlisted.into_iter().chain(runs.iter().enumerate().map(|(i, r)| {
+            let state = r.state.map(run_label).map(str::to_string).unwrap_or_else(|| r.outcome.replace('_', " "));
+            let label = format!("{}{} · {state} · {}", if i == 0 { "newest · " } else { "" }, relative(r.started_at, now), commit(&r.revision));
+            (AttrValue::from(r.id.clone()), AttrValue::from(label))
+        })).collect::<std::rc::Rc<[_]>>();
         html! {
             <label class="run-picker">
                 <span class="muted small">{ "Run" }</span>
-                <select class="input" aria-label="Run to show" ref={select.clone()} {onchange}>
-                    if let (false, Some(s)) = (listed, shown) {
-                        <option value={s.clone()} selected=true>{ "newest" }</option>
-                    }
-                    { for runs.iter().enumerate().map(|(i, r)| {
-                        let state = r.state.map(run_label).map(str::to_string).unwrap_or_else(|| r.outcome.replace('_', " "));
-                        let label = format!("{}{} · {state} · {}", if i == 0 { "newest · " } else { "" }, relative(r.started_at, now), commit(&r.revision));
-                        html! { <option value={r.id.clone()} selected={shown.as_deref() == Some(r.id.as_str())}>{ label }</option> }
-                    }) }
-                </select>
+                <yewi::NativeSelect label="Run to show" size={yewi::Size::Small} fit=true {options}
+                    value={shown.clone().unwrap_or_default()} {on_change} />
             </label>
         }
     });

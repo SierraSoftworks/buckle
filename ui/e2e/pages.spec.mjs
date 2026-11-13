@@ -18,7 +18,7 @@ describe("every page renders in demo mode", () => {
     // The latest rollout: its name leads the subject, and the card carries
     // its state, what it changes and its progress. Its controls sit at the
     // top right of the card they act on.
-    await page.locator(".overview__rollout .panel__actions").getByTestId("rollout-controls").getByRole("button", { name: "Pause" }).waitFor();
+    await page.locator(".overview__rollout .yi-panel__actions").getByTestId("rollout-controls").getByRole("button", { name: "Pause" }).waitFor();
     const card = page.locator(".overview__rollout .commit");
     assert.equal((await card.locator(".commit__rollout").textContent()).trim(), "#42");
     assert.match(await card.locator(".commit__meta").textContent(), /\d+ modules.*\d+ workloads/);
@@ -41,10 +41,10 @@ describe("every page renders in demo mode", () => {
     const { page, close } = await open("/rollouts");
     const bell = page.getByTestId("attention-bell");
     const button = bell.getByRole("button", { name: /targets? needs? attention/ });
-    assert.match(await button.textContent(), /\d+/);
-    assert.equal(await bell.locator(".attention").count(), 0, "the list is only in the page while open");
+    assert.match(await bell.textContent(), /\d+/);
+    assert.equal(await bell.locator(".yi-notification-list").count(), 0, "the list is only in the page while open");
     await button.click();
-    const list = bell.locator(".attention");
+    const list = bell.locator(".yi-notification-list");
     assert.match(await list.textContent(), /awaiting registration approval/);
     assert.match(await list.textContent(), /expected 2\.0\.0-dev\.5/);
     assert.match(await list.textContent(), /failed in home/);
@@ -59,13 +59,13 @@ describe("every page renders in demo mode", () => {
     const { page, close } = await open("/", { flags: "awaiting" });
     const controls = page.getByTestId("rollout-controls");
     await controls.getByRole("button", { name: "Approve cloud…" }).click();
-    const dialog = page.getByRole("dialog", { name: "Approve cloud of rollout #42" });
+    const dialog = page.getByRole("alertdialog", { name: "Approve cloud of rollout #42" });
     assert.match(await dialog.getByTestId("approval-summary").textContent(), /12 hosts/);
     await dialog.getByRole("checkbox", { name: /I have reviewed/ }).check();
     await dialog.getByRole("button", { name: "Approve 12 hosts" }).click();
     await page.getByRole("status").filter({ hasText: "Approved cloud: 2 plans bound." }).waitFor();
     await decide(page, "Pause");
-    await page.getByRole("dialog", { name: "Pause rollout #42" }).getByRole("button", { name: "Pause rollout" }).click();
+    await page.getByRole("alertdialog", { name: "Pause rollout #42" }).getByRole("button", { name: "Pause rollout" }).click();
     // Paused with a failed host: retrying it is the face, resuming past
     // it is skipping the phase.
     await eventually(async () => {
@@ -109,7 +109,7 @@ describe("every page renders in demo mode", () => {
     assert.equal(await page.getByRole("button", { name: "Rollback…", exact: true }).count(), 5);
     const rejected = page.locator(".gitlog__item--rejected");
     assert.equal(await rejected.locator(".marker", { hasText: "Corrupt" }).count(), 1);
-    const aside = rejected.locator(".commit__aside .btn");
+    const aside = rejected.locator(".commit__aside .yi-button:not(.yi-button--icon-only)");
     assert.equal(await aside.count(), 1);
     assert.equal((await aside.textContent()).trim(), "Re-validate");
     // A skipped rollout links to the newer one that superseded it.
@@ -205,10 +205,10 @@ describe("every page renders in demo mode", () => {
     const rows = page.getByTestId("hosts-table").locator("tbody tr");
     assert.equal(await rows.first().getAttribute("data-host"), "rpi-new");
     assert.equal(await rows.count(), 27);
-    await page.getByRole("button", { name: /^Failing/ }).click();
+    await page.getByRole("link", { name: /^Failing/ }).click();
     await eventually(async () => assert.equal(await rows.count(), 2));
     assert.match(page.url(), /show=failing/);
-    await page.getByRole("searchbox", { name: "Search hosts" }).fill("hz-");
+    await page.getByRole("combobox", { name: "Search hosts" }).fill("hz-");
     await eventually(async () => assert.equal(await rows.count(), 1));
     await close();
   });
@@ -224,7 +224,7 @@ describe("every page renders in demo mode", () => {
     const paste = page.locator('tr[data-workload="paste"]');
     const chips = await paste.locator(".placement-chip").evaluateAll((els) => els.map((e) => e.dataset.host));
     assert.deepEqual(chips, ["home-nomad", "lab-nomad"], "one chip per cluster it runs on");
-    await page.getByRole("searchbox", { name: "Search workloads" }).fill("lab");
+    await page.getByRole("combobox", { name: "Search workloads" }).fill("lab");
     await eventually(async () => assert.equal(await rows.count(), 2));
     await paste.locator(".placement-chip", { hasText: "lab-nomad" }).click();
     assert.equal(await heading(page), "paste");
@@ -260,7 +260,7 @@ describe("every page renders in demo mode", () => {
     assert.match(await home.textContent(), /deploying atuin \(server 1\/2 healthy\)/);
     assert.match(await home.textContent(), /pi-1/);
     await page.getByRole("button", { name: /Add a cluster/ }).first().waitFor();
-    await page.getByRole("searchbox", { name: "Search clusters" }).fill("site=home");
+    await page.getByRole("combobox", { name: "Search clusters" }).fill("site=home");
     await eventually(async () => assert.equal(await rows.count(), 1));
     await home.click();
     await page.waitForURL(/\/clusters\/home-nomad/);
@@ -275,7 +275,7 @@ describe("every page renders in demo mode", () => {
     }
     // Health and the latest run live in the Workloads card, not cards of their own.
     for (const panel of ["Health", "Latest run", "Notes"]) {
-      assert.equal(await page.locator(".panel__title", { hasText: new RegExp(`^${panel}$`) }).count(), 0, panel);
+      assert.equal(await page.locator(".yi-panel__title", { hasText: new RegExp(`^${panel}$`) }).count(), 0, panel);
     }
     // Actions are each workload's own, on its row, not in the page's head.
     assert.equal(await page.locator(".page-head").getByRole("button", { name: /Restart/ }).count(), 0);
@@ -332,7 +332,7 @@ describe("every page renders in demo mode", () => {
     await page.locator(".page-head").getByRole("link", { name: "stewards home-nomad" }).click();
     assert.equal(await heading(page), "home-nomad");
     await page.getByRole("button", { name: "Move stewardship…" }).click();
-    const dialog = page.getByRole("dialog");
+    const dialog = page.getByRole("alertdialog");
     const to = dialog.getByTestId("steward-to");
     const target = await to.locator("option").nth(1).getAttribute("value");
     await to.selectOption(target);
@@ -359,7 +359,7 @@ describe("every page renders in demo mode", () => {
     for (const panel of ["Summary", "Labels", "Modules", "Drift", "Recent runs", "Facts"]) {
       await page.getByRole("heading", { name: panel, exact: true }).waitFor();
     }
-    const titles = await page.locator(".panel__title").allTextContents();
+    const titles = await page.locator(".yi-panel__title").allTextContents();
     assert.ok(titles.indexOf("Drift") < titles.indexOf("Modules"), "drift reads before the modules");
     // A module with drift starts open, tagging each resource for cleanup or not.
     const swappiness = page.locator("#modules .run-step[data-resource='sysctl.param[vm.swappiness]']");
@@ -401,7 +401,9 @@ describe("every page renders in demo mode", () => {
     assert.match(await meta.textContent(), /Alice Operator.*Bob Builder.*Carol Reviewer.*Claude/);
     assert.equal(await meta.locator(".avatar--claude").count(), 1);
     await meta.locator(".commit__author", { hasText: "Claude" }).hover();
-    assert.equal(await page.locator('.tip__pop a[href*="claude.ai/code/session_"]').count(), 2);
+    await eventually(async () =>
+      assert.equal(await page.locator('.tip__pop a[href*="claude.ai/code/session_"]').count(), 2),
+    );
     // One session: Claude's entry links straight to it; a short body has no toggle.
     const stable = page.locator(".gitlog__item--stable");
     assert.match(await stable.locator("a.commit__author").getAttribute("href"), /session_01DemoCaddyUpstream$/);
@@ -429,7 +431,7 @@ describe("every page renders in demo mode", () => {
   test("the overview keeps the running rollout while a newer one waits behind it", async () => {
     const { page, close } = await open("/rollouts");
     await page.getByRole("button", { name: "Rollback…", exact: true }).first().click();
-    const dialog = page.getByRole("dialog", { name: /Roll the fleet back/ });
+    const dialog = page.getByRole("alertdialog", { name: /Roll the fleet back/ });
     const typed = (await dialog.getByRole("button", { name: /Roll back to/ }).textContent()).replace("Roll back to", "").trim();
     await dialog.getByRole("textbox", { name: /Type/ }).fill(typed);
     await dialog.getByRole("button", { name: /Roll back to/ }).click();
@@ -446,9 +448,9 @@ describe("every page renders in demo mode", () => {
     await page.getByTestId("audit-table").waitFor();
     const all = await page.locator("tbody tr").count();
     assert.ok(all >= 10);
-    const box = page.getByTestId("audit-filter");
+    const box = page.getByRole("combobox", { name: "Filter the audit log" });
     await box.fill('actor == "alice" &&');
-    await page.getByTestId("filter-error").waitFor();
+    await page.getByRole("banner").getByRole("alert").waitFor();
     await box.fill('action startswith "rollout."');
     await eventually(async () =>
       assert.equal(new URL(page.url()).searchParams.get("filter"), 'action startswith "rollout."'),

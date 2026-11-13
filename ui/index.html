@@ -6,13 +6,15 @@
     <meta name="color-scheme" content="dark light" />
     <title>Buckle</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23d9a24a' stroke-width='2' stroke-linecap='round'%3E%3Crect x='3' y='6' width='18' height='12' rx='3'/%3E%3Cline x1='12' y1='3' x2='12' y2='21'/%3E%3C/svg%3E" />
-    <!-- Apply the stored theme before anything paints, so a light-theme
-         operator is never flashed with the dark one while the bundle loads. -->
+    <!-- Written by build.rs from the yewi-fonts crate and staged by the
+         post_build hook in Trunk.toml. -->
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+    <!-- Apply the stored theme before anything paints (yewi::THEME_SCRIPT),
+         so a light-theme operator is never flashed with the dark one while
+         the bundle loads. A choice made before the move to yewi is carried
+         over once. -->
     <script>
-      try {
-        var t = localStorage.getItem("buckle.theme");
-        if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
-      } catch (e) {}
+      (function(){try{var s=localStorage,t=s.getItem("yewi-theme"),o=s.getItem("buckle.theme");if(!t&&o){s.setItem("yewi-theme",t=o);s.removeItem("buckle.theme")}if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}})()
     </script>
     <link data-trunk rel="scss" href="styles.scss" />
     <link data-trunk rel="rust" data-bin="buckle-ui" data-wasm-opt="z" />

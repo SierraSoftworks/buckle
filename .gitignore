@@ -2,6 +2,7 @@
 **/target
 /ui/dist
 /ui/dist-e2e
+/ui/fonts
 /ui/node_modules
 /ui/target
 *.swp

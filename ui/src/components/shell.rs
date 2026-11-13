@@ -1,17 +1,22 @@
-//! The chrome around every page (design §12): a 48 px app bar, a 220 px
-//! sidebar that becomes a drawer on a narrow screen, and the page itself.
-//! The menu button opens the drawer on a narrow screen and hides or shows
-//! the sidebar (remembered) on a wide one.
+//! The chrome around every page (design §12), which is yewi's `AppShell`: an
+//! app bar, a sidebar that becomes a drawer on a narrow screen, and the page
+//! itself. The menu button opens the drawer on a narrow screen and hides or
+//! shows the sidebar (remembered) on a wide one. The app bar carries the
+//! page's search or filter box, so it stays put while the page scrolls.
 
 use yew::prelude::*;
 use yew_router::prelude::*;
+use yewi::{
+    AppBar, AppBarBrand, AppShell, IconData, NavTarget, Sidebar, SidebarItem, StatusDot,
+    ThemeToggle, UserMenu, icons as yi,
+};
 
 use super::attention::AttentionBell;
-use super::avatar::initials;
 use super::icons;
-use super::link::RouteLink;
-use super::theme::{self, Theme};
+use super::search::AppSearch;
+use super::ui::Badge;
 use crate::app::{Route, Session, use_auth};
+use crate::logic::tone::Tone;
 use crate::store::{Link, use_live};
 
 #[derive(Properties, PartialEq)]
@@ -21,15 +26,15 @@ pub struct ShellProps {
 }
 
 /// A destination: its label, its icon and its route.
-type NavItem = (&'static str, fn() -> Html, Route);
+type NavItem = (&'static str, IconData, Route);
 
 const NAV: &[NavItem] = &[
-    ("Overview", icons::overview, Route::Overview),
-    ("Rollouts", icons::rollouts, Route::Rollouts),
-    ("Hosts", icons::hosts, Route::Hosts),
-    ("Workloads", icons::workloads, Route::Workloads),
-    ("Clusters", icons::clusters, Route::Clusters),
-    ("Audit", icons::audit, Route::Audit),
+    ("Overview", yi::LAYOUT_DASHBOARD, Route::Overview),
+    ("Rollouts", yi::CHART_NO_AXES_COLUMN_DECREASING, Route::Rollouts),
+    ("Hosts", yi::SERVER, Route::Hosts),
+    ("Workloads", yi::LAYERS, Route::Workloads),
+    ("Clusters", yi::WAYPOINTS, Route::Clusters),
+    ("Audit", yi::SCROLL_TEXT, Route::Audit),
 ];
 
 /// The documentation site: modules, tasks, the command line and runbooks.
@@ -45,189 +50,118 @@ fn section(route: &Route) -> Route {
     }
 }
 
-#[function_component(Shell)]
-pub fn shell(props: &ShellProps) -> Html {
-    let route = use_route::<Route>().unwrap_or(Route::Overview);
-    let open = use_state(|| false);
-    let collapsed = use_state(|| crate::util::stored(NAV_COLLAPSED).is_some());
-    let theme = use_state(theme::current);
-
-    // Following a link closes the drawer, so the page it opened can be seen.
-    {
-        let open = open.clone();
-        use_effect_with(route.clone(), move |_| {
-            open.set(false);
-            || ()
-        });
-    }
-
-    let toggle_nav = {
-        let (open, collapsed) = (open.clone(), collapsed.clone());
-        Callback::from(move |_: MouseEvent| {
-            if narrow() {
-                open.set(!*open);
-            } else {
-                let next = !*collapsed;
-                crate::util::store(NAV_COLLAPSED, next.then_some("1"));
-                collapsed.set(next);
-            }
-        })
-    };
-    let close_nav = {
-        let open = open.clone();
-        Callback::from(move |_: MouseEvent| open.set(false))
-    };
-    let toggle_theme = {
-        let theme = theme.clone();
-        Callback::from(move |_: MouseEvent| {
-            let next = theme.other();
-            theme::set(next);
-            theme.set(next);
-        })
-    };
-
-    // Read at render: the button's next press acts on the layout of the moment.
-    let (shown, menu_label) = match (narrow(), *open, *collapsed) {
-        (true, true, _) => (true, "Close navigation"),
-        (true, false, _) => (false, "Open navigation"),
-        (false, _, false) => (true, "Hide navigation"),
-        (false, _, true) => (false, "Show navigation"),
-    };
-    let current = section(&route);
-    let nav = NAV.iter().map(|(label, icon, to)| {
-        let active = *to == current;
-        html! {
-            <RouteLink to={to.clone()} current={active}
-                classes={classes!("nav__item", active.then_some("nav__item--active"))}>
-                <span class="nav__icon">{ icon() }</span>
-                <span class="nav__label">{ *label }</span>
-            </RouteLink>
-        }
-    });
-
-    html! {
-        <div class="app">
-            <a class="skip-link" href="#main">{ "Skip to content" }</a>
-            <header class="app-bar">
-                <button type="button" class="icon-btn app-bar__menu" onclick={toggle_nav}
-                    aria-label={menu_label} title={menu_label}
-                    aria-controls="sidebar" aria-expanded={shown.to_string()}>
-                    { if *open { icons::close() } else { icons::menu() } }
-                </button>
-                <RouteLink to={Route::Overview} classes="app-bar__brand" label="Buckle overview">
-                    { icons::logo() }<span>{ "Buckle" }</span>
-                </RouteLink>
-                if crate::fixtures::is_demo() {
-                    <span class="badge badge--info" title="Every answer comes from the built-in fixtures. Add ?demo=off to leave.">{ "demo" }</span>
-                }
-                <span class="app-bar__spacer" />
-                <LinkStatus />
-                <AttentionBell />
-                <button type="button" class="icon-btn" onclick={toggle_theme} data-testid="theme-toggle"
-                    aria-label={format!("Switch to the {} theme", theme.other().name())}
-                    title={format!("Switch to the {} theme", theme.other().name())}>
-                    { if *theme == Theme::Dark { icons::sun() } else { icons::moon() } }
-                </button>
-                <UserChip />
-            </header>
-            <div class={classes!("app-body", collapsed.then_some("app-body--collapsed"))}>
-                if *open {
-                    <div class="scrim" aria-hidden="true" onclick={close_nav} />
-                }
-                <aside id="sidebar" class={classes!("sidebar", (*open).then_some("sidebar--open"))}>
-                    <nav class="nav" aria-label="Sections">
-                        { for nav }
-                        <a class="nav__item nav__item--external" href={DOCS_URL} target="_blank" rel="noopener"
-                            title="Modules, tasks, the command line and runbooks">
-                            <span class="nav__icon">{ icons::reference() }</span>
-                            <span class="nav__label">{ "Documentation" }</span>
-                            <span class="nav__hint" aria-hidden="true">{ icons::external() }</span>
-                        </a>
-                    </nav>
-                </aside>
-                <main class="app-main" id="main" tabindex="-1">
-                    { props.children.clone() }
-                </main>
-            </div>
-        </div>
-    }
-}
-
 /// Where a wide screen remembers that its sidebar was hidden.
 const NAV_COLLAPSED: &str = "buckle.nav.collapsed";
 
-/// Whether the sidebar is a drawer (`$narrow` in `_tokens.scss`).
-fn narrow() -> bool {
-    crate::util::window()
-        .match_media("(max-width: 860px)")
-        .ok()
-        .flatten()
-        .is_some_and(|m| m.matches())
+#[function_component(Shell)]
+pub fn shell(props: &ShellProps) -> Html {
+    let route = use_route::<Route>().unwrap_or(Route::Overview);
+    let current = section(&route);
+
+    let brand = html! {
+        <AppBarBrand logo={icons::logo()} href={NavTarget::route(Route::Overview)} label="Buckle overview">
+            { "Buckle" }
+        </AppBarBrand>
+    };
+    let actions = html! { <>
+        <LinkStatus />
+        <AttentionBell />
+        <ThemeToggle attrs={yewi::attrs! { "data-testid" => "theme-toggle" }} />
+        <UserArea />
+    </> };
+    let bar = html! {
+        <AppBar class="shell__bar" {brand} {actions} menu_label="Navigation">
+            if crate::fixtures::is_demo() {
+                <Badge tone={Tone::Info} title="Every answer comes from the built-in fixtures. Add ?demo=off to leave.">{ "demo" }</Badge>
+            }
+            <AppSearch />
+        </AppBar>
+    };
+    let docs = html! {
+        <SidebarItem href={NavTarget::href(DOCS_URL).external()} icon={yi::BOOK_OPEN}
+            attrs={yewi::attrs! { "title" => "Modules, tasks, the command line and runbooks" }}>
+            { "Documentation" }
+        </SidebarItem>
+    };
+    let sidebar = html! {
+        <Sidebar label="Sections" footer={docs}>
+            { for NAV.iter().map(|(label, icon, to)| html! {
+                <SidebarItem href={NavTarget::route(to.clone())} icon={*icon} current={*to == current}>
+                    { *label }
+                </SidebarItem>
+            }) }
+        </Sidebar>
+    };
+
+    html! {
+        <AppShell class="shell" {bar} {sidebar} storage_key={NAV_COLLAPSED}>
+            { props.children.clone() }
+        </AppShell>
+    }
 }
 
 /// Whether live updates are flowing.
 #[function_component(LinkStatus)]
 fn link_status() -> Html {
     let live = use_live();
-    let (class, label, title) = match live.link {
+    let (tone, active, label, title) = match live.link {
         Link::Open => (
-            "live--open",
+            yewi::Tone::Ok,
+            false,
             "live".to_string(),
             "Receiving live updates.".to_string(),
         ),
         Link::Connecting => (
-            "live--connecting",
+            yewi::Tone::Neutral,
+            true,
             "connecting".into(),
             "Connecting to live updates…".into(),
         ),
         Link::Retrying(s) => (
-            "live--retrying",
+            yewi::Tone::Warn,
+            true,
             "reconnecting".into(),
             format!(
                 "Live updates were interrupted; trying again in {s}s. Pages refresh when they resume."
             ),
         ),
         Link::Demo => (
-            "live--demo",
+            yewi::Tone::Info,
+            false,
             "fixtures".into(),
             "Demo mode: updates come from the built-in fixtures.".into(),
         ),
     };
     html! {
-        <span class={classes!("live", class)} title={title.clone()} role="status" aria-label={title}>
-            <span class="live__dot" aria-hidden="true" />
+        <span class="live" title={title.clone()} role="status" aria-label={title}>
+            <StatusDot {tone} {active} />
             <span class="live__label">{ label }</span>
         </span>
     }
 }
 
-#[function_component(UserChip)]
-fn user_chip() -> Html {
+/// Who is signed in, and the way out; or that nobody needs to be.
+#[function_component(UserArea)]
+fn user_area() -> Html {
     let auth = use_auth();
-    let sign_out = Callback::from(|_: MouseEvent| {
-        wasm_bindgen_futures::spawn_local(crate::auth::sign_out());
-    });
     match &auth.session {
         Session::SignedIn(me) => html! {
-            <div class="user">
-                <span class="user__avatar" aria-hidden="true">{ initials(&me.name) }</span>
-                <span class="user__meta">
-                    <span class="user__name">{ me.name.clone() }</span>
-                    <span class="user__role">{ if me.is_admin { "admin" } else { "read only" } }</span>
-                </span>
-                <button type="button" class="btn btn--subtle btn--small" onclick={sign_out}>{ "Sign out" }</button>
-            </div>
+            <UserMenu name={me.name.clone()} show_name=true
+                detail={if me.is_admin { "admin" } else { "read only" }}
+                on_sign_out={Callback::from(|()| {
+                    wasm_bindgen_futures::spawn_local(crate::auth::sign_out());
+                })} />
         },
         Session::Open { admin: true } => html! {
-            <span class="badge badge--warn" title="This server has no sign-in configured; every action is permitted (admin_acl, when set, still sees request metadata).">
+            <Badge tone={Tone::Warn} title="This server has no sign-in configured; every action is permitted (admin_acl, when set, still sees request metadata).">
                 { "no sign-in" }
-            </span>
+            </Badge>
         },
         Session::Open { admin: false } => html! {
             <span class="user">
-                <span class="badge badge--warn" title="This server has no sign-in configured; its admin_acl does not match this request's metadata, so actions are refused.">
+                <Badge tone={Tone::Warn} title="This server has no sign-in configured; its admin_acl does not match this request's metadata, so actions are refused.">
                     { "no sign-in" }
-                </span>
+                </Badge>
                 <span class="user__role">{ "read only" }</span>
             </span>
         },

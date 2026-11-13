@@ -4,6 +4,7 @@
 
 use buckle_api::{ActionInfo, ActionInstances};
 use yew::prelude::*;
+use crate::components::ui::Badge;
 
 use super::split_button::{MenuItem, SplitButton};
 use super::{Confirm, Segmented, use_toast};
@@ -26,12 +27,11 @@ pub fn instances_picker(props: &InstancesPickerProps) -> Html {
         .map(|(v, l)| (AttrValue::from(v.as_str()), AttrValue::from(*l)))
         .collect::<Vec<_>>();
     html! {
-        <div class="field">
-            <span class="field__label">{ "Runs in" }</span>
+        <yewi::Field group=true label="Runs in">
             <Segmented label="Where it runs" testid="action-instances" {options}
                 value={AttrValue::from(props.value.as_str())}
                 on_change={props.on_change.reform(|v: AttrValue| parse_instances(&v))} />
-        </div>
+</yewi::Field>
     }
 }
 use crate::logic::controls::TargetAction;
@@ -260,8 +260,8 @@ pub fn use_actions(on_started: Callback<()>) -> AnyTargetActions {
                 note=true note_required={a.confirm} note_placeholder="Why, for the audit log" busy={*busy}
                 error={(*error).clone()} on_confirm={confirm} on_cancel={cancel}>
                 <p>
-                    <span class="badge mono">{ format!("{}/{}", a.module, a.name) }</span>{ " " }
-                    <span class="badge">{ a.kind.clone() }</span>
+                    <Badge mono=true>{ format!("{}/{}", a.module, a.name) }</Badge>{ " " }
+                    <Badge>{ a.kind.clone() }</Badge>
                 </p>
                 if let Some(d) = &a.description { <p>{ d.clone() }</p> }
                 { picker.unwrap_or_default() }

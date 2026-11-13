@@ -7,9 +7,9 @@
   flex-direction: column;
   gap: 0.55rem;
   padding: 0.8rem 0.9rem 0.9rem;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
+  border: 1px solid var(--yi-line);
+  border-radius: var(--yi-radius-card);
+  background: var(--yi-surface);
 
   &__head {
     display: flex;
@@ -19,14 +19,14 @@
   }
 
   &__total {
-    color: var(--fg);
+    color: var(--yi-fg);
     font-size: 1.05rem;
     font-weight: 650;
     font-variant-numeric: tabular-nums;
     text-decoration: none;
 
     &:hover {
-      color: var(--brand);
+      color: var(--yi-accent-text);
     }
   }
 
@@ -39,7 +39,7 @@
   }
 
   &__part {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     text-decoration: none;
     font-variant-numeric: tabular-nums;
 
@@ -50,12 +50,12 @@
       height: 8px;
       margin-right: 0.35rem;
       border-radius: 2px;
-      background: var(--tone, var(--neutral));
+      background: var(--tone, var(--yi-neutral));
       vertical-align: 0;
     }
 
     &:hover {
-      color: var(--fg);
+      color: var(--yi-fg);
     }
 
     // Drift is counted on top of the states, not as a part of the bar.
@@ -83,7 +83,7 @@
     flex-wrap: wrap;
     gap: 0.2rem 0.75rem;
     padding: 0.45rem 0;
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--yi-line);
 
     &:last-child {
       border-bottom: none;
@@ -99,7 +99,7 @@
     width: 4px;
     align-self: stretch;
     border-radius: 2px;
-    background: var(--tone, var(--line-strong));
+    background: var(--tone, var(--yi-line-strong));
   }
 
   &__host {
@@ -111,7 +111,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.2rem 0.9rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 
   &__concern::before {
@@ -121,7 +121,7 @@
     height: 6px;
     margin-right: 0.4rem;
     border-radius: 50%;
-    background: var(--tone, var(--neutral));
+    background: var(--tone, var(--yi-neutral));
     vertical-align: middle;
   }
 }
@@ -137,7 +137,7 @@
     grid-template-columns: 1.4rem minmax(0, 1fr);
     gap: 0.75rem;
     padding: 0.7rem 0;
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--yi-line);
 
     &::before {
       content: "";
@@ -145,7 +145,7 @@
       left: calc(0.7rem - 1px);
       top: 0;
       bottom: 0;
-      border-left: 2px solid var(--line-strong);
+      border-left: 2px solid var(--yi-line-strong);
     }
 
     &:first-child::before {
@@ -158,13 +158,13 @@
     }
 
     &--rejected .gitlog__dot {
-      background: var(--danger);
-      border-color: var(--danger);
+      background: var(--yi-danger);
+      border-color: var(--yi-danger);
     }
 
     &--stable .gitlog__dot {
-      background: var(--ok);
-      border-color: var(--ok);
+      background: var(--yi-ok);
+      border-color: var(--yi-ok);
     }
   }
 
@@ -176,9 +176,9 @@
     height: 10px;
     margin: 0.35rem 0 0 calc(0.7rem - 5px);
     transform: rotate(45deg);
-    border: 2px solid var(--action);
+    border: 2px solid var(--bk-action);
     border-radius: 2px;
-    background: var(--surface);
+    background: var(--yi-surface);
   }
 
   &__dot {
@@ -187,9 +187,9 @@
     width: 12px;
     height: 12px;
     margin: 0.3rem 0 0 calc(0.7rem - 6px);
-    border: 2px solid var(--line-strong);
+    border: 2px solid var(--yi-line-strong);
     border-radius: 50%;
-    background: var(--surface);
+    background: var(--yi-surface);
   }
 
   &--compact &__item {
@@ -214,15 +214,15 @@
   align-items: flex-start;
   gap: 0.75rem;
   min-width: 0;
-  border-radius: var(--radius);
+  border-radius: var(--yi-radius-control);
 
   &--link {
     cursor: pointer;
-    transition: background var(--transition);
+    transition: background var(--yi-duration-fast) var(--yi-ease);
 
     &:hover {
-      background: var(--surface-2);
-      box-shadow: 0 0 0 0.4rem var(--surface-2);
+      background: var(--yi-tone-1);
+      box-shadow: 0 0 0 0.4rem var(--yi-tone-1);
     }
 
     // The subject's link covers the card; its own controls sit above it.
@@ -235,8 +235,8 @@
 
   &--boxed {
     padding: 0.6rem 0.75rem;
-    border: 1px solid var(--line);
-    background: var(--surface);
+    border: 1px solid var(--yi-line);
+    background: var(--yi-surface);
 
     &.commit--link:hover {
       box-shadow: none;
@@ -257,13 +257,13 @@
 
   &__subject {
     font-weight: 600;
-    color: var(--fg);
+    color: var(--yi-fg);
     text-decoration: none;
     overflow-wrap: anywhere;
   }
 
   &--link:hover &__subject {
-    color: var(--brand);
+    color: var(--yi-accent-text);
   }
 
   &__status {
@@ -298,13 +298,13 @@
       text-decoration: none;
 
       &:hover {
-        color: var(--brand);
+        color: var(--yi-accent-text);
       }
     }
   }
 
   &__session {
-    color: var(--brand);
+    color: var(--yi-accent-text);
     text-decoration: none;
     overflow-wrap: anywhere;
 
@@ -324,7 +324,7 @@
   // faded, until "Read more".
   &__body {
     margin: 0.35rem 0 0;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     max-width: 75ch;
   }
 
@@ -357,8 +357,8 @@
 
     pre {
       padding: 0.4rem 0.55rem;
-      border-radius: var(--radius);
-      background: var(--surface-2);
+      border-radius: var(--yi-radius-control);
+      background: var(--yi-tone-1);
       font-size: 0.8rem;
       overflow-x: auto;
     }
@@ -367,7 +367,7 @@
       width: 100%;
       margin: 0.1rem 0;
       border: 0;
-      border-top: 1px solid var(--line);
+      border-top: 1px solid var(--yi-line);
     }
   }
 
@@ -404,7 +404,7 @@
     padding: 0;
     border: 0;
     background: none;
-    color: var(--brand);
+    color: var(--yi-accent-text);
     font: inherit;
     font-size: 0.8rem;
     cursor: pointer;
@@ -422,7 +422,7 @@
     justify-content: flex-end;
     align-items: center;
     gap: 0.4rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.82rem;
   }
 
@@ -437,7 +437,13 @@
   }
 }
 
-.page-head__subtitle .commit {
+// A subtitle holding a rollout's commit card spans the page: yewi caps a
+// subtitle at a reading width, which suits a line of text.
+.page-head .yi-page-header__subtitle:has(.commit) {
+  max-width: none;
+}
+
+.page-head .yi-page-header__subtitle .commit {
   margin: 0.35rem 0 0.5rem;
 }
 
@@ -458,16 +464,16 @@
     grid-template-columns: 5.5rem 11rem minmax(0, 1fr) auto;
     gap: 0.6rem;
     padding: 0.35rem 0 0.35rem 0.7rem;
-    border-left: 2px solid var(--tone, var(--line));
+    border-left: 2px solid var(--tone, var(--yi-line));
     font-size: 0.84rem;
   }
 
   &__at {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 
   &__kind {
-    color: var(--tone, var(--fg-2));
+    color: var(--tone, var(--yi-fg-muted));
     overflow-wrap: anywhere;
   }
 
@@ -485,7 +491,7 @@
     align-items: center;
     gap: 0.25rem 0.6rem;
     padding: 0.35rem 0;
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--yi-line);
     font-size: 0.84rem;
 
     &:last-child {
@@ -496,15 +502,15 @@
   &__reason {
     flex: 1;
     min-width: 12rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 }
 
 .health-module {
   padding: 0.5rem 0.75rem 0.35rem;
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--tone, var(--line-strong));
-  border-radius: var(--radius);
+  border: 1px solid var(--yi-line);
+  border-left: 3px solid var(--tone, var(--yi-line-strong));
+  border-radius: var(--yi-radius-control);
 
   & + & {
     margin-top: 0.6rem;
@@ -523,7 +529,7 @@
   .checks {
     margin-left: 0.35rem;
     padding-left: 0.85rem;
-    border-left: 1px solid var(--line);
+    border-left: 1px solid var(--yi-line);
   }
 }
 
@@ -537,7 +543,7 @@
     width: 0.5rem;
     height: 0.9rem;
     border-radius: 2px;
-    background: var(--tone, var(--fg-3));
+    background: var(--tone, var(--yi-fg-subtle));
   }
 }
 
@@ -588,9 +594,9 @@
     width: 0.6rem;
     height: 0.6rem;
     margin-left: -0.3rem;
-    border: 2px solid var(--surface);
+    border: 2px solid var(--yi-surface);
     border-radius: 50%;
-    background: var(--tone, var(--fg-3));
+    background: var(--tone, var(--yi-fg-subtle));
     cursor: default;
     outline-offset: 2px;
 
@@ -627,11 +633,11 @@
     width: max-content;
     max-width: min(26rem, 80vw);
     padding: 0.5rem 0.65rem;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius);
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    color: var(--fg);
+    border: 1px solid var(--yi-line-strong);
+    border-radius: var(--yi-radius-control);
+    background: var(--yi-surface);
+    box-shadow: var(--yi-shadow-overlay);
+    color: var(--yi-fg);
     font-size: 0.8rem;
     line-height: 1.4;
     translate: -50% 0;
@@ -656,7 +662,7 @@
   }
 
   &__kind {
-    color: var(--tone, var(--fg-2));
+    color: var(--tone, var(--yi-fg-muted));
     font-weight: 600;
   }
 
@@ -664,8 +670,8 @@
     position: relative;
     height: 1.35rem;
     overflow: hidden;
-    border-radius: var(--radius-sm);
-    background: var(--surface-2);
+    border-radius: var(--yi-radius-sm);
+    background: var(--yi-tone-1);
   }
 
   &__seg {
@@ -730,13 +736,13 @@
   gap: 0.4rem;
   width: 100%;
 
-  &--error .input {
-    border-color: var(--danger);
+  &--error .yi-input {
+    border-color: var(--yi-danger);
   }
 
   &__error {
     grid-column: 1 / -1;
-    color: var(--danger);
+    color: var(--yi-danger);
     font-size: 0.78rem;
   }
 }
@@ -746,9 +752,9 @@
   flex-direction: column;
   gap: 0.45rem;
   padding: 0.65rem 0.75rem;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg);
+  border: 1px solid var(--yi-line);
+  border-radius: var(--yi-radius-control);
+  background: var(--yi-bg);
 
   &__row {
     display: grid;
@@ -758,19 +764,19 @@
   }
 
   &__label {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.8rem;
   }
 
   &__phase {
-    font-family: var(--font-mono);
+    font-family: var(--yi-font-mono);
   }
 }
 
 .changes {
   list-style: none;
   margin: 0.6rem 0;
-  font-family: var(--font-mono);
+  font-family: var(--yi-font-mono);
   font-size: 0.8rem;
 }
 
@@ -811,7 +817,7 @@
 
   &__children {
     padding-left: 1.1rem;
-    border-left: 1px solid var(--line);
+    border-left: 1px solid var(--yi-line);
     margin-left: 0.3rem;
   }
 
@@ -820,39 +826,29 @@
   }
 
   &__key {
-    color: var(--fg);
+    color: var(--yi-fg);
   }
 
   &__sep,
   &__count {
-    color: var(--fg-3);
+    color: var(--yi-fg-subtle);
   }
 
   &__str {
-    color: var(--ok);
+    color: var(--yi-ok);
   }
 
   &__num,
   &__bool {
-    color: var(--info);
+    color: var(--yi-info);
   }
 
   &__null {
-    color: var(--fg-3);
+    color: var(--yi-fg-subtle);
   }
 }
 
 // Audit
-.filter {
-  margin-bottom: 1rem;
-
-  &__hint {
-    display: block;
-    margin: -0.2rem 0 0.5rem;
-    font-size: 0.8rem;
-  }
-}
-
 .table--audit td:nth-child(6) {
   min-width: 18rem;
 }
@@ -881,17 +877,6 @@
   }
 }
 
-// A revision's rollout controls. A button is raised and solid; a marker
-// ([Stable], [Running], [Corrupt]) is flat, a tinted label with a dot, the
-// same size as the button so a card's right edge does not jump.
-.commit__aside .btn {
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.18);
-
-  &:active:not(:disabled) {
-    box-shadow: none;
-    transform: translateY(1px);
-  }
-}
 
 .marker {
   display: inline-flex;
@@ -899,7 +884,7 @@
   gap: 0.4rem;
   min-height: 26px;
   padding: 0.15rem 0.55rem;
-  border-radius: var(--radius);
+  border-radius: var(--yi-radius-control);
   background: var(--tone-soft);
   color: var(--tone);
   font-size: 0.82rem;
@@ -942,12 +927,12 @@
 .stable-mark svg {
   width: 12px;
   height: 12px;
-  color: var(--ok);
+  color: var(--yi-ok);
   vertical-align: -2px;
 }
 
 .revision-other {
-  color: var(--fg);
+  color: var(--yi-fg);
   font-weight: 600;
 }
 
@@ -967,7 +952,7 @@
 }
 
 .cell-sub.text-warn {
-  color: var(--warn);
+  color: var(--yi-warn);
 }
 
 // Cluster page: notes and labels in one card, beside the agents able to
@@ -977,7 +962,7 @@
   .panel__section {
     margin-top: 1rem;
     padding-top: 0.75rem;
-    border-top: 1px solid var(--line);
+    border-top: 1px solid var(--yi-line);
   }
 
   .panel__section > .subhead:first-child {
@@ -1017,7 +1002,7 @@
 
   &__progress {
     font-size: 0.8rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 }
 
@@ -1044,11 +1029,16 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--tone, var(--neutral));
+  background: var(--tone, var(--yi-neutral));
 }
 
 .placement-chip {
+  gap: 0.35rem;
   text-decoration: none;
+
+  .yi-status-dot {
+    margin-right: 0.35rem;
+  }
 }
 
 // The meter sits on the centre line of the row's first line of text.
@@ -1071,7 +1061,7 @@ tr[id] {
   font-size: 0.85rem;
 
   dt {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 
   dd {
@@ -1088,16 +1078,16 @@ tr[id] {
 // card: its rollout's name and the bolt in the action colour.
 .action-entry {
   &.commit--link:hover .commit__subject {
-    color: var(--action);
+    color: var(--bk-action);
   }
 
   &__rollout {
-    color: var(--action);
+    color: var(--bk-action);
   }
 
   &__icon {
     display: inline-flex;
-    color: var(--action);
+    color: var(--bk-action);
 
     svg {
       width: 14px;
@@ -1112,13 +1102,13 @@ tr[id] {
     align-items: center;
     min-height: 24px;
     padding: 0 0.3rem;
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.8rem;
     white-space: nowrap;
   }
 
   &__target {
-    color: var(--fg);
+    color: var(--yi-fg);
   }
 
   &__error {
@@ -1127,4 +1117,8 @@ tr[id] {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+}
+
+.pending {
+  margin-bottom: 0.75rem;
 }

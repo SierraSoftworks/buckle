@@ -62,9 +62,15 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 log = "0.4"
 wasm-logger = "0.2"
 console_error_panic_hook = "0.1"
+# The design system: every control, the shell, dialogs and typography.
+yewi = { version = "0.2", features = ["csr", "router"] }
 
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[build-dependencies]
+# The fonts yewi is set in, written into `fonts/` by build.rs.
+yewi-fonts = "0.2"

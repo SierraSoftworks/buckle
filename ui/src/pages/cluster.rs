@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use buckle_api::{Connection, HostStatus, HostSummary};
 use yew::prelude::*;
+use crate::components::ui::Badge;
 use yew_router::prelude::*;
 
 use super::clusters::{cluster_state_pills, steward_cell};
@@ -284,18 +285,14 @@ pub fn cluster_page(props: &Props) -> Html {
                 let chosen = (*steward_to).clone().or_else(|| candidates.first().cloned()).unwrap_or_default();
                 let onchange = {
                     let steward_to = steward_to.clone();
-                    Callback::from(move |e: Event| {
-                        steward_to.set(Some(e.target_unchecked_into::<web_sys::HtmlSelectElement>().value()));
-                    })
+                    Callback::from(move |value: String| steward_to.set(Some(value)))
                 };
                 ("Move stewardship".to_owned(), html! { <>
                     <p>{ format!("The agent holding {}'s lease watches it and runs its workloads and actions. Moving it lets the current steward finish what it is applying first.", c.id) }</p>
-                    <label class="field">
-                        <span class="field__label">{ "Move the lease to" }</span>
-                        <select class="input" aria-label="Move the lease to" data-testid="steward-to" {onchange}>
-                            { for candidates.iter().map(|h| html! { <option value={h.clone()} selected={*h == chosen}>{ h.clone() }</option> }) }
-                        </select>
-                    </label>
+                    <yewi::Field label="Move the lease to">
+                        <yewi::NativeSelect on_change={onchange} value={chosen.clone()} attrs={yewi::attrs! { "data-testid" => "steward-to" }}
+                            options={candidates.iter().map(|h| (AttrValue::from(h.clone()), AttrValue::from(h.clone()))).collect::<std::rc::Rc<[_]>>()} />
+                    </yewi::Field>
                 </> }, false, None)
             }
         };
@@ -371,7 +368,7 @@ pub fn cluster_page(props: &Props) -> Html {
         ),
         (
             "Groups",
-            html! { <>{ for c.groups.iter().map(|g| html! { <span class="badge">{ g.clone() }</span> }) }</> },
+            html! { <>{ for c.groups.iter().map(|g| html! { <Badge>{ g.clone() }</Badge> }) }</> },
         ),
         (
             "Workloads",

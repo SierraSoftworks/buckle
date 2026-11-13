@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use buckle_api::{Connection, HostDetail, HostRolloutState, HostStatus, HostSummary};
 use yew::prelude::*;
+use crate::components::ui::Badge;
 use yew_router::prelude::*;
 
 use super::modules_card::PlacementRow;
@@ -123,7 +124,7 @@ pub fn workload_page(props: &Props) -> Html {
     let needed_by = w.needed_by(&all);
     let link = |n: &str| match n.strip_prefix("module:") {
         Some(m) => {
-            html! { <span class="badge mono" title="a module on the cluster's nodes">{ m.to_owned() }</span> }
+            html! { <Badge mono=true title="a module on the cluster's nodes">{ m.to_owned() }</Badge> }
         }
         None => {
             html! { <RouteLink to={Route::Workload { name: n.to_owned() }} classes={classes!("mono")}>{ n.to_owned() }</RouteLink> }
@@ -246,8 +247,7 @@ fn placements(props: &PlacementsProps) -> Html {
     html! {
         <Panel title="Placements" id="placements"
             subtitle={format!("How it reads on {} and what each one's latest run did", count(props.details.len(), "cluster", "clusters"))}>
-            <div class="table-wrap">
-                <table class="table table--workloads" data-testid="placements">
+            <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true class="table--workloads" attrs={yewi::attrs! { "data-testid" => "placements" }}>
                     <thead><tr>
                         <th scope="col">{ "Cluster" }</th>
                         <th scope="col">{ "Health" }</th>
@@ -270,8 +270,7 @@ fn placements(props: &PlacementsProps) -> Html {
                             }
                         }) }
                     </tbody>
-                </table>
-            </div>
+            </yewi::SimpleTable>
             { actions.dialog.clone() }
         </Panel>
     }

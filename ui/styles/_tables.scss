@@ -1,64 +1,18 @@
 @use 'tokens' as *;
 
-.table-wrap {
-  // A containing block, so that an absolutely positioned descendant (a
-  // visually hidden column header) scrolls with the table instead of
-  // widening the page.
-  position: relative;
-  overflow-x: auto;
-}
-
-.table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.86rem;
-
-  th {
-    padding: 0.45rem 0.6rem;
-    border-bottom: 1px solid var(--line-strong);
-    color: var(--fg-2);
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-align: left;
-    text-transform: uppercase;
-    white-space: nowrap;
-  }
-
+// Tables are yewi's SimpleTable; these are the parts Buckle adds to it.
+.yi-table {
   td {
-    padding: 0.5rem 0.6rem;
-    border-bottom: 1px solid var(--line);
     vertical-align: top;
   }
 
-  tbody tr:hover > td {
-    background: color-mix(in srgb, var(--surface-2) 55%, transparent);
+  // The chevron of a row that opens its details turns when it is open.
+  .row-toggle .yi-icon {
+    transition: transform var(--yi-duration-fast) var(--yi-ease);
   }
 
-  tr.is-open > td {
-    background: var(--surface-2);
-  }
-
-  // A row that opens its details from a click anywhere on it.
-  &__toggle-row {
-    cursor: pointer;
-  }
-
-  .row-toggle .icon {
-    transition: transform var(--transition);
-  }
-
-  tr.is-open .row-toggle .icon {
+  .yi-table__row--expanded .row-toggle .yi-icon {
     transform: rotate(90deg);
-  }
-
-  &__detail > td {
-    background: var(--surface-2);
-    padding: 0.25rem 1rem 1rem;
-  }
-
-  &--compact td {
-    padding: 0.35rem 0.6rem;
   }
 }
 
@@ -68,7 +22,7 @@
 
 .cell-sub {
   display: block;
-  color: var(--fg-2);
+  color: var(--yi-fg-muted);
   font-size: 0.78rem;
   // A long path breaks rather than widening its column.
   overflow-wrap: anywhere;
@@ -85,7 +39,7 @@
   cursor: pointer;
 
   &:hover {
-    background: var(--surface-2);
+    background: var(--yi-tone-1);
   }
 
   &__target::after {
@@ -107,20 +61,20 @@
   cursor: pointer;
 
   &:hover {
-    background: var(--surface-2);
+    background: var(--yi-tone-1);
   }
 }
 
 // A group's heading row inside a table (a rollout's stage).
-.table__group {
+.yi-table__group {
   th {
     padding-top: 1rem;
-    border-bottom: 1px solid var(--line-strong);
+    border-bottom: 1px solid var(--yi-line-strong);
     background: transparent;
     text-transform: none;
     letter-spacing: normal;
     font-size: 0.85rem;
-    color: var(--fg);
+    color: var(--yi-fg);
   }
 
   &:first-child th {
