@@ -107,7 +107,7 @@ pub fn overview() -> Html {
                         None => html! { <Empty title="No stages yet" message="The fleet is laid out on a rollout's stages once the first rollout starts." /> },
                     } }
                 </Panel>
-                <Panel title="Rollouts" actions={html! { <RouteLink to={Route::Rollouts} classes="btn btn--small btn--subtle">{ "All rollouts" }</RouteLink> }}>
+                <Panel title="Rollouts" actions={html! { <yewi::Button size={yewi::Size::Small} variant={yewi::ButtonVariant::Subtle} href={yewi::NavTarget::route(Route::Rollouts)}>{ "All rollouts" }</yewi::Button> }}>
                     { match (&revisions_live, &revisions.error) {
                         (Some(list), _) if list.is_empty() => html! { <Empty title="No revisions yet" message="The server has not seen a commit of the configuration repository." /> },
                         (Some(list), _) => html! {
@@ -168,9 +168,9 @@ fn latest(
             <RolloutProgress rollout={s.clone()} {now} />
         </CommitCard>
         if let Some(reason) = &s.pause_reason {
-            <p class={classes!("note", (s.state == RolloutState::Paused).then_some("note--warn"))}>
+            <yewi::Banner class="note" tone={if s.state == RolloutState::Paused { yewi::Tone::Warn } else { yewi::Tone::Neutral }}>
                 <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
-            </p>
+            </yewi::Banner>
         }
     </> }
 }

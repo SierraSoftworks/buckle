@@ -85,9 +85,9 @@ function controls(page) {
 export async function act(split, name) {
   const s = split.first();
   await s.waitFor();
-  const face = s.locator(".split__main");
+  const face = s.locator(".yi-split-button__face");
   if ((await face.count()) && (await face.textContent()).trim() === name) return face.click();
-  await s.locator(".split__toggle").click();
+  await s.locator(".yi-split-button__toggle").click();
   await s.getByRole("menuitem", { name, exact: true }).click();
 }
 
@@ -95,9 +95,9 @@ export async function act(split, name) {
 export async function offered(split) {
   const s = split.first();
   await s.waitFor();
-  const main = s.locator(".split__main");
+  const main = s.locator(".yi-split-button__face");
   const face = (await main.count()) ? (await main.textContent()).trim() : null;
-  const toggle = s.locator(".split__toggle");
+  const toggle = s.locator(".yi-split-button__toggle");
   if (!(await toggle.count())) return { face, menu: [] };
   await toggle.click();
   const menu = (await s.getByRole("menuitem").allTextContents()).map((t) => t.trim());

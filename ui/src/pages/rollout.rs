@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::components::ui::Badge;
 use buckle_api::{
     ApproveRequest, ContinueRequest, HostRolloutState, HostSummary, LiveEvent, PlanGroup,
     RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
@@ -17,7 +18,6 @@ use crate::components::ui::{Note, NoteKind};
 
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
-use crate::components::icons;
 use crate::components::meter::stage_segments;
 use crate::components::ui::Copyable;
 use crate::components::{
@@ -251,7 +251,7 @@ pub fn rollout_page(props: &Props) -> Html {
             <p class="rollout-action" data-testid="rollout-action">
                 <Pill tone={Tone::Info} label="action" />{ " " }
                 <span class="strong">{ a.label.clone() }</span>{ " " }
-                <span class="badge mono">{ format!("{}/{}", a.module, a.action) }</span>
+                <Badge mono=true>{ format!("{}/{}", a.module, a.action) }</Badge>
                 <span class="muted">{ match &a.selector {
                     Some(sel) => format!(" on the targets {sel} matches, through the phases of {}", short(&s.revision)),
                     None => format!(" on every target offering it, through the phases of {}", short(&s.revision)),
@@ -291,7 +291,7 @@ pub fn rollout_page(props: &Props) -> Html {
         <div class="page page--wide">
             <PageHead title={format!("Rollout {}", rollout_label(&s.id))} {subtitle} actions={head_actions} />
             if let Some(reason) = &s.pause_reason {
-                <div class={classes!("banner", if s.state == RolloutState::Paused { "banner--warn" } else { "banner--info" })} role="status">
+                <yewi::Banner tone={if s.state == RolloutState::Paused { yewi::Tone::Warn } else { yewi::Tone::Info }}>
                     <strong>{ if s.state == RolloutState::Paused { "Paused: " } else { "Stopped: " } }</strong>{ reason.clone() }
                     if admin && s.state == RolloutState::Paused {
                         <span class="muted">{ if failed(&d).is_empty() {
@@ -300,13 +300,13 @@ pub fn rollout_page(props: &Props) -> Html {
                             " Retry what failed once its cause is fixed, act on each from its row's menu, or skip this phase, roll back or abort the rollout."
                         } }</span>
                     }
-                </div>
+                </yewi::Banner>
             }
             if let Some(by) = s.superseded_by.as_ref().filter(|_| s.state == RolloutState::Skipped) {
-                <div class="banner banner--info" role="status">
+                <yewi::Banner>
                     <strong>{ "Skipped: " }</strong>{ "rollout " }<RouteLink to={Route::rollout(by)}>{ rollout_label(by) }</RouteLink>
                     { " of a newer revision superseded this one while it was queued, so it never started." }
-                </div>
+                </yewi::Banner>
             }
             <Panel title="Pipeline" subtitle={{
                 let all = || d.phases.iter().flat_map(|p| &p.hosts);
@@ -1282,7 +1282,7 @@ fn host_table(props: &HostTableProps) -> Html {
                 None => format!("stage-{}", phase.name),
             };
             let head = html! {
-                <tr class="table__group" {key} data-stage={phase.name.clone()} data-step={step.map(|s| s.to_string())}>
+                <tr class="yi-table__group" {key} data-stage={phase.name.clone()} data-step={step.map(|s| s.to_string())}>
                     <th colspan="7" scope="colgroup">
                         <span class="group-head">
                             <span class="group-head__name">{ match step {
@@ -1293,7 +1293,7 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <Pill tone={phase_state_tone(phase.state)} label={phase_state_label(phase.state)} />
                                 <Meter segments={stage_segments(&c)} total={c.total} />
                                 <span class="muted small">{ format!("{}/{} done", c.healthy, c.total) }</span>
-                                if all_need_approval { <span class="badge badge--info">{ "needs approval" }</span> }
+                                if all_need_approval { <Badge tone={Tone::Info}>{ "needs approval" }</Badge> }
                             }
                             if hidden > 0 {
                                 <span class="muted small" data-testid="hidden-unchanged">{ format!("{hidden} unchanged not shown") }</span>
@@ -1311,8 +1311,7 @@ fn host_table(props: &HostTableProps) -> Html {
         }).collect::<Vec<_>>()
     });
     html! {
-        <div class="table-wrap">
-            <table class="table table--hosts">
+        <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true class="table--hosts">
                 <thead><tr>
                     <th scope="col">{ "Target" }</th>
                     <th scope="col">{ "Wave" }</th>
@@ -1348,7 +1347,7 @@ fn host_table(props: &HostTableProps) -> Html {
                             })
                         };
                         html! { <>
-                            <tr key={unit.clone()} class={classes!("table__toggle-row", open.then_some("is-open"))} onclick={on_row}
+                            <tr key={unit.clone()} class={classes!("yi-table__row", "yi-table__row--clickable", open.then_some("yi-table__row--expanded"))} onclick={on_row}
                                 data-unit={unit.clone()} data-unchanged={units::unchanged(h).then_some("true")}>
                                 <td>{ unit_cell(h, props.hosts.get(&h.host), props.now) }</td>
                                 <td class="muted">{ h.wave.map(|w| w.to_string()).unwrap_or_else(|| "—".into()) }</td>
@@ -1356,9 +1355,9 @@ fn host_table(props: &HostTableProps) -> Html {
                                     <HoverTip tip={health_tip(phase, h)} label={format!("{}: {}", units::name(h), host_state_label(h.state))}>
                                         <Pill tone={host_state_tone(h.state)} label={host_state_label(h.state)} />
                                     </HoverTip>
-                                    if h.needs_approval && !all_need_approval { <span class="badge badge--info">{ "needs approval" }</span> }
+                                    if h.needs_approval && !all_need_approval { <Badge tone={Tone::Info}>{ "needs approval" }</Badge> }
                                     if h.needs_attention {
-                                        <span class="badge badge--danger" title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</span>
+                                        <Badge tone={Tone::Danger} title="The host's own rollback failed: it may be left on a mix of revisions. See the error below.">{ "needs attention" }</Badge>
                                     }
                                     if let Some(until) = h.bake_until.filter(|u| h.state == HostRolloutState::Baking && *u > props.now) {
                                         <span class="small muted">{ " " }<Countdown {until} /></span>
@@ -1387,32 +1386,30 @@ fn host_table(props: &HostTableProps) -> Html {
                                         }).unwrap_or_else(|| html! { <span class="muted">{ "—" }</span> }) }
                                     </span>
                                     if h.preview {
-                                        <span class="badge" data-testid="plan-preview"
-                                            title="Planned at the rollout's start; planned again when its stage opens">{ "preview" }</span>
+                                        <Badge testid="plan-preview"
+                                            title="Planned at the rollout's start; planned again when its stage opens">{ "preview" }</Badge>
                                     }
                                     if let Some(from) = &h.drifted_from {
-                                        <span class="badge badge--warn" data-testid="plan-drifted"
-                                            title={format!("The plan changed since its preview ({})", short(from))}>{ "changed since preview" }</span>
+                                        <Badge tone={Tone::Warn} testid="plan-drifted"
+                                            title={format!("The plan changed since its preview ({})", short(from))}>{ "changed since preview" }</Badge>
                                     }
                                 </td>
                                 <td>
-                                    { for h.failed_checks.iter().map(|c| html! { <span class="badge badge--danger mono">{ c.clone() }</span> }) }
-                                    { for h.waived_checks.iter().map(|c| html! { <span class="badge mono" title="waived for this rollout">{ format!("waived {c}") }</span> }) }
+                                    { for h.failed_checks.iter().map(|c| html! { <Badge tone={Tone::Danger} mono=true>{ c.clone() }</Badge> }) }
+                                    { for h.waived_checks.iter().map(|c| html! { <Badge mono=true title="waived for this rollout">{ format!("waived {c}") }</Badge> }) }
                                 </td>
-                                <td title={timestamp(h.updated_at)}>{ relative(h.updated_at, props.now) }</td>
+                                <td class="nowrap" title={timestamp(h.updated_at)}>{ relative(h.updated_at, props.now) }</td>
                                 <td class="row-controls">
                                     if props.admin {
                                         <SplitButton items={host_menu(h, &props.on_ask)} small=true menu_label={format!("More actions for {}", units::name(h))} testid="host-actions" />
                                     }
-                                    <button type="button" class="icon-btn row-toggle" onclick={toggle}
-                                        aria-expanded={open.to_string()} aria-label={format!("Details for {}", units::name(h))}
-                                        title={if open { "Hide details" } else { "Show details" }}>
-                                        { icons::chevron() }
-                                    </button>
+                                    <yewi::IconButton icon={yewi::icons::CHEVRON_RIGHT} class="row-toggle" size={yewi::Size::Small}
+                                        variant={yewi::ButtonVariant::Subtle} on_click={toggle} label={format!("Details for {}", units::name(h))}
+                                        attrs={yewi::attrs! { "aria-expanded" => open.to_string(), "title" => if open { "Hide details" } else { "Show details" } }} />
                                 </td>
                             </tr>
                             if open {
-                                <tr class="table__detail" key={format!("{unit}-detail")}>
+                                <tr class="yi-table__detail" key={format!("{unit}-detail")}>
                                     <td colspan="7">
                                         <HostDetailRow detail={props.detail.clone()} host={h.clone()} admin={props.admin} on_run={props.on_run.clone()} now={props.now} />
                                     </td>
@@ -1422,8 +1419,7 @@ fn host_table(props: &HostTableProps) -> Html {
                     }) }
                     </> }) }
                 </tbody>
-            </table>
-        </div>
+        </yewi::SimpleTable>
     }
 }
 
@@ -1628,7 +1624,7 @@ fn unit_cell(h: &RolloutHost, target: Option<&HostSummary>, now: DateTime<Utc>) 
             <span class="unit-name">
                 <RouteLink to={Route::unit(h)} query={crate::components::pipeline::unit_query(h)}>{ units::name(h).to_owned() }</RouteLink>
                 <span class="muted">{ format!(" on {cluster}") }</span>
-                if h.removal { { " " }<span class="badge" title="It left the configuration; this removes it from the cluster">{ "removing" }</span> }
+                if h.removal { { " " }<Badge title="It left the configuration; this removes it from the cluster">{ "removing" }</Badge> }
             </span>
         },
         None => html! { <HostLink id={h.host.clone()} host={target.cloned()} {now} /> },

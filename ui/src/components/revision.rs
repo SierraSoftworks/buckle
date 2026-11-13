@@ -191,8 +191,8 @@ pub fn revision_controls(props: &RevisionControlsProps) -> Html {
         },
         Some(Stance::Review) => match &props.rollout {
             Some(r) => html! {
-                <RouteLink to={Route::rollout(&r.id)} classes="btn btn--small btn--info"
-                    title="This rollout is waiting for an approval">{ "Review…" }</RouteLink>
+                <yewi::Button size={yewi::Size::Small} variant={yewi::ButtonVariant::Primary} href={yewi::NavTarget::route(Route::rollout(&r.id))}
+                attrs={yewi::attrs! { "title" => "This rollout is waiting for an approval" }}>{ "Review…" }</yewi::Button>
             },
             None => html! {},
         },

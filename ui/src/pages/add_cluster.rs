@@ -81,14 +81,9 @@ fn request(
     })
 }
 
-fn text(state: &UseStateHandle<String>) -> Callback<InputEvent> {
+fn text(state: &UseStateHandle<String>) -> Callback<String> {
     let state = state.clone();
-    Callback::from(move |e: InputEvent| {
-        state.set(
-            e.target_unchecked_into::<web_sys::HtmlInputElement>()
-                .value(),
-        )
-    })
+    Callback::from(move |value: String| state.set(value))
 }
 
 fn file_block(name: &str, contents: &str) -> Html {
@@ -255,49 +250,35 @@ pub fn add_cluster(props: &AddClusterProps) -> Html {
                 .or_else(|| (!id.is_empty()).then(|| draft.clone().err()).flatten());
             (
                 html! { <>
-                    <label class="field">
-                        <span class="field__label">{ "Name" }</span>
-                        <input class="input mono" type="text" placeholder={name_hint} spellcheck="false"
-                            value={(*id).clone()} oninput={text(&id)} />
-                        <span class="field__hint">{ "A cluster buckle.yaml does not declare. Declared clusters appear here on their own." }</span>
-                    </label>
-                    <div class="field">
-                        <span class="field__label">{ "Scheduler" }</span>
-                        <div class="wizard__choices wizard__choices--two" role="radiogroup" aria-label="Scheduler">
-                            { kind_choice(ClusterKind::Nomad, "Nomad") }
-                            { kind_choice(ClusterKind::Kubernetes, "Kubernetes") }
-                        </div>
-                    </div>
-                    <label class="field">
-                        <span class="field__label">{ "API" }</span>
-                        <input class="input mono" type="text" placeholder={api_hint} spellcheck="false"
-                            value={(*api_url).clone()} oninput={text(&api_url)} />
-                        <span class="field__hint">{ "As its executor reaches it. Leave blank for the executor's local default." }</span>
-                    </label>
-                    <div class="field">
-                        <span class="field__label">{ "Executor" }</span>
-                        <div class="wizard__choices wizard__choices--two" role="radiogroup" aria-label="Executor">
-                            { choice(Executor::Hosts, "Hosts of the fleet", "Hosts near the cluster apply its workloads with a token Buckle issues.") }
-                            { choice(Executor::Inside, "Inside the cluster", "A job or pod in the cluster applies them with its workload identity.") }
-                        </div>
-                    </div>
-                    if *executor == Executor::Hosts {
-                        <label class="field">
-                            <span class="field__label">{ "Executors" }</span>
-                            <input class="input mono" type="text" placeholder={executors_hint} spellcheck="false"
-                                value={(*selector).clone()} oninput={text(&selector)} />
-                            <span class="field__hint">{ "A selector over host.* choosing the hosts that may speak for it." }</span>
-                        </label>
-                    } else {
-                        <label class="field">
-                            <span class="field__label">{ "Signing keys" }</span>
-                            <input class="input mono" type="text" placeholder={jwks_url(*kind, api_hint)} spellcheck="false"
-                                value={(*jwks).clone()} oninput={text(&jwks)} />
-                            <span class="field__hint">{ "Where the server reads the keys the cluster signs workload identities with." }</span>
-                        </label>
-                    }
-                    if let Some(p) = problem { <Note kind={NoteKind::Danger}>{ p }</Note> }
-                </> },
+                                    <yewi::Field label="Name" hint={html! { { "A cluster buckle.yaml does not declare. Declared clusters appear here on their own." } }}>
+                    <yewi::TextInput mono=true placeholder={name_hint} value={(*id).clone()} on_input={text(&id)} />
+                </yewi::Field>
+                                    <yewi::Field group=true label="Scheduler">
+                                        <div class="wizard__choices wizard__choices--two" role="radiogroup" aria-label="Scheduler">
+                                            { kind_choice(ClusterKind::Nomad, "Nomad") }
+                                            { kind_choice(ClusterKind::Kubernetes, "Kubernetes") }
+                                        </div>
+                </yewi::Field>
+                                    <yewi::Field label="API" hint={html! { { "As its executor reaches it. Leave blank for the executor's local default." } }}>
+                    <yewi::TextInput mono=true placeholder={api_hint} value={(*api_url).clone()} on_input={text(&api_url)} />
+                </yewi::Field>
+                                    <yewi::Field group=true label="Executor">
+                                        <div class="wizard__choices wizard__choices--two" role="radiogroup" aria-label="Executor">
+                                            { choice(Executor::Hosts, "Hosts of the fleet", "Hosts near the cluster apply its workloads with a token Buckle issues.") }
+                                            { choice(Executor::Inside, "Inside the cluster", "A job or pod in the cluster applies them with its workload identity.") }
+                                        </div>
+                </yewi::Field>
+                                    if *executor == Executor::Hosts {
+                                        <yewi::Field label="Executors" hint={html! { { "A selector over host.* choosing the hosts that may speak for it." } }}>
+                    <yewi::TextInput mono=true placeholder={executors_hint} value={(*selector).clone()} on_input={text(&selector)} />
+                </yewi::Field>
+                                    } else {
+                                        <yewi::Field label="Signing keys" hint={html! { { "Where the server reads the keys the cluster signs workload identities with." } }}>
+                    <yewi::TextInput mono=true placeholder={jwks_url(*kind, api_hint)} value={(*jwks).clone()} on_input={text(&jwks)} />
+                </yewi::Field>
+                                    }
+                                    if let Some(p) = problem { <Note kind={NoteKind::Danger}>{ p }</Note> }
+                                </> },
                 html! { <>
                     <Button kind={Kind::Subtle} onclick={close.clone()}>{ "Cancel" }</Button>
                     <Button kind={Kind::Primary} busy={*busy} disabled={draft.is_err()} onclick={create}>{ "Add cluster" }</Button>

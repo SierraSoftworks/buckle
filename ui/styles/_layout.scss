@@ -1,137 +1,39 @@
-// The shell: 48 px app bar, 220 px sidebar (a drawer on a narrow screen),
-// and the page column.
+// The page frame. The shell itself (app bar, sidebar, drawer) is yewi's
+// AppShell; this lays out what goes in it.
 @use 'tokens' as *;
 
-.app {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
+// Buckle's mark in the app bar.
+.yi-app-bar__logo .logo {
+  width: var(--yi-app-bar-logo-size);
+  height: var(--yi-app-bar-logo-size);
 }
 
-.app-bar {
-  position: sticky;
-  top: 0;
-  z-index: 30;
-  height: var(--bar-h);
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0 1rem;
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
-
-  &__brand {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-weight: 650;
-    font-size: 1rem;
-    text-decoration: none;
-    color: var(--fg);
-
-    .logo {
-      color: var(--brand);
-    }
-  }
-
-  &__spacer {
-    flex: 1;
-  }
-}
-
-.app-body {
+// The search box takes the middle of the app bar, up to a comfortable
+// reading width, the way a browser's address bar does.
+.shell__search {
   flex: 1;
-  display: grid;
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
-  align-items: start;
-
-  // A wide screen's sidebar, hidden from the menu button.
-  &--collapsed {
-    grid-template-columns: minmax(0, 1fr);
-
-    .sidebar {
-      display: none;
-    }
-  }
-}
-
-.sidebar {
-  position: sticky;
-  top: var(--bar-h);
-  height: calc(100vh - var(--bar-h));
-  overflow-y: auto;
-  border-right: 1px solid var(--line);
-  padding: 0.9rem 0.7rem;
-  background: var(--bg);
-}
-
-.nav {
-  display: flex;
-  flex-direction: column;
-  gap: 0.1rem;
-
-  &__item {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.45rem 0.6rem;
-    border-radius: var(--radius-sm);
-    color: var(--fg-2);
-    font-weight: 500;
-    text-decoration: none;
-    transition: background var(--transition), color var(--transition);
-
-    &:hover {
-      background: var(--surface-2);
-      color: var(--fg);
-    }
-
-    &--active {
-      background: var(--surface-2);
-      color: var(--fg);
-
-      .nav__icon {
-        color: var(--brand);
-      }
-    }
-  }
-
-  &__icon {
-    display: inline-flex;
-    color: var(--fg-3);
-  }
-
-  // Leaves the app: set apart from the sections above it.
-  &__item--external {
-    margin-top: 0.6rem;
-    border-top: 1px solid var(--line);
-    border-radius: 0 0 var(--radius-sm) var(--radius-sm);
-    padding-top: 0.8rem;
-  }
-
-  &__hint {
-    display: inline-flex;
-    margin-left: auto;
-    color: var(--fg-3);
-
-    svg {
-      width: 0.85rem;
-      height: 0.85rem;
-    }
-  }
-}
-
-.app-main {
   min-width: 0;
-  outline: none;
+  max-width: 44rem;
+  margin-inline: auto;
+}
+
+@media (max-width: $small) {
+  // The word is on every page's badge in demo mode; the box needs the row.
+  .shell__bar .badge {
+    display: none;
+  }
 }
 
 .page {
   max-width: 1200px;
-  padding: 1.5rem 2rem 4rem;
 
   &--wide {
     max-width: none;
+  }
+
+  // Room between the page's title and what it is the title of.
+  > .yi-page-header {
+    margin-bottom: var(--yi-space-xl);
   }
 }
 
@@ -142,61 +44,26 @@
   padding: 2rem;
 }
 
-.scrim {
-  display: none;
-}
-
 .grid {
   display: grid;
-  gap: 1rem;
-  margin-top: 1rem;
+  gap: var(--yi-space-2xl) var(--yi-space-xl);
+  margin-top: var(--yi-space-2xl);
 
   &--host {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    margin: 0 0 1rem;
+    margin: 0 0 var(--yi-space-2xl);
   }
 
   &__wide {
     grid-column: 1 / -1;
   }
+
+  > .panel + .panel {
+    margin-top: 0;
+  }
 }
 
 @media (max-width: $narrow) {
-  .app-body,
-  .app-body--collapsed {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .sidebar,
-  .app-body--collapsed .sidebar {
-    display: block;
-    position: fixed;
-    left: 0;
-    top: var(--bar-h);
-    z-index: 25;
-    width: var(--sidebar-w);
-    transform: translateX(-100%);
-    transition: transform 160ms ease;
-    background: var(--surface);
-    box-shadow: var(--shadow);
-
-    &--open {
-      transform: none;
-    }
-  }
-
-  .scrim {
-    display: block;
-    position: fixed;
-    inset: var(--bar-h) 0 0 0;
-    z-index: 20;
-    background: var(--scrim);
-  }
-
-  .page {
-    padding: 1rem 1rem 3rem;
-  }
-
   .grid--host {
     grid-template-columns: minmax(0, 1fr);
   }

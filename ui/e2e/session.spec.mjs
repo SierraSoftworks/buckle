@@ -4,7 +4,11 @@
 import { describe, test } from "node:test";
 import { assert, eventually, open, url } from "./helpers.mjs";
 
-const theme = (page) => page.evaluate(() => document.documentElement.dataset.theme);
+// The chosen theme, or the system's while none is chosen.
+const theme = (page) =>
+  page.evaluate(
+    () => document.documentElement.dataset.theme ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"),
+  );
 
 describe("theme", () => {
   test("follows the system until chosen, then remembers the choice", async () => {
@@ -19,7 +23,7 @@ describe("theme", () => {
     await page.getByTestId("theme-toggle").click();
     assert.equal(await theme(page), "light");
     assert.notEqual(await background(), dark, "the same rules, different values");
-    assert.equal(await page.evaluate(() => localStorage.getItem("buckle.theme")), "light");
+    assert.equal(await page.evaluate(() => localStorage.getItem("yewi-theme")), "light");
     await page.reload();
     // Applied by index.html before the bundle runs, and kept by it after.
     assert.equal(await theme(page), "light");
@@ -70,7 +74,8 @@ describe("session", () => {
   test("the session is shown and signing out leaves", async () => {
     const { page, close } = await open("/");
     await page.getByRole("banner").getByText("Alice Operator").waitFor();
-    await page.getByRole("button", { name: "Sign out" }).click();
+    await page.getByRole("banner").getByRole("button", { name: /Alice Operator/ }).click();
+    await page.getByRole("menuitem", { name: "Sign out" }).click();
     await page.waitForURL(url("/").replace(/\?.*/, "") + "?demo");
     await close();
   });
@@ -79,7 +84,7 @@ describe("session", () => {
     const { page, close } = await open("/", { viewport: { width: 390, height: 844 } });
     const nav = page.getByRole("navigation", { name: "Sections" });
     assert.ok(!(await nav.isVisible()) || (await nav.boundingBox()).x < 0);
-    await page.getByRole("button", { name: "Open navigation" }).click();
+    await page.getByRole("button", { name: "Navigation" }).click();
     await eventually(async () => assert.ok((await nav.boundingBox()).x >= 0));
     await nav.getByRole("link", { name: "Hosts" }).click();
     await page.getByTestId("hosts-table").waitFor();
@@ -90,9 +95,9 @@ describe("session", () => {
     const { page, close } = await open("/");
     const nav = page.getByRole("navigation", { name: "Sections" });
     await nav.waitFor();
-    await page.getByRole("button", { name: "Hide navigation" }).click();
+    await page.getByRole("button", { name: "Navigation" }).click();
     await eventually(async () => assert.equal(await nav.isVisible(), false));
-    await page.getByRole("button", { name: "Show navigation" }).click();
+    await page.getByRole("button", { name: "Navigation" }).click();
     await nav.waitFor();
     await close();
   });

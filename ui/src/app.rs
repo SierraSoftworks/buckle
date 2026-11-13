@@ -148,19 +148,17 @@ pub fn app() -> Html {
         },
         Session::Forbidden(m) => html! {
             <div class="splash">
-                <div class="state state--error" role="alert">
-                    <p class="state__title">{ "Not permitted" }</p>
-                    <p class="state__message">{ if m.is_empty() { "Your account is not allowed to use Buckle." } else { m.as_str() } }</p>
-                </div>
+                <yewi::ErrorState title="Not permitted">
+                    { if m.is_empty() { "Your account is not allowed to use Buckle." } else { m.as_str() } }
+                </yewi::ErrorState>
             </div>
         },
         Session::Error(m) => html! {
             <div class="splash">
-                <div class="state state--error" role="alert">
-                    <p class="state__title">{ "Buckle could not be reached" }</p>
-                    <p class="state__message">{ m.clone() }</p>
-                    <button type="button" class="btn" onclick={Callback::from(|_| { let _ = crate::util::window().location().reload(); })}>{ "Try again" }</button>
-                </div>
+                <yewi::ErrorState title="Buckle could not be reached"
+                    on_retry={Callback::from(|()| { let _ = crate::util::window().location().reload(); })}>
+                    { m.clone() }
+                </yewi::ErrorState>
             </div>
         },
         Session::SignedIn(_) | Session::Open { .. } => html! {

@@ -13,93 +13,11 @@ fn icon(children: Html) -> Html {
     }
 }
 
-pub fn overview() -> Html {
-    icon(html! { <>
-        <rect x="3" y="3" width="7" height="9" rx="1" />
-        <rect x="14" y="3" width="7" height="5" rx="1" />
-        <rect x="14" y="12" width="7" height="9" rx="1" />
-        <rect x="3" y="16" width="7" height="5" rx="1" />
-    </> })
-}
-
-pub fn rollouts() -> Html {
-    icon(html! { <>
-        <rect x="3" y="4" width="5" height="16" rx="1" />
-        <rect x="10" y="4" width="5" height="10" rx="1" />
-        <rect x="17" y="4" width="4" height="6" rx="1" />
-    </> })
-}
-
-pub fn hosts() -> Html {
-    icon(html! { <>
-        <rect x="3" y="4" width="18" height="6" rx="1.5" />
-        <rect x="3" y="14" width="18" height="6" rx="1.5" />
-        <line x1="7" y1="7" x2="7.01" y2="7" />
-        <line x1="7" y1="17" x2="7.01" y2="17" />
-    </> })
-}
-
-/// Stacked boxes: workloads.
-pub fn workloads() -> Html {
-    icon(html! { <>
-        <path d="M12 3l8 4-8 4-8-4z" />
-        <path d="M4 12l8 4 8-4" />
-        <path d="M4 17l8 4 8-4" />
-    </> })
-}
-
-/// Three nodes joined: a cluster.
-pub fn clusters() -> Html {
-    icon(html! { <>
-        <circle cx="12" cy="5" r="2.5" />
-        <circle cx="5" cy="18" r="2.5" />
-        <circle cx="19" cy="18" r="2.5" />
-        <line x1="10.8" y1="7.2" x2="6.2" y2="15.8" />
-        <line x1="13.2" y1="7.2" x2="17.8" y2="15.8" />
-        <line x1="7.5" y1="18" x2="16.5" y2="18" />
-    </> })
-}
-
-pub fn audit() -> Html {
-    icon(html! { <>
-        <path d="M9 4h6l1 2h3v14H5V6h3z" />
-        <line x1="9" y1="11" x2="15" y2="11" />
-        <line x1="9" y1="15" x2="13" y2="15" />
-    </> })
-}
-
-pub fn reference() -> Html {
-    icon(html! { <>
-        <path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z" />
-        <path d="M4 19V5" />
-        <line x1="8" y1="7" x2="15" y2="7" />
-    </> })
-}
-
-pub fn menu() -> Html {
-    icon(html! { <>
-        <line x1="4" y1="7" x2="20" y2="7" />
-        <line x1="4" y1="12" x2="20" y2="12" />
-        <line x1="4" y1="17" x2="20" y2="17" />
-    </> })
-}
-
 pub fn close() -> Html {
     icon(html! { <>
         <line x1="6" y1="6" x2="18" y2="18" />
         <line x1="18" y1="6" x2="6" y2="18" />
     </> })
-}
-
-pub fn sun() -> Html {
-    icon(html! { <>
-        <circle cx="12" cy="12" r="4" />
-        <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
-    </> })
-}
-
-pub fn moon() -> Html {
-    icon(html! { <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" /> })
 }
 
 pub fn external() -> Html {
@@ -175,26 +93,11 @@ pub fn heart() -> Html {
     icon(html! { <path d="M3 12h4l2-5 4 10 2-5h6" /> })
 }
 
-pub fn bell() -> Html {
-    icon(html! { <>
-        <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
-        <path d="M13.7 21a2 2 0 0 1-3.4 0" />
-    </> })
-}
-
 pub fn alert() -> Html {
     icon(html! { <>
         <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
         <line x1="12" y1="9" x2="12" y2="13" />
         <line x1="12" y1="17" x2="12.01" y2="17" />
-    </> })
-}
-
-pub fn info() -> Html {
-    icon(html! { <>
-        <circle cx="12" cy="12" r="9" />
-        <line x1="12" y1="11" x2="12" y2="16" />
-        <line x1="12" y1="8" x2="12.01" y2="8" />
     </> })
 }
 

@@ -30,8 +30,8 @@ const THEMES = ["light", "dark"];
 const VIEWPORT = { width: 1280, height: 900 };
 
 /** The panel headed `title`. */
-const panel = (page, title) => page.locator("section.panel", { has: page.locator(".panel__title", { hasText: title }) });
-const dialog = (page) => page.getByRole("dialog");
+const panel = (page, title) => page.locator("section.panel", { has: page.locator(".yi-panel__title", { hasText: title }) });
+const dialog = (page) => page.locator("dialog[open]");
 
 /** The split button's menu, opened. */
 async function openActions(page) {
@@ -49,7 +49,7 @@ const SHOTS = [
     name: "overview-attention",
     path: "/",
     setup: (p) => p.getByTestId("attention-bell").getByRole("button").click(),
-    target: (p) => p.getByTestId("attention-bell").locator(".bell__panel"),
+    target: (p) => p.getByTestId("attention-bell").locator(".yi-notification-panel__surface"),
   },
   {
     name: "hosts-pending",
@@ -77,7 +77,8 @@ const SHOTS = [
     name: "add-agent-platform",
     path: "/hosts",
     setup: async (p) => {
-      await p.getByRole("button", { name: "Add an agent…" }).click();
+      await p.getByTestId("hosts-actions").locator(".yi-split-button__toggle").click();
+      await p.getByRole("menuitem", { name: "Add an agent…" }).click();
       await dialog(p).getByRole("radio", { name: /Linux/ }).click();
     },
     target: dialog,
@@ -86,7 +87,8 @@ const SHOTS = [
     name: "add-agent-details",
     path: "/hosts",
     setup: async (p) => {
-      await p.getByRole("button", { name: "Add an agent…" }).click();
+      await p.getByTestId("hosts-actions").locator(".yi-split-button__toggle").click();
+      await p.getByRole("menuitem", { name: "Add an agent…" }).click();
       await dialog(p).getByRole("radio", { name: /Linux/ }).click();
       await dialog(p).getByRole("button", { name: "Next" }).click();
       await dialog(p).getByRole("textbox", { name: "Host name" }).fill("web-3");
@@ -99,7 +101,8 @@ const SHOTS = [
     name: "add-agent-command",
     path: "/hosts",
     setup: async (p) => {
-      await p.getByRole("button", { name: "Add an agent…" }).click();
+      await p.getByTestId("hosts-actions").locator(".yi-split-button__toggle").click();
+      await p.getByRole("menuitem", { name: "Add an agent…" }).click();
       await dialog(p).getByRole("radio", { name: /Linux/ }).click();
       await dialog(p).getByRole("button", { name: "Next" }).click();
       await dialog(p).getByRole("textbox", { name: "Host name" }).fill("web-3");
@@ -239,7 +242,7 @@ async function frame(context, png, { width, height }, theme) {
 
 async function capture(browser, base, shot, theme) {
   const context = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: 2, colorScheme: theme });
-  await context.addInitScript((t) => localStorage.setItem("buckle.theme", t), theme);
+  await context.addInitScript((t) => localStorage.setItem("yewi-theme", t), theme);
   const page = await context.newPage();
   page.setDefaultTimeout(15_000);
   await page.goto(`${base}${shot.path}${shot.path.includes("?") ? "&" : "?"}demo${shot.flags ? `&${shot.flags}` : ""}`);

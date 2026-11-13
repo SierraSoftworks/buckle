@@ -5,7 +5,6 @@
 
 use buckle_api::HostDetail;
 use serde::{Deserialize, Serialize};
-use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
 
@@ -72,16 +71,6 @@ pub fn workloads() -> Html {
             }
         })
     };
-    let on_search = {
-        let (set, q) = (set_query.clone(), query.clone());
-        Callback::from(move |e: InputEvent| {
-            let text = e.target_unchecked_into::<HtmlInputElement>().value();
-            set.emit(Query {
-                q: text,
-                ..q.clone()
-            });
-        })
-    };
     let on_show = {
         let (set, q) = (set_query.clone(), query.clone());
         Callback::from(move |v: AttrValue| {
@@ -139,8 +128,6 @@ pub fn workloads() -> Html {
                 .collect();
             let body = html! { <>
                 <div class="toolbar">
-                    <input class="input toolbar__search" type="search" placeholder="Search workloads, clusters"
-                        aria-label="Search workloads" value={query.q.clone()} oninput={on_search} />
                     <Segmented label="Workloads shown" testid="workloads-view"
                         value={if query.show == "attention" { "attention" } else { "all" }}
                         options={vec![("all".into(), "All".into()), ("attention".into(), "Needs attention".into())]}
@@ -151,8 +138,7 @@ pub fn workloads() -> Html {
                 } else if rows.is_empty() {
                     <Empty title="No workloads match" message="Clear the search or show all." />
                 } else {
-                    <div class="table-wrap">
-                        <table class="table" data-testid="workloads-table">
+                    <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true attrs={yewi::attrs! { "data-testid" => "workloads-table" }}>
                             <thead><tr>
                                 <th scope="col">{ "Workload" }</th>
                                 <th scope="col">{ "Health" }</th>
@@ -162,8 +148,7 @@ pub fn workloads() -> Html {
                                 if on_action.is_some() { <th scope="col"><span class="visually-hidden">{ "Actions" }</span></th> }
                             </tr></thead>
                             <tbody>{ for rows.into_iter().map(|w| row(w, &on_open, on_action.as_ref(), now)) }</tbody>
-                        </table>
-                    </div>
+                    </yewi::SimpleTable>
                 }
             </> };
             (body, subtitle)
@@ -184,12 +169,16 @@ pub fn workloads() -> Html {
 /// A placement's chip: its cluster, coloured by how it reads there.
 pub(crate) fn placement_chip(name: &str, cluster: &str, state: WorkloadState) -> Html {
     html! {
-        <RouteLink to={Route::Workload { name: name.to_owned() }} query={vec![("cluster".to_owned(), cluster.to_owned())]}
-            classes={classes!("chip", "placement-chip")} title={format!("{name} on {cluster}: {}", state.label())}
-            data_host={cluster.to_owned()} data_state={state.label().replace(' ', "-")}>
-            <span class={classes!("dot", state_tone(state).class())} aria-hidden="true" />
+        <yewi::Tag class="placement-chip"
+            href={yewi::NavTarget::route(Route::Workload { name: name.to_owned() }).query([("cluster", cluster.to_owned())])}
+            attrs={yewi::attrs! {
+                "title" => format!("{name} on {cluster}: {}", state.label()),
+                "data-host" => cluster.to_owned(),
+                "data-state" => state.label().replace(' ', "-"),
+            }}>
+            <yewi::StatusDot tone={state_tone(state).yi()} />
             { cluster.to_owned() }
-        </RouteLink>
+        </yewi::Tag>
     }
 }
 
@@ -216,7 +205,7 @@ fn row(
         .filter_map(|p| p.row.reason.as_ref().map(|r| format!("{}: {r}", p.cluster)))
         .collect();
     html! {
-        <tr data-workload={w.name.clone()} data-state={state.label().replace(' ', "-")} class="row-click" {onclick}>
+        <tr data-workload={w.name.clone()} data-state={state.label().replace(' ', "-")} class="yi-table__row yi-table__row--clickable" {onclick}>
             <td>
                 <RouteLink to={Route::Workload { name: w.name.clone() }} classes={classes!("mono", "strong")}>{ w.name.clone() }</RouteLink>
                 if !w.description.is_empty() { <span class="cell-sub">{ w.description.clone() }</span> }

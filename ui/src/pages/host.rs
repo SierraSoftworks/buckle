@@ -8,12 +8,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::components::ui::Badge;
 use buckle_api::{
     AgentUpgrade, Connection, HostCheck, HostDetail, HostPatch, HostPreview, HostStatus,
     UpgradeState,
 };
 use chrono::{DateTime, Utc};
-use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
 use crate::components::ui::{Note, NoteKind};
@@ -241,11 +241,15 @@ pub fn host_page(props: &Props) -> Html {
                 && h.applied_revision.is_some(),
             forgettable: true,
         });
-        let modules: Vec<MenuItem> = if can_act {
+        let mut modules: Vec<MenuItem> = if can_act {
             action_items(&d.actions, &on_action, Some("Module actions"))
         } else {
             Vec::new()
         };
+        modules.push(crate::components::actions::audit_item(
+            navigator.clone(),
+            &h.id,
+        ));
         let items = target_items(&own, primary, modules, |a| match a {
             TargetAction::ApproveRegistration => open(Ask::Approve),
             TargetAction::ApproveRollout => {
@@ -267,7 +271,7 @@ pub fn host_page(props: &Props) -> Html {
         });
         html! { <SplitButton {items} menu_label="More host actions" testid="host-actions" /> }
     } else {
-        html! {}
+        crate::components::actions::audit_link(&h.id)
     };
     let actions = html! { <>{ refresh }{ actions }</> };
 
@@ -299,18 +303,16 @@ pub fn host_page(props: &Props) -> Html {
             Ask::Upgrade => {
                 let oninput = {
                     let upgrade_to = upgrade_to.clone();
-                    Callback::from(move |e: InputEvent| upgrade_to.set(e.target_unchecked_into::<HtmlInputElement>().value()))
+                    Callback::from(move |value: String| upgrade_to.set(value))
                 };
                 (format!("Upgrade {}'s agent", h.id), "Upgrade agent".to_string(), false, html! { <>
                     <p>{ format!(
                         "The agent (now {}) downloads the release from GitHub, verifies its digest and swaps its binary once nothing else is queued, then restarts into it.",
                         h.agent_version.as_deref().unwrap_or("an unknown version"),
                     ) }</p>
-                    <label class="field">
-                        <span class="field__label">{ "Version" }</span>
-                        <input class="input mono" type="text" placeholder={desired.clone().unwrap_or_default()} aria-label="Version"
-                            value={(*upgrade_to).clone()} {oninput} spellcheck="false" />
-                    </label>
+                    <yewi::Field label="Version">
+    <yewi::TextInput mono=true placeholder={desired.clone().unwrap_or_default()} value={(*upgrade_to).clone()} on_input={oninput} />
+</yewi::Field>
                 </> }, None)
             }
             Ask::Forget => (format!("Forget {}", h.id), format!("Forget {}", h.id), true, html! { <>
@@ -340,7 +342,7 @@ pub fn host_page(props: &Props) -> Html {
                             Some(r) => html! { <span class="mono" title={r.clone()}>{ commit(r) }</span> },
                             None => html! { <span class="muted">{ "nothing yet" }</span> },
                         }),
-                        ("Groups", html! { <>{ for h.groups.iter().map(|g| html! { <span class="badge">{ g.clone() }</span> }) }</> }),
+                        ("Groups", html! { <>{ for h.groups.iter().map(|g| html! { <Badge>{ g.clone() }</Badge> }) }</> }),
                         ("Enrolled", html! { <span title={timestamp(h.first_seen)}>{ relative(h.first_seen, now) }</span> }),
                         ("Health read", html! { <span title={h.health_at.map(timestamp)}>{ relative_opt(h.health_at, now) }</span> }),
                         ("Drift checked", html! { <span title={h.drift_at.map(timestamp)} data-testid="drift-at">{ relative_opt(h.drift_at, now) }</span> }),
@@ -385,11 +387,6 @@ pub fn host_page(props: &Props) -> Html {
                     <JsonTree value={d.facts.clone()} open={1} />
                 }
             </Panel>
-            <p class="muted small">
-                <RouteLink to={Route::Audit} query={vec![("filter".to_string(), crate::logic::filter::equals("subject", &h.id))]}>
-                    { format!("Audit entries for {}", h.id) }
-                </RouteLink>
-            </p>
             { dialog.unwrap_or_default() }
             { target_actions.dialog }
         </div>
@@ -439,7 +436,7 @@ pub(super) fn check_row(c: &HostCheck, now: DateTime<Utc>) -> Html {
         <li class="checks__item" data-check={format!("{}/{}", c.module, c.check)} data-state={state.slug()}>
             <Pill tone={check_status_tone(&c.status)} label={c.status.clone()} />
             <span class="mono">{ c.check.clone() }</span>
-            <span class="badge">{ c.kind.clone() }</span>
+            <Badge>{ c.kind.clone() }</Badge>
             if !c.required { <span class="muted small">{ "informational" }</span> }
             <span class="checks__reason">{ c.reason.clone().unwrap_or_default() }</span>
             <ol class="check-history" aria-label={format!("{} in recent rollouts, oldest first", c.check)}>
@@ -486,8 +483,7 @@ pub(super) fn runs(
         return html! { <Empty title="No runs yet" /> };
     }
     html! {
-        <div class="table-wrap">
-            <table class="table table--compact">
+        <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true compact=true>
                 <thead><tr>
                     <th scope="col">{ "Started" }</th><th scope="col">{ "Revision" }</th><th scope="col">{ "Plan" }</th>
                     <th scope="col">{ "Outcome" }</th><th scope="col">{ "Changes" }</th><th scope="col">{ "Took" }</th><th scope="col">{ "Trace" }</th>
@@ -500,7 +496,7 @@ pub(super) fn runs(
                             <td title={timestamp(r.started_at)}>{ relative(r.started_at, now) }</td>
                             <td class="mono" title={r.revision.clone()}>{ commit(&r.revision) }</td>
                             if let Some(action) = &r.action {
-                                <td><span class="badge" title="An operator's action">{ format!("action {action}") }</span></td>
+                                <td><Badge title="An operator's action">{ format!("action {action}") }</Badge></td>
                             } else {
                                 <td class="mono" title={r.plan_digest.clone()}>{ short(&r.plan_digest) }</td>
                             }
@@ -515,18 +511,17 @@ pub(super) fn runs(
                             <td><TraceLink id={r.trace_id.clone()} url={r.trace_url.clone()} /></td>
                             <td>
                                 if !r.id.is_empty() {
-                                    <button type="button" class="btn btn--subtle btn--small"
-                                        aria-label={format!("Show the report of the run started {}", relative(r.started_at, now))}
+                                    <Button small=true kind={Kind::Subtle}
+                                        label={format!("Show the report of the run started {}", relative(r.started_at, now))}
                                         onclick={{ let (view, id) = (view.clone(), r.id.clone()); Callback::from(move |_: MouseEvent| view.emit(id.clone())) }}>
                                         { "Report" }
-                                    </button>
+                                    </Button>
                                 }
                             </td>
                         </tr>
                     }) }
                 </tbody>
-            </table>
-        </div>
+        </yewi::SimpleTable>
     }
 }
 
@@ -593,8 +588,7 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
         .unwrap_or_default();
     let edit = |i: usize, key: bool| {
         let draft = draft.clone();
-        Callback::from(move |e: InputEvent| {
-            let value = e.target_unchecked_into::<HtmlInputElement>().value();
+        Callback::from(move |value: String| {
             let mut next = (*draft).clone();
             if let Some(row) = next.get_mut(i) {
                 if key {
@@ -678,7 +672,7 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                 </div>
                 <div class="preview__row">
                     <span class="preview__label">{ "Groups" }</span>
-                    <span data-testid="preview-groups">{ for p.groups.iter().map(|g| html! { <span class="badge">{ g.clone() }</span> }) }</span>
+                    <span data-testid="preview-groups">{ for p.groups.iter().map(|g| html! { <Badge>{ g.clone() }</Badge> }) }</span>
                 </div>
                 <div class="preview__row">
                     <span class="preview__label">{ "Effective" }</span>
@@ -717,13 +711,13 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                         <div class="kv-rows" role="group" aria-label="Server labels">
                             { for draft.iter().enumerate().map(|(i, row)| html! {
                                 <div class={classes!("kv-row", errors.contains_key(&i).then_some("kv-row--error"))}>
-                                    <input class="input mono" type="text" placeholder="key" aria-label={format!("Label {} key", i + 1)}
-                                        value={row.key.clone()} oninput={edit(i, true)} spellcheck="false" />
+                                    <yewi::TextInput mono=true placeholder="key" attrs={yewi::attrs! { "aria-label" => format!("Label {} key", i + 1) }}
+                                        value={row.key.clone()} on_input={edit(i, true)} />
                                     <span aria-hidden="true">{ "=" }</span>
-                                    <input class="input mono" type="text" placeholder="value" aria-label={format!("Label {} value", i + 1)}
-                                        value={row.value.clone()} oninput={edit(i, false)} spellcheck="false" />
-                                    <button type="button" class="icon-btn" aria-label={format!("Remove label {}", if row.key.is_empty() { (i + 1).to_string() } else { row.key.clone() })}
-                                        onclick={remove(i)}>{ crate::components::icons::close() }</button>
+                                    <yewi::TextInput mono=true placeholder="value" attrs={yewi::attrs! { "aria-label" => format!("Label {} value", i + 1) }}
+                                        value={row.value.clone()} on_input={edit(i, false)} />
+                                    <yewi::IconButton icon={yewi::icons::X} size={yewi::Size::Small} variant={yewi::ButtonVariant::Subtle}
+                                        label={format!("Remove label {}", if row.key.is_empty() { (i + 1).to_string() } else { row.key.clone() })} on_click={remove(i)} />
                                     if let Some(msg) = errors.get(&i) { <span class="kv-row__error" role="alert">{ msg.clone() }</span> }
                                 </div>
                             }) }
@@ -879,8 +873,7 @@ pub(super) fn notes_editor(props: &NotesProps) -> Html {
     let oninput = {
         let (draft, typed, timer, flush) =
             (draft.clone(), typed.clone(), timer.clone(), flush.clone());
-        Callback::from(move |e: InputEvent| {
-            let text = e.target_unchecked_into::<HtmlTextAreaElement>().value();
+        Callback::from(move |text: String| {
             *typed.borrow_mut() = text.clone();
             draft.set(text);
             let flush = flush.clone();
@@ -903,7 +896,8 @@ pub(super) fn notes_editor(props: &NotesProps) -> Html {
     };
     let body = html! { <>
             if props.admin {
-                <textarea class="input notes" rows="4" value={(*draft).clone()} {oninput} {onblur} aria-label="Notes"
+                <yewi::TextArea class="notes" rows={4} value={(*draft).clone()} on_input={oninput} on_blur={onblur}
+                    attrs={yewi::attrs! { "aria-label" => "Notes" }}
                     placeholder="Anything the next operator should know; saved as you type." />
                 <p class="notes-status" data-testid="notes-status" aria-live="polite">{ note }</p>
             } else if props.notes.is_empty() {

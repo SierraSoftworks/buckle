@@ -31,7 +31,7 @@ describe("host labels", () => {
 
     await page.getByLabel("Label 1 key").fill("canary");
     // Saving sits in the card's head, offered only while something changed.
-    const head = page.locator(".panel", { has: page.getByRole("heading", { name: "Labels", exact: true }) }).locator(".panel__head");
+    const head = page.locator(".panel", { has: page.getByRole("heading", { name: "Labels", exact: true }) }).locator(".yi-panel__header");
     await head.getByRole("button", { name: "Save labels" }).click();
     await page.getByRole("status").filter({ hasText: "Labels of pi-2 saved" }).waitFor();
     await eventually(async () => assert.match(await page.locator(".kv").textContent(), /canary/));
@@ -80,7 +80,7 @@ describe("registration and forgetting", () => {
     const { page, close } = await open("/hosts");
     const banner = page.getByTestId("pending-registrations");
     await banner.getByRole("button", { name: "Approve…" }).click();
-    await page.getByRole("dialog", { name: "Approve rpi-new" }).getByRole("button", { name: "Approve rpi-new" }).click();
+    await page.getByRole("alertdialog", { name: "Approve rpi-new" }).getByRole("button", { name: "Approve rpi-new" }).click();
     await page.getByRole("status").filter({ hasText: "rpi-new approved" }).waitFor();
     await eventually(async () => assert.equal(await banner.count(), 0));
     await close();
@@ -89,7 +89,7 @@ describe("registration and forgetting", () => {
   test("an agent upgrade is asked for and shown on the host", async () => {
     const { page, close } = await open("/hosts/lab-3");
     await page.getByRole("button", { name: "Upgrade agent…" }).click();
-    const dialog = page.getByRole("dialog", { name: "Upgrade lab-3's agent" });
+    const dialog = page.getByRole("alertdialog", { name: "Upgrade lab-3's agent" });
     assert.equal(await dialog.getByRole("textbox", { name: "Version" }).inputValue(), "2.0.0-dev.5");
     await dialog.getByRole("button", { name: "Upgrade agent", exact: true }).click();
     await page.getByRole("status").filter({ hasText: "lab-3 will upgrade its agent to 2.0.0-dev.5" }).waitFor();
@@ -100,7 +100,7 @@ describe("registration and forgetting", () => {
   test("every agent behind the server is upgraded from the hosts page", async () => {
     const { page, close } = await open("/hosts");
     await page.getByRole("button", { name: "Upgrade all agents…" }).click();
-    const dialog = page.getByRole("dialog", { name: "Upgrade agents to 2.0.0-dev.5" });
+    const dialog = page.getByRole("alertdialog", { name: "Upgrade agents to 2.0.0-dev.5" });
     assert.match(await dialog.getByTestId("upgrade-all-hosts").textContent(), /lab-3 from 2\.0\.0-dev\.3/);
     await dialog.getByRole("button", { name: "Upgrade 1 agent", exact: true }).click();
     await page.getByRole("status").filter({ hasText: "1 agent will upgrade to 2.0.0-dev.5" }).waitFor();
@@ -113,7 +113,7 @@ describe("registration and forgetting", () => {
   test("forgetting a host needs its name typed", async () => {
     const { page, close } = await open("/hosts/lab-4");
     await act(page.getByTestId("host-actions"), "Forget…");
-    const dialog = page.getByRole("dialog", { name: "Forget lab-4" });
+    const dialog = page.getByRole("alertdialog", { name: "Forget lab-4" });
     const forget = dialog.getByRole("button", { name: "Forget lab-4" });
     await dialog.getByRole("textbox", { name: /Type/ }).fill("lab-");
     assert.ok(await forget.isDisabled());
@@ -192,7 +192,7 @@ describe("actions", () => {
     await page.getByRole("status").filter({ hasText: "Upgrade packages started on lab-3" }).waitFor();
 
     await act(actions, "Reboot… common");
-    const dialog = page.getByRole("dialog", { name: "Reboot on lab-3" });
+    const dialog = page.getByRole("alertdialog", { name: "Reboot on lab-3" });
     const confirm = dialog.getByRole("button", { name: "Reboot", exact: true });
     assert.ok(await confirm.isDisabled(), "a reason is required");
     await dialog.getByRole("textbox", { name: /Reason/ }).fill("kernel update");
@@ -211,7 +211,7 @@ describe("action rollouts", () => {
   test("Run action… on Hosts picks a module action and its hosts, and opens the rollout it starts", async () => {
     const { page, close } = await open("/hosts");
     await act(page.getByTestId("hosts-actions"), "Run action…");
-    const dialog = page.getByRole("dialog", { name: "Run a module action across hosts" });
+    const dialog = page.getByRole("alertdialog", { name: "Run a module action across hosts" });
     const action = dialog.getByRole("combobox", { name: "Action" });
     await eventually(async () => assert.ok((await action.locator("option").count()) > 0));
     // Workloads' actions run from the Workloads pages instead.
@@ -244,7 +244,7 @@ describe("action rollouts", () => {
       assert.equal(face, "Restart…");
       assert.ok(menu.includes("Stop…"), menu.join(", "));
       await act(split(page), "Restart…");
-      const dialog = page.getByRole("dialog", { name: "Restart paste on every cluster" });
+      const dialog = page.getByRole("alertdialog", { name: "Restart paste on every cluster" });
       await eventually(async () =>
         assert.match(await dialog.getByTestId("workload-rollout-targets").textContent(), /Runs on .*home-nomad/),
       );
@@ -258,9 +258,9 @@ describe("action rollouts", () => {
   test("a Nomad task action asks where it runs and runs there, without a note", async () => {
     const { page, close } = await open("/workloads/postgresql?cluster=home-nomad");
     await act(page.getByTestId("actions-home-nomad-postgresql"), "vacuum…");
-    const dialog = page.getByRole("dialog", { name: "vacuum on home-nomad" });
+    const dialog = page.getByRole("alertdialog", { name: "vacuum on home-nomad" });
     const picker = dialog.getByTestId("action-instances");
-    assert.equal(await picker.getByRole("radio", { checked: true }).textContent(), "One allocation");
+    assert.ok(await picker.getByRole("radio", { name: "One allocation" }).isChecked());
     await picker.getByRole("radio", { name: "Every allocation" }).click();
     await dialog.getByRole("button", { name: "vacuum", exact: true }).click();
     await page.getByRole("status").filter({ hasText: "vacuum started on home-nomad" }).waitFor();

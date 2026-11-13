@@ -106,7 +106,7 @@ describe("the rollout pipeline", () => {
     // A workload block opens the workload, at its cluster.
     assert.match(await atuin.getAttribute("href"), /^\/workloads\/atuin\?cluster=home-nomad/);
     // The Targets card names what it waits on, and what the deployment is doing.
-    const targets = page.locator("section.panel", { has: page.locator(".panel__title", { hasText: /^Targets$/ }) });
+    const targets = page.locator("section.panel", { has: page.locator(".yi-panel__title", { hasText: /^Targets$/ }) });
     assert.match(await targets.locator('tr[data-unit="lab-nomad/grafana"]').getByTestId("host-waiting").textContent(), /waits for lab-1/);
     assert.match(await targets.locator('tr[data-unit="home-nomad/grey"]').textContent(), /grey on home-nomad removing/);
     const row = targets.locator('tr[data-unit="home-nomad/atuin"]');
@@ -121,10 +121,10 @@ describe("the rollout pipeline", () => {
 describe("the targets card", () => {
   test("lists what changes by default, and every unit with All, kept in the URL", async () => {
     const { page, close } = await open("/rollouts/42");
-    const card = page.locator("section.panel", { has: page.locator(".panel__title", { hasText: /^Targets$/ }) });
+    const card = page.locator("section.panel", { has: page.locator(".yi-panel__title", { hasText: /^Targets$/ }) });
     const rows = card.locator("tr[data-unit]");
     await rows.first().waitFor();
-    assert.match(await card.locator(".panel__subtitle").textContent(), /27 changed · 4 unchanged/);
+    assert.match(await card.locator(".yi-panel__subtitle").textContent(), /27 changed · 4 unchanged/);
     assert.equal(await card.locator("tr[data-unchanged]").count(), 0, "Changed hides the no-ops");
     assert.match(await card.locator('tr[data-stage="home"]').first().textContent(), /2 unchanged not shown/);
     // Steps split a stage that has more than one.
@@ -145,7 +145,7 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42");
     const pane = page.locator("#plans");
     // home is still running, so cloud's plans can be reviewed but not approved.
-    const approve = pane.locator(".panel__head").getByRole("button", { name: "Approve phase cloud…" });
+    const approve = pane.locator(".yi-panel__header").getByRole("button", { name: "Approve phase cloud…" });
     await approve.waitFor();
     assert.ok(await approve.isDisabled(), "cloud waits for home");
     assert.match(await pane.getByTestId("approval-waits").textContent(), /home still running: cloud can be approved once it has finished/);
@@ -173,8 +173,8 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
     const pane = page.locator("#plans");
     assert.equal(await pane.getByTestId("approval-waits").count(), 0);
-    await pane.locator(".panel__head").getByRole("button", { name: "Approve phase cloud…" }).click();
-    const dialog = page.getByRole("dialog", { name: "Approve cloud of rollout #42" });
+    await pane.locator(".yi-panel__header").getByRole("button", { name: "Approve phase cloud…" }).click();
+    const dialog = page.getByRole("alertdialog", { name: "Approve cloud of rollout #42" });
     await dialog.waitFor();
     const summary = await dialog.getByTestId("approval-summary").textContent();
     assert.match(summary, /12 hosts/);
@@ -262,12 +262,15 @@ describe("approving a phase", () => {
   test("dialogs keep the keyboard and close on Escape", async () => {
     const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
     await page.getByRole("button", { name: "Approve cloud…" }).click();
-    const dialog = page.getByRole("dialog");
+    const dialog = page.getByRole("alertdialog");
     await dialog.waitFor();
     // Focus starts inside the dialog and Tab cannot leave it.
     for (let i = 0; i < 8; i++) {
       await page.keyboard.press("Tab");
-      assert.ok(await dialog.evaluate((d) => d.contains(document.activeElement)), `tab ${i} stayed inside`);
+      // A native modal dialog: Tab passes the browser's own controls (the
+      // body is focused) between its last and first control, never the page.
+      const inside = await dialog.evaluate((d) => d.contains(document.activeElement) || document.activeElement === document.body);
+      assert.ok(inside, `tab ${i} stayed inside`);
     }
     await page.keyboard.press("Escape");
     await dialog.waitFor({ state: "detached" });
@@ -277,7 +280,7 @@ describe("approving a phase", () => {
   test("aborting asks for the rollout to be named", async () => {
     const { page, close } = await open("/rollouts/42");
     await decide(page, "Abort…");
-    const dialog = page.getByRole("dialog", { name: "Abort rollout #42" });
+    const dialog = page.getByRole("alertdialog", { name: "Abort rollout #42" });
     const confirm = dialog.getByRole("button", { name: "Abort rollout" });
     assert.ok(await confirm.isDisabled());
     await dialog.getByRole("textbox", { name: /Type/ }).fill("#42");
@@ -291,10 +294,10 @@ describe("approving a phase", () => {
     const { page, context, close } = await open("/rollouts/42");
     await context.grantPermissions(["clipboard-read", "clipboard-write"]);
     await decide(page, "Abort…");
-    const dialog = page.getByRole("dialog", { name: "Abort rollout #42" });
+    const dialog = page.getByRole("alertdialog", { name: "Abort rollout #42" });
     const confirm = dialog.getByRole("button", { name: "Abort rollout" });
     const box = dialog.getByRole("textbox", { name: /Type/ });
-    await dialog.getByRole("button", { name: "#42" }).click();
+    await dialog.locator(".yi-confirm__word").click();
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "#42");
     assert.ok(await box.evaluate((el) => el === document.activeElement), "focus moves to the box");
     assert.ok(await confirm.isDisabled(), "copying alone does not confirm");
@@ -309,7 +312,7 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
     await page.locator(".page-head .pill", { hasText: "awaiting approval" }).waitFor();
     await decide(page, "Reject…");
-    const dialog = page.getByRole("dialog", { name: "Reject rollout #42" });
+    const dialog = page.getByRole("alertdialog", { name: "Reject rollout #42" });
     const confirm = dialog.getByRole("button", { name: "Reject rollout" });
     await dialog.getByRole("textbox", { name: /Type/ }).fill("#42");
     assert.ok(await confirm.isDisabled(), "a reason is required");
@@ -345,10 +348,10 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42");
     const rows = page.getByTestId("host-actions");
     await rows.first().waitFor();
-    for (const split of await rows.all()) assert.equal(await split.locator(".split__main").count(), 1);
+    for (const split of await rows.all()) assert.equal(await split.locator(".yi-split-button__face").count(), 1);
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-1", exact: true }) });
     await act(row.getByTestId("host-actions"), "Redeploy…");
-    await page.getByRole("dialog", { name: "Redeploy pi-1" }).getByRole("button", { name: "Redeploy pi-1" }).click();
+    await page.getByRole("alertdialog", { name: "Redeploy pi-1" }).getByRole("button", { name: "Redeploy pi-1" }).click();
     await page.getByRole("status").filter({ hasText: "pi-1: redeploy sent." }).waitFor();
     await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-1"]').getAttribute("data-state"), "applying"));
     await close();
@@ -358,7 +361,7 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-3", exact: true }) });
     await act(row.getByTestId("host-actions"), "Expedite…");
-    await page.getByRole("dialog", { name: "Expedite pi-3" }).getByRole("button", { name: "Expedite pi-3" }).click();
+    await page.getByRole("alertdialog", { name: "Expedite pi-3" }).getByRole("button", { name: "Expedite pi-3" }).click();
     await page.getByRole("status").filter({ hasText: "pi-3: expedite sent." }).waitFor();
     await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-3"]').getAttribute("data-state"), "healthy"));
     await close();
@@ -366,9 +369,9 @@ describe("approving a phase", () => {
 
   test("a baking stage is expedited from its heading in the Targets card", async () => {
     const { page, close } = await open("/rollouts/42");
-    const head = page.locator('tr.table__group[data-stage="home"]');
+    const head = page.locator('tr.yi-table__group[data-stage="home"]');
     await act(head.getByTestId("stage-actions"), "Expedite…");
-    await page.getByRole("dialog", { name: "Expedite home" }).getByRole("button", { name: "Expedite home" }).click();
+    await page.getByRole("alertdialog", { name: "Expedite home" }).getByRole("button", { name: "Expedite home" }).click();
     await page.getByRole("status").filter({ hasText: "home: expedite sent." }).waitFor();
     await eventually(async () => assert.equal(await page.locator('a.block[data-host="pi-3"]').getAttribute("data-state"), "healthy"));
     await eventually(async () => assert.equal(await head.getByTestId("stage-actions").count(), 0, "nothing left to skip"));
@@ -378,9 +381,9 @@ describe("approving a phase", () => {
   test("retrying a paused rollout re-plans its failed hosts", async () => {
     const { page, close } = await open("/rollouts/42");
     await decide(page, "Pause");
-    await page.getByRole("dialog", { name: "Pause rollout #42" }).getByRole("button", { name: "Pause rollout" }).click();
+    await page.getByRole("alertdialog", { name: "Pause rollout #42" }).getByRole("button", { name: "Pause rollout" }).click();
     await decide(page, "Retry");
-    const dialog = page.getByRole("dialog", { name: "Retry rollout #42" });
+    const dialog = page.getByRole("alertdialog", { name: "Retry rollout #42" });
     assert.match(await dialog.textContent(), /pi-5/);
     await dialog.getByRole("button", { name: "Retry" }).click();
     await page.locator(".page-head .pill", { hasText: "rolling" }).waitFor();
@@ -391,7 +394,7 @@ describe("approving a phase", () => {
     const { page, close } = await open("/rollouts/42");
     const row = page.locator("tr", { has: page.getByRole("link", { name: "pi-5", exact: true }) });
     await act(row.getByTestId("host-actions"), "Continue with checks waived…");
-    const dialog = page.getByRole("dialog", { name: "Continue pi-5 with checks waived" });
+    const dialog = page.getByRole("alertdialog", { name: "Continue pi-5 with checks waived" });
     await dialog.getByRole("checkbox").check();
     await dialog.getByRole("button", { name: "Waive 1 check and continue" }).click();
     await page.getByRole("status").filter({ hasText: "pi-5: continuing with nomad/api waived." }).waitFor();

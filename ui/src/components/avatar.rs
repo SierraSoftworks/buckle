@@ -1,6 +1,7 @@
 //! A person's round avatar: their Gravatar (an identicon for an address
 //! Gravatar does not know), over their initials, which show while it loads
-//! or when it cannot (offline, or demo mode, which never leaves the page).
+//! or when it cannot (offline, or demo mode, which never leaves the page),
+//! as yewi's avatar draws it.
 //! Claude has its spark instead.
 
 use sha2::{Digest, Sha256};
@@ -22,10 +23,8 @@ pub fn avatar(props: &AvatarProps) -> Html {
         .filter(|_| !crate::fixtures::is_demo())
         .map(gravatar_url);
     html! {
-        <span class="avatar" aria-hidden="true">
-            { initials(name) }
-            if let Some(src) = src { <img class="avatar__img" {src} alt="" loading="lazy" referrerpolicy="no-referrer" /> }
-        </span>
+        <yewi::Avatar class="avatar" name={name.to_string()} {src} seed={email.map(str::to_string)}
+            size={yewi::Size::Small} decorative=true />
     }
 }
 
@@ -46,15 +45,6 @@ pub fn gravatar_url(email: &str) -> String {
     let digest = Sha256::digest(email.trim().to_lowercase().as_bytes());
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("https://gravatar.com/avatar/{hex}?s=48&d=identicon")
-}
-
-/// Up to two initials: `Ada Lovelace` → `AL`.
-pub fn initials(name: &str) -> String {
-    name.split_whitespace()
-        .filter_map(|w| w.chars().next())
-        .take(2)
-        .collect::<String>()
-        .to_uppercase()
 }
 
 #[cfg(test)]

@@ -9,13 +9,13 @@
 }
 
 .plan {
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--info);
-  border-radius: var(--radius);
-  background: var(--bg);
+  border: 1px solid var(--yi-line);
+  border-left: 3px solid var(--yi-info);
+  border-radius: var(--yi-radius-control);
+  background: var(--yi-bg);
 
   &--destructive {
-    border-left-color: var(--danger);
+    border-left-color: var(--yi-danger);
   }
 
   &__summary {
@@ -33,13 +33,13 @@
   }
 
   &__hosts {
-    font-family: var(--font-mono);
+    font-family: var(--yi-font-mono);
     font-size: 0.8rem;
-    color: var(--fg);
+    color: var(--yi-fg);
   }
 
   &__counts {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
     font-size: 0.8rem;
   }
 
@@ -59,7 +59,7 @@
     align-items: center;
     gap: 0.4rem 0.75rem;
     padding: 0.2rem 0 0.25rem;
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--yi-line);
     font-size: 0.8rem;
     cursor: pointer;
     list-style: none;
@@ -71,8 +71,8 @@
 
   &__chevron {
     display: inline-flex;
-    color: var(--fg-3);
-    transition: transform var(--transition);
+    color: var(--yi-fg-subtle);
+    transition: transform var(--yi-duration-fast) var(--yi-ease);
 
     .icon {
       width: 14px;
@@ -99,15 +99,15 @@
   &__body {
     margin-left: 0.45rem;
     padding-left: 0.9rem;
-    border-left: 2px solid var(--line);
+    border-left: 2px solid var(--yi-line);
   }
 
   &--removals > .plan-module__head {
-    border-bottom-color: color-mix(in srgb, var(--danger) 50%, var(--line));
+    border-bottom-color: color-mix(in srgb, var(--yi-danger) 50%, var(--yi-line));
   }
 
   &--removals > .plan-module__body {
-    border-left-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+    border-left-color: color-mix(in srgb, var(--yi-danger) 40%, var(--yi-line));
   }
 }
 
@@ -117,9 +117,9 @@
   display: inline-flex;
   align-items: stretch;
   overflow: hidden;
-  border: 1px solid var(--line);
+  border: 1px solid var(--yi-line);
   border-radius: 999px;
-  font-family: var(--font-mono);
+  font-family: var(--yi-font-mono);
   font-size: 0.72rem;
   line-height: 1.55;
   white-space: nowrap;
@@ -129,27 +129,27 @@
     padding: 0 0.42rem;
 
     & + & {
-      border-left: 1px solid var(--line);
+      border-left: 1px solid var(--yi-line);
     }
 
     &--create {
-      color: var(--ok);
-      background: var(--ok-soft);
+      color: var(--yi-ok);
+      background: var(--yi-ok-soft);
     }
 
     &--modify {
-      color: var(--warn);
-      background: var(--warn-soft);
+      color: var(--yi-warn);
+      background: var(--yi-warn-soft);
     }
 
     &--remove,
     &--blocked {
-      color: var(--danger);
-      background: var(--danger-soft);
+      color: var(--yi-danger);
+      background: var(--yi-danger-soft);
     }
 
     &--zero {
-      color: var(--fg-3);
+      color: var(--yi-fg-subtle);
       background: transparent;
     }
   }
@@ -161,9 +161,9 @@
   align-items: center;
   gap: 0.25rem;
   padding: 0 0.45rem;
-  border: 1px solid var(--line);
+  border: 1px solid var(--yi-line);
   border-radius: 999px;
-  color: var(--fg-2);
+  color: var(--yi-fg-muted);
   font-size: 0.72rem;
   line-height: 1.55;
   white-space: nowrap;
@@ -175,7 +175,7 @@
   }
 
   &--running {
-    color: var(--active);
+    color: var(--yi-active);
   }
 }
 
@@ -183,7 +183,7 @@
 .mark {
   display: inline-flex;
   align-self: center;
-  color: var(--fg-3);
+  color: var(--yi-fg-subtle);
 
   .icon {
     width: 15px;
@@ -191,16 +191,16 @@
   }
 
   &--create {
-    color: var(--ok);
+    color: var(--yi-ok);
   }
 
   &--modify {
-    color: var(--warn);
+    color: var(--yi-warn);
   }
 
   &--remove,
   &--blocked {
-    color: var(--danger);
+    color: var(--yi-danger);
   }
 }
 
@@ -215,13 +215,13 @@
   white-space: nowrap;
 
   &--all {
-    background: var(--ok-soft);
-    color: var(--ok);
+    background: var(--yi-ok-soft);
+    color: var(--yi-ok);
   }
 
   &--subset {
-    background: var(--warn-soft);
-    color: var(--warn);
+    background: var(--yi-warn-soft);
+    color: var(--yi-warn);
   }
 }
 
@@ -233,10 +233,10 @@
   vertical-align: baseline;
   line-height: 1.35;
   padding: 0 0.3rem;
-  border: 1px dashed color-mix(in srgb, var(--info) 55%, transparent);
-  border-radius: var(--radius-sm);
-  background: var(--info-soft);
-  color: var(--fg);
+  border: 1px dashed color-mix(in srgb, var(--yi-info) 55%, transparent);
+  border-radius: var(--yi-radius-sm);
+  background: var(--yi-info-soft);
+  color: var(--yi-fg);
   white-space: nowrap;
   cursor: help;
 
@@ -244,7 +244,7 @@
     width: 11px;
     height: 11px;
     margin-right: 0.2rem;
-    color: var(--info);
+    color: var(--yi-info);
   }
 
   &--legend {
@@ -259,11 +259,11 @@
     gap: 0.3rem;
     max-width: 360px;
     padding: 0.5rem 0.65rem;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius);
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    font-family: var(--font-sans);
+    border: 1px solid var(--yi-line-strong);
+    border-radius: var(--yi-radius-control);
+    background: var(--yi-surface);
+    box-shadow: var(--yi-shadow-overlay);
+    font-family: var(--yi-font-body);
     font-size: 0.78rem;
     line-height: 1.4;
     white-space: normal;
@@ -280,7 +280,7 @@
   }
 
   &__host {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 }
 
@@ -298,7 +298,7 @@
   align-items: baseline;
   gap: 0.3rem 0.6rem;
   padding: 0.35rem 0.4rem;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--yi-line);
   font-size: 0.84rem;
 
   &:last-child {
@@ -307,8 +307,8 @@
 
   &__glyph {
     width: 1rem;
-    color: var(--warn);
-    font-family: var(--font-mono);
+    color: var(--yi-warn);
+    font-family: var(--yi-font-mono);
     font-weight: 700;
     text-align: center;
   }
@@ -323,11 +323,11 @@
   }
 
   &__resource {
-    color: var(--fg);
+    color: var(--yi-fg);
   }
 
   &__summary {
-    color: var(--fg-2);
+    color: var(--yi-fg-muted);
   }
 
   // A step's diff or preview, indented under its line.
@@ -345,28 +345,28 @@
     flex-basis: 100%;
     margin: 0.3rem 0 0;
     padding: 0.5rem;
-    border-radius: var(--radius-sm);
-    background: var(--surface-2);
+    border-radius: var(--yi-radius-sm);
+    background: var(--yi-tone-1);
     white-space: pre-wrap;
     font-size: 0.78rem;
   }
 
   &--destructive {
-    background: var(--danger-soft);
+    background: var(--yi-danger-soft);
 
     .step__glyph {
-      color: var(--danger);
+      color: var(--yi-danger);
     }
   }
 
   &--forget .step__glyph,
   &--handler .step__glyph,
   &--deferred .step__glyph {
-    color: var(--fg-3);
+    color: var(--yi-fg-subtle);
   }
 
   &--blocked .step__glyph {
-    color: var(--danger);
+    color: var(--yi-danger);
   }
 }
 
@@ -375,7 +375,7 @@
 
   &__stats {
     margin: 0 0 0.2rem;
-    font-family: var(--font-mono);
+    font-family: var(--yi-font-mono);
   }
 
   &__note {
@@ -383,7 +383,7 @@
     gap: 0.4rem;
     align-items: center;
     margin: 0 0 0.3rem;
-    color: var(--brand);
+    color: var(--yi-accent-text);
     font-size: 0.8rem;
   }
 
@@ -391,9 +391,9 @@
     margin: 0;
     padding: 0.4rem 0;
     overflow-x: auto;
-    border: 1px solid var(--line);
-    border-radius: var(--radius-sm);
-    background: var(--surface);
+    border: 1px solid var(--yi-line);
+    border-radius: var(--yi-radius-sm);
+    background: var(--yi-surface);
     font-size: 0.78rem;
     line-height: 1.55;
   }
@@ -404,26 +404,26 @@
     white-space: pre;
 
     &--add {
-      background: var(--diff-add);
-      color: var(--fg);
+      background: var(--bk-diff-add);
+      color: var(--yi-fg);
     }
 
     &--del {
-      background: var(--diff-del);
-      color: var(--fg);
+      background: var(--bk-diff-del);
+      color: var(--yi-fg);
     }
 
     &--hunk {
-      color: var(--info);
+      color: var(--yi-info);
     }
 
     &--file,
     &--meta {
-      color: var(--fg-3);
+      color: var(--yi-fg-subtle);
     }
 
     &--context {
-      color: var(--fg-2);
+      color: var(--yi-fg-muted);
     }
   }
 }

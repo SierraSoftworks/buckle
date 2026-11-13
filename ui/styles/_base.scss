@@ -1,75 +1,26 @@
+// The few element rules and helpers the pages lean on. yewi's stylesheet
+// brings the reset, the body's colours and type, links and focus rings.
 @use 'tokens' as *;
-
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
-}
-
-html {
-  -webkit-text-size-adjust: 100%;
-}
-
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font: 14px/1.5 var(--font-sans);
-  -webkit-font-smoothing: antialiased;
-}
-
-a {
-  color: var(--fg);
-  text-decoration-color: var(--line-strong);
-  text-underline-offset: 2px;
-
-  &:hover {
-    color: var(--brand);
-    text-decoration-color: currentColor;
-  }
-}
-
-:focus-visible {
-  @include focus-ring;
-}
-
-h1,
-h2,
-h3,
-h4 {
-  margin: 0;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-
-p {
-  margin: 0.4rem 0;
-}
 
 code,
 pre,
 .mono {
-  font-family: var(--font-mono);
+  font-family: var(--yi-font-mono);
   font-size: 0.86em;
 }
 
-ul,
-ol {
-  margin: 0;
-  padding: 0;
-}
-
 .icon {
+  display: inline-block;
   flex-shrink: 0;
   vertical-align: -3px;
 }
 
 .muted {
-  color: var(--fg-2);
+  color: var(--yi-fg-muted);
 }
 
 .small {
-  font-size: 0.8rem;
+  font-size: var(--yi-text-sm);
 }
 
 .strong {
@@ -77,15 +28,15 @@ ol {
 }
 
 .text-ok {
-  color: var(--ok);
+  color: var(--yi-ok);
 }
 
 .text-warn {
-  color: var(--warn);
+  color: var(--yi-warn);
 }
 
 .text-danger {
-  color: var(--danger);
+  color: var(--yi-danger);
 }
 
 .visually-hidden {
@@ -100,19 +51,44 @@ ol {
   border: 0;
 }
 
-.skip-link {
-  position: absolute;
-  left: 0.5rem;
-  top: -3rem;
-  z-index: 100;
-  padding: 0.4rem 0.8rem;
-  background: var(--brand);
-  color: var(--on-brand);
-  border-radius: var(--radius);
+// Buckle's pages are dense with links (every host, commit and rollout is
+// one), so a link wears the text colour with a quiet underline and takes the
+// accent on hover, rather than colouring half a table amber.
+:where(.page, .yi-dialog__body, .yi-popover__surface) a:where(:not([class*="yi-"])) {
+  color: var(--yi-fg);
+  text-decoration: underline;
+  text-decoration-color: var(--yi-line-strong);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 
-  &:focus {
-    top: 0.5rem;
+  &:hover {
+    color: var(--yi-accent-text);
+    text-decoration-color: currentColor;
   }
+}
+
+// The headings inside Buckle's own widgets are labels at the text size, not
+// steps of the page's type scale.
+.stage__name,
+.run__section-title,
+.run-module__sub,
+.plan-module__name,
+.subhead {
+  font-family: var(--yi-font-body);
+  font-size: inherit;
+  font-weight: 600;
+  line-height: inherit;
+  letter-spacing: -0.01em;
+}
+
+// Lists are laid out by the widget that holds them.
+:where(ul, ol):where(:not([class*="yi-"])) {
+  margin: 0;
+  padding: 0;
+}
+
+:where(.page, .yi-dialog__body) :where(p):where(:not([class*="yi-"])) {
+  margin: 0.4rem 0;
 }
 
 @media (prefers-reduced-motion: reduce) {

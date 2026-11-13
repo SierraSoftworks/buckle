@@ -2,6 +2,7 @@
 //! rest in its menu. A click runs the action, or asks first when it wants
 //! confirmation, with a note for the audit log.
 
+use crate::components::ui::Badge;
 use buckle_api::{ActionInfo, ActionInstances};
 use yew::prelude::*;
 
@@ -26,13 +27,12 @@ pub fn instances_picker(props: &InstancesPickerProps) -> Html {
         .map(|(v, l)| (AttrValue::from(v.as_str()), AttrValue::from(*l)))
         .collect::<Vec<_>>();
     html! {
-        <div class="field">
-            <span class="field__label">{ "Runs in" }</span>
-            <Segmented label="Where it runs" testid="action-instances" {options}
-                value={AttrValue::from(props.value.as_str())}
-                on_change={props.on_change.reform(|v: AttrValue| parse_instances(&v))} />
-        </div>
-    }
+            <yewi::Field group=true label="Runs in">
+                <Segmented label="Where it runs" testid="action-instances" {options}
+                    value={AttrValue::from(props.value.as_str())}
+                    on_change={props.on_change.reform(|v: AttrValue| parse_instances(&v))} />
+    </yewi::Field>
+        }
 }
 use crate::logic::controls::TargetAction;
 
@@ -95,6 +95,32 @@ pub fn target_items(
         .chain(extra)
         .chain(forget.into_iter().map(|(i, a)| item(i, a)))
         .collect()
+}
+
+/// Where a target's audit entries are listed: the audit log filtered to it.
+pub fn audit_target(subject: &str) -> yewi::NavTarget {
+    yewi::NavTarget::route(crate::app::Route::Audit)
+        .query([("filter", crate::logic::filter::equals("subject", subject))])
+}
+
+/// "Audit entries" as an item of a target's menu, opening its audit log.
+pub fn audit_item(navigator: Option<yew_router::prelude::Navigator>, subject: &str) -> MenuItem {
+    let filter = crate::logic::filter::equals("subject", subject);
+    MenuItem::new(
+        "Audit entries",
+        Callback::from(move |_: MouseEvent| {
+            if let Some(n) = &navigator {
+                let _ = n.push_with_query(&crate::app::Route::Audit, &[("filter", filter.clone())]);
+            }
+        }),
+    )
+}
+
+/// The same for a reader without a menu of actions: a link in the page's head.
+pub fn audit_link(subject: &str) -> Html {
+    html! {
+        <yewi::Button variant={yewi::ButtonVariant::Subtle} href={audit_target(subject)}>{ "Audit entries" }</yewi::Button>
+    }
 }
 
 #[derive(Properties, PartialEq)]
@@ -260,8 +286,8 @@ pub fn use_actions(on_started: Callback<()>) -> AnyTargetActions {
                 note=true note_required={a.confirm} note_placeholder="Why, for the audit log" busy={*busy}
                 error={(*error).clone()} on_confirm={confirm} on_cancel={cancel}>
                 <p>
-                    <span class="badge mono">{ format!("{}/{}", a.module, a.name) }</span>{ " " }
-                    <span class="badge">{ a.kind.clone() }</span>
+                    <Badge mono=true>{ format!("{}/{}", a.module, a.name) }</Badge>{ " " }
+                    <Badge>{ a.kind.clone() }</Badge>
                 </p>
                 if let Some(d) = &a.description { <p>{ d.clone() }</p> }
                 { picker.unwrap_or_default() }

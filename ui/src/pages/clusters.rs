@@ -6,9 +6,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::components::ui::Badge;
 use buckle_api::{ClusterStatus, HealthSummary, HostStatus, HostSummary};
 use serde::{Deserialize, Serialize};
-use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
 
@@ -64,15 +64,6 @@ pub fn clusters() -> Html {
     let live = use_live_value(&fleet, apply_fleet);
     let adding = use_state(|| false);
 
-    let on_search = {
-        let navigator = navigator.clone();
-        Callback::from(move |e: InputEvent| {
-            let q = e.target_unchecked_into::<HtmlInputElement>().value();
-            if let Some(n) = &navigator {
-                let _ = n.replace_with_query(&Route::Clusters, &Query { q });
-            }
-        })
-    };
     let on_open = {
         let navigator = navigator.clone();
         Callback::from(move |(e, id): (MouseEvent, String)| {
@@ -139,15 +130,10 @@ pub fn clusters() -> Html {
             rows.sort_by(|a, b| (!needs_attention(a), &a.id).cmp(&(!needs_attention(b), &b.id)));
             let stable = f.stable_revision.as_deref();
             let body = html! { <>
-                <div class="toolbar">
-                    <input class="input toolbar__search" type="search" placeholder="Search clusters, labels, groups"
-                        aria-label="Search clusters" value={query.q.clone()} oninput={on_search} />
-                </div>
                 if rows.is_empty() {
                     <Empty title="No clusters match" message="Clear the search." />
                 } else {
-                    <div class="table-wrap">
-                        <table class="table" data-testid="clusters-table">
+                    <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true attrs={yewi::attrs! { "data-testid" => "clusters-table" }}>
                             <thead><tr>
                                 <th scope="col">{ "Cluster" }</th>
                                 <th scope="col">{ "State" }</th>
@@ -158,8 +144,7 @@ pub fn clusters() -> Html {
                                 <th scope="col">{ "Health read" }</th>
                             </tr></thead>
                             <tbody>{ for rows.into_iter().map(|c| row(c, &hosts, stable, &on_open, now)) }</tbody>
-                        </table>
-                    </div>
+                    </yewi::SimpleTable>
                 }
             </> };
             (body, subtitle)
@@ -244,7 +229,7 @@ fn row(
     };
     let kind = spec.map(|s| s.kind.as_str()).unwrap_or("cluster");
     html! {
-        <tr data-host={c.id.clone()} class="row-click" {onclick}>
+        <tr data-host={c.id.clone()} class="yi-table__row yi-table__row--clickable" {onclick}>
             <td class="nowrap">
                 <HostLink id={c.id.clone()} host={c.clone()} {now} />
                 <span class="cell-sub">
@@ -264,7 +249,7 @@ fn row(
                 }
             </td>
             <td class="nowrap">{ steward_cell(&status, hosts, now) }</td>
-            <td>{ for c.groups.iter().map(|g| html! { <span class="badge">{ g.clone() }</span> }) }</td>
+            <td>{ for c.groups.iter().map(|g| html! { <Badge>{ g.clone() }</Badge> }) }</td>
             <td class="nowrap">
                 { match &c.applied_revision {
                     Some(r) if Some(r.as_str()) == stable => html! {
