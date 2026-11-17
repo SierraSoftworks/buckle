@@ -76,6 +76,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/rollouts", web::post().to(start_action_rollout))
             .route("/actions", web::get().to(fleet_actions))
             .route("/actions/runs", web::get().to(action_runs))
+            .route("/schedules", web::get().to(schedules))
+            .route("/schedules/{name}", web::get().to(schedule))
             .route("/rollouts/{id}", web::get().to(rollout))
             .route("/rollouts/{id}/plans", web::get().to(rollout_plans))
             .route(
@@ -141,6 +143,8 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("GET", "/api/v1/rollouts"),
     ("POST", "/api/v1/rollouts"),
     ("GET", "/api/v1/actions"),
+    ("GET", "/api/v1/schedules"),
+    ("GET", "/api/v1/schedules/s"),
     ("GET", "/api/v1/rollouts/r"),
     ("GET", "/api/v1/rollouts/r/plans"),
     ("POST", "/api/v1/rollouts/r/approve"),
@@ -1330,74 +1334,50 @@ async fn start_action_rollout(
     admin: Administrative,
     body: web::Json<buckle_api::StartActionRollout>,
 ) -> ApiResult {
-    let body = body.into_inner();
-    let raw = body
-        .selector
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    let selector = parse_selector(raw.as_deref())?;
-    let offered = crate::actions::fleet(&state.store, &state.revisions, selector.as_ref()).await?;
-    let found = offered
-        .into_iter()
-        .find(|f| {
-            f.workload == body.workload
-                && f.action.module == body.module
-                && f.action.name == body.action
-        })
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "No {}{} offers the action '{}' of '{}'.",
-                if body.workload { "cluster" } else { "host" },
-                if raw.is_some() {
-                    " the selector matches"
-                } else {
-                    ""
-                },
-                body.action,
-                body.module
-            ))
-        })?;
-    if found.action.confirm && body.note.trim().is_empty() {
-        return Err(ApiError::bad_request(format!(
-            "The action '{}' asks for confirmation: send a note for the audit log.",
-            found.action.label
-        )));
-    }
-    let names = found.targets.clone();
-    let targets: std::collections::BTreeMap<String, String> = state
-        .store
-        .call(move |db| {
-            let mut out = std::collections::BTreeMap::new();
-            for t in &names {
-                if let Some(rev) = db.hosts().target(t)?.and_then(|r| r.applied_revision) {
-                    out.insert(t.clone(), rev);
-                }
-            }
-            Ok(out)
-        })
-        .await?;
-    let id = state
-        .controller
-        .command(
-            &admin.0.actor(),
-            Command::StartAction {
-                action: crate::rollout::RolloutAction {
-                    module: found.action.module.clone(),
-                    action: found.action.name.clone(),
-                    label: found.action.label.clone(),
-                    confirm: found.action.confirm,
-                    selector: raw,
-                    instances: body.instances.filter(|_| found.action.instances.is_some()),
-                },
-                targets,
-                note: body.note,
-            },
-        )
-        .await?;
+    let id = crate::actions::start_rollout(
+        &state.store,
+        &state.revisions,
+        &state.controller,
+        &admin.0.actor(),
+        body.into_inner(),
+        crate::actions::Origin::default(),
+    )
+    .await?;
     let detail = rollout_detail(&state, &id).await?;
     Ok(HttpResponse::build(StatusCode::CREATED).json(detail.summary))
+}
+
+/// `GET /schedules`: the stable revision's schedules, each with when it
+/// fires next and how its latest occurrence went.
+async fn schedules(state: Data, _: Authenticated) -> ApiResult {
+    let list = match &state.schedules {
+        Some(s) => s.list().await?,
+        None => Vec::new(),
+    };
+    let list: Vec<_> = list
+        .into_iter()
+        .map(|mut s| {
+            if let Some(r) = s.last.as_mut().and_then(|l| l.rollout.take()) {
+                s.last.as_mut().unwrap().rollout = Some(state.link_rollout(r));
+            }
+            s
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(list))
+}
+
+/// `GET /schedules/{name}`: a schedule, the targets it picks now (with how
+/// its latest rollout went on each) and its occurrences, newest first.
+async fn schedule(state: Data, _: Authenticated, path: web::Path<String>) -> ApiResult {
+    let name = path.into_inner();
+    let found = match &state.schedules {
+        Some(s) => s.detail(&name).await?,
+        None => None,
+    };
+    let detail = found.ok_or_else(|| {
+        ApiError::not_found(format!("The stable revision has no schedule '{name}'."))
+    })?;
+    Ok(HttpResponse::Ok().json(detail))
 }
 
 /// Asks the host's agent to install a release once idle and restart into it.

@@ -74,6 +74,8 @@ pub struct Revision {
     pub unloaded: Vec<String>,
     /// Directories under `workloads/` that have no `workload.yaml`.
     pub unloaded_workloads: Vec<String>,
+    /// `schedules/<name>.yaml`: actions rolled out on a schedule, by name.
+    pub schedules: indexmap::IndexMap<String, crate::model::ScheduleDecl>,
 }
 
 impl Revision {

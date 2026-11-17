@@ -661,6 +661,7 @@ mod tests {
             label: "A".into(),
             selector: None,
             instances: None,
+            schedule: None,
         });
         apply_revisions(
             &mut revisions,

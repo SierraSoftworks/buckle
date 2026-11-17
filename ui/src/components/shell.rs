@@ -35,6 +35,7 @@ const NAV: &[NavItem] = &[
         yi::CHART_NO_AXES_COLUMN_DECREASING,
         Route::Rollouts,
     ),
+    ("Schedules", yi::ALARM_CLOCK, Route::Schedules),
     ("Hosts", yi::SERVER, Route::Hosts),
     ("Workloads", yi::LAYERS, Route::Workloads),
     ("Clusters", yi::WAYPOINTS, Route::Clusters),
@@ -50,6 +51,7 @@ fn section(route: &Route) -> Route {
         Route::Host { .. } => Route::Hosts,
         Route::Cluster { .. } => Route::Clusters,
         Route::Workload { .. } => Route::Workloads,
+        Route::Schedule { .. } => Route::Schedules,
         other => other.clone(),
     }
 }

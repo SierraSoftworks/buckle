@@ -209,3 +209,36 @@ during one waits for it (or replaces it, under `supersede: replace`).
 
 Action rollouts, and actions run on one target from its page, appear on the Rollouts timeline
 between the commits (`GET /api/v1/actions/runs` lists the one-off runs across the fleet).
+
+## Scheduled actions
+
+A file under `schedules/` rolls an action out on a cron schedule, as **Run action…** would. The
+file's name is the schedule's.
+
+```yaml
+# schedules/weekly-upgrades.yaml
+description: Upgrade the home hosts' packages early every Sunday.
+cron: "0 4 * * SUN"          # five fields, six with seconds, or @daily, @weekly, ...
+timezone: Europe/London       # IANA zone; UTC when absent
+module: packages              # or `workload: grafana` for a workload's action
+action: upgrade-reboot
+select: 'host.groups contains "home"'   # optional, as Run action…'s selector
+approval: auto                # phases (default) | auto
+window: 2h                    # how late it may start; 1h when absent
+note: Weekly package upgrades # audit note, required for a `confirm: true` action
+```
+
+- **Revision**: the stable revision's schedules run, so a new or changed one takes effect once
+  its commit has rolled out. Validation checks the expression, the zone, and that the module or
+  workload declares the action.
+- **Approval**: `phases` waits wherever a phase asks for approval, as an operator's rollout
+  would; `auto` lets every phase go ahead unattended (the commit declaring it is the sign-off).
+- **Busy fleet**: an occurrence that finds a rollout under way waits for it, for up to `window`,
+  then is skipped. After the server was down, only the latest occurrence starts, and only within
+  its window. A schedule never starts an occurrence due before the server first saw it.
+
+The **Schedules** page lists each schedule with when it fires next and how its latest run went;
+a schedule's page shows the targets it picks (with their result in its latest run) and every
+run it started or skipped (`GET /api/v1/schedules`, `GET /api/v1/schedules/{name}`). Their
+rollouts appear on the Rollouts timeline with an alarm clock, named by their schedule, beneath
+each schedule's next run.

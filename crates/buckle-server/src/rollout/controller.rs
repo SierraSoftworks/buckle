@@ -256,7 +256,7 @@ pub struct CommandError {
 }
 
 impl CommandError {
-    fn not_found(msg: impl Into<String>) -> Self {
+    pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self {
             kind: CommandErrorKind::NotFound,
             error: buckle_core::error::user(
@@ -265,19 +265,19 @@ impl CommandError {
             ),
         }
     }
-    fn conflict(msg: impl Into<String>, advice: &'static [&'static str]) -> Self {
+    pub(crate) fn conflict(msg: impl Into<String>, advice: &'static [&'static str]) -> Self {
         Self {
             kind: CommandErrorKind::Conflict,
             error: buckle_core::error::user(msg.into(), advice),
         }
     }
-    fn invalid(msg: impl Into<String>, advice: &'static [&'static str]) -> Self {
+    pub(crate) fn invalid(msg: impl Into<String>, advice: &'static [&'static str]) -> Self {
         Self {
             kind: CommandErrorKind::Invalid,
             error: buckle_core::error::user(msg.into(), advice),
         }
     }
-    fn internal(error: buckle_core::Error) -> Self {
+    pub(crate) fn internal(error: buckle_core::Error) -> Self {
         Self {
             kind: CommandErrorKind::Internal,
             error,
@@ -2702,11 +2702,17 @@ impl Controller {
         let now = self.now();
         let id = self.new_rollout_id().await?;
         let n = targets.len();
+        let mut policy = rev.fleet.rollout.clone();
+        if action.auto_approve {
+            for p in &mut policy.phases {
+                p.approval = buckle_core::model::ApprovalPolicy::Auto;
+            }
+        }
         let record = RolloutRecord {
             id: id.clone(),
             revision: stable.clone(),
             state: RolloutState::Detected,
-            policy: rev.fleet.rollout.clone(),
+            policy,
             started_at: now,
             finished_at: None,
             triggered_by: actor.to_owned(),

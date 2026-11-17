@@ -748,6 +748,8 @@ impl Harness {
                 confirm,
                 selector: None,
                 instances: None,
+                schedule: None,
+                auto_approve: false,
             },
             targets: targets
                 .iter()
@@ -5266,6 +5268,8 @@ async fn a_cluster_action_rollout_runs_on_its_workloads_placement(#[case] no_wor
                 confirm: false,
                 selector: None,
                 instances: Some(buckle_api::ActionInstances::All),
+                schedule: None,
+                auto_approve: false,
             },
             targets: BTreeMap::from([(CLUSTER.to_string(), "r1".to_string())]),
             note: String::new(),

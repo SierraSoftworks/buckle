@@ -381,6 +381,22 @@ pub async fn action_runs(before: Option<String>) -> Result<Page<buckle_api::Acti
     }
 }
 
+/// The stable revision's schedules, each with when it fires next and how
+/// its latest occurrence went. A server predating them has none.
+pub async fn schedules() -> Result<Vec<buckle_api::ScheduleInfo>, ApiError> {
+    demo!(demo_store::schedules());
+    match get("/schedules").await {
+        Err(ApiError::NotFound(_)) => Ok(Vec::new()),
+        r => r,
+    }
+}
+
+/// A schedule, the targets it picks now and its occurrences.
+pub async fn schedule(name: &str) -> Result<buckle_api::ScheduleDetail, ApiError> {
+    demo!(demo_store::schedule(name));
+    get(&format!("/schedules/{}", enc(name))).await
+}
+
 /// Starts an action rollout over the targets offering the action.
 pub async fn start_action_rollout(body: StartActionRollout) -> Result<RolloutSummary, ApiError> {
     demo!(demo_store::start_action_rollout(&body));

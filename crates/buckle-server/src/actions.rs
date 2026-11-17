@@ -184,3 +184,106 @@ fn offers_to(
         _ => ctx.matches(selector),
     }
 }
+
+/// Who started an action rollout, and how it follows its phases.
+#[derive(Debug, Clone, Default)]
+pub struct Origin {
+    /// The schedule that started it; none for an operator.
+    pub schedule: Option<String>,
+    /// Its phases go ahead without the approvals they ask for.
+    pub auto_approve: bool,
+}
+
+/// Starts an action rollout of `body`'s action over the targets offering it
+/// that its selector matches, each running it from its applied revision;
+/// returns the rollout's id. Shared by `POST /rollouts` and the scheduler.
+pub async fn start_rollout(
+    store: &crate::store::Store,
+    revisions: &crate::source::cache::RevisionCache,
+    controller: &crate::rollout::ControllerHandle,
+    actor: &str,
+    body: buckle_api::StartActionRollout,
+    origin: Origin,
+) -> Result<String, crate::rollout::CommandError> {
+    use crate::rollout::CommandError;
+    let raw = body
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let selector = raw
+        .as_deref()
+        .map(buckle_core::Filter::new)
+        .transpose()
+        .map_err(|e| {
+            CommandError::invalid(
+                format!("The selector is not valid: {e}"),
+                &["Check the selector's syntax."],
+            )
+        })?;
+    let offered = fleet(store, revisions, selector.as_ref())
+        .await
+        .map_err(CommandError::internal)?;
+    let found = offered
+        .into_iter()
+        .find(|f| {
+            f.workload == body.workload
+                && f.action.module == body.module
+                && f.action.name == body.action
+        })
+        .ok_or_else(|| {
+            CommandError::not_found(format!(
+                "No {}{} offers the action '{}' of '{}'.",
+                if body.workload { "cluster" } else { "host" },
+                if raw.is_some() {
+                    " the selector matches"
+                } else {
+                    ""
+                },
+                body.action,
+                body.module
+            ))
+        })?;
+    if found.action.confirm && body.note.trim().is_empty() {
+        return Err(CommandError::invalid(
+            format!(
+                "The action '{}' asks for confirmation: send a note for the audit log.",
+                found.action.label
+            ),
+            &["Describe why it runs; the note is kept in the audit log."],
+        ));
+    }
+    let names = found.targets.clone();
+    let targets: std::collections::BTreeMap<String, String> = store
+        .call(move |db| {
+            let mut out = std::collections::BTreeMap::new();
+            for t in &names {
+                if let Some(rev) = db.hosts().target(t)?.and_then(|r| r.applied_revision) {
+                    out.insert(t.clone(), rev);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(CommandError::internal)?;
+    controller
+        .command(
+            actor,
+            crate::rollout::Command::StartAction {
+                action: crate::rollout::RolloutAction {
+                    module: found.action.module.clone(),
+                    action: found.action.name.clone(),
+                    label: found.action.label.clone(),
+                    confirm: found.action.confirm,
+                    selector: raw,
+                    instances: body.instances.filter(|_| found.action.instances.is_some()),
+                    schedule: origin.schedule,
+                    auto_approve: origin.auto_approve,
+                },
+                targets,
+                note: body.note,
+            },
+        )
+        .await
+}

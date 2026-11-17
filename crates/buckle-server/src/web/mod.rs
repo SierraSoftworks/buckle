@@ -62,6 +62,8 @@ pub struct AppState {
     /// list would otherwise union every listed rollout's plans each time).
     pub rollout_changes:
         Arc<std::sync::Mutex<std::collections::HashMap<String, buckle_api::ChangeCounts>>>,
+    /// Starts scheduled actions, and answers for them.
+    pub schedules: Option<Arc<crate::schedules::Scheduler>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -110,6 +112,7 @@ impl AppState {
             identity: None,
             builder: None,
             rollout_changes: Default::default(),
+            schedules: None,
         }
     }
 

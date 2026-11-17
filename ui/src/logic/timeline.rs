@@ -3,7 +3,7 @@
 //! rollout started (where it was committed, if it has none yet); an action
 //! where it started. `Show` narrows it to the commits or the actions.
 
-use buckle_api::{ActionRun, LiveEvent, RevisionSummary, RolloutSummary};
+use buckle_api::{ActionRun, LiveEvent, RevisionSummary, RolloutSummary, ScheduleInfo};
 use chrono::{DateTime, Utc};
 
 use super::run::run_finished;
@@ -45,6 +45,10 @@ pub enum Entry<'a> {
     Rollout(&'a RolloutSummary),
     /// An action run on one target.
     Run(&'a ActionRun),
+    /// A schedule's next occurrence, above everything that happened.
+    Upcoming(&'a ScheduleInfo, DateTime<Utc>),
+    /// A schedule's latest occurrence, which started no rollout.
+    Skipped(&'a ScheduleInfo, DateTime<Utc>),
 }
 
 impl Entry<'_> {
@@ -55,6 +59,7 @@ impl Entry<'_> {
             Entry::Commit(r, None) => r.created_at,
             Entry::Rollout(x) => x.started_at,
             Entry::Run(r) => r.started_at,
+            Entry::Upcoming(_, at) | Entry::Skipped(_, at) => *at,
         }
     }
 }
@@ -66,6 +71,7 @@ pub fn entries<'a>(
     revisions: &'a [RevisionSummary],
     rollouts: &'a [RolloutSummary],
     runs: &'a [ActionRun],
+    schedules: &'a [ScheduleInfo],
     show: Show,
     since: Option<DateTime<Utc>>,
 ) -> Vec<Entry<'a>> {
@@ -87,6 +93,19 @@ pub fn entries<'a>(
                 .map(Entry::Rollout),
         );
         out.extend(runs.iter().map(Entry::Run));
+        for s in schedules {
+            // Only beside the actions: above the latest commit it would
+            // push the history down.
+            if show == Show::Actions {
+                out.extend(s.next_at.map(|at| Entry::Upcoming(s, at)));
+            }
+            out.extend(
+                s.last
+                    .as_ref()
+                    .filter(|l| l.skipped.is_some())
+                    .map(|l| Entry::Skipped(s, l.due_at)),
+            );
+        }
     }
     out.retain(|e| since.is_none_or(|s| e.at() >= s));
     // Stable, so commits keep their order where their times tie.
@@ -178,6 +197,7 @@ mod tests {
                 label: "A".into(),
                 selector: None,
                 instances: None,
+                schedule: None,
             }),
             changes: None,
         }
@@ -207,6 +227,8 @@ mod tests {
                 Entry::Commit(r, _) => r.id.clone(),
                 Entry::Rollout(x) => x.id.clone(),
                 Entry::Run(r) => r.id.clone(),
+                Entry::Upcoming(s, _) => format!("next:{}", s.name),
+                Entry::Skipped(s, _) => format!("skipped:{}", s.name),
             })
             .collect()
     }
@@ -215,15 +237,45 @@ mod tests {
         revisions: Vec<RevisionSummary>,
         rollouts: Vec<RolloutSummary>,
         runs: Vec<ActionRun>,
+        schedules: Vec<ScheduleInfo>,
+    }
+
+    fn schedule(name: &str, next: Option<i64>, skipped_at: Option<i64>) -> ScheduleInfo {
+        ScheduleInfo {
+            name: name.into(),
+            description: None,
+            cron: "0 4 * * *".into(),
+            cron_text: String::new(),
+            timezone: "UTC".into(),
+            module: "m".into(),
+            action: "a".into(),
+            label: None,
+            workload: false,
+            selector: None,
+            approval: "phases".into(),
+            window_seconds: 3600,
+            next_at: next.map(t),
+            last: skipped_at.map(|at| buckle_api::ScheduleOccurrence {
+                due_at: t(at),
+                rollout: None,
+                skipped: Some("busy".into()),
+                waiting: None,
+            }),
+        }
     }
 
     /// c1 committed at 0 and rolled out at 30; c2 committed at 20, never
-    /// rolled out; an action rollout at 25 and a run at 10.
+    /// rolled out; an action rollout at 25 and a run at 10; a schedule due
+    /// next at 60 that skipped its occurrence at 5.
     fn fixture() -> Fixture {
         Fixture {
             revisions: vec![revision("c2", 20, None), revision("c1", 0, Some("ro1"))],
             rollouts: vec![rollout("ro1", 30, false), rollout("act", 25, true)],
             runs: vec![run("run", 10)],
+            schedules: vec![
+                schedule("nightly", Some(60), Some(5)),
+                schedule("weekly", None, None),
+            ],
         }
     }
 
@@ -231,14 +283,29 @@ mod tests {
     fn actions_stand_between_commits_by_when_their_rollouts_started() {
         let f = fixture();
         let cases = [
-            (Show::All, None, vec!["c1", "act", "c2", "run"]),
+            (
+                Show::All,
+                None,
+                vec!["c1", "act", "c2", "run", "skipped:nightly"],
+            ),
             (Show::Repo, None, vec!["c1", "c2"]),
-            (Show::Actions, None, vec!["act", "run"]),
+            (
+                Show::Actions,
+                None,
+                vec!["next:nightly", "act", "run", "skipped:nightly"],
+            ),
             (Show::All, Some(t(15)), vec!["c1", "act", "c2"]),
         ];
         for (show, since, want) in cases {
             assert_eq!(
-                ids(&entries(&f.revisions, &f.rollouts, &f.runs, show, since)),
+                ids(&entries(
+                    &f.revisions,
+                    &f.rollouts,
+                    &f.runs,
+                    &f.schedules,
+                    show,
+                    since
+                )),
                 want,
                 "{show:?} since {since:?}"
             );
@@ -248,7 +315,7 @@ mod tests {
     #[test]
     fn a_commit_without_its_rollout_loaded_stands_where_it_was_committed() {
         let f = fixture();
-        let found = entries(&f.revisions, &[], &f.runs, Show::All, None);
+        let found = entries(&f.revisions, &[], &f.runs, &[], Show::All, None);
         assert_eq!(ids(&found), vec!["c2", "run", "c1"]);
     }
 

@@ -32,6 +32,7 @@ pub(super) struct State {
     pub rollouts: Vec<RolloutDetail>,
     /// One-off action runs, newest first.
     pub action_runs: Vec<buckle_api::ActionRun>,
+    pub schedules: Vec<buckle_api::ScheduleDetail>,
     pub revisions: Vec<RevisionSummary>,
     pub audit: Vec<AuditEntry>,
     /// Events the demo produced, for the live provider to deliver.
@@ -59,6 +60,11 @@ impl State {
         {
             data::hold_at_cloud_gate(active, now);
         }
+        let schedules = if empty {
+            vec![]
+        } else {
+            data::schedules(now, &rollouts)
+        };
         Self {
             hosts,
             clusters,
@@ -69,6 +75,7 @@ impl State {
             } else {
                 data::action_runs(now)
             },
+            schedules,
             revisions: if empty { vec![] } else { data::revisions(now) },
             audit: if empty { vec![] } else { data::audit(now) },
             outbox: Vec::new(),
@@ -746,6 +753,7 @@ pub fn start_action_rollout(
             label: found.action.label.clone(),
             selector: body.selector.clone(),
             instances: body.instances,
+            schedule: None,
         });
         detail.summary.state = RolloutState::Rolling;
         detail.summary.triggered_by = actor();
@@ -820,6 +828,22 @@ pub fn action_runs(before: Option<&str>) -> Result<Page<buckle_api::ActionRun>, 
             next,
             total: s.action_runs.len() as u64,
         })
+    })
+}
+
+pub fn schedules() -> Result<Vec<buckle_api::ScheduleInfo>, ApiError> {
+    with(|s| Ok(s.schedules.iter().map(|d| d.schedule.clone()).collect()))
+}
+
+pub fn schedule(name: &str) -> Result<buckle_api::ScheduleDetail, ApiError> {
+    with(|s| {
+        s.schedules
+            .iter()
+            .find(|d| d.schedule.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("The stable revision has no schedule '{name}'."))
+            })
     })
 }
 

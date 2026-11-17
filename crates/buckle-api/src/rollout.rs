@@ -298,6 +298,84 @@ pub struct RolloutActionInfo {
     /// Where each target runs it, when the operator picked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instances: Option<crate::ActionInstances>,
+    /// The schedule (`buckle.yaml` `schedules:`) that started it; absent
+    /// when an operator did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+}
+
+/// `GET /api/v1/schedules`: one of the stable revision's
+/// `schedules/<name>.yaml`, an action rolled out on a cron schedule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The cron expression, as written.
+    pub cron: String,
+    /// The expression in words (`At 04:00 on Sunday`).
+    #[serde(default)]
+    pub cron_text: String,
+    /// The IANA time zone it is read in.
+    pub timezone: String,
+    /// The module (a workload's, when `workload`) declaring the action.
+    pub module: String,
+    pub action: String,
+    /// The action's label, where a target offers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub workload: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    /// `phases` (its rollouts wait where a phase asks for approval) or
+    /// `auto` (they never wait).
+    pub approval: String,
+    /// How long an occurrence may wait for a busy fleet before it is skipped.
+    pub window_seconds: u64,
+    /// When it fires next; absent when the expression never fires again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_at: Option<DateTime<Utc>>,
+    /// Its latest occurrence, with the rollout it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<ScheduleOccurrence>,
+}
+
+/// One occurrence of a schedule: the rollout it started, or why it started
+/// none (yet).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleOccurrence {
+    /// When it was due.
+    pub due_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<RolloutSummary>,
+    /// Why it started no rollout (a rollout under way past its window, no
+    /// target offering the action).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    /// Why it is still waiting to start (a rollout under way).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<String>,
+}
+
+/// `GET /api/v1/schedules/{name}`: a schedule, the targets it picks now and
+/// its occurrences, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleDetail {
+    #[serde(flatten)]
+    pub schedule: ScheduleInfo,
+    pub targets: Vec<ScheduleTarget>,
+    pub history: Vec<ScheduleOccurrence>,
+}
+
+/// A target a schedule picks, with how its latest rollout went there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleTarget {
+    pub id: String,
+    pub kind: crate::TargetKind,
+    /// Its row in the schedule's latest rollout, where it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<RolloutHost>,
 }
 
 /// `POST /api/v1/rollouts`: run an action on every target offering it (that

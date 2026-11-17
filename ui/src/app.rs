@@ -32,6 +32,10 @@ pub enum Route {
     Clusters,
     #[at("/clusters/:id")]
     Cluster { id: String },
+    #[at("/schedules")]
+    Schedules,
+    #[at("/schedules/:name")]
+    Schedule { name: String },
     #[at("/revisions")]
     Revisions,
     #[at("/audit")]
@@ -191,6 +195,8 @@ fn switch(route: Route) -> Html {
         Route::Clusters => html! { <pages::clusters::Clusters /> },
         Route::Cluster { id } => html! { <pages::cluster::ClusterPage {id} /> },
         // Revisions and rollouts are one history now.
+        Route::Schedules => html! { <pages::schedules::Schedules /> },
+        Route::Schedule { name } => html! { <pages::schedule::SchedulePage {name} /> },
         Route::Revisions => html! { <Redirect<Route> to={Route::Rollouts} /> },
         Route::Audit => html! { <pages::audit::Audit /> },
         Route::NotFound => html! { <pages::NotFound /> },

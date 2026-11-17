@@ -137,7 +137,6 @@
     grid-template-columns: 1.4rem minmax(0, 1fr);
     gap: 0.75rem;
     padding: 0.7rem 0;
-    border-bottom: 1px solid var(--yi-line);
 
     &::before {
       content: "";
@@ -146,6 +145,16 @@
       top: 0;
       bottom: 0;
       border-left: 2px solid var(--yi-line-strong);
+    }
+
+    // The separator starts beside the rail, never across it.
+    &::after {
+      content: "";
+      position: absolute;
+      left: calc(1.4rem + 0.75rem);
+      right: 0;
+      bottom: 0;
+      border-bottom: 1px solid var(--yi-line);
     }
 
     &:first-child::before {
@@ -179,6 +188,34 @@
     border: 2px solid var(--bk-action);
     border-radius: 2px;
     background: var(--yi-surface);
+  }
+
+  &__item--scheduled &__diamond {
+    border-color: var(--bk-scheduled);
+  }
+
+  // A schedule's next occurrence: faded and striped, quieter than what
+  // has happened.
+  &__item[data-action="upcoming"] {
+    .gitlog__diamond {
+      opacity: 0.6;
+    }
+
+    .action-entry {
+      margin: -0.4rem 0 -0.4rem -0.5rem;
+      padding: 0.4rem 0.5rem;
+      opacity: 0.7;
+      background: repeating-linear-gradient(
+        -45deg,
+        color-mix(in srgb, var(--bk-scheduled) 10%, transparent) 0 6px,
+        transparent 6px 12px
+      );
+
+      &.commit--link:hover {
+        box-shadow: none;
+        opacity: 0.9;
+      }
+    }
   }
 
   &__dot {
@@ -1117,6 +1154,37 @@ tr[id] {
     color: var(--yi-fg);
   }
 
+  // Above the card's link: it opens the schedule.
+  &__schedule {
+    position: relative;
+    z-index: 1;
+    color: var(--bk-scheduled);
+    font-weight: 500;
+    text-decoration: none;
+
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+
+  &__cron {
+    color: var(--yi-fg-muted);
+  }
+
+  // A schedule's: its colour, and the alarm clock drawn in strokes.
+  &--scheduled {
+    &.commit--link:hover .commit__subject,
+    .action-entry__rollout,
+    .action-entry__icon {
+      color: var(--bk-scheduled);
+    }
+
+    .action-entry__icon svg {
+      fill: none;
+      stroke-width: 2;
+    }
+  }
+
   &__error {
     max-width: 28rem;
     overflow: hidden;
@@ -1148,5 +1216,60 @@ tr[id] {
 
   .yi-button {
     margin-left: auto;
+  }
+}
+
+// The Schedules page and a schedule's: names and rollouts in the scheduled
+// colour, an occurrence's outcome on one line.
+.schedule-name {
+  color: var(--bk-scheduled);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.schedule-description {
+  max-width: 26rem;
+}
+
+.schedule-outcome {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+
+  &__rollout {
+    color: var(--bk-scheduled);
+    font-weight: 500;
+    text-decoration: none;
+  }
+
+  .cell-sub {
+    flex-basis: 100%;
+  }
+}
+
+.schedule-runs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+
+  &__item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--yi-line);
+
+    &:last-child {
+      border-bottom: 0;
+    }
+  }
+
+  &__head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
   }
 }

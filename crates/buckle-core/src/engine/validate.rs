@@ -232,6 +232,63 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
         }
     }
 
+    // Schedules: the expression, and an action the revision declares.
+    for (name, schedule) in &revision.schedules {
+        let location = format!("schedules/{name}.yaml");
+        for problem in schedule.problems() {
+            report.error(None, &location, problem);
+        }
+        if let Some(select) = &schedule.select {
+            check_secrets(&mut report, None, &location, select.raw());
+        }
+        let Some((owner, workload)) = schedule.target() else {
+            continue;
+        };
+        let action = schedule.action.as_str();
+        let confirm = if workload {
+            revision.workload(owner).map(|w| {
+                w.config
+                    .implicit_actions()
+                    .iter()
+                    .find(|i| i.name == action)
+                    .map(|i| Some(i.confirm))
+                    .or_else(|| {
+                        w.task_actions
+                            .iter()
+                            .any(|t| t.name == action)
+                            .then_some(Some(false))
+                    })
+                    .or_else(|| w.config.actions.get(action).map(|d| Some(d.confirm)))
+                    .flatten()
+            })
+        } else {
+            revision
+                .modules
+                .iter()
+                .find(|m| m.config.name == owner)
+                .map(|m| m.config.actions.get(action).map(|d| d.confirm))
+        };
+        let noun = if workload { "workload" } else { "module" };
+        match confirm {
+            None => report.error(
+                None,
+                &location,
+                format!("runs an action of the {noun} '{owner}', which does not exist"),
+            ),
+            Some(None) => report.error(
+                None,
+                &location,
+                format!("runs the action '{action}', which the {noun} '{owner}' does not declare"),
+            ),
+            Some(Some(true)) if schedule.note.trim().is_empty() => report.error(
+                None,
+                &location,
+                format!("the action '{action}' asks for confirmation: give the schedule a `note` for the audit log"),
+            ),
+            Some(Some(_)) => {}
+        }
+    }
+
     for name in &revision.unloaded {
         report.warning(
             Some(name),

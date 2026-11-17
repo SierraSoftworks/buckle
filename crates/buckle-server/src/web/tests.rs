@@ -3195,3 +3195,143 @@ async fn workload_selectors_pick_the_placements_offering_an_action() {
     );
     assert!(listed("host.labels.nomad == true").await.is_empty());
 }
+
+/// Each schedule's occurrence starts an action rollout tagged with it (its
+/// phases' approvals waived for `approval: auto`); one that finds a rollout
+/// under way waits, and past its window is skipped. Both are listed with
+/// the schedule, and its detail names the targets it picks.
+#[actix_web::test]
+async fn schedules_start_action_rollouts_and_keep_their_history() {
+    let store = Store::in_memory().await.unwrap();
+    store
+        .call(|db| db.kv().set("stable_revision", "r1"))
+        .await
+        .unwrap();
+    let e = env_on(
+        store,
+        WebConfig {
+            admin_acl: acl("true"),
+            ..Default::default()
+        },
+        |s| {
+            s.schedules = Some(Arc::new(crate::schedules::Scheduler::new(
+                s.store.clone(),
+                s.revisions.clone(),
+                s.controller.clone(),
+                Arc::new(TokioClock::new()),
+            )));
+        },
+    )
+    .await;
+    let dir = e.state.revisions.dir("r1");
+    std::fs::create_dir_all(dir.join("modules/web")).unwrap();
+    std::fs::create_dir_all(dir.join("schedules")).unwrap();
+    std::fs::write(
+        dir.join("modules/web/module.yaml"),
+        "name: web\nactions:\n  drain: { command.run: { run: [\"true\"] }, name: Drain }\n",
+    )
+    .unwrap();
+    // a at 03:00, unattended; b and c both at 04:00, b first by name.
+    for (name, cron, approval) in [
+        ("a-early", "0 3 * * *", "auto"),
+        ("b-nightly", "0 4 * * *", "phases"),
+        ("c-nightly", "0 4 * * *", "phases"),
+    ] {
+        std::fs::write(
+            dir.join(format!("schedules/{name}.yaml")),
+            format!(
+                "cron: '{cron}'\nmodule: web\naction: drain\nselect: 'host.labels.role == \"web\"'\napproval: {approval}\n"
+            ),
+        )
+        .unwrap();
+    }
+    revision(
+        &e,
+        "r1",
+        "version: 2\nrollout:\n  phases:\n    - { name: all, select: 'true', approval: required }\n",
+    )
+    .await;
+    for (host, role) in [("pi-1", "web"), ("pi-2", "web"), ("pi-3", "db")] {
+        add_host(&e.store, host, HostStatus::Active).await;
+        let (h, role) = (host.to_owned(), role.to_owned());
+        e.store
+            .call(move |db| {
+                db.hosts().set_applied_revision(&h, "r1")?;
+                db.hosts().set_labels(
+                    &h,
+                    &std::collections::BTreeMap::from([("role".to_string(), role)]),
+                )
+            })
+            .await
+            .unwrap();
+    }
+    let at = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    let scheduler = e.state.schedules.clone().unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let get = |uri: &str| test::TestRequest::get().uri(uri).to_request();
+    let detail = async |name: &str| -> buckle_api::ScheduleDetail {
+        let resp = test::call_service(&app, get(&format!("/api/v1/schedules/{name}"))).await;
+        test::read_body_json(resp).await
+    };
+
+    // First seen at 02:00; a falls due at 03:00 and goes ahead unattended.
+    scheduler.tick(at("2026-11-17T02:00:00Z")).await.unwrap();
+    scheduler.tick(at("2026-11-17T03:00:10Z")).await.unwrap();
+    let a = detail("a-early").await;
+    assert_eq!(a.history.len(), 1);
+    let rollout = a.history[0].rollout.clone().expect("a started a rollout");
+    assert_eq!(
+        rollout.action.as_ref().unwrap().schedule.as_deref(),
+        Some("a-early")
+    );
+    assert_eq!(rollout.triggered_by, "schedule:a-early");
+    assert_eq!(rollout.hosts_total, 2);
+    assert_eq!(a.schedule.label.as_deref(), Some("Drain"));
+    let full: buckle_api::RolloutDetail = test::read_body_json(
+        test::call_service(&app, get(&format!("/api/v1/rollouts/{}", rollout.id))).await,
+    )
+    .await;
+    assert!(
+        full.phases.iter().all(|p| p.approval == "auto"),
+        "{:?}",
+        full.phases
+    );
+
+    // b starts and waits for approval; c finds it under way, so waits.
+    scheduler.tick(at("2026-11-17T04:00:10Z")).await.unwrap();
+    scheduler.tick(at("2026-11-17T04:00:40Z")).await.unwrap();
+    let list: Vec<buckle_api::ScheduleInfo> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/schedules")).await).await;
+    let names: Vec<&str> = list.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["a-early", "b-nightly", "c-nightly"]);
+    let b = list[1].last.clone().expect("b's occurrence");
+    assert_eq!(
+        b.rollout.map(|r| r.state),
+        Some(buckle_api::RolloutState::AwaitingApproval)
+    );
+    assert!(list[1].next_at.is_some());
+    let c = list[2].last.clone().expect("c's occurrence");
+    assert!(c.rollout.is_none() && c.waiting.is_some(), "{c:?}");
+
+    // c's hour passes with b still waiting: c is skipped.
+    scheduler.tick(at("2026-11-17T05:00:30Z")).await.unwrap();
+    let c = detail("c-nightly").await;
+    assert_eq!(c.history.len(), 1);
+    assert!(c.history[0].skipped.is_some(), "{:?}", c.history[0]);
+    let targets: Vec<&str> = c.targets.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(targets, vec!["pi-1", "pi-2"]);
+    let b = detail("b-nightly").await;
+    assert_eq!(b.history.len(), 1, "handled once");
+    assert!(
+        b.targets.iter().all(|t| t.last.is_some()),
+        "{:?}",
+        b.targets
+    );
+
+    let missing = test::call_service(&app, get("/api/v1/schedules/nope")).await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
