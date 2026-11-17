@@ -137,7 +137,6 @@
     grid-template-columns: 1.4rem minmax(0, 1fr);
     gap: 0.75rem;
     padding: 0.7rem 0;
-    border-bottom: 1px solid var(--yi-line);
 
     &::before {
       content: "";
@@ -146,6 +145,16 @@
       top: 0;
       bottom: 0;
       border-left: 2px solid var(--yi-line-strong);
+    }
+
+    // The separator starts beside the rail, never across it.
+    &::after {
+      content: "";
+      position: absolute;
+      left: calc(1.4rem + 0.75rem);
+      right: 0;
+      bottom: 0;
+      border-bottom: 1px solid var(--yi-line);
     }
 
     &:first-child::before {
@@ -185,16 +194,27 @@
     border-color: var(--bk-scheduled);
   }
 
-  // A schedule's next occurrence: dashed, and quieter than what happened.
+  // A schedule's next occurrence: faded and striped, quieter than what
+  // has happened.
   &__item[data-action="upcoming"] {
     .gitlog__diamond {
-      border-style: dashed;
+      opacity: 0.6;
     }
 
     .action-entry {
-      opacity: 0.8;
-      outline: 1px dashed color-mix(in srgb, var(--bk-scheduled) 45%, transparent);
-      outline-offset: 0.4rem;
+      margin: -0.4rem 0 -0.4rem -0.5rem;
+      padding: 0.4rem 0.5rem;
+      opacity: 0.7;
+      background: repeating-linear-gradient(
+        -45deg,
+        color-mix(in srgb, var(--bk-scheduled) 10%, transparent) 0 6px,
+        transparent 6px 12px
+      );
+
+      &.commit--link:hover {
+        box-shadow: none;
+        opacity: 0.9;
+      }
     }
   }
 

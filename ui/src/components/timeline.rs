@@ -4,7 +4,7 @@
 //! colour set it apart; `module/action` stands where a commit has its hash.
 //! An action rollout opens its rollout, a run on one target that target.
 //! A schedule's rollouts carry an alarm clock and the scheduled colour, with
-//! its next occurrence (dashed) above everything that happened.
+//! its next occurrence (faded, striped) above everything that happened.
 
 use buckle_api::{ActionRun, RevisionSummary, RolloutState, RolloutSummary, ScheduleInfo};
 use chrono::{DateTime, Utc};
