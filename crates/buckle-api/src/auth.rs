@@ -15,6 +15,42 @@ pub struct Me {
     /// `name` and `subject` are placeholders.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub anonymous: bool,
+    /// Which deployment this is (`web.environment`), shown beside the
+    /// product name so nobody mistakes production for staging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Environment>,
+}
+
+/// `web.environment` in `server.yaml`: a label for this deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Environment {
+    /// What the tag says, e.g. `Production`.
+    pub name: String,
+    /// The tag's fill as `#rgb` or `#rrggbb`; its text is black or white,
+    /// whichever reads better on it. Absent: the neutral tag colours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colour: Option<String>,
+}
+
+impl Environment {
+    /// The colour as `(r, g, b)`, if it is `#rgb` or `#rrggbb`.
+    pub fn rgb(&self) -> Option<(u8, u8, u8)> {
+        parse_hex(self.colour.as_deref()?)
+    }
+}
+
+fn parse_hex(colour: &str) -> Option<(u8, u8, u8)> {
+    let hex = colour.strip_prefix('#')?;
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let at = |i: usize, n: usize| u8::from_str_radix(&hex[i..i + n], 16).ok();
+    match hex.len() {
+        3 => Some((at(0, 1)? * 17, at(1, 1)? * 17, at(2, 1)? * 17)),
+        6 => Some((at(0, 2)?, at(2, 2)?, at(4, 2)?)),
+        _ => None,
+    }
 }
 
 impl Me {
@@ -26,6 +62,7 @@ impl Me {
             subject: "anonymous".into(),
             is_admin,
             anonymous: true,
+            environment: None,
         }
     }
 }
@@ -48,6 +85,7 @@ mod tests {
             subject: "ada".into(),
             is_admin: true,
             anonymous: false,
+            environment: None,
         };
         let text = serde_json::to_string(&me).unwrap();
         assert!(!text.contains("anonymous"));
@@ -55,5 +93,24 @@ mod tests {
         let open = serde_json::to_value(Me::anonymous(false)).unwrap();
         assert_eq!(open["anonymous"], true);
         assert_eq!(open["is_admin"], false);
+        assert!(open.get("environment").is_none());
+    }
+
+    #[test]
+    fn environment_colours_parse_short_and_long_hex_only() {
+        let env = |c: &str| Environment {
+            name: "Production".into(),
+            colour: Some(c.into()),
+        };
+        for (colour, rgb) in [
+            ("#d00", Some((0xdd, 0, 0))),
+            ("#1A2b3C", Some((0x1a, 0x2b, 0x3c))),
+            ("d00000", None),
+            ("#d0000", None),
+            ("#zzz", None),
+            ("red", None),
+        ] {
+            assert_eq!(env(colour).rgb(), rgb, "{colour}");
+        }
     }
 }

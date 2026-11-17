@@ -171,6 +171,26 @@ async fn me(
 }
 
 #[actix_web::test]
+async fn me_names_the_configured_environment() {
+    let production = buckle_api::Environment {
+        name: "Production".into(),
+        colour: Some("#c62828".into()),
+    };
+    for environment in [None, Some(production)] {
+        let server = env(WebConfig {
+            environment: environment.clone(),
+            ..Default::default()
+        })
+        .await;
+        let app = test::init_service(app(server.state.clone())).await;
+        assert_eq!(
+            me(&app, test::TestRequest::get()).await.environment,
+            environment
+        );
+    }
+}
+
+#[actix_web::test]
 async fn without_oidc_me_is_anonymous_and_says_whether_admin_acl_matched() {
     let open = env(WebConfig::default()).await;
     let app = test::init_service(app(open.state.clone())).await;

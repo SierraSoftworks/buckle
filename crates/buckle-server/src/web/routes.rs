@@ -172,7 +172,10 @@ pub const PROTECTED: &[(&str, &str)] = &[
 async fn me(state: Data, req: HttpRequest) -> ApiResult {
     let p = auth::resolve(&state, &req).await?;
     if !p.authenticated {
-        return Ok(HttpResponse::Ok().json(Me::anonymous(p.is_admin)));
+        return Ok(HttpResponse::Ok().json(Me {
+            environment: state.web.environment.clone(),
+            ..Me::anonymous(p.is_admin)
+        }));
     }
     Ok(HttpResponse::Ok().json(Me {
         name: p.name,
@@ -180,6 +183,7 @@ async fn me(state: Data, req: HttpRequest) -> ApiResult {
         subject: p.subject,
         is_admin: p.is_admin,
         anonymous: false,
+        environment: state.web.environment.clone(),
     }))
 }
 

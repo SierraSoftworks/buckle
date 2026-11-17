@@ -51,6 +51,7 @@ pub fn me() -> Me {
         subject: "alice".into(),
         is_admin: true,
         anonymous: false,
+        environment: None,
     }
 }
 

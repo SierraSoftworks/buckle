@@ -93,6 +93,8 @@ pub enum Session {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Auth {
     pub session: Session,
+    /// The deployment `/me` named (`web.environment`).
+    pub environment: Option<buckle_api::Environment>,
 }
 
 impl Auth {
@@ -111,17 +113,25 @@ impl Auth {
 pub fn use_auth() -> Auth {
     use_context::<Auth>().unwrap_or(Auth {
         session: Session::Loading,
+        environment: None,
     })
 }
 
 #[function_component(App)]
 pub fn app() -> Html {
     let session = use_state(|| Session::Loading);
+    let environment = use_state(|| None::<buckle_api::Environment>);
     {
         let session = session.clone();
+        let environment = environment.clone();
         use_effect_with((), move |_| {
             spawn_local(async move {
-                session.set(match api::me().await {
+                let me = api::me().await;
+                if let Ok(Some(me)) = &me {
+                    crate::components::environment::title(me.environment.as_ref());
+                    environment.set(me.environment.clone());
+                }
+                session.set(match me {
                     Ok(Some(me)) if me.anonymous => Session::Open { admin: me.is_admin },
                     Ok(Some(me)) => Session::SignedIn(me),
                     // A server from before `Me::anonymous` answered 204.
@@ -140,6 +150,7 @@ pub fn app() -> Html {
 
     let auth = Auth {
         session: (*session).clone(),
+        environment: (*environment).clone(),
     };
     let body = match &*session {
         Session::Loading => {

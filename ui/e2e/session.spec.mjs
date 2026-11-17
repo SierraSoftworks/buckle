@@ -35,6 +35,26 @@ describe("theme", () => {
   });
 });
 
+describe("environment", () => {
+  test("the configured environment is tagged beside the name and leads the tab title", async () => {
+    const { page, close } = await open("/", { flags: "environment=Production&colour=%23c62828" });
+    const tag = page.getByTestId("environment");
+    await tag.waitFor();
+    assert.equal((await tag.textContent()).trim(), "Production");
+    assert.equal(await tag.evaluate((el) => getComputedStyle(el).backgroundColor), "rgb(198, 40, 40)");
+    assert.match(await page.title(), /^Production/);
+    await close();
+  });
+
+  test("without one there is no tag", async () => {
+    const { page, close } = await open("/");
+    await page.locator("main h1").waitFor();
+    assert.equal(await page.getByTestId("environment").count(), 0);
+    assert.equal(await page.title(), "Buckle");
+    await close();
+  });
+});
+
 describe("session", () => {
   test("an expired session that cannot be refreshed goes to sign in, keeping where it was", async () => {
     const { page, close } = await open("/hosts/pi-1", { flags: "auth=expired", allowErrors: true });

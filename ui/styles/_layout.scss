@@ -17,10 +17,27 @@
   margin-inline: auto;
 }
 
+// The deployment's name (`web.environment`), filled with its colour so
+// production is unmistakable; kept on a narrow screen, where badges go.
+.environment-tag {
+  flex-shrink: 0;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
 @media (max-width: $small) {
   // The word is on every page's badge in demo mode; the box needs the row.
   .shell__bar .badge {
     display: none;
+  }
+
+  // The logo still says Buckle; the environment's name needs the room.
+  .shell__bar:has(.environment-tag) .yi-app-bar__name {
+    display: none;
+  }
+
+  .environment-tag {
+    max-inline-size: none;
   }
 }
 

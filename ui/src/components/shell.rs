@@ -12,6 +12,7 @@ use yewi::{
 };
 
 use super::attention::AttentionBell;
+use super::environment::EnvironmentTag;
 use super::icons;
 use super::search::AppSearch;
 use super::ui::Badge;
@@ -77,6 +78,7 @@ pub fn shell(props: &ShellProps) -> Html {
     </> };
     let bar = html! {
         <AppBar class="shell__bar" {brand} {actions} menu_label="Navigation" wrap={super::search::searchable(&route)}>
+            <EnvironmentTag />
             if crate::fixtures::is_demo() {
                 <Badge tone={Tone::Info} title="Every answer comes from the built-in fixtures. Add ?demo=off to leave.">{ "demo" }</Badge>
             }
