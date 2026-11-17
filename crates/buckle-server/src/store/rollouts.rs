@@ -590,6 +590,8 @@ mod tests {
                     confirm: false,
                     selector: None,
                     instances: None,
+                    schedule: None,
+                    auto_approve: false,
                 });
                 db.rollouts().save(&action)?;
                 db.rollouts().latest_for_revision("rev")

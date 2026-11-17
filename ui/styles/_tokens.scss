@@ -16,6 +16,9 @@
   --bk-mute-soft: color-mix(in srgb, var(--bk-mute) 14%, transparent);
   // An operator's action on the Rollouts timeline.
   --bk-action: light-dark(#a8358b, #e27bc6);
+  // An action a schedule started: a teal between the ok green and the info
+  // blue, apart from every state's tone.
+  --bk-scheduled: light-dark(#0a7c83, #3cc3cb);
 
   --bk-diff-add: color-mix(in srgb, var(--yi-ok) 13%, transparent);
   --bk-diff-del: color-mix(in srgb, var(--yi-danger) 12%, transparent);

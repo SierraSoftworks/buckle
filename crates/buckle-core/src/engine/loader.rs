@@ -3,7 +3,7 @@
 
 use super::{LoadedModule, LoadedWorkload, Revision};
 use crate::error::HumanizableResult;
-use crate::model::{FleetConfig, ModuleConfig, WorkloadConfig};
+use crate::model::{FleetConfig, ModuleConfig, ScheduleDecl, WorkloadConfig};
 use crate::plan::RevisionId;
 use crate::task::DirSource;
 use std::path::Path;
@@ -18,8 +18,8 @@ fn shown(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Reads `buckle.yaml`, every `modules/*/module.yaml` and
-/// `workloads/*/workload.yaml`, and the `vars` files.
+/// Reads `buckle.yaml`, every `modules/*/module.yaml`,
+/// `workloads/*/workload.yaml` and `schedules/*.yaml`, and the `vars` files.
 pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
     let fleet_path = root.join("buckle.yaml");
     let fleet_yaml = std::fs::read_to_string(&fleet_path).map_err(|e| {
@@ -174,6 +174,44 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
         }
     }
 
+    let mut schedules = indexmap::IndexMap::new();
+    let schedules_dir = root.join("schedules");
+    if schedules_dir.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(&schedules_dir)
+            .to_human_error()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension().is_some_and(|e| e == "yaml" || e == "yml")
+                    && !p
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            })
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let yaml = std::fs::read_to_string(&path).to_human_error()?;
+            let schedule = ScheduleDecl::parse(&yaml).map_err(|e| {
+                crate::error::wrap_user(
+                    e,
+                    format!("The schedule at {} is invalid.", shown(root, &path)),
+                    &["Fix the schedule and run `buckle validate` again."],
+                )
+            })?;
+            if schedules.insert(name.clone(), schedule).is_some() {
+                return Err(crate::error::user(
+                    format!("Two files under schedules/ declare the schedule '{name}'."),
+                    &["Keep one of schedules/<name>.yaml and schedules/<name>.yml."],
+                ));
+            }
+        }
+    }
+
     let mut var_files = indexmap::IndexMap::new();
     for (index, overlay) in fleet.vars.iter().enumerate() {
         if let Some(file) = &overlay.file {
@@ -218,6 +256,7 @@ pub fn load_dir(root: &Path, id: RevisionId) -> crate::Result<Revision> {
         var_files,
         unloaded,
         unloaded_workloads,
+        schedules,
     })
 }
 
@@ -302,12 +341,44 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["grafana", "paste"]);
         assert_eq!(rev.unloaded_workloads, vec!["half"]);
+        assert!(rev.schedules.is_empty());
         assert!(rev.modules.is_empty());
         let paste = rev.workload("paste").unwrap();
         assert_eq!(paste.files.len(), 2);
         assert!(paste.templates.is_empty());
         let grafana = rev.workload("grafana").unwrap();
         assert_eq!(grafana.templates.len(), 1);
+    }
+
+    #[test]
+    fn schedules_load_by_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("buckle.yaml"), "version: 2\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("schedules")).unwrap();
+        for (file, yaml) in [
+            (
+                "weekly.yaml",
+                "cron: '0 4 * * SUN'\nmodule: packages\naction: upgrade\n",
+            ),
+            (
+                "nightly.yml",
+                "cron: '@daily'\nworkload: grafana\naction: restart\n",
+            ),
+            ("README.md", "not a schedule"),
+        ] {
+            std::fs::write(dir.path().join("schedules").join(file), yaml).unwrap();
+        }
+        let rev = load_dir(dir.path(), RevisionId::new("t")).unwrap();
+        let names: Vec<&str> = rev.schedules.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["nightly", "weekly"]);
+        assert_eq!(rev.schedules["weekly"].target(), Some(("packages", false)));
+
+        std::fs::write(
+            dir.path().join("schedules/weekly.yml"),
+            "cron: '@daily'\nmodule: m\naction: a\n",
+        )
+        .unwrap();
+        assert!(load_dir(dir.path(), RevisionId::new("t")).is_err());
     }
 
     #[test]

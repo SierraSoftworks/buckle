@@ -134,7 +134,8 @@ describe("every page renders in demo mode", () => {
     // Newest first by when each started: the action run of 2h ago stands
     // between rollout #42 (34m ago) and the commit of 3h ago.
     const kinds = await entries.evaluateAll((els) => els.map((e) => e.dataset.action ?? "commit"));
-    assert.deepEqual(kinds.slice(0, 3), ["commit", "run", "commit"]);
+    const scheduled = ["upcoming", "skipped", "scheduled"];
+    assert.deepEqual(kinds.filter((k) => !scheduled.includes(k)).slice(0, 3), ["commit", "run", "commit"]);
     assert.ok(kinds.includes("rollout"), "action rollouts are on the timeline");
     const run = actions.filter({ hasText: "Re-authenticate" });
     // Shaped like a commit: the action, then who ran it where and how it went.
@@ -147,7 +148,7 @@ describe("every page renders in demo mode", () => {
     assert.match(await rollout.locator(".commit__subject").textContent(), /^\S+\.\S+\.\S+\s*Reload caddy$/);
     assert.match(await rollout.locator(".commit__meta").textContent(), /Alice Operator.*3 targets/);
     assert.match(await rollout.locator(".rollout-line").textContent(), /completed.*3\/3 done/);
-    const failed = actions.filter({ hasText: "Reboot" });
+    const failed = actions.filter({ hasText: "did not come back" });
     assert.match(await failed.textContent(), /failed.*did not come back/);
 
     const toggle = page.getByTestId("rollouts-show");
@@ -166,6 +167,48 @@ describe("every page renders in demo mode", () => {
     await actions.filter({ hasText: "Reload caddy" }).locator(".commit__subject").click();
     assert.match(await heading(page), /^Rollout /);
     assert.match(await page.getByTestId("rollout-action").textContent(), /Reload caddy/);
+    await close();
+  });
+
+  test("schedules' rollouts carry an alarm on the timeline, under each schedule's next run", async () => {
+    const { page, close } = await open("/rollouts?show=actions");
+    const entries = page.locator(".gitlog__item");
+    await page.locator(".gitlog__item--scheduled").first().waitFor();
+    const kinds = await entries.evaluateAll((els) => els.map((e) => e.dataset.action));
+    // What the schedules run next stands above everything that happened.
+    assert.deepEqual(kinds.slice(0, 2), ["upcoming", "upcoming"]);
+    assert.ok(kinds.includes("skipped") && kinds.includes("scheduled"), kinds.join());
+    const run = page.locator('.gitlog__item[data-action="scheduled"]').first();
+    assert.match(await run.locator(".commit__meta").textContent(), /weekly-upgrades.*4 targets/);
+    assert.match(await run.locator(".action-entry__icon").getAttribute("title"), /scheduled/);
+    // The schedule's name opens the schedule.
+    await run.locator(".action-entry__schedule").click();
+    assert.equal(await heading(page), "weekly-upgrades");
+    await close();
+  });
+
+  test("schedules list their next and latest runs, and a schedule its targets and runs", async () => {
+    const { page, close } = await open("/schedules");
+    assert.equal(await heading(page), "Schedules");
+    const rows = page.getByTestId("schedules-table").locator("tbody tr");
+    await rows.first().waitFor();
+    assert.equal(await rows.count(), 2);
+    const weekly = rows.filter({ hasText: "weekly-upgrades" });
+    assert.match(await weekly.textContent(), /Upgrade packages and reboot.*At 04:00 on Sunday.*in \d+d.*completed/);
+    assert.match(await rows.filter({ hasText: "nightly-grafana-restart" }).textContent(), /skipped.*under way/);
+
+    await weekly.locator("td").nth(2).click();
+    assert.equal(await heading(page), "weekly-upgrades");
+    const targets = page.getByTestId("schedule-targets").locator("tbody tr");
+    await targets.first().waitFor();
+    assert.match(await targets.filter({ hasText: "pi-1" }).textContent(), /healthy/);
+    assert.match(await targets.filter({ hasText: "nas" }).textContent(), /not in its latest run/);
+    const runs = page.getByTestId("schedule-runs").locator("li");
+    assert.equal(await runs.count(), 3);
+    assert.match(await runs.nth(0).textContent(), /4\/4 done/);
+    assert.match(await runs.nth(2).textContent(), /skipped.*under way/);
+    await runs.nth(0).locator(".schedule-outcome__rollout").click();
+    assert.match(await heading(page), /^Rollout /);
     await close();
   });
 
@@ -503,6 +546,7 @@ describe("empty and not-permitted states", () => {
       ["/", "No stages yet"],
       ["/hosts", "No hosts have enrolled"],
       ["/rollouts", "No revisions yet"],
+      ["/schedules", "No schedules"],
       ["/audit", "Nothing audited yet"],
     ]) {
       const { page, close } = await open(path, { flags: "empty" });

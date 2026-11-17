@@ -231,6 +231,13 @@ pub struct RolloutAction {
     /// Where each target runs it, for an action offering the choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instances: Option<buckle_api::ActionInstances>,
+    /// The schedule that started it; absent when an operator did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    /// Its phases go ahead without the approvals they ask for (a schedule
+    /// declared with `approval: auto`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_approve: bool,
 }
 
 impl RolloutAction {

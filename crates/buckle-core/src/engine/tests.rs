@@ -791,6 +791,7 @@ fn revision_with_vars(
         unloaded: Vec::new(),
         workloads: Vec::new(),
         unloaded_workloads: Vec::new(),
+        schedules: Default::default(),
     })
 }
 
@@ -4580,4 +4581,43 @@ async fn a_stale_action_plan_is_refused() {
         .await
         .expect_err("the host changed under the plan");
     assert!(StalePlan::find(&err).is_some());
+}
+
+/// A schedule must name an action the revision declares, read as a cron
+/// expression in a real time zone, and carry a note where the action asks
+/// for confirmation.
+#[rstest]
+#[case::valid("cron: '0 4 * * SUN'\nmodule: m\naction: upgrade", None)]
+#[case::bad_cron(
+    "cron: 'every sunday'\nmodule: m\naction: upgrade",
+    Some("cron expression")
+)]
+#[case::bad_zone(
+    "cron: '@daily'\ntimezone: Nowhere/Land\nmodule: m\naction: upgrade",
+    Some("time zone")
+)]
+#[case::no_module(
+    "cron: '@daily'\nmodule: gone\naction: upgrade",
+    Some("does not exist")
+)]
+#[case::no_action("cron: '@daily'\nmodule: m\naction: nope", Some("does not declare"))]
+#[case::confirm_without_note("cron: '@daily'\nmodule: m\naction: reboot", Some("`note`"))]
+#[case::confirm_with_note("cron: '@daily'\nmodule: m\naction: reboot\nnote: weekly", None)]
+fn schedules_are_validated(#[case] schedule: &str, #[case] error: Option<&str>) {
+    let m = module(
+        "name: m\nactions:\n  upgrade: { test.file: { path: /u, run: r } }\n  reboot: { test.file: { path: /r, run: r }, confirm: true }\n",
+    );
+    let mut rev = Arc::into_inner(revision("r1", FLEET, vec![m])).unwrap();
+    rev.schedules.insert(
+        "s".into(),
+        crate::model::ScheduleDecl::parse(schedule).unwrap(),
+    );
+    let report = validate(&rev).unwrap();
+    match error {
+        None => assert!(report.errors.is_empty(), "{report}"),
+        Some(text) => assert!(
+            report.errors.iter().any(|e| e.message.contains(text)),
+            "{report}"
+        ),
+    }
 }

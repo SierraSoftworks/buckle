@@ -11,6 +11,8 @@ mod modules_card;
 pub mod overview;
 pub mod rollout;
 pub mod rollouts;
+pub mod schedule;
+pub mod schedules;
 pub mod workload;
 pub mod workloads;
 

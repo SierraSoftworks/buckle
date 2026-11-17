@@ -194,6 +194,18 @@ pub fn logo() -> Html {
     }
 }
 
+/// A scheduled action: an alarm clock.
+pub fn alarm() -> Html {
+    icon(html! { <>
+        <circle cx="12" cy="13" r="8" />
+        <polyline points="12 9 12 13 14.5 14.5" />
+        <path d="M5 3 2 6" />
+        <path d="m22 6-3-3" />
+        <path d="M6.4 19.6 4 22" />
+        <path d="M17.6 19.6 20 22" />
+    </> })
+}
+
 /// An operator's action.
 pub fn bolt() -> Html {
     icon(html! { <polygon points="13 2 4 14 11 14 10 22 19 10 12 10 13 2" /> })

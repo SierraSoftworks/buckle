@@ -54,6 +54,7 @@ pub fn rollouts() -> Html {
     let revisions = use_fetch((), |_| api::revisions(0));
     let rollouts = use_fetch((), |_| api::rollouts(0));
     let runs = use_fetch((), |_| api::action_runs(None));
+    let schedules = use_fetch((), |_| api::schedules());
     let (revs, revs_more) = use_pages(&revisions, |p, e| apply_revisions(&mut p.items, e));
     let (rolls, rolls_more) = use_pages(&rollouts, |p, e| apply_rollouts(&mut p.items, e));
     let (acts, acts_more) = use_pages(&runs, |p, e| apply_action_runs(&mut p.items, e));
@@ -157,7 +158,8 @@ pub fn rollouts() -> Html {
         },
         (Some(true), _) => html! { <>
             <Timeline revisions={revs.clone().unwrap_or_default()} rollouts={rolls.clone().unwrap_or_default()}
-                runs={acts.clone().unwrap_or_default()} {show} {since} {now} open={actions.open.clone()} />
+                runs={acts.clone().unwrap_or_default()} schedules={schedules.value().cloned().unwrap_or_default()}
+                {show} {since} {now} open={actions.open.clone()} />
             if older {
                 <div class="more"><Button onclick={load_more} busy={*more_busy}>{ "Load older" }</Button></div>
             }
@@ -168,12 +170,14 @@ pub fn rollouts() -> Html {
 
     let subtitle = match show {
         Show::All => {
-            "Commits of the configuration repository and operators' actions, newest first, with how each one went."
+            "Commits of the configuration repository and actions operators or schedules ran, newest first, with how each one went."
         }
         Show::Repo => {
             "Commits of the configuration repository, newest first, with how each one's rollout is going."
         }
-        Show::Actions => "Actions operators ran, across the fleet or on one target, newest first.",
+        Show::Actions => {
+            "Actions operators or schedules ran, across the fleet or on one target, newest first, under what the schedules run next."
+        }
     };
     let reload_all = {
         let (a, b, c) = (

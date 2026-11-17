@@ -1705,6 +1705,32 @@ pub fn rollouts(now: DateTime<Utc>) -> Vec<RolloutDetail> {
             now - Duration::hours(26),
             Some(4),
         ),
+        scheduled(
+            action_rollout(
+                "5e2a9d4c7b1f3a60",
+                ("packages", "upgrade-reboot", "Upgrade packages and reboot"),
+                Some("host.groups contains \"home\""),
+                RolloutState::Completed,
+                (4, 4, 0),
+                "schedule:weekly-upgrades",
+                now - Duration::days(2) - Duration::hours(6),
+                Some(38),
+            ),
+            "weekly-upgrades",
+        ),
+        scheduled(
+            action_rollout(
+                "8d0c6b2e4f9a1c37",
+                ("packages", "upgrade-reboot", "Upgrade packages and reboot"),
+                Some("host.groups contains \"home\""),
+                RolloutState::Completed,
+                (4, 3, 1),
+                "schedule:weekly-upgrades",
+                now - Duration::days(9) - Duration::hours(6),
+                Some(44),
+            ),
+            "weekly-upgrades",
+        ),
         action_rollout(
             "9b3f0c5d1e7a4b28",
             ("grafana", "restart", "Restart"),
@@ -1816,6 +1842,7 @@ fn action_rollout(
         label: label.into(),
         selector: selector.map(Into::into),
         instances: None,
+        schedule: None,
     });
     d.summary.triggered_by = by.into();
     d.summary.started_at = started;
@@ -1826,6 +1853,104 @@ fn action_rollout(
     d.summary.current_phase = None;
     d.fleet = None;
     d
+}
+
+/// An action rollout a schedule started.
+fn scheduled(mut d: RolloutDetail, schedule: &str) -> RolloutDetail {
+    if let Some(a) = d.summary.action.as_mut() {
+        a.schedule = Some(schedule.into());
+    }
+    d
+}
+
+/// The stable revision's schedules, each with its targets and occurrences
+/// (their rollouts found among `rollouts`).
+pub fn schedules(
+    now: DateTime<Utc>,
+    rollouts: &[RolloutDetail],
+) -> Vec<buckle_api::ScheduleDetail> {
+    use buckle_api::{ScheduleDetail, ScheduleInfo, ScheduleOccurrence, ScheduleTarget};
+    let rollout = |id: &str| rollouts.iter().find(|r| r.summary.id == id);
+    let ran = |due: DateTime<Utc>, id: &str| ScheduleOccurrence {
+        due_at: due,
+        rollout: rollout(id).map(|r| r.summary.clone()),
+        skipped: None,
+        waiting: None,
+    };
+    let skipped = |due: DateTime<Utc>, why: &str| ScheduleOccurrence {
+        due_at: due,
+        rollout: None,
+        skipped: Some(why.into()),
+        waiting: None,
+    };
+    let targets = |ids: &[&str], latest: Option<&str>| -> Vec<ScheduleTarget> {
+        let rows: Vec<RolloutHost> = latest
+            .and_then(rollout)
+            .map(|r| r.phases.iter().flat_map(|p| p.hosts.clone()).collect())
+            .unwrap_or_default();
+        ids.iter()
+            .map(|id| ScheduleTarget {
+                id: (*id).into(),
+                kind: if id.starts_with("home-nomad") {
+                    buckle_api::TargetKind::Cluster
+                } else {
+                    buckle_api::TargetKind::Host
+                },
+                last: rows.iter().find(|r| r.host == *id).cloned(),
+            })
+            .collect()
+    };
+    let weekly = now - Duration::days(2) - Duration::hours(6);
+    let nightly = now - Duration::minutes(36);
+    vec![
+        ScheduleDetail {
+            schedule: ScheduleInfo {
+                name: "weekly-upgrades".into(),
+                description: Some("Upgrade the home hosts' packages early every Sunday, rebooting where an upgrade needs it.".into()),
+                cron: "0 4 * * SUN".into(),
+                cron_text: "At 04:00 on Sunday".into(),
+                timezone: "Europe/London".into(),
+                module: "packages".into(),
+                action: "upgrade-reboot".into(),
+                label: Some("Upgrade packages and reboot".into()),
+                workload: false,
+                selector: Some("host.groups contains \"home\"".into()),
+                approval: "auto".into(),
+                window_seconds: 7200,
+                next_at: Some(now + Duration::days(4) + Duration::hours(18)),
+                last: Some(ran(weekly, "5e2a9d4c7b1f3a60")),
+            },
+            targets: targets(&["pi-1", "pi-2", "pi-3", "nas"], Some("5e2a9d4c7b1f3a60")),
+            history: vec![
+                ran(weekly, "5e2a9d4c7b1f3a60"),
+                ran(weekly - Duration::days(7), "8d0c6b2e4f9a1c37"),
+                skipped(
+                    weekly - Duration::days(14),
+                    "Not started within its 2h window: Rollout 39 is under way.",
+                ),
+            ],
+        },
+        ScheduleDetail {
+            schedule: ScheduleInfo {
+                name: "nightly-grafana-restart".into(),
+                description: None,
+                cron: "30 2 * * *".into(),
+                cron_text: "At 02:30".into(),
+                timezone: "UTC".into(),
+                module: "grafana".into(),
+                action: "restart".into(),
+                label: Some("Restart".into()),
+                workload: true,
+                selector: None,
+                approval: "phases".into(),
+                window_seconds: 3600,
+                next_at: Some(now + Duration::hours(3) + Duration::minutes(12)),
+                last: Some(skipped(nightly, "Not started within its 1h window: Rollout 42 is under way.")),
+            },
+            targets: targets(&["home-nomad"], None),
+            history: vec![skipped(nightly, "Not started within its 1h window: Rollout 42 is under way.")],
+        },
+    ]
 }
 
 pub fn revisions(now: DateTime<Utc>) -> Vec<RevisionSummary> {

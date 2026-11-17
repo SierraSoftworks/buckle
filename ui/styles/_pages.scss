@@ -181,6 +181,23 @@
     background: var(--yi-surface);
   }
 
+  &__item--scheduled &__diamond {
+    border-color: var(--bk-scheduled);
+  }
+
+  // A schedule's next occurrence: dashed, and quieter than what happened.
+  &__item[data-action="upcoming"] {
+    .gitlog__diamond {
+      border-style: dashed;
+    }
+
+    .action-entry {
+      opacity: 0.8;
+      outline: 1px dashed color-mix(in srgb, var(--bk-scheduled) 45%, transparent);
+      outline-offset: 0.4rem;
+    }
+  }
+
   &__dot {
     position: relative;
     z-index: 1;
@@ -1117,6 +1134,37 @@ tr[id] {
     color: var(--yi-fg);
   }
 
+  // Above the card's link: it opens the schedule.
+  &__schedule {
+    position: relative;
+    z-index: 1;
+    color: var(--bk-scheduled);
+    font-weight: 500;
+    text-decoration: none;
+
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+
+  &__cron {
+    color: var(--yi-fg-muted);
+  }
+
+  // A schedule's: its colour, and the alarm clock drawn in strokes.
+  &--scheduled {
+    &.commit--link:hover .commit__subject,
+    .action-entry__rollout,
+    .action-entry__icon {
+      color: var(--bk-scheduled);
+    }
+
+    .action-entry__icon svg {
+      fill: none;
+      stroke-width: 2;
+    }
+  }
+
   &__error {
     max-width: 28rem;
     overflow: hidden;
@@ -1148,5 +1196,60 @@ tr[id] {
 
   .yi-button {
     margin-left: auto;
+  }
+}
+
+// The Schedules page and a schedule's: names and rollouts in the scheduled
+// colour, an occurrence's outcome on one line.
+.schedule-name {
+  color: var(--bk-scheduled);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.schedule-description {
+  max-width: 26rem;
+}
+
+.schedule-outcome {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+
+  &__rollout {
+    color: var(--bk-scheduled);
+    font-weight: 500;
+    text-decoration: none;
+  }
+
+  .cell-sub {
+    flex-basis: 100%;
+  }
+}
+
+.schedule-runs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+
+  &__item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--yi-line);
+
+    &:last-child {
+      border-bottom: 0;
+    }
+  }
+
+  &__head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
   }
 }

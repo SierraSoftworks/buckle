@@ -22,6 +22,7 @@ pub mod identity;
 pub mod join;
 pub mod metrics;
 pub mod rollout;
+pub mod schedules;
 pub mod secrets;
 pub mod source;
 pub mod store;
@@ -185,6 +186,14 @@ pub async fn run_with(
         ));
     }
 
+    let scheduler = Arc::new(schedules::Scheduler::new(
+        store.clone(),
+        revisions.clone(),
+        controller.clone(),
+        clock.clone(),
+    ));
+    tasks.push(tokio::spawn(scheduler.clone().run(cancel.clone())));
+
     tasks.push(tokio::spawn(metrics::run(
         store.clone(),
         sessions.clone(),
@@ -290,6 +299,7 @@ pub async fn run_with(
     state.trace_url_template = config.telemetry.trace_url_template.clone();
     state.identity = Some(issuer);
     state.builder = Some(builder);
+    state.schedules = Some(scheduler);
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
     if let Some(listening) = &hooks.listening {
         listening.send_replace(Some(Listening {

@@ -7,6 +7,7 @@
 
 mod action_decl;
 mod cluster;
+mod schedule;
 mod task_decl;
 mod workload;
 
@@ -15,6 +16,7 @@ pub use cluster::{
     ClusterDecl, ClusterIdentity, ClusterKind, ClusterScope, ClusterTrust, trust_problem,
     yaml_scalar_text,
 };
+pub use schedule::{Parsed as ParsedSchedule, ScheduleApproval, ScheduleDecl};
 pub use task_decl::{RetryPolicy, TaskDecl};
 pub use workload::{
     DispatchSpec, IMPLICIT_ACTIONS, ImplicitAction, Items, Layer, Need, PolicyAttach,
