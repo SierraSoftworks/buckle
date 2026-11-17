@@ -159,6 +159,19 @@ fn admin() -> Result<(), ApiError> {
 }
 
 pub fn me() -> Result<Option<Me>, ApiError> {
+    me_as().map(|me| {
+        me.map(|me| Me {
+            // `environment=Production&colour=%23c62828` tags the demo.
+            environment: flag("environment").map(|name| buckle_api::Environment {
+                name,
+                colour: flag("colour"),
+            }),
+            ..me
+        })
+    })
+}
+
+fn me_as() -> Result<Option<Me>, ApiError> {
     let viewer = flag("role").as_deref() == Some("viewer");
     match flag("auth").as_deref() {
         Some("expired") => Err(ApiError::Unauthorized),
@@ -174,6 +187,7 @@ pub fn me() -> Result<Option<Me>, ApiError> {
                     subject: "victor".into(),
                     is_admin: false,
                     anonymous: false,
+                    environment: None,
                 };
             }
             Ok(Some(me))

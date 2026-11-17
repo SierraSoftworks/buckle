@@ -62,6 +62,24 @@ impl ServerConfig {
     }
 
     pub fn validate(&self) -> buckle_core::Result<()> {
+        if let Some(env) = &self.web.environment {
+            if env.name.trim().is_empty() {
+                return Err(buckle_core::error::user(
+                    "`web.environment.name` is empty, so the UI would show a blank tag.",
+                    &[
+                        "Set it to the deployment's name, e.g. Production, or remove web.environment.",
+                    ],
+                ));
+            }
+            if let Some(colour) = &env.colour
+                && env.rgb().is_none()
+            {
+                return Err(buckle_core::error::user(
+                    format!("`web.environment.colour` ('{colour}') is not a hex colour."),
+                    &["Use #rgb or #rrggbb, e.g. \"#c62828\", or remove it for the neutral tag."],
+                ));
+            }
+        }
         if let Some(git) = &self.source.git
             && git
                 .webhook_secret
@@ -753,6 +771,10 @@ pub struct WebConfig {
     /// anonymous, and the ACLs see only its metadata.
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    /// A tag beside the product name in the UI (and its tab title) naming
+    /// this deployment, e.g. `{ name: Production, colour: "#c62828" }`.
+    #[serde(default)]
+    pub environment: Option<buckle_api::Environment>,
 }
 
 impl WebConfig {
@@ -1183,6 +1205,28 @@ secrets:
         };
         let err = with_env(&yaml).unwrap_err();
         assert!(err.description().contains(named), "{}", err.description());
+    }
+
+    #[rstest]
+    #[case::named_and_coloured("{ name: Production, colour: \"#c62828\" }", None)]
+    #[case::name_only("{ name: Staging }", None)]
+    #[case::blank_name("{ name: \" \" }", Some("web.environment.name"))]
+    #[case::not_hex("{ name: Production, colour: red }", Some("web.environment.colour"))]
+    fn the_environment_tag_needs_a_name_and_a_hex_colour(
+        #[case] env: &str,
+        #[case] refused: Option<&str>,
+    ) {
+        let yaml = EXAMPLE.replace(
+            "  base_url: https://buckle.example.ts.net\n",
+            &format!("  base_url: https://buckle.example.ts.net\n  environment: {env}\n"),
+        );
+        match (with_env(&yaml), refused) {
+            (Ok(config), None) => assert!(config.web.environment.is_some()),
+            (Err(err), Some(named)) => {
+                assert!(err.description().contains(named), "{}", err.description())
+            }
+            (other, _) => panic!("unexpected: {:?}", other.map(|c| c.web.environment)),
+        }
     }
 
     #[test]

@@ -66,6 +66,7 @@ web:
     client_id: buckle
     client_secret: "${{ env.OIDC_CLIENT_SECRET }}"
     scopes: [openid, profile, email, groups, offline_access]
+  environment: { name: Production, colour: "#c62828" }
 
 secrets:
   providers:
@@ -215,6 +216,8 @@ Per-host labels, pauses and notes are managed in the UI and stored in the databa
 | `oidc.endpoint` | | The issuer; discovery is read from `/.well-known/openid-configuration`. |
 | `oidc.client_id`, `oidc.client_secret` | | The confidential client registered for Buckle, with redirect URI `{base_url}/api/v1/auth/callback`. |
 | `oidc.scopes` | `[openid, profile, email]` | Add `groups` (or whatever your provider calls it) for group-based ACLs, and `offline_access` for long sessions. |
+| `environment.name` | | A tag beside the Buckle name in the UI and its tab title, e.g. `Production`. |
+| `environment.colour` | neutral | The tag's fill, `#rgb` or `#rrggbb`; its text is black or white, whichever reads better. |
 
 Sign-in uses the authorization code flow with PKCE; the session lives in HTTP-only cookies and
 the browser never sees a token. Omitting `oidc` turns sign-in off for local development.

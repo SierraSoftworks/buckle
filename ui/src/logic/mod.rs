@@ -8,6 +8,7 @@ pub mod blueprint;
 pub mod clusters;
 pub mod controls;
 pub mod diff;
+pub mod environment;
 pub mod error_text;
 pub mod filter;
 pub mod fleet;

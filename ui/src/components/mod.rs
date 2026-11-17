@@ -8,6 +8,7 @@ pub mod changes;
 pub mod commit;
 pub mod countdown;
 pub mod diff;
+pub mod environment;
 pub mod error_block;
 pub mod fleet_plan;
 pub mod host_card;
