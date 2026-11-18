@@ -136,6 +136,19 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_DEBUG: 1
           CARGO_PROFILE_RELEASE_STRIP: none
+          # Pin the bundled C code (SQLite, aws-lc) to the same x86-64 baseline
+          # as Rust's target. Ubuntu 26.04's GCC defaults to x86-64-v3, which
+          # emits AVX/BMI and SIGILLs on older CPUs (v2.14.0).
+          CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+      # SQLite has no runtime CPU dispatch, so any VEX (AVX) instruction in it
+      # means the C baseline drifted above what older x86-64 hosts support.
+      - name: Check x86-64 baseline
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          objdump -d --no-show-raw-insn target/${{ matrix.target }}/release/buckle \
+            | awk '/^[0-9a-f]+ <sqlite3/{s=1;next} /^[0-9a-f]+ </{s=0} s && /\tv[a-z]/{n++}
+                   END{printf "%d VEX instructions in sqlite3*\n", n; exit n>0}'
       # Extracts and publishes the debug symbols, then strips the binary in
       # place (Linux and macOS) so the release assets stay small.
       - name: Publish symbols
