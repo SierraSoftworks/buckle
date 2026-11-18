@@ -197,6 +197,29 @@ describe("approving a phase", () => {
     await close();
   });
 
+  test("approves a phase from its stage in the Targets card", async () => {
+    // home is still running: the stage offers the approval, but not yet.
+    const waiting = await open("/rollouts/42");
+    const waitingHead = waiting.page.locator('tr.yi-table__group[data-stage="cloud"]').first().getByTestId("stage-approve");
+    await waitingHead.waitFor();
+    assert.ok(await waitingHead.getByRole("button", { name: "Approve phase cloud…" }).isDisabled(), "cloud waits for home");
+    assert.match(await waitingHead.getAttribute("title"), /cloud can be approved once home has finished/);
+    await waiting.close();
+
+    const { page, close } = await open("/rollouts/42", { flags: "awaiting" });
+    const head = page.locator('tr.yi-table__group[data-stage="cloud"]').first();
+    await head.getByTestId("stage-approve").getByRole("button", { name: "Approve phase cloud…" }).click();
+    // The same dialog as the plans panel's, binding the same plans.
+    const dialog = page.getByRole("alertdialog", { name: "Approve cloud of rollout #42" });
+    await dialog.waitFor();
+    assert.match(await dialog.getByTestId("approval-summary").textContent(), /12 hosts/);
+    await dialog.getByRole("checkbox", { name: /I have reviewed the 4 destructive steps/ }).check();
+    await dialog.getByRole("button", { name: "Approve 12 hosts" }).click();
+    await page.getByRole("status").filter({ hasText: "Approved cloud: 2 plans bound." }).waitFor();
+    await eventually(async () => assert.equal(await head.getByTestId("stage-approve").count(), 0, "nothing left to approve"));
+    await close();
+  });
+
   test("shows the union across hosts and phases with fact placeholders", async () => {
     const { page, close } = await open("/rollouts/42");
     const fleet = page.locator("#plans").getByTestId("fleet-plan");

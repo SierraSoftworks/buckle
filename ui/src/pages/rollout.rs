@@ -749,7 +749,28 @@ pub(crate) fn phase_approvable(
     phase: &RolloutPhase,
     plans: &[PlanGroup],
 ) -> bool {
-    earlier_running(d, phase).is_empty() && !scope_of(phase, plans).digests.is_empty()
+    why_not_approvable(d, phase, plans).is_none()
+}
+
+/// Why `phase` cannot be approved yet, or `None` when it can.
+fn why_not_approvable(
+    d: &RolloutDetail,
+    phase: &RolloutPhase,
+    plans: &[PlanGroup],
+) -> Option<String> {
+    let running = earlier_running(d, phase);
+    if !running.is_empty() {
+        Some(format!(
+            "{} can be approved once {} {} finished.",
+            phase.name,
+            running.join(", "),
+            if running.len() == 1 { "has" } else { "have" }
+        ))
+    } else if scope_of(phase, plans).digests.is_empty() {
+        Some("No plans to approve yet.".to_string())
+    } else {
+        None
+    }
 }
 
 /// The rollout's plans as one view across every phase. The next phase
@@ -842,18 +863,7 @@ fn approval(
         "required" => "required",
         _ => "auto, but a target is held at a failing baseline",
     };
-    let why_not = if !running.is_empty() {
-        Some(format!(
-            "{} can be approved once {} {} finished.",
-            phase.name,
-            running.join(", "),
-            if running.len() == 1 { "has" } else { "have" }
-        ))
-    } else if scope.digests.is_empty() {
-        Some("No plans to approve yet.".to_string())
-    } else {
-        None
-    };
+    let why_not = why_not_approvable(d, phase, plans);
     let title = why_not.clone().unwrap_or_else(|| {
         format!(
             "Binds {} for {} (approval: {policy}). A host whose plan changes after approval asks again.",
@@ -1300,12 +1310,17 @@ fn host_table(props: &HostTableProps) -> Html {
     let expanded = use_state(|| None::<String>);
     let p = layout(&props.detail);
     let all = props.all;
+    let wanting = wanting_approval(&p);
     let groups = p.stages.iter().filter(|st| st.counts.total > 0).flat_map(|st| {
         let phase = st.phase;
         let c = st.counts.clone();
         // Said once on the stage's heading instead of on each of its rows.
         let all_need_approval = c.needs_approval == c.total;
         let baking = props.admin && st.hosts().any(|h| h.state == HostRolloutState::Baking);
+        // The stage's approval, as the panel's head offers it: the same
+        // dialog, disabled (and saying why) until the phase can be approved.
+        let approve = (props.admin && wanting.iter().any(|w| w.name == phase.name))
+            .then(|| why_not_approvable(&props.detail, phase, &props.plans));
         let on_ask = props.on_ask.clone();
         step_groups(st, all).into_iter().enumerate().map(move |(i, (step, rows, hidden))| {
             let first = i == 0;
@@ -1325,14 +1340,26 @@ fn host_table(props: &HostTableProps) -> Html {
                                 <Pill tone={phase_state_tone(phase.state)} label={phase_state_label(phase.state)} />
                                 <Meter segments={stage_segments(&c)} total={c.total} />
                                 <span class="muted small">{ format!("{}/{} done", c.healthy, c.total) }</span>
-                                if all_need_approval { <Badge tone={Tone::Info}>{ "needs approval" }</Badge> }
+                                if all_need_approval && approve.is_none() { <Badge tone={Tone::Info}>{ "needs approval" }</Badge> }
                             }
                             if hidden > 0 {
                                 <span class="muted small" data-testid="hidden-unchanged">{ format!("{hidden} unchanged not shown") }</span>
                             }
-                            if first && baking {
+                            if first && (baking || approve.is_some()) {
                                 <span class="group-head__controls">
-                                    <SplitButton items={stage_menu(&phase.name, &on_ask)} small=true menu_label={format!("More actions for {}", phase.name)} testid="stage-actions" />
+                                    if let Some(why_not) = &approve {
+                                        <span title={why_not.clone().unwrap_or_else(|| format!("Review and approve the plans of {}", phase.name))} data-testid="stage-approve">
+                                            <Button small=true kind={Kind::Primary} disabled={why_not.is_some()}
+                                                label={format!("Approve phase {}…", phase.name)}
+                                                onclick={{ let (on_ask, name) = (on_ask.clone(), phase.name.clone());
+                                                    Callback::from(move |_: MouseEvent| on_ask.emit(Ask::Approve(name.clone()))) }}>
+                                                { "Approve…" }
+                                            </Button>
+                                        </span>
+                                    }
+                                    if baking {
+                                        <SplitButton items={stage_menu(&phase.name, &on_ask)} small=true menu_label={format!("More actions for {}", phase.name)} testid="stage-actions" />
+                                    }
                                 </span>
                             }
                         </span>
