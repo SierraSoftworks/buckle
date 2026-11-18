@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::components::ui::Badge;
 use buckle_api::{
-    ApproveRequest, ContinueRequest, HostRolloutState, HostSummary, LiveEvent, PlanGroup,
-    RolloutDetail, RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
+    ApproveRequest, ContinueRequest, HostRolloutState, HostSummary, PlanGroup, RolloutDetail,
+    RolloutEvent, RolloutHost, RolloutPhase, RolloutState,
 };
 use chrono::{DateTime, Utc};
 use yew::prelude::*;
@@ -29,7 +29,7 @@ use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now,
 use crate::logic::controls::{Decision, Standing, decisions, replan_label};
 use crate::logic::fleet_plan::{Phases, fleet_tally};
 use crate::logic::format::{count, relative, rollout_label, short, since, timestamp};
-use crate::logic::live::{apply_fleet, apply_rollout};
+use crate::logic::live::{apply_fleet, apply_rollout, rollout_refetch_at};
 use crate::logic::pipeline::{self, GateKind, GateState, host_checks, layout};
 use crate::logic::plan::{ApprovalScope, approval_scope, attempt_options, host_tally};
 use crate::logic::run::RolloutActivity;
@@ -137,30 +137,32 @@ pub fn rollout_page(props: &Props) -> Html {
     // of events has settled.
     let live = use_live_value(&detail, apply_rollout);
     let store = use_live();
-    let touched = detail
-        .data
-        .as_ref()
-        .and_then(|d| store.log.since(d.0))
-        .map(|events| {
-            events
-                .iter()
-                .filter(
-                    |e| matches!(&***e, LiveEvent::RolloutChanged { rollout } if rollout.id == id),
-                )
-                .count()
-        })
-        .unwrap_or(0);
-    let settled = use_debounced(touched, 1_500);
     // The plans are fetched again with the detail: a host that plans (or
-    // re-plans) after the page opened is otherwise missing from the
-    // approval pane's scope, leaving nothing to approve.
+    // re-plans, as a retry does) after the page opened is otherwise missing
+    // from the approval pane's scope, leaving nothing to approve.
     let plans = use_fetch(props.id.clone(), |id| async move {
         api::rollout_plans(&id).await
     });
+    // Without plans yet (or after their fetch failed), only the rollout's
+    // own changes count.
+    let wanted = detail.data.as_ref().and_then(|d| {
+        let (plans_at, known) = match &plans.data {
+            Some(p) => (p.0, p.1.as_slice()),
+            None => (store.log.seq, &[][..]),
+        };
+        rollout_refetch_at(
+            &store.log,
+            &id,
+            d.0,
+            plans_at,
+            known.iter().map(|g| g.digest.as_str()),
+        )
+    });
+    let settled = use_debounced(wanted, 1_500);
     {
         let (reload, reload_plans) = (detail.reload.clone(), plans.reload.clone());
-        use_effect_with(settled, move |n| {
-            if *n > 0 {
+        use_effect_with(settled, move |at| {
+            if at.is_some() {
                 reload.emit(());
                 reload_plans.emit(());
             }
