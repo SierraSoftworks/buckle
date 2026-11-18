@@ -136,6 +136,29 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_DEBUG: 1
           CARGO_PROFILE_RELEASE_STRIP: none
+          # ubuntu-latest (26.04) installs Ubuntu's amd64v3 package variant,
+          # whose GCC defaults to -march=x86-64-v3. The C dependencies (bundled
+          # SQLite, aws-lc, ring) then require AVX2 and crash with SIGILL on
+          # older CPUs, as v2.14.0 did. Pin them to the same baseline rustc
+          # uses for this target. Hand-written assembly and code that checks
+          # the CPU at runtime are unaffected.
+          CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+          CXXFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+      # The C code is compiled without runtime CPU checks, so any AVX in it
+      # means the baseline above was lost. Checked here, before the symbols
+      # step strips the binary.
+      - name: Check the x86-64 baseline
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          bin=target/${{ matrix.target }}/release/buckle
+          for fn in sqlite3VdbeExec sqlite3Select; do
+            n="$(objdump -d --no-show-raw-insn --disassemble="$fn" "$bin" | grep -cP '^\s+[0-9a-f]+:\s+v[a-z0-9]+\s' || true)"
+            if [ "$n" -gt 0 ]; then
+              echo "::error::$fn contains $n AVX instructions: the C code was not built for the x86-64 baseline"
+              exit 1
+            fi
+            echo "$fn: no AVX instructions"
+          done
       # Extracts and publishes the debug symbols, then strips the binary in
       # place (Linux and macOS) so the release assets stay small.
       - name: Publish symbols
