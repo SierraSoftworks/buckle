@@ -264,25 +264,67 @@ impl EventLog {
     /// The events after `seq`, oldest first, or `None` when some of them have
     /// already been dropped and the caller must fetch afresh.
     pub fn since(&self, seq: u64) -> Option<Vec<Rc<LiveEvent>>> {
-        if seq >= self.seq {
-            return Some(Vec::new());
-        }
+        Some(self.numbered_since(seq)?.map(|(_, e)| e.clone()).collect())
+    }
+
+    /// The events after `seq` with their sequence numbers, oldest first, or
+    /// `None` when some of them have already been dropped.
+    pub fn numbered_since(
+        &self,
+        seq: u64,
+    ) -> Option<impl Iterator<Item = (u64, &Rc<LiveEvent>)> + '_> {
         let oldest = self
             .entries
             .front()
             .map(|(s, _)| *s)
             .unwrap_or(self.seq + 1);
-        if seq + 1 < oldest {
+        if seq < self.seq && seq + 1 < oldest {
             return None;
         }
         Some(
             self.entries
                 .iter()
-                .filter(|(s, _)| *s > seq)
-                .map(|(_, e)| e.clone())
-                .collect(),
+                .filter(move |(s, _)| *s > seq)
+                .map(|(s, e)| (*s, e)),
         )
     }
+}
+
+/// The sequence number of the newest event a rollout's detail (fetched at
+/// `detail_at`) or its plans (fetched at `plans_at`, holding the digests
+/// `known`) cannot take as it comes, so that the page fetches both again:
+/// a change of the rollout itself (its phases and approvals are not in the
+/// event), or one of its hosts on a plan the plans do not hold (a retried
+/// host re-planned, which an approval has to bind). `None` when there is
+/// none, or when events were missed (which fetches afresh anyway).
+///
+/// A sequence number, not a count: the page waits for it to settle before
+/// fetching, and a count can settle back on the value it had before the
+/// last fetch (one change, fetched; the next, inside the wait) and so never
+/// look changed.
+pub fn rollout_refetch_at<'a>(
+    log: &EventLog,
+    id: &str,
+    detail_at: u64,
+    plans_at: u64,
+    known: impl IntoIterator<Item = &'a str>,
+) -> Option<u64> {
+    let known: Vec<&str> = known.into_iter().collect();
+    let rollout = log
+        .numbered_since(detail_at)?
+        .filter(|(_, e)| matches!(&***e, LiveEvent::RolloutChanged { rollout } if rollout.id == id))
+        .map(|(s, _)| s)
+        .last();
+    let plan = log
+        .numbered_since(plans_at)?
+        .filter(|(_, e)| {
+            matches!(&***e, LiveEvent::RolloutHostChanged { rollout_id, host }
+                if rollout_id == id
+                    && host.plan_digest.as_deref().is_some_and(|d| !known.contains(&d)))
+        })
+        .map(|(s, _)| s)
+        .last();
+    rollout.max(plan)
 }
 
 /// Exponential reconnect delays with a cap, so a server that is down is not
@@ -760,6 +802,67 @@ mod tests {
             "everything still held"
         );
         assert_eq!(log.since(log.seq - 1).map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn a_rollout_refetches_for_every_change_even_one_inside_the_wait() {
+        let changed = |state| LiveEvent::RolloutChanged {
+            rollout: summary("r1", state),
+        };
+        let mut log = EventLog::default();
+        assert_eq!(rollout_refetch_at(&log, "r1", 0, 0, []), None);
+
+        // A retry: the paused rollout plans again, and the page fetches.
+        log.push(changed(RolloutState::Planning));
+        assert_eq!(rollout_refetch_at(&log, "r1", 0, 0, []), Some(1));
+        let fetched = log.seq;
+        assert_eq!(rollout_refetch_at(&log, "r1", fetched, fetched, []), None);
+
+        // The new plan wants an approval, inside the wait after that fetch:
+        // still a new value (a count of changes since the fetch would be 1
+        // again, and the settled count unchanged), so the page fetches.
+        log.push(changed(RolloutState::AwaitingApproval));
+        assert_eq!(
+            rollout_refetch_at(&log, "r1", fetched, fetched, []),
+            Some(2)
+        );
+
+        // Another rollout's changes are not this one's.
+        log.push(LiveEvent::RolloutChanged {
+            rollout: summary("r2", RolloutState::Rolling),
+        });
+        assert_eq!(rollout_refetch_at(&log, "r1", 2, 2, []), None);
+    }
+
+    #[test]
+    fn a_host_on_a_plan_the_page_lacks_refetches_the_plans() {
+        let replanned = |digest: Option<&str>| {
+            let mut host = entry("pi-1", "canary", HostRolloutState::Planned);
+            host.plan_digest = digest.map(Into::into);
+            host.needs_approval = digest.is_some();
+            LiveEvent::RolloutHostChanged {
+                rollout_id: "r1".into(),
+                host,
+            }
+        };
+        let mut log = EventLog::default();
+        log.push(replanned(None));
+        assert_eq!(
+            rollout_refetch_at(&log, "r1", 0, 0, ["old"]),
+            None,
+            "no plan yet"
+        );
+        log.push(replanned(Some("old")));
+        assert_eq!(
+            rollout_refetch_at(&log, "r1", 0, 0, ["old"]),
+            None,
+            "already held"
+        );
+        log.push(replanned(Some("new")));
+        assert_eq!(rollout_refetch_at(&log, "r1", 0, 0, ["old"]), Some(3));
+        // Once the plans hold it, or were fetched after it, nothing more.
+        assert_eq!(rollout_refetch_at(&log, "r1", 0, 0, ["old", "new"]), None);
+        assert_eq!(rollout_refetch_at(&log, "r1", 0, 3, ["old"]), None);
     }
 
     #[test]
