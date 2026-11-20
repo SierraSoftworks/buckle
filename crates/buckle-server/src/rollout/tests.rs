@@ -6278,3 +6278,82 @@ async fn a_rollout_laid_out_before_an_upgrade_keeps_its_order() {
     assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
     assert!(h.applies().iter().any(|a| a.1 == "w1"));
 }
+
+/// Phases that hold hosts and placements together (a selector for each,
+/// joined by `||`): the canary node and then the canary workload, then the
+/// other nodes one at a time under the module's `parallel` and the other
+/// workload after them.
+#[tokio::test(start_paused = true)]
+async fn a_phase_of_hosts_and_placements_is_ordered_by_needs() {
+    const NODES: &str = "host.labels.tier in [\"nomad\", \"canary\"]";
+    let clusters =
+        format!("  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: '{NODES}'\n");
+    let rollout = "  health: { bake: 30s }\n  phases:\n    - { name: canary, select: 'host.labels.tier == \"canary\" || workload.labels.tier == \"canary\"', parallel: 1 }\n    - { name: prod, select: 'host.groups contains \"nomad\" || cluster.kind == \"nomad\"', parallel: 4 }\n";
+    let nomad = format!("name: nomad\nwhen: '{NODES}'\nparallel: 1\n");
+    let workload = |name: &str, extra: &str| {
+        format!("name: {name}\n{extra}needs: ['module:nomad']\nresources: [{name}.nomad.hcl]\n")
+    };
+    let (app, postgres) = (
+        workload("app", "labels: { tier: canary }\n"),
+        workload("postgres", ""),
+    );
+    let mut h = Harness::new().await;
+    h.revision_with(
+        "r1",
+        rollout,
+        &clusters,
+        &[
+            ("modules/nomad/module.yaml", nomad.as_str()),
+            ("workloads/app/workload.yaml", app.as_str()),
+            ("workloads/app/files/app.nomad.hcl", "job \"app\" {}\n"),
+            ("workloads/postgres/workload.yaml", postgres.as_str()),
+            (
+                "workloads/postgres/files/postgres.nomad.hcl",
+                "job \"postgres\" {}\n",
+            ),
+        ],
+    )
+    .await;
+    for (id, tier) in [("c1", "canary"), ("n1", "nomad"), ("n2", "nomad")] {
+        h.enrol(id, tier).await;
+        h.connect(id, None);
+    }
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    let phase = |host: &str, workload: &str| {
+        hosts
+            .iter()
+            .find(|x| x.host == host && x.workload == workload)
+            .unwrap_or_else(|| panic!("a row for {host}/{workload}"))
+            .phase
+            .clone()
+    };
+    assert_eq!(phase("c1", ""), "canary");
+    assert_eq!(phase(CLUSTER, "app"), "canary");
+    for (host, workload) in [("n1", ""), ("n2", ""), (CLUSTER, "postgres")] {
+        assert_eq!(phase(host, workload), "prod", "{host}/{workload}");
+    }
+
+    let applies = h.applies();
+    let at = |pred: &dyn Fn(&pb::Apply, &str) -> bool| {
+        applies
+            .iter()
+            .find(|a| pred(&a.2, &a.1))
+            .unwrap_or_else(|| panic!("an apply: {applies:?}"))
+            .0
+    };
+    let node = |n: &'static str| at(&move |a, host| a.target.is_empty() && host == n);
+    let placed = |w: &'static str| at(&move |a, _| a.target == CLUSTER && a.workload == w);
+    assert!(
+        placed("app") >= node("c1") + BAKE,
+        "the canary workload after its node"
+    );
+    let (first, second) = (node("n1").min(node("n2")), node("n1").max(node("n2")));
+    assert!(first >= placed("app") + BAKE, "prod after the canary phase");
+    assert!(second >= first + BAKE, "one Nomad client at a time");
+    assert!(
+        placed("postgres") >= second + BAKE,
+        "the other workload after every node"
+    );
+}
