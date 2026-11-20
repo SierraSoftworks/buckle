@@ -74,36 +74,79 @@ in the latest of their phases. The cluster is on the revision once every placeme
 While a connected host that could execute for a cluster runs an agent that predates placements,
 the cluster is rolled as one row, as before: one plan covering every workload, one apply.
 
-### Stages inside a phase
+### Order inside a phase
 
-Within a phase, order comes from `needs`. Between the modules of one host that is the agent's
-business and makes no difference to the pipeline; an edge that leaves the host does. A workload
-that needs `module:nomad` waits for that module on the cluster's nodes, a module that needs
-`workload:postgresql` waits for that placement on the cluster its host is a node of, and a
-workload that needs another waits for that placement. The controller resolves those edges into
-**stages**: everything with no such dependency first, then what depends on it, and so on, each
-stage applying `parallel` targets at a time. A host whose modules sit on both sides of a workload
-is applied in two steps, its dependent modules after the placement, and shows as pending with the
-stage it waits for in between.
+Within a phase, order comes from `needs`, target by target: a target starts as soon as everything
+it needs has applied and baked, and a slot of the phase's `parallel` is free. There are no
+barriers between layers, so a phase can be dense (many groups of hosts, a handful of ordering
+rules) and the targets nothing holds back fill the slots the waiting ones leave.
 
-A placement whose workload needs one in a **later phase** (or one no phase selects) cannot wait
-for it inside its own phase. `buckle validate` warns about such a `needs`; the placement starts
-only when the needed workload is already running on the cluster (applied and healthy), and
-otherwise misses its phase and converges in the stragglers stage once the need is healthy. Under
-`rollout.dependencies.across_phases: refuse` the revision is rejected instead, and a placement
-whose need turns out not to be running fails.
+| A `needs` entry | Waits for |
+|---|---|
+| a module the host runs | nothing in the rollout: the agent orders the host's own modules |
+| a module the host does not run | that module on every host that runs it |
+| `group:NAME` | every member of that fleet [group](../modules/fleet.md#groups), hosts and clusters, fleet-wide. A member never waits for its own group. |
+| `workload:NAME` (on a module) | that workload's placement on the cluster the host is a node of, else on every cluster that runs it |
+| `workload:NAME:CLUSTER` | that one placement |
+| `module:NAME` (on a workload) | that module on the cluster's nodes |
+| another workload (on a workload) | its placement on the same cluster; `workload:NAME:CLUSTER` and `group:NAME` reach other clusters |
 
-Every target is planned when the rollout starts, as a **preview** where its stage has not opened
-yet (later phases, placements after the nodes or the workloads they need), and planned again when
-its stage opens, since it depends on what came before. The fresh plan is what applies: one matching what the phase's
+A host waits **whole**: all of its modules apply in one run once every need of every module is
+met. Only a host that a cycle runs through is **split** (two hosts that each serve the other, a
+node whose modules sit on both sides of a workload). Its first run applies every module whose
+needs are met, the rest follow in later runs, and it shows as pending with what it waits for in
+between. A cycle no split resolves (two modules that need each other across hosts) refuses the
+rollout, naming the cycle.
+
+**Limits.** `parallel` on a [module](../modules/README.md#module-yaml) or
+[workload](../modules/workloads.md) caps how many targets that run it change at once across the
+whole rollout, as a count or a percentage of them, on top of the phase's `parallel`:
+
+```yaml
+# modules/ceph/module.yaml
+parallel: 1            # one Ceph host at a time, whatever the phase allows
+# modules/k3s-agent/module.yaml
+needs: [base, 'group:k3s-server']
+parallel: 50%
+```
+
+Targets under no limit take the slots a limited module cannot use. Where several could start, the
+one with the longest chain of dependents goes first, then the one whose limit has the longest
+queue. A target whose plan changes nothing counts against no limit.
+
+**Failures.** A failed target keeps its place in its limits, blocks what needs it, and by default
+stops further targets that run the module or workload that failed (`max_failures: 0`). Raise
+`max_failures` on the module or workload (a count or a percentage of its targets) to let that many
+fail and the rest carry on; their dependents then miss the phase rather than block. The failure
+is charged to the module whose task or check failed, or to what the plan changed when that cannot
+be told. The phase's own `max_failures` counts every failure as before. When nothing is running
+and what remains waits on a failure, the rollout pauses naming it: retry or skip the failed
+target, then resume. Under `on_failure: continue` the blocked targets miss the phase instead.
+
+**Needs outside the phase.** A need on a target in a **later phase** (or one no phase selects)
+cannot wait for it. `buckle validate` warns about such a workload `needs`; the target starts only
+when what it needs is already running (a placement applied and healthy, a host connected), and
+otherwise misses its phase and converges in the stragglers stage. Under
+`rollout.dependencies.across_phases: refuse` the revision is rejected instead, and a target whose
+need turns out not to be running fails. A needed host that is **offline** holds its dependents the
+same way, unless the need names several hosts (a group, a module on other hosts) and at least one
+of them made it: redundancy is assumed.
+
+Every target is planned when the rollout starts, as a **preview** where it has to wait (later
+phases, anything with a need outside its own host), and planned again when it starts, since it
+depends on what came before. The fresh plan is what applies: one matching what the phase's
 approval covered goes ahead, one that changed is marked *changed since preview* (audit
 `rollout.target.plan_drifted`) and needs approval again under `approval: required` (or
 `if_destructive` when destructive); auto phases apply it. A cluster with no free executor at the
-start, or whose preview fails (an earlier stage provides what it needs), stays unplanned until its
-stage opens. A host's later steps are planned when their stage opens. A cluster with no
+start, or whose preview fails (something it needs provides what the plan reads), stays unplanned
+until it starts. A split host's later runs are planned when they start. A cluster with no
 connected host matching its `executors` selector reads *awaiting executor*; it misses its phase
 after the disconnect grace, like an offline host, and converges in the stragglers stage once one
-appears. A phase whose `needs` all stay inside one host is one stage, as before.
+appears.
+
+Agents older than the release that added `group:` needs cannot plan a revision whose modules use
+them, or need a module their host does not run; such a host fails with a note to upgrade its
+agent. Upgrade the fleet's agents one revision before the first such `needs`.
 
 ## 3. Review and approve
 
@@ -191,7 +234,11 @@ row's menu on the Workloads list, or the head of the workload's page, runs one a
 cluster running it (each placement row keeps its own, which runs on that cluster at once). The
 rollout follows the stable revision's phases as a revision's
 would, with the same approvals, waves of `parallel`, baseline and bake checks, failure budgets,
-pause and abort, and reboots.
+pause and abort, and reboots. The action's module or workload keeps its `parallel`, `max_failures`
+and `needs` too ([Order inside a phase](#order-inside-a-phase)): each target runs the action once,
+after what its module needs on other targets, so a nightly reboot under `parallel: 1` takes one
+Ceph host at a time. Needs that form a cycle are dropped for an action rollout (audit
+`rollout.needs.cycle`) rather than refusing it.
 
 - **Targets**: every active target whose applied revision offers the action and that the selector
   matches, frozen when the rollout starts. Each runs the action from the revision it runs.

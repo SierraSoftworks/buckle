@@ -398,6 +398,7 @@ fn entry(
         removal: false,
         earlier: vec![],
         total: None,
+        waiting: None,
         needs_approval: false,
         needs_attention: false,
         error_detail: None,
@@ -678,6 +679,10 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
                     30,
                 );
                 c.step = 1;
+                c.waiting = Some(buckle_api::RolloutWait {
+                    kind: buckle_api::RolloutWaitKind::Needs,
+                    reason: "needs module:nomad: waiting for lab-1, lab-3".into(),
+                });
                 c
             },
             {

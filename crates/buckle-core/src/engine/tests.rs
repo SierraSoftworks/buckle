@@ -1485,8 +1485,10 @@ async fn needs_cycles_are_reported() {
     assert!(err.message().contains("cycle"), "{}", err.message());
 }
 
+/// A needed module the host does not run is needed on the hosts that do:
+/// the rollout orders those, and the host plans without it.
 #[tokio::test]
-async fn a_selected_module_needing_an_unselected_one_is_a_user_error_with_advice() {
+async fn a_selected_module_needing_an_unselected_one_plans_without_it() {
     let rev = revision(
         "r1",
         FLEET,
@@ -1495,12 +1497,21 @@ async fn a_selected_module_needing_an_unselected_one_is_a_user_error_with_advice
             module("name: nomad\nneeds: [docker]\n"),
         ],
     );
+    let plan = plan(&inputs(rev, &FakeSystem::new())).await;
+    assert_eq!(module_names(&plan), ["nomad"]);
+}
+
+#[tokio::test]
+async fn a_selected_module_needing_a_missing_one_is_a_user_error() {
+    let rev = revision("r1", FLEET, vec![module("name: nomad\nneeds: [docker]\n")]);
     let err = plan_err(&inputs(rev, &FakeSystem::new())).await;
     assert!(err.is(crate::error::Kind::User));
     assert!(err.message().contains("'nomad'"), "{}", err.message());
-    assert!(err.message().contains("'docker'"), "{}", err.message());
-    assert!(err.message().contains("not selected"), "{}", err.message());
-    assert!(err.advice().iter().any(|a| a.contains("when")));
+    assert!(
+        err.message().contains("no module named 'docker'"),
+        "{}",
+        err.message()
+    );
 }
 
 // ---------------------------------------------------------------------------

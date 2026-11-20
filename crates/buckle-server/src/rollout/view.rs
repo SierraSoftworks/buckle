@@ -122,6 +122,15 @@ pub fn host(
             .then(|| rollout_plan(h))
             .flatten()
             .map(|p| buckle_api::ChangeCounts::of_plan(&p)),
+        waiting: h
+            .runtime
+            .waiting
+            .as_ref()
+            .filter(|_| matches!(h.state, HostPhase::PlanPending | HostPhase::Planned))
+            .map(|w| buckle_api::RolloutWait {
+                kind: w.kind.api(),
+                reason: w.reason.clone(),
+            }),
     }
 }
 

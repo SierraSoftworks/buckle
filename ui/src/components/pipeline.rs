@@ -90,7 +90,7 @@ pub fn pipeline(props: &PipelineProps) -> Html {
                         </li>
                         <li class="legend__item">
                             <span class="block block--legend block--planned block--cluster block--waiting" aria-hidden="true" />
-                            { "waiting (earlier step, need, steward)" }
+                            { "waiting (need, limit, steward)" }
                         </li>
                     }
                     if has_removal {

@@ -240,8 +240,9 @@ Without `phases`, one implicit phase selects every target, one at a time. Hosts 
 that no phase selects are reported on the rollout and left on their current revision, so end with
 a `select: 'true'` phase if everything should follow.
 
-Inside a phase, `needs` that leave a host (`module:` on a workload, `workload:` on a module, one
-workload on another) order its targets into stages; see
-[Stages inside a phase](../operations/rollouts.md#stages-inside-a-phase).
+Inside a phase, `needs` that leave a host (`group:`, a module other hosts run, `module:` on a
+workload, `workload:` on a module, one workload on another) order its targets one by one, and a
+module's or workload's own `parallel` caps it fleet-wide, so one dense phase can replace several
+ordered ones; see [Order inside a phase](../operations/rollouts.md#order-inside-a-phase).
 
 See [Rolling out changes](../operations/rollouts.md) for what each phase does, step by step.

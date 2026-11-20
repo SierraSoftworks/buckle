@@ -148,10 +148,10 @@ pub struct PhaseRuntime {
     pub gate: Option<GateRuntime>,
     #[serde(default)]
     pub bake_until: Option<DateTime<Utc>>,
-    /// How many dependency stages the phase's targets are laid out in.
+    /// How deep the dependency order of the phase's targets goes.
     #[serde(default = "one")]
     pub stages: u32,
-    /// The highest stage opened so far (its targets may plan and start).
+    /// The deepest dependency level a target has opened at so far.
     #[serde(default)]
     pub open_stage: u32,
 }
@@ -420,14 +420,15 @@ pub struct HostRuntime {
     /// A host, or a cluster applied through an executor.
     #[serde(default)]
     pub kind: TargetKind,
-    /// The target's steps through its phase, in stage order (see
-    /// [`super::stages`]). Empty means one whole step in stage 0.
+    /// The target's steps through its phase, in order, each with what it
+    /// waits for (see [`super::stages`]). Empty means one whole step that
+    /// waits for nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<Step>,
     /// Index into `steps` of the step being worked on.
     #[serde(default)]
     pub step: usize,
-    /// The stage of the current step (what the phase's wave logic gates on).
+    /// How deep the current step sits in its phase's dependency order.
     #[serde(default)]
     pub stage: u32,
     /// For a cluster: the host agent its messages travel through.
@@ -463,6 +464,54 @@ pub struct HostRuntime {
     /// everything it changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub earlier: Vec<PlanAttempt>,
+    /// Everything the current step needs is done: the row is planned for
+    /// real (not as a preview) and starts as soon as a slot and the limits
+    /// of what it runs allow. A step that needs nothing is open without it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opened: bool,
+    /// Why the row has not started yet, while something other than its
+    /// phase's `parallel` keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<Waiting>,
+    /// What the row runs that a module's or workload's `parallel` and
+    /// `max_failures` count: `module:NAME` for each module selected on a
+    /// host, `workload:NAME` for a placement (for a cluster applied as one
+    /// unit: each of its workloads).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<String>,
+}
+
+/// What keeps a row from starting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiting {
+    pub kind: WaitKind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    /// Something it needs is still on its way.
+    Needs,
+    /// Something it needs will not get there in this phase (offline,
+    /// missed, in a later phase and not running): the row misses the phase.
+    Hold,
+    /// Something it needs failed, or what it runs failed elsewhere beyond
+    /// its `max_failures`: it waits for an operator.
+    Blocked,
+    /// A `parallel` limit of what it runs is in use.
+    Limit,
+}
+
+impl WaitKind {
+    pub fn api(self) -> buckle_api::RolloutWaitKind {
+        match self {
+            WaitKind::Needs => buckle_api::RolloutWaitKind::Needs,
+            WaitKind::Hold => buckle_api::RolloutWaitKind::Hold,
+            WaitKind::Blocked => buckle_api::RolloutWaitKind::Blocked,
+            WaitKind::Limit => buckle_api::RolloutWaitKind::Limit,
+        }
+    }
 }
 
 /// A plan a row applied in an earlier attempt or step.
@@ -499,9 +548,9 @@ impl HostRuntime {
         self.steps.get(self.step + 1)
     }
 
-    /// Whether the plan of the current step waits for its stage to open: a
-    /// cluster's or a placement's (it depends on the stages before it), or
-    /// any later step.
+    /// Whether the plan of the current step waits for the row to open: a
+    /// cluster's or a placement's (it depends on what applies before it),
+    /// or any later step.
     pub fn plan_deferred(&self) -> bool {
         self.kind.on_cluster() || self.step > 0
     }
@@ -511,6 +560,23 @@ impl HostRuntime {
         self.stage = steps.first().map_or(0, |s| s.stage);
         self.steps = steps;
         self.step = 0;
+        self.opened = false;
+        self.waiting = None;
+    }
+
+    /// Whether the current step waits for anything outside the row. A step
+    /// stored before needs were kept per target has only its depth to say
+    /// so.
+    pub fn has_needs(&self) -> bool {
+        self.steps
+            .get(self.step)
+            .is_some_and(|s| !s.needs.is_empty() || s.stage > 0)
+            || self.removal
+    }
+
+    /// Whether the row has completed its step `step` (`None`: all of them).
+    pub fn past(&self, step: Option<usize>) -> bool {
+        step.is_some_and(|s| self.step > s)
     }
 }
 

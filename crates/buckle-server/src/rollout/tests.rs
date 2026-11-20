@@ -1,6 +1,8 @@
 //! Controller scenarios driven by scripted fake hosts on tokio's paused clock.
 
-use super::controller::{CHECK_DRIFT_CAPABILITY, TARGETS_CAPABILITY, WORKLOADS_CAPABILITY};
+use super::controller::{
+    CHECK_DRIFT_CAPABILITY, SCHEDULED_NEEDS_CAPABILITY, TARGETS_CAPABILITY, WORKLOADS_CAPABILITY,
+};
 use super::model::{HostPhase, RolloutHostRecord, RolloutRecord, STRAGGLERS};
 use super::*;
 use crate::clock::{Clock, TokioClock};
@@ -177,6 +179,12 @@ impl Harness {
 
     /// Stops the controller and starts a fresh one from the store.
     async fn restart(&mut self) {
+        self.stop().await;
+        self.resume().await;
+    }
+
+    /// Stops the controller, leaving what it stored.
+    async fn stop(&mut self) {
         self.cancel.cancel();
         if let Some(t) = self.task.take() {
             t.await.unwrap();
@@ -184,6 +192,10 @@ impl Harness {
         for (host, id) in std::mem::take(&mut self.session_ids) {
             self.sessions.detach(&host, id);
         }
+    }
+
+    /// Starts a fresh controller from the store.
+    async fn resume(&mut self) {
         let (handle, cancel, task) =
             start_controller(&self.store, &self.sessions, &self.revisions, &self.clock).await;
         self.handle = handle;
@@ -599,6 +611,7 @@ impl Harness {
                     TARGETS_CAPABILITY.into(),
                     WORKLOADS_CAPABILITY.into(),
                     CHECK_DRIFT_CAPABILITY.into(),
+                    SCHEDULED_NEEDS_CAPABILITY.into(),
                 ]
             },
             boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
@@ -5882,4 +5895,386 @@ async fn a_clusters_drift_check_goes_to_its_steward(#[case] workload: Option<&st
     assert_eq!(sent[0].0, steward);
     assert_eq!(sent[0].1.target, CLUSTER);
     assert_eq!(sent[0].1.workload, workload.unwrap_or_default());
+}
+
+// ------------------------------------------------------- dependency scheduling
+
+/// `server` on the db tier and `agent` on the web tier, each with extra
+/// keys (`needs`, `parallel`, `max_failures`).
+fn tiers(server: &str, agent: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "modules/server/module.yaml",
+            format!("name: server\nwhen: 'host.groups contains \"db\"'\n{server}"),
+        ),
+        (
+            "modules/agent/module.yaml",
+            format!("name: agent\nwhen: 'host.groups contains \"web\"'\n{agent}"),
+        ),
+    ]
+}
+
+/// A harness on revision r1 (`rollout`, the modules `files`) with `hosts`
+/// (id, tier) enrolled, those not named in `offline` connected.
+async fn scheduled(
+    rollout: &str,
+    files: &[(&'static str, String)],
+    hosts: &[(&str, &str)],
+    offline: &[&str],
+) -> Harness {
+    let mut h = Harness::new().await;
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    h.revision_with("r1", rollout, "", &files).await;
+    for (id, tier) in hosts {
+        h.enrol(id, tier).await;
+        if !offline.contains(id) {
+            h.connect(id, None);
+        }
+    }
+    h
+}
+
+/// When `host` was sent its (first) Apply.
+fn applied_at(h: &Harness, host: &str) -> DateTime<Utc> {
+    h.applies()
+        .iter()
+        .find(|a| a.1 == host)
+        .unwrap_or_else(|| panic!("{host} was applied: {:?}", h.applies()))
+        .0
+}
+
+const BAKE: chrono::Duration = chrono::Duration::seconds(30);
+const TOLERANT: &str = "  health: { bake: 30s }\n  phases:\n    - { name: all, select: 'true', parallel: 4, max_failures: 2 }\n";
+
+/// A need that leaves the host (a group, or a module the host does not run)
+/// orders the targets of one phase; what needs nothing does not wait.
+#[rstest::rstest]
+#[case::a_group("needs: ['group:db']\n")]
+#[case::a_module_of_other_hosts("needs: [server]\n")]
+#[tokio::test(start_paused = true)]
+async fn a_need_outside_the_host_orders_one_phase(#[case] needs: &str) {
+    let h = scheduled(
+        ONE_PHASE_ALL,
+        &tiers("", needs),
+        &[("w1", "web"), ("w2", "web"), ("d1", "db"), ("c1", "canary")],
+        &[],
+    )
+    .await;
+    let id = h.start("r1").await;
+    h.wait(&id, "the agents say what they wait for", |_, hs| {
+        ["w1", "w2"].iter().all(|w| {
+            host(hs, w)
+                .runtime
+                .waiting
+                .as_ref()
+                .is_some_and(|x| x.kind == super::model::WaitKind::Needs && x.reason.contains("d1"))
+        })
+    })
+    .await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    let server = applied_at(&h, "d1");
+    for agent in ["w1", "w2"] {
+        assert!(
+            applied_at(&h, agent) >= server + BAKE,
+            "{agent} waits for the server to bake"
+        );
+    }
+    assert!(
+        applied_at(&h, "c1") < server + BAKE,
+        "what needs nothing fills the phase meanwhile"
+    );
+}
+
+/// A module's `parallel` holds its targets to that many at a time across
+/// the phase, and the phase's other slots go to what it does not limit.
+#[tokio::test(start_paused = true)]
+async fn a_modules_parallel_limits_its_targets_and_others_fill_the_slots() {
+    let h = scheduled(
+        ONE_PHASE_ALL,
+        &tiers("parallel: 1\n", ""),
+        &[
+            ("d1", "db"),
+            ("d2", "db"),
+            ("d3", "db"),
+            ("w1", "web"),
+            ("w2", "web"),
+        ],
+        &[],
+    )
+    .await;
+    let id = h.start("r1").await;
+    h.wait(&id, "a limited target says so", |_, hs| {
+        hs.iter().any(|x| {
+            x.runtime
+                .waiting
+                .as_ref()
+                .is_some_and(|w| w.kind == super::model::WaitKind::Limit)
+        })
+    })
+    .await;
+    h.wait_state(&id, RolloutState::Completed).await;
+    let mut limited: Vec<_> = ["d1", "d2", "d3"]
+        .iter()
+        .map(|d| applied_at(&h, d))
+        .collect();
+    limited.sort();
+    assert!(
+        limited.windows(2).all(|w| w[1] >= w[0] + BAKE),
+        "one at a time: {limited:?}"
+    );
+    for free in ["w1", "w2"] {
+        assert!(
+            applied_at(&h, free) < limited[0] + BAKE,
+            "{free} does not queue behind the limit"
+        );
+    }
+}
+
+/// A failure the phase tolerates still blocks the other targets of the
+/// failed module and what needs the failed target (`max_failures` of a
+/// module is 0 unless set): with nothing left to do the rollout pauses, and
+/// goes on once the failed target is retried.
+#[tokio::test(start_paused = true)]
+async fn a_failed_target_blocks_its_module_and_its_dependents_until_retried() {
+    let h = scheduled(
+        TOLERANT,
+        &tiers("parallel: 1\n", "needs: ['group:db']\n"),
+        &[("d1", "db"), ("d2", "db"), ("w1", "web")],
+        &[],
+    )
+    .await;
+    h.script("d1", |s| s.apply_fail = Some(vec![]));
+    h.script("d2", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r1").await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    assert_eq!(r.runtime.pause.as_ref().unwrap().kind, "blocked");
+    let failed: Vec<&str> = hosts
+        .iter()
+        .filter(|x| x.state == HostPhase::Failed)
+        .map(|x| x.host.as_str())
+        .collect();
+    assert_eq!(failed.len(), 1, "the limit let one start: {failed:?}");
+    assert_eq!(h.applies().len(), 1, "nothing else starts");
+    for x in hosts.iter().filter(|x| x.state != HostPhase::Failed) {
+        assert_eq!(
+            x.runtime.waiting.as_ref().map(|w| w.kind),
+            Some(super::model::WaitKind::Blocked),
+            "{}: {:?}",
+            x.host,
+            x.runtime.waiting
+        );
+    }
+
+    for d in ["d1", "d2"] {
+        h.script(d, |s| s.apply_fail = None);
+    }
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: failed[0].to_owned(),
+        workload: String::new(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+}
+
+/// A module's `max_failures` lets its other targets go on after a failure,
+/// and what needs the group goes on with the members that made it.
+#[tokio::test(start_paused = true)]
+async fn a_modules_max_failures_keeps_its_branch_going() {
+    let h = scheduled(
+        TOLERANT,
+        &tiers("max_failures: 1\n", "needs: ['group:db']\n"),
+        &[("d1", "db"), ("d2", "db"), ("w1", "web")],
+        &[],
+    )
+    .await;
+    h.script("d1", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "the agent healthy", |_, hs| {
+            host(hs, "w1").state == HostPhase::Healthy
+        })
+        .await;
+    assert_eq!(host(&hosts, "d1").state, HostPhase::Failed);
+    assert_eq!(host(&hosts, "d2").state, HostPhase::Healthy);
+}
+
+/// An offline member of a group does not hold what needs the group while
+/// another member is there; with none there, the dependent misses the phase
+/// and waits in the stragglers stage, saying for what.
+#[rstest::rstest]
+#[case::another_member_is_online(&["d1", "d2"], true)]
+#[case::no_member_is_online(&["d1"], false)]
+#[tokio::test(start_paused = true)]
+async fn an_offline_group_member_holds_its_dependents_only_when_alone(
+    #[case] servers: &[&str],
+    #[case] proceeds: bool,
+) {
+    let mut hosts = vec![("w1", "web")];
+    hosts.extend(servers.iter().map(|s| (*s, "db")));
+    let h = scheduled(
+        ONE_PHASE_ALL,
+        &tiers("", "needs: ['group:db']\n"),
+        &hosts,
+        &["d1"],
+    )
+    .await;
+    let id = h.start("r1").await;
+    let (_, rows) = h.wait_state(&id, RolloutState::Completed).await;
+    let agent = host(&rows, "w1");
+    if proceeds {
+        assert_eq!(agent.state, HostPhase::Healthy);
+        return;
+    }
+    h.idle(600).await;
+    let (_, rows) = h.snapshot(&id).await;
+    let agent = host(&rows, "w1");
+    assert_eq!(agent.phase, STRAGGLERS);
+    let waiting = agent
+        .runtime
+        .waiting
+        .clone()
+        .expect("it says what it waits for");
+    assert!(
+        waiting.reason.contains("group:db") && waiting.reason.contains("d1"),
+        "{waiting:?}"
+    );
+    assert!(h.applies().is_empty());
+}
+
+/// Needs that no ordering resolves refuse the rollout before anything
+/// applies.
+#[tokio::test(start_paused = true)]
+async fn a_needs_cycle_refuses_the_rollout() {
+    let h = scheduled(
+        ONE_PHASE_ALL,
+        &tiers("needs: ['group:web']\n", "needs: ['group:db']\n"),
+        &[("d1", "db"), ("w1", "web"), ("c1", "canary")],
+        &[],
+    )
+    .await;
+    let id = h.start("r1").await;
+    let (r, _) = h.wait_state(&id, RolloutState::Aborted).await;
+    let why = r.runtime.end_reason.unwrap_or_default();
+    assert!(why.contains("cycle") && why.contains("group:db"), "{why}");
+    h.idle(600).await;
+    assert!(h.applies().is_empty());
+}
+
+/// An agent that predates the new `needs` forms would take one for a
+/// missing module: its host fails with what to do instead of being asked to
+/// plan.
+#[tokio::test(start_paused = true)]
+async fn an_agent_that_predates_group_needs_is_not_asked_to_plan_them() {
+    let mut h = Harness::new().await;
+    let files = tiers("", "needs: ['group:db']\n");
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    h.revision_with("r1", TOLERANT, "", &files).await;
+    for (id, tier) in [("d1", "db"), ("w1", "web")] {
+        h.enrol(id, tier).await;
+    }
+    h.script("w1", |s| s.legacy_agent = true);
+    for id in ["d1", "w1"] {
+        h.connect(id, None);
+    }
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "the old agent's host failed", |_, hs| {
+            host(hs, "w1").state == HostPhase::Failed
+        })
+        .await;
+    let error = host(&hosts, "w1").runtime.error.clone().unwrap_or_default();
+    assert!(
+        error.contains("upgrade the agent") && error.contains("group:db"),
+        "{error}"
+    );
+    assert!(
+        h.sent(|host, m| host == "w1" && matches!(m, SMsg::Plan(_)))
+            .is_empty(),
+        "it is never asked for a plan"
+    );
+}
+
+/// An action rollout runs under the same limits and order as a revision's:
+/// the module's `parallel` and the group need apply to the action's runs.
+#[tokio::test(start_paused = true)]
+async fn an_action_rollout_honours_limits_and_needs() {
+    let mut files = tiers("parallel: 1\n", "needs: ['group:db']\n");
+    files.push(("modules/common/module.yaml", "name: common\n".to_owned()));
+    let mut h = Harness::new().await;
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    h.revision_with(
+        "r1",
+        "  health: { bake: 1m }\n  phases:\n    - { name: all, select: 'true', parallel: 4 }\n",
+        "",
+        &borrowed,
+    )
+    .await;
+    h.stable("r1").await;
+    for (id, tier) in [("d1", "db"), ("d2", "db"), ("w1", "web")] {
+        h.enrol(id, tier).await;
+        h.connect(id, Some("r1"));
+    }
+    let id = h.start_action(&["d1", "d2", "w1"], false).await.unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    let runs = action_runs(&h);
+    let at = |host: &str| runs.iter().find(|r| r.1 == host).expect("ran").0;
+    let minute = chrono::Duration::minutes(1);
+    let (first, second) = (at("d1").min(at("d2")), at("d1").max(at("d2")));
+    assert!(second >= first + minute, "the limit: one server at a time");
+    assert!(at("w1") >= second + minute, "the agent after its group");
+}
+
+/// A rollout under way when the server is upgraded stored only how deep each
+/// step sits, not what it waits for: it keeps that order.
+#[tokio::test(start_paused = true)]
+async fn a_rollout_laid_out_before_an_upgrade_keeps_its_order() {
+    let mut h = scheduled(
+        ONE_PHASE_ALL,
+        &tiers("", "needs: ['group:db']\n"),
+        &[("w1", "web"), ("d1", "db")],
+        &[],
+    )
+    .await;
+    h.script("d1", |s| s.silent_apply = true);
+    let id = h.start("r1").await;
+    h.wait(&id, "the server applying", |_, hs| {
+        host(hs, "d1").state == HostPhase::Applying
+    })
+    .await;
+
+    h.stop().await;
+    let rollout = id.clone();
+    h.store
+        .call(move |db| {
+            for mut row in db.rollouts().hosts(&rollout)? {
+                row.runtime.steps.iter_mut().for_each(|s| s.needs.clear());
+                row.runtime.waiting = None;
+                db.rollouts().save_host(&row)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    h.resume().await;
+    h.script("d1", |s| s.silent_apply = false);
+    h.connect("w1", None);
+    h.wait(&id, "the agent still waits for the server", |_, hs| {
+        host(hs, "w1")
+            .runtime
+            .waiting
+            .as_ref()
+            .is_some_and(|w| w.reason.contains("d1"))
+    })
+    .await;
+    assert!(h.applies().iter().all(|a| a.1 != "w1"));
+    h.connect("d1", Some("r1"));
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    assert!(h.applies().iter().any(|a| a.1 == "w1"));
 }

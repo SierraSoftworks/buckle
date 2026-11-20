@@ -39,17 +39,6 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
     let templater = Templater::new();
     let declared_secrets: BTreeSet<&str> =
         revision.fleet.secrets.keys().map(String::as_str).collect();
-    let modules: BTreeSet<&str> = revision
-        .modules
-        .iter()
-        .map(|m| m.config.name.as_str())
-        .collect();
-    let workloads: BTreeSet<&str> = revision
-        .workloads
-        .iter()
-        .map(|w| w.config.name.as_str())
-        .collect();
-
     let check_secrets = |report: &mut ValidationReport,
                          module: Option<&str>,
                          location: &str,
@@ -89,17 +78,12 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
         );
     }
 
-    // A module's `workload:` edges point into this layer.
+    // A module's `workload:` and `group:` edges point out of its layer.
     for m in &revision.modules {
+        let file = format!("modules/{}/module.yaml", m.config.name);
         for need in m.config.needs() {
-            if let Need::Workload(w) = &need
-                && !workloads.contains(w.as_str())
-            {
-                report.error(
-                    Some(&m.config.name),
-                    format!("modules/{}/module.yaml", m.config.name),
-                    format!("needs the workload '{w}', which does not exist"),
-                );
+            if !matches!(need, Need::Module(_)) {
+                check_need(&mut report, revision, &m.config.name, &file, &need);
             }
         }
     }
@@ -160,22 +144,10 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
         }
 
         for need in cfg.needs() {
-            let exists = match &need {
-                Need::Module(n) => modules.contains(n.as_str()),
-                Need::Workload(n) => workloads.contains(n.as_str()),
-            };
-            if !exists {
-                let what = match need {
-                    Need::Module(_) => "module",
-                    Need::Workload(_) => "workload",
-                };
-                report.error(
-                    Some(name),
-                    &file,
-                    format!("needs the {what} '{}', which does not exist", need.name()),
-                );
-            } else if need == Need::Workload(name.to_owned()) {
+            if need == Need::Workload(name.to_owned()) {
                 report.error(Some(name), &file, "a workload cannot need itself");
+            } else {
+                check_need(&mut report, revision, name, &file, &need);
             }
         }
 
@@ -413,22 +385,40 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
     }
 
     // The `needs` graph across both layers. Module nodes carry only their
-    // `workload:` edges (module-to-module cycles are the module graph's to
-    // report), so any cycle found here passes through a workload.
+    // workload edges (module-to-module cycles are the module graph's to
+    // report), so any cycle found here passes through a workload. A
+    // `workload:NAME:CLUSTER` edge counts as one on the workload, except a
+    // workload's on itself (its placement on another cluster first); `group:`
+    // edges depend on the fleet's facts and are resolved when a rollout
+    // starts.
     let mut graph = Graph::new();
+    let workload_edge = |from: &Need, need: &Need| -> Option<String> {
+        let to = Need::Workload(need.workload()?.to_owned());
+        (to != *from).then(|| to.qualified())
+    };
     for m in &revision.modules {
+        let node = Need::Module(m.config.name.clone());
         let edges: Vec<String> = m
             .config
             .needs()
-            .into_iter()
-            .filter(|n| matches!(n, Need::Workload(_)))
-            .map(|n| n.qualified())
+            .iter()
+            .filter_map(|n| workload_edge(&node, n))
             .collect();
-        graph.add(&Need::Module(m.config.name.clone()).qualified(), &edges);
+        graph.add(&node.qualified(), &edges);
     }
     for w in &revision.workloads {
-        let edges: Vec<String> = w.config.needs().iter().map(Need::qualified).collect();
-        graph.add(&Need::Workload(w.config.name.clone()).qualified(), &edges);
+        let node = Need::Workload(w.config.name.clone());
+        let edges: Vec<String> = w
+            .config
+            .needs()
+            .iter()
+            .filter_map(|n| match n {
+                Need::Module(_) => Some(n.qualified()),
+                Need::Group(_) => None,
+                _ => workload_edge(&node, n),
+            })
+            .collect();
+        graph.add(&node.qualified(), &edges);
     }
     if let Some(cycle) = graph.find_cycle() {
         report.error(
@@ -444,6 +434,53 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
     cross_phase_needs(&mut report, revision);
 
     report
+}
+
+/// Reports a `needs` entry of `owner` (declared in `file`) that names
+/// something the revision does not have: an unknown module, workload or
+/// group is an error; `workload:NAME:CLUSTER` on a cluster `buckle.yaml`
+/// does not declare is a warning (clusters can be created through the API),
+/// the need being met there only once the cluster runs the workload.
+fn check_need(
+    report: &mut ValidationReport,
+    revision: &Revision,
+    owner: &str,
+    file: &str,
+    need: &Need,
+) {
+    let (what, exists) = match need {
+        Need::Module(n) => ("module", revision.module(n).is_some()),
+        Need::Workload(n) | Need::Placement { workload: n, .. } => (
+            "workload",
+            revision.workloads.iter().any(|w| w.config.name == *n),
+        ),
+        Need::Group(n) => ("group", revision.fleet.fleet.groups.contains_key(n)),
+    };
+    if !exists {
+        let hint = if matches!(need, Need::Group(_)) {
+            " (groups are declared under `fleet.groups` in buckle.yaml)"
+        } else {
+            ""
+        };
+        report.error(
+            Some(owner),
+            file,
+            format!(
+                "needs the {what} '{}', which does not exist{hint}",
+                need.name()
+            ),
+        );
+    } else if let Need::Placement { workload, cluster } = need
+        && !revision.fleet.fleet.clusters.contains_key(cluster)
+    {
+        report.warning(
+            Some(owner),
+            file,
+            format!(
+                "needs '{workload}' on the cluster '{cluster}', which buckle.yaml does not declare; the need holds until a cluster of that id runs the workload"
+            ),
+        );
+    }
 }
 
 /// A workload placement that needs a workload the same cluster rolls out in
@@ -721,6 +758,18 @@ fleet:
         &[("buckle.yaml", FLEET), ("modules/m/module.yaml", "name: m\nneeds: ['workload:nope']\n")],
         "needs the workload 'nope'"
     )]
+    #[case::module_needs_missing_group(
+        &[("buckle.yaml", FLEET), ("modules/m/module.yaml", "name: m\nneeds: ['group:nope']\n")],
+        "needs the group 'nope'"
+    )]
+    #[case::workload_needs_missing_group(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nneeds: ['group:nope']\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
+        "needs the group 'nope'"
+    )]
+    #[case::module_needs_missing_placement(
+        &[("buckle.yaml", FLEET), ("modules/m/module.yaml", "name: m\nneeds: ['workload:nope:home-nomad']\n")],
+        "needs the workload 'nope'"
+    )]
     #[case::mixed_kinds(
         &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl, a.yaml]\n"), ("workloads/a/files/a.nomad.hcl", ""), ("workloads/a/files/a.yaml", "")],
         "mixes Nomad resources"
@@ -992,6 +1041,51 @@ actions:
     /// A placement needing a workload its cluster rolls out in a later phase
     /// is a warning (it waits for the need to be running) or, under
     /// `dependencies.across_phases: refuse`, an error.
+    #[test]
+    fn needs_reach_groups_and_single_placements() {
+        let fleet = "version: 2
+fleet:
+  groups:
+    servers: 'host.labels.role == \"server\"'
+  clusters:
+    home-nomad: { kind: nomad, nodes: 'true' }
+";
+        let rev = load(&[
+            ("buckle.yaml", fleet),
+            (
+                "modules/agent/module.yaml",
+                "name: agent\nneeds: ['group:servers', 'workload:a:home-nomad', 'workload:a:elsewhere']\nparallel: 50%\nmax_failures: 1\n",
+            ),
+            (
+                "workloads/a/workload.yaml",
+                "name: a\nneeds: ['group:servers']\nparallel: 1\nresources: [a.nomad.hcl]\n",
+            ),
+            ("workloads/a/files/a.nomad.hcl", "job {}"),
+        ]);
+        let report = validate_targets(&rev);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // The one cluster buckle.yaml does not declare is pointed out.
+        let warnings: Vec<String> = report.warnings.iter().map(|w| w.to_string()).collect();
+        assert!(
+            warnings.iter().any(|w| w.contains("'elsewhere'")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("'home-nomad'")),
+            "{warnings:?}"
+        );
+        let agent = &rev.module("agent").unwrap().config;
+        assert_eq!(agent.parallel, Some(crate::model::Parallelism::Percent(50)));
+        assert_eq!(
+            agent.max_failures,
+            Some(crate::model::Parallelism::Count(1))
+        );
+        assert_eq!(
+            rev.workload("a").unwrap().config.parallel,
+            Some(crate::model::Parallelism::Count(1))
+        );
+    }
+
     #[rstest]
     #[case::warn("", false)]
     #[case::refuse("  dependencies: { across_phases: refuse }\n", true)]
