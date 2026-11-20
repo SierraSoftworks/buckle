@@ -55,6 +55,17 @@ none of them (`true`, `vars.x == 1`) applies to every kind. So a module's `when`
 `cluster.*` and a workload's must not read `host.*` or `workload.*`; `buckle validate` rejects
 either, and warns about a group that mixes `host.*` with the other two.
 
+A rollout phase may hold hosts and placements together by joining a selector for each with `||`:
+every target reads its own half, the other namespaces being null.
+
+```yaml
+- name: canary
+  select: 'host.labels.canary == true || (cluster.kind == "nomad" && workload.labels.tier == "staging")'
+```
+
+Keep negations inside the half they belong to: `!(host.labels.canary == true)` is true for every
+placement once the selector also names `workload.*`.
+
 ## Templates
 
 Task fields are templated only when they contain `{{` or `{%`, so plain values cost nothing:

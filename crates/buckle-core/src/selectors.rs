@@ -92,13 +92,16 @@ impl Namespaces {
     /// `kind`: it names that kind's namespace, or names none (`true`,
     /// `vars.x == 1`), so a selector written for another kind alone is
     /// simply false here. A placement is also what `cluster.*` selects (every
-    /// placement on the matching clusters), and `host.*` never selects one;
-    /// a whole cluster is never selected by `workload.*`.
+    /// placement on the matching clusters), and `host.*` alone never selects
+    /// one; a whole cluster is never selected by `workload.*`. A selector
+    /// that names several (`host.x || workload.y`: a phase of hosts and
+    /// placements) is evaluated for each kind it names, the other
+    /// namespaces reading as null.
     pub fn applies_to(self, kind: TargetKind) -> bool {
         match kind {
             TargetKind::Host => self.host || (!self.cluster && !self.workload),
             TargetKind::Cluster => self.cluster || (!self.host && !self.workload),
-            TargetKind::Workload => !self.host,
+            TargetKind::Workload => !self.host || self.cluster || self.workload,
         }
     }
 
@@ -785,6 +788,29 @@ mod tests {
     ) {
         let filter = Filter::new(expr).expect("filter parses");
         assert_eq!(cluster_ctx().matches(&filter), expected, "{expr}");
+    }
+
+    /// A phase may hold hosts and placements: each reads its own half of
+    /// the selector, and a selector for hosts alone never takes a placement.
+    #[rstest]
+    #[case(r#"workload.labels.tier == "staging""#, true)]
+    #[case(r#"cluster.kind == "nomad""#, true)]
+    #[case(
+        r#"host.labels.canary == true || (cluster.kind == "nomad" && workload.labels.tier == "staging")"#,
+        true
+    )]
+    #[case(
+        r#"host.groups contains "cloud" || workload.labels.tier == "app""#,
+        false
+    )]
+    #[case(r#"host.labels.canary == true"#, false)]
+    #[case(r#"!(host.labels.canary == true)"#, false)]
+    fn selectors_resolve_against_a_placement(#[case] expr: &str, #[case] expected: bool) {
+        let mut labels = Labels::new();
+        labels.insert("tier".into(), "staging".into());
+        let placement = HostContext::for_workload(&cluster_ctx(), "paste", labels, &[]);
+        let filter = Filter::new(expr).expect("filter parses");
+        assert_eq!(placement.matches(&filter), expected, "{expr}");
     }
 
     #[rstest]

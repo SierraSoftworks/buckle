@@ -230,7 +230,7 @@ Each phase:
 | Key | Default | Description |
 |---|---|---|
 | `name` | **required** | Unique; `stragglers` is reserved. |
-| `select` | **required** | A selector over `host.*` for hosts and over `workload.*` and `cluster.*` for [placements](../operations/rollouts.md#placements) (a workload on a cluster). A target belongs to the **first** phase whose selector matches it, and only that one. |
+| `select` | **required** | A selector over `host.*` for hosts and over `workload.*` and `cluster.*` for [placements](../operations/rollouts.md#placements) (a workload on a cluster). A target belongs to the **first** phase whose selector matches it, and only that one. One phase takes both with a selector for each joined by `||` ([cluster selectors](./expressions.md#cluster-selectors)), ordered inside it by `needs`. |
 | `parallel` | `1` | Targets applied at once: a count, or a percentage of the phase's targets (rounded up). Targets whose plan changes nothing run alongside, outside the count. |
 | `approval` | `auto` | `required` stops for an operator to approve the phase's plans; `if_destructive` only when a plan removes or deletes something. |
 | `bake` | `health.bake` | The minimum time to watch health after each host applies. |
