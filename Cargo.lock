@@ -7253,9 +7253,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.6.0"
+version = "9.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80cc68510ea7553c30a69c732de5278e94183f68765af6c642dbccefd6ec777e"
+checksum = "63e50f7b2212e4635244be3c363b53273d159f2523eb7db3096c1d2861c1b603"
 dependencies = [
  "constant_time_eq",
  "crc32fast",
@@ -7264,7 +7264,7 @@ dependencies = [
  "indexmap",
  "libc",
  "memchr",
- "nix 0.32.0",
+ "nix 0.31.4",
  "typed-path",
  "windows-sys 0.61.2",
  "zeroize",
