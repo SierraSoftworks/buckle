@@ -38,14 +38,17 @@ fn json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
 /// `approval_digest` (an approval binds the plan's intent), `targets` (it
 /// runs a pipeline per cluster target it executes for) and `workloads` (it
 /// plans, applies and checks one workload placement of a cluster at a time
-/// when an instruction names one, and echoes the workload on its reports)
-/// and `check_drift` (it runs a drift pass when the server asks).
+/// when an instruction names one, and echoes the workload on its reports),
+/// `check_drift` (it runs a drift pass when the server asks) and
+/// `scheduled_needs` (it plans modules whose `needs` name a group, or a
+/// module its host does not run: the rollout orders those).
 pub const CAPABILITIES: &[&str] = &[
     "force_plan",
     "approval_digest",
     "targets",
     "workloads",
     "check_drift",
+    "scheduled_needs",
 ];
 
 /// The protobuf Hello.

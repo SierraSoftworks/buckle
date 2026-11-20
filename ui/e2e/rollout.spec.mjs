@@ -99,15 +99,15 @@ describe("the rollout pipeline", () => {
     const grey = section.locator('a.block[data-workload="grey"]');
     assert.match(await grey.getAttribute("class"), /block--removal/);
     assert.match(await grey.textContent(), /removes the workload/);
-    // Waiting for an earlier step, and naming only what it waits on.
+    // Waiting for what it needs, in the server's words.
     const grafana = page.locator('.stage[data-stage="everything-else"] a.block[data-workload="grafana"]');
     assert.match(await grafana.getAttribute("class"), /block--waiting/);
-    assert.match(await grafana.textContent(), /waits for lab-1, lab-3/);
+    assert.match(await grafana.textContent(), /needs module:nomad: waiting for lab-1, lab-3/);
     // A workload block opens the workload, at its cluster.
     assert.match(await atuin.getAttribute("href"), /^\/workloads\/atuin\?cluster=home-nomad/);
     // The Targets card names what it waits on, and what the deployment is doing.
     const targets = page.locator("section.panel", { has: page.locator(".yi-panel__title", { hasText: /^Targets$/ }) });
-    assert.match(await targets.locator('tr[data-unit="lab-nomad/grafana"]').getByTestId("host-waiting").textContent(), /waits for lab-1/);
+    assert.match(await targets.locator('tr[data-unit="lab-nomad/grafana"]').getByTestId("host-waiting").textContent(), /waiting for lab-1/);
     assert.match(await targets.locator('tr[data-unit="home-nomad/grey"]').textContent(), /grey on home-nomad removing/);
     const row = targets.locator('tr[data-unit="home-nomad/atuin"]');
     assert.match(await row.textContent(), /atuin on home-nomad/);

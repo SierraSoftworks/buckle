@@ -239,55 +239,50 @@ pub fn track_deploying(status: &mut ClusterStatus, p: &RunProgress) {
 /// What a target in a rollout waits for before it is planned and applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waiting {
-    /// The units of an earlier dependency step of its stage that have not
-    /// finished (a workload waits for the hosts or workloads it needs).
-    Step { step: u32, on: Vec<String> },
-    /// Its stage is open, but no connected host can speak for the cluster.
+    /// What the server says keeps it from starting: something it needs, the
+    /// `parallel` of a module or workload it runs, or a failure.
+    Held {
+        kind: buckle_api::RolloutWaitKind,
+        reason: String,
+    },
+    /// Nothing holds it, but no connected host can speak for the cluster.
     Executor,
 }
 
 impl Waiting {
     pub fn describe(&self) -> String {
         match self {
-            Waiting::Step { on, .. } => {
-                const SHOWN: usize = 3;
-                let mut names: Vec<&str> = on.iter().take(SHOWN).map(String::as_str).collect();
-                let more = on.len().saturating_sub(SHOWN);
-                let rest = (more > 0).then(|| format!("{more} more"));
-                names.extend(rest.as_deref());
-                format!("waits for {}", names.join(", "))
-            }
+            Waiting::Held { reason, .. } => reason.clone(),
             Waiting::Executor => "awaiting an executor".into(),
         }
     }
+
+    /// Whether it waits for an operator (a failure it needs retried or
+    /// skipped), as against something on its way.
+    pub fn blocked(&self) -> bool {
+        matches!(
+            self,
+            Waiting::Held {
+                kind: buckle_api::RolloutWaitKind::Blocked,
+                ..
+            }
+        )
+    }
 }
 
-/// Whether a target is through its step, so later stages may go on.
-fn through(state: HostRolloutState) -> bool {
-    matches!(state, HostRolloutState::Healthy | HostRolloutState::Skipped)
-}
-
-/// What `entry` waits for in `phase`, when it has not started: the
-/// unfinished targets of the stages before its own, else (a cluster) an
-/// executor.
-pub fn waiting(phase: &RolloutPhase, entry: &RolloutHost) -> Option<Waiting> {
+/// What `entry` waits for, when it has not started: what the server holds
+/// it for, else (a cluster) an executor.
+pub fn waiting(_phase: &RolloutPhase, entry: &RolloutHost) -> Option<Waiting> {
     if !matches!(
         entry.state,
         HostRolloutState::Pending | HostRolloutState::PlanPending | HostRolloutState::Planned
     ) {
         return None;
     }
-    let on: Vec<String> = phase
-        .hosts
-        .iter()
-        // A unit that changes nothing holds nobody up.
-        .filter(|h| h.step < entry.step && !through(h.state) && !super::units::unchanged(h))
-        .map(|h| super::units::name(h).to_owned())
-        .collect();
-    if !on.is_empty() {
-        return Some(Waiting::Step {
-            step: entry.step,
-            on,
+    if let Some(w) = &entry.waiting {
+        return Some(Waiting::Held {
+            kind: w.kind,
+            reason: w.reason.clone(),
         });
     }
     (entry.kind != TargetKind::Host && entry.executor.is_none()).then_some(Waiting::Executor)
@@ -523,22 +518,26 @@ mod tests {
     }
 
     #[test]
-    fn a_cluster_says_what_it_waits_for() {
+    fn a_target_says_what_it_waits_for() {
+        let held = buckle_api::RolloutWait {
+            kind: buckle_api::RolloutWaitKind::Needs,
+            reason: "needs module:nomad: waiting for pi-1".into(),
+        };
         let cases = [
-            // An earlier stage's host is still applying.
+            // The server holds it for something it needs.
             (
-                HostRolloutState::Applying,
+                Some(held.clone()),
                 None,
-                Some(Waiting::Step {
-                    step: 1,
-                    on: vec!["pi-1".into()],
+                Some(Waiting::Held {
+                    kind: held.kind,
+                    reason: held.reason.clone(),
                 }),
             ),
-            // Its stage is open, but nobody speaks for it.
-            (HostRolloutState::Healthy, None, Some(Waiting::Executor)),
-            (HostRolloutState::Healthy, Some("pi-1"), None),
+            // Nothing holds it, but nobody speaks for it.
+            (None, None, Some(Waiting::Executor)),
+            (None, Some("pi-1"), None),
         ];
-        for (node, executor, expected) in cases {
+        for (wait, executor, expected) in cases {
             let mut cluster = entry(
                 "home-nomad",
                 1,
@@ -546,17 +545,17 @@ mod tests {
                 TargetKind::Cluster,
             );
             cluster.executor = executor.map(Into::into);
+            cluster.waiting = wait.clone();
             let mut phase: RolloutPhase = serde_json::from_value(serde_json::json!({
                 "name": "home", "state": "running", "parallel": "1", "approval": "auto",
                 "bake_seconds": 0, "max_failures": "0", "virtual_stage": false, "hosts": [],
             }))
             .unwrap();
             phase.hosts = vec![
-                entry("pi-1", 0, node, TargetKind::Host),
-                entry("pi-2", 0, HostRolloutState::Skipped, TargetKind::Host),
+                entry("pi-1", 0, HostRolloutState::Applying, TargetKind::Host),
                 cluster.clone(),
             ];
-            assert_eq!(waiting(&phase, &cluster), expected, "{node:?} {executor:?}");
+            assert_eq!(waiting(&phase, &cluster), expected, "{wait:?} {executor:?}");
             let applying = RolloutHost {
                 state: HostRolloutState::Applying,
                 ..cluster
@@ -567,14 +566,5 @@ mod tests {
                 "a target under way waits for nothing"
             );
         }
-    }
-
-    #[test]
-    fn a_long_wait_names_a_few_and_counts_the_rest() {
-        let w = Waiting::Step {
-            step: 1,
-            on: (1..=5).map(|i| format!("pi-{i}")).collect(),
-        };
-        assert_eq!(w.describe(), "waits for pi-1, pi-2, pi-3, 2 more");
     }
 }

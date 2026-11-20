@@ -452,6 +452,7 @@ mod tests {
             removal: false,
             earlier: vec![],
             total: None,
+            waiting: None,
             needs_approval: false,
             needs_attention: false,
             error_detail: None,

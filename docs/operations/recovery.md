@@ -39,6 +39,9 @@ can be fixed without releasing the rest. It never proceeds under an operator's p
 ## A paused rollout
 
 With `on_failure: pause` (the default), a phase that exceeds `max_failures` pauses the rollout.
+So does one where nothing can start any more because what remains
+[needs](./rollouts.md#order-inside-a-phase) a failed target, or runs a module or workload that
+failed more often than its own `max_failures` allows; the pause names the target and the failure.
 Fix the cause, then **Retry** from the split button: every failed host is re-planned, and the
 rollout carries on in the same phase once its failures are cleared.
 

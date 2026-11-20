@@ -67,7 +67,9 @@ health:
 | `name` | **Required.** Must equal the directory name. |
 | `description` | Shown in plans and the UI. |
 | `when` | A [selector](./expressions.md) choosing the hosts this module applies to. Absent means every host. |
-| `needs` | Modules that must apply first. They must form a graph without cycles, and must be selected on every host this module is. `workload:NAME` orders the module after a [workload](./workloads.md) on the cluster the host belongs to. |
+| `needs` | What must apply first. A module's name orders it after that module: on the same host when the host runs it, else on every host that does. `group:NAME` waits for every member of a fleet [group](./fleet.md#groups), `workload:NAME` for a [workload](./workloads.md) on the cluster the host belongs to (else every cluster running it), `workload:NAME:CLUSTER` for one placement. Needs must form a graph without cycles; see [Order inside a phase](../operations/rollouts.md#order-inside-a-phase). |
+| `parallel` | How many hosts running this module a rollout changes at once, fleet-wide: a count or a percentage of them. Absent: only the phase's `parallel` applies. |
+| `max_failures` | Failed hosts (a count or a percentage of those running the module) a rollout tolerates before it stops starting others and blocks what needs it. Default `0`. |
 | `tags` | Labels for `--select 'module.tags contains "network"'`. |
 | `vars` | Default [variables](./fleet.md#vars); every fleet overlay overrides them. |
 | `tasks` | The ordered list of [tasks](./tasks/README.md). |

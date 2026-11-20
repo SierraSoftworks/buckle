@@ -1490,8 +1490,8 @@ async fn nomad_login(
 }
 
 /// The workloads in `needs` order: each after the selected workloads it
-/// needs, otherwise in the revision's order. `module:` edges are the
-/// rollout's to order (stages); a cycle (rejected by validation) keeps the
+/// needs, otherwise in the revision's order. Edges out of the cluster are the
+/// rollout's to order; a cycle (rejected by validation) keeps the
 /// revision's order for the rest.
 fn order(selected: Vec<&LoadedWorkload>) -> Vec<&LoadedWorkload> {
     let names: BTreeSet<&str> = selected.iter().map(|w| w.config.name.as_str()).collect();
@@ -1506,7 +1506,9 @@ fn order(selected: Vec<&LoadedWorkload>) -> Vec<&LoadedWorkload> {
                 buckle_core::model::Need::Workload(dep) => {
                     !names.contains(dep.as_str()) || done.contains(dep)
                 }
-                buckle_core::model::Need::Module(_) => true,
+                // Other targets' (a module, a group, another cluster's
+                // placement): the rollout's to order.
+                _ => true,
             });
             if ready {
                 done.insert(w.config.name.clone());

@@ -7,17 +7,26 @@
 //! bottom and removed bottom to top. Its `when` selects over `cluster.*`,
 //! never `host.*`.
 
-use super::{ClusterKind, HealthDecl};
+use super::{ClusterKind, FailureBudget, HealthDecl, Parallelism};
 use crate::Filter;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 /// A `needs` entry, as a module or a workload writes it: a bare name is the
-/// same layer, `module:NAME` and `workload:NAME` cross the layers (D2).
+/// same layer, `module:NAME` and `workload:NAME` cross the layers (D2),
+/// `workload:NAME:CLUSTER` names the workload on one cluster, and
+/// `group:NAME` names every member of a fleet group.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Need {
     Module(String),
     Workload(String),
+    /// `workload:NAME:CLUSTER`: the workload's placement on that cluster.
+    Placement {
+        workload: String,
+        cluster: String,
+    },
+    /// `group:NAME`: every target of the group (`fleet.groups`).
+    Group(String),
 }
 
 impl Need {
@@ -26,8 +35,16 @@ impl Need {
         let raw = raw.trim();
         if let Some(name) = raw.strip_prefix("module:") {
             Need::Module(name.trim().to_owned())
+        } else if let Some(name) = raw.strip_prefix("group:") {
+            Need::Group(name.trim().to_owned())
         } else if let Some(name) = raw.strip_prefix("workload:") {
-            Need::Workload(name.trim().to_owned())
+            match name.split_once(':') {
+                Some((workload, cluster)) => Need::Placement {
+                    workload: workload.trim().to_owned(),
+                    cluster: cluster.trim().to_owned(),
+                },
+                None => Need::Workload(name.trim().to_owned()),
+            }
         } else {
             match layer {
                 Layer::Module => Need::Module(raw.to_owned()),
@@ -36,26 +53,30 @@ impl Need {
         }
     }
 
-    /// The layer this edge points into.
-    pub fn layer(&self) -> Layer {
-        match self {
-            Need::Module(_) => Layer::Module,
-            Need::Workload(_) => Layer::Workload,
-        }
-    }
-
-    /// The needed module's or workload's name.
+    /// The needed module's, workload's or group's name.
     pub fn name(&self) -> &str {
         match self {
-            Need::Module(n) | Need::Workload(n) => n,
+            Need::Module(n) | Need::Workload(n) | Need::Group(n) => n,
+            Need::Placement { workload, .. } => workload,
         }
     }
 
-    /// `module:NAME` / `workload:NAME`: the unambiguous written form.
+    /// The workload the edge points at, on any cluster or on one.
+    pub fn workload(&self) -> Option<&str> {
+        match self {
+            Need::Workload(w) | Need::Placement { workload: w, .. } => Some(w),
+            Need::Module(_) | Need::Group(_) => None,
+        }
+    }
+
+    /// `module:NAME`, `workload:NAME`, `workload:NAME:CLUSTER` or
+    /// `group:NAME`: the unambiguous written form.
     pub fn qualified(&self) -> String {
         match self {
             Need::Module(n) => format!("module:{n}"),
             Need::Workload(n) => format!("workload:{n}"),
+            Need::Placement { workload, cluster } => format!("workload:{workload}:{cluster}"),
+            Need::Group(n) => format!("group:{n}"),
         }
     }
 }
@@ -683,10 +704,19 @@ pub struct WorkloadConfig {
     /// Absent means every cluster.
     #[serde(default)]
     pub when: Option<Filter>,
-    /// Workloads (bare, or `workload:NAME`) and modules (`module:NAME`) that
-    /// must apply before this one.
+    /// Workloads (bare, `workload:NAME`, or `workload:NAME:CLUSTER` for the
+    /// one on another cluster), modules (`module:NAME`) and groups
+    /// (`group:NAME`) that must apply before this one.
     #[serde(default)]
     pub needs: Vec<String>,
+    /// How many placements of this workload a rollout changes at once,
+    /// across every phase. Absent: only the phase's `parallel` limits them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<Parallelism>,
+    /// Failed placements of this workload a rollout tolerates before it
+    /// starts no further one and holds what needs them. Absent: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_failures: Option<FailureBudget>,
     #[serde(default)]
     pub tags: Vec<String>,
     /// Labels of the workload's placements (`workload.labels.*` in phase
@@ -752,6 +782,10 @@ struct RawWorkload {
     when: Option<Filter>,
     #[serde(default)]
     needs: Vec<String>,
+    #[serde(default)]
+    parallel: Option<Parallelism>,
+    #[serde(default)]
+    max_failures: Option<FailureBudget>,
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
@@ -887,6 +921,8 @@ impl TryFrom<RawWorkload> for WorkloadConfig {
             description: raw.description,
             when: raw.when,
             needs: raw.needs,
+            parallel: raw.parallel,
+            max_failures: raw.max_failures,
             tags: raw.tags,
             labels: raw.labels,
             vars: raw.vars,
@@ -1390,6 +1426,13 @@ removal: purge
     #[case("module:nomad", Layer::Workload, Need::Module("nomad".into()))]
     #[case("workload: postgresql", Layer::Module, Need::Workload("postgresql".into()))]
     #[case("docker", Layer::Module, Need::Module("docker".into()))]
+    #[case("group:k3s-servers", Layer::Module, Need::Group("k3s-servers".into()))]
+    #[case("group: k3s-servers", Layer::Workload, Need::Group("k3s-servers".into()))]
+    #[case(
+        "workload:vault:nomad",
+        Layer::Module,
+        Need::Placement { workload: "vault".into(), cluster: "nomad".into() }
+    )]
     fn needs_resolve_their_layer(#[case] raw: &str, #[case] layer: Layer, #[case] expected: Need) {
         let need = Need::parse(raw, layer);
         assert_eq!(need, expected);

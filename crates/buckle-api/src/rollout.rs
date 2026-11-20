@@ -159,6 +159,36 @@ pub struct RolloutHost {
     /// (see [`crate::PlanView::absorb`]). Only set with `earlier`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<crate::ChangeCounts>,
+    /// Why the target has not started yet, while something other than its
+    /// phase's `parallel` keeps it: a `needs` entry, or the `parallel` or
+    /// `max_failures` of a module or workload it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<RolloutWait>,
+}
+
+/// What keeps a rollout target from starting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutWait {
+    pub kind: RolloutWaitKind,
+    /// In words: `k3s-agent needs group:k3s-server: waiting for pi-1`.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutWaitKind {
+    /// Something it needs is still being rolled out.
+    Needs,
+    /// Something it needs will not be done in this phase (offline, missed,
+    /// or in a later phase and not running): the target misses its phase
+    /// and converges in the stragglers stage.
+    Hold,
+    /// Something it needs failed, or a module or workload it runs failed
+    /// on another target beyond its `max_failures`: it waits for an
+    /// operator to retry or skip the failed target.
+    Blocked,
+    /// The `parallel` limit of a module or workload it runs is in use.
+    Limit,
 }
 
 /// A plan a rollout target applied before it was planned again.

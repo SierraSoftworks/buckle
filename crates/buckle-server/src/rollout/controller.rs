@@ -8,7 +8,7 @@ use super::bake::{self, BakeWindow};
 use super::link::HostLink;
 use super::model::{
     GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, PlanAttempt, RebootWait,
-    RolloutAction, RolloutHostRecord, RolloutRecord, RolloutRuntime, STRAGGLERS,
+    RolloutAction, RolloutHostRecord, RolloutRecord, RolloutRuntime, STRAGGLERS, WaitKind, Waiting,
 };
 use super::stages;
 use super::view;
@@ -630,15 +630,113 @@ pub const WORKLOADS_CAPABILITY: &str = "workloads";
 /// announces it; older agents keep to their own timer.
 pub const CHECK_DRIFT_CAPABILITY: &str = "check_drift";
 
-/// How a placement row may start: its needs on the cluster are met, or not.
-enum Readiness {
-    Ready,
-    /// A workload it needs is neither applied by this rollout nor running on
-    /// the cluster: the row waits (it misses its phase and converges in the
-    /// stragglers stage once the need is running).
-    Waiting(String),
-    /// The same under `dependencies.across_phases: refuse`: the row fails.
+/// Agents plan a revision whose modules use `group:` needs, or need a
+/// module their host does not run, only once they announce it; older ones
+/// take such an entry for a missing module and fail to plan.
+pub const SCHEDULED_NEEDS_CAPABILITY: &str = "scheduled_needs";
+
+/// Whether what a row's current step needs lets it start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Gate {
+    Open,
+    /// Something it needs is still on its way.
+    Wait(String),
+    /// Something it needs will not get there in this phase (offline,
+    /// missed, or in a later phase and not running): the row misses its
+    /// phase and converges in the stragglers stage.
+    Hold(String),
+    /// Something it needs failed: it waits for an operator.
+    Blocked(String),
+    /// A need outside its phase is not running, under
+    /// `dependencies.across_phases: refuse`: the row fails.
     Refused(String),
+}
+
+/// One target a row waits for, as the rollout stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredState {
+    Met,
+    Pending,
+    /// Not coming in this phase: offline, missed, or failed within what
+    /// its modules tolerate.
+    Away,
+    /// Outside the row's phase (a later one, or no row) and not running.
+    Outside,
+    Failed,
+}
+
+/// How many targets of a rollout run a module or workload, which of them
+/// hold a place of its `parallel` (in flight, or failed), and which failed
+/// on it.
+#[derive(Debug, Clone, Default)]
+struct Usage {
+    total: usize,
+    in_flight: usize,
+    /// Targets still to start.
+    queued: usize,
+    /// Failed targets that run it: each keeps its place.
+    failed_holders: Vec<String>,
+    /// Failed targets whose failure is this module's or workload's.
+    failures: Vec<String>,
+}
+
+/// A few names in words, and how many more there are: a wait on a large
+/// group stays a line.
+fn some_of(names: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let mut shown: Vec<String> = names.iter().take(SHOWN).cloned().collect();
+    if names.len() > SHOWN {
+        shown.push(format!("{} more", names.len() - SHOWN));
+    }
+    shown.join(", ")
+}
+
+/// Counts a target that starts against the `parallel` of everything it
+/// runs.
+fn take_places(usage: &mut HashMap<String, Usage>, runs: &[String]) {
+    for key in runs {
+        if let Some(u) = usage.get_mut(key) {
+            u.in_flight += 1;
+            u.queued = u.queued.saturating_sub(1);
+        }
+    }
+}
+
+/// The members (active hosts and clusters) of each fleet group a `needs`
+/// of `revision` names, as the targets' latest facts place them.
+fn group_members(
+    revision: &Revision,
+    targets: &[(crate::store::HostRecord, serde_json::Value)],
+) -> BTreeMap<String, Vec<String>> {
+    use buckle_core::model::Need;
+    let needed: BTreeSet<String> = revision
+        .modules
+        .iter()
+        .flat_map(|m| m.config.needs())
+        .chain(revision.workloads.iter().flat_map(|w| w.config.needs()))
+        .filter_map(|n| match n {
+            Need::Group(g) => Some(g),
+            _ => None,
+        })
+        .collect();
+    let mut members: BTreeMap<String, Vec<String>> =
+        needed.iter().map(|g| (g.clone(), Vec::new())).collect();
+    if needed.is_empty() {
+        return members;
+    }
+    for (host, facts) in targets {
+        if host.status != HostStatus::Active || host.executor_of().is_some() {
+            continue;
+        }
+        let ctx = crate::fleet::record_context(host, facts, &revision.fleet);
+        for group in ctx.groups.iter().filter(|g| needed.contains(*g)) {
+            members
+                .entry(group.clone())
+                .or_default()
+                .push(host.id.clone());
+        }
+    }
+    members
 }
 
 /// One workload placement of a cluster, as the freeze lays it out.
@@ -1094,20 +1192,45 @@ impl Controller {
             && self.row_session(ri, hi).is_some_and(|s| self.eligible(&s))
     }
 
-    /// Whether row `hi`'s stage is open: its phase is the current one (or
-    /// the stragglers stage, which has no stages) and the phase has reached
-    /// the stage of the row's current step.
+    /// Whether row `hi` is open: its phase is the current one (or the
+    /// stragglers stage) and everything its current step needs is done (see
+    /// [`Controller::open_rows`]).
     fn stage_open(&self, ri: usize, hi: usize) -> bool {
         let live = &self.live[ri];
         let h = &live.hosts[hi];
+        let ready = h.runtime.opened || !h.runtime.has_needs();
         let Some(pi) = h.runtime.phase_index else {
-            return true;
+            return ready;
         };
         let Some(phase) = live.record.runtime.phases.get(pi) else {
-            return true;
+            return ready;
         };
-        phase.virtual_stage
-            || (pi == live.record.runtime.current_phase && h.runtime.stage <= phase.open_stage)
+        ready && (phase.virtual_stage || pi == live.record.runtime.current_phase)
+    }
+
+    /// Row `hi` waits for something that will not be done in its phase: it
+    /// counts as missing it. Under `on_failure: continue` so does one that
+    /// waits for a failed target, as nothing pauses for it.
+    fn held(&self, ri: usize, hi: usize) -> bool {
+        let live = &self.live[ri];
+        let r = &live.hosts[hi].runtime;
+        !r.opened
+            && r.waiting.as_ref().is_some_and(|w| match w.kind {
+                WaitKind::Hold => true,
+                WaitKind::Blocked => live.record.policy.on_failure == FailurePolicy::Continue,
+                WaitKind::Needs | WaitKind::Limit => false,
+            })
+    }
+
+    /// Records why row `hi` has not started (`None`: nothing keeps it).
+    /// Returns whether that changed.
+    fn set_waiting(&mut self, ri: usize, hi: usize, waiting: Option<Waiting>) -> bool {
+        if self.live[ri].hosts[hi].runtime.waiting == waiting {
+            return false;
+        }
+        self.live[ri].hosts[hi].runtime.waiting = waiting;
+        self.touch_host(ri, hi);
+        true
     }
 
     /// Whether a target still to plan or apply counts as missing its phase:
@@ -1136,14 +1259,15 @@ impl Controller {
         }
     }
 
-    /// Whether row `hi` is done with its current stage as far as the stage's
-    /// completion is concerned: finished, or still to plan or apply but
-    /// unreachable (it will miss the phase).
+    /// Whether row `hi` is done as far as its phase's completion is
+    /// concerned: finished, or still to plan or apply but unreachable or
+    /// waiting for something that will not be done in the phase (it will
+    /// miss the phase).
     fn stage_done(&self, ri: usize, hi: usize) -> bool {
         let h = &self.live[ri].hosts[hi];
         h.state.finished()
             || (matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
-                && self.offline_for_phase(ri, hi))
+                && (self.offline_for_phase(ri, hi) || self.held(ri, hi)))
     }
 
     /// Whether host `hi` may be sent an Apply (or a baseline check leading
@@ -4014,11 +4138,38 @@ impl Controller {
         live.dirty_hosts = (0..live.hosts.len()).collect();
         let n = live.hosts.len();
         let count = format!("{n} targets frozen into {} phases", phases.len());
-        // An action runs on each target as one step: no dependency stages.
-        if only.is_none() {
-            for pi in 0..phases.len() {
-                self.compute_stages(ri, pi, &hosts);
+        let cycles = self.compute_stages(ri, None, &hosts);
+        if let Some(cycle) = cycles.first() {
+            let cycle = cycle.join(" -> ");
+            if only.is_none() {
+                // Nothing can be ordered: the revision is wrong, and a
+                // queued one may start.
+                self.finish(
+                    ri,
+                    RolloutState::Aborted,
+                    "controller",
+                    &format!(
+                        "refused: the `needs` of its targets form a cycle no ordering resolves ({cycle}); nothing was applied"
+                    ),
+                );
+                return Ok(());
             }
+            // An action still runs, under the limits alone.
+            let live = &mut self.live[ri];
+            for h in &mut live.hosts {
+                for step in &mut h.runtime.steps {
+                    step.needs.clear();
+                }
+            }
+            let (id, trace) = (live.record.id.clone(), live.record.runtime.trace_id.clone());
+            self.audit(
+                "controller",
+                "rollout.needs.cycle",
+                &id,
+                format!("the `needs` of its targets form a cycle ({cycle}); the action runs without their order"),
+                serde_json::json!({"cycle": cycle}),
+                trace,
+            );
         }
         self.set_rollout_state(ri, RolloutState::Planning, "controller", &count);
         for hi in 0..n {
@@ -4211,79 +4362,112 @@ impl Controller {
         !rows.is_empty()
     }
 
-    /// Lays phase `pi`'s targets out in dependency stages (see
-    /// [`stages`]) from the `needs` of the modules selected on its hosts and
-    /// of the workloads on its clusters (one unit per placement), and
-    /// records each target's steps. Hosts' first steps keep any plan they
-    /// have unless the step narrowed to a module subset, in which case they
-    /// re-plan.
+    /// Lays the rollout's targets out (see [`stages`]) from the `needs` of
+    /// the modules selected on its hosts and of the workloads on its
+    /// clusters (one unit per placement), and records each target's steps,
+    /// what each step waits for and what the target runs. With `phases`,
+    /// only the rows of those phases are laid out (targets admitted late):
+    /// the others keep their steps. A row keeps any plan it has unless its
+    /// first step narrowed to a module subset, in which case it re-plans.
+    /// An action runs once on each target: in the place of the target's
+    /// first step. Returns the dependency cycles no split of a host
+    /// resolves.
     fn compute_stages(
         &mut self,
         ri: usize,
-        pi: usize,
+        phases: Option<&BTreeSet<usize>>,
         targets: &[(crate::store::HostRecord, serde_json::Value)],
-    ) {
-        let rows = self.live[ri].phase_hosts(pi);
-        let (hosts, clusters) = {
+    ) -> Vec<Vec<String>> {
+        let rows: Vec<usize> = (0..self.live[ri].hosts.len()).collect();
+        let action = self.live[ri].record.runtime.action.is_some();
+        let (fleet, mut runs) = {
             let live = &self.live[ri];
             let revision = &live.revision;
-            let mut hosts = Vec::new();
-            let mut clusters = Vec::new();
+            let mut fleet = stages::Fleet {
+                groups: group_members(revision, targets),
+                ..Default::default()
+            };
+            let mut runs: HashMap<usize, Vec<String>> = HashMap::new();
             let mut placements: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             for &hi in &rows {
                 let row = &live.hosts[hi];
+                let phase = row.runtime.phase_index.unwrap_or(usize::MAX);
                 match row.runtime.kind {
                     TargetKind::Host => {
                         let ctx = targets
                             .iter()
                             .find(|(h, _)| h.id == row.host)
                             .map(|(h, f)| (h, f));
-                        let modules = crate::views::selected_modules(revision, None, ctx)
+                        let names = crate::views::selected_modules(revision, None, ctx);
+                        runs.insert(hi, names.iter().map(|n| format!("module:{n}")).collect());
+                        let modules = names
                             .into_iter()
                             .map(|name| stages::ModuleUnit {
                                 needs: revision
                                     .module(&name)
-                                    .map(|m| {
-                                        m.config
-                                            .needs()
-                                            .into_iter()
-                                            .map(stages::Need::from)
-                                            .collect()
-                                    })
+                                    .map(|m| m.config.needs())
                                     .unwrap_or_default(),
                                 name,
                             })
                             .collect();
-                        hosts.push(stages::HostInput {
+                        fleet.hosts.push(stages::HostInput {
                             id: row.host.clone(),
+                            phase,
                             modules,
                         });
                     }
                     TargetKind::Cluster => {
                         if let Some(c) = self.cluster_input(ri, hi, &rows, targets) {
-                            clusters.push(c);
+                            runs.insert(
+                                hi,
+                                c.workloads
+                                    .iter()
+                                    .map(|w| format!("workload:{}", w.name))
+                                    .collect(),
+                            );
+                            fleet.clusters.push(c);
                         }
                     }
                     TargetKind::Workload => {
+                        runs.insert(hi, vec![format!("workload:{}", row.workload)]);
                         placements.entry(row.host.clone()).or_default().push(hi)
                     }
                 }
             }
             for (cluster, rows_of) in &placements {
                 if let Some(c) = self.placements_input(ri, cluster, rows_of, &rows, targets) {
-                    clusters.push(c);
+                    fleet.clusters.push(c);
                 }
             }
-            (hosts, clusters)
+            (fleet, runs)
         };
-        let staged = stages::layer(&hosts, &clusters);
+        let staged = stages::layer(&fleet);
+        let laid_out = |pi: Option<usize>| match phases {
+            Some(only) => pi.is_some_and(|pi| only.contains(&pi)),
+            None => true,
+        };
         let mut replan = Vec::new();
         for &hi in &rows {
-            let steps = staged
+            if !laid_out(self.live[ri].hosts[hi].runtime.phase_index) {
+                continue;
+            }
+            let mut steps = staged
                 .steps
                 .get(&self.row_key(ri, hi))
                 .cloned()
                 .unwrap_or_else(|| vec![stages::whole()]);
+            if action {
+                steps.truncate(1);
+                for step in &mut steps {
+                    step.modules = None;
+                }
+            }
+            let runs = runs.remove(&hi).unwrap_or_default();
+            let h = &mut self.live[ri].hosts[hi];
+            if h.runtime.runs != runs {
+                h.runtime.runs = runs;
+                self.live[ri].dirty_hosts.insert(hi);
+            }
             let h = &mut self.live[ri].hosts[hi];
             if h.runtime.steps == steps
                 || (h.runtime.steps.is_empty() && steps == [stages::whole()])
@@ -4298,10 +4482,16 @@ impl Controller {
             }
             self.live[ri].dirty_hosts.insert(hi);
         }
-        let phase = &mut self.live[ri].record.runtime.phases[pi];
-        if phase.stages != staged.stages {
-            phase.stages = staged.stages;
-            self.live[ri].dirty = true;
+        for (pi, depth) in &staged.stages {
+            if !laid_out(Some(*pi)) {
+                continue;
+            }
+            if let Some(phase) = self.live[ri].record.runtime.phases.get_mut(*pi)
+                && phase.stages != *depth
+            {
+                phase.stages = *depth;
+                self.live[ri].dirty = true;
+            }
         }
         for hi in replan {
             self.live[ri].hosts[hi].plan_digest = None;
@@ -4313,9 +4503,10 @@ impl Controller {
             );
             self.request_plan(ri, hi);
         }
+        staged.cycles
     }
 
-    /// The node hosts of `cluster` among the phase's `rows`.
+    /// The node hosts of `cluster` among `rows`.
     fn cluster_nodes(
         &self,
         ri: usize,
@@ -4361,20 +4552,18 @@ impl Controller {
         let nodes = self.cluster_nodes(ri, cluster, rows, targets)?;
         let (rec, facts) = targets.iter().find(|(h, _)| &h.id == cluster)?;
         let ctx = crate::fleet::record_context(rec, facts, &live.revision.fleet);
+        let phase = live.hosts[hi].runtime.phase_index.unwrap_or(usize::MAX);
         let workloads = buckle_core::engine::selected_workloads(&live.revision, &ctx)
             .into_iter()
             .map(|w| stages::WorkloadUnit {
                 name: w.config.name.clone(),
-                needs: w
-                    .config
-                    .needs()
-                    .into_iter()
-                    .map(stages::Need::from)
-                    .collect(),
+                phase,
+                needs: w.config.needs(),
             })
             .collect();
         Some(stages::ClusterInput {
             id: cluster.clone(),
+            phase,
             nodes,
             workloads,
             placements: false,
@@ -4402,28 +4591,24 @@ impl Controller {
                     r.runtime
                         .after
                         .iter()
-                        .map(|a| stages::Need::Workload(a.clone()))
+                        .map(|a| buckle_core::model::Need::Workload(a.clone()))
                         .collect()
                 } else {
                     live.revision
                         .workload(&r.workload)
-                        .map(|w| {
-                            w.config
-                                .needs()
-                                .into_iter()
-                                .map(stages::Need::from)
-                                .collect()
-                        })
+                        .map(|w| w.config.needs())
                         .unwrap_or_default()
                 };
                 stages::WorkloadUnit {
                     name: r.workload.clone(),
+                    phase: r.runtime.phase_index.unwrap_or(usize::MAX),
                     needs,
                 }
             })
             .collect();
         Some(stages::ClusterInput {
             id: cluster.to_owned(),
+            phase: usize::MAX,
             nodes,
             workloads,
             placements: true,
@@ -4499,6 +4684,13 @@ impl Controller {
         let Some(session) = self.row_session(ri, hi) else {
             return;
         };
+        if let Some(need) = self.unplannable_need(ri, hi, &session) {
+            let why = format!(
+                "its agent predates `needs` such as {need} and would misread it: upgrade the agent (its host page), then retry"
+            );
+            self.fail_host(ri, hi, &why);
+            return;
+        }
         if self.live[ri].hosts[hi].runtime.preview != !open {
             self.live[ri].hosts[hi].runtime.preview = !open;
             self.live[ri].dirty_hosts.insert(hi);
@@ -4514,6 +4706,32 @@ impl Controller {
             revision,
             stable,
         });
+    }
+
+    /// A `needs` entry of a module host row `hi` runs that the agent behind
+    /// `session` would take for a missing module: a group, or a module the
+    /// host does not run, on an agent that predates both
+    /// ([`SCHEDULED_NEEDS_CAPABILITY`]).
+    fn unplannable_need(&self, ri: usize, hi: usize, session: &str) -> Option<String> {
+        use buckle_core::model::Need;
+        let live = &self.live[ri];
+        let h = &live.hosts[hi];
+        if h.runtime.kind != TargetKind::Host
+            || self.has_capability(session, SCHEDULED_NEEDS_CAPABILITY)
+        {
+            return None;
+        }
+        h.runtime
+            .runs
+            .iter()
+            .filter_map(|key| live.revision.module(key.strip_prefix("module:")?))
+            .flat_map(|m| m.config.needs())
+            .find(|need| match need {
+                Need::Group(_) => true,
+                Need::Module(n) => !h.runtime.runs.contains(&format!("module:{n}")),
+                Need::Workload(_) | Need::Placement { .. } => false,
+            })
+            .map(|need| need.qualified())
     }
 
     /// The task selector of row `hi`'s current step (empty: the whole target).
@@ -4625,7 +4843,9 @@ impl Controller {
             return false;
         }
         match pause.kind.as_str() {
-            "failure_budget" => true,
+            // Whatever an operator did to a host may have unblocked the
+            // rest; a rollout still blocked pauses again.
+            "failure_budget" | "blocked" => true,
             "gate" | "local_rollback" => pause.host.as_ref().is_none_or(|h| {
                 live.find(h).is_none_or(|i| {
                     !matches!(live.hosts[i].state, HostPhase::Failed | HostPhase::Held)
@@ -4743,6 +4963,7 @@ impl Controller {
         }
         self.live[ri].dirty = true;
         self.live[ri].hosts[hi].wave = Some(started / parallel.max(1) + 1);
+        self.live[ri].hosts[hi].runtime.waiting = None;
         if unchanged {
             // Nothing to change: its health before the run says nothing
             // about the run, so it is not checked (nor held for it).
@@ -5201,7 +5422,7 @@ impl Controller {
     }
 
     /// Row `hi` baked: healthy, unless a later step waits, in which case it
-    /// moves on to that step and plans it once its stage opens.
+    /// moves on to that step and plans it once what the step needs is done.
     fn finish_step(&mut self, ri: usize, hi: usize) {
         let Some(next) = self.live[ri].hosts[hi].runtime.next_step().cloned() else {
             self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
@@ -5213,6 +5434,8 @@ impl Controller {
             let from = h.runtime.stage;
             h.runtime.step += 1;
             h.runtime.stage = next.stage;
+            h.runtime.opened = false;
+            h.runtime.waiting = None;
             h.plan_digest = None;
             h.plan = None;
             h.result = None;
@@ -5267,7 +5490,7 @@ impl Controller {
             ri,
             hi,
             HostPhase::PlanPending,
-            "its stage is done; the next step plans when its stage opens",
+            "its step is done; the next plans once what it needs is done",
         );
         self.request_plan(ri, hi);
     }
@@ -5652,9 +5875,8 @@ impl Controller {
                 self.on_breach(ri, bp, failures, None);
                 return true;
             }
-            // The next stage opens once every target of the open one has
-            // finished (or will miss the phase).
-            if self.advance_stage(ri, p).await {
+            // A target opens once everything its step needs is done.
+            if self.open_rows(ri, p).await {
                 changed = true;
             }
             if self.serve_waiting_executors(ri, p, true).await {
@@ -5669,37 +5891,29 @@ impl Controller {
                 .resolve(hosts.len());
             let mut inflight = hosts.iter().filter(|&&i| self.takes_slot(ri, i)).count();
             let busy = self.busy_elsewhere(ri);
-            for &hi in &hosts {
+            let mut usage = self.usage(ri);
+            // What unblocks the most goes first; a target the limits keep
+            // back leaves its slot to the next.
+            for hi in self.start_order(ri, &hosts, &usage) {
                 self.probe_baseline(ri, hi, &busy);
-                // A target with nothing to change starts past the cap.
+                // A target with nothing to change starts past the cap and
+                // the limits.
                 let slot = !self.unchanged(ri, hi);
-                if slot && inflight >= cap {
+                if !self.clear_to_start(ri, hi, slot, &usage) || (slot && inflight >= cap) {
                     continue;
                 }
                 let startable = self.live[ri].hosts[hi].state == HostPhase::Planned
-                    && self.stage_open(ri, hi)
                     && self.row_eligible(ri, hi)
                     && !self.row_session(ri, hi).is_some_and(|s| busy.contains(&s))
                     && self.approved(ri, hi);
                 if !startable {
                     continue;
                 }
-                match self.readiness(ri, hi).await {
-                    Readiness::Ready => {
-                        self.start_baseline(ri, hi);
-                        inflight += usize::from(slot);
-                    }
-                    // Misses its phase; converges in the stragglers stage
-                    // once what it needs is running.
-                    Readiness::Waiting(why) => {
-                        self.live[ri].hosts[hi].runtime.error = Some(why.clone());
-                        self.set_host_state(ri, hi, HostPhase::Missed, &why);
-                    }
-                    Readiness::Refused(why) => {
-                        self.live[ri].hosts[hi].runtime.error = Some(why.clone());
-                        self.fail_host(ri, hi, &why);
-                    }
+                if slot {
+                    take_places(&mut usage, &self.live[ri].hosts[hi].runtime.runs);
                 }
+                self.start_baseline(ri, hi);
+                inflight += usize::from(slot);
                 changed = true;
             }
             // The phase is done when its hosts, and hosts of earlier phases an
@@ -5713,7 +5927,15 @@ impl Controller {
                 })
                 .collect();
             let done = upto.iter().all(|&i| self.stage_done(ri, i));
-            if !done || self.unapproved(ri, p, &hosts) {
+            if !done {
+                // Nothing moves until an operator acts on a failed target.
+                if let Some((reason, host)) = self.stalled(ri, &upto) {
+                    self.pause(ri, "blocked", reason, host);
+                    return true;
+                }
+                return changed;
+            }
+            if self.unapproved(ri, p, &hosts) {
                 return changed;
             }
             for &hi in &upto {
@@ -5721,12 +5943,20 @@ impl Controller {
                     self.live[ri].hosts[hi].state,
                     HostPhase::PlanPending | HostPhase::Planned
                 ) {
-                    self.set_host_state(
-                        ri,
-                        hi,
-                        HostPhase::Missed,
-                        "offline or excluded during its phase",
-                    );
+                    // What it waited for says why it missed the phase.
+                    let held = self.live[ri].hosts[hi].runtime.waiting.take();
+                    match held.filter(|_| !self.offline_for_phase(ri, hi)) {
+                        Some(w) => {
+                            self.live[ri].hosts[hi].runtime.error = Some(w.reason.clone());
+                            self.set_host_state(ri, hi, HostPhase::Missed, &w.reason);
+                        }
+                        None => self.set_host_state(
+                            ri,
+                            hi,
+                            HostPhase::Missed,
+                            "offline or excluded during its phase",
+                        ),
+                    }
                 }
             }
             self.start_gate(ri, p);
@@ -5751,49 +5981,89 @@ impl Controller {
             })
     }
 
-    /// Opens the next stage of phase `p` when every target of the open stage
-    /// (and below) has finished or will miss the phase: targets still to plan
-    /// or apply but unreachable are marked missed, the stage's targets whose
-    /// plans waited for it (clusters, later steps) are planned, and clusters
-    /// get an executor. Returns whether a stage opened.
-    async fn advance_stage(&mut self, ri: usize, p: usize) -> bool {
-        let mut opened = false;
+    /// Opens the rows of phase `p` whose current step's needs are now done:
+    /// each is planned for real (a cluster gets an executor first; a plan
+    /// made as a preview is made again by [`Controller::refresh_previews`])
+    /// and starts when a slot and the limits of what it runs allow. The
+    /// others record what they wait for. Returns whether anything changed.
+    async fn open_rows(&mut self, ri: usize, p: usize) -> bool {
+        let mut changed = false;
+        let mut opened: Vec<usize> = Vec::new();
+        // A row that will miss the phase holds what waits for it in turn:
+        // repeat until nothing moves.
         loop {
-            let (open, stages) = {
-                let phase = &self.live[ri].record.runtime.phases[p];
-                (phase.open_stage, phase.stages)
-            };
-            if open + 1 >= stages {
-                return opened;
+            let rows: Vec<usize> = self.live[ri]
+                .phase_hosts(p)
+                .into_iter()
+                .filter(|&hi| {
+                    let h = &self.live[ri].hosts[hi];
+                    matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
+                        && h.runtime.has_needs()
+                        && !h.runtime.opened
+                })
+                .collect();
+            let mut moved = false;
+            for hi in rows {
+                let waiting = match self.gate(ri, hi).await {
+                    Gate::Open => {
+                        self.live[ri].hosts[hi].runtime.opened = true;
+                        self.live[ri].hosts[hi].runtime.waiting = None;
+                        self.touch_host(ri, hi);
+                        opened.push(hi);
+                        moved = true;
+                        continue;
+                    }
+                    Gate::Refused(why) => {
+                        self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                        self.live[ri].hosts[hi].runtime.waiting = None;
+                        self.fail_host(ri, hi, &why);
+                        moved = true;
+                        continue;
+                    }
+                    Gate::Wait(reason) => Waiting {
+                        kind: WaitKind::Needs,
+                        reason,
+                    },
+                    Gate::Hold(reason) => Waiting {
+                        kind: WaitKind::Hold,
+                        reason,
+                    },
+                    Gate::Blocked(reason) => Waiting {
+                        kind: WaitKind::Blocked,
+                        reason,
+                    },
+                };
+                let was = self.live[ri].hosts[hi]
+                    .runtime
+                    .waiting
+                    .as_ref()
+                    .map(|w| w.kind);
+                moved |= was != Some(waiting.kind);
+                self.set_waiting(ri, hi, Some(waiting));
             }
-            let rows = self.live[ri].phase_hosts(p);
-            let blocking = rows.iter().any(|&hi| {
-                self.live[ri].hosts[hi].runtime.stage <= open && !self.stage_done(ri, hi)
-            });
-            if blocking {
-                return opened;
+            changed |= moved;
+            if !moved {
+                break;
             }
-            for &hi in &rows {
-                let h = &self.live[ri].hosts[hi];
-                if h.runtime.stage <= open
-                    && matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
-                {
-                    self.set_host_state(
-                        ri,
-                        hi,
-                        HostPhase::Missed,
-                        "offline or excluded during its stage",
-                    );
-                }
-            }
-            let next = open + 1;
-            self.live[ri].record.runtime.phases[p].open_stage = next;
+        }
+        if opened.is_empty() {
+            return changed;
+        }
+        let depth = opened
+            .iter()
+            .map(|&hi| self.live[ri].hosts[hi].runtime.stage)
+            .max()
+            .unwrap_or(0);
+        if depth > self.live[ri].record.runtime.phases[p].open_stage {
+            self.live[ri].record.runtime.phases[p].open_stage = depth;
             self.live[ri].dirty = true;
-            let (id, name, trace) = {
+            let (id, name, stages, trace) = {
                 let live = &self.live[ri];
+                let phase = &live.record.runtime.phases[p];
                 (
                     live.record.id.clone(),
-                    live.record.runtime.phases[p].name.clone(),
+                    phase.name.clone(),
+                    phase.stages,
                     live.record.runtime.trace_id.clone(),
                 )
             };
@@ -5801,33 +6071,429 @@ impl Controller {
                 "controller",
                 "rollout.phase.stage",
                 &id,
-                format!("phase '{name}': stage {} of {stages} open", next + 1),
-                serde_json::json!({"phase": name, "stage": next, "stages": stages}),
+                format!("phase '{name}': stage {} of {stages} open", depth + 1),
+                serde_json::json!({"phase": name, "stage": depth, "stages": stages}),
                 trace,
             );
-            self.open_stage_targets(ri, p, next).await;
-            opened = true;
+        }
+        let clusters: Vec<usize> = opened
+            .iter()
+            .copied()
+            .filter(|&hi| self.live[ri].hosts[hi].runtime.kind.on_cluster())
+            .collect();
+        if !clusters.is_empty() {
+            self.assign_executors(ri, &clusters, true).await;
+        }
+        for hi in opened {
+            if self.live[ri].hosts[hi].state == HostPhase::PlanPending {
+                self.request_plan(ri, hi);
+            }
+        }
+        true
+    }
+
+    /// Decides whether what row `hi`'s current step needs lets it start.
+    /// Each need is met once every target it resolved to is done: healthy
+    /// (or skipped by an operator) in this rollout, past the step that
+    /// applies the needed module, or, for a target of a later phase or
+    /// outside the rollout, running already. A host that is unavailable
+    /// (offline, missed, or failed within what its modules tolerate) does
+    /// not keep a need open while another target of the same need is done:
+    /// redundancy is assumed. A removal waits for the placements that
+    /// needed its workload to finish.
+    async fn gate(&self, ri: usize, hi: usize) -> Gate {
+        let (cluster, workload, removal, after, step) = {
+            let h = &self.live[ri].hosts[hi];
+            (
+                h.host.clone(),
+                h.workload.clone(),
+                h.runtime.removal,
+                h.runtime.after.clone(),
+                h.runtime.current_step(),
+            )
+        };
+        if removal {
+            let pending: Vec<String> = after
+                .iter()
+                .filter(|a| {
+                    self.live[ri]
+                        .find_row(&cluster, a)
+                        .is_some_and(|i| !self.live[ri].hosts[i].state.finished())
+                })
+                .cloned()
+                .collect();
+            return if pending.is_empty() {
+                Gate::Open
+            } else {
+                Gate::Wait(format!(
+                    "{workload} is removed once {} finished",
+                    pending.join(", ")
+                ))
+            };
+        }
+        // A step laid out before needs were kept per target (a rollout under
+        // way when the server was upgraded) says only how deep it sits: it
+        // waits for everything shallower in its phase, as it did then.
+        if step.needs.is_empty() && step.stage > 0 {
+            let live = &self.live[ri];
+            let phase = live.hosts[hi].runtime.phase_index;
+            let pending: Vec<String> = (0..live.hosts.len())
+                .filter(|&i| {
+                    i != hi
+                        && live.hosts[i].runtime.phase_index == phase
+                        && live.hosts[i].runtime.stage < step.stage
+                        && !self.stage_done(ri, i)
+                })
+                .map(|i| self.row_key(ri, i))
+                .collect();
+            return if pending.is_empty() {
+                Gate::Open
+            } else {
+                Gate::Wait(format!("waiting for {}", some_of(&pending)))
+            };
+        }
+        let refuse = self.live[ri].record.policy.dependencies.across_phases
+            == buckle_core::model::AcrossPhases::Refuse;
+        let severity = |g: &Gate| match g {
+            Gate::Open => 0,
+            Gate::Wait(_) => 1,
+            Gate::Hold(_) => 2,
+            Gate::Blocked(_) => 3,
+            Gate::Refused(_) => 4,
+        };
+        let mut verdict = Gate::Open;
+        for wait in &step.needs {
+            let mut met = 0usize;
+            let (mut pending, mut away, mut outside, mut failed) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for pred in &wait.on {
+                match self.pred_state(ri, hi, pred).await {
+                    PredState::Met => met += 1,
+                    PredState::Pending => pending.push(pred.key.clone()),
+                    PredState::Away => away.push(pred.key.clone()),
+                    PredState::Outside => outside.push(pred.key.clone()),
+                    PredState::Failed => failed.push(pred.key.clone()),
+                }
+            }
+            let label = wait.label();
+            let hosts_only = away
+                .iter()
+                .chain(&outside)
+                .all(|k| !k.contains('/') && !self.clusters.contains_key(k));
+            let edge = if !failed.is_empty() {
+                Gate::Blocked(format!("{label}: {} failed", some_of(&failed)))
+            } else if !pending.is_empty() {
+                Gate::Wait(format!("{label}: waiting for {}", some_of(&pending)))
+            } else if (away.is_empty() && outside.is_empty()) || (met > 0 && hosts_only) {
+                Gate::Open
+            } else if away.is_empty() {
+                let why = format!(
+                    "{label}: {} is in a later phase or outside the rollout, and not running yet",
+                    some_of(&outside)
+                );
+                if refuse {
+                    Gate::Refused(why)
+                } else {
+                    Gate::Hold(why)
+                }
+            } else {
+                away.extend(outside);
+                Gate::Hold(format!(
+                    "{label}: {} did not make it in this phase",
+                    some_of(&away)
+                ))
+            };
+            if severity(&edge) > severity(&verdict) {
+                verdict = edge;
+            }
+        }
+        verdict
+    }
+
+    /// How the target `pred` names stands for row `hi`, which waits for it.
+    async fn pred_state(&self, ri: usize, hi: usize, pred: &stages::Pred) -> PredState {
+        let (target, workload) = buckle_api::split_placement_key(&pred.key);
+        let live = &self.live[ri];
+        if let Some(pi) = live.find_row(target, workload.unwrap_or("")) {
+            let r = &live.hosts[pi];
+            // In play: its phase has come (or it converges in the
+            // stragglers stage, as everything does for a row there).
+            let in_play = self.is_virtual(ri, hi)
+                || self.is_virtual(ri, pi)
+                || match (r.runtime.phase_index, live.hosts[hi].runtime.phase_index) {
+                    (Some(theirs), Some(ours)) => theirs <= ours,
+                    _ => true,
+                };
+            if in_play {
+                if r.runtime.past(pred.step) {
+                    return PredState::Met;
+                }
+                return match r.state {
+                    HostPhase::Healthy | HostPhase::Skipped => PredState::Met,
+                    HostPhase::Failed if self.failure_tolerated(ri, pi) => PredState::Away,
+                    HostPhase::Failed | HostPhase::RollingBack | HostPhase::RolledBack => {
+                        PredState::Failed
+                    }
+                    HostPhase::Missed => PredState::Away,
+                    HostPhase::PlanPending | HostPhase::Planned
+                        if self.offline_for_phase(ri, pi) || self.held(ri, pi) =>
+                    {
+                        PredState::Away
+                    }
+                    _ => PredState::Pending,
+                };
+            }
+        }
+        // A later phase's, or not in the rollout: it counts when it runs.
+        let running = match workload {
+            Some(w) => self.running_on(target, w).await,
+            None => {
+                self.clusters.contains_key(target)
+                    || self.connected(target)
+                    || self.online.contains(target)
+            }
+        };
+        if running {
+            PredState::Met
+        } else {
+            PredState::Outside
         }
     }
 
-    /// Plans the targets of stage `stage` of phase `p` whose plans waited
-    /// for it, picking an executor for each cluster first.
-    async fn open_stage_targets(&mut self, ri: usize, p: usize, stage: u32) {
-        let rows: Vec<usize> = self.live[ri]
-            .phase_hosts(p)
+    /// The `parallel` and `max_failures` of the module or workload `key`
+    /// (`module:NAME`, `workload:NAME`) names.
+    fn unit_limits(
+        &self,
+        ri: usize,
+        key: &str,
+    ) -> (
+        Option<buckle_core::model::Parallelism>,
+        Option<buckle_core::model::FailureBudget>,
+    ) {
+        let revision = &self.live[ri].revision;
+        match key.split_once(':') {
+            Some(("module", m)) => revision
+                .module(m)
+                .map(|m| (m.config.parallel, m.config.max_failures)),
+            Some(("workload", w)) => revision
+                .workload(w)
+                .map(|w| (w.config.parallel, w.config.max_failures)),
+            _ => None,
+        }
+        .unwrap_or((None, None))
+    }
+
+    /// Failures the module or workload `key` tolerates among the `total`
+    /// targets that run it: none unless it sets `max_failures` (a count as
+    /// is; a percentage rounds down).
+    fn unit_budget(&self, ri: usize, key: &str, total: usize) -> usize {
+        match self.unit_limits(ri, key).1 {
+            None => 0,
+            Some(buckle_core::model::Parallelism::Count(n)) => n as usize,
+            Some(buckle_core::model::Parallelism::Percent(p)) => total * p as usize / 100,
+        }
+    }
+
+    /// The modules or workloads row `hi`'s failure is charged to: the
+    /// module whose task failed and those of its failed checks, else what
+    /// its plan changes, else everything it runs.
+    fn attributed(&self, ri: usize, hi: usize) -> Vec<String> {
+        let h = &self.live[ri].hosts[hi];
+        let layer = if h.runtime.kind.on_cluster() {
+            "workload"
+        } else {
+            "module"
+        };
+        let mut named: BTreeSet<String> = h.runtime.failed_module.iter().cloned().collect();
+        named.extend(
+            h.runtime
+                .failed_checks
+                .iter()
+                .filter_map(|c| c.split_once('/').map(|(m, _)| m.to_owned())),
+        );
+        if named.is_empty() && !h.runtime.kind.on_cluster() {
+            named = self.plan_changes(ri, hi).unwrap_or_default();
+        }
+        let named: Vec<String> = named
             .into_iter()
-            .filter(|&hi| {
-                let h = &self.live[ri].hosts[hi];
-                h.runtime.stage == stage && h.state == HostPhase::PlanPending
+            .map(|m| format!("{layer}:{m}"))
+            .filter(|k| h.runtime.runs.contains(k))
+            .collect();
+        if named.is_empty() {
+            h.runtime.runs.clone()
+        } else {
+            named
+        }
+    }
+
+    /// What every module and workload of rollout `ri` has in flight and
+    /// failed, across its phases: a `parallel` and a `max_failures` on a
+    /// module or workload count fleet-wide.
+    fn usage(&self, ri: usize) -> HashMap<String, Usage> {
+        let mut usage: HashMap<String, Usage> = HashMap::new();
+        for hi in 0..self.live[ri].hosts.len() {
+            let h = &self.live[ri].hosts[hi];
+            let in_flight = self.takes_slot(ri, hi);
+            let failed = h.state == HostPhase::Failed;
+            let queued = matches!(h.state, HostPhase::PlanPending | HostPhase::Planned);
+            for key in &h.runtime.runs {
+                let u = usage.entry(key.clone()).or_default();
+                u.total += 1;
+                u.in_flight += usize::from(in_flight);
+                u.queued += usize::from(queued);
+                if failed {
+                    u.failed_holders.push(view::row_key(h));
+                }
+            }
+            if failed {
+                for key in self.attributed(ri, hi) {
+                    usage
+                        .entry(key)
+                        .or_default()
+                        .failures
+                        .push(view::row_key(h));
+                }
+            }
+        }
+        usage
+    }
+
+    /// Whether row `hi`'s failure is within what the modules or workloads it
+    /// is charged to tolerate: then it is out of the way like an offline
+    /// target, instead of blocking what needs it.
+    fn failure_tolerated(&self, ri: usize, hi: usize) -> bool {
+        let usage = self.usage(ri);
+        self.attributed(ri, hi).iter().all(|key| {
+            usage
+                .get(key)
+                .is_none_or(|u| u.failures.len() <= self.unit_budget(ri, key, u.total))
+        })
+    }
+
+    /// What of the modules or workloads row `hi` runs keeps it from
+    /// starting: one failed elsewhere beyond its `max_failures`, or its
+    /// `parallel` is in use (a failed target keeps its place).
+    fn limited(&self, ri: usize, hi: usize, usage: &HashMap<String, Usage>) -> Option<Waiting> {
+        let runs = &self.live[ri].hosts[hi].runtime.runs;
+        let name = |key: &str| key.replacen(':', " ", 1);
+        // A row an operator released (retry, continue) goes ahead whatever
+        // failed elsewhere: that is the decision they made.
+        let released = self.live[ri].hosts[hi].runtime.released;
+        for key in runs {
+            let Some(u) = usage.get(key) else { continue };
+            let budget = self.unit_budget(ri, key, u.total);
+            if !released && u.failures.len() > budget {
+                return Some(Waiting {
+                    kind: WaitKind::Blocked,
+                    reason: format!(
+                        "{} failed on {} (max_failures {budget}): retry or skip there first",
+                        name(key),
+                        u.failures.join(", ")
+                    ),
+                });
+            }
+        }
+        for key in runs {
+            let Some(u) = usage.get(key) else { continue };
+            let Some(cap) = self.unit_limits(ri, key).0.map(|p| p.resolve(u.total)) else {
+                continue;
+            };
+            if u.in_flight + u.failed_holders.len() < cap {
+                continue;
+            }
+            return Some(if u.in_flight == 0 {
+                Waiting {
+                    kind: WaitKind::Blocked,
+                    reason: format!(
+                        "{} runs {cap} at a time, and {} failed: a failed target keeps its place",
+                        name(key),
+                        u.failed_holders.join(", ")
+                    ),
+                }
+            } else {
+                Waiting {
+                    kind: WaitKind::Limit,
+                    reason: format!("{} runs {cap} at a time", name(key)),
+                }
+            });
+        }
+        None
+    }
+
+    /// Whether row `hi`, still to start, is open and no limit keeps it,
+    /// recording what does.
+    fn clear_to_start(
+        &mut self,
+        ri: usize,
+        hi: usize,
+        slot: bool,
+        usage: &HashMap<String, Usage>,
+    ) -> bool {
+        let h = &self.live[ri].hosts[hi];
+        if !matches!(h.state, HostPhase::PlanPending | HostPhase::Planned) {
+            return false;
+        }
+        if !self.stage_open(ri, hi) {
+            return false;
+        }
+        let limit = slot.then(|| self.limited(ri, hi, usage)).flatten();
+        let clear = limit.is_none();
+        self.set_waiting(ri, hi, limit);
+        clear
+    }
+
+    /// `rows` in the order they start: what the longest chain of needs
+    /// waits behind first, then what queues the most targets behind a
+    /// `parallel` limit, then as listed.
+    fn start_order(&self, ri: usize, rows: &[usize], usage: &HashMap<String, Usage>) -> Vec<usize> {
+        let queue = |hi: usize| {
+            self.live[ri].hosts[hi]
+                .runtime
+                .runs
+                .iter()
+                .filter(|key| self.unit_limits(ri, key).0.is_some())
+                .filter_map(|key| usage.get(key).map(|u| u.queued))
+                .max()
+                .unwrap_or(0)
+        };
+        let mut order: Vec<(std::cmp::Reverse<(u32, usize)>, usize)> = rows
+            .iter()
+            .map(|&hi| {
+                let rank = self.live[ri].hosts[hi].runtime.current_step().rank;
+                (std::cmp::Reverse((rank, queue(hi))), hi)
             })
             .collect();
-        if rows.is_empty() {
-            return;
+        order.sort_by_key(|a| a.0);
+        order.into_iter().map(|(_, hi)| hi).collect()
+    }
+
+    /// Whether the rows `upto` (the current phase's and earlier ones')
+    /// cannot move without an operator: nothing is in flight, and every
+    /// target still to start waits for a failed one. Returns why, and a
+    /// target that waits.
+    fn stalled(&self, ri: usize, upto: &[usize]) -> Option<(String, Option<String>)> {
+        let mut blocked: Vec<(String, &str)> = Vec::new();
+        for &hi in upto {
+            if self.stage_done(ri, hi) {
+                continue;
+            }
+            let h = &self.live[ri].hosts[hi];
+            match &h.runtime.waiting {
+                Some(w)
+                    if w.kind == WaitKind::Blocked
+                        && matches!(h.state, HostPhase::PlanPending | HostPhase::Planned) =>
+                {
+                    blocked.push((view::row_key(h), w.reason.as_str()))
+                }
+                _ => return None,
+            }
         }
-        self.assign_executors(ri, &rows, true).await;
-        for hi in rows {
-            self.request_plan(ri, hi);
-        }
+        let (first, why) = blocked.first()?;
+        let reason = match blocked.len() {
+            1 => format!("{first} cannot start: {why}"),
+            n => format!("{n} targets cannot start; {first}: {why}"),
+        };
+        Some((reason, Some(first.clone())))
     }
 
     /// Starts hosts an operator retried or continued, in whichever phase
@@ -5857,7 +6523,9 @@ impl Controller {
                 .parallel
                 .resolve(hosts.len());
             let inflight = hosts.iter().filter(|&&i| self.takes_slot(ri, i)).count();
-            if inflight < cap || self.unchanged(ri, hi) {
+            let slot = !self.unchanged(ri, hi);
+            let usage = self.usage(ri);
+            if self.clear_to_start(ri, hi, slot, &usage) && (inflight < cap || !slot) {
                 self.start_baseline(ri, hi);
                 changed = true;
             }
@@ -6150,8 +6818,9 @@ impl Controller {
             h.runtime.error = None;
             h.runtime.error_detail = None;
             h.runtime.failed_checks.clear();
-            // The stragglers stage has no stages: one whole step.
-            h.runtime.set_steps(Vec::new());
+            // Its steps stand: what it needs still orders it there.
+            h.runtime.opened = false;
+            h.runtime.waiting = None;
         }
         self.live[ri].hosts[hi].state = HostPhase::Missed;
         self.set_host_state(
@@ -6294,6 +6963,7 @@ impl Controller {
         let Some(si) = self.live[ri].stragglers_index() else {
             return;
         };
+        self.open_rows(ri, si).await;
         self.serve_waiting_executors(ri, si, false).await;
         let hosts = self.live[ri].phase_hosts(si);
         let cap = self.live[ri].record.runtime.phases[si]
@@ -6306,9 +6976,11 @@ impl Controller {
             .flat_map(|l| l.hosts.iter().map(|h| h.host.clone()))
             .collect();
         let mut inflight = hosts.iter().filter(|&&i| self.takes_slot(ri, i)).count();
-        for &hi in &hosts {
+        let mut usage = self.usage(ri);
+        // The stragglers stage has no end: a row that waits says why.
+        for hi in self.start_order(ri, &hosts, &usage) {
             let slot = !self.unchanged(ri, hi);
-            if slot && inflight >= cap {
+            if !self.clear_to_start(ri, hi, slot, &usage) || (slot && inflight >= cap) {
                 continue;
             }
             let h = &self.live[ri].hosts[hi];
@@ -6320,92 +6992,11 @@ impl Controller {
             if !startable {
                 continue;
             }
-            match self.readiness(ri, hi).await {
-                Readiness::Ready => {
-                    self.start_baseline(ri, hi);
-                    inflight += usize::from(slot);
-                }
-                // The stragglers stage has no end: the row waits, saying why.
-                Readiness::Waiting(why) => {
-                    if self.live[ri].hosts[hi].runtime.error.as_deref() != Some(why.as_str()) {
-                        self.live[ri].hosts[hi].runtime.error = Some(why);
-                        self.touch_host(ri, hi);
-                    }
-                }
-                Readiness::Refused(why) => {
-                    self.live[ri].hosts[hi].runtime.error = Some(why.clone());
-                    self.fail_host(ri, hi, &why);
-                }
+            if slot {
+                take_places(&mut usage, &self.live[ri].hosts[hi].runtime.runs);
             }
-        }
-    }
-
-    /// Whether placement row `hi` may start now: the workloads its workload
-    /// needs on the cluster are healthy in this rollout or running there
-    /// already, and, for a removal, the placements that needed its workload
-    /// are done. A host's or a whole cluster's row always may (the engine
-    /// orders its modules or workloads itself).
-    async fn readiness(&mut self, ri: usize, hi: usize) -> Readiness {
-        let h = &self.live[ri].hosts[hi];
-        if h.runtime.kind != TargetKind::Workload {
-            return Readiness::Ready;
-        }
-        let (cluster, workload) = (h.host.clone(), h.workload.clone());
-        if h.runtime.removal {
-            let pending: Vec<String> = h
-                .runtime
-                .after
-                .iter()
-                .filter(|a| {
-                    self.live[ri]
-                        .find_row(&cluster, a)
-                        .is_some_and(|i| !self.live[ri].hosts[i].state.finished())
-                })
-                .cloned()
-                .collect();
-            return if pending.is_empty() {
-                Readiness::Ready
-            } else {
-                Readiness::Waiting(format!(
-                    "{workload} is removed once {} finished",
-                    pending.join(", ")
-                ))
-            };
-        }
-        let needs: Vec<String> = self.live[ri]
-            .revision
-            .workload(&workload)
-            .map(|w| {
-                w.config
-                    .needs()
-                    .into_iter()
-                    .filter_map(|n| match n {
-                        buckle_core::model::Need::Workload(x) if x != workload => Some(x),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut missing = Vec::new();
-        for need in needs {
-            let healthy_here = self.live[ri]
-                .find_row(&cluster, &need)
-                .is_some_and(|i| self.live[ri].hosts[i].state == HostPhase::Healthy);
-            if healthy_here || self.running_on(&cluster, &need).await {
-                continue;
-            }
-            missing.push(need);
-        }
-        if missing.is_empty() {
-            return Readiness::Ready;
-        }
-        let why = format!(
-            "needs {} on {cluster}, which is not running yet",
-            missing.join(", ")
-        );
-        match self.live[ri].record.policy.dependencies.across_phases {
-            buckle_core::model::AcrossPhases::Warn => Readiness::Waiting(why),
-            buckle_core::model::AcrossPhases::Refuse => Readiness::Refused(why),
+            self.start_baseline(ri, hi);
+            inflight += usize::from(slot);
         }
     }
 
@@ -6636,12 +7227,10 @@ impl Controller {
         picked
     }
 
-    /// Picks executors for the cluster rows of phase `p` in its open stage
-    /// that wait for one, and asks the newly spoken-for ones for their
-    /// plans. Run on every pass, so a host that connects or finishes its
+    /// Picks executors for the open cluster rows of phase `p` that wait
+    /// for one, and asks the newly spoken-for ones for their plans. Run on every pass, so a host that connects or finishes its
     /// own wave is picked up at once.
     async fn serve_waiting_executors(&mut self, ri: usize, p: usize, grace: bool) -> bool {
-        let open = self.live[ri].record.runtime.phases[p].open_stage;
         let rows: Vec<usize> = self.live[ri]
             .phase_hosts(p)
             .into_iter()
@@ -6649,7 +7238,8 @@ impl Controller {
                 let h = &self.live[ri].hosts[hi];
                 h.runtime.kind.on_cluster()
                     && h.runtime.executor.is_none()
-                    && h.runtime.stage == open
+                    && !h.state.finished()
+                    && self.stage_open(ri, hi)
             })
             .collect();
         if rows.is_empty() {
@@ -7001,8 +7591,10 @@ impl Controller {
             Some(targets) => targets,
             None => self.load_targets(None).await.unwrap_or(candidates),
         };
+        // A cycle among targets admitted late cannot refuse a rollout under
+        // way: its rows wait for each other, and the phase stalls on them.
+        self.compute_stages(ri, Some(&touched), &targets);
         for pi in touched {
-            self.compute_stages(ri, pi, &targets);
             for hi in self.live[ri].phase_hosts(pi) {
                 if self.live[ri].hosts[hi].state == HostPhase::PlanPending
                     && self.live[ri].hosts[hi].plan_digest.is_none()

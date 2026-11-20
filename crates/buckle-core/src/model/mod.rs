@@ -428,10 +428,22 @@ pub struct ModuleConfig {
     #[serde(default)]
     pub when: Option<Filter>,
     /// Modules that must apply before this one (ordering and fact
-    /// dependency), and `workload:NAME` for a workload on the cluster this
-    /// host is a node of (resolved by the rollout controller, not here).
+    /// dependency), and what a rollout must have deployed before a host
+    /// running this module starts: `workload:NAME` (on the clusters the host
+    /// is a node of, else wherever the workload runs),
+    /// `workload:NAME:CLUSTER` and `group:NAME` (resolved by the rollout
+    /// controller, not here).
     #[serde(default)]
     pub needs: Vec<String>,
+    /// How many hosts running this module a rollout changes at once, across
+    /// every phase. Absent: only the phase's `parallel` limits them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<Parallelism>,
+    /// Failed hosts whose failure is this module's that a rollout tolerates
+    /// before it starts no further host running the module and holds what
+    /// needs them. Absent: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_failures: Option<FailureBudget>,
     #[serde(default)]
     pub tags: Vec<String>,
     /// Module defaults; fleet vars override.
@@ -475,14 +487,14 @@ impl ModuleConfig {
     }
 
     /// The modules this module needs: its `needs` without the `workload:`
-    /// edges, which order it against a cluster's workloads rather than
-    /// against other modules on the host.
+    /// and `group:` edges, which order its host against other targets
+    /// rather than against other modules on the host.
     pub fn module_needs(&self) -> Vec<String> {
         self.needs()
             .into_iter()
             .filter_map(|n| match n {
                 Need::Module(name) => Some(name),
-                Need::Workload(_) => None,
+                Need::Workload(_) | Need::Placement { .. } | Need::Group(_) => None,
             })
             .collect()
     }

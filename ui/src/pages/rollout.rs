@@ -1428,7 +1428,7 @@ fn host_table(props: &HostTableProps) -> Html {
                                         <span class="cell-sub mono" data-testid="host-activity">{ now.clone() }</span>
                                     }
                                     if let Some(w) = crate::logic::clusters::waiting(phase, h) {
-                                        <span class="cell-sub" data-testid="host-waiting">{ w.describe() }</span>
+                                        <span class={classes!("cell-sub", w.blocked().then_some("text-warn"))} data-testid="host-waiting">{ w.describe() }</span>
                                     } else if h.kind != buckle_api::TargetKind::Host && let Some(e) = &h.executor {
                                         <span class="cell-sub">{ "via " }<span class="mono">{ e.clone() }</span></span>
                                     }
@@ -1446,7 +1446,7 @@ fn host_table(props: &HostTableProps) -> Html {
                                     </span>
                                     if h.preview {
                                         <Badge testid="plan-preview"
-                                            title="Planned at the rollout's start; planned again when its stage opens">{ "preview" }</Badge>
+                                            title="Planned at the rollout's start; planned again when it starts">{ "preview" }</Badge>
                                     }
                                     if let Some(from) = &h.drifted_from {
                                         <Badge tone={Tone::Warn} testid="plan-drifted"

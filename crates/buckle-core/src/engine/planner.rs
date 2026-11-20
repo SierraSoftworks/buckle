@@ -565,26 +565,23 @@ impl<'a> Planner<'a> {
         indeterminate.sort_by(|a, b| a.module.cmp(&b.module));
         let mut graph = Graph::new();
         for (name, module) in &selected {
-            for need in &module.config.module_needs() {
-                if !selected.contains_key(need.as_str()) {
-                    let reason = if self.revision.module(need).is_some() {
-                        format!("'{need}' is not selected on this host")
-                    } else {
-                        format!("there is no module named '{need}'")
-                    };
+            // A needed module this host does not run is needed on the hosts
+            // that do run it: the rollout orders those, nothing here.
+            let mut local = Vec::new();
+            for need in module.config.module_needs() {
+                if selected.contains_key(need.as_str()) {
+                    local.push(need);
+                } else if self.revision.module(&need).is_none() {
                     return Err(crate::error::user(
                         format!(
-                            "The module '{name}' is selected on host '{}' but needs '{need}', and {reason}.",
+                            "The module '{name}' is selected on host '{}' but needs '{need}', and there is no module named '{need}'.",
                             self.host.id
                         ),
-                        &[
-                            "Give the dependent module a `when` that is at least as narrow as the module it needs.",
-                            "Or widen the needed module's `when` so that it is selected on the same hosts.",
-                        ],
+                        &["Name a module of the revision, or remove the `needs` entry."],
                     ));
                 }
             }
-            graph.add(name, &module.config.module_needs());
+            graph.add(name, &local);
         }
         let order = graph.topo_order().map_err(|cycle| {
             crate::error::user(
