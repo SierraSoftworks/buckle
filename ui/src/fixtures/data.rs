@@ -760,6 +760,32 @@ pub fn active_rollout(now: DateTime<Utc>) -> RolloutDetail {
         plans: plans(),
         fleet: Some(fleet_plan()),
         events,
+        // nomad runs three at a time and stopped at pi-5's failure; docker
+        // has yet to start anywhere.
+        limits: vec![
+            buckle_api::RolloutLimit {
+                kind: buckle_api::RolloutLimitKind::Module,
+                name: "docker".into(),
+                parallel: Some(1),
+                max_failures: 1,
+                total: 6,
+                in_flight: 0,
+                queued: 4,
+                holding: Vec::new(),
+                failures: Vec::new(),
+            },
+            buckle_api::RolloutLimit {
+                kind: buckle_api::RolloutLimitKind::Module,
+                name: "nomad".into(),
+                parallel: Some(3),
+                max_failures: 0,
+                total: 12,
+                in_flight: 2,
+                queued: 5,
+                holding: vec!["pi-5".into()],
+                failures: vec!["pi-5".into()],
+            },
+        ],
     }
 }
 
@@ -1635,6 +1661,7 @@ fn finished(
         },
         phases,
         fleet: None,
+        limits: Vec::new(),
         plans: vec![PlanGroup {
             digest: PLAN_NOMAD.into(),
             hosts: vec!["pi-1".into()],
@@ -1674,6 +1701,7 @@ fn skipped(id: &str, rev: &str, message: &str, by: &str, at: DateTime<Utc>) -> R
         },
         phases: vec![],
         fleet: None,
+        limits: Vec::new(),
         plans: vec![],
         events: vec![
             RolloutEvent {

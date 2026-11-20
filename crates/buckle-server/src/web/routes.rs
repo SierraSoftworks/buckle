@@ -1744,6 +1744,10 @@ async fn rollout_detail(state: &AppState, id: &str) -> Result<buckle_api::Rollou
     detail.summary.changes = plan_changes(&fleet);
     detail.fleet = Some(fleet);
     fill_health_checks(state, &r.revision, &hosts, &mut detail).await?;
+    // The limits are the revision's: one that no longer loads shows none.
+    if let Ok(revision) = state.revisions.load(&r.revision).await {
+        detail.limits = crate::rollout::limits::view(&revision, &hosts);
+    }
     Ok(detail)
 }
 

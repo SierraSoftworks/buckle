@@ -105,6 +105,12 @@ describe("the rollout pipeline", () => {
     assert.match(await grafana.textContent(), /needs module:nomad: waiting for lab-1, lab-3/);
     // A workload block opens the workload, at its cluster.
     assert.match(await atuin.getAttribute("href"), /^\/workloads\/atuin\?cluster=home-nomad/);
+    // Module limits under the pipeline: what is in flight, and what a failure stopped.
+    const limits = page.getByTestId("rollout-limits");
+    assert.match(await limits.getByTestId("limit-docker").textContent(), /0 of 1 in flight.*4 queued/);
+    const nomad = limits.getByTestId("limit-nomad");
+    assert.match(await nomad.getAttribute("class"), /limit--stopped/);
+    assert.match(await nomad.textContent(), /failed on pi-5/);
     // The Targets card names what it waits on, and what the deployment is doing.
     const targets = page.locator("section.panel", { has: page.locator(".yi-panel__title", { hasText: /^Targets$/ }) });
     assert.match(await targets.locator('tr[data-unit="lab-nomad/grafana"]').getByTestId("host-waiting").textContent(), /waiting for lab-1/);

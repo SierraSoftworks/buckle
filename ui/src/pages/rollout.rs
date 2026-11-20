@@ -18,7 +18,7 @@ use crate::components::ui::{Note, NoteKind};
 
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
-use crate::components::meter::stage_segments;
+use crate::components::meter::{Segment, stage_segments};
 use crate::components::ui::Copyable;
 use crate::components::{
     Button, Changes, Commit, CommitCard, Confirm, Countdown, ErrorBlock, ErrorState, HostLink,
@@ -29,6 +29,7 @@ use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now,
 use crate::logic::controls::{Decision, Standing, decisions, replan_label};
 use crate::logic::fleet_plan::{Phases, fleet_tally};
 use crate::logic::format::{count, relative, rollout_label, short, since, timestamp};
+use crate::logic::limits;
 use crate::logic::live::{apply_fleet, apply_rollout, rollout_refetch_at};
 use crate::logic::pipeline::{self, GateKind, GateState, host_checks, layout};
 use crate::logic::plan::{ApprovalScope, approval_scope, attempt_options, host_tally};
@@ -324,6 +325,7 @@ pub fn rollout_page(props: &Props) -> Html {
                 line
             }}>
                 <Pipeline detail={d.clone()} hosts={hosts.clone()} activity={activity.clone()} {now} />
+                { limits_strip(&d) }
             </Panel>
             { plans_panel }
             <Panel title="Targets" subtitle={{
@@ -584,6 +586,41 @@ pub(crate) fn use_approval_wanted(active: Option<String>, target: String) -> Opt
         .iter()
         .any(|p| p.hosts.iter().any(|h| h.host == target))
         .then(|| d.summary.id.clone())
+}
+
+/// The rollout's module and workload limits that say something now: how
+/// much of each `parallel` is in use, what queues behind it, and a failure
+/// that stopped its other targets.
+fn limits_strip(d: &RolloutDetail) -> Html {
+    let lines = limits::lines(d);
+    if lines.is_empty() {
+        return html! {};
+    }
+    html! {
+        <ul class="limits" data-testid="rollout-limits" aria-label="Module and workload limits">
+            { for lines.into_iter().map(|l| {
+                let segments = vec![
+                    Segment::new(l.in_flight, Tone::Active, "in flight"),
+                    Segment::new(l.held, Tone::Danger, "held by a failure"),
+                ];
+                html! {
+                    <li class={classes!("limit", l.stopped().then_some("limit--stopped"))} data-testid={format!("limit-{}", l.name)} title={l.tip.clone()}>
+                        <span class="limit__name">
+                            <span class="muted">{ l.layer }</span>{ " " }
+                            <span class="strong mono">{ l.name.clone() }</span>
+                        </span>
+                        if let Some(places) = l.places {
+                            <Meter {segments} total={places} rest="free" class="limit__meter" />
+                        }
+                        <span class="limit__usage">{ l.usage.clone() }</span>
+                        if let Some((tone, text)) = &l.failures {
+                            <span class={classes!("limit__failures", tone.class())}>{ text.clone() }</span>
+                        }
+                    </li>
+                }
+            }) }
+        </ul>
+    }
 }
 
 fn ask_for(d: &Decision) -> Ask {

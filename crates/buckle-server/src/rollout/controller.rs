@@ -5,6 +5,7 @@
 //! messages sent to hosts.
 
 use super::bake::{self, BakeWindow};
+use super::limits::{self, Usage};
 use super::link::HostLink;
 use super::model::{
     GateRuntime, HostPhase, HostRuntime, PauseInfo, PhaseRuntime, PlanAttempt, RebootWait,
@@ -663,21 +664,6 @@ enum PredState {
     /// Outside the row's phase (a later one, or no row) and not running.
     Outside,
     Failed,
-}
-
-/// How many targets of a rollout run a module or workload, which of them
-/// hold a place of its `parallel` (in flight, or failed), and which failed
-/// on it.
-#[derive(Debug, Clone, Default)]
-struct Usage {
-    total: usize,
-    in_flight: usize,
-    /// Targets still to start.
-    queued: usize,
-    /// Failed targets that run it: each keeps its place.
-    failed_holders: Vec<String>,
-    /// Failed targets whose failure is this module's or workload's.
-    failures: Vec<String>,
 }
 
 /// A few names in words, and how many more there are: a wait on a large
@@ -5184,10 +5170,7 @@ impl Controller {
 
     /// The modules row `hi`'s plan expects to change, when it has one.
     fn plan_changes(&self, ri: usize, hi: usize) -> Option<BTreeSet<String>> {
-        let plan = self.live[ri].hosts[hi].plan.as_ref()?;
-        serde_json::from_value::<buckle_core::plan::Plan>(plan.clone())
-            .ok()
-            .map(|p| bake::planned(&p))
+        limits::plan_changes(&self.live[ri].hosts[hi])
     }
 
     /// Row `hi` is in flight and holds a slot of its phase's `parallel`.
@@ -5199,8 +5182,7 @@ impl Controller {
     /// modules): its health does not gate the rollout, and it takes no slot
     /// of its phase's `parallel`.
     fn unchanged(&self, ri: usize, hi: usize) -> bool {
-        let r = &self.live[ri].hosts[hi].runtime;
-        r.plan_changes == Some(0) && r.plan_removals == Some(0) && r.deferred_modules.is_empty()
+        limits::unchanged(&self.live[ri].hosts[hi])
     }
 
     /// The workloads whose checks gate cluster row `hi` (its baseline, bake
@@ -6270,92 +6252,24 @@ impl Controller {
         Option<buckle_core::model::Parallelism>,
         Option<buckle_core::model::FailureBudget>,
     ) {
-        let revision = &self.live[ri].revision;
-        match key.split_once(':') {
-            Some(("module", m)) => revision
-                .module(m)
-                .map(|m| (m.config.parallel, m.config.max_failures)),
-            Some(("workload", w)) => revision
-                .workload(w)
-                .map(|w| (w.config.parallel, w.config.max_failures)),
-            _ => None,
-        }
-        .unwrap_or((None, None))
+        limits::of(&self.live[ri].revision, key)
     }
 
     /// Failures the module or workload `key` tolerates among the `total`
-    /// targets that run it: none unless it sets `max_failures` (a count as
-    /// is; a percentage rounds down).
+    /// targets that run it.
     fn unit_budget(&self, ri: usize, key: &str, total: usize) -> usize {
-        match self.unit_limits(ri, key).1 {
-            None => 0,
-            Some(buckle_core::model::Parallelism::Count(n)) => n as usize,
-            Some(buckle_core::model::Parallelism::Percent(p)) => total * p as usize / 100,
-        }
+        limits::budget(&self.live[ri].revision, key, total)
     }
 
-    /// The modules or workloads row `hi`'s failure is charged to: the
-    /// module whose task failed and those of its failed checks, else what
-    /// its plan changes, else everything it runs.
+    /// The modules or workloads row `hi`'s failure is charged to.
     fn attributed(&self, ri: usize, hi: usize) -> Vec<String> {
-        let h = &self.live[ri].hosts[hi];
-        let layer = if h.runtime.kind.on_cluster() {
-            "workload"
-        } else {
-            "module"
-        };
-        let mut named: BTreeSet<String> = h.runtime.failed_module.iter().cloned().collect();
-        named.extend(
-            h.runtime
-                .failed_checks
-                .iter()
-                .filter_map(|c| c.split_once('/').map(|(m, _)| m.to_owned())),
-        );
-        if named.is_empty() && !h.runtime.kind.on_cluster() {
-            named = self.plan_changes(ri, hi).unwrap_or_default();
-        }
-        let named: Vec<String> = named
-            .into_iter()
-            .map(|m| format!("{layer}:{m}"))
-            .filter(|k| h.runtime.runs.contains(k))
-            .collect();
-        if named.is_empty() {
-            h.runtime.runs.clone()
-        } else {
-            named
-        }
+        limits::attributed(&self.live[ri].hosts[hi])
     }
 
     /// What every module and workload of rollout `ri` has in flight and
-    /// failed, across its phases: a `parallel` and a `max_failures` on a
-    /// module or workload count fleet-wide.
+    /// failed, across its phases.
     fn usage(&self, ri: usize) -> HashMap<String, Usage> {
-        let mut usage: HashMap<String, Usage> = HashMap::new();
-        for hi in 0..self.live[ri].hosts.len() {
-            let h = &self.live[ri].hosts[hi];
-            let in_flight = self.takes_slot(ri, hi);
-            let failed = h.state == HostPhase::Failed;
-            let queued = matches!(h.state, HostPhase::PlanPending | HostPhase::Planned);
-            for key in &h.runtime.runs {
-                let u = usage.entry(key.clone()).or_default();
-                u.total += 1;
-                u.in_flight += usize::from(in_flight);
-                u.queued += usize::from(queued);
-                if failed {
-                    u.failed_holders.push(view::row_key(h));
-                }
-            }
-            if failed {
-                for key in self.attributed(ri, hi) {
-                    usage
-                        .entry(key)
-                        .or_default()
-                        .failures
-                        .push(view::row_key(h));
-                }
-            }
-        }
-        usage
+        limits::usage(&self.live[ri].hosts)
     }
 
     /// Whether row `hi`'s failure is within what the modules or workloads it
