@@ -114,6 +114,11 @@ Targets under no limit take the slots a limited module cannot use. Where several
 one with the longest chain of dependents goes first, then the one whose limit has the longest
 queue. A target whose plan changes nothing counts against no limit.
 
+While a limit is in use, has targets queued or has a failure charged to it, the rollout page
+lists it under the pipeline: how many of its places are in flight, how many a failed target
+holds, how many targets queue behind it, and what failed against its `max_failures` (outlined
+red once that stops its other targets). `GET /api/v1/rollouts/{id}` carries the same as `limits`.
+
 **Failures.** A failed target keeps its place in its limits, blocks what needs it, and by default
 stops further targets that run the module or workload that failed (`max_failures: 0`). Raise
 `max_failures` on the module or workload (a count or a percentage of its targets) to let that many

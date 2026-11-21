@@ -457,6 +457,47 @@
   }
 }
 
+// Module and workload limits under the pipeline: what each has in flight
+// against its own `parallel`, what queues behind it and what failed on it.
+.limits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.6rem;
+  margin: 0.9rem 0 0;
+  padding: 0.75rem 0 0;
+  border-top: 1px solid var(--yi-line);
+  list-style: none;
+}
+
+.limit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.55rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--yi-line);
+  border-radius: 6px;
+  font-size: 0.82rem;
+
+  &--stopped {
+    border-color: var(--yi-danger);
+  }
+
+  &__meter {
+    width: 64px;
+  }
+
+  &__usage {
+    color: var(--yi-fg-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__failures {
+    flex-basis: 100%;
+    color: var(--tone);
+  }
+}
+
 @media (max-width: $narrow) {
   .pipeline__track,
   .pipeline__step {

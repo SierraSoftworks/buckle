@@ -621,6 +621,7 @@ mod tests {
             }],
             plans: vec![],
             fleet: None,
+            limits: Vec::new(),
             events: vec![],
         };
 

@@ -446,6 +446,52 @@ pub struct RolloutDetail {
     /// The timeline, oldest first (the newest 200 entries); later entries
     /// arrive as [`LiveEvent::RolloutTimeline`].
     pub events: Vec<RolloutEvent>,
+    /// What the rollout's modules and workloads have in flight against
+    /// their own `parallel` and `max_failures` (see [`RolloutLimit`]). Empty
+    /// from servers that predate it, and when none sets a limit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<RolloutLimit>,
+}
+
+/// Which layer a [`RolloutLimit`] is declared on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutLimitKind {
+    Module,
+    Workload,
+}
+
+/// A module's or workload's own limits across a rollout, and how much of
+/// them is in use: its `parallel` counts the targets in flight and those
+/// that failed (a failed target keeps its place), its `max_failures` the
+/// failures charged to it. Listed for every module or workload that sets
+/// either, and for any other with a failure charged to it (which stops its
+/// other targets).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutLimit {
+    pub kind: RolloutLimitKind,
+    pub name: String,
+    /// Targets that may run it at once, resolved against `total`; absent
+    /// when it sets no `parallel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// Failures it tolerates before its other targets stop (0 by default).
+    #[serde(default)]
+    pub max_failures: u32,
+    /// Targets of the rollout that run it.
+    pub total: u32,
+    /// Those applying or baking now.
+    #[serde(default)]
+    pub in_flight: u32,
+    /// Those still to start.
+    #[serde(default)]
+    pub queued: u32,
+    /// Failed targets that run it: each keeps a place of its `parallel`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holding: Vec<String>,
+    /// Failed targets whose failure is charged to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<String>,
 }
 
 /// Hosts sharing one plan digest.

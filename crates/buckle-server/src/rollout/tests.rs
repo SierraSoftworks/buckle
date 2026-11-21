@@ -6081,6 +6081,66 @@ async fn a_failed_target_blocks_its_module_and_its_dependents_until_retried() {
     assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
 }
 
+/// The rollout says what each limited module has in flight, queued and
+/// failed against its `parallel` and `max_failures`; a module without
+/// either is listed only once a failure is charged to it.
+#[tokio::test(start_paused = true)]
+async fn a_rollouts_limits_say_what_is_in_use_and_what_failed() {
+    let h = scheduled(
+        TOLERANT,
+        &tiers("parallel: 1\n", ""),
+        &[("d1", "db"), ("d2", "db"), ("d3", "db"), ("w1", "web")],
+        &[],
+    )
+    .await;
+    for d in ["d1", "d2", "d3"] {
+        h.script(d, |s| s.apply_fail = Some(vec![]));
+    }
+    let revision = h.revisions.load("r1").await.unwrap();
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "a limited target says so", |_, hs| {
+            hs.iter().any(|x| {
+                x.runtime
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|w| w.kind == super::model::WaitKind::Limit)
+            }) && hs.iter().any(|x| x.state.in_flight())
+        })
+        .await;
+    let limits = super::limits::view(&revision, &hosts);
+    let names: Vec<&str> = limits.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["server"], "only what sets a limit: {limits:?}");
+    let server = &limits[0];
+    assert_eq!(
+        (
+            server.parallel,
+            server.total,
+            server.in_flight,
+            server.queued
+        ),
+        (Some(1), 3, 1, 2),
+        "{server:?}"
+    );
+    assert!(server.failures.is_empty() && server.holding.is_empty());
+
+    let (_, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    let limits = super::limits::view(&revision, &hosts);
+    let server = limits.iter().find(|l| l.name == "server").unwrap();
+    let failed: Vec<String> = hosts
+        .iter()
+        .filter(|x| x.state == HostPhase::Failed)
+        .map(|x| x.host.clone())
+        .collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        (&server.failures, &server.holding, server.in_flight),
+        (&failed, &failed, 0),
+        "{server:?}"
+    );
+    assert_eq!(server.max_failures, 0);
+}
+
 /// A module's `max_failures` lets its other targets go on after a failure,
 /// and what needs the group goes on with the members that made it.
 #[tokio::test(start_paused = true)]

@@ -317,5 +317,6 @@ pub fn detail(
         plans: plan_groups(hosts),
         fleet: None,
         events,
+        limits: Vec::new(),
     }
 }
