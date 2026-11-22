@@ -1166,6 +1166,39 @@ async fn the_catalog_lists_registered_kinds() {
 }
 
 #[actix_web::test]
+async fn the_attention_list_is_served_as_the_server_works_it_out() {
+    let e = env_with(WebConfig::default(), |s| {
+        s.attention = Some(Arc::new(crate::notifications::Notifier::new(
+            crate::notifications::NotifierDeps {
+                store: s.store.clone(),
+                revisions: s.revisions.clone(),
+                events: s.events.clone(),
+                clock: Arc::new(TokioClock::new()),
+                hooks: vec![],
+                base_url: None,
+                expected_version: "2.3.0".into(),
+                outbox: Arc::new(Notify::new()),
+            },
+        )));
+    })
+    .await;
+    add_host(&e.store, "new-1", HostStatus::Pending).await;
+    let app = test::init_service(app(e.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/attention")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list: buckle_api::attention::AttentionList = test::read_body_json(resp).await;
+    let ids: Vec<_> = list.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, vec!["host/new-1/registration"]);
+    assert!(list.items[0].opened_at.is_some());
+}
+
+#[actix_web::test]
 async fn webhooks_need_a_valid_signature() {
     use hmac::{Hmac, KeyInit, Mac};
     let e = env(WebConfig::default()).await;

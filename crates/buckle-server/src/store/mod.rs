@@ -12,6 +12,7 @@ pub mod drift;
 mod health;
 mod hosts;
 pub mod kv;
+pub mod notifications;
 mod reports;
 mod revisions;
 pub mod rollouts;
@@ -24,6 +25,7 @@ pub use health::{HEALTH_EPOCHS, HealthEventRecord, HealthEvents};
 pub(crate) use hosts::status_str as hosts_status_str;
 pub use hosts::{HostRecord, Hosts, NewCluster, NewHost, WORKLOAD_AUTH_PREFIX};
 pub use kv::Kv;
+pub use notifications::Notifications;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
@@ -336,6 +338,33 @@ ALTER TABLE hosts ADD COLUMN drift_at TEXT;
 ALTER TABLE runs ADD COLUMN actor TEXT;
 ALTER TABLE runs ADD COLUMN action_label TEXT;
 "#,
+    // 15: what the attention list last announced, and the webhook outbox
+    // that carries each opened and resolved edge to every webhook in order.
+    r#"
+CREATE TABLE attention_open (
+    id TEXT PRIMARY KEY NOT NULL,
+    item TEXT NOT NULL,
+    opened_at TEXT NOT NULL
+);
+CREATE TABLE webhook_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hook TEXT NOT NULL,
+    delivery TEXT NOT NULL,
+    event TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_at TEXT NOT NULL,
+    last_error TEXT
+);
+CREATE INDEX webhook_outbox_hook ON webhook_outbox(hook, id);
+CREATE TABLE webhook_status (
+    hook TEXT PRIMARY KEY NOT NULL,
+    failing_since TEXT,
+    last_error TEXT,
+    last_success TEXT
+);
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.
@@ -394,6 +423,11 @@ impl<'c> Db<'c> {
     /// The audit log.
     pub fn audit(&self) -> Audit<'c> {
         Audit::new(self.conn)
+    }
+
+    /// The attention list's open items and the webhook outbox.
+    pub fn notifications(&self) -> Notifications<'c> {
+        Notifications::new(self.conn)
     }
 
     /// Small key/value state.

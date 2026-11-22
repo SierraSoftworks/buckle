@@ -260,6 +260,12 @@ pub async fn fleet() -> Result<Fleet, ApiError> {
     get("/fleet").await
 }
 
+/// What needs attention, worst first: the bell's list, as webhooks get it.
+pub async fn attention() -> Result<buckle_api::attention::AttentionList, ApiError> {
+    demo!(Ok(demo_store::attention()));
+    get("/attention").await
+}
+
 /// The host with its facts, owned resources, recent runs, health results and
 /// drift: everything `/hosts/{id}/facts|state|runs` serve separately.
 pub async fn host(id: &str) -> Result<HostDetail, ApiError> {

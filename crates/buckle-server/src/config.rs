@@ -24,6 +24,8 @@ pub struct ServerConfig {
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub identity: IdentityConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 impl ServerConfig {
@@ -93,6 +95,7 @@ impl ServerConfig {
                 ],
             ));
         }
+        self.notifications.validate()?;
         if let Some(template) = &self.telemetry.trace_url_template
             && !template.contains(TRACE_ID_PLACEHOLDER)
         {
@@ -233,6 +236,90 @@ impl ServerConfig {
             .clone()
             .or_else(|| self.web.base_url.clone())
             .unwrap_or_else(|| "buckle".to_owned())
+    }
+}
+
+/// `notifications`: where the attention list's edges are sent.
+///
+/// ```yaml
+/// notifications:
+///   webhooks:
+///     - name: automate
+///       url: https://automate.example.ts.net/hooks/buckle
+///       secret: "${{ env.BUCKLE_WEBHOOK_SECRET }}"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationsConfig {
+    #[serde(default)]
+    pub webhooks: Vec<WebhookConfig>,
+}
+
+impl NotificationsConfig {
+    fn validate(&self) -> buckle_core::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, w) in self.webhooks.iter().enumerate() {
+            let name = w.name.trim();
+            if name.is_empty() {
+                return Err(buckle_core::error::user(
+                    format!("`notifications.webhooks[{i}].name` is empty."),
+                    &["Name each webhook; the name appears in logs and on the attention list."],
+                ));
+            }
+            if !seen.insert(name) {
+                return Err(buckle_core::error::user(
+                    format!("Two webhooks in `notifications.webhooks` are named '{name}'."),
+                    &["Give each webhook its own name."],
+                ));
+            }
+            if !url::Url::parse(&w.url).is_ok_and(|u| matches!(u.scheme(), "http" | "https")) {
+                return Err(buckle_core::error::user(
+                    format!("The URL of webhook '{name}' is not an http(s) URL."),
+                    &[
+                        "Set `url` to where the receiver listens, e.g. https://automate.example.ts.net/hooks/buckle.",
+                    ],
+                ));
+            }
+            if w.secret.trim().is_empty() {
+                return Err(buckle_core::error::user(
+                    format!(
+                        "The secret of webhook '{name}' is empty, so its deliveries could not be verified."
+                    ),
+                    &["Set `secret` to a long random value, and the same in the receiver."],
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One receiver of `attention.opened` and `attention.resolved` events.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    pub name: String,
+    pub url: String,
+    /// Signs each body (`X-Hub-Signature-256`, as GitHub does).
+    pub secret: String,
+    /// How long one delivery attempt may take (default 10s).
+    #[serde(default = "WebhookConfig::default_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+impl WebhookConfig {
+    fn default_timeout() -> Duration {
+        Duration::from_secs(10)
+    }
+}
+
+impl std::fmt::Debug for WebhookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookConfig")
+            .field("name", &self.name)
+            .field("url", &redact_url(&self.url))
+            .field("secret", &"***")
+            .field("timeout", &self.timeout)
+            .finish()
     }
 }
 
@@ -1226,6 +1313,48 @@ secrets:
                 assert!(err.description().contains(named), "{}", err.description())
             }
             (other, _) => panic!("unexpected: {:?}", other.map(|c| c.web.environment)),
+        }
+    }
+
+    #[rstest]
+    #[case::one(
+        "[{ name: automate, url: \"https://a.example/hook\", secret: s }]",
+        None
+    )]
+    #[case::unnamed(
+        "[{ name: \"\", url: \"https://a.example\", secret: s }]",
+        Some("name")
+    )]
+    #[case::duplicate(
+        "[{ name: a, url: \"https://a.example\", secret: s }, { name: a, url: \"https://b.example\", secret: s }]",
+        Some("named 'a'")
+    )]
+    #[case::not_http("[{ name: a, url: \"ftp://a.example\", secret: s }]", Some("http(s)"))]
+    #[case::no_secret(
+        "[{ name: a, url: \"https://a.example\", secret: \" \" }]",
+        Some("secret")
+    )]
+    fn notification_webhooks_need_a_name_url_and_secret(
+        #[case] hooks: &str,
+        #[case] refused: Option<&str>,
+    ) {
+        match (
+            with_env(&format!(
+                "{EXAMPLE}notifications: {{ webhooks: {hooks} }}\n"
+            )),
+            refused,
+        ) {
+            (Ok(c), None) => {
+                assert_eq!(c.notifications.webhooks[0].timeout, Duration::from_secs(10));
+                assert!(
+                    !format!("{c:?}").contains("secret: \"s\""),
+                    "the secret is redacted"
+                );
+            }
+            (Err(e), Some(named)) => {
+                assert!(e.description().contains(named), "{}", e.description())
+            }
+            (other, _) => panic!("unexpected: {:?}", other.map(|c| c.notifications)),
         }
     }
 

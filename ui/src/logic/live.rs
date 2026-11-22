@@ -228,6 +228,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "revision_added",
     "run_progress",
     "audit",
+    "attention",
     "lagged",
     "session_ended",
     "message",

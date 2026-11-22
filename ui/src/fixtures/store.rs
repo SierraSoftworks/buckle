@@ -41,6 +41,8 @@ pub(super) struct State {
     pub run_frame: usize,
     /// Join commands made with Add an agent.
     pub joins: Vec<JoinTicket>,
+    /// The attention list as last delivered, so a change is announced.
+    pub attention: Vec<buckle_api::attention::AttentionItem>,
 }
 
 impl State {
@@ -81,6 +83,7 @@ impl State {
             outbox: Vec::new(),
             run_frame: 0,
             joins: Vec::new(),
+            attention: Vec::new(),
         }
     }
 
@@ -137,9 +140,69 @@ pub(super) fn with<T>(f: impl FnOnce(&mut State) -> T) -> T {
     STATE.with(|s| f(&mut s.borrow_mut()))
 }
 
-/// The events produced since the last call.
+/// The events produced since the last call, and the attention list when
+/// they changed it, as the server announces it.
 pub fn drain() -> Vec<LiveEvent> {
-    with(|s| std::mem::take(&mut s.outbox))
+    with(|s| {
+        let mut out = std::mem::take(&mut s.outbox);
+        let list = attention_of(s);
+        if list.items != s.attention {
+            s.attention.clone_from(&list.items);
+            out.push(LiveEvent::Attention { list });
+        }
+        out
+    })
+}
+
+/// `GET /attention`, worked out from the demo's state as the server would.
+pub fn attention() -> buckle_api::attention::AttentionList {
+    with(|s| {
+        let list = attention_of(s);
+        s.attention.clone_from(&list.items);
+        list
+    })
+}
+
+fn attention_of(s: &State) -> buckle_api::attention::AttentionList {
+    use buckle_api::attention::{AttentionInputs, SkippedRun, TargetChecks, build};
+    let rollout = s
+        .rollouts
+        .iter()
+        .find(|r| crate::logic::tone::rollout_active(r.summary.state));
+    let checks: Vec<TargetChecks<'_>> = s
+        .details
+        .iter()
+        .filter(|d| d.summary.kind == buckle_api::TargetKind::Host)
+        .map(|d| TargetChecks {
+            target: &d.summary.id,
+            checks: &d.health_checks,
+        })
+        .collect();
+    let skipped: Vec<SkippedRun> = s
+        .schedules
+        .iter()
+        .filter_map(|d| {
+            let last = d.history.first()?;
+            Some(SkippedRun {
+                schedule: d.schedule.name.clone(),
+                due_at: last.due_at,
+                reason: last.skipped.clone()?,
+            })
+        })
+        .collect();
+    let items = build(
+        &AttentionInputs {
+            hosts: &s.hosts,
+            clusters: &s.clusters,
+            expected_version: Some(data::SERVER_VERSION),
+            rollout,
+            checks: &checks,
+            skipped: &skipped,
+            ..Default::default()
+        },
+        Utc::now(),
+    );
+    buckle_api::attention::AttentionList { items }
 }
 
 fn actor() -> String {

@@ -2,6 +2,7 @@
 //! and the WebAssembly UI. Deliberately free of web-framework, database and
 //! engine dependencies so that it compiles for both targets.
 
+pub mod attention;
 pub mod audit;
 pub mod auth;
 pub mod catalog;

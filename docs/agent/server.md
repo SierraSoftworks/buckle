@@ -353,6 +353,59 @@ An executor on a cluster node finds the API server and its CA in the node's kube
 (`KUBECONFIG`, `/etc/rancher/k3s/k3s.yaml`, `~/.kube/config`), so `api` may be left out; with
 `identity: local` it uses that kubeconfig's own credentials instead (root's on a k3s server).
 
+### notifications
+
+What the UI's **Needs attention** bell lists also leaves the server: each item sends
+`attention.opened` once when it appears and `attention.resolved` once when it is gone (after a
+minute's absence, so an agent that reconnects at once repeats nothing). The bell and webhooks
+read the same list (`GET /api/v1/attention`).
+
+```yaml
+notifications:
+  webhooks:
+    - name: automate
+      url: https://automate.example.ts.net/hooks/buckle
+      secret: "${{ env.BUCKLE_WEBHOOK_SECRET }}"
+      timeout: 10s
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `webhooks[].name` | **required** | Unique; names the webhook in logs and on the attention list. |
+| `webhooks[].url` | **required** | An http(s) URL. A tailnet address keeps the receiver off the internet. |
+| `webhooks[].secret` | **required** | Signs each body as `X-Hub-Signature-256: sha256=<hex HMAC-SHA256>`, as GitHub does. |
+| `webhooks[].timeout` | `10s` | How long one attempt may take. |
+
+**Items.** Registrations waiting, agents offline for 10 minutes, unexpected agent versions,
+failing health checks (informational ones included), held health, failing cluster workloads, the
+live rollout's failed, held or stale-plan hosts, a paused rollout, a schedule whose latest run was
+skipped, a refused identity (for a day, or until a grant), and a webhook failing for 5 minutes.
+Each has a stable `id` (`host/pi-1/offline`), a `kind`, a `tone` (`danger`, `warn`, `info`), a
+`subject` (`{ kind: host|cluster|rollout|schedule|webhook, id }`), a `summary`, and `since` when
+the condition's start is known.
+
+**Delivery.** Events wait in an outbox in the database and go to each webhook in order, at least
+once: a 2xx answer delivers, anything else retries after 15s, doubling to an hour, for a day.
+Receivers dedupe by `X-Buckle-Delivery`. Sending never holds up a rollout.
+
+```http
+POST /hooks/buckle
+Content-Type: application/json
+X-Buckle-Event: attention.opened
+X-Buckle-Delivery: 7f9c…
+X-Hub-Signature-256: sha256=…
+
+{"event": "attention.opened", "delivery": "7f9c…", "at": "2026-11-22T10:00:00Z",
+ "item": {"id": "host/pi-1/offline", "kind": "offline", "tone": "warn",
+          "subject": {"kind": "host", "id": "pi-1"}, "summary": "agent offline",
+          "since": "2026-11-22T09:49:12Z", "opened_at": "2026-11-22T10:00:00Z"},
+ "url": "https://buckle.example.ts.net/hosts/pi-1",
+ "server": {"url": "https://buckle.example.ts.net", "version": "2.18.0"}}
+```
+
+`attention.resolved` carries the item as last listed and `resolved_at`. `url` is absolute when
+`web.base_url` is set.
+
 ## API
 
 The UI is a client of the REST API under `/api/v1`, which you can script against with the same
@@ -361,6 +414,7 @@ session cookie or behind the same ACLs. Useful endpoints:
 | Route | Purpose |
 |---|---|
 | `GET /api/v1/fleet` | Every host with its status, health and applied revision. |
+| `GET /api/v1/attention` | What needs attention, worst first, as webhooks are told it (see [notifications](#notifications)). |
 | `GET /api/v1/rollouts`, `GET /api/v1/rollouts/{id}` | Rollouts with their phases, hosts and timeline. |
 | `POST /api/v1/rollouts/{id}/approve` and `…/pause`, `…/resume`, `…/retry`, `…/expedite`, `…/rollback`, `…/abort` | Rollout decisions (admin, CSRF-protected, audited). |
 | `POST /api/v1/rollouts/{id}/hosts/{host}/retry`, `…/expedite`, `…/force`, `…/skip`, `…/continue` | Host decisions within a rollout (admin, CSRF-protected, audited). |

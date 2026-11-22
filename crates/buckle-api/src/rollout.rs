@@ -621,6 +621,10 @@ pub enum LiveEvent {
     Audit {
         entry: AuditEntryRef,
     },
+    /// The attention list changed (`GET /api/v1/attention`): the whole list.
+    Attention {
+        list: crate::attention::AttentionList,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
