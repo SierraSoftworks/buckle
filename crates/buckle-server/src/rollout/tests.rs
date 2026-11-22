@@ -4532,6 +4532,53 @@ async fn an_applied_cluster_stays_leased_between_rollouts(
     }
 }
 
+/// A revision that changes a cluster's `executors` moves its steward before
+/// the cluster is planned when the steward no longer matches (it would be
+/// refused an identity), and keeps it when it still does.
+#[rstest::rstest]
+#[case::narrowed_away("'host.id == \"n2\"'", "n2")]
+#[case::still_eligible("'host.id == \"n1\"'", "n1")]
+#[tokio::test(start_paused = true)]
+async fn a_changed_executors_selector_reelects_the_steward(
+    #[case] executors: &str,
+    #[case] expected: &str,
+) {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, FLAT)
+        .await;
+    for n in ["n1", "n2"] {
+        h.enrol(n, "nomad").await;
+        h.connect(n, None);
+    }
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(
+        host(&hosts, CLUSTER).runtime.executor.as_deref(),
+        Some("n1")
+    );
+
+    let narrowed = format!("{NOMAD_CLUSTER}      executors: {executors}\n");
+    h.revision_with("r2", ONE_PHASE_ALL, &narrowed, FLAT).await;
+    let before = h.sent(|_, _| true).len();
+    let id = h.start("r2").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(
+        host(&hosts, CLUSTER).runtime.executor.as_deref(),
+        Some(expected)
+    );
+    assert_eq!(h.steward(CLUSTER).await.as_deref(), Some(expected));
+    let misdirected: Vec<_> = h.sent(|_, _| true)[before..]
+        .iter()
+        .filter(|(_, to, m)| {
+            to != expected
+                && matches!(m, SMsg::Plan(_) | SMsg::Apply(_))
+                && targeted(m) == Some(CLUSTER)
+        })
+        .cloned()
+        .collect();
+    assert!(misdirected.is_empty(), "{misdirected:?}");
+}
+
 /// A cluster none of whose candidate executors runs a pipeline per target is
 /// handed nothing, waits through the grace, misses its phase and converges
 /// in the stragglers stage once a capable host connects.

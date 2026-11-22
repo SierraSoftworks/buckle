@@ -3983,11 +3983,9 @@ impl Controller {
             .iter()
             .filter_map(|(h, _)| h.cluster.as_ref().map(|c| (h.id.clone(), c.spec.clone())))
             .collect();
-        // A cluster that appeared (synced from a revision) or went needs
-        // its lease reviewed.
-        if clusters.len() != self.clusters.len()
-            || clusters.keys().any(|c| !self.clusters.contains_key(c))
-        {
+        // A cluster that appeared (synced from a revision), went or changed
+        // (a narrowed `executors`) needs its lease reviewed.
+        if clusters != self.clusters {
             self.leases_dirty = true;
         }
         self.clusters = clusters;
@@ -7118,11 +7116,28 @@ impl Controller {
         if waiting.is_empty() {
             return Vec::new();
         }
+        if self.any_steward_connected(ri, &waiting) {
+            let targets = self.load_targets(None).await.unwrap_or_default();
+            if waiting
+                .iter()
+                .any(|&hi| !self.steward_qualifies(ri, hi, &targets))
+            {
+                // This rollout's revision narrowed who may speak for the
+                // cluster: elect under it before the old steward is asked
+                // for a plan it would be refused an identity for.
+                self.leases_dirty = true;
+            }
+        }
         self.review_leases_if_due().await;
+        let targets = if self.any_steward_connected(ri, &waiting) {
+            self.load_targets(None).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let now = self.now();
         let mut picked = Vec::new();
         for hi in waiting {
-            match self.pick_executor(ri, hi) {
+            match self.pick_executor(ri, hi, &targets) {
                 Pick::Executor(executor) => {
                     self.set_executor(ri, hi, Some(executor));
                     self.live[ri].hosts[hi].runtime.disconnected_at = None;
@@ -7171,7 +7186,12 @@ impl Controller {
     /// The host agent that speaks for cluster row `hi` now: the cluster's
     /// steward, while it is connected (leases are assigned by
     /// [`Controller::assign_leases`] on the same pass).
-    fn pick_executor(&self, ri: usize, hi: usize) -> Pick {
+    fn pick_executor(
+        &self,
+        ri: usize,
+        hi: usize,
+        targets: &[(crate::store::HostRecord, serde_json::Value)],
+    ) -> Pick {
         let live = &self.live[ri];
         let h = &live.hosts[hi];
         // An action runs as it always has on any steward: the workload is
@@ -7181,12 +7201,63 @@ impl Controller {
         match self.executors.get(&h.host) {
             Some(steward)
                 if self.connected(steward)
+                    && self.steward_qualifies(ri, hi, targets)
                     && (!placement || self.has_capability(steward, WORKLOADS_CAPABILITY)) =>
             {
                 Pick::Executor(steward.clone())
             }
             _ => Pick::None,
         }
+    }
+
+    fn any_steward_connected(&self, ri: usize, rows: &[usize]) -> bool {
+        rows.iter().any(|&hi| {
+            self.executors
+                .get(&self.live[ri].hosts[hi].host)
+                .is_some_and(|s| self.connected(s))
+        })
+    }
+
+    /// Whether cluster row `hi`'s current steward (when there is one) may
+    /// speak for the cluster under the rollout's own revision: the server
+    /// issues its identities against that revision's `executors`.
+    fn steward_qualifies(
+        &self,
+        ri: usize,
+        hi: usize,
+        targets: &[(crate::store::HostRecord, serde_json::Value)],
+    ) -> bool {
+        let live = &self.live[ri];
+        let cluster = &live.hosts[hi].host;
+        let Some(steward) = self.executors.get(cluster) else {
+            return true;
+        };
+        !self.connected(steward)
+            || self
+                .steward_candidates(cluster, &live.revision.fleet, targets)
+                .contains(steward)
+    }
+
+    /// The fleet config that decides who may steward `cluster`: the
+    /// revision of the newest live rollout still to finish a row for it
+    /// (its plans and applies ask for identities under that revision),
+    /// else `reference`.
+    fn governing_fleet<'a>(
+        &'a self,
+        cluster: &str,
+        reference: &'a buckle_core::model::FleetConfig,
+    ) -> &'a buckle_core::model::FleetConfig {
+        self.live
+            .iter()
+            .rev()
+            .find(|l| {
+                l.record.is_active()
+                    && l.hosts.iter().any(|h| {
+                        h.host == cluster && h.runtime.kind.on_cluster() && !h.state.finished()
+                    })
+            })
+            .map(|l| &l.revision.fleet)
+            .unwrap_or(reference)
     }
 
     fn has_capability(&self, host: &str, capability: &str) -> bool {
@@ -7206,11 +7277,20 @@ impl Controller {
         fleet: &buckle_core::model::FleetConfig,
         targets: &[(crate::store::HostRecord, serde_json::Value)],
     ) -> Vec<String> {
-        let executors = self
-            .clusters
-            .get(target)
-            .and_then(|spec| buckle_core::Filter::new(spec.executors()?).ok());
-        let parent = self.clusters.get(target).and_then(|s| s.cluster.as_deref());
+        // `fleet`'s own declaration wins over the stored row, which follows
+        // whichever revision synced it last.
+        let declared = fleet.fleet.clusters.get(target);
+        let executors = match declared {
+            Some(d) => d.executors.clone().or_else(|| d.nodes.clone()),
+            None => self
+                .clusters
+                .get(target)
+                .and_then(|spec| buckle_core::Filter::new(spec.executors()?).ok()),
+        };
+        let parent = match declared {
+            Some(d) => d.cluster.as_deref(),
+            None => self.clusters.get(target).and_then(|s| s.cluster.as_deref()),
+        };
         let mut inside: Vec<String> = Vec::new();
         let mut outside: Vec<String> = Vec::new();
         for (h, facts) in targets {
@@ -8052,7 +8132,8 @@ impl Controller {
             .collect();
         for cluster in &clusters {
             let current = self.executors.get(cluster).cloned();
-            let desired = self.choose_steward(cluster, fleet, &targets);
+            let desired =
+                self.choose_steward(cluster, self.governing_fleet(cluster, fleet), &targets);
             let inside = desired
                 .as_ref()
                 .is_some_and(|d| in_cluster_executor(d, &targets));
