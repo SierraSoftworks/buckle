@@ -70,7 +70,7 @@ pub(super) struct LeaseTerms {
 
 struct LaneHandle {
     tx: mpsc::UnboundedSender<LaneOp>,
-    busy: Arc<AtomicBool>,
+    busy: Arc<AtomicUsize>,
     queued: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -126,7 +126,7 @@ impl Lanes {
             .lock()
             .map(|l| {
                 l.values().any(|lane| {
-                    lane.busy.load(Ordering::SeqCst) || lane.queued.load(Ordering::SeqCst) > 0
+                    lane.busy.load(Ordering::SeqCst) > 0 || lane.queued.load(Ordering::SeqCst) > 0
                 })
             })
             .unwrap_or(false)
@@ -139,6 +139,49 @@ impl Lanes {
             return Vec::new();
         };
         lanes.drain().map(|(_, l)| l.task).collect()
+    }
+}
+
+/// Whether `instruction` is a bake: health sampled until a window ends.
+fn is_bake(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::RunHealth {
+            scope: HealthScope::Bake,
+            until: Some(_),
+            ..
+        }
+    )
+}
+
+/// Whether `instruction` for `target` may start: the agent is not stopping,
+/// and the session that asked for it (`generation`) is the current one.
+fn may_start(
+    shared: &Shared,
+    target: &str,
+    instruction: &Instruction,
+    generation: Option<u64>,
+) -> bool {
+    if shared.stopping.load(Ordering::SeqCst) || shared.stop.is_cancelled() {
+        tracing::info!(%target, "not starting a cluster operation: the agent is stopping");
+        return false;
+    }
+    if let Some(generation) = generation
+        && generation != shared.generation.load(Ordering::SeqCst)
+    {
+        tracing::debug!(%target, instruction = ?std::mem::discriminant(instruction), "skipping a cluster operation queued by a session that has ended");
+        return false;
+    }
+    true
+}
+
+/// Takes one off a counter when dropped (an operation that ends or is
+/// aborted).
+struct Decrement(Arc<AtomicUsize>);
+
+impl Drop for Decrement {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -182,18 +225,52 @@ struct Watch {
 }
 
 /// One cluster's lane.
+///
+/// The lane's own loop only routes: it takes the lease, runs the watch and
+/// hands each instruction to the queue of the placement it concerns, so the
+/// cluster's workloads plan, apply and bake side by side (the server already
+/// orders them by their `needs` and its limits). One placement's
+/// instructions keep their order; whole-cluster instructions (an older
+/// server's cluster rows, a whole-cluster health read) run alone.
 struct Lane {
     shared: Arc<Shared>,
     target: String,
-    busy: Arc<AtomicBool>,
+    /// Operations running (bakes included), and instructions waiting to.
+    busy: Arc<AtomicUsize>,
     queued: Arc<AtomicUsize>,
     watch: Option<Watch>,
+    /// One queue per placement (`None`: the whole cluster).
+    queues: HashMap<Option<String>, mpsc::UnboundedSender<Queued>>,
+    /// Placement queues share it; the whole cluster's takes it alone.
+    gate: Arc<tokio::sync::RwLock<()>>,
+    /// The queues' tasks: each finishes the operation it runs when the lane
+    /// closes, and starts no other.
+    workers: tokio::task::JoinSet<()>,
+    /// Bakes sample beside the queues (a bake samples one placement for its
+    /// whole window, and holds nothing): aborted when the lane closes.
+    bakes: tokio::task::JoinSet<()>,
+    closing: Arc<AtomicBool>,
+    done_tx: mpsc::UnboundedSender<Done>,
+    done: mpsc::UnboundedReceiver<Done>,
+}
+
+/// An instruction waiting in a placement's queue.
+struct Queued {
+    instruction: Instruction,
+    generation: Option<u64>,
+}
+
+/// What a finished operation tells the lane.
+struct Done {
+    /// The revision an Apply or Rollback left applied.
+    applied: Option<RevisionId>,
 }
 
 impl Lane {
     fn open(shared: Arc<Shared>, target: &str) -> LaneHandle {
         let (tx, rx) = mpsc::unbounded_channel();
-        let busy = Arc::new(AtomicBool::new(false));
+        let (done_tx, done) = mpsc::unbounded_channel();
+        let busy = Arc::new(AtomicUsize::new(0));
         let queued = Arc::new(AtomicUsize::new(0));
         let lane = Lane {
             shared,
@@ -201,6 +278,13 @@ impl Lane {
             busy: busy.clone(),
             queued: queued.clone(),
             watch: None,
+            queues: HashMap::new(),
+            gate: Arc::default(),
+            workers: tokio::task::JoinSet::new(),
+            bakes: tokio::task::JoinSet::new(),
+            closing: Arc::default(),
+            done_tx,
+            done,
         };
         let span = tracing::info_span!("agent.lane", buckle.target = %target);
         let task = tokio::spawn(lane.run(rx).instrument(span));
@@ -241,10 +325,10 @@ impl Lane {
                         }
                     }
                     Some(LaneOp::Instruction { instruction, generation }) => {
-                        self.queued.fetch_sub(1, Ordering::SeqCst);
-                        self.instruction(instruction, generation).await;
+                        self.route(instruction, generation).await;
                     }
                 },
+                Some(done) = self.done.recv() => self.after(done).await,
                 event = async {
                     match self.watch.as_mut() {
                         Some(w) => w.events.recv().await,
@@ -262,33 +346,134 @@ impl Lane {
                     None => {}
                 },
                 _ = tokio::time::sleep_until(health_due), if watching => self.read_health().await,
-                _ = tokio::time::sleep_until(drift_due), if watching => self.read_drift(None).await,
+                // A drift pass plans the whole cluster: not while a
+                // placement is changing it (each operation's end moves the
+                // timer on again).
+                _ = tokio::time::sleep_until(drift_due), if watching => {
+                    if self.working() {
+                        if let Some(w) = &mut self.watch {
+                            w.drift_due = Instant::now() + SETTLE;
+                        }
+                    } else {
+                        self.read_drift(None).await;
+                    }
+                }
+                Some(_) = self.bakes.join_next(), if !self.bakes.is_empty() => {}
             }
         }
         self.watch = None;
+        // What runs finishes; nothing queued starts.
+        self.closing.store(true, Ordering::SeqCst);
+        self.queues.clear();
+        self.bakes.shutdown().await;
+        while self.workers.join_next().await.is_some() {}
     }
 
-    /// Runs a targeted instruction, unless its session ended first or the
-    /// agent is stopping.
-    async fn instruction(&mut self, instruction: Instruction, generation: Option<u64>) {
-        if self.shared.stopping.load(Ordering::SeqCst) || self.shared.stop.is_cancelled() {
-            tracing::info!(target = %self.target, "not starting a cluster operation: the agent is stopping");
+    /// Whether a placement's operation (not a bake) is running or queued.
+    fn working(&self) -> bool {
+        let bakes = self.bakes.len();
+        self.busy.load(Ordering::SeqCst) > bakes || self.queued.load(Ordering::SeqCst) > 0
+    }
+
+    /// Hands a targeted instruction to where it runs. An Assign only
+    /// records a revision for the instruction after it, so it is taken in
+    /// order here; a bake samples on its own; everything else waits in its
+    /// placement's queue.
+    async fn route(&mut self, instruction: Instruction, generation: Option<u64>) {
+        if matches!(instruction, Instruction::Assign { .. }) {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            if self.may_start(&instruction, generation) {
+                self.shared
+                    .target_op(self.target.clone(), instruction)
+                    .await;
+            }
             return;
         }
-        if let Some(generation) = generation
-            && generation != self.shared.generation.load(Ordering::SeqCst)
+        if is_bake(&instruction) {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            if self.may_start(&instruction, generation) {
+                self.bake(instruction);
+            }
+            return;
+        }
+        let key = instruction.workload().map(str::to_owned);
+        let queue = match self.queues.get(&key) {
+            Some(q) if !q.is_closed() => q.clone(),
+            _ => {
+                let q = self.serve(key.clone());
+                self.queues.insert(key, q.clone());
+                q
+            }
+        };
+        if queue
+            .send(Queued {
+                instruction,
+                generation,
+            })
+            .is_err()
         {
-            tracing::debug!(target = %self.target, instruction = ?std::mem::discriminant(&instruction), "skipping a cluster operation queued by a session that has ended");
-            return;
+            self.queued.fetch_sub(1, Ordering::SeqCst);
         }
-        let changes = !matches!(instruction, Instruction::Assign { .. });
-        self.busy.store(true, Ordering::SeqCst);
-        let applied = self
-            .shared
-            .target_op(self.target.clone(), instruction)
-            .await;
-        self.busy.store(false, Ordering::SeqCst);
-        let moved = match (&mut self.watch, applied) {
+    }
+
+    /// Whether `instruction` may start: the agent is not stopping, and the
+    /// session that asked for it is still the current one.
+    fn may_start(&self, instruction: &Instruction, generation: Option<u64>) -> bool {
+        may_start(&self.shared, &self.target, instruction, generation)
+    }
+
+    /// Starts the queue of placement `workload` (`None`: the whole cluster).
+    fn serve(&mut self, workload: Option<String>) -> mpsc::UnboundedSender<Queued> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Queued>();
+        let shared = self.shared.clone();
+        let target = self.target.clone();
+        let gate = self.gate.clone();
+        let (busy, queued) = (self.busy.clone(), self.queued.clone());
+        let closing = self.closing.clone();
+        let done = self.done_tx.clone();
+        let span = tracing::info_span!(
+            "agent.queue",
+            buckle.workload = workload.as_deref().unwrap_or("")
+        );
+        self.workers.spawn(
+            async move {
+                while let Some(Queued {
+                    instruction,
+                    generation,
+                }) = rx.recv().await
+                {
+                    queued.fetch_sub(1, Ordering::SeqCst);
+                    if closing.load(Ordering::SeqCst)
+                        || !may_start(&shared, &target, &instruction, generation)
+                    {
+                        continue;
+                    }
+                    busy.fetch_add(1, Ordering::SeqCst);
+                    let running = Decrement(busy.clone());
+                    let applied = match workload {
+                        Some(_) => {
+                            let _turn = gate.read().await;
+                            shared.target_op(target.clone(), instruction).await
+                        }
+                        None => {
+                            let _turn = gate.write().await;
+                            shared.target_op(target.clone(), instruction).await
+                        }
+                    };
+                    drop(running);
+                    let _ = done.send(Done { applied });
+                }
+            }
+            .instrument(span),
+        );
+        tx
+    }
+
+    /// Follows up an operation that finished: a watch of the revision it
+    /// left applied, its health read once it settles, and drift planned
+    /// only after a quiet spell.
+    async fn after(&mut self, done: Done) {
+        let moved = match (&mut self.watch, done.applied) {
             (Some(w), Some(revision)) if w.applied.as_ref() != Some(&revision) => {
                 w.applied = Some(revision);
                 true
@@ -298,15 +483,31 @@ impl Lane {
         if moved {
             self.restart_watcher().await;
         }
-        if let Some(w) = &mut self.watch
-            && changes
-        {
-            // Read what the operation left behind once it settles, and plan
-            // for drift only after a quiet spell.
+        if let Some(w) = &mut self.watch {
             let now = Instant::now();
             w.health_due = now + SETTLE;
             w.drift_due = now + w.config.drift;
         }
+    }
+
+    /// Samples a bake beside the queues. It still ends when its window
+    /// does, when the server moves past it (see [`super::bakes`]) or when
+    /// the session ends; the placement's other instructions run meanwhile.
+    fn bake(&mut self, instruction: Instruction) {
+        let shared = self.shared.clone();
+        let target = self.target.clone();
+        let busy = self.busy.clone();
+        let done = self.done_tx.clone();
+        busy.fetch_add(1, Ordering::SeqCst);
+        self.bakes.spawn(
+            async move {
+                let running = Decrement(busy);
+                shared.target_op(target, instruction).await;
+                drop(running);
+                let _ = done.send(Done { applied: None });
+            }
+            .in_current_span(),
+        );
     }
 
     /// Takes (or refreshes) the lease: the cluster's spec, applied

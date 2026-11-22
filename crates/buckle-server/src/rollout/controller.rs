@@ -875,6 +875,10 @@ enum Pick {
 /// when nothing (a connect, a disconnect, a host change) prompts it.
 const LEASE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How far ahead of its end a bake has to be cut short for its agent to be
+/// told (one that ends on time stops by itself).
+const BAKE_STOP_MARGIN: Duration = Duration::from_secs(5);
+
 struct Controller {
     store: Store,
     link: Arc<dyn HostLink>,
@@ -1515,6 +1519,9 @@ impl Controller {
                 live.record.runtime.trace_id.clone(),
             )
         };
+        if from == HostPhase::Baking {
+            self.end_agent_bake(ri, hi);
+        }
         self.live[ri].hosts[hi].state = state;
         self.touch_host(ri, hi);
         if state.finished() || state == HostPhase::Held {
@@ -6028,6 +6035,37 @@ impl Controller {
         );
     }
 
+    /// Row `hi`'s bake ended here before the window its agent samples (an
+    /// expedite, a skip, a failure): the agent is told, so the bake stops
+    /// holding the target's queue (a host's, or a cluster's lane) until the
+    /// old window ends. Any rollout instruction for the same target stops a
+    /// bake there; a one-off bake reading is the smallest, and every agent
+    /// knows it.
+    fn end_agent_bake(&mut self, ri: usize, hi: usize) {
+        let now = self.now();
+        let Some(asked) = self.live[ri].hosts[hi].runtime.bake_asked_until else {
+            return;
+        };
+        if asked <= now + chrono::Duration::from_std(BAKE_STOP_MARGIN).unwrap_or_default() {
+            return;
+        }
+        let span = self.host_span(ri, hi);
+        self.send_to(
+            ri,
+            hi,
+            server_message::Msg::Health(RunHealth {
+                target: String::new(),
+                workload: String::new(),
+                revision: String::new(),
+                request_id: new_id(),
+                scope: HealthScope::Bake as i32,
+                modules: vec![],
+                until: None,
+                traceparent: traceparent_of(&span).unwrap_or_default(),
+            }),
+        );
+    }
+
     fn send_rollback(&mut self, ri: usize, hi: usize) {
         let Some(prev) = self.live[ri].record.runtime.previous_stable.clone() else {
             return;
@@ -6073,6 +6111,7 @@ impl Controller {
             self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
             return;
         };
+        self.end_agent_bake(ri, hi);
         self.keep_applied_plan(ri, hi);
         let (host, from) = {
             let h = &mut self.live[ri].hosts[hi];

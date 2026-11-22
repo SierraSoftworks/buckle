@@ -3056,7 +3056,7 @@ async fn a_check_failing_at_the_end_of_the_bake_is_sampled_through_settle(
     );
     let asks = h.sent(|x, m| {
         x == agent
-            && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Bake as i32 && r.target == target)
+            && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Bake as i32 && r.target == target && r.until.is_some())
     });
     assert_eq!(
         asks.len(),
@@ -4909,7 +4909,8 @@ async fn retrying_a_rollout_without_failures_is_refused() {
 const LONG_BAKE: &str = "  settle: 10m\n  health: { bake: 1h }\n  phases:\n    - { name: web, select: 'true', parallel: 2 }\n";
 
 /// Skipping a bake (one host's, a phase's, or every baking host's) counts it
-/// as baked at once, instead of waiting out the window.
+/// as baked at once, instead of waiting out the window, and tells the agent:
+/// its bake stops holding the target's queue.
 #[rstest::rstest]
 #[case::one_host(Some("a"), None)]
 #[case::phase(None, Some("web"))]
@@ -4948,6 +4949,11 @@ async fn skipping_a_bake_finishes_the_host_now(
             HostPhase::Baking
         };
         assert_eq!(host(&hosts, x).state, want, "{x}");
+        let told = h.sent(|to, m| {
+            to == x
+                && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Bake as i32 && r.until.is_none())
+        });
+        assert_eq!(!told.is_empty(), skipped, "{x}");
     }
 }
 
