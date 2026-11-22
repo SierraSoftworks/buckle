@@ -386,6 +386,11 @@ CREATE TABLE paused_units (
     PRIMARY KEY (target, unit)
 );
 "#,
+    // 18: a workload's newest placement row on a cluster, found by a seek
+    // rather than a scan of the cluster's whole rollout history.
+    r#"
+CREATE INDEX rollout_hosts_workload ON rollout_hosts(host, workload, created_at);
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.
