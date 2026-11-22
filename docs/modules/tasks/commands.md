@@ -78,6 +78,14 @@ counts as a change, which is what fires handlers. `unless` and `only_if` also ru
   id: nomad-drain
 ```
 
+```yaml
+# Log in to Vault as this host, with a token the server issues for the `vault` audience.
+- command.run:
+    run: 'vault write -field=token auth/jwt/login role=buckle jwt="$BUCKLE_IDENTITY" > /run/vault-token'
+    identity: { audience: vault }       # a fleet.identities entry, passed as BUCKLE_IDENTITY
+  id: vault-login
+```
+
 <KindReference registry="tasks" kind="command.run" />
 
 **Cluster identity.** `identity` asks the server for a short-lived credential for a cluster
@@ -89,6 +97,9 @@ secret: never planned, logged or stored, and output is not captured unless `capt
   [the server docs](../../agent/server.md).
 - **Exchange**: Nomad logs in through the `buckle` auth method at `api`, else `NOMAD_ADDR`, else
   `http://127.0.0.1:4646`; Kubernetes (`kind: kubernetes`) takes the JWT as a bearer token.
+- **Audience**: `identity: { audience: NAME }` instead names a
+  [`fleet.identities`](../fleet.md#identities) entry; the JWT itself reaches the command, as
+  `BUCKLE_IDENTITY` unless `env` names another variable, with no exchange.
 - **Local runs** have no server to ask, so the task fails there.
 
 `run`, `unless`, `only_if` and `remove` are an argv list (run directly) or a string (run with

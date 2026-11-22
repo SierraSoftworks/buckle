@@ -30,7 +30,8 @@ testing, and resume it afterwards.
 ## Labels
 
 Operator labels win over the labels the agent reports, and decide the host's groups and the
-rollout phase it falls into. The editor previews the result as you type.
+rollout phase it falls into. A [reserved label](../modules/fleet.md#trust) is the operator's alone:
+the agent's value is ignored and the label cannot be removed. The editor previews the result as you type.
 
 <Screenshot name="host-labels" alt="The labels editor and its preview of phase and groups" />
 

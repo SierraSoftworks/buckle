@@ -20,6 +20,16 @@ secrets:
 | `{ env: NAME }` | An environment variable of the resolving process. |
 | `{ exec: [PROGRAM, ARGS…] }` | A command's standard output. Only for programs the server (`secrets.providers.exec.allow`) or a standalone agent (`--allow-secret-exec`) explicitly allows; meant for local development. |
 
+A declaration may add `hosts`, a [trust selector](./fleet.md#trust) capping who may receive the
+secret: a host it does not select is never sent the value, even when a module it runs references
+it (`secrets.NAME.present` is false there, and a task that renders it fails naming the secret). For a cluster's workloads the cap is checked against
+the executor applying them.
+
+```yaml
+secrets:
+  EDGE_API_KEY: { env: EDGE_API_KEY, hosts: 'host.labels.zone == "public"' }
+```
+
 The server restricts what each provider may read; see
 [`secrets` in server.yaml](../agent/server.md#secrets). A Nomad job can render one file per
 Nomad Variable into its secrets directory with `template` stanzas; Nomad re-renders them on change
@@ -73,7 +83,7 @@ sets `capture: always`.
 ## Delivery
 
 The server works out which modules each host selects, collects the secrets those modules (and the
-vars overlays that match the host) reference, and sends only those, with the revision, over the
+vars overlays that match the host) reference, and sends only those (less any whose `hosts` cap excludes the host), with the revision, over the
 agent's connection. A pending (unapproved) host receives none. Agents cache the stable revision's
 secrets in their state directory (mode 0600) so they can roll back without the server.
 

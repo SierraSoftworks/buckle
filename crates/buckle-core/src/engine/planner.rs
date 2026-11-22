@@ -261,7 +261,7 @@ impl<'a> Planner<'a> {
             revision,
             HostIdentity {
                 id: inputs.host.id.clone(),
-                labels: inputs.labels(),
+                labels: inputs.labels(revision),
             },
             inputs.system.clone(),
             inputs.secrets.clone(),

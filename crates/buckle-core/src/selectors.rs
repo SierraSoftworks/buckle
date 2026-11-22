@@ -123,6 +123,48 @@ pub fn selector_namespaces(raw: &str) -> Namespaces {
     }
 }
 
+/// The fact a host's verified tags are read through. For a host the server
+/// authenticated over the tailnet, the server puts the tags its own
+/// tailscaled reports here, in place of what the agent says.
+pub const VERIFIED_TAGS_FACT: &str = "tailscale.tags";
+
+static KEY_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\b(?:host|cluster|workload|vars|secrets|module|task)\.[A-Za-z0-9_/-]+(?:\.[A-Za-z0-9_/:-]+)*",
+    )
+    .expect("static regex compiles")
+});
+
+/// The keys a trust selector reads that a trust decision does not know:
+/// everything but `host.id`, `host.groups`, the verified tags
+/// (`host.facts.tailscale.tags`) and the labels named in `reserved`. They
+/// read as null there, so a comparison with one is false and a negated one
+/// is true. Lowercased, in order of appearance, without repeats.
+pub fn untrusted_references(raw: &str, reserved: &[String]) -> Vec<String> {
+    let tags = format!("host.facts.{VERIFIED_TAGS_FACT}");
+    let mut out: Vec<String> = Vec::new();
+    for m in KEY_REF.find_iter(raw) {
+        let key = m.as_str().to_ascii_lowercase();
+        let trusted = key == "host.id"
+            || key == "host.groups"
+            || key == tags
+            || key
+                .strip_prefix("host.labels.")
+                .is_some_and(|l| reserved.iter().any(|r| r.eq_ignore_ascii_case(l)));
+        if !trusted && !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// Whether a selector reads `host.groups`.
+pub fn reads_groups(raw: &str) -> bool {
+    KEY_REF
+        .find_iter(raw)
+        .any(|m| m.as_str().eq_ignore_ascii_case("host.groups"))
+}
+
 /// Labels as reported by the agent and managed on the server: string keys to
 /// scalar JSON values (strings, numbers, booleans).
 pub type Labels = IndexMap<String, serde_json::Value>;
@@ -237,6 +279,33 @@ impl HostContext {
             host,
             ..Default::default()
         }
+    }
+
+    /// The context a trust decision is evaluated in: the host's id, its
+    /// verified tags (`None` when the server did not authenticate it over
+    /// the tailnet) and its server-set reserved labels. Nothing an agent
+    /// reports is in it, so every other key reads as null.
+    pub fn trusted(id: &str, tags: Option<&[String]>, reserved: Labels) -> Self {
+        let facts = match tags {
+            Some(tags) => {
+                let mut tree = serde_json::Value::Null;
+                set_path(&mut tree, VERIFIED_TAGS_FACT, serde_json::json!(tags));
+                tree
+            }
+            None => serde_json::Value::Null,
+        };
+        Self::new(HostIdentity {
+            id: id.to_owned(),
+            labels: reserved,
+        })
+        .with_facts(facts)
+    }
+
+    /// This context with the host's verified tags in place of whatever the
+    /// facts tree says they are.
+    pub fn with_verified_tags(mut self, tags: &[String]) -> Self {
+        set_path(&mut self.facts, VERIFIED_TAGS_FACT, serde_json::json!(tags));
+        self
     }
 
     /// The context of a cluster target: `identity` is read as `cluster.id`
@@ -507,6 +576,25 @@ pub fn lookup_path<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a se
     Some(current)
 }
 
+/// Sets the value at a dotted `path` in `root`, making objects on the way
+/// (anything else found there is replaced). Keys that differ from a path
+/// segment only by case are dropped, since lookups ignore case and must not
+/// find another spelling first.
+fn set_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) {
+    let mut current = root;
+    for part in path.split('.') {
+        if !current.is_object() {
+            *current = serde_json::Value::Object(Default::default());
+        }
+        let serde_json::Value::Object(map) = current else {
+            return;
+        };
+        map.retain(|k, _| k == part || !k.eq_ignore_ascii_case(part));
+        current = map.entry(part).or_insert(serde_json::Value::Null);
+    }
+    *current = value;
+}
+
 impl Filterable for HostContext {
     fn get(&self, key: &str) -> FilterValue<'_> {
         let lower = key.to_ascii_lowercase();
@@ -717,6 +805,59 @@ mod tests {
         .with_secrets(Arc::new(secrets))
         .in_module("nomad", &["config".into()])
         .in_task("file.template", "nomad.hcl", &["network".into()])
+    }
+
+    #[rstest]
+    #[case::id(r#"host.id == "pi-1""#, &[])]
+    #[case::verified_tags(r#"host.facts.tailscale.tags contains "tag:z2""#, &[])]
+    #[case::reserved_label(r#"host.labels.Zone == "home""#, &[])]
+    #[case::groups(r#"host.groups contains "z2""#, &[])]
+    #[case::other_label(r#"host.labels.role == "steward""#, &["host.labels.role"])]
+    #[case::other_fact(r#"host.facts.os.family == "debian""#, &["host.facts.os.family"])]
+    #[case::other_tailscale_fact(r#"host.facts.tailscale.hostname == "x""#, &["host.facts.tailscale.hostname"])]
+    #[case::vars_and_secrets(r#"vars.zone == "x" || secrets.k.present"#, &["vars.zone", "secrets.k.present"])]
+    #[case::mixed(r#"host.id == "a" && !(host.labels.role == "edge")"#, &["host.labels.role"])]
+    fn trust_selectors_know_only_trusted_keys(#[case] expr: &str, #[case] untrusted: &[&str]) {
+        assert_eq!(untrusted_references(expr, &["zone".to_owned()]), untrusted);
+    }
+
+    #[rstest]
+    #[case::tag(r#"host.facts.tailscale.tags contains "tag:z2""#, true)]
+    #[case::reserved(r#"host.labels.zone == "home""#, true)]
+    #[case::id(r#"host.id == "pi-1""#, true)]
+    #[case::unreported_fact(r#"host.facts.os.family == "debian""#, false)]
+    #[case::unreserved_label(r#"host.labels.role == "steward""#, false)]
+    fn a_trusted_context_holds_only_what_the_server_verified(
+        #[case] expr: &str,
+        #[case] expected: bool,
+    ) {
+        let labels: Labels = [("zone".to_owned(), serde_json::json!("home"))]
+            .into_iter()
+            .collect();
+        let ctx = HostContext::trusted("pi-1", Some(&["tag:z2".to_owned()]), labels);
+        assert_eq!(ctx.matches(&Filter::new(expr).unwrap()), expected);
+    }
+
+    #[test]
+    fn verified_tags_replace_whatever_the_agent_reported() {
+        let reported = serde_json::json!({
+            "tailscale": {"tags": ["tag:z2"], "hostname": "pi-1"},
+            "Tailscale": {"tags": ["tag:z2"]},
+        });
+        let ctx = HostContext::new(HostIdentity {
+            id: "pi-1".into(),
+            labels: Labels::new(),
+        })
+        .with_facts(reported)
+        .with_verified_tags(&["tag:z0".to_owned()]);
+        let has = |tag: &str| {
+            ctx.matches(
+                &Filter::new(format!(r#"host.facts.tailscale.tags contains "{tag}""#)).unwrap(),
+            )
+        };
+        assert!(has("tag:z0"));
+        assert!(!has("tag:z2"));
+        assert!(ctx.matches(&Filter::new(r#"host.facts.tailscale.hostname == "pi-1""#).unwrap()));
     }
 
     #[rstest]

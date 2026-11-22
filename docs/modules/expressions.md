@@ -37,14 +37,21 @@ double quotes inside them survive.
 | Key | Value |
 |---|---|
 | `host.id` | The host's identity. |
-| `host.labels.*` | Effective labels: the agent's seed labels, overridden by labels set in the UI. Typed like YAML scalars. |
+| `host.labels.*` | Effective labels: the agent's seed labels, overridden by labels set in the UI. Typed like YAML scalars. A [reserved](./fleet.md#trust) label is only ever the server's. |
 | `host.groups` | The groups the host belongs to (a list, for `contains`). |
-| `host.facts.*` | [Facts](../agent/facts.md), flattened to dotted keys. Lists can be tested with `contains` but not indexed. |
+| `host.facts.*` | [Facts](../agent/facts.md), flattened to dotted keys. Lists can be tested with `contains` but not indexed. `host.facts.tailscale.tags` is the server's verified copy for agents connected over Tailscale. |
 | `cluster.id`, `cluster.kind`, `cluster.labels.*`, `cluster.groups` | The [cluster target](./fleet.md#clusters) being evaluated (`kind` is `nomad` or `kubernetes`), in a [workload](./workloads.md)'s `when` and in groups and phases written for clusters; for a placement, its hosting cluster. |
 | `workload.name`, `workload.labels.*`, `workload.tags`, `workload.groups` | The [placement](../operations/rollouts.md#placements) being evaluated: a workload on a cluster, in groups and rollout phases. Never in a `when`, which runs before any placement exists. |
 | `vars.*` | The host's variables (scalars and lists). |
 | `secrets.NAME` | A secret, comparable but never printable; `secrets.NAME.present` and `secrets.NAME.fingerprint` for "is it set" and "did it rotate". |
 | `task.kind`, `task.id`, `task.tags`, `module.name`, `module.tags` | The task being evaluated, for `--select`. |
+
+### Trust selectors
+
+A cluster's `executors`, an identity's `hosts` and a secret's `hosts` decide what a host is handed,
+so they read only `host.id`, `host.facts.tailscale.tags` (as verified by the server), reserved
+`host.labels.*` and the groups built from those alone; every other key is `null` there. See
+[Trust](./fleet.md#trust).
 
 ### Cluster selectors
 

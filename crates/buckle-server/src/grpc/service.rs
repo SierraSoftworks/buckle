@@ -111,6 +111,25 @@ struct Authenticated {
     host: String,
     issued_token: Option<String>,
     status: HostStatus,
+    /// The ACL tags whois reported, when the tailnet authenticated the host.
+    tags: Option<Vec<String>>,
+}
+
+/// What a token says the server knows about `record`'s host: its verified
+/// tags and the reserved labels of its trust context.
+fn attributes_of(
+    record: &crate::store::HostRecord,
+    trusted: &buckle_core::selectors::HostContext,
+) -> crate::identity::Attributes {
+    crate::identity::Attributes {
+        tags: record.verified_tags.clone().unwrap_or_default(),
+        labels: record
+            .labels
+            .iter()
+            .filter(|(k, _)| trusted.host.labels.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    }
 }
 
 /// The audit detail naming the proxy a host connected through.
@@ -151,6 +170,26 @@ impl FleetService {
         match self.agents.registration {
             Registration::Auto => HostStatus::Active,
             Registration::Approve => HostStatus::Pending,
+        }
+    }
+
+    /// The status a new host starts with: `wanted`, unless the fleet
+    /// reserves labels the host has no server-set value for (`labels` are
+    /// the ones its join command brought). It then waits as pending until an
+    /// operator sets them, since selectors that decide trust read them.
+    async fn onboarding_status(
+        &self,
+        wanted: HostStatus,
+        labels: &BTreeMap<String, String>,
+    ) -> HostStatus {
+        if wanted != HostStatus::Active {
+            return wanted;
+        }
+        match crate::views::reference_revision(&self.store, &self.revisions).await {
+            Some(rev) if !crate::fleet::missing_reserved(labels, &rev.fleet).is_empty() => {
+                HostStatus::Pending
+            }
+            _ => wanted,
         }
     }
 
@@ -214,6 +253,215 @@ impl FleetService {
         }
     }
 
+    /// Audits an agent reporting a reserved label with a value other than
+    /// the server's. The report is ignored either way; the entry tells the
+    /// operator that agent.yaml and the server disagree.
+    async fn audit_label_claims(&self, host: &str) {
+        let Some(rev) = crate::views::reference_revision(&self.store, &self.revisions).await else {
+            return;
+        };
+        if rev.fleet.reserved_labels().is_empty() {
+            return;
+        }
+        let h = host.to_owned();
+        let Ok(Some(record)) = self.store.call(move |db| db.hosts().get(&h)).await else {
+            return;
+        };
+        let conflicts = crate::fleet::label_conflicts(&record, &rev.fleet);
+        let what = conflicts
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !self
+            .guard
+            .disagrees(&format!("{host}/labels"), what.clone())
+        {
+            return;
+        }
+        tracing::warn!(buckle.host = %host, reported = %what, "the agent reports reserved labels the server does not set that way; they are ignored");
+        self.audit_entry(NewAudit {
+            at: self.now(),
+            actor: host.to_owned(),
+            action: "host.label_conflict".into(),
+            outcome: "ignored".into(),
+            subject: Some(host.to_owned()),
+            message: format!(
+                "{host} reports {what}, but only the server sets reserved labels; its report is ignored"
+            ),
+            detail: Some(serde_json::json!({ "reported": conflicts, "server": record.labels })),
+            trace_id: None,
+        })
+        .await;
+    }
+
+    /// Audits an agent reporting Tailscale tags other than the ones the
+    /// server's own tailscaled verified for it. Selectors read the verified
+    /// ones either way.
+    async fn audit_tag_claims(&self, host: &str, facts: &serde_json::Value) {
+        let h = host.to_owned();
+        let Ok(Some(record)) = self.store.call(move |db| db.hosts().get(&h)).await else {
+            return;
+        };
+        let Some(verified) = &record.verified_tags else {
+            return;
+        };
+        let Some(reported) =
+            buckle_core::selectors::lookup_path(facts, buckle_core::selectors::VERIFIED_TAGS_FACT)
+        else {
+            return;
+        };
+        let mut reported: Vec<String> = reported
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        reported.sort();
+        let mut known = verified.clone();
+        known.sort();
+        let what = if reported == known {
+            String::new()
+        } else {
+            format!("[{}] against [{}]", reported.join(", "), known.join(", "))
+        };
+        if !self.guard.disagrees(&format!("{host}/tags"), what) {
+            return;
+        }
+        tracing::warn!(buckle.host = %host, ?reported, verified = ?known, "the agent reports Tailscale tags the tailnet does not confirm; the verified ones are used");
+        self.audit_entry(NewAudit {
+            at: self.now(),
+            actor: host.to_owned(),
+            action: "host.tags_mismatch".into(),
+            outcome: "ignored".into(),
+            subject: Some(host.to_owned()),
+            message: format!(
+                "{host} reports the Tailscale tags [{}], but the tailnet says [{}]; the verified tags are used",
+                reported.join(", "),
+                known.join(", ")
+            ),
+            detail: Some(serde_json::json!({ "reported": reported, "verified": known })),
+            trace_id: None,
+        })
+        .await;
+    }
+
+    /// `IssueIdentity` for an audience `fleet.identities` names: a token for
+    /// a system that is not a cluster target, granted to the hosts the
+    /// entry's `hosts` selects in their trust context.
+    async fn issue_audience_identity(
+        &self,
+        host: String,
+        req: IssueIdentityRequest,
+    ) -> Result<Response<IssuedIdentity>, Status> {
+        if !req.target.is_empty() {
+            return Err(Status::invalid_argument(
+                "name a cluster target or an audience, not both",
+            ));
+        }
+        let revision = if req.revision.is_empty() {
+            self.store
+                .call(|db| db.kv().get(crate::store::kv::keys::STABLE_REVISION))
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| Status::failed_precondition("the fleet has no stable revision"))?
+        } else {
+            req.revision.clone()
+        };
+        self.entitled_to(&host, &revision).await?;
+        let h = host.clone();
+        let (record, clusters) = self
+            .store
+            .call(move |db| Ok((db.hosts().get(&h)?, db.hosts().clusters()?)))
+            .await
+            .map_err(internal)?;
+        let record = record.ok_or_else(|| Status::unauthenticated("unknown host"))?;
+        let loaded = self
+            .revisions
+            .load(&revision)
+            .await
+            .map_err(|_| Status::not_found("no such revision"))?;
+        let name = req.audience.clone();
+        let denied = |reason: String| NewAudit {
+            at: self.now(),
+            actor: host.clone(),
+            action: "identity.denied".into(),
+            outcome: "denied".into(),
+            subject: Some(name.clone()),
+            message: format!("{host} was refused an identity for the audience {name}: {reason}"),
+            detail: Some(serde_json::json!({ "audience": name, "revision": revision })),
+            trace_id: None,
+        };
+        let Some(decl) = loaded.fleet.fleet.identities.get(&name) else {
+            let reason = format!("revision {revision} declares no identity {name}");
+            self.audit_entry(denied(reason.clone())).await;
+            return Err(Status::not_found(reason));
+        };
+        let audience = decl.audience(&name).to_owned();
+        // A cluster's auth method takes any token whose audience is its
+        // name: never sign one that was not authorised as its credential.
+        if loaded.fleet.fleet.clusters.contains_key(&audience)
+            || clusters.iter().any(|c| c.id == audience)
+        {
+            let reason = format!("the audience {audience} is a cluster target");
+            self.audit_entry(denied(reason.clone())).await;
+            return Err(Status::permission_denied(reason));
+        }
+        let trusted = crate::fleet::trust_context(&record, &loaded.fleet);
+        if !trusted.matches(&decl.hosts) {
+            let reason = format!("{host} is not one of the hosts of the identity {name}");
+            self.audit_entry(denied(reason.clone())).await;
+            return Err(Status::permission_denied(reason));
+        }
+        let grant = crate::identity::AudienceGrant {
+            host: host.clone(),
+            audience,
+            attributes: attributes_of(&record, &trusted),
+        };
+        let issued = self
+            .identity
+            .issue_for_audience(&grant, self.now())
+            .map_err(internal)?;
+        tracing::info!(
+            buckle.host = %host,
+            audience = %grant.audience,
+            jti = %issued.id,
+            "identity issued"
+        );
+        self.audit_entry(NewAudit {
+            at: issued.issued_at,
+            actor: host.clone(),
+            action: "identity.issued".into(),
+            outcome: "ok".into(),
+            subject: Some(name.clone()),
+            message: format!(
+                "{host} was issued an identity for the audience {} until {}",
+                grant.audience,
+                issued.expires_at.format("%H:%M:%S UTC")
+            ),
+            detail: Some(serde_json::json!({
+                "jti": issued.id,
+                "audience": grant.audience,
+                "revision": revision,
+                "expires_at": issued.expires_at,
+            })),
+            trace_id: None,
+        })
+        .await;
+        Ok(Response::new(IssuedIdentity {
+            token: issued.token,
+            expires_at: Some(prost_types::Timestamp {
+                seconds: issued.expires_at.timestamp(),
+                nanos: 0,
+            }),
+            issuer: self.identity.issuer().to_owned(),
+            audience: grant.audience,
+            id: issued.id,
+        }))
+    }
+
     /// Authenticates a session from its Hello. `Err` carries the rejection.
     async fn authenticate(
         &self,
@@ -272,9 +520,14 @@ impl FleetService {
                     } else {
                         HostStatus::Pending
                     };
+                    let labels = joined
+                        .as_ref()
+                        .map(|j| j.labels.clone())
+                        .unwrap_or_default();
+                    let status = self.onboarding_status(status, &labels).await;
                     let created = self
                         .store
-                        .call(move |db| match db.hosts().get(&id)? {
+                        .transaction(move |db| match db.hosts().get(&id)? {
                             // Enrolled with a token: the token is its identity,
                             // not whichever tailnet node carries its name.
                             Some(h) if h.token_hash.is_some() => Ok(None),
@@ -287,6 +540,9 @@ impl FleetService {
                                     auth_method: "tailscale".into(),
                                     at: now,
                                 })?;
+                                if !labels.is_empty() {
+                                    db.hosts().set_labels(&id, &labels)?;
+                                }
                                 Ok(Some((status, true)))
                             }
                         })
@@ -334,6 +590,7 @@ impl FleetService {
                         host: identity.node,
                         issued_token: None,
                         status: created.0,
+                        tags: Some(identity.tags),
                     });
                 }
                 Ok(None) => {}
@@ -466,6 +723,7 @@ impl FleetService {
             host: hello.host_id.clone(),
             issued_token: Some(issued),
             status,
+            tags: None,
         })
     }
 
@@ -511,6 +769,7 @@ impl FleetService {
                 host: host.id,
                 issued_token: None,
                 status: host.status,
+                tags: None,
             });
         }
         // Anything that is not a per-host token is an enrolment attempt;
@@ -546,6 +805,11 @@ impl FleetService {
         } else {
             self.initial_status()
         };
+        let labels = joined
+            .as_ref()
+            .map(|j| j.labels.clone())
+            .unwrap_or_default();
+        let status = self.onboarding_status(status, &labels).await;
         let now = self.now();
         let outcome = self
             .store
@@ -563,6 +827,9 @@ impl FleetService {
                         auth_method: "token".into(),
                         at: now,
                     })?;
+                    if !labels.is_empty() {
+                        db.hosts().set_labels(&id, &labels)?;
+                    }
                     Ok(Ok(status))
                 }
             })
@@ -597,6 +864,7 @@ impl FleetService {
                     host: hello.host_id.clone(),
                     issued_token: Some(issued),
                     status,
+                    tags: None,
                 })
             }
         }
@@ -615,14 +883,20 @@ impl FleetService {
                     "this tailnet node is not trusted as an agent",
                 ));
             }
-            let node = identity.node.clone();
+            let (node, tags) = (identity.node.clone(), identity.tags.clone());
             let token_enrolled = self
                 .store
                 .call(move |db| {
-                    Ok(db
+                    let token_enrolled = db
                         .hosts()
                         .get(&node)?
-                        .is_some_and(|h| h.token_hash.is_some()))
+                        .is_some_and(|h| h.token_hash.is_some());
+                    if !token_enrolled {
+                        // Whois just answered: a tag changed since the
+                        // session began counts from this call on.
+                        db.hosts().set_verified_tags(&node, Some(&tags))?;
+                    }
+                    Ok(token_enrolled)
                 })
                 .await
                 .map_err(internal)?;
@@ -708,7 +982,8 @@ impl FleetService {
             // An in-cluster executor runs no modules, so it holds no host secrets.
             (Some(rev), HostStatus::Active) if record.executor_of().is_none() => {
                 let ctx = crate::fleet::record_context(&record, &facts, &rev.fleet);
-                Some(self.secrets.for_host(rev, &ctx).await)
+                let trusted = crate::fleet::trust_context(&record, &rev.fleet);
+                Some(self.secrets.for_host(rev, &ctx, &trusted).await)
             }
             _ => Some(SecretBundle::default()),
         };
@@ -730,7 +1005,7 @@ impl FleetService {
             session_id: session_id.to_string(),
             stable_revision: stable.map(|r| r.id.0.clone()).unwrap_or_default(),
             issued_token: authed.issued_token.clone().unwrap_or_default(),
-            labels: record.effective_labels().into_iter().collect(),
+            labels: record.labels.clone().into_iter().collect(),
             status: status_str(record.status).into(),
             secrets,
         }
@@ -837,6 +1112,9 @@ impl FleetService {
             agent_message::Msg::Facts(f) => {
                 let facts: serde_json::Value =
                     serde_json::from_slice(&f.json).unwrap_or(serde_json::Value::Null);
+                if f.target.is_empty() {
+                    self.audit_tag_claims(host, &facts).await;
+                }
                 self.store
                     .call(move |db| db.hosts().record_facts(&h, &facts, now))
                     .await
@@ -1489,8 +1767,10 @@ impl Fleet for FleetService {
         let abandoned = {
             let (h, hello2) = (host.clone(), hello.clone());
             let labels: BTreeMap<String, String> = hello.labels.clone().into_iter().collect();
+            let tags = authed.tags.clone();
             self.store
                 .call(move |db| {
+                    db.hosts().set_verified_tags(&h, tags.as_deref())?;
                     db.hosts().record_hello(
                         &h,
                         &hello2.agent_version,
@@ -1522,6 +1802,7 @@ impl Fleet for FleetService {
                 progress: crate::views::finished_progress(&run, None),
             });
         }
+        self.audit_label_claims(&host).await;
         let (session_id, rx) = self.sessions.attach(&host);
         let closed = self.guard.sessions.register(&host, session_id);
         let welcome = self.welcome(&host, &authed, session_id).await;
@@ -1664,7 +1945,11 @@ impl Fleet for FleetService {
             .await
             .map_err(|_| Status::not_found("no such revision"))?;
         let ctx = crate::fleet::record_context(&record, &facts, &revision.fleet);
-        let bundle = self.secrets.fetch(&revision, &ctx, &req.names).await;
+        let trusted = crate::fleet::trust_context(&record, &revision.fleet);
+        let bundle = self
+            .secrets
+            .fetch(&revision, &ctx, &trusted, &req.names)
+            .await;
         tracing::info!(buckle.host = %host, requested = req.names.len(), granted = bundle.secrets.len(), "secrets fetched");
         Ok(Response::new(bundle))
     }
@@ -1677,6 +1962,9 @@ impl Fleet for FleetService {
         use buckle_proto::v1::IdentityPurpose;
         let host = self.caller(&request).await?;
         let req = request.into_inner();
+        if !req.audience.is_empty() {
+            return self.issue_audience_identity(host, req).await;
+        }
         let purpose = match req.purpose() {
             IdentityPurpose::Read => Purpose::Read,
             IdentityPurpose::Deploy => Purpose::Deploy,
@@ -1723,6 +2011,7 @@ impl Fleet for FleetService {
             &facts.unwrap_or(serde_json::Value::Null),
             &loaded.fleet,
         );
+        let trusted = crate::fleet::trust_context(&record, &loaded.fleet);
         let denied = |reason: String| NewAudit {
             at: self.now(),
             actor: host.clone(),
@@ -1742,7 +2031,7 @@ impl Fleet for FleetService {
             self.audit_entry(denied(reason.clone())).await;
             return Err(Status::not_found(reason));
         };
-        if let Err(reason) = trust.authorise(&ctx, purpose) {
+        if let Err(reason) = trust.authorise(&ctx, &trusted, purpose) {
             self.audit_entry(denied(reason.clone())).await;
             return Err(Status::permission_denied(reason));
         }
@@ -1752,6 +2041,7 @@ impl Fleet for FleetService {
             cluster: trust.cluster.clone(),
             purpose,
             rollout: (!req.rollout_id.is_empty()).then(|| req.rollout_id.clone()),
+            attributes: attributes_of(&record, &trusted),
         };
         let issued = self.identity.issue(&grant, self.now()).map_err(internal)?;
         tracing::info!(

@@ -185,11 +185,14 @@ pub struct TargetChecks<'a> {
     pub checks: &'a [HostCheck],
 }
 
-/// A host refused a cluster identity, with no grant for it since.
+/// A host refused an identity, with no grant for it since.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityRefusal {
     pub host: String,
+    /// The cluster target, or the `fleet.identities` entry when `purpose`
+    /// is empty.
     pub target: String,
+    /// What the cluster credential was for; empty for an audience identity.
     pub purpose: String,
     pub reason: String,
     pub at: DateTime<Utc>,
@@ -407,24 +410,38 @@ pub fn build(inputs: &AttentionInputs<'_>, now: DateTime<Utc>) -> Vec<AttentionI
         if now - r.at > Duration::seconds(REFUSAL_ATTENTION) {
             continue;
         }
-        let kind = inputs
-            .clusters
-            .iter()
-            .find(|c| c.id == r.target)
-            .map(AttentionSubject::of)
-            .unwrap_or_else(|| AttentionSubject::new(SubjectKind::Cluster, r.target.clone()));
-        out.push(
-            AttentionItem::new(
-                K::IdentityRefused,
-                T::Warn,
-                kind,
-                &format!("{}/{}", r.host, r.purpose),
+        // An audience identity belongs to no cluster: it is the host's.
+        let (subject, key, summary) = if r.purpose.is_empty() {
+            (
+                inputs
+                    .hosts
+                    .iter()
+                    .find(|h| h.id == r.host)
+                    .map(AttentionSubject::of)
+                    .unwrap_or_else(|| AttentionSubject::new(SubjectKind::Host, r.host.clone())),
+                r.target.clone(),
+                format!("refused the {} identity: {}", r.target, r.reason),
+            )
+        } else {
+            (
+                inputs
+                    .clusters
+                    .iter()
+                    .find(|c| c.id == r.target)
+                    .map(AttentionSubject::of)
+                    .unwrap_or_else(|| {
+                        AttentionSubject::new(SubjectKind::Cluster, r.target.clone())
+                    }),
+                format!("{}/{}", r.host, r.purpose),
                 format!(
                     "{} was refused a {} identity: {}",
                     r.host, r.purpose, r.reason
                 ),
             )
-            .since(Some(r.at)),
+        };
+        out.push(
+            AttentionItem::new(K::IdentityRefused, T::Warn, subject, &key, summary)
+                .since(Some(r.at)),
         );
     }
 
@@ -546,6 +563,8 @@ mod tests {
             agent_labels: Default::default(),
             labels: Default::default(),
             effective_labels: Default::default(),
+            reserved_labels: Vec::new(),
+            verified_tags: None,
             groups: vec![],
             platform: None,
             arch: None,
@@ -831,6 +850,12 @@ mod tests {
                 target: "old".into(),
                 ..refusal(now - Duration::days(2))
             },
+            // An audience identity (`fleet.identities`) is the host's own.
+            IdentityRefusal {
+                target: "vault".into(),
+                purpose: String::new(),
+                ..refusal(now)
+            },
         ];
         let webhooks = [WebhookFailure {
             name: "automate".into(),
@@ -852,11 +877,12 @@ mod tests {
             .iter()
             .map(|i| (i.kind, i.subject.id.as_str()))
             .collect();
-        assert_eq!(kinds.len(), 4, "{kinds:?}");
+        assert_eq!(kinds.len(), 5, "{kinds:?}");
         for want in [
             (AttentionKind::RolloutPaused, "42"),
             (AttentionKind::ScheduleSkipped, "backup"),
             (AttentionKind::IdentityRefused, "home-nomad"),
+            (AttentionKind::IdentityRefused, "pi-1"),
             (AttentionKind::WebhookFailing, "automate"),
         ] {
             assert!(kinds.contains(&want), "{want:?} in {kinds:?}");

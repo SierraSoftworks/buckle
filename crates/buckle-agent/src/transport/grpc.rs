@@ -400,13 +400,26 @@ impl Transport for GrpcTransport {
     ) -> buckle_core::Result<crate::identity::IssuedIdentity> {
         use crate::identity::Purpose;
         let token = self.token();
+        // An audience identity names a `fleet.identities` entry and has no
+        // cluster target or purpose.
+        let audience = request.purpose == Purpose::Audience;
         let message = pb::IssueIdentityRequest {
-            target: request.target.clone(),
+            target: if audience {
+                String::new()
+            } else {
+                request.target.clone()
+            },
+            audience: if audience {
+                request.target.clone()
+            } else {
+                String::new()
+            },
             purpose: match request.purpose {
                 Purpose::Read => pb::IdentityPurpose::Read,
                 Purpose::Deploy => pb::IdentityPurpose::Deploy,
                 Purpose::Drain => pb::IdentityPurpose::Drain,
                 Purpose::Acl => pb::IdentityPurpose::Acl,
+                Purpose::Audience => pb::IdentityPurpose::Unspecified,
             } as i32,
             revision: request
                 .revision
@@ -421,9 +434,15 @@ impl Transport for GrpcTransport {
             .await
             .map_err(|status| {
                 let advice: &[&str] = match status.code() {
-                    tonic::Code::PermissionDenied | tonic::Code::NotFound => &[
-                        "Check the cluster's `nodes` and `executors` selectors and its `identity` in buckle.yaml.",
+                    tonic::Code::PermissionDenied | tonic::Code::NotFound if audience => &[
+                        "Check the entry under `fleet.identities` in buckle.yaml and its `hosts` selector, which reads only `host.id`, verified tags and reserved labels.",
                     ],
+                    tonic::Code::PermissionDenied | tonic::Code::NotFound => &[
+                        "Check the cluster's `nodes` and `executors` selectors and its `identity` in buckle.yaml. `executors` reads only `host.id`, verified tags and reserved labels.",
+                    ],
+                    tonic::Code::InvalidArgument if audience => {
+                        &["Upgrade the Buckle server; it predates `fleet.identities`."]
+                    }
                     tonic::Code::Unimplemented => {
                         &["Upgrade the Buckle server; it predates cluster identities."]
                     }

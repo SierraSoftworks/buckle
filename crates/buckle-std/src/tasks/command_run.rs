@@ -39,6 +39,14 @@ use tracing::instrument;
 ///       env: NOMAD_TOKEN                     # the variable it is passed in (default)
 /// ```
 ///
+/// ```yaml
+/// - command.run:
+///     run: ["vault", "write", "-field=token", "auth/jwt/login", "role=host", "jwt=@/dev/stdin"]
+///     identity:
+///       audience: vault                      # a fleet.identities entry, instead of `cluster`
+///       env: BUCKLE_IDENTITY                 # the variable the token is passed in (default)
+/// ```
+///
 /// **Planning.** `creates` existing, `unless` exiting 0 or `only_if` exiting
 /// non-zero all make the plan a no-op. The `unless` and `only_if` probes run in
 /// plan mode too, so they must be read-only. A command with none of `creates`,
@@ -80,6 +88,14 @@ use tracing::instrument;
 /// cleanup command does not receive it. Local runs have no server to ask, so
 /// the task fails there.
 ///
+/// **Other identities.** With `identity.audience` in place of `cluster`, the
+/// agent asks for a token for that `fleet.identities` entry and passes the
+/// JWT itself in `env` (`BUCKLE_IDENTITY` by default), for the command to
+/// log in to whatever verifies it (a secrets store's JWT auth). The server
+/// issues it to the hosts the entry's `hosts` selects. It carries the host's
+/// verified tags and reserved labels, and is handled as the cluster
+/// credential is.
+///
 /// **Resource identity.** The resource is keyed by its rendered command, so editing the
 /// command or a var inside it re-keys it (a removal plus an addition). Give a
 /// templated command, or one with `remove`, a stable task `id`.
@@ -120,23 +136,31 @@ pub struct Spec {
     /// Whether output is recorded on the task's span.
     #[serde(default)]
     pub capture: Capture,
-    /// A cluster credential passed to the command and its probes.
-    #[serde(default)]
+    /// A cluster credential, or a token for another audience, passed to the
+    /// command and its probes.
+    #[serde(default, deserialize_with = "Identity::one_subject")]
     pub identity: Option<Identity>,
 }
 
-/// A cluster credential for the command (`identity`).
+/// A Buckle-issued identity for the command (`identity`): a credential for
+/// `cluster`, or a token for `audience`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
     /// The cluster target, as `fleet.clusters` names it.
-    pub cluster: String,
-    /// What the credential may do; the cluster's binding rules map it to permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    /// Instead of `cluster`: an entry of `fleet.identities`, whose token is
+    /// passed as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// What a cluster credential may do; the cluster's binding rules map it to permissions.
     #[serde(default)]
     pub purpose: Purpose,
-    /// The environment variable the credential is passed in.
-    #[serde(default = "Identity::default_env")]
-    pub env: String,
+    /// The environment variable it is passed in: `NOMAD_TOKEN` for a
+    /// cluster credential and `BUCKLE_IDENTITY` for an audience, unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
     /// `nomad` (default) or `kubernetes`.
     #[serde(default = "Identity::default_kind")]
     #[schemars(with = "String")]
@@ -147,8 +171,34 @@ pub struct Identity {
 }
 
 impl Identity {
-    fn default_env() -> String {
-        "NOMAD_TOKEN".into()
+    /// Parses `identity`, which names a `cluster` or an `audience`, not both.
+    fn one_subject<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Option<Self>, D::Error> {
+        let identity = Option::<Self>::deserialize(d)?;
+        match &identity {
+            Some(i) if i.cluster.is_some() == i.audience.is_some() => Err(
+                serde::de::Error::custom("`identity` names either a `cluster` or an `audience`"),
+            ),
+            _ => Ok(identity),
+        }
+    }
+
+    /// What the identity is for: the cluster target, or the audience's name.
+    fn subject(&self) -> &str {
+        self.cluster
+            .as_deref()
+            .or(self.audience.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// The environment variable the command receives it in.
+    fn env(&self) -> String {
+        match (&self.env, &self.audience) {
+            (Some(env), _) => env.clone(),
+            (None, Some(_)) => "BUCKLE_IDENTITY".into(),
+            (None, None) => "NOMAD_TOKEN".into(),
+        }
     }
 
     fn default_kind() -> buckle_core::model::ClusterKind {
@@ -330,7 +380,7 @@ impl CommandRun {
             field.inject_env(&mut command, name.clone(), &cx.templater, &cx.host)?;
         }
         if let (Some(identity), Some(credential)) = (&spec.identity, credential) {
-            ProcessEnvSink.inject_credential(&mut command, identity.env.clone(), credential);
+            ProcessEnvSink.inject_credential(&mut command, identity.env(), credential);
         }
         Ok(command)
     }
@@ -344,7 +394,7 @@ impl CommandRun {
             error::user(
                 format!(
                     "command.run asks for a credential for {}, which only an enrolled agent can obtain.",
-                    identity.cluster
+                    identity.subject()
                 ),
                 &["Run it through the Buckle server, or remove `identity` for local runs."],
             )
@@ -357,8 +407,11 @@ impl CommandRun {
             return Ok(None);
         };
         let request = CredentialRequest {
-            target: identity.cluster.clone(),
-            purpose: identity.purpose.as_str().to_owned(),
+            target: identity.subject().to_owned(),
+            purpose: match identity.audience {
+                Some(_) => "audience".to_owned(),
+                None => identity.purpose.as_str().to_owned(),
+            },
             kind: identity.kind,
             api: identity.api.clone(),
         };
@@ -1006,6 +1059,7 @@ mod tests {
     #[case::bad_timeout(json!({"run": ["x"], "timeout": "soon"}))]
     #[case::bad_purpose(json!({"run": ["x"], "identity": {"cluster": "c", "purpose": "admin"}}))]
     #[case::identity_without_cluster(json!({"run": ["x"], "identity": {}}))]
+    #[case::identity_for_both(json!({"run": ["x"], "identity": {"cluster": "c", "audience": "vault"}}))]
     fn invalid_specs_fail_to_parse(#[case] raw: serde_json::Value) {
         assert!(serde_json::from_value::<Spec>(raw).is_err());
     }
@@ -1240,6 +1294,42 @@ mod tests {
                 "drain",
                 buckle_core::model::ClusterKind::Nomad
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn an_audience_identity_is_passed_to_the_command_as_issued() {
+        let sys = FakeSystem::new().on_command_ok("vault-login", &[], "");
+        let clusters = Arc::new(Clusters::default());
+        let spec = spec(json!({
+            "run": ["vault-login"],
+            "changed_when": "never",
+            "identity": {"audience": "vault"},
+        }));
+        let planned = CommandRun
+            .plan(
+                &cluster_cx(&sys, &clusters, buckle_core::task::Mode::Plan),
+                &spec,
+            )
+            .await
+            .unwrap();
+        CommandRun
+            .apply(
+                &cluster_cx(&sys, &clusters, buckle_core::task::Mode::Apply),
+                &spec,
+                &planned,
+            )
+            .await
+            .unwrap();
+        let ran = sys.commands_run();
+        assert_eq!(
+            ran[0].env.get("BUCKLE_IDENTITY").map(String::as_str),
+            Some("acl-secret")
+        );
+        let requests = clusters.requests.lock().unwrap();
+        assert_eq!(
+            (requests[0].target.as_str(), requests[0].purpose.as_str()),
+            ("vault", "audience")
         );
     }
 

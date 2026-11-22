@@ -13,7 +13,11 @@
 //!   PEM (Nomad's `JWTValidationPubKeys` takes them without any URL).
 //! * Tokens: `iss` the configured issuer, `sub` the host, `aud` the target,
 //!   with `purpose`, `target`, `cluster` and `rollout` claims for binding
-//!   rules and RBAC.
+//!   rules and RBAC, and the host's verified `tags` and reserved `labels`,
+//!   which only the server sets.
+//! * Other audiences: `fleet.identities` names tokens for systems that are
+//!   not cluster targets (a secrets store). They carry `host`, `tags` and
+//!   `labels` and no cluster claims.
 
 use crate::config::IdentityConfig;
 use base64::Engine as _;
@@ -73,6 +77,27 @@ pub struct Grant {
     pub purpose: Purpose,
     /// The rollout the credential serves, when one does.
     pub rollout: Option<String>,
+    pub attributes: Attributes,
+}
+
+/// What the server itself knows about a host, carried in every token so the
+/// system verifying it can bind on either: the ACL tags the server's
+/// tailscaled reported (none for a host not authenticated over the tailnet)
+/// and the host's reserved labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attributes {
+    pub tags: Vec<String>,
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// A token for an audience `fleet.identities` names, already authorised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudienceGrant {
+    /// The host the token speaks for (`sub`).
+    pub host: String,
+    /// The token's `aud`.
+    pub audience: String,
+    pub attributes: Attributes,
 }
 
 /// How a cluster target lets hosts obtain credentials for it: the part of
@@ -85,18 +110,26 @@ pub struct ClusterTrust {
     pub cluster: String,
     /// The cluster's member hosts: who may drain their own node.
     pub nodes: Option<buckle_core::Filter>,
-    /// Who may read and deploy (defaults to `nodes`).
+    /// Who may read and deploy (defaults to `nodes`): a trust selector.
     pub executors: Option<buckle_core::Filter>,
+    /// Whether this is a scoped target on a shared cluster. Managing the
+    /// cluster's ACLs belongs to the cluster itself, never to a part of it.
+    pub scoped: bool,
     /// Whether the target trusts Buckle-issued tokens (`identity:
     /// buckle_jwt`); other modes never get one.
     pub buckle_jwt: bool,
 }
 
 impl ClusterTrust {
-    /// Why `ctx`'s host may not have a `purpose` credential, or `Ok`.
+    /// Why the host may not have a `purpose` credential, or `Ok`. `ctx` is
+    /// the host's selector context, which decides whether it is a node;
+    /// `trusted` its trust context ([`crate::fleet::trust_context`]), which
+    /// decides whether it is an executor: what its agent reports plays no
+    /// part in that.
     pub fn authorise(
         &self,
         ctx: &buckle_core::selectors::HostContext,
+        trusted: &buckle_core::selectors::HostContext,
         purpose: Purpose,
     ) -> std::result::Result<(), String> {
         if !self.buckle_jwt {
@@ -105,10 +138,17 @@ impl ClusterTrust {
                 self.target
             ));
         }
-        let (selector, role) = match purpose {
-            Purpose::Drain => (self.nodes.as_ref(), "a node of"),
+        if purpose == Purpose::Acl && self.scoped {
+            return Err(format!(
+                "{} is a scoped target; ACL policies are managed through its cluster {}",
+                self.target, self.cluster
+            ));
+        }
+        let (selector, ctx, role) = match purpose {
+            Purpose::Drain => (self.nodes.as_ref(), ctx, "a node of"),
             Purpose::Read | Purpose::Deploy | Purpose::Acl => (
                 self.executors.as_ref().or(self.nodes.as_ref()),
+                trusted,
                 "an executor for",
             ),
         };
@@ -140,8 +180,24 @@ pub struct Claims {
     pub nbf: i64,
     pub exp: i64,
     pub jti: String,
-    pub purpose: Purpose,
     pub host: String,
+    /// The ACL tags the server verified for the host; empty when it was not
+    /// authenticated over the tailnet.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// The host's reserved labels, as set on the server.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// Present on a cluster credential, absent on a token for a
+    /// `fleet.identities` audience.
+    #[serde(flatten)]
+    pub cluster: Option<ClusterClaims>,
+}
+
+/// The claims of a cluster credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterClaims {
+    pub purpose: Purpose,
     pub target: String,
     pub cluster: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,22 +352,49 @@ impl Issuer {
 
     /// Signs a token for `grant`, valid from `now` for the configured TTL.
     pub fn issue(&self, grant: &Grant, now: DateTime<Utc>) -> Result<Issued> {
+        self.sign(
+            &grant.host,
+            &grant.target,
+            &grant.attributes,
+            Some(ClusterClaims {
+                purpose: grant.purpose,
+                target: grant.target.clone(),
+                cluster: grant.cluster.clone(),
+                rollout: grant.rollout.clone(),
+            }),
+            now,
+        )
+    }
+
+    /// Signs a token for an audience `fleet.identities` names, valid from
+    /// `now` for the configured TTL.
+    pub fn issue_for_audience(&self, grant: &AudienceGrant, now: DateTime<Utc>) -> Result<Issued> {
+        self.sign(&grant.host, &grant.audience, &grant.attributes, None, now)
+    }
+
+    fn sign(
+        &self,
+        host: &str,
+        audience: &str,
+        attributes: &Attributes,
+        cluster: Option<ClusterClaims>,
+        now: DateTime<Utc>,
+    ) -> Result<Issued> {
         let ttl = chrono::Duration::from_std(self.ttl).unwrap_or(chrono::Duration::minutes(15));
         let expires_at = now + ttl;
         let id = uuid::Uuid::new_v4().to_string();
         let claims = Claims {
             iss: self.issuer.clone(),
-            sub: grant.host.clone(),
-            aud: grant.target.clone(),
+            sub: host.to_owned(),
+            aud: audience.to_owned(),
             iat: now.timestamp(),
             nbf: now.timestamp(),
             exp: expires_at.timestamp(),
             jti: id.clone(),
-            purpose: grant.purpose,
-            host: grant.host.clone(),
-            target: grant.target.clone(),
-            cluster: grant.cluster.clone(),
-            rollout: grant.rollout.clone(),
+            host: host.to_owned(),
+            tags: attributes.tags.clone(),
+            labels: attributes.labels.clone(),
+            cluster,
         };
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(self.current.kid.clone());
@@ -351,7 +434,7 @@ impl Issuer {
             "id_token_signing_alg_values_supported": [ALGORITHM],
             "claims_supported": [
                 "iss", "sub", "aud", "iat", "nbf", "exp", "jti",
-                "purpose", "host", "target", "cluster", "rollout",
+                "purpose", "host", "target", "cluster", "rollout", "tags", "labels",
             ],
         })
     }
@@ -382,6 +465,14 @@ mod tests {
             cluster: "home-nomad".into(),
             purpose,
             rollout: Some("r-1".into()),
+            attributes: attributes(),
+        }
+    }
+
+    fn attributes() -> Attributes {
+        Attributes {
+            tags: vec!["tag:z2".into()],
+            labels: [("zone".to_owned(), "home".to_owned())].into(),
         }
     }
 
@@ -416,10 +507,41 @@ mod tests {
         let issued = issuer.issue(&grant(purpose), Utc::now()).unwrap();
         let claims = verify(&issuer, &issued.token, "home-nomad").expect("valid");
         assert_eq!(claims.sub, "pi-1");
-        assert_eq!(claims.purpose, purpose);
-        assert_eq!(claims.rollout.as_deref(), Some("r-1"));
+        let cluster = claims.cluster.expect("a cluster credential");
+        assert_eq!(cluster.purpose, purpose);
+        assert_eq!(cluster.rollout.as_deref(), Some("r-1"));
         assert_eq!(claims.jti, issued.id);
         assert_eq!(claims.exp - claims.iat, 15 * 60, "the default TTL");
+        assert_eq!(claims.tags, ["tag:z2"]);
+        assert_eq!(claims.labels["zone"], "home");
+    }
+
+    #[test]
+    fn a_token_for_a_named_audience_carries_no_cluster_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::load(dir.path(), &config(), "buckle".into()).unwrap();
+        let grant = AudienceGrant {
+            host: "pi-1".into(),
+            audience: "vault".into(),
+            attributes: attributes(),
+        };
+        let issued = issuer.issue_for_audience(&grant, Utc::now()).unwrap();
+        let claims = verify(&issuer, &issued.token, "vault").expect("valid");
+        assert_eq!(claims.sub, "pi-1");
+        assert_eq!(claims.tags, ["tag:z2"]);
+        assert_eq!(claims.labels["zone"], "home");
+        assert_eq!(claims.cluster, None);
+        let raw: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(issued.token.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            raw.get("purpose").is_none(),
+            "no binding rule on purpose can match: {raw}"
+        );
+        assert!(verify(&issuer, &issued.token, "home-nomad").is_err());
     }
 
     #[test]
@@ -483,6 +605,7 @@ mod tests {
             cluster: "home-nomad".into(),
             nodes: f(nodes),
             executors: f(executors),
+            scoped: false,
             buckle_jwt,
         }
     }
@@ -511,13 +634,49 @@ mod tests {
         #[case] granted: bool,
     ) {
         let t = trust(Some(NODES), executors, true);
-        assert_eq!(t.authorise(&host(id), purpose).is_ok(), granted);
+        assert_eq!(t.authorise(&host(id), &host(id), purpose).is_ok(), granted);
+    }
+
+    /// What the agent reports (`ctx`) may make a host a node, never an
+    /// executor: that reads the trust context alone.
+    #[rstest]
+    #[case::reported_role_drains(Purpose::Drain, true)]
+    #[case::reported_role_cannot_read(Purpose::Read, false)]
+    #[case::reported_role_cannot_deploy(Purpose::Deploy, false)]
+    #[case::reported_role_cannot_manage_acls(Purpose::Acl, false)]
+    fn executors_are_decided_on_what_the_server_verified(
+        #[case] purpose: Purpose,
+        #[case] granted: bool,
+    ) {
+        let role = r#"host.labels.role == "nomad""#;
+        let t = trust(Some(role), None, true);
+        let mut reported = host("pi-1");
+        reported
+            .host
+            .labels
+            .insert("role".into(), serde_json::json!("nomad"));
+        let verified =
+            buckle_core::selectors::HostContext::trusted("pi-1", None, Default::default());
+        assert_eq!(t.authorise(&reported, &verified, purpose).is_ok(), granted);
+    }
+
+    #[rstest]
+    #[case(Purpose::Acl, false)]
+    #[case(Purpose::Deploy, true)]
+    fn a_scoped_target_never_manages_acls(#[case] purpose: Purpose, #[case] granted: bool) {
+        let mut t = trust(None, Some(SERVERS), true);
+        t.target = "nomad-public".into();
+        t.scoped = true;
+        let got = t.authorise(&host("pi-1"), &host("pi-1"), purpose);
+        assert_eq!(got.is_ok(), granted, "{got:?}");
     }
 
     #[test]
     fn a_target_without_buckle_jwt_grants_nothing() {
         let t = trust(Some(NODES), None, false);
-        let err = t.authorise(&host("pi-1"), Purpose::Read).unwrap_err();
+        let err = t
+            .authorise(&host("pi-1"), &host("pi-1"), Purpose::Read)
+            .unwrap_err();
         assert!(err.contains("buckle_jwt"), "{err}");
     }
 

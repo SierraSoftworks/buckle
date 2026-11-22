@@ -192,6 +192,8 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             }
         };
 
+    super::trust::validate_trust(&mut report, &revision.fleet);
+
     // Fleet-level text.
     for (name, selector) in &revision.fleet.fleet.groups {
         let location = format!("buckle.yaml fleet.groups.{name}");

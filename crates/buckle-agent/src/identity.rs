@@ -29,6 +29,9 @@ pub enum Purpose {
     Drain,
     /// ACL policies, for executors only: never offered to `command.run`.
     Acl,
+    /// Not a cluster credential: a token for the `fleet.identities` entry
+    /// the request's `target` names, for another system to verify.
+    Audience,
 }
 
 /// A request for an identity.
@@ -70,6 +73,9 @@ pub enum Login {
     Nomad { api: url::Url, auth_method: String },
     /// Present it as a bearer token (a JWT authenticator trusts the issuer).
     Kubernetes,
+    /// Hand the JWT over as it is: whatever asked for it does its own login
+    /// (a `fleet.identities` audience).
+    Token,
 }
 
 impl Login {
@@ -157,7 +163,7 @@ impl Login {
         identity: &IssuedIdentity,
     ) -> buckle_core::Result<Credential> {
         match self {
-            Login::Kubernetes => Ok(Credential::Bearer {
+            Login::Kubernetes | Login::Token => Ok(Credential::Bearer {
                 token: identity.token.clone(),
                 expires_at: identity.expires_at,
             }),
@@ -322,6 +328,7 @@ impl Purpose {
             "read" => Ok(Purpose::Read),
             "deploy" => Ok(Purpose::Deploy),
             "drain" => Ok(Purpose::Drain),
+            "audience" => Ok(Purpose::Audience),
             other => Err(buckle_core::error::user(
                 format!("'{other}' is not an identity purpose."),
                 &["Use read, deploy or drain."],
@@ -336,7 +343,9 @@ impl buckle_core::task::ClusterCredentials for TaskCredentials {
         &self,
         request: &buckle_core::task::CredentialRequest,
     ) -> buckle_core::Result<secrecy::SecretString> {
+        let purpose = Purpose::parse(&request.purpose)?;
         let login = match request.kind {
+            _ if purpose == Purpose::Audience => Login::Token,
             buckle_core::model::ClusterKind::Kubernetes => Login::Kubernetes,
             buckle_core::model::ClusterKind::Nomad => {
                 let address = request
@@ -366,7 +375,7 @@ impl buckle_core::task::ClusterCredentials for TaskCredentials {
             .get(
                 &IdentityRequest {
                     target: request.target.clone(),
-                    purpose: Purpose::parse(&request.purpose)?,
+                    purpose,
                     revision: self.revision.clone(),
                     rollout: None,
                 },

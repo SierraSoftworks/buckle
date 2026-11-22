@@ -957,16 +957,7 @@ async fn cluster_view(
                     // An in-cluster executor speaks for its own cluster only.
                     Some(c) => c == id || parent.as_deref() == Some(c),
                     None => match &selector {
-                        Some(f) => {
-                            let facts = db.hosts().latest_facts(&h.id)?.map(|(f, _)| f);
-                            let null = serde_json::Value::Null;
-                            crate::fleet::record_context(
-                                &h,
-                                facts.as_ref().unwrap_or(&null),
-                                &fleet,
-                            )
-                            .matches(f)
-                        }
+                        Some(f) => crate::fleet::trust_context(&h, &fleet).matches(f),
                         None => false,
                     },
                 };
@@ -1143,6 +1134,17 @@ async fn host_patch(
             })
         }
     };
+    if let Some(labels) = &patch.labels
+        && let Some(removed) = current
+            .reserved_labels
+            .iter()
+            .find(|r| r.value.is_some() && !has_label(labels, &r.key))
+    {
+        return Err(ApiError::conflict(format!(
+            "The label '{}' is reserved: trust decisions read it, so it can be changed but not removed.",
+            removed.key
+        )));
+    }
     let (i2, p2, seed) = (id.clone(), patch.clone(), current.agent_labels.clone());
     state
         .store
@@ -1170,6 +1172,14 @@ async fn host_patch(
     )
     .await;
     Ok(HttpResponse::Ok().json(host_changed(&state, &id).await?))
+}
+
+/// Whether `labels` gives `key` a value (keys compare without case, as
+/// selectors read them).
+fn has_label(labels: &std::collections::BTreeMap<String, String>, key: &str) -> bool {
+    labels
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case(key) && !v.trim().is_empty())
 }
 
 async fn host_forget(state: Data, admin: Administrative, path: web::Path<String>) -> ApiResult {
@@ -1216,6 +1226,14 @@ async fn host_action(
 ) -> ApiResult {
     let (id, action) = path.into_inner();
     let current = summary_or_404(&state, &id).await?;
+    if action == "approve"
+        && let Some(missing) = current.reserved_labels.iter().find(|r| r.value.is_none())
+    {
+        return Err(ApiError::conflict(format!(
+            "'{id}' has no value for the reserved label '{}'; set it before approving the host.",
+            missing.key
+        )));
+    }
     let target = match (action.as_str(), current.status) {
         ("approve", HostStatus::Pending) => HostStatus::Active,
         ("pause", HostStatus::Active | HostStatus::Pending) => HostStatus::Paused,
@@ -1471,9 +1489,35 @@ async fn join_create(
     body: web::Json<buckle_api::JoinRequest>,
 ) -> ApiResult {
     let actor = admin.0.actor();
+    let mut request = body.into_inner();
+    // Reserved labels are the server's to set: they are kept on the ticket
+    // and applied when the host enrols, never passed as `--label` (where
+    // the host could change them). A host cannot start without them.
+    if let Some(rev) = crate::views::reference_revision(&state.store, &state.revisions).await {
+        for key in rev.fleet.reserved_labels() {
+            let given: Vec<String> = request
+                .labels
+                .keys()
+                .filter(|k| k.eq_ignore_ascii_case(key))
+                .cloned()
+                .collect();
+            for k in given {
+                if let Some(v) = request.labels.remove(&k) {
+                    request.server_labels.entry(k).or_insert(v);
+                }
+            }
+        }
+        if let Some(missing) =
+            crate::fleet::missing_reserved(&request.server_labels, &rev.fleet).first()
+        {
+            return Err(ApiError::bad_request(format!(
+                "This fleet reserves the label '{missing}': give the new host a value for it."
+            )));
+        }
+    }
     let ticket = state
         .joins
-        .create(body.into_inner(), &actor, chrono::Utc::now())
+        .create(request, &actor, chrono::Utc::now())
         .await
         .map_err(join_error)?;
     let host = ticket.host_id.as_deref().unwrap_or("a new host");
@@ -1573,7 +1617,10 @@ async fn host_preview(
         None => (vec![], None),
     };
     Ok(HttpResponse::Ok().json(HostPreview {
-        effective_labels: host.effective_labels(),
+        effective_labels: match &fleet {
+            Some(rev) => crate::fleet::effective_labels(&host, &rev.fleet),
+            None => host.effective_labels(),
+        },
         groups,
         phase,
     }))
@@ -1780,13 +1827,17 @@ async fn host_contexts(
     ids: impl IntoIterator<Item = String>,
 ) -> Result<HashMap<String, serde_json::Value>, ApiError> {
     let ids: std::collections::BTreeSet<String> = ids.into_iter().collect();
+    let reference = crate::views::reference_revision(&state.store, &state.revisions).await;
     Ok(state
         .store
         .call(move |db| {
             let mut out = HashMap::new();
             for id in ids {
                 let facts = db.hosts().latest_facts(&id)?.map(|(f, _)| f);
-                let labels = db.hosts().get(&id)?.map(|h| h.effective_labels());
+                let labels = db.hosts().get(&id)?.map(|h| match &reference {
+                    Some(rev) => crate::fleet::effective_labels(&h, &rev.fleet),
+                    None => h.effective_labels(),
+                });
                 out.insert(
                     id.clone(),
                     serde_json::json!({

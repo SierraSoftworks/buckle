@@ -1510,6 +1510,7 @@ pub fn create_join(r: &JoinRequest) -> Result<JoinTicket, ApiError> {
         method: r.method,
         host_id: r.host_id.clone(),
         labels: r.labels.clone(),
+        server_labels: Default::default(),
         created_by: actor(),
         created_at: now,
         expires_at: now + chrono::Duration::hours(1),

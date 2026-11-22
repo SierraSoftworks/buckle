@@ -44,7 +44,7 @@ pub struct FleetConfig {
     pub vars: Vec<VarsOverlay>,
     /// Secret references by name. Values are resolved by a provider, never stored here.
     #[serde(default)]
-    pub secrets: IndexMap<String, SecretRef>,
+    pub secrets: IndexMap<String, SecretDecl>,
     #[serde(default)]
     pub rollout: RolloutPolicy,
 }
@@ -67,6 +67,11 @@ impl FleetConfig {
         }
         Ok(config)
     }
+
+    /// The label keys only the server may set (`fleet.labels.reserved`).
+    pub fn reserved_labels(&self) -> &[String] {
+        &self.fleet.labels.reserved
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -79,6 +84,47 @@ pub struct FleetSection {
     /// The clusters this repository declares as targets, by name.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub clusters: IndexMap<String, ClusterDecl>,
+    #[serde(default, skip_serializing_if = "LabelsSection::is_empty")]
+    pub labels: LabelsSection,
+    /// Identities hosts may ask the server for beyond cluster credentials,
+    /// by name: a token for another system (a secrets store, say) to verify.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub identities: IndexMap<String, IdentityDecl>,
+}
+
+/// `fleet.labels`: how host labels are governed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelsSection {
+    /// Label keys only the server sets. An agent's own value for one is
+    /// ignored, so selectors that decide trust may read it.
+    #[serde(default)]
+    pub reserved: Vec<String>,
+}
+
+impl LabelsSection {
+    pub fn is_empty(&self) -> bool {
+        self.reserved.is_empty()
+    }
+}
+
+/// One entry of `fleet.identities`: a token audience and who may ask for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityDecl {
+    /// The token's `aud`. Defaults to the entry's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// Which hosts may be issued one: a trust selector (it reads `host.id`,
+    /// verified tags and reserved labels only).
+    pub hosts: Filter,
+}
+
+impl IdentityDecl {
+    /// The `aud` of tokens issued for the entry called `name`.
+    pub fn audience<'a>(&'a self, name: &'a str) -> &'a str {
+        self.audience.as_deref().unwrap_or(name)
+    }
 }
 
 /// One entry in the `vars` list.
@@ -94,6 +140,77 @@ pub struct VarsOverlay {
     /// Inline values.
     #[serde(default)]
     pub values: IndexMap<String, serde_yaml::Value>,
+}
+
+/// One entry of `secrets`: where the value comes from, and optionally which
+/// hosts may ever receive it. Written as the reference's one-key map with
+/// `hosts` beside it: `{ env: NAME, hosts: 'host.labels.zone == "home"' }`.
+#[derive(Debug, Clone)]
+pub struct SecretDecl {
+    pub source: SecretRef,
+    /// A cap on who receives the secret, whatever selects the host: a trust
+    /// selector (it reads `host.id`, verified tags and reserved labels
+    /// only). For a cluster's secrets it is checked against the executor.
+    pub hosts: Option<Filter>,
+}
+
+impl From<SecretRef> for SecretDecl {
+    fn from(source: SecretRef) -> Self {
+        Self {
+            source,
+            hosts: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSecretDecl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hosts: Option<Filter>,
+}
+
+impl Serialize for SecretDecl {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut raw = RawSecretDecl {
+            env: None,
+            file: None,
+            exec: None,
+            hosts: self.hosts.clone(),
+        };
+        match &self.source {
+            SecretRef::Env { env } => raw.env = Some(env.clone()),
+            SecretRef::File { file } => raw.file = Some(file.clone()),
+            SecretRef::Exec { exec } => raw.exec = Some(exec.clone()),
+        }
+        raw.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretDecl {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = RawSecretDecl::deserialize(d)?;
+        let source = match (raw.env, raw.file, raw.exec) {
+            (Some(env), None, None) => SecretRef::Env { env },
+            (None, Some(file), None) => SecretRef::File { file },
+            (None, None, Some(exec)) => SecretRef::Exec { exec },
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "a secret names exactly one of `env`, `file` or `exec`",
+                ));
+            }
+        };
+        Ok(Self {
+            source,
+            hosts: raw.hosts,
+        })
+    }
 }
 
 /// Where a secret's value comes from. Written as a one-key map in YAML:
@@ -643,13 +760,13 @@ rollout:
             "an overlay without `when` applies everywhere"
         );
         assert_eq!(
-            cfg.secrets["rustic_password"],
+            cfg.secrets["rustic_password"].source,
             SecretRef::Env {
                 env: "RUSTIC_PASSWORD".into()
             }
         );
         assert_eq!(
-            cfg.secrets["admin_password"],
+            cfg.secrets["admin_password"].source,
             SecretRef::File {
                 file: "/secrets/admin_password".into()
             }

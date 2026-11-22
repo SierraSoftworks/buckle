@@ -123,7 +123,7 @@ const KEY: [u8; 32] = [9; 32];
 /// or empty) and the `rollout` section.
 fn fleet_yaml_with(rollout: &str, clusters: &str) -> String {
     format!(
-        "version: 2\nfleet:\n  groups:\n    canary: 'host.labels.tier == \"canary\"'\n    web: 'host.labels.tier == \"web\"'\n    db: 'host.labels.tier == \"db\"'\n    nomad: 'host.labels.tier == \"nomad\"'\n{clusters}rollout:\n{rollout}"
+        "version: 2\nfleet:\n  labels:\n    reserved: [tier]\n  groups:\n    canary: 'host.labels.tier == \"canary\"'\n    web: 'host.labels.tier == \"web\"'\n    db: 'host.labels.tier == \"db\"'\n    nomad: 'host.labels.tier == \"nomad\"'\n{clusters}rollout:\n{rollout}"
     )
 }
 

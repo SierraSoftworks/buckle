@@ -47,6 +47,7 @@ fn request(platform: JoinPlatform, method: JoinMethod) -> JoinRequest {
         method,
         host_id: Some("web-1".into()),
         labels: BTreeMap::from([("role".into(), "web server".into())]),
+        server_labels: Default::default(),
         tailscale_tags: vec![],
     }
 }

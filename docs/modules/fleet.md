@@ -8,9 +8,12 @@ and how a revision rolls out.
 version: 2
 
 fleet:
+  labels:
+    reserved: [role]
   groups:
     pis:           'host.labels.site == "home" && host.facts.hardware.arch == "aarch64"'
     cloud:         'host.facts.cloud.provider in ["oci", "azure"]'
+    nomad-servers: 'host.labels.role == "server"'
     nomad-clients: 'host.labels.role == "worker"'
     canary:        'host.labels.canary == true'
   clusters:
@@ -19,6 +22,8 @@ fleet:
       nodes:     'host.groups contains "nomad-servers" || host.groups contains "nomad-clients"'
       executors: 'host.groups contains "nomad-servers"'
       labels: { site: home }
+  identities:
+    vault: { hosts: 'host.groups contains "nomad-servers"' }
 
 vars:
   - file: vars/defaults.yaml
@@ -33,6 +38,7 @@ vars:
 secrets:
   TAILSCALE_AUTHKEY: { file: /secrets/TAILSCALE_AUTHKEY }
   RUSTIC_PASSWORD:   { env: RUSTIC_PASSWORD }
+  NOMAD_ENCRYPT_KEY: { file: /secrets/NOMAD_ENCRYPT_KEY, hosts: 'host.labels.role == "server"' }
 
 rollout:
   phases:
@@ -60,6 +66,44 @@ fact arrives, rather than treated as unselected and removed.
 A group may also be written over `cluster.*`, in which case it is a group of
 [clusters](#clusters). A selector names one of the two namespaces: a `host.*` group is never true
 for a cluster, and a `cluster.*` group never for a host.
+
+## Trust
+
+A label an agent reports and a fact it collects are that host's own word. They are fine for
+choosing what a host converges to, and not for deciding what it is handed: a compromised host
+could report its way into a cluster credential or a secret. So the selectors that hand something
+out (a cluster's `executors`, an identity's `hosts`, a secret's `hosts`) are *trust selectors*,
+and read only what the server itself established:
+
+| Key | Established by |
+|---|---|
+| `host.id` | The agent's enrolment (its certificate, or its tailnet node). |
+| `host.facts.tailscale.tags` | Tailscale: the node's ACL tags as the server's own tailnet lookup returns them, for agents connected [over Tailscale](../agent/server.md#agents). Empty for every other host. |
+| `host.labels.KEY`, for a reserved `KEY` | An operator: `fleet.labels.reserved` names labels only the server may set. |
+| `host.groups` | Only groups whose own selector reads nothing but the keys above. |
+
+Everything else is `null` in a trust selector, and `buckle validate` warns about each such key
+and group it finds in one. Prefer positive selectors: `host.labels.zone != "public"` is true for
+a host whose zone is unknown.
+
+```yaml
+fleet:
+  labels:
+    reserved: [zone, role]
+```
+
+A reserved label:
+
+- **ignores the agent**: the host's own `--label zone=…` is dropped (and audited as
+  `host.label_conflict` when it disagrees), for selection as well as trust;
+- **is set on the server**: in the UI's label editor, with `PATCH /api/v1/hosts/{id}`, or on a
+  join token (the Add an agent wizard), and cannot be removed while it is reserved;
+- **is required of new hosts**: a host that enrols without a value for every reserved label
+  waits as pending, and cannot be approved until they are set. Hosts already in the fleet are
+  not held back; trust selectors simply do not match them until the label is set.
+
+Reserving a label that hosts already report therefore needs its value set on the server first,
+or `executors` selecting on it stops matching.
 
 ## Clusters
 
@@ -91,11 +135,11 @@ fleet:
 | Key | Meaning |
 |---|---|
 | `nodes` | A [selector](./expressions.md) over `host.*` choosing the cluster's members: what a workload's `module:` edge and a module's `workload:` edge refer to. |
-| `executors` | Which of the hosts may apply workloads to the cluster, and hold its lease (see [Stewards](#stewards)). Defaults to `nodes`. |
+| `executors` | Which of the hosts may apply workloads to the cluster, and hold its lease (see [Stewards](#stewards)). A [trust selector](#trust). Defaults to `nodes`, read the same way. |
 | `ui` | The cluster's own web UI, for the links beside each workload on the cluster's page (Nomad: `…/ui/jobs/NAME@NAMESPACE`). Defaults to `api` when that is an HTTP URL. |
 | `identity` | How an executor authenticates to the API: a token Buckle issues (`buckle_jwt`, see [identity](../agent/server.md#identity)), the host's own credentials (`local`), the scheduler's workload identity (`workload`), or a declared secret (`secret://NAME`). |
 | `labels` | Seed labels, as an agent's are for a host. Operators may add to them in the UI, and `cluster.labels.*` selects on the result. |
-| `cluster`, `scope` | A *scoped* target is part of another cluster and may touch only the namespaces listed. |
+| `cluster`, `scope` | A *scoped* target is part of another cluster and may touch only the namespaces listed. It is never issued an `acl` identity, so its workloads cannot carry ACL policies. |
 | `watch` | How often the steward reads the cluster when nothing wakes it: `health` (default `60s`) covers a dropped Nomad long poll, `drift` (default `10m`) re-plans the applied revision. |
 | `trust` | Which workload identities may speak for the cluster from inside it ([in-cluster executors](../agent/server.md#in-cluster-executors)): `jwks_url` the server reads the signing keys from, or `keys` pinned as a JWKS document; an optional `issuer`; `subjects` as `namespace/job` (Nomad, default `default/buckle-executor`) or `sub` (Kubernetes, default `system:serviceaccount:buckle-system:buckle-executor`). Not on a scoped target. |
 
@@ -126,6 +170,29 @@ Declared clusters appear on the UI's Clusters page and under `GET /api/v1/target
 spec and seed labels following the repository. Operators can also create clusters that are not in
 the repository with `POST /api/v1/targets` (`kind: cluster`), and pause, relabel or forget those
 through the same routes as hosts.
+
+## Identities
+
+`fleet.identities` lets hosts prove who they are to a service that is not a cluster (Vault, a
+cloud provider's workload federation, an internal API): the server issues the same short-lived
+JWT it issues for clusters, for an audience the service trusts.
+
+```yaml
+fleet:
+  identities:
+    vault:                                      # the entry's name, and its audience by default
+      hosts: 'host.labels.zone == "internal"'   # a trust selector: who may ask
+    cloud-backup:
+      audience: https://sts.example.com
+      hosts: 'host.facts.tailscale.tags contains "tag:backup"'
+```
+
+- **Ask**: a `command.run` with [`identity: { audience: vault }`](./tasks/commands.md) receives
+  the token in its environment.
+- **Claims**: `sub` and `host` name the host, `tags` its verified Tailscale tags and `labels` its
+  reserved labels, for the service to bind on; see [identity](../agent/server.md#identity).
+- **Limits**: an audience may not be the name of a cluster target, and every grant and refusal
+  is audited (`identity.issued`, `identity.denied`).
 
 ## Vars
 
@@ -171,7 +238,11 @@ secrets:
   NOMAD_ENCRYPT_KEY: { file: /secrets/NOMAD_ENCRYPT_KEY }   # a file; one trailing newline trimmed
   RUSTIC_PASSWORD:   { env: RUSTIC_PASSWORD }               # an environment variable
   DEV_TOKEN:         { exec: [op, read, "op://dev/token"] } # a command, only where explicitly allowed
+  EDGE_API_KEY:      { env: EDGE_API_KEY, hosts: 'host.labels.zone == "public"' }
 ```
+
+`hosts` is a [trust selector](#trust) capping who may ever receive the secret, whatever modules
+reference it.
 
 ## Rollout
 

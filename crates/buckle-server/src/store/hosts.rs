@@ -23,6 +23,11 @@ pub struct HostRecord {
     /// its declaration (or creation) seeded.
     pub agent_labels: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
+    /// The ACL tags the server's own tailscaled reported for the host when
+    /// it last authenticated it; `None` for a host the server did not
+    /// authenticate over the tailnet (and until its first session since
+    /// tags were recorded).
+    pub verified_tags: Option<Vec<String>>,
     pub status: HostStatus,
     pub notes: String,
     pub token_hash: Option<String>,
@@ -102,7 +107,7 @@ pub struct Hosts<'c> {
     conn: &'c Connection,
 }
 
-const COLUMNS: &str = "host_id, agent_labels, labels, status, notes, token_hash, platform, arch, agent_version, applied_revision, last_plan_digest, connection, auth_method, first_seen, last_seen, health, health_at, drifted, kind, cluster, steward, reachable, reachable_error, drift_at";
+const COLUMNS: &str = "host_id, agent_labels, labels, status, notes, token_hash, platform, arch, agent_version, applied_revision, last_plan_digest, connection, auth_method, first_seen, last_seen, health, health_at, drifted, kind, cluster, steward, reachable, reachable_error, drift_at, verified_tags";
 
 pub(crate) fn status_str(s: HostStatus) -> &'static str {
     match s {
@@ -164,6 +169,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<RawHost> {
         reachable: r.get(21)?,
         reachable_error: r.get(22)?,
         drift_at: r.get(23)?,
+        verified_tags: r.get(24)?,
     })
 }
 
@@ -192,6 +198,7 @@ struct RawHost {
     reachable: Option<String>,
     reachable_error: Option<String>,
     drift_at: Option<String>,
+    verified_tags: Option<String>,
 }
 
 impl RawHost {
@@ -206,6 +213,7 @@ impl RawHost {
             cluster: self.cluster.map(|c| from_json(&c)).transpose()?,
             agent_labels: from_json(&self.agent_labels)?,
             labels: from_json(&self.labels)?,
+            verified_tags: self.verified_tags.map(|t| from_json(&t)).transpose()?,
             status: parse_status(&self.status),
             notes: self.notes,
             token_hash: self.token_hash,
@@ -467,6 +475,20 @@ impl<'c> Hosts<'c> {
         Ok(n > 0)
     }
 
+    /// Records the tags the server verified for the host (`None`: it was
+    /// not authenticated over the tailnet). Returns whether they changed.
+    pub fn set_verified_tags(&self, id: &str, tags: Option<&[String]>) -> Result<bool> {
+        let json = tags.map(|t| to_json(&t)).transpose()?;
+        let n = self
+            .conn
+            .execute(
+                "UPDATE hosts SET verified_tags = ?2 WHERE host_id = ?1 AND verified_tags IS NOT ?2",
+                params![id, json],
+            )
+            .map_err(db_error)?;
+        Ok(n > 0)
+    }
+
     /// Replaces the operator notes.
     pub fn set_notes(&self, id: &str, notes: &str) -> Result<bool> {
         let n = self
@@ -620,9 +642,88 @@ impl<'c> Hosts<'c> {
 }
 
 #[cfg(test)]
+impl HostRecord {
+    /// An active host as the store returns it, for tests: what its agent
+    /// reports, what the server set, and the tags the tailnet verified.
+    pub(crate) async fn fixture(
+        id: &str,
+        agent_labels: &[(&str, &str)],
+        labels: &[(&str, &str)],
+        tags: Option<&[&str]>,
+    ) -> Self {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let (id, agent, server) = (id.to_owned(), map(agent_labels), map(labels));
+        let tags: Option<Vec<String>> = tags.map(|t| t.iter().map(|t| t.to_string()).collect());
+        super::Store::in_memory()
+            .await
+            .unwrap()
+            .call(move |db| {
+                let now = Utc::now();
+                db.hosts().create(&NewHost {
+                    id: id.clone(),
+                    status: HostStatus::Active,
+                    token_hash: None,
+                    auth_method: "tailscale".into(),
+                    at: now,
+                })?;
+                db.hosts()
+                    .record_hello(&id, "2.0.0", "linux", "aarch64", &agent, None, None, now)?;
+                db.hosts().set_labels(&id, &server)?;
+                db.hosts().set_verified_tags(&id, tags.as_deref())?;
+                Ok(db.hosts().get(&id)?.expect("just created"))
+            })
+            .await
+            .unwrap()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::Store;
     use super::*;
+
+    #[tokio::test]
+    async fn verified_tags_are_kept_per_host_and_say_when_they_change() {
+        let host = HostRecord::fixture("pi-1", &[], &[], None).await;
+        assert_eq!(
+            host.verified_tags, None,
+            "not authenticated over the tailnet"
+        );
+        let tagged = HostRecord::fixture("pi-1", &[], &[], Some(&["tag:z2"])).await;
+        assert_eq!(tagged.verified_tags, Some(vec!["tag:z2".to_owned()]));
+        let untagged = HostRecord::fixture("pi-1", &[], &[], Some(&[])).await;
+        assert_eq!(
+            untagged.verified_tags,
+            Some(vec![]),
+            "on the tailnet, without tags"
+        );
+
+        let store = Store::in_memory().await.unwrap();
+        let changes = store
+            .call(|db| {
+                db.hosts().create(&NewHost {
+                    id: "pi-1".into(),
+                    status: HostStatus::Active,
+                    token_hash: None,
+                    auth_method: "tailscale".into(),
+                    at: Utc::now(),
+                })?;
+                let tags = vec!["tag:z2".to_owned()];
+                Ok([
+                    db.hosts().set_verified_tags("pi-1", Some(&tags))?,
+                    db.hosts().set_verified_tags("pi-1", Some(&tags))?,
+                    db.hosts().set_verified_tags("pi-1", None)?,
+                ])
+            })
+            .await
+            .unwrap();
+        assert_eq!(changes, [true, false, true]);
+    }
 
     #[tokio::test]
     async fn hosts_enrol_with_a_token_and_are_found_by_its_hash() {

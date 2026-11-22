@@ -2470,7 +2470,7 @@ impl Controller {
     async fn push_host_update(&self, record: &crate::store::HostRecord) {
         let mut update = pb::HostUpdate {
             status: crate::store::hosts_status_str(record.status).to_owned(),
-            labels: record.effective_labels().into_iter().collect(),
+            labels: record.labels.clone().into_iter().collect(),
             ..Default::default()
         };
         if let Some(stable) = self.stable.clone() {
@@ -2496,7 +2496,8 @@ impl Controller {
                     .flatten()
                     .unwrap_or(serde_json::Value::Null);
                 let ctx = crate::fleet::record_context(record, &facts, &rev.fleet);
-                update.secrets = Some(self.secrets.for_host(&rev, &ctx).await);
+                let trusted = crate::fleet::trust_context(record, &rev.fleet);
+                update.secrets = Some(self.secrets.for_host(&rev, &ctx, &trusted).await);
             }
         }
         self.link
@@ -7293,7 +7294,7 @@ impl Controller {
         };
         let mut inside: Vec<String> = Vec::new();
         let mut outside: Vec<String> = Vec::new();
-        for (h, facts) in targets {
+        for (h, _) in targets {
             if h.kind != TargetKind::Host
                 || h.status != HostStatus::Active
                 || self.excluded.contains(&h.id)
@@ -7309,8 +7310,10 @@ impl Controller {
                 Some(c) if c == target || parent == Some(c) => inside.push(h.id.clone()),
                 Some(_) => {}
                 None => {
+                    // The same trust decision IssueIdentity makes, so a
+                    // steward is never one the server would then refuse.
                     if executors.as_ref().is_some_and(|executors| {
-                        crate::fleet::record_context(h, facts, fleet).matches(executors)
+                        crate::fleet::trust_context(h, fleet).matches(executors)
                     }) {
                         outside.push(h.id.clone());
                     }
@@ -7996,21 +7999,30 @@ impl Controller {
         };
         let h = if target.is_empty() { host } else { target }.to_owned();
         let rid = revision.to_owned();
+        let receiver = host.to_owned();
         let found = self
             .store
             .call(move |db| {
                 let rec = db.hosts().target(&h)?;
                 let facts = db.hosts().latest_facts(&h)?.map(|(f, _)| f);
                 let digest = db.revisions().get(&rid)?.and_then(|r| r.tarball_digest);
-                Ok((rec, facts.unwrap_or(serde_json::Value::Null), digest))
+                Ok((
+                    rec,
+                    facts.unwrap_or(serde_json::Value::Null),
+                    digest,
+                    db.hosts().get(&receiver)?,
+                ))
             })
             .await;
-        let Ok((Some(record), facts, tree_digest)) = found else {
+        let Ok((Some(record), facts, tree_digest, Some(receiver))) = found else {
             return None;
         };
         let ctx = crate::fleet::record_context(&record, &facts, &rev.fleet);
+        // Whoever receives the bundle: the host itself, or the executor
+        // of the cluster.
+        let trusted = crate::fleet::trust_context(&receiver, &rev.fleet);
         let (secrets, cluster) = if target.is_empty() {
-            (self.secrets.for_host(&rev, &ctx).await, None)
+            (self.secrets.for_host(&rev, &ctx, &trusted).await, None)
         } else {
             let Some(spec) = record.cluster.as_ref().map(|c| &c.spec) else {
                 tracing::warn!(target = %target, "not a cluster target; nothing assigned");
@@ -8025,7 +8037,7 @@ impl Controller {
                 .and_then(|i| i.secret().map(str::to_owned));
             let secrets = self
                 .secrets
-                .for_cluster(&rev, &ctx, secret.as_deref())
+                .for_cluster(&rev, &ctx, &trusted, secret.as_deref())
                 .await;
             let cluster = self.cluster_target(target, &record, spec, declared);
             (secrets, Some(cluster))

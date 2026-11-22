@@ -29,6 +29,27 @@ pub enum HealthSummary {
     Unknown,
 }
 
+/// A label only the server may set (`fleet.labels.reserved`), on one host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReservedLabel {
+    pub key: String,
+    /// The value set on the server; absent until an operator sets one,
+    /// which a pending host needs before it can be approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// What the agent reports for the key, when it reports one: ignored,
+    /// and worth a look when it differs from `value`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<String>,
+}
+
+impl ReservedLabel {
+    /// Whether the agent reports a value other than the server's.
+    pub fn conflicts(&self) -> bool {
+        self.reported.is_some() && self.reported != self.value
+    }
+}
+
 /// The summary row of a target: a host, or (with `kind: cluster` and
 /// `cluster` set) a cluster target that has no agent of its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,8 +70,18 @@ pub struct HostSummary {
     pub agent_labels: BTreeMap<String, String>,
     /// Labels set by operators; win on conflict.
     pub labels: BTreeMap<String, String>,
-    /// The merged view.
+    /// The merged view: what selectors read. A reserved label is in it only
+    /// with the value set on the server.
     pub effective_labels: BTreeMap<String, String>,
+    /// The labels the fleet reserves, as this host has them. Empty when the
+    /// fleet reserves none, and for a cluster.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserved_labels: Vec<ReservedLabel>,
+    /// The ACL tags the server's own tailscaled verified for the host,
+    /// which `host.facts.tailscale.tags` reads; absent for a host the
+    /// server did not authenticate over the tailnet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_tags: Option<Vec<String>>,
     pub groups: Vec<String>,
     pub platform: Option<String>,
     pub arch: Option<String>,

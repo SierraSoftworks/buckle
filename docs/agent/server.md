@@ -249,7 +249,9 @@ rollout, phase and state) and `buckle.agent.connected`.
 ### identity
 
 The server issues short-lived JWTs that agents exchange for cluster credentials, so no Nomad or
-Kubernetes token is stored anywhere. It signs; it holds nothing that can reach a cluster.
+Kubernetes token is stored anywhere. It signs; it holds nothing that can reach a cluster. The same
+tokens serve any other service that trusts the issuer, through
+[`fleet.identities`](../modules/fleet.md#identities).
 
 | Key | Default | Description |
 |---|---|---|
@@ -258,18 +260,23 @@ Kubernetes token is stored anywhere. It signs; it holds nothing that can reach a
 
 **Issue.** An agent calls `IssueIdentity { target, purpose }`. The server grants it only for a
 cluster target declared in a revision the host may fetch, with `identity: buckle_jwt`, and only
-when the host matches the target's `executors` selector (purposes `read` and `deploy`) or its
-`nodes` selector (`drain`, for its own node). Grants and refusals are audited (`identity.issued`,
-`identity.denied`).
+when the host matches the target's `executors` selector (purposes `read`, `deploy` and `acl`) or
+its `nodes` selector (`drain`, for its own node). `executors` is a
+[trust selector](../modules/fleet.md#trust), so nothing the agent reports about itself earns a
+grant, and `acl` is never issued for a scoped target. `IssueIdentity { audience }` instead names a
+`fleet.identities` entry, granted when the host matches its `hosts`. Grants and refusals are
+audited (`identity.issued`, `identity.denied`).
 
 | Claim | Value |
 |---|---|
 | `iss` | `identity.issuer` |
 | `sub`, `host` | The requesting host, e.g. `pi-1`. |
-| `aud`, `target` | The cluster target, e.g. `home-nomad`. |
-| `cluster` | The cluster the target is on (differs for a scoped target). |
-| `purpose` | `read`, `deploy`, `drain` or `acl`. |
-| `rollout` | The rollout the credential serves, when any. |
+| `aud` | The cluster target, e.g. `home-nomad`, or the identity's audience. |
+| `tags` | The host's verified Tailscale tags (`[]` when it did not connect over Tailscale). |
+| `labels` | The host's [reserved labels](../modules/fleet.md#trust), as set on the server, e.g. `{"zone": "home"}`. |
+| `target`, `cluster` | Cluster tokens only: the target, and the cluster it is on (differs for a scoped target). |
+| `purpose` | Cluster tokens only: `read`, `deploy`, `drain` or `acl`. |
+| `rollout` | Cluster tokens only: the rollout the credential serves, when any. |
 
 **Keys.** One ES256 key at `data_dir/identity/signing.key`, generated on first start and
 published at `/.well-known/jwks.json` and, as PEM, at `/.well-known/buckle-identity.pem`. To
@@ -314,6 +321,10 @@ for purpose in read deploy drain; do
     -bind-name "buckle-$purpose" -selector "value.purpose == \"$purpose\""
 done
 ```
+
+To bind on where a host sits as well, map the claims in (`"ClaimMappings": { "/labels/zone":
+"zone" }`, a JSON pointer into `labels`; `"ListClaimMappings": { "tags": "tags" }`) and select on
+them: `value.purpose == "deploy" and value.zone == "home"`, `"tag:nomad" in list.tags`.
 
 Nomad serves and writes ACL policies only to management tokens, so a workload that lists a
 `*.policy.hcl` plans and applies it with a separate `acl` credential, which executors request only
