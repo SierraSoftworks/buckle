@@ -466,6 +466,34 @@ fn window_text(decl: &ScheduleDecl) -> String {
     humantime_serde::re::humantime::format_duration(decl.window).to_string()
 }
 
+/// Each schedule of the stable revision whose latest occurrence was skipped.
+pub async fn skipped(
+    store: &Store,
+    revisions: &RevisionCache,
+) -> buckle_core::Result<Vec<buckle_api::attention::SkippedRun>> {
+    let Some(rev) = crate::views::stable_revision(store, revisions).await else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<String> = rev.schedules.keys().cloned().collect();
+    store
+        .call(move |db| {
+            let mut out = Vec::new();
+            for name in names {
+                if let Some(o) = history(&db.kv(), &name)?.into_iter().next()
+                    && let Some(reason) = o.skipped
+                {
+                    out.push(buckle_api::attention::SkippedRun {
+                        schedule: name,
+                        due_at: o.due_at,
+                        reason,
+                    });
+                }
+            }
+            Ok(out)
+        })
+        .await
+}
+
 fn history(kv: &crate::store::kv::Kv<'_>, name: &str) -> buckle_core::Result<Vec<Occurrence>> {
     Ok(kv
         .get(&history_key(name))?

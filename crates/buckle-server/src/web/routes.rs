@@ -31,6 +31,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/auth/refresh", web::post().to(refresh))
             .route("/auth/logout", web::post().to(logout))
             .route("/fleet", web::get().to(fleet))
+            .route("/attention", web::get().to(attention))
             .route("/hosts", web::get().to(hosts))
             .route("/hosts/{id}", web::get().to(host_detail))
             .route("/hosts/{id}", web::patch().to(host_patch))
@@ -110,6 +111,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 #[cfg(test)]
 pub const PROTECTED: &[(&str, &str)] = &[
     ("GET", "/api/v1/fleet"),
+    ("GET", "/api/v1/attention"),
     ("GET", "/api/v1/hosts"),
     ("GET", "/api/v1/hosts/h"),
     ("PATCH", "/api/v1/hosts/h"),
@@ -559,6 +561,15 @@ async fn fleet(state: Data, _: Authenticated) -> ApiResult {
         server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         desired_agent_version: Some(state.upgrades.desired().to_owned()),
     }))
+}
+
+/// `GET /attention`: what needs attention, worst first, as webhooks are told.
+async fn attention(state: Data, _: Authenticated) -> ApiResult {
+    let list = match &state.attention {
+        Some(n) => n.list().await?,
+        None => buckle_api::attention::AttentionList::default(),
+    };
+    Ok(HttpResponse::Ok().json(list))
 }
 
 async fn hosts(state: Data, _: Authenticated) -> ApiResult {

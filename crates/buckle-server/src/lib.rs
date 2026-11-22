@@ -21,6 +21,7 @@ pub mod grpc;
 pub mod identity;
 pub mod join;
 pub mod metrics;
+pub mod notifications;
 pub mod rollout;
 pub mod schedules;
 pub mod secrets;
@@ -244,6 +245,7 @@ pub async fn run_with(
             .clone()
             .unwrap_or_else(|| VERSION.to_owned()),
     ));
+    let notify_clock = clock.clone();
     let fleet = grpc::FleetService {
         store: store.clone(),
         sessions: sessions.clone(),
@@ -274,6 +276,26 @@ pub async fn run_with(
     tracing::info!(address = %grpc_addr, "listening for agents");
     let grpc_task = tokio::spawn(grpc::serve(fleet, grpc_listener, identity, cancel.clone()));
 
+    let outbox = Arc::new(tokio::sync::Notify::new());
+    let notifier = Arc::new(notifications::Notifier::new(notifications::NotifierDeps {
+        store: store.clone(),
+        revisions: revisions.clone(),
+        events: events.clone(),
+        clock: notify_clock.clone(),
+        hooks: config.notifications.webhooks.clone(),
+        base_url: config.web.base_url.clone(),
+        expected_version: upgrades.desired().to_owned(),
+        outbox: outbox.clone(),
+    }));
+    tasks.push(tokio::spawn(notifier.clone().run(cancel.clone())));
+    let deliveries = Arc::new(notifications::webhooks::Deliveries::new(
+        store.clone(),
+        config.notifications.webhooks.clone(),
+        notify_clock,
+        outbox,
+    ));
+    tasks.push(tokio::spawn(deliveries.run(cancel.clone())));
+
     let http_listener = std::net::TcpListener::bind(&config.listen.http).map_err(|e| {
         buckle_core::error::wrap_user(
             e,
@@ -300,6 +322,7 @@ pub async fn run_with(
     state.identity = Some(issuer);
     state.builder = Some(builder);
     state.schedules = Some(scheduler);
+    state.attention = Some(notifier);
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
     if let Some(listening) = &hooks.listening {
         listening.send_replace(Some(Listening {

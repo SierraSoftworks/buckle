@@ -64,6 +64,8 @@ pub struct AppState {
         Arc<std::sync::Mutex<std::collections::HashMap<String, buckle_api::ChangeCounts>>>,
     /// Starts scheduled actions, and answers for them.
     pub schedules: Option<Arc<crate::schedules::Scheduler>>,
+    /// Works out what needs attention, and announces it to webhooks.
+    pub attention: Option<Arc<crate::notifications::Notifier>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -113,6 +115,7 @@ impl AppState {
             builder: None,
             rollout_changes: Default::default(),
             schedules: None,
+            attention: None,
         }
     }
 

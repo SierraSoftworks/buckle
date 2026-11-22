@@ -40,7 +40,7 @@ describe("every page renders in demo mode", () => {
   test("the bell lists what needs attention", async () => {
     const { page, close } = await open("/rollouts");
     const bell = page.getByTestId("attention-bell");
-    const button = bell.getByRole("button", { name: /targets? needs? attention/ });
+    const button = bell.getByRole("button", { name: /items? needs? attention/ });
     assert.match(await bell.textContent(), /\d+/);
     assert.equal(await bell.locator(".yi-notification-list").count(), 0, "the list is only in the page while open");
     await button.click();
@@ -48,8 +48,9 @@ describe("every page renders in demo mode", () => {
     assert.match(await list.textContent(), /awaiting registration approval/);
     assert.match(await list.textContent(), /expected 2\.0\.0-dev\.5/);
     assert.match(await list.textContent(), /failed in home/);
-    // Unhealthy hosts and failing workloads, each linking to its target.
-    assert.match(await list.textContent(), /health checks failing/);
+    // Each failing check by name, and the server-side additions.
+    assert.match(await list.textContent(), /nomad\/api failing/);
+    assert.match(await list.textContent(), /skipped the run due/);
     await page.keyboard.press("Escape");
     await eventually(async () => assert.equal(await list.count(), 0));
     await close();
