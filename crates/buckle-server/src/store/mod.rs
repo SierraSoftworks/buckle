@@ -18,6 +18,7 @@ mod reports;
 mod revisions;
 pub mod rollouts;
 mod runs;
+mod snapshot;
 
 pub use approvals::{ApprovalRecord, Approvals};
 pub use audit::{Audit, AuditFilter, NewAudit};
@@ -36,7 +37,7 @@ pub use runs::{ABANDONED, ActionRunRecord, RUNNING, RolloutRunIds, RunEvent, Run
 use buckle_core::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Schema migrations, applied in order and recorded in `migrations`.
@@ -391,6 +392,20 @@ CREATE TABLE paused_units (
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    restored: Option<Arc<Restored>>,
+}
+
+/// The database was at a newer schema than this server knows (an older
+/// server came back after an upgrade), and the snapshot taken before that
+/// upgrade was put in its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restored {
+    /// The schema the newer server left.
+    pub from: i64,
+    /// The schema of the snapshot restored.
+    pub to: i64,
+    /// Where the newer database was moved to.
+    pub set_aside: PathBuf,
 }
 
 impl std::fmt::Debug for Store {
@@ -478,35 +493,45 @@ impl<'c> Db<'c> {
 
 impl Store {
     /// Opens (creating if needed) the database at `path` and migrates it.
+    ///
+    /// Before a migration changes an existing database, a snapshot of it is
+    /// kept beside it (`buckle.db.schema-N`, N being the schema it was at).
+    /// A server that finds the database at a newer schema than it knows (it
+    /// was downgraded) puts that snapshot back, setting the newer database
+    /// aside, rather than run against tables it does not understand; see
+    /// [`Store::restored`].
     pub async fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, MIGRATIONS).await
+    }
+
+    /// [`Store::open`] for a server that knows `migrations`.
+    pub(crate) async fn open_with(
+        path: &Path,
+        migrations: &'static [&'static str],
+    ) -> Result<Self> {
         let path = path.to_path_buf();
-        let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    buckle_core::error::wrap_user(
-                        e,
-                        format!("Could not create the data directory {}.", parent.display()),
-                        &["Check that `data_dir` in server.yaml is writable by the server."],
-                    )
-                })?;
-            }
-            let conn = Connection::open(&path).map_err(|e| {
-                buckle_core::error::wrap_user(
-                    e,
-                    format!("Could not open the database at {}.", path.display()),
-                    &["Check that `data_dir` in server.yaml is writable by the server."],
-                )
-            })?;
-            configure(&conn, true)?;
-            Ok(conn)
-        })
-        .await
-        .map_err(join_error)??;
-        let store = Self {
+        let (conn, restored) =
+            tokio::task::spawn_blocking(move || -> Result<(Connection, Option<Restored>)> {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        buckle_core::error::wrap_user(
+                            e,
+                            format!("Could not create the data directory {}.", parent.display()),
+                            &["Check that `data_dir` in server.yaml is writable by the server."],
+                        )
+                    })?;
+                }
+                let restored = snapshot::prepare(&path, migrations.len() as i64)?;
+                let conn = connect(&path)?;
+                migrate(&conn, migrations)?;
+                Ok((conn, restored))
+            })
+            .await
+            .map_err(join_error)??;
+        Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-        };
-        store.migrate().await?;
-        Ok(store)
+            restored: restored.map(Arc::new),
+        })
     }
 
     /// An in-memory database, migrated (tests and ephemeral runs).
@@ -515,6 +540,7 @@ impl Store {
         configure(&conn, false)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            restored: None,
         };
         store.migrate().await?;
         Ok(store)
@@ -522,7 +548,19 @@ impl Store {
 
     /// Applies every migration not yet recorded. Idempotent.
     pub async fn migrate(&self) -> Result<()> {
-        self.call(|db| migrate(db.conn)).await
+        self.call(|db| migrate(db.conn, MIGRATIONS)).await
+    }
+
+    /// Set when opening the database put back the snapshot from before an
+    /// upgrade: what the newer server wrote since is not in it.
+    pub fn restored(&self) -> Option<&Restored> {
+        self.restored.as_deref()
+    }
+
+    /// A store that says it was restored, as an older server's is.
+    #[cfg(test)]
+    pub(crate) fn mark_restored(&mut self, restored: Restored) {
+        self.restored = Some(Arc::new(restored));
     }
 
     /// Runs `f` against the connection on the blocking pool.
@@ -580,6 +618,31 @@ impl Store {
     }
 }
 
+/// Opens the database file at `path`.
+fn connect(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).map_err(|e| {
+        buckle_core::error::wrap_user(
+            e,
+            format!("Could not open the database at {}.", path.display()),
+            &["Check that `data_dir` in server.yaml is writable by the server."],
+        )
+    })?;
+    configure(&conn, true)?;
+    Ok(conn)
+}
+
+/// The latest migration recorded in the database (0: none yet).
+fn schema(conn: &Connection) -> Result<i64> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)",
+    )
+    .map_err(db_error)?;
+    conn.query_row("SELECT COALESCE(MAX(id), 0) FROM migrations", [], |r| {
+        r.get(0)
+    })
+    .map_err(db_error)
+}
+
 fn configure(conn: &Connection, on_disk: bool) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(db_error)?;
@@ -594,17 +657,9 @@ fn configure(conn: &Connection, on_disk: bool) -> Result<()> {
     Ok(())
 }
 
-fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)",
-    )
-    .map_err(db_error)?;
-    let applied: i64 = conn
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM migrations", [], |r| {
-            r.get(0)
-        })
-        .map_err(db_error)?;
-    for (index, sql) in MIGRATIONS.iter().enumerate() {
+fn migrate(conn: &Connection, migrations: &[&str]) -> Result<()> {
+    let applied = schema(conn)?;
+    for (index, sql) in migrations.iter().enumerate() {
         let id = index as i64 + 1;
         if id <= applied {
             continue;

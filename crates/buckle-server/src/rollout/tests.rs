@@ -104,6 +104,8 @@ struct Script {
     failing_workload: Option<String>,
     /// The agent's own plans are real plans changing these modules.
     host_changes: Option<Vec<String>>,
+    /// Never answer an Apply of this workload (a deployment still followed).
+    silent_workload: Option<String>,
 }
 
 /// Report ids for the fake agents' durable action results.
@@ -123,6 +125,8 @@ struct Harness {
     scripts: BTreeMap<String, Arc<Mutex<Script>>>,
     log: Log,
     session_ids: BTreeMap<String, u64>,
+    /// What the controller is started with (again after a restart).
+    options: ControllerOptions,
 }
 
 const KEY: [u8; 32] = [9; 32];
@@ -140,6 +144,7 @@ async fn start_controller(
     sessions: &Arc<Sessions>,
     revisions: &Arc<RevisionCache>,
     clock: &Arc<TokioClock>,
+    options: &ControllerOptions,
 ) -> (
     ControllerHandle,
     CancellationToken,
@@ -154,7 +159,7 @@ async fn start_controller(
         revisions: revisions.clone(),
         secrets: ServerSecrets::new(&Default::default(), InstallKey::from_bytes(KEY)),
         approval_key: KEY,
-        options: ControllerOptions::default(),
+        options: options.clone(),
     };
     let (handle, task) = spawn(deps, cancel.clone())
         .await
@@ -164,13 +169,20 @@ async fn start_controller(
 
 impl Harness {
     async fn new() -> Self {
+        Self::with(ControllerOptions::default()).await
+    }
+
+    /// A harness whose controller runs with `options`.
+    async fn with(options: ControllerOptions) -> Self {
         let data = tempfile::tempdir().unwrap();
         let store = Store::in_memory().await.unwrap();
         let sessions = Arc::new(Sessions::new());
         let revisions = Arc::new(RevisionCache::new(data.path()));
         let clock = Arc::new(TokioClock::new());
-        let (handle, cancel, task) = start_controller(&store, &sessions, &revisions, &clock).await;
+        let (handle, cancel, task) =
+            start_controller(&store, &sessions, &revisions, &clock, &options).await;
         Self {
+            options,
             _data: data,
             store,
             sessions,
@@ -204,8 +216,14 @@ impl Harness {
 
     /// Starts a fresh controller from the store.
     async fn resume(&mut self) {
-        let (handle, cancel, task) =
-            start_controller(&self.store, &self.sessions, &self.revisions, &self.clock).await;
+        let (handle, cancel, task) = start_controller(
+            &self.store,
+            &self.sessions,
+            &self.revisions,
+            &self.clock,
+            &self.options,
+        )
+        .await;
         self.handle = handle;
         self.cancel = cancel;
         self.task = Some(task);
@@ -433,7 +451,10 @@ impl Harness {
                         }));
                     }
                     SMsg::Apply(mut a) => {
-                        if s.silent_apply || (s.silent_target_apply && !a.target.is_empty()) {
+                        if s.silent_apply
+                            || (s.silent_target_apply && !a.target.is_empty())
+                            || s.silent_workload.as_deref() == Some(a.workload.as_str())
+                        {
                             continue;
                         }
                         // A force apply, or an Apply binding the plan's
@@ -6900,4 +6921,214 @@ async fn a_suspended_workload_sits_out_rollouts_until_it_is_resumed(#[case] roll
     assert_eq!(applies_of(&h, "app"), 2, "applied once it was resumed");
     assert!(steward_told(&h, "n1").is_empty());
     assert!(h.suspended().await.is_empty());
+}
+
+// ------------------------------------------------------------ the server's own placement
+
+/// A harness whose server runs as `workload` on the cluster.
+async fn hosted_as(workload: &str) -> Harness {
+    Harness::with(ControllerOptions {
+        own: Some(OwnPlacement {
+            target: CLUSTER.into(),
+            workload: workload.into(),
+        }),
+        ..Default::default()
+    })
+    .await
+}
+
+/// A fleet whose cluster runs this server as the workload `app`, which the
+/// first phase selects, with `postgres` and the node `n1` in the last.
+async fn self_hosted() -> Harness {
+    let mut h = hosted_as("app").await;
+    let files = labelled(false);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    h.revision_with("r1", CANARY_WORKLOADS, NOMAD_CLUSTER, &files)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h
+}
+
+/// When the latest apply of the server's own placement (`own`), or of
+/// anything else, was sent.
+fn last_sent(h: &Harness, server: &str, own: bool) -> DateTime<Utc> {
+    h.applies()
+        .into_iter()
+        .filter(|a| (a.2.workload == server) == own)
+        .map(|a| a.0)
+        .max()
+        .expect("applies")
+}
+
+/// Applying the placement that runs the server restarts the server, so it
+/// leaves the phase its labels select for the last one, and starts there
+/// once everything else has applied and baked.
+#[tokio::test(start_paused = true)]
+async fn the_servers_own_placement_goes_last_and_alone() {
+    let mut h = self_hosted().await;
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let (_, rows) = h.wait_state(&id, RolloutState::Completed).await;
+    assert_eq!(placement(&rows, CLUSTER, "app").phase, "all");
+    assert!(
+        rows.iter().all(|r| r.state == HostPhase::Healthy),
+        "{rows:#?}"
+    );
+    assert!(
+        last_sent(&h, "app", true) - last_sent(&h, "app", false) >= BAKE,
+        "every other target was baked before the server's own applied"
+    );
+}
+
+/// What needs the server's own placement still goes after it: only the
+/// targets that do not wait for it are waited for.
+#[tokio::test(start_paused = true)]
+async fn what_needs_the_servers_own_placement_follows_it() {
+    let mut h = hosted_as("postgres").await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, TWO_WORKLOADS)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let (_, rows) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(
+        rows.iter().all(|r| r.state == HostPhase::Healthy),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        cluster_applies(&h, CLUSTER)
+            .into_iter()
+            .map(|a| a.1)
+            .collect::<Vec<_>>(),
+        ["postgres", "app"]
+    );
+    assert!(
+        last_sent(&h, "postgres", true) - applied_at(&h, "n1") >= BAKE,
+        "the node was baked before the server's own applied"
+    );
+}
+
+/// How the server's own apply went, as the server that comes up finds out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restarted {
+    /// Before the steward reported: the deployment is still followed.
+    Applying,
+    /// While baking, and the cluster runs what the revision has.
+    BakingAsPlanned,
+    /// While baking, and the cluster runs something else again.
+    BakingOnAnEarlierVersion,
+    /// On the previous version, with its store put back.
+    Restored,
+}
+
+/// The server that restarts during its own placement settles the row:
+/// it never sends the apply again, waits for a result still to come,
+/// confirms a bake with the steward's plan, and fails the row (pausing the
+/// rollout) when it is the previous version that came back.
+#[rstest::rstest]
+#[case::applying(Restarted::Applying, true)]
+#[case::baking(Restarted::BakingAsPlanned, true)]
+#[case::reverted(Restarted::BakingOnAnEarlierVersion, false)]
+#[case::restored(Restarted::Restored, false)]
+#[tokio::test(start_paused = true)]
+async fn a_server_restarted_by_its_own_apply_settles_how_it_went(
+    #[case] how: Restarted,
+    #[case] completes: bool,
+) {
+    let mut h = self_hosted().await;
+    let baking = matches!(
+        how,
+        Restarted::BakingAsPlanned | Restarted::BakingOnAnEarlierVersion
+    );
+    if !baking {
+        h.script("n1", |s| s.silent_workload = Some("app".into()));
+    }
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    let during = if baking {
+        HostPhase::Baking
+    } else {
+        HostPhase::Applying
+    };
+    h.wait(&id, "the server's own placement under way", |_, rows| {
+        placement(rows, CLUSTER, "app").state == during
+    })
+    .await;
+    let apply = h
+        .applies()
+        .into_iter()
+        .find(|a| a.2.workload == "app")
+        .expect("its apply")
+        .2;
+
+    if how == Restarted::Restored {
+        h.store.mark_restored(crate::store::Restored {
+            from: 2,
+            to: 1,
+            set_aside: "buckle.db.schema-2.set-aside".into(),
+        });
+    }
+    // Its agents are back as soon as it is: the steward's session is up
+    // before the controller has heard from it, and it keeps its lease.
+    h.restart().await;
+    // What the steward plans now says what the cluster runs.
+    h.script("n1", |s| {
+        s.target_changes = (how == Restarted::BakingAsPlanned).then(Vec::new)
+    });
+    h.connect("n1", Some("r1"));
+    if how == Restarted::Applying {
+        h.idle(5).await;
+        h.handle.agent_message(
+            "n1",
+            AMsg::Result(ApplyResult {
+                target: apply.target.clone(),
+                workload: apply.workload.clone(),
+                revision: apply.revision.clone(),
+                plan_digest: apply.plan_digest.clone(),
+                succeeded: true,
+                ..Default::default()
+            }),
+        );
+    }
+
+    let end = if completes {
+        RolloutState::Completed
+    } else {
+        RolloutState::Paused
+    };
+    let (_, rows) = h.wait_state(&id, end).await;
+    let app = placement(&rows, CLUSTER, "app");
+    assert_eq!(applies_of(&h, "app"), 1, "its apply is never sent again");
+    let actions = h.audit_actions(&id).await;
+    let confirmed = actions.iter().any(|a| a == "rollout.server.confirmed");
+    assert_eq!(confirmed, how == Restarted::BakingAsPlanned, "{actions:?}");
+    if completes {
+        assert_eq!(app.state, HostPhase::Healthy);
+    } else {
+        assert_eq!(app.state, HostPhase::Failed);
+        let error = app.runtime.error.clone().unwrap_or_default();
+        let expect = match how {
+            Restarted::Restored => "put back the snapshot",
+            _ => "an earlier version is back",
+        };
+        assert!(error.contains(expect), "{error}");
+    }
+}
+
+#[rstest::rstest]
+#[case::nomad_meta(&[("NOMAD_META_buckle.target", "home-nomad"), ("NOMAD_META_buckle.module", "buckle")], Some(("home-nomad", "buckle")))]
+#[case::cleaned_and_upper(&[("NOMAD_META_BUCKLE_TARGET", "home-nomad"), ("NOMAD_META_BUCKLE_MODULE", "buckle")], Some(("home-nomad", "buckle")))]
+#[case::named(&[("BUCKLE_SERVER_TARGET", "k3s"), ("BUCKLE_SERVER_WORKLOAD", "buckle"), ("NOMAD_META_buckle.target", "other")], Some(("k3s", "buckle")))]
+#[case::half(&[("NOMAD_META_buckle.target", "home-nomad")], None)]
+#[case::elsewhere(&[("PATH", "/bin")], None)]
+fn a_server_knows_its_placement_from_its_environment(
+    #[case] env: &[(&str, &str)],
+    #[case] expected: Option<(&str, &str)>,
+) {
+    let own = OwnPlacement::detect(env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    assert_eq!(
+        own.as_ref()
+            .map(|o| (o.target.as_str(), o.workload.as_str())),
+        expected
+    );
 }

@@ -42,6 +42,69 @@ pub struct ControllerOptions {
     pub disconnect_timeout: Duration,
     /// How long a host may stay applying without a result before it fails.
     pub apply_timeout: Duration,
+    /// The placement that runs this server, when a cluster of the fleet
+    /// does (see [`OwnPlacement`]).
+    pub own: Option<OwnPlacement>,
+    /// This server's version, as it names itself.
+    pub version: String,
+}
+
+/// The workload placement that runs this server. Applying it replaces the
+/// server, so a rollout applies it last and alone, once every other target
+/// has finished, and the server that comes up settles how it went: see
+/// [`Controller::settle_own`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnPlacement {
+    /// The cluster target.
+    pub target: String,
+    pub workload: String,
+}
+
+impl OwnPlacement {
+    /// Reads the placement from what a scheduler tells the process it runs.
+    /// Nomad passes a job's meta to its tasks (`NOMAD_META_…`), and Buckle
+    /// stamps the jobs it applies with their target and workload
+    /// (`buckle.target`, `buckle.module`), so a server Buckle deployed
+    /// knows its placement with nothing configured. Elsewhere
+    /// `BUCKLE_SERVER_TARGET` and `BUCKLE_SERVER_WORKLOAD` name it.
+    pub fn detect(env: impl IntoIterator<Item = (String, String)>) -> Option<Self> {
+        let (mut named, mut meta) = ((None, None), (None, None));
+        for (key, value) in env {
+            if value.is_empty() {
+                continue;
+            }
+            match key.as_str() {
+                "BUCKLE_SERVER_TARGET" => named.0 = Some(value),
+                "BUCKLE_SERVER_WORKLOAD" => named.1 = Some(value),
+                _ => {
+                    // Nomad cleans a meta key for the environment and also
+                    // passes it in upper case; either spelling is read.
+                    let Some(rest) = key.strip_prefix("NOMAD_META_") else {
+                        continue;
+                    };
+                    let rest: String = rest
+                        .chars()
+                        .map(|c| match c {
+                            c if c.is_ascii_alphanumeric() => c.to_ascii_lowercase(),
+                            _ => '_',
+                        })
+                        .collect();
+                    match rest.as_str() {
+                        "buckle_target" => meta.0 = Some(value),
+                        "buckle_module" => meta.1 = Some(value),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let pair = |(target, workload): (Option<String>, Option<String>)| {
+            Some(OwnPlacement {
+                target: target?,
+                workload: workload?,
+            })
+        };
+        pair(named).or_else(|| pair(meta))
+    }
 }
 
 /// How often an Apply is re-sent to a host that reconnects without having
@@ -57,6 +120,8 @@ impl Default for ControllerOptions {
         Self {
             disconnect_timeout: Duration::from_secs(600),
             apply_timeout: Duration::from_secs(30 * 60),
+            own: None,
+            version: crate::VERSION.to_owned(),
         }
     }
 }
@@ -372,6 +437,12 @@ impl std::fmt::Debug for ControllerHandle {
 }
 
 impl ControllerHandle {
+    /// Whether the controller still takes input (it stops with the server,
+    /// or when its task ends).
+    pub fn is_running(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
     /// A host's session is established (its link is attached).
     pub fn connected(&self, c: Connected) {
         let _ = self.tx.send(Input::Connected(c));
@@ -512,6 +583,7 @@ pub async fn spawn(
     let mut controller = Controller::load(deps).await?;
     let handle = ControllerHandle { tx };
     let task = tokio::spawn(async move {
+        controller.settle_own();
         // Durable reports the gRPC layer stored but whose reaction was not
         // saved before the server stopped (they were never acked: the ack
         // waits for that checkpoint). Replay them before any other input.
@@ -873,6 +945,12 @@ struct Controller {
     ack_waiters: Vec<oneshot::Sender<bool>>,
     /// Pending durable reports found on load, replayed before any input.
     replay: Vec<(String, u64, agent_message::Msg)>,
+    /// This run of the server: what tells it from the one that sent the
+    /// apply of its own placement.
+    boot: String,
+    /// The store was put back to the snapshot from before an upgrade when
+    /// this server started (it is an older one, back).
+    restored: Option<crate::store::Restored>,
 }
 
 fn msg(m: server_message::Msg) -> ServerMessage {
@@ -1140,6 +1218,8 @@ impl Controller {
                 .await?;
         }
         Ok(Self {
+            boot: new_id(),
+            restored: deps.store.restored().cloned(),
             store: deps.store,
             link: deps.link,
             clock: deps.clock,
@@ -1728,6 +1808,9 @@ impl Controller {
             // host itself; a cluster's executor says nothing about the
             // cluster, so its in-flight work is simply waited for.
             let own = self.live[ri].hosts[hi].runtime.kind == TargetKind::Host;
+            if state == HostPhase::Baking && self.live[ri].hosts[hi].runtime.confirming {
+                self.ask_confirmation(ri, hi);
+            }
             match state {
                 HostPhase::PlanPending => self.request_plan(ri, hi),
                 HostPhase::Baseline if self.may_apply(ri, hi) => self.send_baseline(ri, hi),
@@ -1905,6 +1988,10 @@ impl Controller {
                 continue;
             }
             if h.runtime.revision != plan.revision {
+                continue;
+            }
+            if h.runtime.confirming && h.state == HostPhase::Baking {
+                self.on_confirmation(ri, hi, &plan);
                 continue;
             }
             // The agent refused an Apply because its fresh plan differs from
@@ -2114,6 +2201,11 @@ impl Controller {
                     }
                     // The agent accepted and ran the approved plan.
                     self.live[ri].hosts[hi].runtime.stale_refusals = 0;
+                    // The server's own placement: a deployment that was
+                    // followed to its end says what this server is.
+                    if result.succeeded && self.live[ri].hosts[hi].runtime.server_boot.is_some() {
+                        self.live[ri].hosts[hi].runtime.server_boot = Some(self.boot.clone());
+                    }
                     if result.succeeded {
                         let changed = self.result_changes(ri, hi, &result);
                         self.live[ri].hosts[hi].runtime.bake =
@@ -4812,6 +4904,13 @@ impl Controller {
                 }
             }
         }
+        // The placement that runs this server goes in the last phase, where
+        // it waits for everything else (see [`Controller::own_wait`]).
+        if let Some(own) = self.options.own.as_ref().filter(|o| o.target == record.id) {
+            for p in out.iter_mut().filter(|p| p.workload == own.workload) {
+                p.phase = p.phase.map(|_| phases.len().saturating_sub(1));
+            }
+        }
         let latest = out
             .iter()
             .filter(|p| !p.removal)
@@ -5641,6 +5740,11 @@ impl Controller {
         h.runtime.apply_resends = 0;
         h.runtime.reboot = None;
         h.runtime.bake = None;
+        h.runtime.confirming = false;
+        h.runtime.server_boot = None;
+        if self.own_row(ri) == Some(hi) {
+            self.live[ri].hosts[hi].runtime.server_boot = Some(self.boot.clone());
+        }
         self.set_host_state(ri, hi, HostPhase::Applying, "apply sent");
         self.touch_host(ri, hi);
         self.send_to(ri, hi, server_message::Msg::Apply(apply));
@@ -5964,6 +6068,7 @@ impl Controller {
     /// Row `hi` baked: healthy, unless a later step waits, in which case it
     /// moves on to that step and plans it once what the step needs is done.
     fn finish_step(&mut self, ri: usize, hi: usize) {
+        self.live[ri].hosts[hi].runtime.confirming = false;
         let Some(next) = self.live[ri].hosts[hi].runtime.next_step().cloned() else {
             self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
             return;
@@ -6175,6 +6280,7 @@ impl Controller {
                     let ended = h.runtime.bake_until.filter(|u| *u <= now);
                     if let Some(until) = ended
                         && h.runtime.failing_since.is_empty()
+                        && !h.runtime.confirming
                     {
                         if reported && (!window || self.row_back(ri, hi)) {
                             self.finish_step(ri, hi);
@@ -6848,6 +6954,198 @@ impl Controller {
         })
     }
 
+    /// The row of the placement that runs this server, in a rollout of a
+    /// revision (an action restarts nothing by being sent).
+    fn own_row(&self, ri: usize) -> Option<usize> {
+        let own = self.options.own.as_ref()?;
+        let live = &self.live[ri];
+        if live.record.runtime.action.is_some() {
+            return None;
+        }
+        let hi = live.find_row(&own.target, &own.workload)?;
+        (live.hosts[hi].runtime.kind == TargetKind::Workload).then_some(hi)
+    }
+
+    /// What keeps row `hi` back on account of the placement that runs this
+    /// server. Applying that placement replaces the server, so it goes last
+    /// and alone: it waits until every other target of the phases has
+    /// finished (or missed its phase), and nothing else starts while it is
+    /// under way.
+    fn own_wait(&self, ri: usize, hi: usize) -> Option<Waiting> {
+        // In the stragglers stage nothing is left to wait for.
+        let own = self.own_row(ri).filter(|&own| !self.is_virtual(ri, own))?;
+        let live = &self.live[ri];
+        let reason = if own == hi {
+            // What needs this placement goes after it, as its `needs` say.
+            let mut after: HashSet<String> = HashSet::from([self.row_key(ri, own)]);
+            loop {
+                let more: Vec<String> = (0..live.hosts.len())
+                    .filter(|&i| {
+                        live.hosts[i]
+                            .runtime
+                            .current_step()
+                            .needs
+                            .iter()
+                            .any(|w| w.on.iter().any(|p| after.contains(&p.key)))
+                    })
+                    .map(|i| self.row_key(ri, i))
+                    .filter(|k| !after.contains(k))
+                    .collect();
+                if more.is_empty() {
+                    break;
+                }
+                after.extend(more);
+            }
+            let pending: Vec<String> = (0..live.hosts.len())
+                .filter(|&i| !self.is_virtual(ri, i) && !self.stage_done(ri, i))
+                .map(|i| self.row_key(ri, i))
+                .filter(|k| !after.contains(k))
+                .collect();
+            if pending.is_empty() {
+                return None;
+            }
+            format!(
+                "runs this server, so it goes last: waiting for {}",
+                some_of(&pending)
+            )
+        } else if live.hosts[own].state.in_flight() {
+            format!(
+                "waiting for {}, which runs this server",
+                self.row_key(ri, own)
+            )
+        } else {
+            return None;
+        };
+        Some(Waiting {
+            kind: WaitKind::Needs,
+            reason,
+        })
+    }
+
+    /// Settles the placement that runs this server when the server starts
+    /// with it under way, sent by an earlier run of the server: applying it
+    /// is what replaced that run.
+    ///
+    /// * Still **applying**: the steward follows the deployment and its
+    ///   result is durable, so it is waited for as for any placement, and
+    ///   never sent again (a server that came back on the previous version
+    ///   would otherwise upgrade itself in a loop).
+    /// * **Baking** (the result arrived before the restart): the server
+    ///   asks the steward to plan the placement again. Nothing to change
+    ///   means the cluster runs what the revision has, and the bake goes
+    ///   on; anything else means an earlier version is back, and the row
+    ///   fails.
+    /// * The store was **restored** to the snapshot from before the upgrade
+    ///   (this is the previous version, back): the row fails at once, as
+    ///   the result may have gone with the newer store.
+    fn settle_own(&mut self) {
+        for ri in 0..self.live.len() {
+            let Some(hi) = self.own_row(ri) else { continue };
+            let (state, sent_by) = {
+                let h = &self.live[ri].hosts[hi];
+                (h.state, h.runtime.server_boot.clone())
+            };
+            if !matches!(state, HostPhase::Applying | HostPhase::Baking)
+                || sent_by.is_none_or(|b| b == self.boot)
+            {
+                continue;
+            }
+            let key = self.row_key(ri, hi);
+            let version = self.options.version.clone();
+            if let Some(restored) = self.restored.clone() {
+                let why = format!(
+                    "the server is back on {version}: it found its store at a newer schema ({}, it knows {}) and put back the snapshot from before the upgrade",
+                    restored.from, restored.to
+                );
+                self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+                self.fail_host(ri, hi, &why);
+                continue;
+            }
+            let (message, confirming) = match state {
+                HostPhase::Baking => (
+                    format!(
+                        "{key}: the server restarted (now {version}) while its own placement baked; asking the cluster's steward whether it runs what the revision has"
+                    ),
+                    true,
+                ),
+                _ => (
+                    format!(
+                        "{key}: the server restarted (now {version}) during its own apply; waiting for the result"
+                    ),
+                    false,
+                ),
+            };
+            self.live[ri].hosts[hi].runtime.confirming = confirming;
+            self.touch_host(ri, hi);
+            let (host, workload) = {
+                let h = &self.live[ri].hosts[hi];
+                (h.host.clone(), h.workload.clone())
+            };
+            self.command_audit(
+                "controller",
+                "rollout.server.restarted",
+                ri,
+                message,
+                serde_json::json!({"host": host, "workload": workload, "version": version, "confirming": confirming}),
+            );
+        }
+    }
+
+    /// Asks the steward of the placement that runs this server to plan it
+    /// again: its plan says whether the cluster runs what the revision has.
+    fn ask_confirmation(&mut self, ri: usize, hi: usize) {
+        let Some(session) = self.row_session(ri, hi) else {
+            return;
+        };
+        let revision = self.live[ri].hosts[hi].runtime.revision.clone();
+        self.outbox.push(Out::AssignAndPlan {
+            session,
+            target: self.row_target(ri, hi),
+            workload: self.live[ri].hosts[hi].workload.clone(),
+            stable: self.stable.as_deref() == Some(revision.as_str()),
+            revision,
+        });
+    }
+
+    /// The steward planned the placement that runs this server after the
+    /// server restarted during its bake (see [`Controller::settle_own`]).
+    fn on_confirmation(&mut self, ri: usize, hi: usize, plan: &PlanResult) {
+        let key = self.row_key(ri, hi);
+        let revision = short(&plan.revision).to_owned();
+        let version = self.options.version.clone();
+        self.live[ri].hosts[hi].runtime.confirming = false;
+        self.touch_host(ri, hi);
+        let pending = plan.changes + plan.removals;
+        let why = if !plan.error.is_empty() {
+            format!(
+                "the server restarted during its own upgrade (now {version}), and whether the cluster runs revision {revision} could not be confirmed: planning failed: {}",
+                plan.error
+            )
+        } else if pending > 0 {
+            format!(
+                "the server restarted during its own upgrade (now {version}) and the cluster no longer runs it as revision {revision} has it ({pending} to change): an earlier version is back"
+            )
+        } else {
+            self.live[ri].hosts[hi].runtime.server_boot = Some(self.boot.clone());
+            let (host, workload) = {
+                let h = &self.live[ri].hosts[hi];
+                (h.host.clone(), h.workload.clone())
+            };
+            self.command_audit(
+                "controller",
+                "rollout.server.confirmed",
+                ri,
+                format!(
+                    "{key}: the server restarted into {version} and the cluster runs it as revision {revision} has it"
+                ),
+                serde_json::json!({"host": host, "workload": workload, "version": version}),
+            );
+            return;
+        };
+        self.live[ri].hosts[hi].runtime.error = Some(why.clone());
+        self.fail_host(ri, hi, &why);
+    }
+
     /// What of the modules or workloads row `hi` runs keeps it from
     /// starting: one failed elsewhere beyond its `max_failures`, or its
     /// `parallel` is in use (a failed target keeps its place).
@@ -6914,6 +7212,10 @@ impl Controller {
         if !self.stage_open(ri, hi) {
             return false;
         }
+        if let Some(own) = self.own_wait(ri, hi) {
+            self.set_waiting(ri, hi, Some(own));
+            return false;
+        }
         let limit = slot.then(|| self.limited(ri, hi, usage)).flatten();
         let clear = limit.is_none();
         self.set_waiting(ri, hi, limit);
@@ -6956,6 +7258,14 @@ impl Controller {
                 continue;
             }
             let h = &self.live[ri].hosts[hi];
+            // The server's own placement waits for the others: it moves
+            // when they do.
+            if matches!(h.state, HostPhase::PlanPending | HostPhase::Planned)
+                && self.own_row(ri) == Some(hi)
+                && self.own_wait(ri, hi).is_some()
+            {
+                continue;
+            }
             match &h.runtime.waiting {
                 Some(w)
                     if w.kind == WaitKind::Blocked
@@ -8719,7 +9029,11 @@ impl Controller {
             match (&current, &desired) {
                 (Some(c), Some(d)) if c == d => {}
                 (None, None) => {}
-                (Some(c), _) if !self.connected(c) => {
+                // A steward whose session is up but which the controller
+                // has not heard from yet (after a restart every agent comes
+                // back at once, and what an agent can do is known from its
+                // Hello) is still on its way, not disqualified.
+                (Some(c), _) if !self.connected(c) || !self.online.contains(c) => {
                     // Away: the lease holds until the disconnect timeout,
                     // unless the cluster's own executor connects meanwhile.
                     let since = *self.steward_away.entry(cluster.clone()).or_insert(now);
