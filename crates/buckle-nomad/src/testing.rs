@@ -22,6 +22,10 @@ struct State {
     policies: BTreeMap<String, Value>,
     namespaces: BTreeMap<String, Value>,
     pools: BTreeMap<String, Value>,
+    /// Client nodes by id.
+    nodes: BTreeMap<String, Value>,
+    /// The bodies of the introduction tokens asked for.
+    introductions: Vec<Value>,
     volumes: Vec<Value>,
     outcome: String,
     /// Reads of the blocked evaluation left before it completes, after a
@@ -70,6 +74,31 @@ impl FakeNomad {
             json!({"Name": "default", "ModifyIndex": 1}),
         );
         fake
+    }
+
+    /// Registers (or replaces) the client node `id`, named `name`.
+    pub fn node(&self, id: &str, name: &str, status: &str, eligible: bool, draining: bool) {
+        self.state.lock().unwrap().nodes.insert(
+            id.to_owned(),
+            json!({
+                "ID": id,
+                "Name": name,
+                "Status": status,
+                "SchedulingEligibility": if eligible { "eligible" } else { "ineligible" },
+                "Drain": draining,
+                "NodePool": "default",
+            }),
+        );
+    }
+
+    /// The node `id` as the fake holds it.
+    pub fn node_state(&self, id: &str) -> Option<Value> {
+        self.state.lock().unwrap().nodes.get(id).cloned()
+    }
+
+    /// The introduction tokens asked for, as their request bodies.
+    pub fn introductions(&self) -> Vec<Value> {
+        self.state.lock().unwrap().introductions.clone()
     }
 
     /// A client over this fake.
@@ -501,6 +530,31 @@ impl FakeNomad {
             ("DELETE", ["var", rest @ ..]) => {
                 s.vars.remove(&(ns.clone(), rest.join("/")));
                 (200, Value::Null)
+            }
+            ("GET", ["nodes"]) => (200, Value::Array(s.nodes.values().cloned().collect())),
+            ("POST", ["node", id, "drain"]) => match s.nodes.get_mut(*id) {
+                Some(node) => {
+                    let draining = !body["DrainSpec"].is_null();
+                    node["Drain"] = json!(draining);
+                    let eligible = !draining && body["MarkEligible"] == json!(true);
+                    node["SchedulingEligibility"] =
+                        json!(if eligible { "eligible" } else { "ineligible" });
+                    (200, json!({"NodeModifyIndex": index}))
+                }
+                None => not_found,
+            },
+            ("POST", ["node", id, "eligibility"]) => match s.nodes.get_mut(*id) {
+                Some(node) => {
+                    node["SchedulingEligibility"] = body["Eligibility"].clone();
+                    (200, json!({"NodeModifyIndex": index}))
+                }
+                None => not_found,
+            },
+            ("POST", ["acl", "identity", "client-introduction-token"]) => {
+                s.introductions.push(body.clone());
+                let pool = body["NodePool"].as_str().unwrap_or("default");
+                let name = body["NodeName"].as_str().unwrap_or_default();
+                (200, json!({"JWT": format!("intro:{name}:{pool}")}))
             }
             ("GET", ["acl", "policies"]) => {
                 (200, Value::Array(s.policies.values().cloned().collect()))

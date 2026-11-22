@@ -153,11 +153,34 @@ pub(super) fn validate_trust(report: &mut ValidationReport, fleet: &FleetConfig)
             );
         }
     }
+    for (name, decl) in &fleet.fleet.clusters {
+        let mut open: Option<&str> = None;
+        for (i, pool) in decl.pools.iter().enumerate() {
+            let location = format!("buckle.yaml fleet.clusters.{name}.pools[{i}]");
+            if pool.name.trim().is_empty() {
+                report.error(None, &location, "names no pool");
+            }
+            if let Some(earlier) = open {
+                report.warning(
+                    None,
+                    &location,
+                    format!(
+                        "is never reached: '{earlier}' above it has no `when`, so it takes every node"
+                    ),
+                );
+            }
+            match &pool.when {
+                Some(when) => selector(report, format!("{location}.when"), when.raw()),
+                None => open = open.or(Some(&pool.name)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PoolChoice;
     use rstest::rstest;
 
     const FLEET: &str = r#"
@@ -175,6 +198,8 @@ fleet:
     fn fleet(extra: &str) -> FleetConfig {
         FleetConfig::parse(&format!("{FLEET}{extra}")).unwrap()
     }
+
+    const POOLS: &str = "      pools:\n        - { name: boundary, when: 'host.groups contains \"z2\"' }\n        - { name: home, when: 'host.labels.zone == \"home\"' }\n        - { name: workers, when: 'host.labels.role == \"worker\"' }\n";
 
     fn labels(pairs: &[(&str, &str)]) -> Labels {
         pairs
@@ -208,6 +233,27 @@ fleet:
     ) {
         let ctx = trust_context(&fleet(""), "pi-1", tags, &labels(server));
         assert_eq!(ctx.groups, groups);
+    }
+
+    /// A join is for the first pool whose `when` the host's trust context
+    /// matches; what its agent reports plays no part.
+    #[rstest]
+    #[case::none_declared("", Some(&["tag:z2".to_owned()][..]), &[], PoolChoice::Default)]
+    #[case::first_match(POOLS, Some(&["tag:z2".to_owned()][..]), &[("zone", "home")], PoolChoice::Named("boundary"))]
+    #[case::later_match(POOLS, None, &[("zone", "home")], PoolChoice::Named("home"))]
+    #[case::reported_label_does_not_count(POOLS, None, &[("role", "worker")], PoolChoice::Refused)]
+    #[case::bare_name_takes_every_node("      pools: [home]\n", None, &[], PoolChoice::Named("home"))]
+    fn a_pool_is_chosen_from_what_the_server_verified(
+        #[case] pools: &str,
+        #[case] tags: Option<&[String]>,
+        #[case] server: &[(&str, &str)],
+        #[case] expected: PoolChoice<'static>,
+    ) {
+        let fleet = fleet(&format!(
+            "  clusters:\n    nomad:\n      kind: nomad\n{pools}"
+        ));
+        let ctx = trust_context(&fleet, "pi-1", tags, &labels(server));
+        assert_eq!(fleet.fleet.clusters["nomad"].pool(&ctx), expected);
     }
 
     #[rstest]
@@ -248,6 +294,21 @@ fleet:
     )]
     #[case::secret_capped_by_a_fact(
         "secrets:\n  k: { env: K, hosts: 'host.facts.os.family == \"debian\"' }\n",
+        0,
+        1
+    )]
+    #[case::pools_over_trusted_keys(
+        "  clusters:\n    nomad:\n      kind: nomad\n      executors: 'host.id == \"pi-1\"'\n      pools:\n        - { name: public, when: 'host.groups contains \"z2\"' }\n        - home\n",
+        0,
+        0
+    )]
+    #[case::pool_over_an_agent_label(
+        "  clusters:\n    nomad:\n      kind: nomad\n      executors: 'host.id == \"pi-1\"'\n      pools:\n        - { name: public, when: 'host.labels.role == \"edge\"' }\n",
+        0,
+        1
+    )]
+    #[case::pool_after_one_that_takes_every_node(
+        "  clusters:\n    nomad:\n      kind: nomad\n      executors: 'host.id == \"pi-1\"'\n      pools:\n        - home\n        - { name: public, when: 'host.groups contains \"z2\"' }\n",
         0,
         1
     )]

@@ -13,8 +13,8 @@ mod workload;
 
 pub use action_decl::ActionDecl;
 pub use cluster::{
-    Bounds, ClusterDecl, ClusterIdentity, ClusterKind, ClusterScope, ClusterTrust, trust_problem,
-    yaml_scalar_text,
+    Bounds, ClusterDecl, ClusterIdentity, ClusterKind, ClusterPool, ClusterScope, ClusterTrust,
+    PoolChoice, trust_problem, yaml_scalar_text,
 };
 pub use schedule::{Parsed as ParsedSchedule, ScheduleApproval, ScheduleDecl};
 pub use task_decl::{RetryPolicy, TaskDecl};

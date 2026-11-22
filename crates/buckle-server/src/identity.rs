@@ -45,6 +45,9 @@ pub enum Purpose {
     Drain,
     /// Reading and writing ACL policies (Nomad: a management token).
     Acl,
+    /// Node operations (eligibility, drains, join tokens) a steward
+    /// performs for the cluster's nodes.
+    Node,
 }
 
 impl Purpose {
@@ -54,6 +57,7 @@ impl Purpose {
             Purpose::Deploy => "deploy",
             Purpose::Drain => "drain",
             Purpose::Acl => "acl",
+            Purpose::Node => "node",
         }
     }
 }
@@ -144,9 +148,15 @@ impl ClusterTrust {
                 self.target, self.cluster
             ));
         }
+        if purpose == Purpose::Node && self.scoped {
+            return Err(format!(
+                "{} is a scoped target; nodes belong to its cluster {}",
+                self.target, self.cluster
+            ));
+        }
         let (selector, ctx, role) = match purpose {
             Purpose::Drain => (self.nodes.as_ref(), ctx, "a node of"),
-            Purpose::Read | Purpose::Deploy | Purpose::Acl => (
+            Purpose::Read | Purpose::Deploy | Purpose::Acl | Purpose::Node => (
                 self.executors.as_ref().or(self.nodes.as_ref()),
                 trusted,
                 "an executor for",
@@ -155,6 +165,26 @@ impl ClusterTrust {
         match selector {
             Some(f) if ctx.matches(f) => Ok(()),
             _ => Err(format!("{} is not {role} {}", ctx.host.id, self.target)),
+        }
+    }
+
+    /// Why the host may not ask the cluster's steward for an operation on
+    /// its own node, or `Ok`: it must match `nodes`, read from its selector
+    /// context `ctx`. No credential reaches the host, so the cluster's
+    /// `identity` plays no part.
+    pub fn node(
+        &self,
+        ctx: &buckle_core::selectors::HostContext,
+    ) -> std::result::Result<(), String> {
+        if self.scoped {
+            return Err(format!(
+                "{} is a scoped target; nodes belong to its cluster {}",
+                self.target, self.cluster
+            ));
+        }
+        match &self.nodes {
+            Some(f) if ctx.matches(f) => Ok(()),
+            _ => Err(format!("{} is not a node of {}", ctx.host.id, self.target)),
         }
     }
 }
@@ -501,6 +531,7 @@ mod tests {
     #[case(Purpose::Deploy)]
     #[case(Purpose::Drain)]
     #[case(Purpose::Acl)]
+    #[case(Purpose::Node)]
     fn a_token_verifies_against_the_published_keys(#[case] purpose: Purpose) {
         let dir = tempfile::tempdir().unwrap();
         let issuer = Issuer::load(dir.path(), &config(), "https://buckle.example".into()).unwrap();
@@ -627,6 +658,8 @@ mod tests {
     #[case::node_drains_itself("pi-2", Purpose::Drain, Some(SERVERS), true)]
     #[case::stranger_cannot_drain("nas", Purpose::Drain, Some(SERVERS), false)]
     #[case::executors_default_to_nodes("pi-2", Purpose::Deploy, None, true)]
+    #[case::executor_operates_nodes("pi-1", Purpose::Node, Some(SERVERS), true)]
+    #[case::node_cannot_operate_nodes("pi-2", Purpose::Node, Some(SERVERS), false)]
     fn grants_follow_the_selectors(
         #[case] id: &str,
         #[case] purpose: Purpose,
@@ -644,6 +677,7 @@ mod tests {
     #[case::reported_role_cannot_read(Purpose::Read, false)]
     #[case::reported_role_cannot_deploy(Purpose::Deploy, false)]
     #[case::reported_role_cannot_manage_acls(Purpose::Acl, false)]
+    #[case::reported_role_cannot_operate_nodes(Purpose::Node, false)]
     fn executors_are_decided_on_what_the_server_verified(
         #[case] purpose: Purpose,
         #[case] granted: bool,

@@ -1187,3 +1187,83 @@ async fn a_scoped_target_applies_inside_the_namespaces_its_cluster_hands_it() {
         assert!(again.removals.is_empty(), "{:?}", again.removals);
     }
 }
+
+// ------------------------------------------------------------ node operations
+
+fn access(a: &Assignment) -> Access<'_> {
+    Access {
+        target: &a.target,
+        spec: &a.spec,
+        revision: None,
+        secrets: None,
+    }
+}
+
+fn node_task<'a>(op: buckle_core::task::NodeOp, node: &'a str) -> node::NodeTask<'a> {
+    node::NodeTask {
+        op,
+        node,
+        pool: Some("public"),
+        deadline: None,
+    }
+}
+
+/// The steward acts on the asking host's node with a `node` credential of
+/// its own, and a join token is for the pool the server picked.
+#[tokio::test]
+async fn a_steward_acts_on_a_node_with_its_node_credential() {
+    use buckle_core::task::NodeOp;
+    use secrecy::ExposeSecret;
+    let fake = FakeNomad::new();
+    fake.node("n-1", "web-1", "ready", false, false);
+    let ex = executor(&fake);
+    let a = assignment(revision("r1", &[]), ClusterIdentity::BuckleJwt, 7);
+
+    let before = ex
+        .node(access(&a), node_task(NodeOp::Status, "web-1"))
+        .await
+        .unwrap();
+    let undrained = ex
+        .node(access(&a), node_task(NodeOp::Undrain, "web-1"))
+        .await
+        .unwrap();
+    let absent = ex
+        .node(access(&a), node_task(NodeOp::Undrain, "web-9"))
+        .await
+        .unwrap();
+    let joined = ex
+        .node(access(&a), node_task(NodeOp::Join, "web-9"))
+        .await
+        .unwrap();
+
+    assert!(before.registered && !before.eligible && !before.changed);
+    assert!(undrained.changed && undrained.eligible);
+    assert!(!absent.registered && !absent.changed);
+    assert_eq!(joined.pool, "public");
+    assert_eq!(
+        joined.token.as_ref().map(|t| t.expose_secret().to_owned()),
+        Some("intro:web-9:public".to_owned())
+    );
+    assert_eq!(fake.logins(), vec![format!("jwt:{TARGET}:Node")]);
+}
+
+#[tokio::test]
+async fn a_scoped_target_has_no_nodes_to_act_on() {
+    let fake = FakeNomad::new();
+    fake.node("n-1", "web-1", "ready", false, false);
+    let ex = executor(&fake);
+    let a = bounded(revision("r1", &[]), "home-nomad-public", &["public"], &[]);
+
+    let outcome = ex
+        .node(
+            access(&a),
+            node_task(buckle_core::task::NodeOp::Undrain, "web-1"),
+        )
+        .await;
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        fake.node_state("n-1").unwrap()["SchedulingEligibility"],
+        "ineligible"
+    );
+}

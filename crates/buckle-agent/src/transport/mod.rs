@@ -352,6 +352,25 @@ pub enum Instruction {
         /// With `target`: only this workload's placement.
         workload: Option<String>,
     },
+    /// Act on one node of a cluster this agent stewards, for the host of
+    /// that name, and answer with a [`Report::NodeOperation`].
+    NodeOperation {
+        /// Names the request; echoed in the answer.
+        op_id: String,
+        /// The cluster target.
+        target: String,
+        /// How to reach it.
+        cluster: Option<WireCluster>,
+        op: buckle_core::task::NodeOp,
+        /// The node's name: the asking host's id.
+        node: String,
+        /// `join`: the pool the token is for; `None`: the default pool.
+        pool: Option<String>,
+        /// The revision declaring the cluster, for the credential.
+        revision: Option<RevisionId>,
+        /// `drain`: how long the node's work gets to move.
+        deadline: Option<std::time::Duration>,
+    },
     /// Keepalive from the server; nothing to do.
     Ping,
     /// Install this agent version when idle, then restart.
@@ -484,6 +503,23 @@ pub trait Transport: Send + Sync + 'static {
             ],
         ))
     }
+
+    /// Asks the control plane to have a cluster's steward act on this
+    /// host's own node. `revision` declares the cluster; `None`: the stable
+    /// revision.
+    async fn node_operation(
+        &self,
+        request: &buckle_core::task::NodeRequest,
+        _revision: Option<&RevisionId>,
+    ) -> buckle_core::Result<buckle_core::task::NodeReply> {
+        Err(buckle_core::error::user(
+            format!(
+                "There is no Buckle server to pass a node operation to {}'s steward.",
+                request.target
+            ),
+            &["Run `cluster.node` tasks on an agent enrolled with a Buckle server."],
+        ))
+    }
 }
 
 /// Agent → control plane messages, transport-neutral. The gRPC transport
@@ -584,6 +620,12 @@ pub enum Report {
         reachable: bool,
         /// Why not, when it did not.
         error: Option<String>,
+    },
+    /// How an [`Instruction::NodeOperation`] went.
+    NodeOperation {
+        op_id: String,
+        /// The node's state and what was done, or why it failed.
+        result: Result<buckle_core::task::NodeReply, String>,
     },
     /// A report about a cluster target this agent executes for: the inner
     /// report travels with `target` (and, for one placement, `workload`)

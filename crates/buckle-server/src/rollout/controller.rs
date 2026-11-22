@@ -212,6 +212,22 @@ pub enum Command {
         workload: Option<String>,
         note: String,
     },
+    /// Hand a node operation to cluster `target`'s steward (see
+    /// [`crate::node_ops`]); replies with the steward it was sent to. The
+    /// caller has authorised it and waits for the steward's answer.
+    NodeOperation {
+        target: String,
+        /// Names the request in the steward's answer.
+        op_id: String,
+        op: pb::NodeOp,
+        /// The node: the asking host's id.
+        node: String,
+        /// A join's pool; empty for the scheduler's default.
+        pool: String,
+        /// The revision whose fleet declares the cluster.
+        revision: String,
+        deadline: Option<Duration>,
+    },
 }
 
 impl Command {
@@ -236,6 +252,7 @@ impl Command {
             Command::StartAction { .. } => "rollout.action.start",
             Command::MoveLease { .. } => "target.steward.move",
             Command::CheckDrift { .. } => "host.drift.check",
+            Command::NodeOperation { .. } => "target.node",
         }
     }
 }
@@ -635,6 +652,10 @@ pub const CHECK_DRIFT_CAPABILITY: &str = "check_drift";
 /// module their host does not run, only once they announce it; older ones
 /// take such an entry for a missing module and fail to plan.
 pub const SCHEDULED_NEEDS_CAPABILITY: &str = "scheduled_needs";
+
+/// An agent that stewards a cluster acts on the cluster's nodes for their
+/// hosts (`RunNodeOperation`) only once it announces it.
+pub const NODE_OPS_CAPABILITY: &str = "node_ops";
 
 /// An agent holds a target to its bounds (a scoped target's namespaces, the
 /// ones a cluster handed to its scoped targets) only once it announces it;
@@ -1545,8 +1566,12 @@ impl Controller {
                 reply,
             } => {
                 let action = command.action();
+                // A node operation is audited by the RPC that asked for it.
+                let audited = !matches!(command, Command::NodeOperation { .. });
                 let result = self.on_command(&actor, command).await;
-                if let Err(e) = &result {
+                if let Err(e) = &result
+                    && audited
+                {
                     self.audits.push(NewAudit {
                         at: self.now(),
                         actor: actor.clone(),
@@ -2776,6 +2801,66 @@ impl Controller {
         Ok(session)
     }
 
+    /// Sends a node operation to `target`'s steward (see
+    /// [`Command::NodeOperation`]). Refused for anything but a cluster, and
+    /// without a connected steward that understands the request.
+    #[allow(clippy::too_many_arguments)]
+    async fn node_operation(
+        &mut self,
+        target: String,
+        op_id: String,
+        op: pb::NodeOp,
+        node: String,
+        pool: String,
+        revision: String,
+        deadline: Option<Duration>,
+    ) -> Result<String, CommandError> {
+        let t = target.clone();
+        let record = self
+            .store
+            .call(move |db| db.hosts().target(&t))
+            .await
+            .map_err(CommandError::internal)?
+            .filter(|r| r.kind == TargetKind::Cluster)
+            .ok_or_else(|| CommandError::not_found(format!("No cluster '{target}'.")))?;
+        let Some(spec) = record.cluster.as_ref().map(|c| c.spec.clone()) else {
+            return Err(CommandError::not_found(format!("No cluster '{target}'.")));
+        };
+        let session = self
+            .executors
+            .get(&target)
+            .filter(|s| self.eligible(s))
+            .cloned()
+            .ok_or_else(|| {
+                CommandError::conflict(
+                    format!("No steward of {target} is connected."),
+                    &["The node asks again on its next run, once a steward's agent is back."],
+                )
+            })?;
+        if !self.has_capability(&session, NODE_OPS_CAPABILITY) {
+            // The node asks again, as it does while no steward is connected.
+            return Err(CommandError::conflict(
+                format!("{session}'s agent, the steward of {target}, cannot act on nodes."),
+                &["Upgrade its agent."],
+            ));
+        }
+        let fleet = self.revisions.load(&revision).await.ok();
+        let cluster =
+            self.cluster_target(&target, &record, &spec, fleet.as_ref().map(|r| &r.fleet));
+        let m = msg(server_message::Msg::NodeOperation(pb::RunNodeOperation {
+            op_id,
+            target,
+            cluster: Some(cluster),
+            op: op as i32,
+            node,
+            pool,
+            revision,
+            deadline: deadline.and_then(|d| d.try_into().ok()),
+        }));
+        self.outbox.push(Out::Msg(session.clone(), Box::new(m)));
+        Ok(session)
+    }
+
     /// Starts an action rollout (see [`Command::StartAction`]): refused
     /// while another rollout is under way or queued, and without a stable
     /// revision (whose phases it follows).
@@ -3077,6 +3162,18 @@ impl Controller {
                 workload,
                 note,
             } => self.check_drift(actor, target, workload, note).await,
+            Command::NodeOperation {
+                target,
+                op_id,
+                op,
+                node,
+                pool,
+                revision,
+                deadline,
+            } => {
+                self.node_operation(target, op_id, op, node, pool, revision, deadline)
+                    .await
+            }
             Command::StartAction {
                 action,
                 targets,

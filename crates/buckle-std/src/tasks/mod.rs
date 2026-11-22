@@ -39,6 +39,7 @@ pub mod git_repository;
 pub mod github_release;
 
 // Commands, users and host settings.
+pub mod cluster_node;
 pub mod command_run;
 pub mod cron_job;
 pub mod docker_image;

@@ -24,6 +24,7 @@ pub mod config;
 pub mod fields;
 pub mod health;
 pub mod index;
+pub mod nodes;
 pub mod object;
 pub mod primitives;
 pub mod transport;

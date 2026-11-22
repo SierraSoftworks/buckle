@@ -72,7 +72,7 @@ for a cluster, and a `cluster.*` group never for a host.
 A label an agent reports and a fact it collects are that host's own word. They are fine for
 choosing what a host converges to, and not for deciding what it is handed: a compromised host
 could report its way into a cluster credential or a secret. So the selectors that hand something
-out (a cluster's `executors`, an identity's `hosts`, a secret's `hosts`) are *trust selectors*,
+out (a cluster's `executors` and `pools`, an identity's `hosts`, a secret's `hosts`) are *trust selectors*,
 and read only what the server itself established:
 
 | Key | Established by |
@@ -123,6 +123,9 @@ fleet:
       identity: buckle_jwt                          # buckle_jwt (default), local, workload or secret://NAME
       labels: { site: home }
       watch: { health: 60s, drift: 10m }            # how often its steward reads it unprompted (defaults)
+      pools:                                        # optional: the node pool a host joins, first match wins
+        - { name: public, when: 'host.facts.tailscale.tags contains "tag:public"' }
+        - home
       trust:                                        # optional: an executor running inside the cluster
         jwks_url: http://nomad.home:4646/.well-known/jwks.json
         subjects: [default/buckle-executor]
@@ -141,6 +144,7 @@ fleet:
 | `labels` | Seed labels, as an agent's are for a host. Operators may add to them in the UI, and `cluster.labels.*` selects on the result. |
 | `cluster`, `scope` | A [scoped target](#scoped-targets): part of another cluster, holding only the namespaces listed. |
 | `watch` | How often the steward reads the cluster when nothing wakes it: `health` (default `60s`) covers a dropped Nomad long poll, `drift` (default `10m`) re-plans the applied revision. |
+| `pools` | The [node pools](#node-pools) a host may join the cluster in. Not on a scoped target. |
 | `trust` | Which workload identities may speak for the cluster from inside it ([in-cluster executors](../agent/server.md#in-cluster-executors)): `jwks_url` the server reads the signing keys from, or `keys` pinned as a JWKS document; an optional `issuer`; `subjects` as `namespace/job` (Nomad, default `default/buckle-executor`) or `sub` (Kubernetes, default `system:serviceaccount:buckle-system:buckle-executor`). Not on a scoped target. |
 
 ### Scoped targets
@@ -171,6 +175,19 @@ fleet:
 
 Stewards must run an agent that holds targets to their bounds (it announces the `scopes`
 capability); an older one is never leased a scoped target or its cluster.
+
+### Node pools
+
+`pools` decides which pool a [`cluster.node`](./tasks/commands.md#cluster-node) `join` token is
+for. The server picks; the host has no say.
+
+- **Order**: a list read top to bottom; the first entry the host matches wins.
+- **Entry**: a pool's name, or `{ name, when }`. `when` is a [trust selector](#trust). An entry
+  without one takes every node, so `pools: [home]` puts all of them in `home`, and `buckle
+  validate` warns about entries after it.
+- **No match**: no token. With no `pools` at all, tokens are for the scheduler's default pool.
+- **`nodes` is not trust**: it reads what agents report, so an entry without `when` hands a token
+  to any host that claims to be a node. Give every entry a `when` where joining must be earned.
 
 ### Stewards
 

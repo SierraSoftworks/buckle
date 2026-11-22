@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 /// (group/version, kind, plural, namespaced) served from the start.
 const BUILTIN: &[(&str, &str, &str, bool)] = &[
     ("v1", "Namespace", "namespaces", false),
+    ("v1", "Node", "nodes", false),
     ("v1", "ConfigMap", "configmaps", true),
     ("v1", "Secret", "secrets", true),
     ("v1", "Service", "services", true),
@@ -321,6 +322,22 @@ impl FakeKube {
             .as_ref()
             .and_then(|b| serde_json::from_slice(b).ok())
             .unwrap_or(Value::Null);
+
+        // Eviction: the pod leaves unless its `fake/pdb` annotation holds it.
+        if let (Some(pod), Some(&"eviction")) = (&name, rest.get(2)) {
+            return match s.objects.get(&key(pod)) {
+                None => status(404, "NotFound", "not found"),
+                Some(o) if o["metadata"]["annotations"]["fake/pdb"].is_string() => status(
+                    429,
+                    "TooManyRequests",
+                    "Cannot evict pod as it would violate the pod's disruption budget.",
+                ),
+                Some(_) => {
+                    s.objects.remove(&key(pod));
+                    ok(json!({"status": "Success"}))
+                }
+            };
+        }
 
         match (req.method, name) {
             ("GET", None) => {

@@ -347,4 +347,29 @@ impl Fleet for FakeFleet {
             id: "jti-1".into(),
         }))
     }
+
+    /// Answers as a steward that did what was asked; refuses the cluster
+    /// `denied`.
+    async fn node_operation(
+        &self,
+        request: Request<pb::NodeOperationRequest>,
+    ) -> Result<Response<pb::NodeOperationResult>, Status> {
+        let r = request.into_inner();
+        if r.cluster == "denied" {
+            return Err(Status::permission_denied(
+                "test-host is not a node of denied",
+            ));
+        }
+        Ok(Response::new(pb::NodeOperationResult {
+            registered: true,
+            eligible: true,
+            changed: r.op() != pb::NodeOp::Status,
+            summary: format!("{:?} on {} at {}", r.op(), r.cluster, r.revision),
+            token: match r.op() {
+                pb::NodeOp::Join => "join-token".into(),
+                _ => String::new(),
+            },
+            ..Default::default()
+        }))
+    }
 }

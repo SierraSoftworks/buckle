@@ -260,10 +260,10 @@ tokens serve any other service that trusts the issuer, through
 
 **Issue.** An agent calls `IssueIdentity { target, purpose }`. The server grants it only for a
 cluster target declared in a revision the host may fetch, with `identity: buckle_jwt`, and only
-when the host matches the target's `executors` selector (purposes `read`, `deploy` and `acl`) or
-its `nodes` selector (`drain`, for its own node). `executors` is a
+when the host matches the target's `executors` selector (purposes `read`, `deploy`, `acl` and
+`node`) or its `nodes` selector (`drain`, for its own node). `executors` is a
 [trust selector](../modules/fleet.md#trust), so nothing the agent reports about itself earns a
-grant, and `acl` is never issued for a scoped target. `IssueIdentity { audience }` instead names a
+grant, and `acl` and `node` are never issued for a scoped target. `IssueIdentity { audience }` instead names a
 `fleet.identities` entry, granted when the host matches its `hosts`. Grants and refusals are
 audited (`identity.issued`, `identity.denied`).
 
@@ -275,7 +275,7 @@ audited (`identity.issued`, `identity.denied`).
 | `tags` | The host's verified Tailscale tags (`[]` when it did not connect over Tailscale). |
 | `labels` | The host's [reserved labels](../modules/fleet.md#trust), as set on the server, e.g. `{"zone": "home"}`. |
 | `target`, `cluster` | Cluster tokens only: the target, and the cluster it is on (differs for a scoped target). |
-| `purpose` | Cluster tokens only: `read`, `deploy`, `drain` or `acl`. |
+| `purpose` | Cluster tokens only: `read`, `deploy`, `node`, `acl` or `drain`. |
 | `rollout` | Cluster tokens only: the rollout the credential serves, when any. |
 
 **Keys.** One ES256 key at `data_dir/identity/signing.key`, generated on first start and
@@ -359,6 +359,31 @@ and run health checks as `buckle:read`, which reads the objects and the index Co
 kubectl create clusterrolebinding buckle-deploy --clusterrole=cluster-admin --group=buckle:deploy
 kubectl create clusterrolebinding buckle-read --clusterrole=view --group=buckle:read
 ```
+
+#### Node operations
+
+A [`cluster.node`](../modules/tasks/commands.md#cluster-node) task reaches the server as
+`NodeOperation { cluster, op }`. The server checks the host against the cluster's `nodes`, picks
+a join's pool from [`pools`](../modules/fleet.md#node-pools) and hands the operation to the
+cluster's steward, which acts with a `node` credential. No host holds one.
+
+- **Nomad**: bind `node` to a policy with `node { policy = "write" }`, which covers eligibility,
+  drains and client introduction tokens:
+
+  ```sh
+  nomad acl policy apply buckle-node - <<< 'node { policy = "write" }'
+  nomad acl binding-rule create -auth-method buckle -bind-type policy -bind-name buckle-node \
+    -selector 'value.purpose == "node"'
+  ```
+
+  Introduction tokens only gate joining once the servers set
+  `client_introduction { enforcement = "strict" }`.
+- **Kubernetes**: bind the group `buckle:node` to a ClusterRole that may `get` and `patch`
+  `nodes`, `list` `pods`, `create` `pods/eviction`, and a Role in `kube-system` that may `create`
+  `secrets` (bootstrap tokens).
+- **`drain`**: the older purpose that handed a node's own host `node:write` through
+  `command.run`. Once a fleet's modules use `cluster.node`, delete its binding rule and policy;
+  the server keeps issuing it until then.
 
 #### Scoped targets
 

@@ -633,6 +633,36 @@ impl Agent {
 }
 
 impl Shared {
+    /// Carries out a node operation on a cluster this agent stewards, as
+    /// the server described the cluster.
+    async fn node_operation(
+        &self,
+        target: &str,
+        cluster: Option<&crate::transport::WireCluster>,
+        revision: Option<&RevisionId>,
+        task: crate::cluster::node::NodeTask<'_>,
+    ) -> buckle_core::Result<buckle_core::task::NodeReply> {
+        let cluster = cluster.ok_or_else(|| {
+            buckle_core::error::system(
+                format!("The server did not describe the cluster {target}."),
+                &["Upgrade the Buckle server to match this agent."],
+            )
+        })?;
+        let spec = targets::target_spec(cluster)?;
+        // A `secret://` credential travels with an assignment.
+        let secrets = {
+            let data = self.data.lock().await;
+            data.assignments.latest(target).map(|a| a.secrets.clone())
+        };
+        let access = crate::cluster::Access {
+            target,
+            spec: &spec,
+            revision,
+            secrets: secrets.as_deref(),
+        };
+        self.executor.node(access, task).await
+    }
+
     async fn load(&self) -> buckle_core::Result<()> {
         // state.cbor belongs to the engine; it is only read here, to adopt
         // the bookkeeping older agents kept in it.
@@ -866,6 +896,26 @@ impl Shared {
                     }
                     Some(Instruction::CheckDrift { target: Some(target), workload }) => {
                         self.lanes.dispatch(&self, &target, lanes::LaneOp::CheckDrift { workload });
+                    }
+                    // A node of a cluster this agent stewards asks for an
+                    // operation on itself. Served beside the cluster's lane:
+                    // an apply under way must not hold a booting node up.
+                    Some(Instruction::NodeOperation { op_id, target, cluster, op, node, pool, revision, deadline }) => {
+                        let shared = self.clone();
+                        tokio::spawn(async move {
+                            let task = crate::cluster::node::NodeTask {
+                                op,
+                                node: &node,
+                                pool: pool.as_deref(),
+                                deadline,
+                            };
+                            let result = shared.node_operation(&target, cluster.as_ref(), revision.as_ref(), task).await;
+                            if let Err(e) = &result {
+                                tracing::warn!(%target, %node, %op, error = %e.description(), "a node operation failed");
+                            }
+                            let result = result.map_err(|e| e.description().to_string());
+                            shared.sink.send(Report::NodeOperation { op_id, result }).await;
+                        }.instrument(tracing::info_span!("agent.node_operation")));
                     }
                     // Work for a cluster target this host speaks for runs on
                     // the cluster's lane. As for the host's own work, all
@@ -2841,6 +2891,7 @@ fn op_for(instruction: Instruction) -> Option<Op> {
         | Instruction::Lease { .. }
         | Instruction::Release { .. }
         | Instruction::CheckDrift { .. }
+        | Instruction::NodeOperation { .. }
         | Instruction::Rejected { .. } => return None,
     })
 }

@@ -27,6 +27,12 @@ service Fleet {
   // ACL login, or a Kubernetes bearer token). Granted only for a cluster
   // target the host may act for, and audited.
   rpc IssueIdentity(IssueIdentityRequest) returns (IssuedIdentity);
+
+  // A host asks the steward of a cluster it is a node of for an operation
+  // on its own node. The host holds no cluster credential for it: the
+  // server checks the request, picks the pool a join is for, and hands it
+  // to the cluster's steward.
+  rpc NodeOperation(NodeOperationRequest) returns (NodeOperationResult);
 }
 
 // ---------------------------------------------------------------- agent → server
@@ -46,6 +52,7 @@ message AgentMessage {
     RebootFailed reboot_failed = 11;
     ActionResult action = 12;
     TargetStatus target_status = 13;
+    NodeOperationDone node_operation = 14;
   }
 }
 
@@ -348,7 +355,39 @@ message ServerMessage {
     Lease lease = 13;
     Release release = 14;
     CheckDrift check_drift = 15;
+    RunNodeOperation node_operation = 16;
   }
+}
+
+// The steward acts on one node of a cluster it holds the lease of, with a
+// `node` credential, and answers with a NodeOperationDone. Sent to agents
+// that announce the `node_ops` capability. It is served beside the
+// cluster's lane, so an apply under way does not hold a booting node up.
+message RunNodeOperation {
+  // Names the request; echoed in the answer.
+  string op_id = 1;
+  string target = 2;
+  ClusterTarget cluster = 3;
+  NodeOp op = 4;
+  // The node: the requesting host's id, as the server verified it.
+  string node = 5;
+  // NODE_OP_JOIN: the pool the token is for; empty for the scheduler's
+  // default pool.
+  string pool = 6;
+  // The revision whose fleet declares the cluster, for the credential.
+  string revision = 7;
+  // NODE_OP_DRAIN: how long the node's work gets to move; unset: the
+  // steward's default.
+  google.protobuf.Duration deadline = 8;
+}
+
+// How a RunNodeOperation went. Not durable: the host waiting for it asks
+// again.
+message NodeOperationDone {
+  string op_id = 1;
+  NodeOperationResult result = 2;
+  // Why it failed (scrubbed); empty when it did not.
+  string error = 3;
 }
 
 // Check for drift now, as the agent's own drift pass does (and correcting
@@ -677,6 +716,9 @@ enum IdentityPurpose {
   // Reading and writing ACL policies, which Nomad allows only for
   // management tokens: bound apart so read and deploy stay narrow.
   IDENTITY_PURPOSE_ACL = 4;
+  // Node operations (eligibility, drains, introduction tokens) on behalf
+  // of the cluster's nodes: for executors only, never for a scoped target.
+  IDENTITY_PURPOSE_NODE = 5;
 }
 
 message IssueIdentityRequest {
@@ -703,4 +745,47 @@ message IssuedIdentity {
   string issuer = 3;
   string audience = 4;
   string id = 5;
+}
+
+// ---------------------------------------------------------------- nodes
+
+enum NodeOp {
+  NODE_OP_UNSPECIFIED = 0;
+  // Read the node's state; changes nothing.
+  NODE_OP_STATUS = 1;
+  // Stop a drain and mark the node eligible (Kubernetes: uncordon).
+  NODE_OP_UNDRAIN = 2;
+  // Take the node out of scheduling and move its work elsewhere.
+  NODE_OP_DRAIN = 3;
+  // A token the node joins the cluster with.
+  NODE_OP_JOIN = 4;
+}
+
+message NodeOperationRequest {
+  // The cluster the host is a node of. Never a scoped target: nodes
+  // belong to the cluster itself.
+  string cluster = 1;
+  NodeOp op = 2;
+  // The revision whose fleet declares the cluster; one the host may fetch.
+  // Empty: the fleet's stable revision.
+  string revision = 3;
+  // NODE_OP_DRAIN: how long the node's work gets to move; unset: the
+  // steward's default.
+  google.protobuf.Duration deadline = 4;
+}
+
+message NodeOperationResult {
+  // Whether the scheduler knows a live node of the host's name.
+  bool registered = 1;
+  // Whether the scheduler places work on it, and whether it is draining.
+  bool eligible = 2;
+  bool draining = 3;
+  // Whether the operation changed anything.
+  bool changed = 4;
+  // What happened, one line.
+  string summary = 5;
+  // NODE_OP_JOIN: the pool the token is for (empty: the default pool) and
+  // the token itself, which the server passes on and never stores.
+  string pool = 6;
+  string token = 7;
 }

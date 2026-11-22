@@ -55,7 +55,12 @@ pub struct FleetService {
     pub identity: Arc<crate::identity::Issuer>,
     /// Checks in-cluster executors' workload identities.
     pub workload: Arc<crate::workload::WorkloadTrust>,
+    /// Node operations waiting for a steward's answer.
+    pub node_ops: Arc<crate::node_ops::NodeOps>,
 }
+
+/// How long a host's node operation waits for the steward's answer.
+const NODE_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl std::fmt::Debug for FleetService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1053,6 +1058,19 @@ impl FleetService {
     }
 
     async fn route(&self, host: &str, msg: agent_message::Msg) {
+        // A steward's answer to a node operation goes to the call waiting
+        // for it and nowhere else: it may carry a join token.
+        let msg = match msg {
+            agent_message::Msg::NodeOperation(done) => {
+                let outcome = match done.result {
+                    Some(result) if done.error.is_empty() => Ok(result),
+                    _ => Err(done.error),
+                };
+                self.node_ops.answer(&done.op_id, host, outcome);
+                return;
+            }
+            other => other,
+        };
         let now = self.now();
         // A report naming a cluster target is about that target, not the
         // executor that sent it: its facts, plan, run, health and drift are
@@ -1515,7 +1533,7 @@ impl FleetService {
                     .await
                     .map(|()| true)
             }
-            agent_message::Msg::Hello(_) => Ok(true),
+            agent_message::Msg::Hello(_) | agent_message::Msg::NodeOperation(_) => Ok(true),
         };
         match &stored {
             Err(e) => {
@@ -1954,6 +1972,167 @@ impl Fleet for FleetService {
         Ok(Response::new(bundle))
     }
 
+    async fn node_operation(
+        &self,
+        request: Request<buckle_proto::v1::NodeOperationRequest>,
+    ) -> Result<Response<buckle_proto::v1::NodeOperationResult>, Status> {
+        use buckle_core::model::PoolChoice;
+        use buckle_proto::v1::NodeOp;
+        let host = self.caller(&request).await?;
+        let req = request.into_inner();
+        let op = req.op();
+        let name = match op {
+            NodeOp::Unspecified => return Err(Status::invalid_argument("name the operation")),
+            NodeOp::Status => "status",
+            NodeOp::Undrain => "undrain",
+            NodeOp::Drain => "drain",
+            NodeOp::Join => "join",
+        };
+        let revision = if req.revision.is_empty() {
+            self.store
+                .call(|db| db.kv().get(crate::store::kv::keys::STABLE_REVISION))
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| Status::failed_precondition("the fleet has no stable revision"))?
+        } else {
+            req.revision.clone()
+        };
+        self.entitled_to(&host, &revision).await?;
+        let (h, t) = (host.clone(), req.cluster.clone());
+        let (record, facts, stored) = self
+            .store
+            .call(move |db| {
+                Ok((
+                    db.hosts().get(&h)?,
+                    db.hosts().latest_facts(&h)?.map(|(f, _)| f),
+                    db.hosts().target(&t)?,
+                ))
+            })
+            .await
+            .map_err(internal)?;
+        let record = record.ok_or_else(|| Status::unauthenticated("unknown host"))?;
+        let loaded = self
+            .revisions
+            .load(&revision)
+            .await
+            .map_err(|_| Status::not_found("no such revision"))?;
+        let ctx = crate::fleet::record_context(
+            &record,
+            &facts.unwrap_or(serde_json::Value::Null),
+            &loaded.fleet,
+        );
+        let trusted = crate::fleet::trust_context(&record, &loaded.fleet);
+        // Reading a node's state is not worth an audit line each drift
+        // pass; everything that changes one (or is refused) is.
+        let audit = |outcome: &str, message: String, pool: Option<&str>| NewAudit {
+            at: self.now(),
+            actor: host.clone(),
+            action: format!("target.node.{name}"),
+            outcome: outcome.into(),
+            subject: Some(req.cluster.clone()),
+            message,
+            detail: Some(serde_json::json!({ "node": host, "pool": pool, "revision": revision })),
+            trace_id: None,
+        };
+        let refuse = |reason: String| {
+            audit(
+                "denied",
+                format!(
+                    "{host} was refused a node {name} on {}: {reason}",
+                    req.cluster
+                ),
+                None,
+            )
+        };
+        let Some(trust) = crate::fleet::cluster_trust(&loaded.fleet, stored.as_ref(), &req.cluster)
+        else {
+            let reason = format!("revision {revision} declares no cluster {}", req.cluster);
+            self.audit_entry(refuse(reason.clone())).await;
+            return Err(Status::not_found(reason));
+        };
+        if let Err(reason) = trust.node(&ctx) {
+            self.audit_entry(refuse(reason.clone())).await;
+            return Err(Status::permission_denied(reason));
+        }
+        // The pool is the server's choice, from what it verified itself.
+        let declared = loaded.fleet.fleet.clusters.get(&req.cluster);
+        let pool = match (op, declared.map(|d| d.pool(&trusted))) {
+            (NodeOp::Join, Some(PoolChoice::Named(pool))) => pool.to_owned(),
+            (NodeOp::Join, Some(PoolChoice::Refused)) => {
+                let reason = format!("{host} matches none of {}'s pools", req.cluster);
+                self.audit_entry(refuse(reason.clone())).await;
+                return Err(Status::permission_denied(reason));
+            }
+            _ => String::new(),
+        };
+        let op_id = uuid::Uuid::new_v4().to_string();
+        let answer = self.node_ops.open(&op_id);
+        let sent = self
+            .controller
+            .command(
+                &host,
+                crate::rollout::Command::NodeOperation {
+                    target: req.cluster.clone(),
+                    op_id: op_id.clone(),
+                    op,
+                    node: host.clone(),
+                    pool: pool.clone(),
+                    revision: revision.clone(),
+                    deadline: req.deadline.and_then(|d| d.try_into().ok()),
+                },
+            )
+            .await;
+        let outcome = match sent {
+            Err(e) => {
+                use crate::rollout::CommandErrorKind as Kind;
+                let reason = e.error.description().to_string();
+                Err(match e.kind {
+                    Kind::NotFound => Status::not_found(reason),
+                    Kind::Conflict => Status::unavailable(reason),
+                    Kind::Invalid => Status::failed_precondition(reason),
+                    Kind::Internal => Status::internal(reason),
+                })
+            }
+            Ok(steward) => {
+                self.node_ops.sent_to(&op_id, &steward);
+                match tokio::time::timeout(NODE_OPERATION_TIMEOUT, answer).await {
+                    Ok(Ok(Ok(result))) => Ok(result),
+                    Ok(Ok(Err(error))) => Err(Status::aborted(format!(
+                        "{steward}, the steward of {}, could not {name} {host}: {error}",
+                        req.cluster
+                    ))),
+                    Ok(Err(_)) | Err(_) => Err(Status::deadline_exceeded(format!(
+                        "{steward}, the steward of {}, did not answer in time",
+                        req.cluster
+                    ))),
+                }
+            }
+        };
+        self.node_ops.close(&op_id);
+        match &outcome {
+            Ok(result) if op != NodeOp::Status => {
+                tracing::info!(buckle.host = %host, buckle.target = %req.cluster, op = name, changed = result.changed, "node operation");
+                let pool = (op == NodeOp::Join).then_some(pool.as_str());
+                self.audit_entry(audit(
+                    "ok",
+                    format!(
+                        "{host} asked for a node {name} on {}: {}",
+                        req.cluster, result.summary
+                    ),
+                    pool,
+                ))
+                .await;
+            }
+            Err(status) if op != NodeOp::Status => {
+                let mut entry = refuse(status.message().to_owned());
+                entry.outcome = "failed".into();
+                self.audit_entry(entry).await;
+            }
+            _ => {}
+        }
+        outcome.map(Response::new)
+    }
+
     async fn issue_identity(
         &self,
         request: Request<IssueIdentityRequest>,
@@ -1970,6 +2149,7 @@ impl Fleet for FleetService {
             IdentityPurpose::Deploy => Purpose::Deploy,
             IdentityPurpose::Drain => Purpose::Drain,
             IdentityPurpose::Acl => Purpose::Acl,
+            IdentityPurpose::Node => Purpose::Node,
             IdentityPurpose::Unspecified => {
                 return Err(Status::invalid_argument("name the identity's purpose"));
             }

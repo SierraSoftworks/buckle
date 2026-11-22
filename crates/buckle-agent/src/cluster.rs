@@ -16,6 +16,7 @@
 //!   `secret://` secret.
 
 mod kubernetes;
+pub(crate) mod node;
 
 use crate::identity::{Credential, Credentials, IdentityRequest, Login, Purpose};
 use crate::transport::Transport;
@@ -80,6 +81,19 @@ impl std::fmt::Debug for TargetSpec {
             .field("bounds", &self.bounds)
             .finish_non_exhaustive()
     }
+}
+
+/// What a client for a cluster target is built from: an [`Assignment`], or
+/// (for a node operation, which no revision is assigned for) the target as
+/// the server described it.
+#[derive(Clone, Copy)]
+pub(crate) struct Access<'a> {
+    pub target: &'a str,
+    pub spec: &'a TargetSpec,
+    /// The revision whose fleet declares the target; `None`: the stable one.
+    pub revision: Option<&'a RevisionId>,
+    /// The secrets a `secret://` identity is read from.
+    pub secrets: Option<&'a SecretStore>,
 }
 
 /// One revision of one cluster target, ready to plan, apply or check.
@@ -296,19 +310,35 @@ impl Executor {
         purpose: Purpose,
         rollout: Option<&str>,
     ) -> buckle_core::Result<Nomad> {
+        let access = Access {
+            target: &a.target,
+            spec: &a.spec,
+            revision: Some(&a.revision.id),
+            secrets: Some(&a.secrets),
+        };
+        self.nomad_as(access, purpose, rollout).await
+    }
+
+    /// A Nomad client for a cluster carrying a credential for `purpose`.
+    async fn nomad_as(
+        &self,
+        a: Access<'_>,
+        purpose: Purpose,
+        rollout: Option<&str>,
+    ) -> buckle_core::Result<Nomad> {
         let nomad = self
             .connect
-            .nomad(&a.target, &a.spec)?
+            .nomad(a.target, a.spec)?
             .home(a.spec.bounds.home());
         match &a.spec.identity {
             ClusterIdentity::BuckleJwt => {
                 let request = IdentityRequest {
-                    target: a.target.clone(),
+                    target: a.target.to_owned(),
                     purpose,
-                    revision: Some(a.revision.id.clone()),
+                    revision: a.revision.cloned(),
                     rollout: rollout.map(str::to_owned),
                 };
-                let address = nomad_address(&a.spec);
+                let address = nomad_address(a.spec);
                 let login = Login::Nomad {
                     api: url::Url::parse(&address)
                         .or_else(|_| url::Url::parse(DEFAULT_NOMAD_ADDR))
@@ -318,7 +348,7 @@ impl Executor {
                     auth_method: Login::DEFAULT_NOMAD_AUTH_METHOD.to_owned(),
                 };
                 let anonymous = nomad.clone();
-                let target = a.target.clone();
+                let target = a.target.to_owned();
                 let credential = self
                     .credentials
                     .get_with(&request, &login, |identity| async move {
@@ -336,7 +366,7 @@ impl Executor {
                     _ => nomad,
                 })
             }
-            ClusterIdentity::Secret(name) => match a.secrets.get(name) {
+            ClusterIdentity::Secret(name) => match a.secrets.and_then(|s| s.get(name)) {
                 Some(secret) => Ok(nomad.token(ApiSink.credential(secret))),
                 None => Err(buckle_core::error::user(
                     format!(
@@ -1932,6 +1962,12 @@ impl Assignments {
         if list.len() > Self::KEEP {
             list.remove(0);
         }
+    }
+
+    /// The assignment most recently made for `target`, whose secrets a
+    /// node operation's `secret://` credential is read from.
+    pub fn latest(&self, target: &str) -> Option<&Assignment> {
+        self.by_target.get(target)?.last()
     }
 
     pub fn get(&self, target: &str, revision: &RevisionId) -> Option<&Assignment> {

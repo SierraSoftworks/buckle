@@ -403,6 +403,9 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
                 check_secrets(report, Some(name), location, s);
                 check_template(report, Some(name), location, s);
             }
+            if let Some(problem) = cluster_node_problem(decl, &revision.fleet) {
+                report.error(Some(name), location, problem);
+            }
             if let Some(when) = &decl.when {
                 check_secrets(report, Some(name), location, when.raw());
                 if let Some(problem) = host_selector_problem(when.raw()) {
@@ -596,6 +599,32 @@ pub fn command_run_without_id(decl: &TaskDecl) -> Option<String> {
     (decl.kind == "command.run" && has_remove && decl.id.is_none()).then(|| {
         "sets `remove:` but no `id`: a command.run is identified by its rendered command, so editing the command (or a var inside it) would run the old `remove:`; give the task a stable `id`".to_owned()
     })
+}
+
+/// A `cluster.node` names the cluster whose steward acts on the host's
+/// node: one the fleet declares (unless its clusters are created through
+/// the API alone), and never a scoped target, which has no nodes.
+pub fn cluster_node_problem(decl: &TaskDecl, fleet: &crate::model::FleetConfig) -> Option<String> {
+    if decl.kind != "cluster.node" {
+        return None;
+    }
+    let cluster = decl
+        .spec
+        .as_mapping()?
+        .get(serde_yaml::Value::String("cluster".into()))?
+        .as_str()
+        .filter(|c| !c.contains("{{"))?;
+    match fleet.fleet.clusters.get(cluster) {
+        Some(decl) => decl.cluster.as_ref().map(|parent| {
+            format!(
+                "names '{cluster}', a scoped target, which has no nodes of its own; name its cluster '{parent}'"
+            )
+        }),
+        None if fleet.fleet.clusters.is_empty() => None,
+        None => Some(format!(
+            "names the cluster '{cluster}', which fleet.clusters does not declare"
+        )),
+    }
 }
 
 /// A `command.run` whose `run` is templated and has no `id` is re-keyed
@@ -949,5 +978,53 @@ mod secret_scope_tests {
             "host.labels.role == \"x\"",
             &serde_json::Value::Null
         ));
+    }
+}
+
+#[cfg(test)]
+mod cluster_node_tests {
+    use super::*;
+    use rstest::rstest;
+
+    const FLEET: &str = "version: 2\nfleet:\n  clusters:\n    nomad: { kind: nomad, nodes: 'true' }\n    public: { kind: nomad, cluster: nomad, scope: { namespaces: [edge] } }\n";
+
+    #[rstest]
+    #[case::the_cluster(FLEET, "cluster.node: { cluster: nomad, op: undrain }", None)]
+    #[case::a_scoped_target(
+        FLEET,
+        "cluster.node: { cluster: public, op: undrain }",
+        Some("scoped target")
+    )]
+    #[case::undeclared(
+        FLEET,
+        "cluster.node: { cluster: nomda, op: undrain }",
+        Some("does not declare")
+    )]
+    #[case::templated(
+        FLEET,
+        "cluster.node: { cluster: '{{ vars.cluster }}', op: undrain }",
+        None
+    )]
+    #[case::clusters_made_through_the_api(
+        "version: 2\n",
+        "cluster.node: { cluster: lab, op: undrain }",
+        None
+    )]
+    #[case::another_kind(FLEET, "command.run: { run: 'true', cluster: nomda }", None)]
+    fn a_node_task_names_a_cluster_with_nodes(
+        #[case] fleet: &str,
+        #[case] task: &str,
+        #[case] problem: Option<&str>,
+    ) {
+        let fleet = crate::model::FleetConfig::parse(fleet).unwrap();
+        let decl: TaskDecl = serde_yaml::from_str(task).unwrap();
+        let found = cluster_node_problem(&decl, &fleet);
+        match problem {
+            Some(text) => assert!(
+                found.as_deref().is_some_and(|p| p.contains(text)),
+                "{found:?}"
+            ),
+            None => assert_eq!(found, None),
+        }
     }
 }

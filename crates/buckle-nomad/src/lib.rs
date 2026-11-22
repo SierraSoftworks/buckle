@@ -20,6 +20,7 @@ pub mod diff;
 pub mod hcl;
 pub mod health;
 pub mod index;
+pub mod nodes;
 pub mod primitives;
 pub mod stamps;
 pub mod transport;
