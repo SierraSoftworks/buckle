@@ -146,6 +146,18 @@ pub fn workload_views(
         .collect()
 }
 
+/// Target `host`'s checks, less those of workloads it no longer runs
+/// (their last readings stay in the history, not in its standing).
+pub fn current_checks(
+    db: &crate::store::Db<'_>,
+    host: &str,
+) -> buckle_core::Result<Vec<buckle_api::HostCheck>> {
+    let removed = db.rollouts().removed_workloads(host)?;
+    let mut checks = db.health().checks(host)?;
+    checks.retain(|c| !removed.contains(&c.module));
+    Ok(checks)
+}
+
 /// How cluster target `host` stands: its last executor (kv
 /// `executor/<id>`), how many workloads `fleet` selects for it, which of
 /// them fail a required check, and which its run in progress is applying.
@@ -169,9 +181,7 @@ pub fn cluster_status(
             buckle_core::engine::selected_workloads(r, &ctx).len() as u32
         })
         .unwrap_or_default();
-    let mut failing: Vec<String> = db
-        .health()
-        .checks(&host.id)?
+    let mut failing: Vec<String> = current_checks(db, &host.id)?
         .into_iter()
         .filter(|c| c.required && c.status == "fail")
         .map(|c| c.module)

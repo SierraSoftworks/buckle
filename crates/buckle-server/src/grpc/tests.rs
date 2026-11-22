@@ -999,6 +999,70 @@ async fn health_readings_belong_to_the_rollout_that_applied_their_revision() {
     assert_eq!(events[0].rollout.as_deref(), Some("ro-1"));
 }
 
+/// Once a workload's removal applies, readings of it (taken at the revision
+/// still applied while its rollout finishes) are dropped rather than stored
+/// as failures; the target's other readings still count.
+#[tokio::test]
+async fn readings_of_a_removed_workload_are_not_stored() {
+    use crate::store::rollouts::tests::{host_row, rollout};
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let (tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    s.store
+        .call(|db| {
+            db.rollouts()
+                .save(&rollout("ro-1", "r2", buckle_api::RolloutState::Completed))?;
+            let mut row = host_row("ro-1", "pi-1", "r2");
+            row.workload = "gone".into();
+            row.state = crate::rollout::model::HostPhase::Healthy;
+            row.runtime.removal = true;
+            db.rollouts().save_host(&row)
+        })
+        .await
+        .unwrap();
+    let reading = |module: &str, passed: bool| buckle_proto::v1::HealthResult {
+        module: module.into(),
+        check: "job".into(),
+        kind: "nomad.job".into(),
+        required: true,
+        passed,
+        reason: if passed { "" } else { "not registered" }.into(),
+        ..Default::default()
+    };
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::Health(buckle_proto::v1::HealthReport {
+            scope: buckle_proto::v1::HealthScope::Drift as i32,
+            revision: "r1".into(),
+            results: vec![reading("gone", false), reading("kept", true)],
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    let checks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let checks = s.store.call(|db| db.health().checks("pi-1")).await.unwrap();
+            if !checks.is_empty() {
+                return checks;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the readings are stored");
+    assert_eq!(
+        checks.iter().map(|c| c.module.as_str()).collect::<Vec<_>>(),
+        vec!["kept"]
+    );
+    let host = s
+        .store
+        .call(|db| db.hosts().get("pi-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(host.health, buckle_api::HealthSummary::Healthy);
+}
+
 /// A host hears which of its modules are suspended as soon as it connects,
 /// and what their checks report is stored as paused: nothing fails.
 #[tokio::test]
