@@ -75,6 +75,10 @@ pub struct SessionGuard {
     pub enrolment: RateLimiter,
     /// How long a stream may take to send Hello.
     pub hello_timeout: Duration,
+    /// What each host last reported that the server knows otherwise (tags,
+    /// reserved labels), so a standing disagreement is audited once and not
+    /// on every reconnect.
+    pub disagreements: Mutex<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for SessionGuard {
@@ -91,6 +95,7 @@ impl Default for SessionGuard {
             sessions: Default::default(),
             enrolment: RateLimiter::new(ENROLMENT_ATTEMPTS_PER_MINUTE, Duration::from_secs(60)),
             hello_timeout: HELLO_TIMEOUT,
+            disagreements: Default::default(),
         }
     }
 }
@@ -100,11 +105,36 @@ impl SessionGuard {
     pub fn allow_enrolment(&self, peer: Option<IpAddr>) -> bool {
         self.enrolment.allow(peer)
     }
+
+    /// Notes what `key` (a host and what it reports) now disagrees with the
+    /// server about; empty when it agrees. Returns whether that is a new
+    /// disagreement worth auditing.
+    pub fn disagrees(&self, key: &str, what: String) -> bool {
+        let mut map = lock(&self.disagreements);
+        if what.is_empty() {
+            map.remove(key);
+            return false;
+        }
+        map.insert(key.to_owned(), what.clone()).as_ref() != Some(&what)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_standing_disagreement_is_reported_once() {
+        let guard = SessionGuard::default();
+        assert!(guard.disagrees("pi-1/tags", "tag:z2".into()));
+        assert!(!guard.disagrees("pi-1/tags", "tag:z2".into()));
+        assert!(guard.disagrees("pi-1/tags", "tag:z1".into()), "a new claim");
+        assert!(!guard.disagrees("pi-1/tags", String::new()));
+        assert!(
+            guard.disagrees("pi-1/tags", "tag:z1".into()),
+            "it came back"
+        );
+    }
 
     #[test]
     fn closing_a_host_cancels_its_live_session_only() {

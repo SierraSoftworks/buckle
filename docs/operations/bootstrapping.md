@@ -17,6 +17,8 @@ new host, joins it to the tailnet when the server can provision it, and enrols t
 2. **Details.** Choose how the agent connects (over Tailscale, or with a join token), its name
    (its tailnet node name over Tailscale), the tags it advertises, and its labels. Labels set here
    are the agent's own; they decide which groups and which rollout phase the host lands in.
+   [Reserved labels](../modules/fleet.md#trust) must be given here: they are kept on the join
+   token and set on the server when the host enrols.
 
    <Screenshot name="add-agent-details" alt="The Add an agent wizard's connection, name and labels" />
 
@@ -76,7 +78,8 @@ overview both list it.
 <Screenshot name="hosts-pending" alt="The pending registrations banner on the hosts page" />
 
 Check that the name is one you expect, then **Approve…**. A host you do not recognise can be left
-pending, paused, or forgotten.
+pending, paused, or forgotten. A host missing a [reserved label](../modules/fleet.md#trust) waits
+here whatever the registration mode, and is approved once the label is set.
 
 <Screenshot name="hosts-approve" alt="The approve registration dialog" />
 

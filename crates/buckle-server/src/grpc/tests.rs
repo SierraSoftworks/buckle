@@ -303,6 +303,16 @@ async fn approve_registration_leaves_new_hosts_pending() {
 
 /// A join token from a command for `host` (any host when `None`).
 async fn join_token(s: &Server, method: buckle_api::JoinMethod, host: Option<&str>) -> String {
+    join_token_with(s, method, host, &[]).await
+}
+
+/// [`join_token`], for a command whose host the server gives `server_labels`.
+async fn join_token_with(
+    s: &Server,
+    method: buckle_api::JoinMethod,
+    host: Option<&str>,
+    server_labels: &[(&str, &str)],
+) -> String {
     let ticket = s
         .joins
         .create(
@@ -311,6 +321,10 @@ async fn join_token(s: &Server, method: buckle_api::JoinMethod, host: Option<&st
                 method,
                 host_id: host.map(str::to_owned),
                 labels: Default::default(),
+                server_labels: server_labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
                 tailscale_tags: vec![],
             },
             "ada@example.com",
@@ -323,6 +337,42 @@ async fn join_token(s: &Server, method: buckle_api::JoinMethod, host: Option<&st
     };
     let rest = command.split("--token ").nth(1).unwrap();
     rest.split_whitespace().next().unwrap().to_owned()
+}
+
+/// While the fleet reserves a label, a new host is held as pending until
+/// the server has a value for it: one from its join command, or one an
+/// operator sets. What the host says about itself never counts.
+#[rstest::rstest]
+#[case::bootstrap_token(None, "pending")]
+#[case::join_command_with_the_label(Some(&[("role", "server")][..]), "active")]
+#[case::join_command_without_it(Some(&[][..]), "pending")]
+#[tokio::test]
+async fn a_new_host_waits_for_its_reserved_labels(
+    #[case] join: Option<&[(&str, &str)]>,
+    #[case] status: &str,
+) {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    build_revision_with(&s, "abc", CLUSTERS).await;
+    let token = match join {
+        Some(labels) => join_token_with(&s, buckle_api::JoinMethod::Token, None, labels).await,
+        None => "boot".to_owned(),
+    };
+    let mut first = hello("pi-7", &token, "2.0.0");
+    if let Some(agent_message::Msg::Hello(h)) = &mut first.msg {
+        h.labels = [("role".to_owned(), "server".to_owned())].into();
+    }
+    let (_tx, _stream, reply) = open(s.addr, first).await;
+    let welcome = expect_welcome(reply);
+    assert_eq!(welcome.status, status);
+    let expected: std::collections::HashMap<String, String> = join
+        .unwrap_or_default()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(
+        welcome.labels, expected,
+        "the agent is told what the server set, not its own report back"
+    );
 }
 
 #[tokio::test]
@@ -1287,21 +1337,54 @@ async fn a_requested_upgrade_is_resent_until_the_agent_reconnects_on_it() {
 
 const CLUSTERS: &str = r#"version: 2
 fleet:
+  labels:
+    reserved: [role]
   clusters:
     home-nomad:
       kind: nomad
       nodes: 'host.labels.nomad == true'
       executors: 'host.labels.role == "server"'
+    tagged-nomad:
+      kind: nomad
+      executors: 'host.facts.tailscale.tags contains "tag:buckle"'
+    public-nomad:
+      kind: nomad
+      cluster: home-nomad
+      scope: { namespaces: [public] }
+      executors: 'host.labels.role == "server"'
     lab-k3s:
       kind: kubernetes
       nodes: 'true'
       identity: local
+  identities:
+    vault:
+      audience: https://vault.example
+      hosts: 'host.labels.role == "server"'
+    shadow:
+      audience: home-nomad
+      hosts: 'true'
 "#;
 
-/// An active host `id` with `labels`, enrolled by token, on stable revision `abc`.
+/// An active host `pi-1` with the server-set `labels`, enrolled by token, on
+/// stable revision `abc`.
 async fn identity_host(labels: &[(&str, &str)]) -> (Server, String) {
+    identity_host_reporting(&[], labels).await
+}
+
+/// [`identity_host`], whose agent reports the labels `reported`.
+async fn identity_host_reporting(
+    reported: &[(&str, &str)],
+    labels: &[(&str, &str)],
+) -> (Server, String) {
     let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
-    let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let mut first = hello("pi-1", "boot", "2.0.0");
+    if let Some(agent_message::Msg::Hello(h)) = &mut first.msg {
+        h.labels = reported
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+    }
+    let (_tx, _stream, reply) = open(s.addr, first).await;
     let token = expect_welcome(reply).issued_token;
     build_revision_with(&s, "abc", CLUSTERS).await;
     let labels: std::collections::BTreeMap<String, String> = labels
@@ -1399,6 +1482,183 @@ async fn identities_are_granted_by_the_cluster_selectors_and_audited(
             audit,
             vec![("identity.denied".to_string(), target.to_string())]
         ),
+    }
+}
+
+/// The claims of a token, unverified (the issuer's own tests verify).
+fn claims(token: &str) -> serde_json::Value {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1).expect("a compact JWS");
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Executors are chosen on what the server set or verified: a label the
+/// agent reports for itself never makes it one, though it may make it a
+/// node.
+#[rstest::rstest]
+#[case::reported_role(&[("role", "server")], &[], buckle_proto::v1::IdentityPurpose::Deploy, tonic::Code::PermissionDenied)]
+#[case::reported_role_for_acl(&[("role", "server")], &[], buckle_proto::v1::IdentityPurpose::Acl, tonic::Code::PermissionDenied)]
+#[case::reported_role_against_the_servers(&[("role", "server")], &[("role", "db")], buckle_proto::v1::IdentityPurpose::Deploy, tonic::Code::PermissionDenied)]
+#[case::server_set_role(&[("role", "db")], &[("role", "server")], buckle_proto::v1::IdentityPurpose::Deploy, tonic::Code::Ok)]
+#[case::reported_node(&[("nomad", "true")], &[], buckle_proto::v1::IdentityPurpose::Drain, tonic::Code::Ok)]
+#[tokio::test]
+async fn an_agent_cannot_report_its_way_to_an_executor_identity(
+    #[case] reported: &[(&str, &str)],
+    #[case] set: &[(&str, &str)],
+    #[case] purpose: buckle_proto::v1::IdentityPurpose,
+    #[case] expected: tonic::Code,
+) {
+    let (s, token) = identity_host_reporting(reported, set).await;
+    let got = issue(&s, &token, "home-nomad", purpose).await;
+    assert_eq!(
+        got.map(|_| tonic::Code::Ok).unwrap_or_else(|e| e.code()),
+        expected
+    );
+}
+
+#[rstest::rstest]
+#[case::deploys(buckle_proto::v1::IdentityPurpose::Deploy, tonic::Code::Ok)]
+#[case::never_manages_acls(buckle_proto::v1::IdentityPurpose::Acl, tonic::Code::PermissionDenied)]
+#[tokio::test]
+async fn a_scoped_target_issues_no_acl_identity(
+    #[case] purpose: buckle_proto::v1::IdentityPurpose,
+    #[case] expected: tonic::Code,
+) {
+    let (s, token) = identity_host(&[("role", "server")]).await;
+    let got = issue(&s, &token, "public-nomad", purpose).await;
+    assert_eq!(
+        got.map(|_| tonic::Code::Ok).unwrap_or_else(|e| e.code()),
+        expected
+    );
+}
+
+/// A tailnet host's tags come from the server's own tailscaled: they select
+/// it as an executor with nothing configured on the host, and travel in the
+/// token for the cluster to bind on.
+#[tokio::test]
+async fn verified_tags_select_executors_and_travel_in_the_token() {
+    let s = server(
+        Registration::Auto,
+        Some(FakeWhois::tagged("tag:buckle")),
+        vec![AgentAuth::Tailscale],
+    )
+    .await;
+    let (_tx, _stream, reply) = open(s.addr, hello("tail-1", "", "2.0.0")).await;
+    expect_welcome(reply);
+    build_revision_with(&s, "abc", CLUSTERS).await;
+    s.store
+        .call(|db| {
+            db.kv()
+                .set(crate::store::kv::keys::STABLE_REVISION, "abc")?;
+            let labels = [("role".to_owned(), "db".to_owned())].into();
+            db.hosts().set_labels("tail-1", &labels).map(|_| ())
+        })
+        .await
+        .unwrap();
+    let record = s
+        .store
+        .call(|db| db.hosts().get("tail-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.verified_tags, Some(vec!["tag:buckle".to_owned()]));
+
+    let mut client = FleetClient::connect(format!("http://{}", s.addr))
+        .await
+        .unwrap();
+    let issued = client
+        .issue_identity(buckle_proto::v1::IssueIdentityRequest {
+            target: "tagged-nomad".into(),
+            purpose: buckle_proto::v1::IdentityPurpose::Deploy as i32,
+            ..Default::default()
+        })
+        .await
+        .expect("the verified tag makes it an executor")
+        .into_inner();
+    let claims = claims(&issued.token);
+    assert_eq!(claims["tags"], serde_json::json!(["tag:buckle"]));
+    assert_eq!(claims["labels"], serde_json::json!({"role": "db"}));
+    assert_eq!(claims["purpose"], "deploy");
+}
+
+/// A host enrolled by token has no verified tags, whatever facts it sends.
+#[tokio::test]
+async fn reported_tags_are_not_verified_tags() {
+    let (s, token) = identity_host(&[]).await;
+    s.store
+        .call(|db| {
+            let facts = serde_json::json!({"tailscale": {"tags": ["tag:buckle"]}});
+            db.hosts().record_facts("pi-1", &facts, chrono::Utc::now())
+        })
+        .await
+        .unwrap();
+    let err = issue(
+        &s,
+        &token,
+        "tagged-nomad",
+        buckle_proto::v1::IdentityPurpose::Deploy,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+async fn issue_for_audience(
+    s: &Server,
+    token: &str,
+    audience: &str,
+) -> Result<buckle_proto::v1::IssuedIdentity, tonic::Status> {
+    let mut client = FleetClient::connect(format!("http://{}", s.addr))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(buckle_proto::v1::IssueIdentityRequest {
+        audience: audience.into(),
+        ..Default::default()
+    });
+    request
+        .metadata_mut()
+        .insert(buckle_proto::TOKEN_METADATA_KEY, token.parse().unwrap());
+    client.issue_identity(request).await.map(|r| r.into_inner())
+}
+
+#[rstest::rstest]
+#[case::selected_host(&[("role", "server")], "vault", tonic::Code::Ok)]
+#[case::other_host(&[("role", "db")], "vault", tonic::Code::PermissionDenied)]
+#[case::undeclared(&[("role", "server")], "nowhere", tonic::Code::NotFound)]
+#[case::a_clusters_audience(&[("role", "server")], "shadow", tonic::Code::PermissionDenied)]
+#[tokio::test]
+async fn audience_identities_go_to_the_hosts_their_entry_selects(
+    #[case] labels: &[(&str, &str)],
+    #[case] name: &str,
+    #[case] expected: tonic::Code,
+) {
+    let (s, token) = identity_host(labels).await;
+    let got = issue_for_audience(&s, &token, name).await;
+    assert_eq!(
+        got.as_ref()
+            .map_err(|e| e.code())
+            .err()
+            .unwrap_or(tonic::Code::Ok),
+        expected,
+        "{got:?}"
+    );
+    let audited = audit_actions(&s).await;
+    match got {
+        Ok(issued) => {
+            assert_eq!(issued.audience, "https://vault.example");
+            let claims = claims(&issued.token);
+            assert_eq!(claims["aud"], "https://vault.example");
+            assert_eq!(claims["sub"], "pi-1");
+            assert_eq!(claims["labels"]["role"], "server");
+            assert!(claims.get("purpose").is_none() && claims.get("target").is_none());
+            assert_eq!(audited, vec![("identity.issued".into(), name.to_string())]);
+        }
+        Err(_) => assert_eq!(audited, vec![("identity.denied".into(), name.to_string())]),
     }
 }
 

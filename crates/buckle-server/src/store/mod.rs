@@ -365,6 +365,11 @@ CREATE TABLE webhook_status (
     last_success TEXT
 );
 "#,
+    // 16: the ACL tags the server's tailscaled verified for a host (a JSON
+    // list); NULL for a host not authenticated over the tailnet.
+    r#"
+ALTER TABLE hosts ADD COLUMN verified_tags TEXT;
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.

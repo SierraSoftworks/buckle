@@ -80,6 +80,10 @@ pub struct JoinRequest {
     /// Seed labels for the agent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// Labels the server sets on the host when it enrols; they never appear
+    /// in the command. A reserved label given under `labels` is moved here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_labels: BTreeMap<String, String>,
     /// With Tailscale provisioning: the ACL tags the node advertises (a
     /// subset of [`TailscaleJoinOptions::tags`]; empty takes the first).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -96,6 +100,9 @@ pub struct JoinTicket {
     pub host_id: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// Labels the server sets on the host when it enrols.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_labels: BTreeMap<String, String>,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     /// After this the command's keys no longer work.
@@ -129,6 +136,7 @@ mod tests {
             method: JoinMethod::Tailscale,
             host_id: None,
             labels: BTreeMap::new(),
+            server_labels: BTreeMap::new(),
             created_by: "ada@example.com".into(),
             created_at: DateTime::UNIX_EPOCH,
             expires_at: DateTime::UNIX_EPOCH,

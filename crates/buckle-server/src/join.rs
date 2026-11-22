@@ -150,10 +150,13 @@ impl JoinSettings {
         }
     }
 
-    /// Whether a ticket for `method` carries a join token: always for token
-    /// enrolment, and over Tailscale only to skip approval.
-    fn needs_token(&self, method: JoinMethod) -> bool {
-        method == JoinMethod::Token || self.approval_required
+    /// Whether a ticket for `request` carries a join token: always for
+    /// token enrolment, and over Tailscale only to skip approval or to carry
+    /// labels the server sets when the host enrols.
+    fn needs_token(&self, request: &JoinRequest) -> bool {
+        request.method == JoinMethod::Token
+            || self.approval_required
+            || !request.server_labels.is_empty()
     }
 }
 
@@ -366,6 +369,8 @@ pub struct Redeemed {
     pub ticket: String,
     /// The admin who created the command.
     pub created_by: String,
+    /// The labels the server sets on the host it enrols.
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// The live tickets.
@@ -448,7 +453,7 @@ impl Joins {
                 "'{h}' is not a host name: use 1–128 letters, digits, '.', '_' or '-'."
             )));
         }
-        for (k, v) in &request.labels {
+        for (k, v) in request.labels.iter().chain(&request.server_labels) {
             if !valid_label_key(k) || v.contains(['\n', '\r']) {
                 return Err(JoinError::Invalid(format!(
                     "'{k}' is not a label key: use letters, digits, '.', '_', '-' or '/'."
@@ -510,7 +515,7 @@ impl Joins {
         let id = random_hex(12);
         let join_token = self
             .settings
-            .needs_token(request.method)
+            .needs_token(&request)
             .then(crate::grpc::auth::new_token);
         let ttl =
             chrono::Duration::from_std(self.settings.ttl).unwrap_or(chrono::Duration::hours(1));
@@ -521,6 +526,7 @@ impl Joins {
                 method: request.method,
                 host_id: request.host_id.clone(),
                 labels: request.labels.clone(),
+                server_labels: request.server_labels.clone(),
                 created_by: actor.to_owned(),
                 created_at: now,
                 expires_at: now + ttl,
@@ -733,6 +739,7 @@ impl Joins {
         Some(Redeemed {
             ticket: entry.ticket.id.clone(),
             created_by: entry.ticket.created_by.clone(),
+            labels: entry.ticket.server_labels.clone(),
         })
     }
 

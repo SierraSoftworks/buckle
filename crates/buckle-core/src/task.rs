@@ -123,14 +123,16 @@ impl Source for EmptySource {
     }
 }
 
-/// A credential for a cluster's API that a task asks for on the host's
-/// behalf: a Buckle-issued identity for `purpose`, exchanged the way the
-/// cluster takes it (a Nomad ACL token, a Kubernetes bearer token).
+/// A credential a task asks for on the host's behalf: a Buckle-issued
+/// identity for `purpose`, exchanged the way the cluster takes it (a Nomad
+/// ACL token, a Kubernetes bearer token), or, with the purpose `audience`,
+/// the identity itself for the `fleet.identities` entry `target` names.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CredentialRequest {
-    /// The cluster target, as `fleet.clusters` names it.
+    /// The cluster target, as `fleet.clusters` names it; for the purpose
+    /// `audience`, the name of a `fleet.identities` entry.
     pub target: String,
-    /// `read`, `deploy` or `drain`.
+    /// `read`, `deploy`, `drain` or `audience`.
     pub purpose: String,
     pub kind: crate::model::ClusterKind,
     /// The API the credential is exchanged at; `None`: the local default.

@@ -442,6 +442,127 @@ async fn hosts_can_be_relabelled_approved_and_previewed() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
 
+/// While the fleet reserves a label, the server is the only one to set it:
+/// a pending host is approved once it has a value, the value can change
+/// but not go, and a join command keeps it out of the command line.
+#[actix_web::test]
+async fn reserved_labels_are_set_on_the_server_and_required_of_new_hosts() {
+    let e = env(WebConfig {
+        admin_acl: acl("true"),
+        ..Default::default()
+    })
+    .await;
+    revision(
+        &e,
+        "r1",
+        "version: 2\nfleet:\n  labels:\n    reserved: [zone]\n",
+    )
+    .await;
+    add_host(&e.store, "pi-1", HostStatus::Pending).await;
+    e.store
+        .call(|db| {
+            let reported = BTreeMap::from([("zone".to_string(), "home".to_string())]);
+            db.hosts().record_hello(
+                "pi-1",
+                "2.0.0",
+                "linux",
+                "aarch64",
+                &reported,
+                None,
+                None,
+                chrono::Utc::now(),
+            )
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    let post = |uri: &str| {
+        test::TestRequest::post()
+            .uri(uri)
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+    };
+    let patch = |labels: &[(&str, &str)]| {
+        test::TestRequest::patch()
+            .uri("/api/v1/hosts/pi-1")
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(buckle_api::HostPatch {
+                labels: Some(
+                    labels
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                ),
+                notes: None,
+                cluster: None,
+            })
+            .to_request()
+    };
+
+    let summary: buckle_api::HostSummary = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/hosts/pi-1")
+            .to_request(),
+    )
+    .await;
+    assert!(
+        !summary.effective_labels.contains_key("zone"),
+        "the agent's own report of a reserved label is not read"
+    );
+    assert_eq!(summary.reserved_labels.len(), 1);
+    assert!(summary.reserved_labels[0].conflicts());
+
+    let unset = test::call_service(&app, post("/api/v1/hosts/pi-1/approve").to_request()).await;
+    assert_eq!(unset.status(), StatusCode::CONFLICT, "no value yet");
+    let set = test::call_service(&app, patch(&[("zone", "public")])).await;
+    let summary: buckle_api::HostSummary = test::read_body_json(set).await;
+    assert_eq!(summary.effective_labels["zone"], "public");
+    let approved = test::call_service(&app, post("/api/v1/hosts/pi-1/approve").to_request()).await;
+    assert_eq!(approved.status(), StatusCode::OK);
+
+    let removed = test::call_service(&app, patch(&[])).await;
+    assert_eq!(
+        removed.status(),
+        StatusCode::CONFLICT,
+        "changed, never removed"
+    );
+    let changed = test::call_service(&app, patch(&[("zone", "home")])).await;
+    assert_eq!(changed.status(), StatusCode::OK);
+
+    let join = |labels: &[(&str, &str)]| {
+        post("/api/v1/join")
+            .set_json(buckle_api::JoinRequest {
+                platform: buckle_api::JoinPlatform::Linux,
+                method: buckle_api::JoinMethod::Token,
+                host_id: Some("web-1".into()),
+                labels: labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                server_labels: Default::default(),
+                tailscale_tags: vec![],
+            })
+            .to_request()
+    };
+    let without = test::call_service(&app, join(&[("site", "lab")])).await;
+    assert_eq!(without.status(), StatusCode::BAD_REQUEST);
+    let with = test::call_service(&app, join(&[("site", "lab"), ("zone", "home")])).await;
+    assert_eq!(with.status(), StatusCode::CREATED);
+    let ticket: buckle_api::JoinTicket = test::read_body_json(with).await;
+    assert_eq!(ticket.server_labels["zone"], "home");
+    let buckle_api::JoinState::Ready { command } = ticket.state else {
+        panic!("a token join is ready at once");
+    };
+    assert!(command.contains("site=lab"), "{command}");
+    assert!(
+        !command.contains("zone"),
+        "the host is never handed it: {command}"
+    );
+}
+
 #[actix_web::test]
 async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
     let e = env(WebConfig::default()).await;
@@ -467,7 +588,7 @@ async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
     revision(
         &e,
         "r1",
-        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      ui: https://nomad.example:4646/\n      executors: 'host.labels.role == \"nomad\"'\n",
+        "version: 2\nfleet:\n  labels:\n    reserved: [role]\n  clusters:\n    home-nomad:\n      kind: nomad\n      ui: https://nomad.example:4646/\n      executors: 'host.labels.role == \"nomad\"'\n",
     )
     .await;
     // Agents able to speak for it: active and matching its executors.
@@ -975,6 +1096,7 @@ async fn admins_create_join_commands_through_tailscale_consent() {
                 method,
                 host_id: Some("web-1".into()),
                 labels: Default::default(),
+                server_labels: Default::default(),
                 tailscale_tags: vec![],
             })
             .to_request()

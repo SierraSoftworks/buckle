@@ -653,11 +653,11 @@ impl Resolver {
     /// provider finds missing, is a user error naming the secret.
     pub async fn resolve_all(
         &self,
-        refs: &IndexMap<String, SecretRef>,
+        refs: &IndexMap<String, crate::model::SecretDecl>,
     ) -> crate::Result<SecretStore> {
         let mut store = SecretStore::new();
-        for (name, reference) in refs {
-            store.insert(self.resolve_one(name, reference).await?);
+        for (name, decl) in refs {
+            store.insert(self.resolve_one(name, &decl.source).await?);
         }
         Ok(store)
     }
@@ -764,7 +764,8 @@ mod tests {
             "x".to_string(),
             SecretRef::Env {
                 env: "DEFINITELY_UNSET_BUCKLE_TEST".into(),
-            },
+            }
+            .into(),
         );
         let err = resolver.resolve_all(&refs).await.unwrap_err();
         assert!(err.is(crate::error::Kind::User));

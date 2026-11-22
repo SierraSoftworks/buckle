@@ -69,6 +69,27 @@ pub fn host_summary(
     let groups = fleet
         .map(|r| crate::fleet::record_context(host, facts, &r.fleet).groups)
         .unwrap_or_default();
+    let reserved_labels = match fleet {
+        Some(r) if host.kind == buckle_api::TargetKind::Host => r
+            .fleet
+            .reserved_labels()
+            .iter()
+            .map(|key| {
+                let find = |labels: &std::collections::BTreeMap<String, String>| {
+                    labels
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                        .map(|(_, v)| v.clone())
+                };
+                buckle_api::ReservedLabel {
+                    key: key.clone(),
+                    value: find(&host.labels),
+                    reported: find(&host.agent_labels),
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     HostSummary {
         id: host.id.clone(),
         kind: host.kind,
@@ -77,7 +98,12 @@ pub fn host_summary(
         connection: host.connection,
         agent_labels: host.agent_labels.clone(),
         labels: host.labels.clone(),
-        effective_labels: host.effective_labels(),
+        effective_labels: match fleet {
+            Some(r) => crate::fleet::effective_labels(host, &r.fleet),
+            None => host.effective_labels(),
+        },
+        reserved_labels,
+        verified_tags: host.verified_tags.clone(),
         groups,
         platform: host.platform.clone(),
         arch: host.arch.clone(),

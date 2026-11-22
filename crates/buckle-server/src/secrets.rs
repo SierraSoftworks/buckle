@@ -80,15 +80,36 @@ impl ServerSecrets {
 
     /// The bundle a cluster target's executor receives with a targeted
     /// Assign: the secrets its selected workloads, matching vars overlays and
-    /// `secret://` identity reference.
+    /// `secret://` identity reference, of which `executor` (the receiving
+    /// host's trust context) may hold each.
     pub async fn for_cluster(
         &self,
         revision: &Revision,
         ctx: &HostContext,
+        executor: &HostContext,
         identity: Option<&str>,
     ) -> SecretBundle {
-        let names = buckle_core::engine::secret_names_for_cluster(revision, ctx, identity);
+        let mut names = buckle_core::engine::secret_names_for_cluster(revision, ctx, identity);
+        Self::cap(revision, executor, &mut names);
         self.bundle(revision, &names).await
+    }
+
+    /// Drops from `names` the secrets whose `hosts` does not select the
+    /// receiving host. `receiver` is its trust context, so nothing its agent
+    /// reports can widen what it is sent.
+    pub fn cap(revision: &Revision, receiver: &HostContext, names: &mut BTreeSet<String>) {
+        names.retain(|name| {
+            let allowed = revision
+                .fleet
+                .secrets
+                .get(name)
+                .and_then(|decl| decl.hosts.as_ref())
+                .is_none_or(|hosts| receiver.matches(hosts));
+            if !allowed {
+                tracing::debug!(secret = %name, buckle.host = %receiver.host.id, "a secret's `hosts` does not select the host; withheld");
+            }
+            allowed
+        });
     }
 
     /// Names of secret references in `text` (`secrets.NAME`,
@@ -147,7 +168,7 @@ impl ServerSecrets {
             let Some(reference) = revision.fleet.secrets.get(name) else {
                 continue;
             };
-            match self.resolver.resolve_one(name, reference).await {
+            match self.resolver.resolve_one(name, &reference.source).await {
                 Ok(secret) => store.insert(secret),
                 Err(e) => {
                     tracing::warn!(secret = %name, error = %e, "a secret could not be resolved")
@@ -174,21 +195,31 @@ impl ServerSecrets {
         }
     }
 
-    /// The bundle a host's Welcome/Assign carries for `revision`.
-    pub async fn for_host(&self, revision: &Revision, ctx: &HostContext) -> SecretBundle {
-        let names = self.scoped_names(revision, ctx).await;
+    /// The bundle a host's Welcome/Assign carries for `revision`: what its
+    /// selected modules reference (`ctx`), capped by each secret's `hosts`
+    /// (`trusted`, the host's trust context).
+    pub async fn for_host(
+        &self,
+        revision: &Revision,
+        ctx: &HostContext,
+        trusted: &HostContext,
+    ) -> SecretBundle {
+        let mut names = self.scoped_names(revision, ctx).await;
+        Self::cap(revision, trusted, &mut names);
         self.bundle(revision, &names).await
     }
 
-    /// A FetchSecrets answer: only names the revision declares and the
-    /// host's selected modules reference.
+    /// A FetchSecrets answer: only names the revision declares, the host's
+    /// selected modules reference and its `hosts` caps allow.
     pub async fn fetch(
         &self,
         revision: &Revision,
         ctx: &HostContext,
+        trusted: &HostContext,
         requested: &[String],
     ) -> SecretBundle {
-        let allowed = self.scoped_names(revision, ctx).await;
+        let mut allowed = self.scoped_names(revision, ctx).await;
+        Self::cap(revision, trusted, &mut allowed);
         let names: BTreeSet<String> = requested
             .iter()
             .filter(|n| allowed.contains(*n))
@@ -258,7 +289,7 @@ mod tests {
             },
             InstallKey::from_bytes([3; 32]),
         );
-        let bundle = server.for_host(&rev, &ctx).await;
+        let bundle = server.for_host(&rev, &ctx, &ctx).await;
         assert_eq!(bundle.secrets.len(), 1);
         assert_eq!(bundle.secrets[0].name, "nomad_token");
         assert_eq!(bundle.secrets[0].value, b"nomad-value");
@@ -267,6 +298,7 @@ mod tests {
         let fetched = server
             .fetch(
                 &rev,
+                &ctx,
                 &ctx,
                 &["backup_key".into(), "nomad_token".into(), "unused".into()],
             )
@@ -277,6 +309,61 @@ mod tests {
             vec!["nomad_token"],
             "only referenced, declared names are answered"
         );
+    }
+
+    /// A secret's `hosts` caps who receives it, read from what the server
+    /// verified: a host whose agent reports the label a module selects on is
+    /// selected for the module and still not sent the secret.
+    #[rstest::rstest]
+    #[case::reserved_label_set_on_the_server(&[("zone", "home")], true)]
+    #[case::another_zone(&[("zone", "public")], false)]
+    #[case::nothing_set_on_the_server(&[], false)]
+    #[tokio::test]
+    async fn a_secret_goes_only_to_the_hosts_its_cap_selects(
+        #[case] server_labels: &[(&str, &str)],
+        #[case] sent: bool,
+    ) {
+        let repo = tempfile::tempdir().unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(secrets.path().join("backup_key"), "backup-value").unwrap();
+        write(
+            repo.path(),
+            "buckle.yaml",
+            "version: 2
+fleet:
+  labels:
+    reserved: [zone]
+secrets:
+  backup_key: { file: backup_key, hosts: 'host.labels.zone == \"home\"' }
+",
+        );
+        write(
+            repo.path(),
+            "modules/backup/module.yaml",
+            "name: backup
+when: 'host.labels.role == \"backup\"'
+tasks:
+  - command.run: { run: [\"x\"], env: { K: \"{{ secrets.backup_key }}\" } }
+",
+        );
+        let rev = buckle_core::engine::loader::load_dir(repo.path(), RevisionId::new("r")).unwrap();
+        // The agent claims the role, and the zone too.
+        let record = crate::store::HostRecord::fixture(
+            "pi-1",
+            &[("role", "backup"), ("zone", "home")],
+            server_labels,
+            None,
+        )
+        .await;
+        let ctx = crate::fleet::record_context(&record, &serde_json::Value::Null, &rev.fleet);
+        let trusted = crate::fleet::trust_context(&record, &rev.fleet);
+        let server = file_server(secrets.path());
+        let bundle = server.for_host(&rev, &ctx, &trusted).await;
+        assert_eq!(bundle.secrets.len(), usize::from(sent));
+        let fetched = server
+            .fetch(&rev, &ctx, &trusted, &["backup_key".into()])
+            .await;
+        assert_eq!(fetched.secrets.len(), usize::from(sent));
     }
 
     #[test]

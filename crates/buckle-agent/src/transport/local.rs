@@ -185,7 +185,7 @@ async fn resolve_secrets(
         if names.is_some_and(|n| !n.contains(name)) {
             continue;
         }
-        match resolver.resolve_one(name, reference).await {
+        match resolver.resolve_one(name, &reference.source).await {
             Ok(secret) => store.insert(secret),
             Err(err) => {
                 tracing::warn!(secret = %name, error = %err.description(), "a secret could not be resolved")

@@ -76,7 +76,7 @@ cloud, no Tailscale) is a normal value: `host.facts.cloud.provider == "oci"` is 
 |---|---|
 | `hostname` | The node's MagicDNS name. |
 | `ips` | Its tailnet addresses. |
-| `tags` | ACL tags, for `host.facts.tailscale.tags contains "tag:server"`. |
+| `tags` | ACL tags, for `host.facts.tailscale.tags contains "tag:server"`. For an agent connected over Tailscale the server replaces these with the tags its own tailnet lookup returns (and audits a mismatch as `host.tags_mismatch`), which is what makes them usable in [trust selectors](../modules/fleet.md#trust). |
 | `online`, `backend_state`, `tailnet` | |
 
 `null` when Tailscale is not installed. A module that installs Tailscale should declare

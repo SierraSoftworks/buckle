@@ -23,12 +23,13 @@ pub mod loader;
 mod planner;
 pub mod targets;
 pub mod task_actions;
+pub mod trust;
 pub mod validate;
 
 #[cfg(test)]
 mod tests;
 
-pub use context::{layer_vars_over, merged_labels, render_vars};
+pub use context::{host_labels, layer_vars_over, merged_labels, render_vars};
 pub use planner::action_step_key;
 pub use targets::{selected_workloads, validate_targets};
 pub use validate::{
@@ -138,6 +139,11 @@ pub struct Inputs {
     pub host: HostIdentity,
     /// Labels managed on the server, overlaid on the agent's own.
     pub server_labels: Labels,
+    /// Whether a server manages this host (set by
+    /// [`Inputs::with_server_labels`]): its reserved labels then come from
+    /// the server alone. A local run has no server, and reads them from
+    /// its own labels.
+    pub enrolled: bool,
     pub system: Arc<dyn System>,
     pub secrets: Arc<SecretStore>,
     pub state: Arc<dyn StateStore>,
@@ -192,6 +198,7 @@ impl Inputs {
             revision,
             host,
             server_labels: Labels::new(),
+            enrolled: false,
             system,
             secrets,
             state,
@@ -242,6 +249,7 @@ impl Inputs {
     /// Labels managed on the server, overlaid on the agent's own.
     pub fn with_server_labels(mut self, labels: Labels) -> Self {
         self.server_labels = labels;
+        self.enrolled = true;
         self
     }
 
@@ -288,9 +296,19 @@ impl Inputs {
         self
     }
 
-    /// The agent's labels with the server's overlaid (server wins).
-    pub fn labels(&self) -> Labels {
-        context::merged_labels(&self.host.labels, &self.server_labels)
+    /// The agent's labels with the server's overlaid (server wins). On an
+    /// enrolled host the labels `revision` reserves come from the server
+    /// alone.
+    pub fn labels(&self, revision: &Revision) -> Labels {
+        if self.enrolled {
+            context::host_labels(
+                revision.fleet.reserved_labels(),
+                &self.host.labels,
+                &self.server_labels,
+            )
+        } else {
+            context::merged_labels(&self.host.labels, &self.server_labels)
+        }
     }
 }
 

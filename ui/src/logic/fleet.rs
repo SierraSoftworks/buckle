@@ -201,6 +201,8 @@ mod tests {
             agent_labels: BTreeMap::new(),
             labels: BTreeMap::new(),
             effective_labels: BTreeMap::new(),
+            reserved_labels: Vec::new(),
+            verified_tags: None,
             groups: vec![],
             platform: None,
             arch: None,

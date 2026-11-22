@@ -20,6 +20,22 @@ pub fn merged_labels(agent: &Labels, server: &Labels) -> Labels {
     out
 }
 
+/// The labels selectors read for an enrolled host: the agent's own without
+/// the `reserved` keys (only the server sets those), with the server's
+/// overlaid. The server computes the same from its host record, so both
+/// sides select alike.
+pub fn host_labels(reserved: &[String], agent: &Labels, server: &Labels) -> Labels {
+    let mut out: Labels = agent
+        .iter()
+        .filter(|(k, _)| !reserved.iter().any(|r| r.eq_ignore_ascii_case(k)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (k, v) in server {
+        out.insert(k.clone(), v.clone());
+    }
+    out
+}
+
 /// Evaluates the fleet's group selectors against `ctx` (labels and facts; no
 /// groups yet), keeping declaration order. Also returns the groups whose
 /// membership is uncertain: their selector could not be evaluated, or reads
@@ -430,6 +446,20 @@ mod tests {
     fn yaml_converts_to_json(#[case] yaml: &str, #[case] expected: serde_json::Value) {
         let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(yaml_to_json(&v), expected);
+    }
+
+    #[test]
+    fn an_agent_cannot_set_a_reserved_label() {
+        let mut agent = Labels::new();
+        agent.insert("Zone".into(), "home".into());
+        agent.insert("site".into(), "home".into());
+        let mut server = Labels::new();
+        let reserved = ["zone".to_owned()];
+        let unset = host_labels(&reserved, &agent, &server);
+        assert!(!unset.contains_key("Zone"));
+        assert_eq!(unset["site"], "home");
+        server.insert("zone".into(), "public".into());
+        assert_eq!(host_labels(&reserved, &agent, &server)["zone"], "public");
     }
 
     #[test]

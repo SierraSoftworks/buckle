@@ -440,7 +440,9 @@ message RunAction {
 message HostUpdate {
   // pending, active or paused.
   string status = 1;
-  // Effective labels after server overrides.
+  // The labels set on the server. The agent overlays them on its own; a
+  // label the fleet reserves comes from here alone. (Servers before reserved
+  // labels sent the merged result, which overlays to the same thing.)
   map<string, string> labels = 2;
   // The fleet's stable revision and the secrets scoped to the host for it
   // (sent when the host is active), as in Welcome.
@@ -463,7 +465,7 @@ message Welcome {
   string stable_revision = 3;
   // Per-host token to persist (set on enrolment or rotation).
   string issued_token = 4;
-  // Effective labels after server overrides.
+  // The labels set on the server, as in HostUpdate.
   map<string, string> labels = 5;
   // Host status as the server sees it: pending, active, paused.
   string status = 6;
@@ -680,6 +682,10 @@ message IssueIdentityRequest {
   // The rollout the credential serves, recorded in its claims and the audit
   // log. Empty outside a rollout.
   string rollout_id = 4;
+  // Instead of `target` and `purpose`: the name of a `fleet.identities`
+  // entry, for a token another system verifies (it carries the host's
+  // verified tags and reserved labels and no cluster claims).
+  string audience = 5;
 }
 
 message IssuedIdentity {

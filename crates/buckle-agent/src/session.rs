@@ -2369,7 +2369,8 @@ impl Shared {
             let data = self.data.lock().await;
             let host = buckle_core::selectors::HostIdentity {
                 id: self.host_id.clone(),
-                labels: buckle_core::engine::merged_labels(
+                labels: buckle_core::engine::host_labels(
+                    rev.fleet.reserved_labels(),
                     &labels_json(&self.config.labels),
                     &labels_json(&data.agent.labels),
                 ),

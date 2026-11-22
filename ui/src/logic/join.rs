@@ -60,6 +60,7 @@ pub fn request(
         method,
         host_id: (!host.is_empty()).then(|| host.to_owned()),
         labels,
+        server_labels: Default::default(),
         tailscale_tags: tags.to_vec(),
     })
 }
@@ -121,6 +122,8 @@ mod tests {
             agent_labels: Default::default(),
             labels: Default::default(),
             effective_labels: Default::default(),
+            reserved_labels: Vec::new(),
+            verified_tags: None,
             groups: vec![],
             platform: None,
             arch: None,
@@ -227,6 +230,7 @@ mod tests {
             method: JoinMethod::Token,
             host_id: Some("web-1".into()),
             labels: Default::default(),
+            server_labels: Default::default(),
             created_by: "a".into(),
             created_at: at,
             expires_at: at,
