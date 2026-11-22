@@ -4,7 +4,9 @@
 
 use buckle_api::{HostSummary, JoinMethod, JoinOptions, JoinPlatform, JoinRequest, JoinTicket};
 
-use super::labels::{Row, collect};
+use std::collections::BTreeMap;
+
+use super::labels::{Row, collect, is_reserved, reserved_values};
 
 /// The method the wizard starts on: the server's preferred one.
 pub fn default_method(options: &JoinOptions) -> JoinMethod {
@@ -34,13 +36,17 @@ pub fn valid_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// The form as a request, or the first thing wrong with it.
+/// The form as a request, or the first thing wrong with it. `reserved` are
+/// the values given for the labels the fleet reserves: the server sets
+/// those on the host when it enrols, and they never appear in the command.
 pub fn request(
     platform: JoinPlatform,
     method: JoinMethod,
     host: &str,
     labels: &[Row],
     tags: &[String],
+    options: &JoinOptions,
+    reserved: &BTreeMap<String, String>,
 ) -> Result<JoinRequest, String> {
     let host = host.trim();
     if !host.is_empty() && !valid_host(host) {
@@ -55,14 +61,29 @@ pub fn request(
             .map(|e| e.message)
             .unwrap_or_default()
     })?;
+    if let Some(key) = labels
+        .keys()
+        .find(|k| is_reserved(k, &options.reserved_labels))
+    {
+        return Err(format!(
+            "'{key}' is reserved: give its value under Reserved labels."
+        ));
+    }
+    let server_labels = reserved_values(&options.reserved_labels, reserved)?;
     Ok(JoinRequest {
         platform,
         method,
         host_id: (!host.is_empty()).then(|| host.to_owned()),
         labels,
-        server_labels: Default::default(),
+        server_labels,
         tailscale_tags: tags.to_vec(),
     })
+}
+
+/// What [`request`] says while a reserved label still lacks its value: the
+/// form is unfinished, not wrong, so the wizard only keeps its button off.
+pub fn unfinished(options: &JoinOptions, reserved: &BTreeMap<String, String>) -> Option<String> {
+    reserved_values(&options.reserved_labels, reserved).err()
 }
 
 /// What the operator should know before pasting the command.
@@ -151,7 +172,32 @@ mod tests {
             }),
             ttl_seconds: 3600,
             approval_required: false,
+            reserved_labels: Vec::new(),
         }
+    }
+
+    /// The form's request on a fleet reserving `reserved`, given `given`.
+    fn asked(
+        host: &str,
+        labels: &[Row],
+        reserved: &[&str],
+        given: &[(&str, &str)],
+    ) -> Result<JoinRequest, String> {
+        let mut o = options(false);
+        o.reserved_labels = reserved.iter().map(|k| k.to_string()).collect();
+        let given = given
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        request(
+            JoinPlatform::Linux,
+            JoinMethod::Token,
+            host,
+            labels,
+            &[],
+            &o,
+            &given,
+        )
     }
 
     fn row(key: &str, value: &str) -> Row {
@@ -163,29 +209,51 @@ mod tests {
 
     #[test]
     fn the_form_becomes_a_request_with_blank_fields_left_out() {
-        let r = request(
-            JoinPlatform::Linux,
-            JoinMethod::Token,
-            "  ",
-            &[row("role", "web"), row("", "")],
-            &[],
-        )
-        .unwrap();
+        let r = asked("  ", &[row("role", "web"), row("", "")], &[], &[]).unwrap();
         assert_eq!(r.host_id, None);
         assert_eq!(r.labels.get("role").map(String::as_str), Some("web"));
+        assert!(r.server_labels.is_empty());
+    }
+
+    #[test]
+    fn reserved_labels_are_the_servers_to_set_and_each_needs_a_value() {
+        let r = asked(
+            "web-1",
+            &[row("role", "web")],
+            &["zone"],
+            &[("zone", "public")],
+        )
+        .unwrap();
+        assert_eq!(
+            r.server_labels.get("zone").map(String::as_str),
+            Some("public")
+        );
+        assert!(!r.labels.contains_key("zone"), "never in the command");
+        for (labels, given, says) in [
+            (vec![], vec![], "Give 'zone' a value"),
+            (
+                vec![row("Zone", "x")],
+                vec![("zone", "public")],
+                "is reserved",
+            ),
+        ] {
+            let e = asked("web-1", &labels, &["zone"], &given).unwrap_err();
+            assert!(e.contains(says), "{e}");
+        }
+        let mut o = options(false);
+        assert_eq!(unfinished(&o, &BTreeMap::new()), None);
+        o.reserved_labels = vec!["zone".into()];
+        assert_eq!(
+            unfinished(&o, &BTreeMap::new()),
+            asked("web-1", &[], &["zone"], &[]).err(),
+            "a value still to give is the form unfinished"
+        );
     }
 
     #[test]
     fn bad_names_and_labels_are_reported() {
-        assert!(request(JoinPlatform::Linux, JoinMethod::Token, "web 1", &[], &[]).is_err());
-        let e = request(
-            JoinPlatform::Linux,
-            JoinMethod::Token,
-            "web-1",
-            &[row("bad key", "x")],
-            &[],
-        )
-        .unwrap_err();
+        assert!(asked("web 1", &[], &[], &[]).is_err());
+        let e = asked("web-1", &[row("bad key", "x")], &[], &[]).unwrap_err();
         assert!(e.contains("bad key"), "{e}");
     }
 

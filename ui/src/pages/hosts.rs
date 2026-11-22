@@ -16,7 +16,7 @@ use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
     Button, Confirm, Empty, ErrorState, HostLink, Kind, Loading, MenuItem, PageHead, Refresh,
-    RouteLink, RunAction, SplitButton, host_state_pills, icons, use_toast,
+    RouteLink, RunAction, SplitButton, host_state_pills, icons, use_host_approval, use_toast,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{agents_behind, expected_version, matches_filter, same_version};
@@ -77,7 +77,7 @@ pub fn hosts() -> Html {
         .unwrap_or_default();
     let fleet = use_fetch((), |_| api::fleet());
     let live = use_live_value(&fleet, apply_fleet);
-    let approving = use_state(|| None::<String>);
+    let approval = use_host_approval(fleet.reload.clone());
     let upgrading = use_state(|| false);
     let adding = use_state(|| false);
     let running = use_state(|| false);
@@ -91,7 +91,6 @@ pub fn hosts() -> Html {
             }
         });
     }
-    let error = use_state(|| None::<String>);
 
     let set_query = {
         let navigator = navigator.clone();
@@ -101,42 +100,6 @@ pub fn hosts() -> Html {
             }
         }
     };
-    let approve = {
-        let (approving, busy, error, toast, reload) = (
-            approving.clone(),
-            busy.clone(),
-            error.clone(),
-            toast.clone(),
-            fleet.reload.clone(),
-        );
-        Callback::from(move |_note: String| {
-            let Some(id) = (*approving).clone() else {
-                return;
-            };
-            let (approving, busy, error, toast, reload) = (
-                approving.clone(),
-                busy.clone(),
-                error.clone(),
-                toast.clone(),
-                reload.clone(),
-            );
-            busy.set(true);
-            wasm_bindgen_futures::spawn_local(async move {
-                match api::host_action(&id, "approve").await {
-                    Ok(_) => {
-                        toast.ok(format!(
-                            "{id} approved: it joins the next rollout's selection."
-                        ));
-                        approving.set(None);
-                        reload.emit(());
-                    }
-                    Err(e) => error.set(Some(e.to_string())),
-                }
-                busy.set(false);
-            });
-        })
-    };
-
     // The version agents converge to, and who is not on it yet.
     let target = live
         .as_ref()
@@ -262,14 +225,13 @@ pub fn hosts() -> Html {
                         <div class="pending__body">
                         <strong>{ format!("{} awaiting registration approval: ", pending.len()) }</strong>
                         { for pending.iter().map(|h| {
-                            let id = h.id.clone();
-                            let approving = approving.clone();
+                            let ask = approval.on_ask.reform({ let h = (*h).clone(); move |_: MouseEvent| h.clone() });
                             html! {
                                 <span class="banner__item">
                                     <RouteLink to={Route::Host { id: h.id.clone() }} classes="mono">{ h.id.clone() }</RouteLink>
                                     <span class="muted small">{ format!(" enrolled {}", relative(h.first_seen, now)) }</span>
                                     if auth.is_admin() {
-                                        <Button small=true kind={Kind::Primary} onclick={Callback::from(move |_| approving.set(Some(id.clone())))}>{ "Approve…" }</Button>
+                                        <Button small=true kind={Kind::Primary} onclick={ask}>{ "Approve…" }</Button>
                                     }
                                 </span>
                             }
@@ -343,14 +305,7 @@ pub fn hosts() -> Html {
                         })
                     }} />
             }
-            if let Some(id) = (*approving).clone() {
-                <Confirm title={format!("Approve {id}")} confirm_label={format!("Approve {id}")}
-                    busy={*busy} error={(*error).clone()} on_confirm={approve}
-                    on_cancel={{ let a = approving.clone(); let e = error.clone(); Callback::from(move |_| { a.set(None); e.set(None); }) }}>
-                    <p>{ format!("{id} enrolled and is waiting to join the fleet. Once approved it is assigned the stable revision and is selected by the next rollout like any other host.") }</p>
-                    <p class="muted">{ "Check the host's labels and facts first if you did not enrol it yourself." }</p>
-                </Confirm>
-            }
+            { approval.dialog.clone() }
             if *upgrading && !upgrade_ids.is_empty() {
                 <Confirm title={format!("Upgrade agents to {}", target.clone().unwrap_or_default())}
                     confirm_label={format!("Upgrade {}", count(upgrade_ids.len(), "agent", "agents"))}

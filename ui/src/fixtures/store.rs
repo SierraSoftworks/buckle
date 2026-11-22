@@ -190,8 +190,14 @@ fn attention_of(s: &State) -> buckle_api::attention::AttentionList {
             })
         })
         .collect();
+    let paused: Vec<buckle_api::PausedUnit> = s
+        .details
+        .iter()
+        .flat_map(|d| d.paused_units.iter().cloned())
+        .collect();
     let items = build(
         &AttentionInputs {
+            paused: &paused,
             hosts: &s.hosts,
             clusters: &s.clusters,
             expected_version: Some(data::SERVER_VERSION),
@@ -348,6 +354,19 @@ pub fn patch_host(id: &str, patch: &HostPatch) -> Result<HostSummary, ApiError> 
             .find(|h| h.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("No host '{id}'.")))?;
         if let Some(labels) = &patch.labels {
+            if let Some(gone) = host
+                .reserved_labels
+                .iter()
+                .find(|r| r.value.is_some() && !labels.contains_key(&r.key))
+            {
+                return Err(ApiError::Conflict(format!(
+                    "The label '{}' is reserved: trust decisions read it, so it can be changed but not removed.",
+                    gone.key
+                )));
+            }
+            for r in &mut host.reserved_labels {
+                r.value = labels.get(&r.key).cloned();
+            }
             host.labels = labels.clone();
             host.effective_labels = crate::logic::labels::effective(&host.agent_labels, labels);
             host.groups = data::groups_for(&host.effective_labels);
@@ -406,6 +425,14 @@ pub fn host_action(id: &str, action: &str) -> Result<HostSummary, ApiError> {
             .iter_mut()
             .find(|h| h.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("No host '{id}'.")))?;
+        if action == "approve"
+            && let Some(missing) = host.reserved_labels.iter().find(|r| r.value.is_none())
+        {
+            return Err(ApiError::Conflict(format!(
+                "'{id}' has no value for the reserved label '{}'; set it before approving the host.",
+                missing.key
+            )));
+        }
         host.status = match (action, host.status) {
             ("approve", HostStatus::Pending) => HostStatus::Active,
             ("pause", HostStatus::Active | HostStatus::Pending) => HostStatus::Paused,
@@ -500,6 +527,92 @@ pub fn run_action(
             },
         );
         Ok(buckle_api::ActionStarted { run_id })
+    })
+}
+
+/// Suspends or resumes a unit as the server would: the pause is kept on the
+/// target's detail and its checks read `paused` while it lasts (and are
+/// read again, passing, once it is resumed).
+pub fn pause_unit(
+    id: &str,
+    unit: &str,
+    resume: bool,
+    note: &str,
+    review_at: Option<chrono::DateTime<Utc>>,
+) -> Result<Option<String>, ApiError> {
+    admin()?;
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(ApiError::Conflict(
+            if resume {
+                "Say why it is resumed."
+            } else {
+                "Say why it is suspended."
+            }
+            .into(),
+        ));
+    }
+    with(|s| {
+        let now = Utc::now();
+        let by = actor();
+        let detail = s
+            .details
+            .iter_mut()
+            .find(|d| d.summary.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("No target '{id}'.")))?;
+        let was = detail.paused_units.iter().any(|p| p.unit == unit);
+        if resume && !was {
+            return Err(ApiError::Conflict(format!(
+                "'{unit}' is not suspended on {id}."
+            )));
+        }
+        if !resume
+            && detail.summary.kind == buckle_api::TargetKind::Host
+            && detail.summary.connection == Connection::Offline
+        {
+            return Err(ApiError::Conflict(format!(
+                "{id} is out of reach: its agent is offline."
+            )));
+        }
+        detail.paused_units.retain(|p| p.unit != unit);
+        if !resume {
+            detail.paused_units.push(buckle_api::PausedUnit {
+                target: id.into(),
+                unit: unit.into(),
+                note: note.into(),
+                by: by.clone(),
+                at: now,
+                review_at,
+            });
+        }
+        for c in detail.health_checks.iter_mut().filter(|c| c.module == unit) {
+            c.status = if resume { "pass" } else { "paused" }.into();
+            c.reason = (!resume).then(|| "it is suspended".into());
+            c.at = now;
+        }
+        s.record(
+            &by,
+            if resume {
+                "target.unit.resume"
+            } else {
+                "target.unit.suspend"
+            },
+            id,
+            format!(
+                "{by} {} {unit} on {id}: {note}",
+                if resume { "resumed" } else { "suspended" }
+            ),
+        );
+        Ok(None)
+    })
+}
+
+pub fn paused_units() -> Result<Vec<buckle_api::PausedUnit>, ApiError> {
+    with(|s| {
+        Ok(s.details
+            .iter()
+            .flat_map(|d| d.paused_units.iter().cloned())
+            .collect())
     })
 }
 
@@ -1439,6 +1552,7 @@ pub fn join_options() -> Result<JoinOptions, ApiError> {
         }),
         ttl_seconds: 3600,
         approval_required: true,
+        reserved_labels: vec![data::RESERVED_LABEL.into()],
     })
 }
 
@@ -1498,6 +1612,15 @@ fn demo_command(r: &JoinRequest, tags: &[String]) -> String {
 
 pub fn create_join(r: &JoinRequest) -> Result<JoinTicket, ApiError> {
     admin()?;
+    if r.server_labels
+        .get(data::RESERVED_LABEL)
+        .is_none_or(|v| v.trim().is_empty())
+    {
+        return Err(ApiError::Conflict(format!(
+            "This fleet reserves the label '{}': give the new host a value for it.",
+            data::RESERVED_LABEL
+        )));
+    }
     let now = Utc::now();
     let platform = serde_json::to_value(r.platform)
         .ok()
@@ -1510,7 +1633,7 @@ pub fn create_join(r: &JoinRequest) -> Result<JoinTicket, ApiError> {
         method: r.method,
         host_id: r.host_id.clone(),
         labels: r.labels.clone(),
-        server_labels: Default::default(),
+        server_labels: r.server_labels.clone(),
         created_by: actor(),
         created_at: now,
         expires_at: now + chrono::Duration::hours(1),

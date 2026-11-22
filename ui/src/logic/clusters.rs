@@ -6,7 +6,7 @@
 
 use buckle_api::{
     ClusterSpec, ClusterStatus, Deploying, HostCheck, HostDetail, HostRolloutState, ModuleState,
-    RolloutHost, RolloutPhase, RunProgress, RunReport, StepState, TargetKind,
+    PausedUnit, RolloutHost, RolloutPhase, RunProgress, RunReport, StepState, TargetKind,
 };
 use chrono::{DateTime, Utc};
 
@@ -20,6 +20,8 @@ pub enum WorkloadState {
     Failing,
     /// The run in progress is applying it.
     Deploying,
+    /// Suspended by an operator: left alone until it is resumed.
+    Suspended,
     /// Applied, and nothing reads otherwise.
     Running,
     /// Declared, but nothing of it has been applied yet.
@@ -31,6 +33,7 @@ impl WorkloadState {
         match self {
             WorkloadState::Failing => "failing",
             WorkloadState::Deploying => "deploying",
+            WorkloadState::Suspended => "suspended",
             WorkloadState::Running => "running",
             WorkloadState::NotApplied => "not applied yet",
         }
@@ -52,6 +55,8 @@ pub struct WorkloadRow {
     pub reason: Option<String>,
     /// When its resources were last applied, and in which revision.
     pub applied: Option<(DateTime<Utc>, String)>,
+    /// Who suspended it, when and why, while it is suspended.
+    pub paused: Option<PausedUnit>,
 }
 
 /// Where the cluster's own UI shows a resource of `kind` and `key`: its
@@ -107,8 +112,11 @@ fn row_of(
             .and_then(|s| s.deploying.iter().find(|x| x.workload == name))
             .map(|x| x.progress.clone()),
     };
+    let paused = d.paused_units.iter().find(|p| p.unit == name).cloned();
     let state = if failing.is_some() {
         WorkloadState::Failing
+    } else if paused.is_some() {
+        WorkloadState::Suspended
     } else if progress.is_some() {
         WorkloadState::Deploying
     } else if own.is_empty() && list.is_empty() {
@@ -127,6 +135,7 @@ fn row_of(
         checks: (passing, list.len()),
         reason: failing.and_then(|c| c.reason.clone()),
         applied,
+        paused,
     }
 }
 
@@ -166,7 +175,8 @@ pub fn module_rows(d: &HostDetail, run: Option<&RunReport>) -> Vec<WorkloadRow> 
         .flat_map(|r| r.modules.iter().map(|m| m.name.as_str()));
     let applied = d.resources.iter().map(|r| r.module.as_str());
     let checked = d.health_checks.iter().map(|c| c.module.as_str());
-    for name in planned.chain(applied).chain(checked) {
+    let paused = d.paused_units.iter().map(|p| p.unit.as_str());
+    for name in planned.chain(applied).chain(checked).chain(paused) {
         if !names.contains(&name) {
             names.push(name);
         }
@@ -370,6 +380,7 @@ mod tests {
                 w("atuin", &["postgresql"]),
                 w("paste", &[]),
             ],
+            paused_units: vec![],
         }
     }
 
@@ -391,6 +402,35 @@ mod tests {
         assert_eq!(atuin.applied.as_ref().map(|a| a.0), Some(t(3)));
         assert_eq!(row(&rows, "paste").state, WorkloadState::NotApplied);
         assert!(row(&rows, "retired").description.contains("no longer"));
+    }
+
+    #[test]
+    fn a_suspended_unit_reads_as_suspended_with_who_and_why() {
+        let mut d = detail();
+        d.paused_units = vec![PausedUnit {
+            target: "home-nomad".into(),
+            unit: "atuin".into(),
+            note: "moving its database".into(),
+            by: "ada@example.com".into(),
+            at: t(4),
+            review_at: None,
+        }];
+        let rows = workload_rows(&d, None);
+        let atuin = row(&rows, "atuin");
+        assert_eq!(atuin.state, WorkloadState::Suspended);
+        assert_eq!(
+            atuin.paused.as_ref().map(|p| p.note.as_str()),
+            Some("moving its database")
+        );
+        assert_eq!(
+            row(&rows, "postgresql").state,
+            WorkloadState::Failing,
+            "the others read as they did"
+        );
+        // A host's suspended module is listed even with nothing else of it.
+        d.paused_units[0].unit = "cron".into();
+        let modules = module_rows(&d, None);
+        assert_eq!(row(&modules, "cron").state, WorkloadState::Suspended);
     }
 
     #[test]

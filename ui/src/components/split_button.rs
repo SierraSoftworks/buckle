@@ -16,7 +16,8 @@ pub struct MenuItem {
     /// A muted suffix that says where the action comes from (its module).
     pub aside: Option<AttrValue>,
     /// The menu section the action is listed under; a run of items with the
-    /// same section is one group, headed by it when it has a name.
+    /// same section is one group, headed by it when it has a name (an
+    /// empty name only sets the group apart).
     pub section: Option<AttrValue>,
     /// How the face looks when this is the face; in the menu only `Danger`
     /// (red) and `Caution` (orange) show.
@@ -127,7 +128,7 @@ pub fn split_button(props: &SplitButtonProps) -> Html {
             label={face.label.clone()} menu_label={props.menu_label.clone()}
             on_click={face.onclick.clone()} attrs={yewi::Attrs::new(extra)}>
             { for groups(rest).into_iter().map(|(section, items)| html! {
-                <MenuGroup label={section}>{ for items.iter().map(item) }</MenuGroup>
+                <MenuGroup label={section.filter(|s| !s.is_empty())}>{ for items.iter().map(item) }</MenuGroup>
             }) }
         </yewi::SplitButton>
     }

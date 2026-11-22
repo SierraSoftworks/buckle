@@ -35,6 +35,7 @@ pub fn instances_picker(props: &InstancesPickerProps) -> Html {
         }
 }
 use crate::logic::controls::TargetAction;
+use crate::logic::pause::Offer;
 
 /// A target's actions as split button items, in declaration order: named
 /// for what they do, each with its module as a muted aside when the list
@@ -131,12 +132,16 @@ pub struct ActionsButtonProps {
     /// "Check drift" item after its actions.
     #[prop_or_default]
     pub on_check_drift: Option<Callback<()>>,
+    /// Set where the row may suspend its unit, or resume it: the item
+    /// (for a workload, when the flag is set), last and set apart.
+    #[prop_or_default]
+    pub pause: Option<(Offer, bool, Callback<()>)>,
     #[prop_or_default]
     pub testid: Option<AttrValue>,
 }
 
-/// A module's actions as one split button, then checking it for drift
-/// where offered; nothing when there is neither.
+/// A module's actions as one split button, then checking it for drift and
+/// suspending or resuming it where offered; nothing when there is none.
 #[function_component(ActionsButton)]
 pub fn actions_button(props: &ActionsButtonProps) -> Html {
     let mut items = action_items(&props.actions, &props.on_run, None);
@@ -145,6 +150,9 @@ pub fn actions_button(props: &ActionsButtonProps) -> Html {
             check,
             "Re-plan it against what is running now and report what differs",
         ));
+    }
+    if let Some((offer, workload, ask)) = &props.pause {
+        items.push(super::pause_item(*offer, *workload, ask.clone()));
     }
     html! {
         <SplitButton {items} small=true menu_label="More actions" testid={props.testid.clone()} />

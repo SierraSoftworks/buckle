@@ -494,7 +494,7 @@ session cookie or behind the same ACLs. Useful endpoints:
 | `POST /api/v1/targets/{id}/steward` | Moves a cluster's lease to the host in the body (`{"host": …, "note": …}`), which must qualify now (admin, CSRF-protected, audited). |
 | `POST /api/v1/targets/{id}/drift` | Asks a host, or a cluster's steward, to check for drift now; a body of `{"workload": …}` checks one placement (admin, CSRF-protected, audited). Needs agents that announce `check_drift`. |
 | `POST /api/v1/units/suspend`, `POST /api/v1/units/resume` | Suspends or resumes a module on hosts or a workload on clusters, by `target` or `selector`, with a required `note` ([suspending](../operations/hosts.md#suspending-a-module-or-a-workload); admin, CSRF-protected, audited). Needs agents that announce `unit_pause`. |
-| `GET /api/v1/units/paused` | The suspended modules and workloads, with their notes and review dates. |
+| `GET /api/v1/units/paused` | The suspended modules and workloads, with their notes and review dates; one target's are `paused_units` of `GET /api/v1/hosts/{id}`. |
 | `GET /api/v1/catalog` | The task kinds, fact providers and health checks this server knows, with their JSON schemas. |
 | `GET /api/v1/events` | Server-sent events for live updates. |
 | `POST /api/v1/webhooks/source` | Git push notifications. |

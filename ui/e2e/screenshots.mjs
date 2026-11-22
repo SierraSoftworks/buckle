@@ -92,6 +92,7 @@ const SHOTS = [
       await dialog(p).getByRole("radio", { name: /Linux/ }).click();
       await dialog(p).getByRole("button", { name: "Next" }).click();
       await dialog(p).getByRole("textbox", { name: "Host name" }).fill("web-3");
+      await dialog(p).getByLabel("Reserved label zone").fill("public");
       await dialog(p).getByLabel("Label 1 key").fill("role");
       await dialog(p).getByLabel("Label 1 value").fill("web");
     },
@@ -108,6 +109,7 @@ const SHOTS = [
       await dialog(p).getByRole("textbox", { name: "Host name" }).fill("web-3");
       await dialog(p).getByLabel("Label 1 key").fill("role");
       await dialog(p).getByLabel("Label 1 value").fill("web");
+      await dialog(p).getByLabel("Reserved label zone").fill("public");
       await dialog(p).getByRole("button", { name: "Continue in Tailscale" }).click();
       await dialog(p).getByTestId("join-command").waitFor();
     },
@@ -121,6 +123,17 @@ const SHOTS = [
     target: dialog,
   },
   { name: "host-drift", path: "/hosts/hz-3", target: (p) => panel(p, "Drift") },
+  {
+    name: "host-suspend",
+    path: "/hosts/pi-2",
+    setup: async (p) => {
+      await p.getByTestId("actions-tailscale").locator(".yi-split-button__face").click();
+      await dialog(p).locator('input[type="date"]').fill("2026-12-01");
+      await dialog(p).getByRole("textbox", { name: /Reason/ }).fill("Rotating its auth key");
+    },
+    target: dialog,
+  },
+  { name: "overview-suspended", path: "/", target: (p) => p.locator("#suspended") },
   { name: "rollout-pipeline", path: "/rollouts/42", target: (p) => panel(p, "Pipeline") },
   { name: "rollout-approval", path: "/rollouts/42", target: (p) => p.locator("#plans") },
   {

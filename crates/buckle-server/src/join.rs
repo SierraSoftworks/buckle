@@ -147,6 +147,7 @@ impl JoinSettings {
             }),
             ttl_seconds: self.ttl.as_secs(),
             approval_required: self.approval_required,
+            reserved_labels: Vec::new(),
         }
     }
 

@@ -327,7 +327,7 @@ pub fn check_status_tone(status: &str) -> Tone {
         "pass" | "passed" | "ok" | "healthy" => Tone::Ok,
         "fail" | "failed" | "failing" | "error" => Tone::Danger,
         "flap" | "flapping" | "warn" | "warning" => Tone::Warn,
-        "waived" => Tone::Mute,
+        "waived" | "paused" => Tone::Mute,
         _ => Tone::Neutral,
     }
 }

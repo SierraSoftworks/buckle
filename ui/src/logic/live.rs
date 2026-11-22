@@ -741,6 +741,7 @@ mod tests {
             workloads: vec![],
             executors: vec![],
             actions: vec![],
+            paused_units: vec![],
         };
         let event = LiveEvent::RunProgress {
             progress: RunProgress {

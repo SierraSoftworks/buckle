@@ -18,12 +18,14 @@ use crate::components::changes::Took;
 use crate::components::run_report::{health_bar, module_steps, removal_steps, run_summary};
 use crate::components::{
     ActionsButton, Button, Changes, Empty, ErrorBlock, ErrorState, Kind, Loading, Panel, Pill,
+    suspended_pill,
 };
 use crate::hooks::{RunSource, use_fetch, use_now, use_run_report};
 use crate::logic::actions::of_module;
 use crate::logic::blueprint::blueprint;
 use crate::logic::clusters::{WorkloadRow, WorkloadState, module_rows, workload_rows};
 use crate::logic::format::{commit, count, millis, relative, timestamp};
+use crate::logic::pause::{PauseAsk, attribution, offer, review_text};
 use crate::logic::run::{
     elapsed_ms, expanded_by_default, follow_run_list, module_label, module_slug, module_tally,
     module_tone, resource_module, run_finished, run_label,
@@ -43,6 +45,14 @@ pub(super) struct ModulesProps {
     /// (named by the click).
     #[prop_or_default]
     pub on_check_drift: Option<Callback<String>>,
+    /// Set where the operator may suspend a module or workload, and resume
+    /// one.
+    #[prop_or_default]
+    pub on_pause: Option<Callback<PauseAsk>>,
+    /// Whether the target can take a new pause: it is active and its agent
+    /// (a cluster's steward) is connected.
+    #[prop_or_default]
+    pub reachable: bool,
     /// The newest run heard of (a run may have started since the detail).
     pub newest: Option<String>,
     /// The run the reader picked; `None` follows the newest.
@@ -191,7 +201,8 @@ pub(super) fn modules_panel(props: &ModulesProps) -> Html {
                                 .collect();
                             html! { <>
                                 { workload_row(d, r, cluster, false, module, run, is_open, toggle, now, live,
-                                    row_actions(d, &r.name, props.on_action.as_ref(), props.on_check_drift.as_ref().map(|c| { let n = r.name.clone(); c.reform(move |_| n.clone()) }), format!("actions-{}", r.name))) }
+                                    row_actions(d, r, props.on_action.as_ref(), props.on_check_drift.as_ref().map(|c| { let n = r.name.clone(); c.reform(move |_| n.clone()) }),
+                                        props.on_pause.as_ref().map(|p| (p, props.reachable)), format!("actions-{}", r.name))) }
                                 if is_open {
                                     <tr class="yi-table__detail" key={format!("{}-detail", r.name)} data-detail-of={r.name.clone()}>
                                         <td colspan="6">
@@ -224,29 +235,53 @@ pub(super) struct PlacementProps {
     /// Set where the operator may check the placement for drift.
     #[prop_or_default]
     pub on_check_drift: Option<Callback<()>>,
+    /// Set where the operator may suspend the placement, and resume it.
+    #[prop_or_default]
+    pub on_pause: Option<Callback<PauseAsk>>,
+    /// Whether the cluster can take a new pause.
+    #[prop_or_default]
+    pub reachable: bool,
     /// Opened at first (the cluster the page was opened for).
     #[prop_or_default]
     pub focus: bool,
 }
 
 /// A row's split button: its module's actions where the operator may run
-/// them, then checking it for drift where offered; nothing when neither.
+/// them, then checking it for drift, then suspending or resuming it, each
+/// where offered; nothing when none is. A suspended unit keeps only Resume:
+/// everything else leaves it alone.
 fn row_actions(
     d: &HostDetail,
-    name: &str,
+    r: &WorkloadRow,
     on_action: Option<&Callback<ActionInfo>>,
     on_check_drift: Option<Callback<()>>,
+    on_pause: Option<(&Callback<PauseAsk>, bool)>,
     testid: String,
 ) -> Option<Html> {
-    if on_action.is_none() && on_check_drift.is_none() {
+    let workload = d.summary.kind != buckle_api::TargetKind::Host;
+    let pause = on_pause.and_then(|(ask, reachable)| {
+        let offer = offer(r.paused.is_some(), reachable)?;
+        let asked = PauseAsk {
+            target: d.summary.id.clone(),
+            unit: r.name.clone(),
+            workload,
+            paused: r.paused.clone(),
+        };
+        Some((offer, workload, ask.reform(move |_| asked.clone())))
+    });
+    let (on_action, on_check_drift) = match r.paused {
+        Some(_) => (None, None),
+        None => (on_action, on_check_drift),
+    };
+    if on_action.is_none() && on_check_drift.is_none() && pause.is_none() {
         return None;
     }
     let actions = on_action
-        .map(|_| of_module(&d.actions, name))
+        .map(|_| of_module(&d.actions, &r.name))
         .unwrap_or_default();
     let on_run = on_action.cloned().unwrap_or_default();
     Some(html! {
-        <ActionsButton {actions} {on_run} {on_check_drift} {testid} />
+        <ActionsButton {actions} {on_run} {on_check_drift} {pause} {testid} />
     })
 }
 
@@ -302,9 +337,10 @@ pub(super) fn placement_row(props: &PlacementProps) -> Html {
         .unwrap_or_default();
     let actions = row_actions(
         d,
-        &r.name,
+        &r,
         props.on_action.as_ref(),
         props.on_check_drift.clone(),
+        props.on_pause.as_ref().map(|p| (p, props.reachable)),
         format!("actions-{}-{}", d.summary.id, r.name),
     );
     html! { <>
@@ -390,7 +426,11 @@ fn workload_detail(
     }
 }
 
-pub(super) fn state_pill(r: &WorkloadRow, cluster: bool) -> Html {
+pub(super) fn state_pill(
+    r: &WorkloadRow,
+    cluster: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Html {
     match r.state {
         WorkloadState::Failing => {
             html! { <Pill tone={Tone::Danger} label="failing" title={r.reason.clone()} /> }
@@ -398,6 +438,10 @@ pub(super) fn state_pill(r: &WorkloadRow, cluster: bool) -> Html {
         WorkloadState::Deploying => {
             html! { <Pill tone={Tone::Active} label={if cluster { "deploying" } else { "applying" }} /> }
         }
+        WorkloadState::Suspended => match &r.paused {
+            Some(p) => suspended_pill(p, now),
+            None => html! { <Pill tone={Tone::Mute} label="suspended" /> },
+        },
         // The norm, said quietly.
         WorkloadState::Running if r.checks.1 > 0 => {
             html! { <span class="muted">{ "healthy" }</span> }
@@ -443,11 +487,17 @@ fn workload_row(
                 if !placement && !r.needs.is_empty() { <span class="cell-sub">{ format!("needs {}", r.needs.join(", ")) }</span> }
             </td>
             <td>
-                { state_pill(r, cluster) }
+                { state_pill(r, cluster, now) }
                 if let (WorkloadState::Failing, Some(reason)) = (r.state, &r.reason) {
                     <span class="cell-sub">{ reason.clone() }</span>
                 }
-                if r.checks.1 > 0 && r.state != WorkloadState::Failing {
+                if let Some(p) = &r.paused {
+                    <span class="cell-sub" data-testid="suspended-note">{ p.note.clone() }</span>
+                    <span class="cell-sub muted">
+                        { attribution(p, now) }
+                        if let Some(review) = review_text(p, now) { { format!(" · {review}") } }
+                    </span>
+                } else if r.checks.1 > 0 && r.state != WorkloadState::Failing {
                     <span class="cell-sub muted" data-testid="workload-checks">{ format!("{} of {} passing", r.checks.0, count(r.checks.1, "check", "checks")) }</span>
                 }
             </td>

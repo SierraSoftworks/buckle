@@ -40,6 +40,7 @@ pub(crate) fn state_tone(s: WorkloadState) -> Tone {
     match s {
         WorkloadState::Failing => Tone::Danger,
         WorkloadState::Deploying => Tone::Active,
+        WorkloadState::Suspended => Tone::Mute,
         WorkloadState::Running => Tone::Ok,
         WorkloadState::NotApplied => Tone::Neutral,
     }
@@ -197,6 +198,7 @@ fn row(
         Segment::new(tally(WorkloadState::Running), Tone::Ok, "running"),
         Segment::new(tally(WorkloadState::Deploying), Tone::Active, "deploying"),
         Segment::new(tally(WorkloadState::Failing), Tone::Danger, "failing"),
+        Segment::new(tally(WorkloadState::Suspended), Tone::Mute, "suspended"),
     ];
     let state = w.state();
     let reasons: Vec<String> = w

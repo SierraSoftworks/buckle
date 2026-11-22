@@ -20,6 +20,7 @@ pub mod labels;
 pub mod limits;
 pub mod live;
 pub mod message;
+pub mod pause;
 pub mod pipeline;
 pub mod plan;
 pub mod run;
