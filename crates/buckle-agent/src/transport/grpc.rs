@@ -417,9 +417,7 @@ impl Transport for GrpcTransport {
                     ],
                     tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => &[
                         "The cluster's steward must be connected and reach the cluster; the task is retried on the next run.",
-                    ],
-                    tonic::Code::FailedPrecondition => &[
-                        "Upgrade the agent that stewards the cluster; it predates node operations.",
+                        "A steward whose agent predates node operations needs an upgrade.",
                     ],
                     tonic::Code::Unimplemented => {
                         &["Upgrade the Buckle server; it predates node operations."]

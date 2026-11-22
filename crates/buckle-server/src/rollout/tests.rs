@@ -4661,7 +4661,7 @@ async fn a_scoped_target_is_served_by_its_clusters_executors_within_its_namespac
 /// is one for anything but a cluster.
 #[rstest::rstest]
 #[case::steward("home-nomad", "", Ok(()))]
-#[case::older_agent("home-nomad", "old", Err(CommandErrorKind::Invalid))]
+#[case::older_agent("home-nomad", "old", Err(CommandErrorKind::Conflict))]
 #[case::steward_offline("home-nomad", "offline", Err(CommandErrorKind::Conflict))]
 #[case::a_host("n1", "", Err(CommandErrorKind::NotFound))]
 #[tokio::test(start_paused = true)]

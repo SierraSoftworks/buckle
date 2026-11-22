@@ -2838,7 +2838,8 @@ impl Controller {
                 )
             })?;
         if !self.has_capability(&session, NODE_OPS_CAPABILITY) {
-            return Err(CommandError::invalid(
+            // The node asks again, as it does while no steward is connected.
+            return Err(CommandError::conflict(
                 format!("{session}'s agent, the steward of {target}, cannot act on nodes."),
                 &["Upgrade its agent."],
             ));
