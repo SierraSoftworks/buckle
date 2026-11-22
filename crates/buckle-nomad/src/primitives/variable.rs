@@ -70,6 +70,9 @@ pub(crate) async fn plan(cx: &Context, spec: &VariableSpec) -> Result<Step> {
     }
     let ns = super::namespace_or_default(Some(&spec.namespace));
     let key = ObjectKey::new(Kind::Variable, &ns, &spec.path);
+    if let Some(blocked) = cx.out_of_bounds(&key) {
+        return Ok(blocked);
+    }
     let live = cx.nomad.get::<Live>(&url(&ns, &spec.path)).await?;
     let idx = index::read(&cx.nomad, &cx.target).await?;
     let previous = idx.find(Kind::Variable, &ns, &spec.path);

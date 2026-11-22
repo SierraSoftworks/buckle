@@ -121,6 +121,7 @@ fn assignment(revision: Arc<Revision>, identity: ClusterIdentity, key: u8) -> As
             identity,
             labels: IndexMap::new(),
             fingerprints: Arc::new(InstallKey::from_bytes([key; 32])),
+            bounds: Default::default(),
         }),
         revision,
         secrets: Arc::new(secrets),
@@ -1102,4 +1103,87 @@ async fn a_scoped_plan_covers_one_workload_and_its_own_orphans() {
     let whole = ex.plan(&next, None, None).await.unwrap().plan;
     assert_eq!(whole.modules.len(), 1);
     assert_eq!(whole.removals.len(), paste.removals.len());
+}
+
+/// `assignment`, as the target `target` holding `namespaces` (a scoped
+/// target) or kept out of `excluded` (its cluster).
+fn bounded(
+    revision: Arc<Revision>,
+    target: &str,
+    namespaces: &[&str],
+    excluded: &[&str],
+) -> Assignment {
+    let owned = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect();
+    let a = assignment(revision, ClusterIdentity::Local, 7);
+    Assignment {
+        target: target.into(),
+        spec: Arc::new(TargetSpec {
+            bounds: Bounds {
+                namespaces: owned(namespaces),
+                excluded: owned(excluded),
+            },
+            ..(*a.spec).clone()
+        }),
+        ..a
+    }
+}
+
+/// The cluster's own target manages what is cluster-wide (here the
+/// namespace); the scoped target then applies inside it, keeps its index
+/// there, and neither touches what belongs to the other.
+#[tokio::test]
+async fn a_scoped_target_applies_inside_the_namespaces_its_cluster_hands_it() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let mut files = paste();
+    files[0].1.push_str("when: 'cluster.id == \"public\"'\n");
+    files.extend([
+        (
+            "workloads/platform/workload.yaml".to_owned(),
+            "name: platform\nwhen: 'cluster.id == \"nomad\"'\nresources: [apps.namespace.hcl]\n"
+                .to_owned(),
+        ),
+        (
+            "workloads/platform/files/apps.namespace.hcl".to_owned(),
+            "name = \"apps\"".to_owned(),
+        ),
+    ]);
+    let rev = revision("r1", &files);
+    let scoped = bounded(rev.clone(), "public", &["apps"], &[]);
+    let cluster = bounded(rev, "nomad", &[], &["apps"]);
+
+    // Before its namespace exists the scoped target cannot create it.
+    let early = ex.plan(&scoped, None, None).await.unwrap();
+    let blocked: Vec<&str> = early.plan.modules[0]
+        .steps
+        .iter()
+        .filter_map(|s| match &s.planned {
+            buckle_core::plan::Planned::Blocked { reason } => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        blocked.iter().any(|r| r.contains("cluster-wide")),
+        "{blocked:?}"
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    assert!(!ex.apply(&early, tx).await.succeeded);
+    assert!(fake.job("apps", "paste").is_none());
+
+    let outcome = apply(&ex, &cluster).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    let outcome = apply(&ex, &scoped).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    assert!(fake.job("apps", "paste").is_some());
+    assert!(
+        fake.variable("apps", &buckle_nomad::index::path("public"))
+            .is_some()
+    );
+
+    // Each target sees only its own objects as its own.
+    for a in [&scoped, &cluster] {
+        let again = ex.plan(a, None, None).await.unwrap().plan;
+        assert_eq!(again.changes(), 0, "{again:#?}");
+        assert!(again.removals.is_empty(), "{:?}", again.removals);
+    }
 }

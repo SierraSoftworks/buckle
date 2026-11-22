@@ -126,10 +126,10 @@ fleet:
       trust:                                        # optional: an executor running inside the cluster
         jwks_url: http://nomad.home:4646/.well-known/jwks.json
         subjects: [default/buckle-executor]
-    lab-k3s-team-a:
-      kind: kubernetes
-      cluster: lab-k3s                              # a scoped target: part of another cluster
-      scope: { namespaces: [team-a] }
+    home-nomad-public:
+      kind: nomad
+      cluster: home-nomad                           # a scoped target: part of another cluster
+      scope: { namespaces: [edge, public] }
 ```
 
 | Key | Meaning |
@@ -139,9 +139,38 @@ fleet:
 | `ui` | The cluster's own web UI, for the links beside each workload on the cluster's page (Nomad: `…/ui/jobs/NAME@NAMESPACE`). Defaults to `api` when that is an HTTP URL. |
 | `identity` | How an executor authenticates to the API: a token Buckle issues (`buckle_jwt`, see [identity](../agent/server.md#identity)), the host's own credentials (`local`), the scheduler's workload identity (`workload`), or a declared secret (`secret://NAME`). |
 | `labels` | Seed labels, as an agent's are for a host. Operators may add to them in the UI, and `cluster.labels.*` selects on the result. |
-| `cluster`, `scope` | A *scoped* target is part of another cluster and may touch only the namespaces listed. It is never issued an `acl` identity, so its workloads cannot carry ACL policies. |
+| `cluster`, `scope` | A [scoped target](#scoped-targets): part of another cluster, holding only the namespaces listed. |
 | `watch` | How often the steward reads the cluster when nothing wakes it: `health` (default `60s`) covers a dropped Nomad long poll, `drift` (default `10m`) re-plans the applied revision. |
 | `trust` | Which workload identities may speak for the cluster from inside it ([in-cluster executors](../agent/server.md#in-cluster-executors)): `jwks_url` the server reads the signing keys from, or `keys` pinned as a JWKS document; an optional `issuer`; `subjects` as `namespace/job` (Nomad, default `default/buckle-executor`) or `sub` (Kubernetes, default `system:serviceaccount:buckle-system:buckle-executor`). Not on a scoped target. |
+
+### Scoped targets
+
+A scoped target is a slice of a cluster with a credential of its own, so that a workload placed
+on it cannot touch the rest of the cluster even by mistake: the token Buckle issues carries the
+target's name, and the cluster binds that name to a policy limited to its namespaces
+([trust setup](../agent/server.md#scoped-targets)).
+
+```yaml
+fleet:
+  clusters:
+    nomad:        { kind: nomad, executors: 'host.facts.tailscale.tags contains "tag:boundary"' }
+    nomad-public: { kind: nomad, cluster: nomad, scope: { namespaces: [edge, public] } }
+```
+
+- **Inherits**: `api`, `ui`, `identity`, `nodes`, `executors` and `watch` default to the
+  cluster's, so the same stewards serve it, under its own lease. A namespace belongs to one
+  target.
+- **Holds only its namespaces**: every object a workload renders must land in one of them. What
+  belongs to no namespace (Nomad namespaces, node pools, quotas and ACL policies; Kubernetes
+  cluster-scoped objects) stays with the cluster's own target, which in turn keeps out of the
+  namespaces it handed over. `buckle validate` reports what `workload.yaml` shows, and the
+  executor blocks the rest in the plan. A scoped target is never issued an `acl` identity.
+- **Explicit placement**: a workload names its target (`when: 'cluster.id == "nomad-public"'`)
+  and sets `namespace`. Its `needs` reach workloads on the cluster's other targets, so a
+  workload can wait for the one that creates its namespace.
+
+Stewards must run an agent that holds targets to their bounds (it announces the `scopes`
+capability); an older one is never leased a scoped target or its cluster.
 
 ### Stewards
 

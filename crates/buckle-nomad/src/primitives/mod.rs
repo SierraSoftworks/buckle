@@ -16,6 +16,7 @@ pub use volume::VolumeSpec;
 
 use crate::client::Nomad;
 use buckle_core::Result;
+use buckle_core::model::Bounds;
 use buckle_core::plan::Planned;
 use buckle_core::secrets::InstallKey;
 use buckle_core::task::Applied;
@@ -43,6 +44,9 @@ pub struct Context {
     /// which executor made it.
     pub fingerprints: Arc<InstallKey>,
     pub progress: Progress,
+    /// The part of the cluster the target may touch; a primitive outside
+    /// it plans as blocked.
+    pub bounds: Bounds,
 }
 
 impl Context {
@@ -61,7 +65,21 @@ impl Context {
             revision: revision.into(),
             fingerprints,
             progress: Arc::new(|_| {}),
+            bounds: Bounds::default(),
         }
+    }
+
+    /// Holds the target to `bounds`.
+    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// The blocked step for `key` when it lies outside the target's bounds.
+    pub(crate) fn out_of_bounds(&self, key: &ObjectKey) -> Option<Step> {
+        self.bounds
+            .refusal(&self.target, &key.to_string(), &key.namespace)
+            .map(|reason| Step::blocked(key.clone(), reason))
     }
 
     pub fn with_progress(mut self, progress: Progress) -> Self {
@@ -335,8 +353,12 @@ impl Orphan {
 pub async fn orphans(cx: &Context, declared: &[ObjectKey]) -> Result<Vec<Orphan>> {
     let mut found = Vec::new();
     found.extend(job::owned(cx).await?);
-    found.extend(policy::owned(cx).await?);
-    found.extend(entity::owned(cx).await?);
+    // A scoped target owns nothing cluster-wide, and its credential could
+    // not list it.
+    if !cx.bounds.scoped() {
+        found.extend(policy::owned(cx).await?);
+        found.extend(entity::owned(cx).await?);
+    }
     for e in crate::index::read(&cx.nomad, &cx.target).await?.entries {
         found.push(Orphan {
             key: ObjectKey::new(e.kind, e.namespace, e.name),

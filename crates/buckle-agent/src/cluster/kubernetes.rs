@@ -81,7 +81,10 @@ impl Executor {
         purpose: Purpose,
         rollout: Option<&str>,
     ) -> buckle_core::Result<(Kube, Option<chrono::DateTime<Utc>>)> {
-        let kube = self.connect.kubernetes(&a.target, &a.spec)?;
+        let kube = self
+            .connect
+            .kubernetes(&a.target, &a.spec)?
+            .home(a.spec.bounds.home());
         match &a.spec.identity {
             ClusterIdentity::BuckleJwt => {
                 let request = IdentityRequest {
@@ -130,7 +133,8 @@ impl Executor {
             "",
             &a.revision.id.0,
             a.spec.fingerprints.clone(),
-        );
+        )
+        .with_bounds(a.spec.bounds.clone());
 
         // A workload's `namespace` the cluster lacks is created by the
         // first workload naming it; one that exists is left alone.

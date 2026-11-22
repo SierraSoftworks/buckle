@@ -254,6 +254,9 @@ pub(crate) async fn plan(cx: &Context, spec: &JobSpec, created: &[ObjectKey]) ->
     };
     job["Namespace"] = Value::String(ns.clone());
     let key = ObjectKey::new(Kind::Job, &ns, &id);
+    if let Some(blocked) = cx.out_of_bounds(&key) {
+        return Ok(blocked);
+    }
 
     let job_url = with_query(&format!("/v1/job/{}", seg(&id)), "namespace", &ns);
     let live = cx.nomad.get::<Value>(&job_url).await?;

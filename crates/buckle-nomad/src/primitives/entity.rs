@@ -196,6 +196,9 @@ pub(crate) async fn plan(cx: &Context, spec: &EntitySpec) -> Result<Step> {
     let (name, mut desired) = decode(spec)?;
     let kind = spec.kind;
     let key = ObjectKey::new(kind.kind(), "", &name);
+    if let Some(blocked) = cx.out_of_bounds(&key) {
+        return Ok(blocked);
+    }
     let live = cx.nomad.get_indexed::<Value>(&kind.get_url(&name)).await?;
     if let Some(l) = &live {
         buckle_core::fieldpath::adopt_all(&spec.ignore, &mut desired, &l.value);

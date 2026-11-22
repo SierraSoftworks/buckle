@@ -3,8 +3,9 @@
 //! their own (variables and host volumes), so that the executor can find
 //! what a removed workload left behind without keeping state.
 //!
-//! It lives at `buckle/<target>/index` in the `default` namespace and holds
-//! no secret: item names and fingerprint digests only.
+//! It lives at `buckle/<target>/index` in the `default` namespace (a scoped
+//! target's in the first namespace it owns, see [`Nomad::home`]) and holds no
+//! secret: item names and fingerprint digests only.
 
 use crate::client::{self, Nomad};
 use crate::primitives::Kind;
@@ -13,7 +14,8 @@ use buckle_core::error::system;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// The namespace the index variable lives in.
+/// The namespace the index variable lives in, unless the client names
+/// another.
 pub const NAMESPACE: &str = "default";
 
 /// The index variable's path for `target`.
@@ -71,17 +73,17 @@ struct Variable {
     modify_index: u64,
 }
 
-fn url(target: &str) -> String {
+fn url(nomad: &Nomad, target: &str) -> String {
     format!(
         "/v1/var/{}?namespace={}",
         client::path(&path(target)),
-        NAMESPACE
+        nomad.home
     )
 }
 
 /// Reads the index; an absent index is empty.
 pub async fn read(nomad: &Nomad, target: &str) -> Result<Index> {
-    let Some(var) = nomad.get::<Variable>(&url(target)).await? else {
+    let Some(var) = nomad.get::<Variable>(&url(nomad, target)).await? else {
         return Ok(Index::default());
     };
     let entries = match var.items.get("entries") {
@@ -121,21 +123,21 @@ pub async fn update(nomad: &Nomad, target: &str, change: impl Fn(&mut Vec<Entry>
             .entries
             .sort_by(|a, b| (a.kind, &a.namespace, &a.name).cmp(&(b.kind, &b.namespace, &b.name)));
         let body = json!({
-            "Namespace": NAMESPACE,
+            "Namespace": &*nomad.home,
             "Path": path(target),
             "Items": {"entries": serde_json::to_string(&index.entries).unwrap_or_default()},
         });
         let resp = nomad
             .send(
                 "PUT",
-                &format!("{}&cas={}", url(target), index.modify_index),
+                &format!("{}&cas={}", url(nomad, target), index.modify_index),
                 Some(serde_json::to_vec(&body).unwrap_or_default()),
             )
             .await?;
         if resp.status == 409 {
             continue;
         }
-        nomad.ok("PUT", &url(target), resp)?;
+        nomad.ok("PUT", &url(nomad, target), resp)?;
         return Ok(());
     }
     Err(system(

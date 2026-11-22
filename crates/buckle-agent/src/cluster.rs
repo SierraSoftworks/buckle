@@ -27,7 +27,8 @@ use buckle_core::engine::{
 use buckle_core::error::ErrorReport;
 use buckle_core::health::{HealthReport, HealthResult, HealthScope, HealthStatus};
 use buckle_core::model::{
-    ClusterIdentity, ClusterKind, RemovalPolicy, ResourceEntry, ResourceKind, WorkloadRemoval,
+    Bounds, ClusterIdentity, ClusterKind, RemovalPolicy, ResourceEntry, ResourceKind,
+    WorkloadRemoval,
 };
 use buckle_core::plan::{
     Indeterminate, ModulePlan, Plan, Removal, ResourceKey, RevisionId, Step, TaskRef,
@@ -64,6 +65,9 @@ pub struct TargetSpec {
     pub labels: IndexMap<String, String>,
     /// Keys plan fingerprints (the same for every executor of the target).
     pub fingerprints: Arc<InstallKey>,
+    /// The part of the cluster the target may touch: a scoped target's
+    /// namespaces, or the ones a cluster has handed to its scoped targets.
+    pub bounds: Bounds,
 }
 
 impl std::fmt::Debug for TargetSpec {
@@ -73,6 +77,7 @@ impl std::fmt::Debug for TargetSpec {
             .field("api", &self.api)
             .field("identity", &self.identity)
             .field("labels", &self.labels)
+            .field("bounds", &self.bounds)
             .finish_non_exhaustive()
     }
 }
@@ -291,7 +296,10 @@ impl Executor {
         purpose: Purpose,
         rollout: Option<&str>,
     ) -> buckle_core::Result<Nomad> {
-        let nomad = self.connect.nomad(&a.target, &a.spec)?;
+        let nomad = self
+            .connect
+            .nomad(&a.target, &a.spec)?
+            .home(a.spec.bounds.home());
         match &a.spec.identity {
             ClusterIdentity::BuckleJwt => {
                 let request = IdentityRequest {
@@ -468,7 +476,8 @@ impl Executor {
                         &a.revision.id.0,
                         a.spec.fingerprints.clone(),
                     )
-                    .with_acl(acl.clone());
+                    .with_acl(acl.clone())
+                    .with_bounds(a.spec.bounds.clone());
                     workload
                         .plan_after(&cx, &earlier)
                         .await
@@ -526,7 +535,8 @@ impl Executor {
             &a.revision.id.0,
             a.spec.fingerprints.clone(),
         )
-        .with_acl(acl);
+        .with_acl(acl)
+        .with_bounds(a.spec.bounds.clone());
         let mut removals = Vec::new();
         let mut planned_removals = Vec::new();
         for orphan in buckle_nomad::primitives::orphans(&cx, &declared).await? {

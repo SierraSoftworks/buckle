@@ -1,4 +1,5 @@
-//! The target's index: one ConfigMap (`default/buckle-index-<target>`)
+//! The target's index: one ConfigMap (`default/buckle-index-<target>`; a
+//! scoped target's in the first namespace it owns, see [`Kube::home`])
 //! listing every object Buckle applied for the target, so objects of a
 //! workload (or a manifest document) that went away are found without
 //! listing every resource type in the cluster. The objects themselves carry
@@ -12,7 +13,8 @@ use buckle_core::error::system;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// The namespace of every target's index ConfigMap.
+/// The namespace of a target's index ConfigMap, unless the client names
+/// another.
 pub const NAMESPACE: &str = "default";
 
 /// The ConfigMap name of `target`'s index.
@@ -20,9 +22,10 @@ pub fn name(target: &str) -> String {
     format!("buckle-index-{}", label_value(&target.to_ascii_lowercase()))
 }
 
-fn path(target: &str) -> String {
+fn path(kube: &Kube, target: &str) -> String {
     format!(
-        "/api/v1/namespaces/{NAMESPACE}/configmaps/{}",
+        "/api/v1/namespaces/{}/configmaps/{}",
+        seg(&kube.home),
         seg(&name(target))
     )
 }
@@ -45,7 +48,7 @@ pub struct Index {
 
 /// Reads `target`'s index; empty when it does not exist yet.
 pub async fn read(kube: &Kube, target: &str) -> Result<Index> {
-    let Some(cm) = kube.get(&path(target)).await? else {
+    let Some(cm) = kube.get(&path(kube, target)).await? else {
         return Ok(Index::default());
     };
     let entries = cm["data"]["entries"]
@@ -82,17 +85,20 @@ pub async fn update(kube: &Kube, target: &str, change: impl Fn(&mut Vec<Entry>))
             "kind": "ConfigMap",
             "metadata": {
                 "name": name(target),
-                "namespace": NAMESPACE,
+                "namespace": &*kube.home,
                 "labels": {crate::object::TARGET_LABEL: label_value(target)},
             },
             "data": {"entries": serde_json::to_string(&index.entries).unwrap_or_default()},
         });
         let written = if index.resource_version.is_empty() {
-            kube.create(&format!("/api/v1/namespaces/{NAMESPACE}/configmaps"), &body)
-                .await?
+            kube.create(
+                &format!("/api/v1/namespaces/{}/configmaps", seg(&kube.home)),
+                &body,
+            )
+            .await?
         } else {
             body["metadata"]["resourceVersion"] = json!(index.resource_version);
-            kube.replace(&path(target), &body).await?
+            kube.replace(&path(kube, target), &body).await?
         };
         if written {
             return Ok(());
@@ -100,7 +106,8 @@ pub async fn update(kube: &Kube, target: &str, change: impl Fn(&mut Vec<Entry>))
     }
     Err(system(
         format!(
-            "The index ConfigMap {NAMESPACE}/{} kept changing while it was written.",
+            "The index ConfigMap {}/{} kept changing while it was written.",
+            kube.home,
             name(target)
         ),
         &["Retry the apply; another executor may be applying the same target."],

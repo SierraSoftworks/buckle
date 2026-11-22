@@ -194,6 +194,11 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
                 }
             }
         }
+        for (cluster, decl) in &revision.fleet.fleet.clusters {
+            if selects(revision, w, cluster, decl) {
+                validate_bounds(&mut report, revision, w, cluster);
+            }
+        }
         for duplicate in cfg.duplicates() {
             report.error(
                 Some(name),
@@ -638,8 +643,118 @@ fn validate_cluster(
                     decl.kind, p.kind
                 ),
             ),
-            Some(_) => {}
+            Some(_) => {
+                if decl.scope.is_empty() {
+                    report.error(
+                        None,
+                        format!("{location}.scope"),
+                        format!("is scoped to '{parent}' but lists no namespaces; give `scope.namespaces` the namespaces it owns"),
+                    );
+                }
+                // Reported once per pair, on the later of the two.
+                for (other, sibling) in revision.fleet.fleet.clusters.iter() {
+                    if other == name {
+                        break;
+                    }
+                    if sibling.cluster.as_ref() != Some(parent) {
+                        continue;
+                    }
+                    for ns in &decl.scope.namespaces {
+                        if sibling.scope.namespaces.contains(ns) {
+                            report.error(
+                                None,
+                                format!("{location}.scope"),
+                                format!("claims the namespace '{ns}', which the scoped target '{other}' already owns; a namespace belongs to one target"),
+                            );
+                        }
+                    }
+                }
+            }
         },
+    }
+}
+
+/// Reports a workload placed where its objects may not be: outside the
+/// namespaces of a scoped target it selects, or, on a cluster, inside the
+/// namespaces of one of its scoped targets. Only what `workload.yaml` says is
+/// judged here (its `namespace` and the kinds it lists); the executor holds
+/// every rendered object to the same bounds when it plans.
+fn validate_bounds(
+    report: &mut ValidationReport,
+    revision: &Revision,
+    w: &LoadedWorkload,
+    cluster: &str,
+) {
+    let bounds = revision.fleet.bounds(cluster);
+    if !bounds.scoped() && bounds.excluded.is_empty() {
+        return;
+    }
+    let cfg = &w.config;
+    let name = cfg.name.as_str();
+    let file = workload_file(name);
+    let namespace = cfg
+        .namespace
+        .as_deref()
+        .filter(|ns| !Templater::needs_render(ns));
+    if !bounds.scoped() {
+        if let Some(ns) = namespace
+            && let Some(owner) = revision.fleet.fleet.clusters.iter().find_map(|(n, c)| {
+                (c.cluster.as_deref() == Some(cluster)
+                    && c.scope.namespaces.iter().any(|x| x == ns))
+                .then_some(n)
+            })
+        {
+            report.error(
+                Some(name),
+                format!("{file} namespace"),
+                format!(
+                    "is placed on '{cluster}' in the namespace '{ns}', which belongs to the scoped target '{owner}'; place it there (`when: 'cluster.id == \"{owner}\"'`)"
+                ),
+            );
+        }
+        return;
+    }
+    let owned = bounds.namespaces.join(", ");
+    match (&cfg.namespace, namespace) {
+        (None, _) => report.error(
+            Some(name),
+            format!("{file} namespace"),
+            format!(
+                "is placed on the scoped target '{cluster}' without a `namespace`; set it to one the target owns ({owned}), or narrow `when` to the cluster the workload belongs on"
+            ),
+        ),
+        (Some(_), Some(ns)) if !bounds.holds(ns) => report.error(
+            Some(name),
+            format!("{file} namespace"),
+            format!(
+                "is placed on the scoped target '{cluster}' in the namespace '{ns}', which is outside it (it owns: {owned})"
+            ),
+        ),
+        _ => {}
+    }
+    for entry in &cfg.resources {
+        if matches!(
+            entry.kind,
+            ResourceKind::Policy
+                | ResourceKind::Namespace
+                | ResourceKind::NodePool
+                | ResourceKind::Quota
+        ) {
+            let parent = revision
+                .fleet
+                .fleet
+                .clusters
+                .get(cluster)
+                .and_then(|c| c.cluster.as_deref())
+                .unwrap_or_default();
+            report.error(
+                Some(name),
+                format!("{file} resources ({})", entry.describe()),
+                format!(
+                    "is cluster-wide, but '{cluster}' is a scoped target; manage it from a workload on '{parent}'"
+                ),
+            );
+        }
     }
 }
 
@@ -712,6 +827,13 @@ fleet:
   clusters:
     home-nomad: { kind: nomad, nodes: 'true', labels: { site: home } }
     lab: { kind: kubernetes, nodes: 'true', labels: { site: lab } }
+";
+
+    const SCOPED_FLEET: &str = "version: 2
+fleet:
+  clusters:
+    nomad: { kind: nomad, api: 'http://nomad:4646', nodes: 'true', executors: 'host.id == \"z2\"', identity: local }
+    public: { kind: nomad, cluster: nomad, scope: { namespaces: [edge, public] } }
 ";
 
     fn load(files: &[(&str, &str)]) -> Revision {
@@ -870,12 +992,71 @@ fleet:
         &[("buckle.yaml", MIXED_FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'cluster.labels.site == \"home\"'\nresources: [a.yaml]\n"), ("workloads/a/files/a.yaml", "")],
         "selects the nomad cluster 'home-nomad'"
     )]
+    #[case::scoped_without_namespaces(
+        &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    c: { kind: nomad, cluster: p }\n")],
+        "lists no namespaces"
+    )]
+    #[case::scopes_overlap(
+        &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    a: { kind: nomad, cluster: p, scope: { namespaces: [edge, public] } }\n    b: { kind: nomad, cluster: p, scope: { namespaces: [public] } }\n")],
+        "which the scoped target 'a' already owns"
+    )]
+    #[case::unplaced_workload_reaches_a_scoped_target(
+        &[("buckle.yaml", SCOPED_FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
+        "on the scoped target 'public' without a `namespace`"
+    )]
+    #[case::namespace_outside_the_scope(
+        &[("buckle.yaml", SCOPED_FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'cluster.id == \"public\"'\nnamespace: internal\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
+        "which is outside it"
+    )]
+    #[case::cluster_wide_object_on_a_scoped_target(
+        &[("buckle.yaml", SCOPED_FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'cluster.id == \"public\"'\nnamespace: edge\nresources: [edge.namespace.hcl]\n"), ("workloads/a/files/edge.namespace.hcl", "namespace {}")],
+        "manage it from a workload on 'nomad'"
+    )]
+    #[case::cluster_workload_inside_a_scope(
+        &[("buckle.yaml", SCOPED_FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'cluster.id == \"nomad\"'\nnamespace: edge\nresources: [a.nomad.hcl]\n"), ("workloads/a/files/a.nomad.hcl", "job {}")],
+        "which belongs to the scoped target 'public'"
+    )]
     fn invalid_configurations_are_reported(#[case] files: &[(&str, &str)], #[case] needle: &str) {
         let errors = errors(files);
         assert!(
             errors.iter().any(|e| e.contains(needle)),
             "expected {needle:?} in {errors:#?}"
         );
+    }
+
+    #[test]
+    fn a_scoped_target_takes_what_it_leaves_out_from_its_cluster() {
+        let rev = load(&[
+            ("buckle.yaml", SCOPED_FLEET),
+            (
+                "workloads/platform/workload.yaml",
+                "name: platform\nwhen: 'cluster.id == \"nomad\"'\nresources: [edge.namespace.hcl]\n",
+            ),
+            (
+                "workloads/platform/files/edge.namespace.hcl",
+                "namespace {}",
+            ),
+            (
+                "workloads/site/workload.yaml",
+                "name: site\nwhen: 'cluster.id == \"public\"'\nnamespace: edge\nneeds: ['workload:platform:nomad']\nresources: [site.nomad.hcl]\n",
+            ),
+            ("workloads/site/files/site.nomad.hcl", "job {}"),
+        ]);
+        let report = validate_targets(&rev);
+        assert!(report.errors.is_empty(), "{:#?}", report.errors);
+
+        let (parent, scoped) = (
+            &rev.fleet.fleet.clusters["nomad"],
+            &rev.fleet.fleet.clusters["public"],
+        );
+        assert_eq!(scoped.api, parent.api);
+        assert_eq!(scoped.identity, parent.identity);
+        assert_eq!(
+            scoped.executors().map(|f| f.raw()),
+            parent.executors().map(|f| f.raw())
+        );
+        assert_eq!(rev.fleet.bounds("public").namespaces, ["edge", "public"]);
+        assert_eq!(rev.fleet.bounds("nomad").excluded, ["edge", "public"]);
     }
 
     #[test]

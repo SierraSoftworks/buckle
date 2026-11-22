@@ -49,6 +49,7 @@ pub const CAPABILITIES: &[&str] = &[
     "workloads",
     "check_drift",
     "scheduled_needs",
+    "scopes",
 ];
 
 /// The protobuf Hello.
@@ -110,6 +111,8 @@ fn cluster_from_proto(mut c: pb::ClusterTarget) -> WireCluster {
         identity: std::mem::take(&mut c.identity),
         labels: std::mem::take(&mut c.labels).into_iter().collect(),
         fingerprint_key: std::mem::take(&mut c.fingerprint_key),
+        namespaces: std::mem::take(&mut c.namespaces),
+        excluded_namespaces: std::mem::take(&mut c.excluded_namespaces),
     }
 }
 

@@ -716,3 +716,98 @@ async fn a_blocked_placement_is_waited_for(
         }
     }
 }
+
+fn job_in(namespace: &str) -> Primitive {
+    let mut spec = atuin_job("atuin:1");
+    spec.hcl = spec
+        .hcl
+        .replacen('{', &format!("{{\"Namespace\":\"{namespace}\","), 1);
+    Primitive::Job(spec)
+}
+
+fn namespace_entity(name: &str) -> Primitive {
+    Primitive::Entity(EntitySpec::new(
+        EntityKind::Namespace,
+        format!("{name}.namespace.hcl"),
+        format!("name = \"{name}\""),
+    ))
+}
+
+fn bounds(namespaces: &[&str], excluded: &[&str]) -> buckle_core::model::Bounds {
+    let owned = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect();
+    buckle_core::model::Bounds {
+        namespaces: owned(namespaces),
+        excluded: owned(excluded),
+    }
+}
+
+/// A target plans an object outside its bounds as blocked, before anything
+/// is asked of the namespace it may not touch.
+#[rstest::rstest]
+#[case::scoped_inside(&["edge"], &[], job_in("edge"), None)]
+#[case::scoped_outside(&["edge"], &[], job_in("internal"), Some("outside the scoped target"))]
+#[case::scoped_cluster_wide(&["edge"], &[], namespace_entity("edge"), Some("cluster-wide"))]
+#[case::cluster_outside_its_scopes(&[], &["edge"], job_in("internal"), None)]
+#[case::cluster_inside_a_scope(&[], &["edge"], job_in("edge"), Some("belongs to a target scoped to"))]
+#[case::cluster_manages_namespaces(&[], &["edge"], namespace_entity("edge"), None)]
+#[tokio::test]
+async fn a_target_plans_only_within_its_bounds(
+    #[case] namespaces: &[&str],
+    #[case] excluded: &[&str],
+    #[case] primitive: Primitive,
+    #[case] refused: Option<&str>,
+) {
+    let fake = FakeNomad::new();
+    let cx = cx(&fake, "r1").with_bounds(bounds(namespaces, excluded));
+    let plan = with(vec![primitive]).plan(&cx).await.unwrap();
+    match (plan.blocked(), refused) {
+        (None, None) => {}
+        (Some((_, reason)), Some(needle)) => {
+            assert!(reason.contains(needle), "{reason}");
+            assert!(plan.apply(&cx).await.is_err());
+            assert!(
+                !fake.requests().iter().any(|(_, p)| p.contains("/v1/job/")),
+                "{:?}",
+                fake.requests()
+            );
+        }
+        (blocked, refused) => panic!("blocked {blocked:?}, expected {refused:?}"),
+    }
+}
+
+/// A scoped target's credential reaches only its namespaces, so its index
+/// lives in one of them and its orphans are looked for there alone.
+#[tokio::test]
+async fn a_scoped_target_keeps_its_index_and_orphan_search_inside_its_scope() {
+    let fake = FakeNomad::new();
+    let scope = bounds(&["edge", "public"], &[]);
+    let cx = Context {
+        nomad: fake.client().home(scope.home()),
+        ..cx(&fake, "r1").with_bounds(scope)
+    };
+    let w = with(vec![Primitive::Variable(VariableSpec {
+        namespace: "public".into(),
+        ..variables(&[("url", render("{{ secrets.db }}"))])
+    })]);
+    w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
+
+    assert!(fake.variable("edge", &index::path("home-nomad")).is_some());
+    assert!(
+        fake.variable("default", &index::path("home-nomad"))
+            .is_none()
+    );
+    let orphans = orphans(&cx, &[]).await.unwrap();
+    assert_eq!(
+        orphans.iter().map(|o| o.key.key()).collect::<Vec<_>>(),
+        ["public/nomad/jobs/atuin"]
+    );
+    let cluster_wide = ["/v1/acl/policies", "/v1/namespaces", "/v1/node/pools"];
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|(_, p)| cluster_wide.iter().any(|c| p.starts_with(c))),
+        "{:?}",
+        fake.requests()
+    );
+}

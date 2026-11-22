@@ -159,6 +159,10 @@ pub struct WireCluster {
     pub labels: IndexMap<String, String>,
     /// Keys the target's plan fingerprints.
     pub fingerprint_key: Vec<u8>,
+    /// A scoped target's namespaces; empty: the whole cluster.
+    pub namespaces: Vec<String>,
+    /// The namespaces the cluster's scoped targets own.
+    pub excluded_namespaces: Vec<String>,
 }
 
 impl Drop for WireCluster {
@@ -174,6 +178,8 @@ impl std::fmt::Debug for WireCluster {
             .field("api", &self.api)
             .field("identity", &self.identity)
             .field("labels", &self.labels)
+            .field("namespaces", &self.namespaces)
+            .field("excluded_namespaces", &self.excluded_namespaces)
             .finish_non_exhaustive()
     }
 }

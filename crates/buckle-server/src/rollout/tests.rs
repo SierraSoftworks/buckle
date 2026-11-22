@@ -1,7 +1,8 @@
 //! Controller scenarios driven by scripted fake hosts on tokio's paused clock.
 
 use super::controller::{
-    CHECK_DRIFT_CAPABILITY, SCHEDULED_NEEDS_CAPABILITY, TARGETS_CAPABILITY, WORKLOADS_CAPABILITY,
+    CHECK_DRIFT_CAPABILITY, SCHEDULED_NEEDS_CAPABILITY, SCOPES_CAPABILITY, TARGETS_CAPABILITY,
+    WORKLOADS_CAPABILITY,
 };
 use super::model::{HostPhase, RolloutHostRecord, RolloutRecord, STRAGGLERS};
 use super::*;
@@ -77,6 +78,9 @@ struct Script {
     /// cluster whole), so clusters it could execute for are rolled as one
     /// row.
     no_workloads: bool,
+    /// The agent does not announce the `scopes` capability (it holds no
+    /// target to its bounds), so it never stewards a bounded target.
+    no_scopes: bool,
     /// Never answer an Apply aimed at a cluster target (the agent's own
     /// applies are answered).
     silent_target_apply: bool,
@@ -584,9 +588,9 @@ impl Harness {
 
     /// Connects `host` with a Hello naming `unreported` apply revisions.
     fn connect_with(&mut self, host: &str, applied: Option<&str>, unreported: Vec<String>) {
-        let (legacy, no_targets, no_workloads) = {
+        let (legacy, no_targets, no_workloads, no_scopes) = {
             let s = self.scripts[host].lock().unwrap();
-            (s.legacy_agent, s.no_targets, s.no_workloads)
+            (s.legacy_agent, s.no_targets, s.no_workloads, s.no_scopes)
         };
         self.handle.connected(Connected {
             host: host.to_owned(),
@@ -613,6 +617,9 @@ impl Harness {
                     CHECK_DRIFT_CAPABILITY.into(),
                     SCHEDULED_NEEDS_CAPABILITY.into(),
                 ]
+                .into_iter()
+                .chain((!no_scopes).then(|| SCOPES_CAPABILITY.to_owned()))
+                .collect()
             },
             boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
         });
@@ -4577,6 +4584,72 @@ async fn a_changed_executors_selector_reelects_the_steward(
         .cloned()
         .collect();
     assert!(misdirected.is_empty(), "{misdirected:?}");
+}
+
+/// `postgres` on the cluster itself and `site` on the target scoped to it.
+const SCOPED: &[(&str, &str)] = &[
+    (
+        "workloads/postgres/workload.yaml",
+        "name: postgres\nwhen: 'cluster.id == \"home-nomad\"'\nresources: [postgres.nomad.hcl]\n",
+    ),
+    (
+        "workloads/postgres/files/postgres.nomad.hcl",
+        "job \"postgres\" {}\n",
+    ),
+    (
+        "workloads/site/workload.yaml",
+        "name: site\nwhen: 'cluster.id == \"public\"'\nnamespace: edge\nresources: [site.nomad.hcl]\n",
+    ),
+    ("workloads/site/files/site.nomad.hcl", "job \"site\" {}\n"),
+];
+
+/// A scoped target takes its cluster's executors and reaches them with the
+/// namespaces it owns, and the cluster with those namespaces excluded. An
+/// agent that holds no target to its bounds stewards neither.
+#[rstest::rstest]
+#[case::holds_bounds(false)]
+#[case::older_agent(true)]
+#[tokio::test(start_paused = true)]
+async fn a_scoped_target_is_served_by_its_clusters_executors_within_its_namespaces(
+    #[case] older: bool,
+) {
+    let mut h = Harness::new().await;
+    let clusters = format!(
+        "{NOMAD_CLUSTER}    public:\n      kind: nomad\n      cluster: home-nomad\n      scope: {{ namespaces: [edge] }}\n"
+    );
+    h.revision_with("r1", ONE_PHASE_ALL, &clusters, SCOPED)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.script("n1", |s| s.no_scopes = older);
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+
+    if older {
+        h.wait(&id, "n1 healthy", |_, hs| {
+            host(hs, "n1").state == HostPhase::Healthy
+        })
+        .await;
+        assert!(
+            h.sent(|_, m| targeted(m).is_some()).is_empty(),
+            "an agent that ignores bounds is never handed a bounded target"
+        );
+        return;
+    }
+
+    h.wait_state(&id, RolloutState::Completed).await;
+    let bounds = |target: &str| {
+        h.sent(|_, m| matches!(m, SMsg::Assign(_)) && targeted(m) == Some(target))
+            .into_iter()
+            .find_map(|(_, to, m)| match m {
+                SMsg::Assign(a) => a.cluster.map(|c| (to, c.namespaces, c.excluded_namespaces)),
+                _ => None,
+            })
+            .expect("the target was assigned")
+    };
+    let edge = vec!["edge".to_owned()];
+    assert_eq!(bounds("public"), ("n1".to_owned(), edge.clone(), vec![]));
+    assert_eq!(bounds(CLUSTER), ("n1".to_owned(), vec![], edge));
+    assert_eq!(h.steward("public").await.as_deref(), Some("n1"));
 }
 
 /// A cluster none of whose candidate executors runs a pipeline per target is

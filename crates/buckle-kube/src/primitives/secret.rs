@@ -65,6 +65,9 @@ pub(crate) async fn plan(cx: &Context, spec: &SecretSpec) -> Result<Step> {
         spec.namespace.clone()
     };
     let key = ObjectKey::new("v1", "Secret", &ns, &spec.name);
+    if let Some(blocked) = cx.out_of_bounds(&key) {
+        return Ok(blocked);
+    }
     let secret_type = spec.secret_type.clone().unwrap_or_else(|| "Opaque".into());
     let live = cx.kube.get(&path(&ns, &spec.name)).await?;
     let owner = Owner::of(live.as_ref(), &cx.target);

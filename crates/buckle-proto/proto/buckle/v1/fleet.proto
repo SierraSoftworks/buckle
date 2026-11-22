@@ -509,6 +509,13 @@ message ClusterTarget {
   // (Nomad variable items). Derived per target by the server, so every
   // executor of the target makes the same plan digest.
   bytes fingerprint_key = 5;
+  // For a scoped target: the namespaces it owns. The executor refuses to
+  // plan an object outside them, or one that belongs to no namespace.
+  // Empty: the whole cluster.
+  repeated string namespaces = 6;
+  // For a cluster with scoped targets: the namespaces those own, which the
+  // executor refuses to plan this target's objects in.
+  repeated string excluded_namespaces = 7;
 }
 
 message RequestPlan {
