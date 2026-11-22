@@ -27,6 +27,37 @@ records who ran it and why. To run an action on many hosts at once, through the 
 Pause a host before maintenance that Buckle would otherwise undo, such as a manual hotfix you are
 testing, and resume it afterwards.
 
+## Suspending a module or a workload
+
+Suspend is Pause with a narrower scope: one module on one host, or one workload on one cluster,
+while the rest of the target carries on. It always asks for a note, shown with the suspended
+unit and kept in the audit log.
+
+```sh
+curl -X POST "$BUCKLE/api/v1/units/suspend" -d '{
+  "selector": "cluster.id == \"nomad-public\"", "workload": true,
+  "note": "CVE in the ingress image", "review_at": "2026-12-01T09:00:00Z"
+}'
+curl -X POST "$BUCKLE/api/v1/units/resume" -d '{"target": "edge-1", "unit": "cloudflared", "note": "patched"}'
+```
+
+* **Scope.** `target` names one host or cluster, or `selector` picks them (a cluster is read as
+  each workload's placement, so `workload.*` works). `unit` names the module or workload;
+  without it, `"workload": true` takes every workload of the clusters matched. The response
+  lists each unit with the run of its hook, or why it was left as it was.
+* **While suspended.** Rollouts, drift correction, local rollback and every action leave the
+  unit alone, and a scheduled action waits for it or skips the run saying so. Its checks read
+  `paused` and fail nothing. A module's [`@suspend`](../modules/README.md#suspend-and-resume-hooks)
+  runs once the pause is in place; a workload's jobs are stopped.
+* **Resuming.** A module's `@resume` runs first, and the pause lifts when it succeeded. The
+  host's next drift pass then brings the module to the applied revision (with `drift.correct`
+  off, the next rollout does); a workload's placement rejoins the stable revision's stragglers
+  stage, under that stage's approval policy.
+* **Limits.** The agent (a cluster's steward) keeps the pause, so it has to be connected and
+  announce `unit_pause`, and the unit must not be changing in a rollout. `review_at` only puts
+  the unit on the attention list once it has passed. `GET /api/v1/units/paused` lists what is
+  suspended.
+
 ## Labels
 
 Operator labels win over the labels the agent reports, and decide the host's groups and the

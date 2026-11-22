@@ -14,6 +14,19 @@ use super::TaskDecl;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+/// What Suspend runs on a module before it stays paused, when the module
+/// declares it. A workload's is implicit: its jobs are stopped.
+pub const SUSPEND_ACTION: &str = "@suspend";
+/// What Resume runs on a module before its pause is lifted, when declared.
+pub const RESUME_ACTION: &str = "@resume";
+
+/// Whether `name` is one of Buckle's own action names: they start with `@`,
+/// which no operator's action (or Nomad task action) may, are run only by
+/// Suspend and Resume, and are left out of the actions a target offers.
+pub fn reserved_action(name: &str) -> bool {
+    name.starts_with('@')
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActionDecl {
     /// The task the action runs (its `notify`, `when`, `retry` and `name`

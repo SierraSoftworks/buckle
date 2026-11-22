@@ -43,6 +43,11 @@ pub struct RunContext {
     pub drift: bool,
     /// Cluster credentials for `command.run` `identity`.
     pub clusters: Option<Arc<dyn buckle_core::task::ClusterCredentials>>,
+    /// The modules an operator suspended on this host: every run leaves
+    /// them alone.
+    pub paused: Vec<String>,
+    /// Resumed modules a drift pass brings to the applied revision.
+    pub catch_up: Vec<String>,
 }
 
 /// Plans, applies, checks health and collects facts for the agent.
@@ -171,6 +176,8 @@ impl EngineRunner {
             .with_agent_vars(ctx.vars.clone())
             .with_drift(ctx.drift)
             .with_clusters(ctx.clusters.clone())
+            .with_paused(ctx.paused.iter().cloned())
+            .with_catch_up(ctx.catch_up.iter().cloned())
             .with_removals(!ctx.drift))
     }
 }

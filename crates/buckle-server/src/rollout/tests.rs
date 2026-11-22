@@ -2,7 +2,7 @@
 
 use super::controller::{
     CHECK_DRIFT_CAPABILITY, NODE_OPS_CAPABILITY, SCHEDULED_NEEDS_CAPABILITY, SCOPES_CAPABILITY,
-    TARGETS_CAPABILITY, WORKLOADS_CAPABILITY,
+    TARGETS_CAPABILITY, UNIT_PAUSE_CAPABILITY, WORKLOADS_CAPABILITY,
 };
 use super::model::{HostPhase, RolloutHostRecord, RolloutRecord, STRAGGLERS};
 use super::*;
@@ -83,6 +83,8 @@ struct Script {
     no_scopes: bool,
     /// The agent predates node operations.
     no_node_ops: bool,
+    /// The agent predates suspending a module or a workload.
+    no_unit_pause: bool,
     /// Never answer an Apply aimed at a cluster target (the agent's own
     /// applies are answered).
     silent_target_apply: bool,
@@ -591,6 +593,7 @@ impl Harness {
     /// Connects `host` with a Hello naming `unreported` apply revisions.
     fn connect_with(&mut self, host: &str, applied: Option<&str>, unreported: Vec<String>) {
         let no_node_ops = self.scripts[host].lock().unwrap().no_node_ops;
+        let no_unit_pause = self.scripts[host].lock().unwrap().no_unit_pause;
         let (legacy, no_targets, no_workloads, no_scopes) = {
             let s = self.scripts[host].lock().unwrap();
             (s.legacy_agent, s.no_targets, s.no_workloads, s.no_scopes)
@@ -623,6 +626,7 @@ impl Harness {
                 .into_iter()
                 .chain((!no_scopes).then(|| SCOPES_CAPABILITY.to_owned()))
                 .chain((!no_node_ops).then(|| NODE_OPS_CAPABILITY.to_owned()))
+                .chain((!no_unit_pause).then(|| UNIT_PAUSE_CAPABILITY.to_owned()))
                 .collect()
             },
             boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
@@ -6596,4 +6600,304 @@ async fn a_phase_of_hosts_and_placements_is_ordered_by_needs() {
         placed("postgres") >= second + BAKE,
         "the other workload after every node"
     );
+}
+
+// ---------------------------------------------------------------- suspended units
+
+/// `web` with both hooks and an action of its own; `plain` with neither.
+const HOOKED: &[(&str, &str)] = &[
+    (
+        "modules/web/module.yaml",
+        "name: web\nactions:\n  '@suspend': { command.run: { run: [\"true\"] } }\n  '@resume': { command.run: { run: [\"true\"] } }\n  restart: { command.run: { run: [\"true\"] } }\n",
+    ),
+    ("modules/plain/module.yaml", "name: plain\n"),
+];
+
+impl Harness {
+    /// Host `a`, connected and on the stable `r1` with [`HOOKED`].
+    async fn suspendable() -> Self {
+        let mut h = Harness::new().await;
+        h.revision_with("r1", ONE_PHASE_ALL, "", HOOKED).await;
+        h.stable("r1").await;
+        h.enrol("a", "web").await;
+        h.applied("a", "r1").await;
+        h.connect("a", Some("r1"));
+        h
+    }
+
+    async fn applied(&self, target: &str, revision: &str) {
+        let (t, r) = (target.to_owned(), revision.to_owned());
+        self.store
+            .call(move |db| db.hosts().set_applied_revision(&t, &r))
+            .await
+            .unwrap();
+    }
+
+    /// Closes `target`'s action runs, as the gRPC service does when their
+    /// results arrive.
+    async fn close_runs(&self, target: &str) {
+        let (t, now) = (target.to_owned(), self.clock.now());
+        self.store
+            .call(move |db| db.runs().abandon_actions(&t, now))
+            .await
+            .unwrap();
+    }
+
+    async fn suspended(&self) -> Vec<(String, String)> {
+        self.store
+            .call(|db| db.paused().list())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| (u.target, u.unit))
+            .collect()
+    }
+
+    async fn suspend(&self, target: &str, unit: &str) -> Result<String, CommandError> {
+        self.command(Command::Suspend {
+            target: target.into(),
+            unit: unit.into(),
+            note: "disk swap".into(),
+            review_at: None,
+        })
+        .await
+    }
+
+    async fn resume_unit(&self, target: &str, unit: &str) -> Result<String, CommandError> {
+        self.command(Command::ResumeUnit {
+            target: target.into(),
+            unit: unit.into(),
+            note: "disk swapped".into(),
+        })
+        .await
+    }
+
+    /// What `host` was told about its suspended modules and asked to run,
+    /// in order: `paused:a,b` for a HostUpdate, `run:<action>` for an action.
+    fn told(&self, host: &str) -> Vec<String> {
+        self.sent(|to, m| to == host && matches!(m, SMsg::HostUpdate(_) | SMsg::Action(_)))
+            .into_iter()
+            .map(|(_, _, m)| match m {
+                SMsg::HostUpdate(u) => format!("paused:{}", u.paused_modules.join(",")),
+                SMsg::Action(a) => format!("run:{}", a.action),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+}
+
+/// A module is paused on its agent before its `@suspend` runs, keeps its
+/// own actions to itself while suspended, and is let go only once its
+/// `@resume` has succeeded.
+#[rstest::rstest]
+#[case::resume_succeeds(false)]
+#[case::resume_fails(true)]
+#[tokio::test(start_paused = true)]
+async fn a_module_is_paused_around_its_hooks(#[case] resume_fails: bool) {
+    let h = Harness::suspendable().await;
+    let run = h.suspend("a", "web").await.unwrap();
+    assert!(!run.is_empty(), "the @suspend run is named");
+    assert_eq!(
+        h.suspended().await,
+        vec![("a".to_owned(), "web".to_owned())]
+    );
+    h.idle(5).await;
+    assert_eq!(h.told("a"), vec!["paused:web", "run:@suspend"]);
+    h.close_runs("a").await;
+
+    let action = |action: &str| Command::RunAction {
+        target: "a".into(),
+        module: "web".into(),
+        action: action.into(),
+        label: action.into(),
+        revision: "r1".into(),
+        instances: None,
+        note: String::new(),
+    };
+    for (name, kind) in [
+        ("restart", CommandErrorKind::Conflict),
+        ("@resume", CommandErrorKind::Invalid),
+    ] {
+        let refused = h.command(action(name)).await.expect_err(name);
+        assert_eq!(refused.kind, kind, "{name}");
+    }
+
+    h.script("a", |s| s.action_fail = resume_fails);
+    let run = h.resume_unit("a", "web").await.unwrap();
+    assert!(!run.is_empty(), "the @resume run is named");
+    h.idle(5).await;
+    let told = h.told("a");
+    assert_eq!(told[2], "run:@resume", "{told:?}");
+    if resume_fails {
+        assert_eq!(h.suspended().await.len(), 1, "still suspended");
+        assert_eq!(told.len(), 3, "{told:?}");
+    } else {
+        assert!(h.suspended().await.is_empty());
+        assert_eq!(told.last().map(String::as_str), Some("paused:"), "{told:?}");
+        h.close_runs("a").await;
+        h.command(action("restart"))
+            .await
+            .expect("its actions run again");
+    }
+    let audited = h.audit_actions("a").await;
+    assert!(
+        audited.iter().any(|a| a == "target.unit.suspend"),
+        "{audited:?}"
+    );
+    assert_eq!(
+        audited.iter().any(|a| a == "target.unit.resume"),
+        !resume_fails,
+        "{audited:?}"
+    );
+}
+
+/// A module without hooks is only paused, and resumed at once.
+#[tokio::test(start_paused = true)]
+async fn a_module_without_hooks_is_only_paused() {
+    let h = Harness::suspendable().await;
+    assert_eq!(h.suspend("a", "plain").await.unwrap(), "");
+    assert_eq!(h.resume_unit("a", "plain").await.unwrap(), "");
+    assert!(h.suspended().await.is_empty());
+    assert_eq!(h.told("a"), vec!["paused:plain", "paused:"]);
+    let again = h.resume_unit("a", "plain").await.unwrap_err();
+    assert_eq!(again.kind, CommandErrorKind::Conflict);
+}
+
+#[rstest::rstest]
+#[case::agent_offline("offline", "web", "why", CommandErrorKind::Conflict)]
+#[case::agent_too_old("old", "web", "why", CommandErrorKind::Conflict)]
+#[case::no_such_module("", "nginx", "why", CommandErrorKind::NotFound)]
+#[case::no_such_target("gone", "web", "why", CommandErrorKind::NotFound)]
+#[case::no_note("", "web", " ", CommandErrorKind::Invalid)]
+#[case::applying("applying", "web", "why", CommandErrorKind::Conflict)]
+#[tokio::test(start_paused = true)]
+async fn a_unit_is_suspended_only_where_the_pause_holds(
+    #[case] state: &str,
+    #[case] unit: &str,
+    #[case] note: &str,
+    #[case] kind: CommandErrorKind,
+) {
+    let mut h = Harness::suspendable().await;
+    match state {
+        "offline" => h.disconnect("a"),
+        "old" => {
+            h.disconnect("a");
+            h.script("a", |s| s.no_unit_pause = true);
+            h.connect("a", Some("r1"));
+        }
+        "applying" => {
+            h.script("a", |s| s.silent_apply = true);
+            h.revision_with("r2", ONE_PHASE_ALL, "", HOOKED).await;
+            let id = h.start("r2").await;
+            h.wait_apply(&id, "a").await;
+        }
+        _ => {}
+    }
+    h.idle(1).await;
+    let target = if state == "gone" { "nowhere" } else { "a" };
+    let refused = h
+        .command(Command::Suspend {
+            target: target.into(),
+            unit: unit.into(),
+            note: note.into(),
+            review_at: None,
+        })
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.kind, kind, "{}", refused.error.description());
+    assert!(h.suspended().await.is_empty());
+    assert!(h.told("a").is_empty(), "{:?}", h.told("a"));
+}
+
+/// The paused workloads a cluster's steward was last told of.
+fn steward_told(h: &Harness, steward: &str) -> Vec<String> {
+    h.sent(|to, m| to == steward && matches!(m, SMsg::Assign(a) if a.target == CLUSTER))
+        .into_iter()
+        .filter_map(|(_, _, m)| match m {
+            SMsg::Assign(a) => a.cluster.map(|c| c.paused_workloads),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or_default()
+}
+
+fn applies_of(h: &Harness, workload: &str) -> usize {
+    cluster_applies(h, CLUSTER)
+        .iter()
+        .filter(|(_, w)| w == workload)
+        .count()
+}
+
+/// A suspended workload's jobs are stopped through the steward, which is
+/// told to leave it alone; its placement sits out the rollouts that run
+/// meanwhile (the rest of the cluster moves on), and converges in the
+/// stragglers stage once it is resumed.
+#[rstest::rstest]
+#[case::a_rollout_meanwhile(true)]
+#[case::nothing_meanwhile(false)]
+#[tokio::test(start_paused = true)]
+async fn a_suspended_workload_sits_out_rollouts_until_it_is_resumed(#[case] rollout: bool) {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, TWO_WORKLOADS)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.connect("n1", None);
+    let first = h.start("r1").await;
+    h.wait_state(&first, RolloutState::Completed).await;
+    assert_eq!(applies_of(&h, "app"), 1);
+
+    let run = h.suspend(CLUSTER, "app").await.unwrap();
+    assert!(!run.is_empty(), "its jobs are stopped by a run");
+    h.idle(5).await;
+    assert_eq!(steward_told(&h, "n1"), vec!["app"]);
+    let stops: Vec<_> = action_runs(&h)
+        .into_iter()
+        .map(|(_, to, a)| (to, a.target, a.module, a.action))
+        .collect();
+    assert_eq!(
+        stops,
+        vec![(
+            "n1".to_owned(),
+            CLUSTER.to_owned(),
+            "app".to_owned(),
+            "@suspend".to_owned()
+        )]
+    );
+
+    let live = if rollout {
+        h.revision_with("r2", ONE_PHASE_ALL, NOMAD_CLUSTER, TWO_WORKLOADS)
+            .await;
+        let second = h.start("r2").await;
+        let (_, rows) = h.wait_state(&second, RolloutState::Completed).await;
+        assert_eq!(
+            placement(&rows, CLUSTER, "postgres").state,
+            HostPhase::Healthy
+        );
+        let app = placement(&rows, CLUSTER, "app");
+        assert_ne!(app.state, HostPhase::Healthy, "{app:#?}");
+        second
+    } else {
+        first
+    };
+    h.idle(120).await;
+    assert_eq!(
+        applies_of(&h, "app"),
+        1,
+        "nothing touches it while suspended"
+    );
+
+    assert_eq!(h.resume_unit(CLUSTER, "app").await.unwrap(), "");
+    let (_, rows) = h
+        .wait(&live, "the resumed placement converging", |_, rows| {
+            let app = placement(rows, CLUSTER, "app");
+            app.phase == STRAGGLERS && app.state == HostPhase::Healthy
+        })
+        .await;
+    assert_eq!(
+        placement(&rows, CLUSTER, "postgres").state,
+        HostPhase::Healthy
+    );
+    assert_eq!(applies_of(&h, "app"), 2, "applied once it was resumed");
+    assert!(steward_told(&h, "n1").is_empty());
+    assert!(h.suspended().await.is_empty());
 }

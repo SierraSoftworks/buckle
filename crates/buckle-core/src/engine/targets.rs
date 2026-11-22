@@ -251,6 +251,13 @@ pub fn validate_targets(revision: &Revision) -> ValidationReport {
         for (aname, action) in &cfg.actions {
             let location = format!("{file} actions.{aname} ({})", action.task.kind);
             let task = &action.task;
+            if crate::model::reserved_action(aname) {
+                report.error(
+                    Some(name),
+                    &location,
+                    format!("'{aname}' is not declared on a workload: Suspend stops its jobs and Resume lets the next apply start them"),
+                );
+            }
             if cfg.implicit_actions().iter().any(|i| i.name == aname) {
                 report.error(
                     Some(name),
@@ -950,6 +957,10 @@ fleet:
     #[case::workload_action_shadows_implicit(
         &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nactions:\n  restart: { dispatch: { job: a } }\n"), ("workloads/a/files/a.nomad.hcl", "")],
         "implicit action"
+    )]
+    #[case::workload_action_reserved_name(
+        &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nactions:\n  '@suspend': { dispatch: { job: a } }\n"), ("workloads/a/files/a.nomad.hcl", "")],
+        "not declared on a workload"
     )]
     #[case::workload_action_bad_spec(
         &[("buckle.yaml", FLEET), ("workloads/a/workload.yaml", "name: a\nresources: [a.nomad.hcl]\nactions:\n  backfill: { dispatch: { meta: { a: b } } }\n"), ("workloads/a/files/a.nomad.hcl", "")],

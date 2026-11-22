@@ -111,6 +111,8 @@ pub enum AttentionKind {
     IdentityRefused,
     /// A webhook's deliveries keep failing.
     WebhookFailing,
+    /// A suspended module or workload is past the date set to review it.
+    ReviewDue,
 }
 
 /// One thing that needs attention.
@@ -230,6 +232,8 @@ pub struct AttentionInputs<'a> {
     pub skipped: &'a [SkippedRun],
     pub refusals: &'a [IdentityRefusal],
     pub webhooks: &'a [WebhookFailure],
+    /// The suspended modules and workloads.
+    pub paused: &'a [crate::PausedUnit],
     /// Since when the server has been able to see agents connect: an agent
     /// is not offline for longer than the server has been up.
     pub watching_since: Option<DateTime<Utc>>,
@@ -463,6 +467,33 @@ pub fn build(inputs: &AttentionInputs<'_>, now: DateTime<Utc>) -> Vec<AttentionI
         );
     }
 
+    for unit in inputs.paused {
+        let Some(due) = unit.review_at.filter(|at| *at <= now) else {
+            continue;
+        };
+        let cluster = inputs.clusters.iter().any(|c| c.id == unit.target);
+        let kind = if cluster {
+            SubjectKind::Cluster
+        } else {
+            SubjectKind::Host
+        };
+        out.push(
+            AttentionItem::new(
+                K::ReviewDue,
+                T::Warn,
+                AttentionSubject::new(kind, unit.target.clone()),
+                &unit.unit,
+                format!(
+                    "{} is suspended and was to be reviewed by {}: {}",
+                    unit.unit,
+                    due.format("%Y-%m-%d %H:%M UTC"),
+                    unit.note
+                ),
+            )
+            .since(Some(due)),
+        );
+    }
+
     sort(&mut out);
     out
 }
@@ -530,6 +561,7 @@ fn kind_str(k: AttentionKind) -> &'static str {
         AttentionKind::ScheduleSkipped => "schedule_skipped",
         AttentionKind::IdentityRefused => "identity_refused",
         AttentionKind::WebhookFailing => "webhook_failing",
+        AttentionKind::ReviewDue => "review_due",
     }
 }
 
@@ -863,12 +895,26 @@ mod tests {
             error: "connection refused".into(),
             queued: 3,
         }];
+        let suspended = |unit: &str, review_at| crate::PausedUnit {
+            target: "pi-1".into(),
+            unit: unit.into(),
+            note: "disk swap".into(),
+            by: "ops".into(),
+            at: now - Duration::days(3),
+            review_at,
+        };
+        let paused = [
+            suspended("backup", Some(now - Duration::hours(1))),
+            suspended("later", Some(now + Duration::hours(1))),
+            suspended("open-ended", None),
+        ];
         let list = build(
             &AttentionInputs {
                 rollout: Some(&r),
                 skipped: &skipped,
                 refusals: &refusals,
                 webhooks: &webhooks,
+                paused: &paused,
                 ..Default::default()
             },
             now,
@@ -877,7 +923,13 @@ mod tests {
             .iter()
             .map(|i| (i.kind, i.subject.id.as_str()))
             .collect();
-        assert_eq!(kinds.len(), 5, "{kinds:?}");
+        assert_eq!(kinds.len(), 6, "{kinds:?}");
+        let due = list
+            .iter()
+            .find(|i| i.kind == AttentionKind::ReviewDue)
+            .expect("a review date that passed is listed");
+        assert_eq!(due.path().as_deref(), Some("/hosts/pi-1"));
+        assert!(due.summary.contains("backup") && due.summary.contains("disk swap"));
         for want in [
             (AttentionKind::RolloutPaused, "42"),
             (AttentionKind::ScheduleSkipped, "backup"),

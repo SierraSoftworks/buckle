@@ -1009,6 +1009,7 @@ impl Shared {
                 &welcome.secrets,
                 queue,
             );
+            self.adopt_paused(&mut data, &welcome.paused_modules, queue);
             if let Ok(mut guard) = self.watchdog.lock()
                 && let Some(w) = guard.take()
             {
@@ -1093,7 +1094,34 @@ impl Shared {
             &update.secrets,
             queue,
         );
+        self.adopt_paused(&mut data, &update.paused_modules, queue);
         self.save_agent(&data);
+    }
+
+    /// Takes on the modules the server says are suspended here. One that
+    /// is resumed is looked at by a drift pass at once, not at the next
+    /// interval: what its `@suspend` stopped is put back.
+    fn adopt_paused(&self, data: &mut Data, paused: &[String], queue: &Queue) {
+        let resumed: Vec<String> = data
+            .agent
+            .paused_modules
+            .iter()
+            .filter(|m| !paused.contains(m))
+            .cloned()
+            .collect();
+        if data.agent.paused_modules != paused {
+            tracing::info!(paused = ?paused, "the server changed which modules are suspended here");
+            data.agent.paused_modules = paused.to_vec();
+        }
+        data.agent.resumed_modules.retain(|m| !paused.contains(m));
+        if !resumed.is_empty() {
+            for module in resumed {
+                if !data.agent.resumed_modules.contains(&module) {
+                    data.agent.resumed_modules.push(module);
+                }
+            }
+            queue.push(Op::Drift, None);
+        }
     }
 
     /// Links an agent-initiated root span to the current (or last) session.
@@ -1494,6 +1522,8 @@ impl Shared {
                 credentials: self.credentials.clone(),
                 revision: Some(revision.clone()),
             })),
+            paused: data.agent.paused_modules.clone(),
+            catch_up: Vec::new(),
         }
     }
 
@@ -1740,6 +1770,13 @@ impl Shared {
                     data.agent.waived_checks = ctx.waived_checks.clone();
                 }
                 data.agent.rolled_back_modules = outcome.rolled_back_modules.clone();
+                if outcome.succeeded {
+                    // An apply from the server covers every resumed module;
+                    // a drift pass, the ones it caught up.
+                    data.agent
+                        .resumed_modules
+                        .retain(|m| ctx.drift && !ctx.catch_up.contains(m));
+                }
                 data.agent.last_plan_digest = Some(plan.digest.to_string());
                 self.save_agent(&data);
             }
@@ -2308,19 +2345,20 @@ impl Shared {
                 HealthStatus::Unknown { reason } => HealthStatus::Unknown {
                     reason: redactor.redact(&reason).into_inner(),
                 },
-                HealthStatus::Pass => HealthStatus::Pass,
+                other => other,
             };
         }
         report
     }
 
     async fn drift(&self) {
-        let (applied, paused, rolled_back) = {
+        let (applied, paused, rolled_back, resumed) = {
             let data = self.data.lock().await;
             (
                 data.agent.applied_revision.clone(),
                 data.agent.status.as_deref() == Some("paused"),
                 data.agent.rolled_back_modules.clone(),
+                data.agent.resumed_modules.clone(),
             )
         };
         let Some(revision) = applied else { return };
@@ -2336,11 +2374,22 @@ impl Shared {
         // selections are held (plan.held), and removals never run.
         let mut ctx = self.context(&revision, None, Vec::new(), false).await;
         ctx.drift = true;
+        // A resumed module sat out the rollouts that ran while it was
+        // suspended: this pass brings it to the applied revision.
+        let catching_up = !resumed.is_empty();
+        ctx.catch_up = resumed;
         match self.runner.plan(rev.clone(), &ctx).await {
             Ok((plan, facts)) => {
                 self.remember_facts(facts).await;
-                if !plan.held.is_empty() {
-                    tracing::warn!(held = ?plan.held.iter().map(|h| h.module.as_str()).collect::<Vec<_>>(), "drift held modules whose selection is uncertain");
+                // A suspended module is held on purpose.
+                let uncertain: Vec<&str> = plan
+                    .held
+                    .iter()
+                    .map(|h| h.module.as_str())
+                    .filter(|m| !ctx.paused.iter().any(|p| p == m))
+                    .collect();
+                if !uncertain.is_empty() {
+                    tracing::warn!(held = ?uncertain, "drift held modules whose selection is uncertain");
                 }
                 let drifted = !plan.is_empty();
                 let mut corrected = false;
@@ -2353,14 +2402,20 @@ impl Shared {
                     if self.config.drift.correct && !rolled_back.is_empty() {
                         tracing::warn!(modules = ?rolled_back, "not correcting drift: modules were rolled back after a failure; waiting for the server");
                     }
-                    if self.config.drift.correct && !paused && rolled_back.is_empty() {
-                        let outcome = self.run_apply(rev.clone(), &ctx, &plan, false, true).await;
-                        if let Some(reboot) = &outcome.reboot {
-                            // An unattended pass never reboots the host.
-                            tracing::warn!(by = ?reboot.requested_by, "the drift correction asked for a reboot; not rebooting on its own: reboot the host or apply from the server");
-                        }
-                        corrected = outcome.succeeded;
+                }
+                // With nothing to change, a resumed module is still applied:
+                // that records it at this revision.
+                if (drifted || catching_up)
+                    && self.config.drift.correct
+                    && !paused
+                    && rolled_back.is_empty()
+                {
+                    let outcome = self.run_apply(rev.clone(), &ctx, &plan, false, true).await;
+                    if let Some(reboot) = &outcome.reboot {
+                        // An unattended pass never reboots the host.
+                        tracing::warn!(by = ?reboot.requested_by, "the drift correction asked for a reboot; not rebooting on its own: reboot the host or apply from the server");
                     }
+                    corrected = drifted && outcome.succeeded;
                 }
                 self.sink
                     .send(Report::Drift {

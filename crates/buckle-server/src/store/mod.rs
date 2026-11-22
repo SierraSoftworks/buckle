@@ -13,6 +13,7 @@ mod health;
 mod hosts;
 pub mod kv;
 pub mod notifications;
+mod paused;
 mod reports;
 mod revisions;
 pub mod rollouts;
@@ -26,6 +27,7 @@ pub(crate) use hosts::status_str as hosts_status_str;
 pub use hosts::{HostRecord, Hosts, NewCluster, NewHost, WORKLOAD_AUTH_PREFIX};
 pub use kv::Kv;
 pub use notifications::Notifications;
+pub use paused::PausedUnits;
 pub use reports::AgentReports;
 pub use revisions::{RevisionRecord, Revisions};
 pub use rollouts::{RolloutHostRecord, RolloutRecord, Rollouts};
@@ -370,6 +372,19 @@ CREATE TABLE webhook_status (
     r#"
 ALTER TABLE hosts ADD COLUMN verified_tags TEXT;
 "#,
+    // 17: the units an operator suspended: a module on a host, or a
+    // workload on a cluster target.
+    r#"
+CREATE TABLE paused_units (
+    target TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    note TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    at TEXT NOT NULL,
+    review_at TEXT,
+    PRIMARY KEY (target, unit)
+);
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.
@@ -438,6 +453,11 @@ impl<'c> Db<'c> {
     /// Small key/value state.
     pub fn kv(&self) -> Kv<'c> {
         Kv::new(self.conn)
+    }
+
+    /// The suspended units.
+    pub fn paused(&self) -> PausedUnits<'c> {
+        PausedUnits::new(self.conn)
     }
 
     /// Apply runs per host.

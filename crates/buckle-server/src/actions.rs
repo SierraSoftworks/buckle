@@ -22,7 +22,14 @@ pub fn list(
                 .iter()
                 .filter(|m| selected.contains(&m.config.name))
                 .flat_map(|m| {
-                    m.config.actions.iter().map(|(name, decl)| ActionInfo {
+                    // `@suspend` and `@resume` run only through Suspend
+                    // and Resume.
+                    let own = m
+                        .config
+                        .actions
+                        .iter()
+                        .filter(|(name, _)| !buckle_core::model::reserved_action(name));
+                    own.map(|(name, decl)| ActionInfo {
                         module: m.config.name.clone(),
                         name: name.clone(),
                         label: decl.label(name).to_owned(),
@@ -91,19 +98,68 @@ pub fn list(
     }
 }
 
-/// Every action the fleet's active targets offer now (each from the
-/// revision it runs), with the targets offering it that `selector` matches:
-/// hosts' module actions apart from clusters' workload actions, even where
-/// a module and a workload share a name.
-/// The selector sees a target as the stable revision's phases do: a host as
-/// itself, a cluster's workload action as that workload's placement
-/// (`workload.*` beside `cluster.*`), so `workload.labels.tier == "web"`
-/// picks the clusters running such a workload, offering its actions only.
-pub async fn fleet(
+/// What suspending and resuming a unit runs besides pausing it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnitHooks {
+    /// Suspending it runs `@suspend` (a workload: stops its jobs).
+    pub suspend: bool,
+    /// Resuming it runs `@resume` before the pause is lifted.
+    pub resume: bool,
+}
+
+/// The hooks of `unit` on `record` at `revision`: a module the host
+/// selects, or a workload placed on the cluster. `None` when `record` has
+/// no such unit there.
+pub fn unit(
+    revision: &Revision,
+    record: &HostRecord,
+    facts: &serde_json::Value,
+    unit: &str,
+) -> Option<UnitHooks> {
+    use buckle_core::model::{RESUME_ACTION, SUSPEND_ACTION};
+    match record.kind {
+        TargetKind::Host => {
+            let selected = crate::views::selected_modules(revision, None, Some((record, facts)));
+            let module = revision
+                .modules
+                .iter()
+                .find(|m| m.config.name == unit && selected.contains(&m.config.name))?;
+            Some(UnitHooks {
+                suspend: module.config.actions.contains_key(SUSPEND_ACTION),
+                resume: module.config.actions.contains_key(RESUME_ACTION),
+            })
+        }
+        TargetKind::Cluster | TargetKind::Workload => {
+            let ctx = crate::fleet::record_context(record, facts, &revision.fleet);
+            let workload = buckle_core::engine::selected_workloads(revision, &ctx)
+                .into_iter()
+                .find(|w| w.config.name == unit)?;
+            Some(UnitHooks {
+                // Its jobs are stopped as the implicit `stop` stops them.
+                suspend: workload
+                    .config
+                    .implicit_actions()
+                    .iter()
+                    .any(|i| i.name == "stop"),
+                resume: false,
+            })
+        }
+    }
+}
+
+/// The units (target, name) of the fleet's active targets, each from the
+/// revision it runs: the modules hosts select, or with `workload` the
+/// workloads placed on clusters; of `target` alone when one is named, and
+/// only those called `unit` when that is. `selector` reads a host as
+/// itself and a cluster as the workload's placement, as [`offered`] does.
+pub async fn units(
     store: &crate::store::Store,
     revisions: &crate::source::cache::RevisionCache,
+    target: Option<&str>,
     selector: Option<&buckle_core::Filter>,
-) -> buckle_core::Result<Vec<buckle_api::FleetAction>> {
+    workload: bool,
+    unit: Option<&str>,
+) -> buckle_core::Result<Vec<(String, String)>> {
     let targets = store
         .call(|db| {
             let mut out = Vec::new();
@@ -115,9 +171,106 @@ pub async fn fleet(
         })
         .await?;
     let stable = crate::views::stable_revision(store, revisions).await;
+    let mut out = Vec::new();
+    for (record, facts) in &targets {
+        if record.status != buckle_api::HostStatus::Active
+            || record.executor_of().is_some()
+            || (record.kind != TargetKind::Host) != workload
+            || target.is_some_and(|t| t != record.id)
+        {
+            continue;
+        }
+        let Some(applied) = record.applied_revision.as_deref() else {
+            continue;
+        };
+        let Ok(rev) = revisions.load(applied).await else {
+            continue;
+        };
+        let seen_by = stable.as_deref().unwrap_or(&rev);
+        let ctx = crate::fleet::record_context(record, facts, &seen_by.fleet);
+        let names: Vec<String> = if workload {
+            let own = crate::fleet::record_context(record, facts, &rev.fleet);
+            buckle_core::engine::selected_workloads(&rev, &own)
+                .into_iter()
+                .map(|w| w.config.name.clone())
+                .collect()
+        } else {
+            let selected = crate::views::selected_modules(&rev, None, Some((record, facts)));
+            rev.modules
+                .iter()
+                .map(|m| m.config.name.clone())
+                .filter(|name| selected.contains(name))
+                .collect()
+        };
+        for name in names {
+            if unit.is_some_and(|u| u != name)
+                || selector.is_some_and(|s| !offers_to(s, record.kind, &ctx, seen_by, &rev, &name))
+            {
+                continue;
+            }
+            out.push((record.id.clone(), name));
+        }
+    }
+    Ok(out)
+}
+
+/// An action the fleet offers, with the targets it is suspended on.
+pub struct Offered {
+    pub action: buckle_api::FleetAction,
+    /// Targets that would offer it, were its module (or workload) not
+    /// suspended there.
+    pub suspended: Vec<String>,
+}
+
+/// [`offered`] without the suspended targets: what can run now.
+pub async fn fleet(
+    store: &crate::store::Store,
+    revisions: &crate::source::cache::RevisionCache,
+    selector: Option<&buckle_core::Filter>,
+) -> buckle_core::Result<Vec<buckle_api::FleetAction>> {
+    Ok(offered(store, revisions, selector)
+        .await?
+        .into_iter()
+        .filter(|o| !o.action.targets.is_empty())
+        .map(|o| o.action)
+        .collect())
+}
+
+/// Every action the fleet's active targets offer now (each from the
+/// revision it runs), with the targets offering it that `selector` matches:
+/// hosts' module actions apart from clusters' workload actions, even where
+/// a module and a workload share a name.
+/// The selector sees a target as the stable revision's phases do: a host as
+/// itself, a cluster's workload action as that workload's placement
+/// (`workload.*` beside `cluster.*`), so `workload.labels.tier == "web"`
+/// picks the clusters running such a workload, offering its actions only.
+/// A target whose module (or workload) is suspended is set apart: actions
+/// leave it alone until it is resumed.
+pub async fn offered(
+    store: &crate::store::Store,
+    revisions: &crate::source::cache::RevisionCache,
+    selector: Option<&buckle_core::Filter>,
+) -> buckle_core::Result<Vec<Offered>> {
+    let (targets, paused) = store
+        .call(|db| {
+            let mut out = Vec::new();
+            for h in db.hosts().targets()? {
+                let facts = db.hosts().latest_facts(&h.id)?.map(|(f, _)| f);
+                out.push((h, facts.unwrap_or(serde_json::Value::Null)));
+            }
+            let paused: std::collections::HashSet<(String, String)> = db
+                .paused()
+                .list()?
+                .into_iter()
+                .map(|u| (u.target, u.unit))
+                .collect();
+            Ok((out, paused))
+        })
+        .await?;
+    let stable = crate::views::stable_revision(store, revisions).await;
     let mut loaded: std::collections::HashMap<String, Option<std::sync::Arc<Revision>>> =
         std::collections::HashMap::new();
-    let mut out: Vec<buckle_api::FleetAction> = Vec::new();
+    let mut out: Vec<Offered> = Vec::new();
     for (record, facts) in &targets {
         // An in-cluster executor runs no modules of its own.
         if record.status != buckle_api::HostStatus::Active || record.executor_of().is_some() {
@@ -142,19 +295,31 @@ pub async fn fleet(
             {
                 continue;
             }
-            match out.iter_mut().find(|f| {
+            let suspended = paused.contains(&(record.id.clone(), a.module.clone()));
+            let at = out.iter().position(|o| {
+                let f = &o.action;
                 f.workload == workload && f.action.module == a.module && f.action.name == a.name
-            }) {
-                Some(f) => f.targets.push(record.id.clone()),
-                None => out.push(buckle_api::FleetAction {
-                    action: a,
-                    workload,
-                    targets: vec![record.id.clone()],
-                }),
+            });
+            let at = at.unwrap_or_else(|| {
+                out.push(Offered {
+                    action: buckle_api::FleetAction {
+                        action: a,
+                        workload,
+                        targets: Vec::new(),
+                    },
+                    suspended: Vec::new(),
+                });
+                out.len() - 1
+            });
+            if suspended {
+                out[at].suspended.push(record.id.clone());
+            } else {
+                out[at].action.targets.push(record.id.clone());
             }
         }
     }
     out.sort_by(|a, b| {
+        let (a, b) = (&a.action, &b.action);
         (a.workload, &a.action.module, &a.action.name).cmp(&(
             b.workload,
             &b.action.module,
@@ -222,12 +387,13 @@ pub async fn start_rollout(
                 &["Check the selector's syntax."],
             )
         })?;
-    let offered = fleet(store, revisions, selector.as_ref())
+    let all = offered(store, revisions, selector.as_ref())
         .await
         .map_err(CommandError::internal)?;
-    let found = offered
+    let found = all
         .into_iter()
-        .find(|f| {
+        .find(|o| {
+            let f = &o.action;
             f.workload == body.workload
                 && f.action.module == body.module
                 && f.action.name == body.action
@@ -245,6 +411,23 @@ pub async fn start_rollout(
                 body.module
             ))
         })?;
+    if found.action.targets.is_empty() {
+        // Nothing can run it now; a schedule tries again while its window
+        // lasts, and says this when it gives up.
+        return Err(CommandError::conflict(
+            format!(
+                "'{}' is suspended on every target offering its action '{}' ({}).",
+                body.module,
+                body.action,
+                found.suspended.join(", ")
+            ),
+            &["Resume it where the action should run."],
+        ));
+    }
+    if !found.suspended.is_empty() {
+        tracing::info!(module = %body.module, action = %body.action, suspended = ?found.suspended, "the action leaves out the targets its module is suspended on");
+    }
+    let found = found.action;
     if found.action.confirm && body.note.trim().is_empty() {
         return Err(CommandError::invalid(
             format!(

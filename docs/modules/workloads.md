@@ -229,6 +229,11 @@ actions:
 `job` and `meta` are rendered with the workload's vars; `namespace` defaults to the
 workload's. An extra cannot take an implicit action's name, `notify` or `when`.
 
+A workload declares no `'@suspend'` or `'@resume'`:
+[suspending](../operations/hosts.md#suspending-a-module-or-a-workload) one stops its jobs as
+`stop` does, and resuming it lets the stable revision's stragglers stage start them again. A
+Kubernetes workload has no jobs to stop and is only paused.
+
 ### Nomad task actions
 
 Each `action` block in a workload's job specs is one more implicit action, named after the block,

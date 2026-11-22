@@ -12,6 +12,69 @@ pub enum HostStatus {
     Paused,
 }
 
+/// A unit an operator suspended: a module on a host, or a workload on a
+/// cluster target. Rollouts, drift correction, local rollback and every
+/// action leave it alone until it is resumed, and its checks read
+/// `paused`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PausedUnit {
+    /// The host, or the cluster target.
+    pub target: String,
+    /// The module, or the workload.
+    pub unit: String,
+    /// Why, as the operator said.
+    pub note: String,
+    pub by: String,
+    pub at: DateTime<Utc>,
+    /// When the operator meant to look at it again. Passing it raises
+    /// attention and changes nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_at: Option<DateTime<Utc>>,
+}
+
+/// Body of `POST /units/suspend` and `POST /units/resume`: the units of
+/// one `target`, or of every target `selector` matches (a host as itself,
+/// a cluster as the placement of each workload, as an action rollout's
+/// selector reads them).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    /// The module or workload. Absent: every workload of the clusters
+    /// matched (hosts are paused whole instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Workloads on clusters; otherwise modules on hosts.
+    #[serde(default)]
+    pub workload: bool,
+    /// Kept in the audit log and shown with the unit. Required.
+    #[serde(default)]
+    pub note: String,
+    /// Suspend only: see [`PausedUnit::review_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_at: Option<DateTime<Utc>>,
+}
+
+/// What `POST /units/suspend` or `POST /units/resume` did to one unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitOutcome {
+    pub target: String,
+    pub unit: String,
+    /// The run of its `@suspend` or `@resume` hook, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// Why it was left as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitsResponse {
+    pub units: Vec<UnitOutcome>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Connection {

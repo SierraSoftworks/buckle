@@ -557,5 +557,6 @@ pub(super) fn target_spec(cluster: &WireCluster) -> buckle_core::Result<TargetSp
             namespaces: cluster.namespaces.clone(),
             excluded: cluster.excluded_namespaces.clone(),
         },
+        paused: cluster.paused_workloads.iter().cloned().collect(),
     })
 }

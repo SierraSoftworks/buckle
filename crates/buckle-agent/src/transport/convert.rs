@@ -42,8 +42,9 @@ fn json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
 /// `check_drift` (it runs a drift pass when the server asks) and
 /// `scheduled_needs` (it plans modules whose `needs` name a group, or a
 /// module its host does not run: the rollout orders those), `scopes` (it
-/// holds a cluster target to its bounds) and `node_ops` (as a cluster's
-/// steward it acts on the cluster's nodes for their hosts).
+/// holds a cluster target to its bounds), `node_ops` (as a cluster's
+/// steward it acts on the cluster's nodes for their hosts) and `unit_pause`
+/// (it leaves the modules and workloads the server names as paused alone).
 pub const CAPABILITIES: &[&str] = &[
     "force_plan",
     "approval_digest",
@@ -53,6 +54,7 @@ pub const CAPABILITIES: &[&str] = &[
     "scheduled_needs",
     "scopes",
     "node_ops",
+    "unit_pause",
 ];
 
 /// A node operation on the wire.
@@ -168,6 +170,7 @@ fn cluster_from_proto(mut c: pb::ClusterTarget) -> WireCluster {
         fingerprint_key: std::mem::take(&mut c.fingerprint_key),
         namespaces: std::mem::take(&mut c.namespaces),
         excluded_namespaces: std::mem::take(&mut c.excluded_namespaces),
+        paused_workloads: std::mem::take(&mut c.paused_workloads),
     }
 }
 
@@ -210,6 +213,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             status: w.status,
             secrets: secrets_from_proto(w.secrets),
             stable_tree_digest: non_empty(w.stable_tree_digest),
+            paused_modules: w.paused_modules,
         }),
         Msg::Assign(a) => Instruction::Assign {
             revision: RevisionId(a.revision),
@@ -325,6 +329,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             stable_revision: non_empty(u.stable_revision).map(RevisionId),
             secrets: secrets_from_proto(u.secrets),
             stable_tree_digest: non_empty(u.stable_tree_digest),
+            paused_modules: u.paused_modules,
         }),
         Msg::Ack(a) => Instruction::Ack {
             report_ids: a.report_ids,
@@ -369,6 +374,7 @@ pub fn health_result_to_proto(result: &HealthResult) -> pb::HealthResult {
         HealthStatus::Pass => (true, false, String::new()),
         HealthStatus::Fail { reason } => (false, false, reason.clone()),
         HealthStatus::Unknown { reason } => (false, true, reason.clone()),
+        HealthStatus::Paused => (false, true, "paused".to_owned()),
     };
     pb::HealthResult {
         module: result.module.clone(),
@@ -378,6 +384,7 @@ pub fn health_result_to_proto(result: &HealthResult) -> pb::HealthResult {
         passed,
         unknown,
         reason,
+        paused: result.status == HealthStatus::Paused,
         at: Some(timestamp(result.at)),
         duration_ms: result.duration_ms.min(u32::MAX as u64) as u32,
     }

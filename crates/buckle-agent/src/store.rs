@@ -53,6 +53,16 @@ pub struct AgentState {
     /// Host status from the last Welcome (`pending`, `active`, `paused`).
     #[serde(default)]
     pub status: Option<String>,
+    /// The modules an operator suspended on this host, from the last
+    /// Welcome or HostUpdate. Kept on disk with the status, so a suspended
+    /// module stays untouched while the server is out of reach.
+    #[serde(default)]
+    pub paused_modules: Vec<String>,
+    /// Modules resumed since the host last applied: the next drift pass
+    /// brings them to the applied revision, which they sat out while
+    /// suspended.
+    #[serde(default)]
+    pub resumed_modules: Vec<String>,
     /// The armed local rollback watchdog, if any.
     #[serde(default)]
     pub watchdog: Option<WatchdogState>,

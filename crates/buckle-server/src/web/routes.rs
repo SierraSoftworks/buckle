@@ -76,6 +76,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/rollouts", web::get().to(rollouts))
             .route("/rollouts", web::post().to(start_action_rollout))
             .route("/actions", web::get().to(fleet_actions))
+            .route("/units/paused", web::get().to(paused_units))
+            .route("/units/{verb}", web::post().to(units_action))
             .route("/actions/runs", web::get().to(action_runs))
             .route("/schedules", web::get().to(schedules))
             .route("/schedules/{name}", web::get().to(schedule))
@@ -145,6 +147,9 @@ pub const PROTECTED: &[(&str, &str)] = &[
     ("GET", "/api/v1/rollouts"),
     ("POST", "/api/v1/rollouts"),
     ("GET", "/api/v1/actions"),
+    ("GET", "/api/v1/units/paused"),
+    ("POST", "/api/v1/units/suspend"),
+    ("POST", "/api/v1/units/resume"),
     ("GET", "/api/v1/schedules"),
     ("GET", "/api/v1/schedules/s"),
     ("GET", "/api/v1/rollouts/r"),
@@ -1334,6 +1339,133 @@ async fn run_action(
             .publish(LiveEvent::HostChanged { host: summary });
     }
     Ok(HttpResponse::Accepted().json(buckle_api::ActionStarted { run_id }))
+}
+
+/// `GET /units/paused`: the suspended modules and workloads.
+async fn paused_units(state: Data, _: Authenticated) -> ApiResult {
+    let units = state.store.call(|db| db.paused().list()).await?;
+    Ok(HttpResponse::Ok().json(units))
+}
+
+/// `POST /units/suspend` and `POST /units/resume`: suspends (or resumes)
+/// a module on hosts or a workload on clusters, on one `target` or on
+/// every target the `selector` matches. Each unit is its own command: the
+/// response says what became of each. A request for one unit of one
+/// target fails as that unit does.
+async fn units_action(
+    state: Data,
+    admin: Administrative,
+    verb: web::Path<String>,
+    body: web::Json<buckle_api::UnitsRequest>,
+) -> ApiResult {
+    let suspend = match verb.as_str() {
+        "suspend" => true,
+        "resume" => false,
+        other => return Err(ApiError::not_found(format!("No unit action '{other}'."))),
+    };
+    let body = body.into_inner();
+    let target = body
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let unit = body
+        .unit
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+    let selector = parse_selector(body.selector.as_deref())?;
+    if target.is_some() == selector.is_some() {
+        return Err(ApiError::bad_request(
+            "Name one `target`, or give a `selector` for the targets.",
+        ));
+    }
+    if body.note.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "Send a note saying why: it is shown with the unit and kept in the audit log.",
+        ));
+    }
+    if unit.is_none() && !body.workload {
+        return Err(ApiError::bad_request(
+            "Name the module in `unit`: a host is paused as a whole with POST /hosts/{id}/pause.",
+        ));
+    }
+    let single = target.zip(unit);
+    let units: Vec<(String, String)> = match single {
+        // The controller says what is wrong with the one unit asked for.
+        Some((target, unit)) => vec![(target.to_owned(), unit.to_owned())],
+        None => {
+            let matched = crate::actions::units(
+                &state.store,
+                &state.revisions,
+                target,
+                selector.as_ref(),
+                body.workload,
+                unit,
+            )
+            .await?;
+            if suspend {
+                matched
+            } else {
+                let paused = state.store.call(|db| db.paused().list()).await?;
+                matched
+                    .into_iter()
+                    .filter(|(t, u)| paused.iter().any(|p| &p.target == t && &p.unit == u))
+                    .collect()
+            }
+        }
+    };
+    if units.is_empty() {
+        return Err(ApiError::not_found(if suspend {
+            "Nothing to suspend: no active target matched runs such a unit."
+        } else {
+            "Nothing to resume: no suspended unit matched."
+        }));
+    }
+    let actor = admin.0.actor();
+    let mut outcomes = Vec::new();
+    for (target, unit) in units {
+        let command = if suspend {
+            Command::Suspend {
+                target: target.clone(),
+                unit: unit.clone(),
+                note: body.note.clone(),
+                review_at: body.review_at,
+            }
+        } else {
+            Command::ResumeUnit {
+                target: target.clone(),
+                unit: unit.clone(),
+                note: body.note.clone(),
+            }
+        };
+        let result = state.controller.command(&actor, command).await;
+        if single.is_some()
+            && let Err(e) = result
+        {
+            return Err(e.into());
+        }
+        if let Ok(summary) = summary_or_404(&state, &target).await {
+            state
+                .events
+                .publish(LiveEvent::HostChanged { host: summary });
+        }
+        outcomes.push(match result {
+            Ok(run) => buckle_api::UnitOutcome {
+                target,
+                unit,
+                run: Some(run).filter(|r| !r.is_empty()),
+                error: None,
+            },
+            Err(e) => buckle_api::UnitOutcome {
+                target,
+                unit,
+                run: None,
+                error: Some(e.error.description().to_string()),
+            },
+        });
+    }
+    Ok(HttpResponse::Ok().json(buckle_api::UnitsResponse { units: outcomes }))
 }
 
 #[derive(Deserialize)]

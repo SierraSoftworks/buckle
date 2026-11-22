@@ -182,6 +182,16 @@ pub struct Inputs {
     /// Cluster credentials for tasks that ask for one (`command.run`
     /// `identity`); `None` where no agent can issue them.
     pub clusters: Option<Arc<dyn crate::task::ClusterCredentials>>,
+    /// Modules an operator paused on this host: a plan holds them
+    /// ([`Plan::held`]) whatever its mode, so nothing of theirs is applied
+    /// or removed, and their checks report
+    /// [`crate::health::HealthStatus::Paused`]. Their actions still run.
+    pub paused: std::collections::BTreeSet<String>,
+    /// Modules a drift plan brings to `revision` although the host has them
+    /// at an older one: those an operator resumed, which sat out the
+    /// rollouts that ran while they were paused. One whose last run failed
+    /// stays held.
+    pub catch_up: std::collections::BTreeSet<String>,
 }
 
 impl Inputs {
@@ -215,7 +225,21 @@ impl Inputs {
             drift: false,
             scratch_dirs: Vec::new(),
             clusters: None,
+            paused: Default::default(),
+            catch_up: Default::default(),
         }
+    }
+
+    /// The resumed modules a drift plan catches up; see [`Inputs::catch_up`].
+    pub fn with_catch_up(mut self, modules: impl IntoIterator<Item = String>) -> Self {
+        self.catch_up = modules.into_iter().collect();
+        self
+    }
+
+    /// The modules paused on this host; see [`Inputs::paused`].
+    pub fn with_paused(mut self, paused: impl IntoIterator<Item = String>) -> Self {
+        self.paused = paused.into_iter().collect();
+        self
     }
 
     /// Cluster credentials for tasks that ask for one.

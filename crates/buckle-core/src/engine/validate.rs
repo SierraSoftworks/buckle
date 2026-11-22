@@ -247,6 +247,14 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             continue;
         };
         let action = schedule.action.as_str();
+        if crate::model::reserved_action(action) {
+            report.error(
+                None,
+                &location,
+                format!("runs '{action}', which only Suspend and Resume run"),
+            );
+            continue;
+        }
         let confirm = if workload {
             revision.workload(owner).map(|w| {
                 w.config
@@ -447,6 +455,20 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
         for (aname, action) in &m.config.actions {
             let location = format!("{file} actions.{aname} ({})", action.task.kind);
             check_decl(&mut report, &action.task, &location);
+            if crate::model::reserved_action(aname)
+                && ![crate::model::SUSPEND_ACTION, crate::model::RESUME_ACTION]
+                    .contains(&aname.as_str())
+            {
+                report.error(
+                    Some(name),
+                    &location,
+                    format!(
+                        "'{aname}' is not an action Buckle runs: names that start with `@` are its own ({} and {})",
+                        crate::model::SUSPEND_ACTION,
+                        crate::model::RESUME_ACTION
+                    ),
+                );
+            }
             for key in action.unsupported_keys() {
                 report.error(
                     Some(name),

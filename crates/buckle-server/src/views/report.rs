@@ -538,6 +538,7 @@ fn health_dto(r: &buckle_core::health::HealthResult, scope: &str) -> HealthResul
         HealthStatus::Pass => ("pass", None),
         HealthStatus::Fail { reason } => ("fail", Some(reason.clone())),
         HealthStatus::Unknown { reason } => ("unknown", Some(reason.clone())),
+        HealthStatus::Paused => ("paused", None),
     };
     HealthResultDto {
         scope: scope.to_owned(),

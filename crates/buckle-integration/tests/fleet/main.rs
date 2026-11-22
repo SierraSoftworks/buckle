@@ -16,3 +16,4 @@ mod phased;
 mod reports;
 mod secrets;
 mod staleness;
+mod suspend;

@@ -36,6 +36,8 @@ pub enum HealthStatus {
     Unknown {
         reason: String,
     },
+    /// The check's module is paused: nothing ran, and nothing failed.
+    Paused,
 }
 
 impl HealthStatus {
