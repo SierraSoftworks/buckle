@@ -407,6 +407,7 @@ pub(crate) async fn apply(cx: &Context, key: &ObjectKey, p: &Pending) -> Result<
     if key.kind == "CustomResourceDefinition" {
         cx.kube.refresh_discovery();
         wait(cx, key, &path, health::established).await?;
+        discoverable(cx, key, &applied).await?;
         return Ok(Applied::changed(format!("applied {key}")));
     }
     if health::is_rollout(key) {
@@ -464,6 +465,41 @@ fn moved(key: &ObjectKey) -> buckle_core::Error {
 /// Polls `path` until `state` reports done, failed, or the rollout timeout;
 /// a controller also fails once its pods stay unplaceable for the placement
 /// timeout.
+/// Waits until API discovery lists every served version of the applied CRD
+/// `crd`: `Established` can turn true before its group version appears in
+/// discovery, and objects of the CRD planned in the same apply are resolved
+/// through discovery.
+async fn discoverable(cx: &Context, key: &ObjectKey, crd: &Value) -> Result<()> {
+    let spec = &crd["spec"];
+    let (Some(group), Some(kind)) = (spec["group"].as_str(), spec["names"]["kind"].as_str()) else {
+        return Ok(());
+    };
+    let versions: Vec<String> = spec["versions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["served"].as_bool().unwrap_or(true))
+        .filter_map(|v| v["name"].as_str())
+        .map(|v| format!("{group}/{v}"))
+        .collect();
+    let started = tokio::time::Instant::now();
+    for api_version in &versions {
+        while cx.kube.resource(api_version, kind).await?.is_none() {
+            if started.elapsed() >= cx.rollout_timeout {
+                return Err(user(
+                    format!(
+                        "{key} was established but the API did not serve {api_version} {kind} after {}s.",
+                        cx.rollout_timeout.as_secs()
+                    ),
+                    &["The API server may still be loading the definition; apply again shortly."],
+                ));
+            }
+            tokio::time::sleep(cx.poll).await;
+        }
+    }
+    Ok(())
+}
+
 async fn wait(
     cx: &Context,
     key: &ObjectKey,
