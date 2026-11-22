@@ -493,10 +493,38 @@ impl Rollouts<'_> {
             .map_err(db_error)?;
         rows.into_iter().map(h_record).collect()
     }
+
+    /// The workloads cluster `host` no longer runs: those whose newest
+    /// placement row is a removal that applied (baking or healthy). A
+    /// workload added back has a newer row and runs again.
+    pub fn removed_workloads(&self, host: &str) -> Result<std::collections::BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {H_COLUMNS} FROM rollout_hosts h WHERE host = ?1 AND workload != '' \
+                 AND state IN ('baking', 'healthy') \
+                 AND rowid = (SELECT rowid FROM rollout_hosts x WHERE x.host = h.host AND x.workload = h.workload \
+                              ORDER BY created_at DESC, rowid DESC LIMIT 1)"
+            ))
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![host], h_row)
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let mut out = std::collections::BTreeSet::new();
+        for raw in rows {
+            let row = h_record(raw)?;
+            if row.runtime.removal {
+                out.insert(row.workload);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::Store;
     use super::*;
     use crate::rollout::model::{HostRuntime, RolloutRuntime};
@@ -536,6 +564,52 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// A placement row of `workload` on cluster `c`, created `at` minutes in.
+    fn placement(
+        rollout: &str,
+        workload: &str,
+        state: HostPhase,
+        removal: bool,
+        at: i64,
+    ) -> RolloutHostRecord {
+        let mut h = host_row(rollout, "c", "r");
+        h.workload = workload.into();
+        h.state = state;
+        h.runtime.removal = removal;
+        h.created_at += chrono::Duration::minutes(at);
+        h
+    }
+
+    #[rstest::rstest]
+    #[case::applied_removal(vec![("w", HostPhase::Healthy, false, 0), ("w", HostPhase::Healthy, true, 1)], true)]
+    #[case::removal_baking(vec![("w", HostPhase::Baking, true, 0)], true)]
+    #[case::removal_not_applied(vec![("w", HostPhase::Planned, true, 0)], false)]
+    #[case::removal_failed(vec![("w", HostPhase::Failed, true, 0)], false)]
+    #[case::removal_rolled_back(vec![("w", HostPhase::RolledBack, true, 0)], false)]
+    #[case::added_back(vec![("w", HostPhase::Healthy, true, 0), ("w", HostPhase::Planned, false, 1)], false)]
+    #[case::never_removed(vec![("w", HostPhase::Healthy, false, 0)], false)]
+    #[tokio::test]
+    async fn a_workload_is_removed_once_its_newest_row_applied_a_removal(
+        #[case] rows: Vec<(&'static str, HostPhase, bool, i64)>,
+        #[case] removed: bool,
+    ) {
+        let store = Store::in_memory().await.unwrap();
+        let got = store
+            .call(move |db| {
+                for (i, (workload, state, removal, at)) in rows.into_iter().enumerate() {
+                    let id = format!("ro-{i}");
+                    db.rollouts()
+                        .save(&rollout(&id, "r", RolloutState::Rolling))?;
+                    db.rollouts()
+                        .save_host(&placement(&id, workload, state, removal, at))?;
+                }
+                db.rollouts().removed_workloads("c")
+            })
+            .await
+            .unwrap();
+        assert_eq!(got.contains("w"), removed, "{got:?}");
     }
 
     #[tokio::test]

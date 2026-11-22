@@ -1431,18 +1431,24 @@ impl FleetService {
                         at: now,
                     })
                     .collect();
-                let failing = report
+                let failing: Vec<(String, bool)> = report
                     .results
                     .iter()
-                    .any(|r| r.required && !r.passed && !r.unknown);
-                let summary = if failing {
-                    HealthSummary::Failing
-                } else {
-                    HealthSummary::Healthy
-                };
+                    .map(|r| (r.module.clone(), r.required && !r.passed && !r.unknown))
+                    .collect();
                 let revision = report.revision.clone();
                 self.store
                     .call(move |db| {
+                        // A workload whose removal applied is gone: a reading
+                        // of it (one taken at the revision still applied while
+                        // the rest of its rollout finishes) is not a failure.
+                        let removed = db.rollouts().removed_workloads(&h)?;
+                        events.retain(|e| !removed.contains(&e.module));
+                        let summary = if failing.iter().any(|(m, f)| *f && !removed.contains(m)) {
+                            HealthSummary::Failing
+                        } else {
+                            HealthSummary::Healthy
+                        };
                         // The readings belong to the epoch of the revision
                         // they ran against: its newest run's rollout.
                         let run = if revision.is_empty() {

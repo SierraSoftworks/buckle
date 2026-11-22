@@ -863,7 +863,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
     let id = path.into_inner();
     let summary = summary_or_404(&state, &id).await?;
     let lookup = id.clone();
-    let (paused_units, facts, row, runs, health, checks, drift, latest, record) = state
+    let (paused_units, facts, row, runs, health, checks, drift, latest, record, removed) = state
         .store
         .call(move |db| {
             Ok((
@@ -873,10 +873,11 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
                 // Newest first, the run in progress included.
                 db.runs().page(&lookup, None, 20)?.0,
                 db.health().for_host(&lookup, 100)?,
-                db.health().checks(&lookup)?,
+                crate::views::current_checks(db, &lookup)?,
                 db.drift().for_host(&lookup)?,
                 db.runs().latest_for_host(&lookup)?,
                 db.hosts().target(&lookup)?,
+                db.rollouts().removed_workloads(&lookup)?,
             ))
         })
         .await?;
@@ -907,7 +908,10 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
             .map(|(f, _)| f.clone())
             .unwrap_or(serde_json::Value::Null),
         facts_at: facts.map(|(_, at)| at),
-        resources: resources(&row),
+        resources: resources(&row)
+            .into_iter()
+            .filter(|r| !removed.contains(&r.module))
+            .collect(),
         drift,
         recent_runs: runs.into_iter().map(|r| run_dto(&state, r)).collect(),
         health_results: health.into_iter().map(health_dto).collect(),
