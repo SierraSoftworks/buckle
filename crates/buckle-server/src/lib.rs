@@ -108,6 +108,37 @@ pub async fn run_with(
     })?;
     let store = store::Store::open(&config.data_dir.join("buckle.db")).await?;
     store.call(|db| db.hosts().mark_all_offline()).await?;
+    if let Some(restored) = store.restored().cloned() {
+        // Said where an operator looks: what the newer server recorded since
+        // its upgrade is not in the snapshot.
+        let message = format!(
+            "the store was at schema {} (a newer Buckle's); this server ({VERSION}) knows {} and put back the snapshot from before that upgrade. The newer store is kept at {}",
+            restored.from,
+            restored.to,
+            restored.set_aside.display()
+        );
+        store
+            .call(move |db| {
+                db.audit().add(&store::NewAudit {
+                    at: chrono::Utc::now(),
+                    actor: "server".into(),
+                    action: "server.store.restored".into(),
+                    outcome: "ok".into(),
+                    subject: None,
+                    message,
+                    detail: Some(serde_json::json!({"from": restored.from, "to": restored.to})),
+                    trace_id: None,
+                })
+            })
+            .await?;
+    }
+    let own = rollout::OwnPlacement::detect(
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+    );
+    if let Some(own) = &own {
+        tracing::info!(target = %own.target, workload = %own.workload, "this server runs as a workload placement: rollouts apply it last and alone");
+    }
     let key = install_key(&config.data_dir)?;
     let secrets = secrets::ServerSecrets::new(
         &config.secrets,
@@ -131,6 +162,8 @@ pub async fn run_with(
             options: rollout::ControllerOptions {
                 disconnect_timeout: config.agents.disconnect_timeout,
                 apply_timeout: config.agents.apply_timeout,
+                own,
+                version: VERSION.to_owned(),
             },
         },
         cancel.clone(),
@@ -276,7 +309,15 @@ pub async fn run_with(
         })?;
     let grpc_addr = grpc_listener.local_addr().to_human_error()?;
     tracing::info!(address = %grpc_addr, "listening for agents");
-    let grpc_task = tokio::spawn(grpc::serve(fleet, grpc_listener, identity, cancel.clone()));
+    let agents_serving = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let grpc_task = tokio::spawn({
+        let (serving, cancel) = (agents_serving.clone(), cancel.clone());
+        async move {
+            let served = grpc::serve(fleet, grpc_listener, identity, cancel).await;
+            serving.store(false, std::sync::atomic::Ordering::Relaxed);
+            served
+        }
+    });
 
     let outbox = Arc::new(tokio::sync::Notify::new());
     let notifier = Arc::new(notifications::Notifier::new(notifications::NotifierDeps {
@@ -325,6 +366,7 @@ pub async fn run_with(
     state.builder = Some(builder);
     state.schedules = Some(scheduler);
     state.attention = Some(notifier);
+    state.agents_serving = Some(agents_serving);
     let http_task = tokio::spawn(web::serve(state, http_listener, cancel.clone()));
     if let Some(listening) = &hooks.listening {
         listening.send_replace(Some(Listening {
@@ -403,6 +445,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(ok, "the HTTP listener answers");
+        let ready: serde_json::Value = reqwest::get(format!("http://{http}/readyz"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ready["ready"], true, "{ready}");
         // The directory source produced a valid revision, which promoted with no hosts.
         let mut promoted = false;
         for _ in 0..100 {

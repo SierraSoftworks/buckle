@@ -6,6 +6,7 @@ pub mod catalog;
 mod error;
 pub mod logger;
 pub mod oidc;
+mod ready;
 mod routes;
 pub mod timeline;
 mod ui;
@@ -66,6 +67,9 @@ pub struct AppState {
     pub schedules: Option<Arc<crate::schedules::Scheduler>>,
     /// Works out what needs attention, and announces it to webhooks.
     pub attention: Option<Arc<crate::notifications::Notifier>>,
+    /// Whether the agent listener is serving, for `/readyz` (`None`: this
+    /// process runs none).
+    pub agents_serving: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -116,6 +120,7 @@ impl AppState {
             rollout_changes: Default::default(),
             schedules: None,
             attention: None,
+            agents_serving: None,
         }
     }
 
@@ -176,6 +181,7 @@ pub fn app(
         .wrap(from_fn(auth::middleware))
         .wrap(from_fn(logger::middleware))
         .configure(routes::configure)
+        .configure(ready::configure)
         .configure(wellknown::configure)
         .configure(ui::configure)
 }

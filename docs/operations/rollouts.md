@@ -74,6 +74,10 @@ in the latest of their phases. The cluster is on the revision once every placeme
 While a connected host that could execute for a cluster runs an agent that predates placements,
 the cluster is rolled as one row, as before: one plan covering every workload, one apply.
 
+The placement that runs the Buckle server itself is the exception to its labels: it joins the last
+phase and starts once every other target has applied and baked, since applying it restarts the
+server ([upgrading the server as a workload](./upgrading.md#as-a-workload-of-its-own-fleet)).
+
 ### Order inside a phase
 
 Within a phase, order comes from `needs`, target by target: a target starts as soon as everything

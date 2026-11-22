@@ -11,6 +11,10 @@ SQLite database under `data_dir`; a restart mid-rollout resumes where it left of
 The server listens on two ports: gRPC for agents (`listen.grpc`, conventionally `7700`) and HTTP
 for the API and UI (`listen.http`, conventionally `7701`). It shuts down gracefully on `SIGTERM`.
 
+`GET /readyz` on the HTTP port says whether the server can do its work, for a scheduler's health
+check; see [upgrading](../operations/upgrading.md#readiness), which also covers the database
+snapshot an upgrade keeps and running the server as a workload of its own fleet.
+
 ## server.yaml
 
 Values are YAML. Any string may contain `${{ env.NAME }}`, replaced with that environment variable
@@ -96,8 +100,9 @@ identity:
 | `tls.cert`, `tls.key` | | PEM certificate and key for `mode: files`. |
 
 `data_dir` (default `/data`) holds the database, the Git clone, built revisions and the generated
-certificate. Back it up; downgrading the server needs a backup from before the upgrade, because
-database migrations only move forward.
+certificate. Back it up. An upgrade that changes the database's schema keeps a snapshot of it
+there, which the previous version puts back when it is started again
+([downgrading](../operations/upgrading.md#downgrading)).
 
 ### source
 

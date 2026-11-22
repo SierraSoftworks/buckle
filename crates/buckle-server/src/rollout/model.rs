@@ -479,6 +479,17 @@ pub struct HostRuntime {
     /// unit: each of its workloads).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<String>,
+    /// On the placement that runs the server: the run of the server that
+    /// last saw its apply through (sent it, took its result, or confirmed
+    /// it after a restart). Another run finding the row under way was
+    /// started by that apply, and settles it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_boot: Option<String>,
+    /// The server restarted while the placement that runs it baked: the
+    /// steward is asked whether the cluster runs what the revision has, and
+    /// the row is not baked before it answers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirming: bool,
 }
 
 /// What keeps a row from starting.

@@ -1390,6 +1390,35 @@ async fn the_ui_falls_back_to_index_and_robots_disallow() {
     );
 }
 
+#[actix_web::test]
+async fn readiness_names_what_keeps_the_server_from_its_work() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let agents = Arc::new(AtomicBool::new(true));
+    let flag = agents.clone();
+    // Sign-in is required of the API, never of the readiness check.
+    let e = env_with(
+        WebConfig {
+            user_acl: acl("false"),
+            ..Default::default()
+        },
+        move |s| s.agents_serving = Some(flag),
+    )
+    .await;
+    let app = test::init_service(app(e.state.clone())).await;
+    for (serving, status, failing) in [
+        (true, StatusCode::OK, vec![]),
+        (false, StatusCode::SERVICE_UNAVAILABLE, vec!["agents"]),
+    ] {
+        agents.store(serving, Ordering::Relaxed);
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/readyz").to_request()).await;
+        assert_eq!(resp.status(), status, "serving={serving}");
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["ready"], serving);
+        assert_eq!(body["failing"], serde_json::json!(failing));
+    }
+}
+
 // ------------------------------------------------------------ OIDC
 
 const KID: &str = "buckle-test-key";
