@@ -144,6 +144,9 @@ pub(crate) async fn plan(cx: &Context, spec: &ManifestSpec, created: &[ObjectKey
             m.remove("namespace");
         }
     }
+    if let Some(blocked) = cx.out_of_bounds(&key) {
+        return Ok(blocked);
+    }
     object::stamp(&mut intent, &cx.target, &cx.module);
 
     let Some(resource) = resource else {

@@ -164,6 +164,9 @@ async fn find(cx: &Context, d: &Decoded) -> Result<Option<String>> {
 pub(crate) async fn plan(cx: &Context, spec: &VolumeSpec) -> Result<Step> {
     let d = decode(spec)?;
     let key = ObjectKey::new(Kind::Volume, &d.namespace, &d.name);
+    if let Some(blocked) = cx.out_of_bounds(&key) {
+        return Ok(blocked);
+    }
     let live = find(cx, &d).await?;
     let idx = index::read(&cx.nomad, &cx.target).await?;
     let listed = idx.find(Kind::Volume, &d.namespace, &d.name);

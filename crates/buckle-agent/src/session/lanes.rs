@@ -640,10 +640,21 @@ async fn watch_kubernetes(
         let opened = async {
             let (kube, expires) = shared.executor.read_kube(&a).await?;
             let index = buckle_kube::index::read(&kube, &a.target).await?;
-            let mut kinds: Vec<(String, String)> = index
+            // A scoped target's credential can watch only inside its own
+            // namespaces, so it watches each kind there; a whole cluster
+            // watches each kind once, everywhere.
+            let scoped = a.spec.bounds.scoped();
+            let mut kinds: Vec<(String, String, String)> = index
                 .entries
                 .iter()
-                .map(|e| (e.key.api_version.clone(), e.key.kind.clone()))
+                .map(|e| {
+                    let namespace = if scoped {
+                        e.key.namespace.clone()
+                    } else {
+                        String::new()
+                    };
+                    (e.key.api_version.clone(), e.key.kind.clone(), namespace)
+                })
                 .collect();
             kinds.sort();
             kinds.dedup();
@@ -653,12 +664,12 @@ async fn watch_kubernetes(
                 buckle_kube::object::label_value(&a.target)
             );
             let mut streams = Vec::new();
-            for (api_version, kind) in kinds {
+            for (api_version, kind, namespace) in kinds {
                 let Some(resource) = kube.resource(&api_version, &kind).await? else {
                     continue;
                 };
                 let path = buckle_kube::client::with_query(
-                    &resource.path("", None),
+                    &resource.path(&namespace, None),
                     "labelSelector",
                     &selector,
                 );

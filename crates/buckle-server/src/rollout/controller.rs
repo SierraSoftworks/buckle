@@ -636,6 +636,12 @@ pub const CHECK_DRIFT_CAPABILITY: &str = "check_drift";
 /// take such an entry for a missing module and fail to plan.
 pub const SCHEDULED_NEEDS_CAPABILITY: &str = "scheduled_needs";
 
+/// An agent holds a target to its bounds (a scoped target's namespaces, the
+/// ones a cluster handed to its scoped targets) only once it announces it;
+/// an older one would apply such a target as a whole cluster, so it is
+/// never its steward.
+pub const SCOPES_CAPABILITY: &str = "scopes";
+
 /// Whether what a row's current step needs lets it start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Gate {
@@ -4548,6 +4554,7 @@ impl Controller {
             .collect();
         Some(stages::ClusterInput {
             id: cluster.clone(),
+            family: self.family(cluster, &live.revision.fleet),
             phase,
             nodes,
             workloads,
@@ -4593,6 +4600,7 @@ impl Controller {
             .collect();
         Some(stages::ClusterInput {
             id: cluster.to_owned(),
+            family: self.family(cluster, &live.revision.fleet),
             phase: usize::MAX,
             nodes,
             workloads,
@@ -7292,6 +7300,7 @@ impl Controller {
             Some(d) => d.cluster.as_deref(),
             None => self.clusters.get(target).and_then(|s| s.cluster.as_deref()),
         };
+        let bounded = self.bounds(target, Some(fleet)) != Default::default();
         let mut inside: Vec<String> = Vec::new();
         let mut outside: Vec<String> = Vec::new();
         for (h, _) in targets {
@@ -7303,6 +7312,7 @@ impl Controller {
                     .capabilities
                     .get(&h.id)
                     .is_some_and(|c| c.iter().any(|c| c == TARGETS_CAPABILITY))
+                || (bounded && !self.has_capability(&h.id, SCOPES_CAPABILITY))
             {
                 continue;
             }
@@ -8039,7 +8049,7 @@ impl Controller {
                 .secrets
                 .for_cluster(&rev, &ctx, &trusted, secret.as_deref())
                 .await;
-            let cluster = self.cluster_target(target, &record, spec, declared);
+            let cluster = self.cluster_target(target, &record, spec, Some(&rev.fleet));
             (secrets, Some(cluster))
         };
         Some(msg(server_message::Msg::Assign(Assign {
@@ -8416,10 +8426,7 @@ impl Controller {
             None => {
                 let reference =
                     crate::views::reference_revision(&self.store, &self.revisions).await;
-                let declared = reference
-                    .as_ref()
-                    .and_then(|r| r.fleet.fleet.clusters.get(target));
-                self.cluster_target(target, &record, &spec, declared)
+                self.cluster_target(target, &record, &spec, reference.as_ref().map(|r| &r.fleet))
             }
         };
         let watch = spec.watch.map(|w| pb::Watch {
@@ -8454,8 +8461,10 @@ impl Controller {
         target: &str,
         record: &crate::store::HostRecord,
         spec: &buckle_api::ClusterSpec,
-        declared: Option<&buckle_core::model::ClusterDecl>,
+        fleet: Option<&buckle_core::model::FleetConfig>,
     ) -> pb::ClusterTarget {
+        let declared = fleet.and_then(|f| f.fleet.clusters.get(target));
+        let bounds = self.bounds(target, fleet);
         let kind = declared
             .map(|d| d.kind.as_str())
             .unwrap_or(crate::targets::core_kind(spec.kind).as_str())
@@ -8473,7 +8482,46 @@ impl Controller {
             identity,
             labels: record.effective_labels().into_iter().collect(),
             fingerprint_key: self.secrets.fingerprint_key(target),
+            namespaces: bounds.namespaces,
+            excluded_namespaces: bounds.excluded,
         }
+    }
+
+    /// The cluster `target` is a part of: the one a scoped target names
+    /// (`fleet`'s declaration first, else the stored target's), else itself.
+    fn family(&self, target: &str, fleet: &buckle_core::model::FleetConfig) -> String {
+        match fleet.fleet.clusters.get(target) {
+            Some(decl) => decl.cluster.clone(),
+            None => self.clusters.get(target).and_then(|s| s.cluster.clone()),
+        }
+        .unwrap_or_else(|| target.to_owned())
+    }
+
+    /// The part of its cluster `target` may touch: `fleet`'s declaration of
+    /// it and of the targets scoped to it, with the stored targets (those
+    /// created through the API) beside them.
+    fn bounds(
+        &self,
+        target: &str,
+        fleet: Option<&buckle_core::model::FleetConfig>,
+    ) -> buckle_core::model::Bounds {
+        let mut bounds = fleet.map(|f| f.bounds(target)).unwrap_or_default();
+        let declared = |name: &str| fleet.is_some_and(|f| f.fleet.clusters.contains_key(name));
+        if !declared(target)
+            && let Some(spec) = self.clusters.get(target)
+        {
+            bounds.namespaces = spec.scope.namespaces.clone();
+        }
+        for (name, spec) in &self.clusters {
+            if spec.cluster.as_deref() == Some(target) && !declared(name) {
+                bounds
+                    .excluded
+                    .extend(spec.scope.namespaces.iter().cloned());
+            }
+        }
+        bounds.excluded.sort();
+        bounds.excluded.dedup();
+        bounds
     }
 }
 

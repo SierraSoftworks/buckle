@@ -122,8 +122,9 @@ impl<'de> Deserialize<'de> for ClusterIdentity {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterScope {
-    /// The namespaces the target owns; workloads whose objects fall outside
-    /// them are skipped on this target.
+    /// The namespaces the target owns. An object outside them (or one that
+    /// belongs to no namespace) is refused on this target, and the cluster's
+    /// own target refuses objects inside them.
     #[serde(default)]
     pub namespaces: Vec<String>,
 }
@@ -131,6 +132,107 @@ pub struct ClusterScope {
 impl ClusterScope {
     pub fn is_empty(&self) -> bool {
         self.namespaces.is_empty()
+    }
+}
+
+/// The part of a cluster one target may touch, as an executor enforces it:
+/// a scoped target stays inside its namespaces, and the cluster's own target
+/// stays out of the namespaces handed to its scoped targets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Bounds {
+    /// A scoped target's namespaces; empty: the whole cluster.
+    pub namespaces: Vec<String>,
+    /// Namespaces that belong to the targets scoped to this cluster.
+    pub excluded: Vec<String>,
+}
+
+impl Bounds {
+    /// Whether the target is a scoped one.
+    pub fn scoped(&self) -> bool {
+        !self.namespaces.is_empty()
+    }
+
+    /// The namespace the target keeps its own bookkeeping in (its index):
+    /// the first it owns, so a credential limited to its scope can write
+    /// it; `default` for a whole cluster.
+    pub fn home(&self) -> &str {
+        self.namespaces.first().map_or("default", String::as_str)
+    }
+
+    /// Whether the target may hold objects in `namespace`.
+    pub fn holds(&self, namespace: &str) -> bool {
+        if self.scoped() {
+            self.namespaces.iter().any(|n| n == namespace)
+        } else {
+            !self.excluded.iter().any(|n| n == namespace)
+        }
+    }
+
+    /// Why `target` may not manage `what` in `namespace` (empty for an
+    /// object that belongs to no namespace), when it may not.
+    pub fn refusal(&self, target: &str, what: &str, namespace: &str) -> Option<String> {
+        if namespace.is_empty() {
+            return self.scoped().then(|| {
+                format!(
+                    "{what} is cluster-wide, and '{target}' is a scoped target (namespaces: {}); manage it from a workload on the cluster itself.",
+                    self.namespaces.join(", ")
+                )
+            });
+        }
+        if self.holds(namespace) {
+            return None;
+        }
+        Some(if self.scoped() {
+            format!(
+                "{what} is outside the scoped target '{target}' (namespaces: {}); place the workload on the target that owns '{namespace}'.",
+                self.namespaces.join(", ")
+            )
+        } else {
+            format!(
+                "{what} is in the namespace '{namespace}', which belongs to a target scoped to '{target}'; place the workload on that target."
+            )
+        })
+    }
+}
+
+/// Fills what each scoped target leaves out from the cluster it is a part
+/// of: how to reach it (`api`, `ui`, `identity`), who its members and
+/// executors are (`nodes`, `executors`) and how often it is read (`watch`).
+/// `raw` is the `fleet.clusters` mapping as written, which says what was
+/// left out.
+pub(super) fn inherit(clusters: &mut IndexMap<String, ClusterDecl>, raw: &serde_yaml::Value) {
+    let parents: Vec<(String, ClusterDecl)> = clusters
+        .iter()
+        .filter(|(_, c)| c.cluster.is_none())
+        .map(|(n, c)| (n.clone(), c.clone()))
+        .collect();
+    for (name, decl) in clusters.iter_mut() {
+        let Some((_, parent)) = decl
+            .cluster
+            .as_ref()
+            .and_then(|p| parents.iter().find(|(n, _)| n == p))
+        else {
+            continue;
+        };
+        let written = |key: &str| raw[name.as_str()].get(key).is_some();
+        if !written("api") {
+            decl.api = parent.api.clone();
+        }
+        if !written("ui") {
+            decl.ui = parent.ui.clone();
+        }
+        if !written("identity") {
+            decl.identity = parent.identity.clone();
+        }
+        if !written("nodes") {
+            decl.nodes = parent.nodes.clone();
+        }
+        if !written("executors") {
+            decl.executors = parent.executors.clone();
+        }
+        if !written("watch") {
+            decl.watch = parent.watch;
+        }
     }
 }
 
@@ -314,6 +416,39 @@ pub fn yaml_scalar_text(value: &serde_yaml::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::scoped_inside(&["edge", "public"], &[], "edge", true)]
+    #[case::scoped_outside(&["edge", "public"], &[], "default", false)]
+    #[case::scoped_cluster_wide(&["edge"], &[], "", false)]
+    #[case::cluster_free(&[], &["edge"], "default", true)]
+    #[case::cluster_in_a_scope(&[], &["edge"], "edge", false)]
+    #[case::cluster_wide_on_the_cluster(&[], &["edge"], "", true)]
+    #[case::unbounded(&[], &[], "anything", true)]
+    fn a_target_manages_only_what_its_bounds_hold(
+        #[case] namespaces: &[&str],
+        #[case] excluded: &[&str],
+        #[case] namespace: &str,
+        #[case] allowed: bool,
+    ) {
+        let owned = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect();
+        let bounds = Bounds {
+            namespaces: owned(namespaces),
+            excluded: owned(excluded),
+        };
+        let refusal = bounds.refusal("t", "job x", namespace);
+        assert_eq!(refusal.is_none(), allowed, "{refusal:?}");
+    }
+
+    #[test]
+    fn a_scoped_target_keeps_its_bookkeeping_in_its_own_namespace() {
+        let scoped = Bounds {
+            namespaces: vec!["edge".into(), "public".into()],
+            excluded: Vec::new(),
+        };
+        assert_eq!(scoped.home(), "edge");
+        assert_eq!(Bounds::default().home(), "default");
+    }
     use rstest::rstest;
 
     #[rstest]

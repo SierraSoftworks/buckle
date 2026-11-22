@@ -553,5 +553,9 @@ pub(super) fn target_spec(cluster: &WireCluster) -> buckle_core::Result<TargetSp
         identity,
         labels: cluster.labels.clone(),
         fingerprints: Arc::new(fingerprints),
+        bounds: buckle_core::model::Bounds {
+            namespaces: cluster.namespaces.clone(),
+            excluded: cluster.excluded_namespaces.clone(),
+        },
     })
 }

@@ -118,7 +118,30 @@ pub fn check_spec(
                     "'{parent}' is a {} cluster, so a target scoped to it must be one too.",
                     c.spec.kind
                 )),
-                Some(_) => Ok(()),
+                Some(_) if spec.scope.is_empty() => Err(format!(
+                    "A target scoped to '{parent}' must list the namespaces it owns under `scope.namespaces`."
+                )),
+                Some(_) => {
+                    // A namespace belongs to one target of the cluster.
+                    let taken = targets.iter().filter(|t| t.id != id).find_map(|t| {
+                        let other = &t.cluster.as_ref()?.spec;
+                        (other.cluster.as_deref() == Some(parent.as_str()))
+                            .then(|| {
+                                spec.scope
+                                    .namespaces
+                                    .iter()
+                                    .find(|ns| other.scope.namespaces.contains(ns))
+                                    .map(|ns| (ns.clone(), t.id.clone()))
+                            })
+                            .flatten()
+                    });
+                    match taken {
+                        Some((ns, owner)) => Err(format!(
+                            "The namespace '{ns}' already belongs to the scoped target '{owner}'."
+                        )),
+                        None => Ok(()),
+                    }
+                }
             },
         },
     }

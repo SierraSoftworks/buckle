@@ -13,7 +13,7 @@ mod workload;
 
 pub use action_decl::ActionDecl;
 pub use cluster::{
-    ClusterDecl, ClusterIdentity, ClusterKind, ClusterScope, ClusterTrust, trust_problem,
+    Bounds, ClusterDecl, ClusterIdentity, ClusterKind, ClusterScope, ClusterTrust, trust_problem,
     yaml_scalar_text,
 };
 pub use schedule::{Parsed as ParsedSchedule, ScheduleApproval, ScheduleDecl};
@@ -52,7 +52,14 @@ pub struct FleetConfig {
 impl FleetConfig {
     pub fn parse(yaml: &str) -> crate::Result<Self> {
         use crate::error::HumanizableResult;
-        let config: FleetConfig = serde_yaml::from_str(yaml).to_human_error()?;
+        let mut config: FleetConfig = serde_yaml::from_str(yaml).to_human_error()?;
+        // The typed parse cannot tell an absent key from its default, and a
+        // scoped target takes what it leaves out from its cluster.
+        if config.fleet.clusters.values().any(|c| c.cluster.is_some())
+            && let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        {
+            cluster::inherit(&mut config.fleet.clusters, &raw["fleet"]["clusters"]);
+        }
         if config.version != 2 {
             return Err(crate::error::user(
                 format!(
@@ -71,6 +78,24 @@ impl FleetConfig {
     /// The label keys only the server may set (`fleet.labels.reserved`).
     pub fn reserved_labels(&self) -> &[String] {
         &self.fleet.labels.reserved
+    }
+
+    /// The part of its cluster the declared target `name` may touch: its
+    /// own `scope` when it is a scoped target, and the namespaces of the
+    /// targets scoped to it when it is their cluster.
+    pub fn bounds(&self, name: &str) -> Bounds {
+        let clusters = &self.fleet.clusters;
+        let Some(decl) = clusters.get(name) else {
+            return Bounds::default();
+        };
+        Bounds {
+            namespaces: decl.scope.namespaces.clone(),
+            excluded: clusters
+                .values()
+                .filter(|c| c.cluster.as_deref() == Some(name))
+                .flat_map(|c| c.scope.namespaces.iter().cloned())
+                .collect(),
+        }
     }
 }
 

@@ -709,3 +709,77 @@ async fn restart_and_undo() {
     );
     assert!(live["spec"]["template"]["metadata"]["labels"]["pod-template-hash"].is_null());
 }
+
+fn bounds(namespaces: &[&str], excluded: &[&str]) -> buckle_core::model::Bounds {
+    let owned = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect();
+    buckle_core::model::Bounds {
+        namespaces: owned(namespaces),
+        excluded: owned(excluded),
+    }
+}
+
+fn namespace_object(name: &str) -> Primitive {
+    manifest(json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}}))
+}
+
+/// A cluster whose `monitoring` namespace exists already.
+fn monitoring_cluster() -> FakeKube {
+    let fake = FakeKube::new();
+    fake.insert(
+        json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "monitoring"}}),
+    );
+    fake
+}
+
+/// A target plans an object outside its bounds as blocked: `monitoring` is
+/// the namespace the fixture's objects land in.
+#[rstest]
+#[case::scoped_inside(&["monitoring"], &[], manifest(deployment("grafana:1")), None)]
+#[case::scoped_outside(&["team-a"], &[], manifest(deployment("grafana:1")), Some("outside the scoped target"))]
+#[case::scoped_cluster_wide(&["monitoring"], &[], namespace_object("monitoring"), Some("cluster-wide"))]
+#[case::cluster_inside_a_scope(&[], &["monitoring"], manifest(deployment("grafana:1")), Some("belongs to a target scoped to"))]
+#[case::cluster_manages_namespaces(&[], &["monitoring"], namespace_object("monitoring"), None)]
+#[tokio::test]
+async fn a_target_plans_only_within_its_bounds(
+    #[case] namespaces: &[&str],
+    #[case] excluded: &[&str],
+    #[case] primitive: Primitive,
+    #[case] refused: Option<&str>,
+) {
+    let fake = monitoring_cluster();
+    let cx = cx(&fake, "grafana").with_bounds(bounds(namespaces, excluded));
+    let plan = Workload::new("grafana", vec![primitive])
+        .plan(&cx)
+        .await
+        .unwrap();
+    match (plan.blocked(), refused) {
+        (None, None) => {}
+        (Some((_, reason)), Some(needle)) => {
+            assert!(reason.contains(needle), "{reason}");
+            assert!(plan.apply(&cx).await.is_err());
+        }
+        (blocked, refused) => panic!("blocked {blocked:?}, expected {refused:?}"),
+    }
+}
+
+/// A scoped target's credential reaches only its namespaces, so its index
+/// ConfigMap lives in the first of them.
+#[tokio::test]
+async fn a_scoped_target_keeps_its_index_inside_its_scope() {
+    let fake = monitoring_cluster();
+    let scope = bounds(&["monitoring"], &[]);
+    let cx = Context {
+        kube: fake.client().home(scope.home()),
+        ..cx(&fake, "grafana").with_bounds(scope)
+    };
+    let w = Workload::new("grafana", vec![manifest(deployment("grafana:1"))]);
+    w.plan(&cx).await.unwrap().apply(&cx).await.unwrap();
+
+    let name = index::name("lab-k3s");
+    assert!(
+        fake.object("v1", "ConfigMap", "monitoring", &name)
+            .is_some()
+    );
+    assert!(fake.object("v1", "ConfigMap", "default", &name).is_none());
+    assert_eq!(owned(&cx).await.unwrap().len(), 1);
+}

@@ -14,6 +14,7 @@ use crate::client::Kube;
 use crate::index;
 use crate::object::{ObjectKey, Owner};
 use buckle_core::Result;
+use buckle_core::model::Bounds;
 use buckle_core::plan::Planned;
 use buckle_core::secrets::InstallKey;
 use buckle_core::task::Applied;
@@ -48,6 +49,9 @@ pub struct Context {
     /// The longest a controller's pods may stay unschedulable during an
     /// apply (the workload's `timeouts.placement`).
     pub placement_timeout: Duration,
+    /// The part of the cluster the target may touch; a primitive outside
+    /// it plans as blocked.
+    pub bounds: Bounds,
 }
 
 /// The default `timeouts.placement`, as on Nomad.
@@ -75,7 +79,21 @@ impl Context {
             poll: Duration::from_secs(2),
             rollout_timeout: ROLLOUT_TIMEOUT,
             placement_timeout: PLACEMENT_TIMEOUT,
+            bounds: Bounds::default(),
         }
+    }
+
+    /// Holds the target to `bounds`.
+    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// The blocked step for `key` when it lies outside the target's bounds.
+    pub(crate) fn out_of_bounds(&self, key: &ObjectKey) -> Option<Step> {
+        self.bounds
+            .refusal(&self.target, &key.to_string(), &key.namespace)
+            .map(|reason| Step::blocked(key.clone(), reason))
     }
 
     /// The workload's `timeouts`, each defaulting when absent.

@@ -68,6 +68,10 @@ pub struct WorkloadUnit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterInput {
     pub id: String,
+    /// The cluster the target is a part of: itself, or for a scoped target
+    /// the cluster it is scoped to. A workload's `needs` reach the other
+    /// targets of the same cluster.
+    pub family: String,
     /// The phase of a cluster applied as one unit (its placements carry
     /// their own).
     pub phase: usize,
@@ -486,12 +490,23 @@ impl<'a> Solver<'a> {
                             .map(|n| Target::Unit(Unit::Module(n.clone(), m.clone())))
                             .collect(),
                         // Between two placements of the cluster; inside one
-                        // cluster unit the apply orders them itself.
-                        Need::Workload(x) => Self::workload_unit(c, x)
-                            .filter(|_| c.placements && *x != w.name)
-                            .map(Target::Unit)
-                            .into_iter()
-                            .collect(),
+                        // cluster unit the apply orders them itself. A
+                        // workload the target does not run is looked for on
+                        // the other targets of its cluster (a scoped
+                        // target's workload needing one of the cluster's).
+                        Need::Workload(x) => match Self::workload_unit(c, x) {
+                            Some(unit) => (c.placements && *x != w.name)
+                                .then_some(Target::Unit(unit))
+                                .into_iter()
+                                .collect(),
+                            None => fleet
+                                .clusters
+                                .iter()
+                                .filter(|o| o.id != c.id && o.family == c.family)
+                                .filter_map(|o| Self::workload_unit(o, x))
+                                .map(Target::Unit)
+                                .collect(),
+                        },
                         Need::Placement { workload, cluster } => {
                             if *cluster == c.id && *workload == w.name {
                                 continue;
@@ -840,6 +855,7 @@ mod tests {
     fn cluster(id: &str, nodes: &[&str], workloads: Vec<WorkloadUnit>) -> ClusterInput {
         ClusterInput {
             id: id.into(),
+            family: id.into(),
             phase: 0,
             nodes: nodes.iter().map(|n| (*n).to_owned()).collect(),
             workloads,
@@ -1206,6 +1222,30 @@ mod tests {
             steps[0].rank > staged.steps["home/monitoring"][0].rank,
             "{steps:?}"
         );
+    }
+
+    /// A scoped target's workload may need one its cluster runs (the
+    /// namespace it lands in, say): the need reaches across the targets of
+    /// one cluster, and no further.
+    #[test]
+    fn a_need_reaches_the_other_targets_of_the_same_cluster() {
+        let scoped = |id: &str, family: &str| ClusterInput {
+            family: family.into(),
+            ..placed(id, &[], vec![workload("site", &["platform"])])
+        };
+        let staged = layer(&fleet(
+            vec![],
+            vec![
+                placed("nomad", &[], vec![workload("platform", &[])]),
+                scoped("nomad-public", "nomad"),
+                scoped("elsewhere", "elsewhere"),
+            ],
+        ));
+        assert_eq!(
+            waits_for(&staged, "nomad-public/site", 0),
+            ["nomad/platform"]
+        );
+        assert!(waits_for(&staged, "elsewhere/site", 0).is_empty());
     }
 
     /// A removal placement names the placements that needed its workload as

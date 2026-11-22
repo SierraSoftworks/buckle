@@ -70,6 +70,8 @@ pub struct Kube {
     /// Serialises this executor's index writes (workloads apply
     /// concurrently and would otherwise keep losing the resourceVersion race).
     pub(crate) index_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The namespace the target's index ConfigMap lives in.
+    pub(crate) home: Arc<str>,
 }
 
 impl std::fmt::Debug for Kube {
@@ -106,7 +108,15 @@ impl Kube {
             token: None,
             discovery: Arc::new(Mutex::new(HashMap::new())),
             index_lock: Arc::new(tokio::sync::Mutex::new(())),
+            home: Arc::from(crate::index::NAMESPACE),
         }
+    }
+
+    /// Keeps the target's index ConfigMap in `namespace` rather than
+    /// `default`: a scoped target's own, which its credential can write.
+    pub fn home(mut self, namespace: &str) -> Self {
+        self.home = Arc::from(namespace);
+        self
     }
 
     /// Sends `Authorization: Bearer` on every request.

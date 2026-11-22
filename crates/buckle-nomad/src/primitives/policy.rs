@@ -95,6 +95,9 @@ pub(crate) async fn plan(cx: &Context, spec: &PolicySpec) -> Result<Step> {
         ));
     }
     let key = ObjectKey::new(Kind::Policy, "", &name);
+    if let Some(blocked) = cx.out_of_bounds(&key) {
+        return Ok(blocked);
+    }
     let live = cx.acl().get::<Value>(&url(&name)).await?;
     let (_, live_stamps) = live
         .as_ref()

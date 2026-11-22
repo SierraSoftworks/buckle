@@ -360,6 +360,41 @@ kubectl create clusterrolebinding buckle-deploy --clusterrole=cluster-admin --gr
 kubectl create clusterrolebinding buckle-read --clusterrole=view --group=buckle:read
 ```
 
+#### Scoped targets
+
+A [scoped target](../modules/fleet.md#scoped-targets) is only as narrow as the policy the cluster
+binds to it. Its tokens have the target as `aud` and `target`, and the cluster as `cluster`.
+
+- **Nomad**: list every target in `BoundAudiences`, map the claim in (`"ClaimMappings": {
+  "target": "target", … }`), and bind per target. Binding rules add up, so the cluster's own rules
+  must name it too, or a scoped token also matches them:
+
+  ```sh
+  nomad acl binding-rule create -auth-method buckle -bind-type policy -bind-name buckle-deploy \
+    -selector 'value.target == "nomad" and value.purpose == "deploy"'
+  nomad acl binding-rule create -auth-method buckle -bind-type policy -bind-name buckle-deploy-public \
+    -selector 'value.target == "nomad-public" and value.purpose == "deploy"'
+  ```
+
+  ```hcl
+  # buckle-deploy-public, for scope: { namespaces: [edge, public] }
+  namespace "edge" {
+    policy = "write"
+    variables { path "*" { capabilities = ["read", "write", "destroy", "list"] } }
+  }
+  namespace "public" {
+    policy = "write"
+    variables { path "*" { capabilities = ["read", "write", "destroy", "list"] } }
+  }
+  ```
+
+  The target's index variable (`buckle/<target>/index`) lives in the first namespace it lists.
+- **Kubernetes**: list every target under `audiences`, put the target in the group
+  (`'["buckle:" + claims.target + ":" + claims.purpose]'`), and bind it in each namespace with a
+  RoleBinding instead of a ClusterRoleBinding (`kubectl create rolebinding buckle-deploy -n team-a
+  --clusterrole=admin --group=buckle:lab-k3s-team-a:deploy`). The index ConfigMap lives in the
+  first namespace listed.
+
 An executor on a cluster node finds the API server and its CA in the node's kubeconfig
 (`KUBECONFIG`, `/etc/rancher/k3s/k3s.yaml`, `~/.kube/config`), so `api` may be left out; with
 `identity: local` it uses that kubeconfig's own credentials instead (root's on a k3s server).

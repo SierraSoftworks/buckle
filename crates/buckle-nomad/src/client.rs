@@ -25,6 +25,8 @@ pub struct Nomad {
     /// workloads applying concurrently do not race each other's
     /// check-and-set. See [`crate::index::update`].
     pub(crate) index_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The namespace the target's index variable lives in.
+    pub(crate) home: Arc<str>,
 }
 
 impl std::fmt::Debug for Nomad {
@@ -60,7 +62,15 @@ impl Nomad {
             region: None,
             redactor: None,
             index_lock: Arc::default(),
+            home: Arc::from(crate::index::NAMESPACE),
         }
+    }
+
+    /// Keeps the target's index variable in `namespace` rather than
+    /// `default`: a scoped target's own, which its credential can write.
+    pub fn home(mut self, namespace: &str) -> Self {
+        self.home = Arc::from(namespace);
+        self
     }
 
     /// Sends `X-Nomad-Token` on every request. Over the task API socket no
