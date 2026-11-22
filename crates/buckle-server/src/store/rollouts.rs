@@ -64,6 +64,16 @@ fn r_record(raw: RawRollout) -> Result<RolloutRecord> {
     })
 }
 
+/// The newest placement row of each workload on cluster `?1`, where it
+/// applied (baking or healthy). Each workload's newest row is one seek of
+/// `rollout_hosts_workload`, so the cost follows the workloads, not the
+/// rollout history (every health report and fleet view asks for it).
+const NEWEST_PLACEMENTS: &str = "FROM rollout_hosts WHERE rowid IN (\
+     SELECT (SELECT x.rowid FROM rollout_hosts x WHERE x.host = ?1 AND x.workload = w.workload \
+             ORDER BY x.created_at DESC, x.rowid DESC LIMIT 1) \
+     FROM (SELECT DISTINCT workload FROM rollout_hosts WHERE host = ?1 AND workload != '') w) \
+     AND state IN ('baking', 'healthy')";
+
 const H_COLUMNS: &str = "rollout, host, workload, phase, wave, state, plan_digest, plan, result, health, created_at, updated_at, detail";
 
 type RawHost = (
@@ -500,12 +510,7 @@ impl Rollouts<'_> {
     pub fn removed_workloads(&self, host: &str) -> Result<std::collections::BTreeSet<String>> {
         let mut stmt = self
             .conn
-            .prepare(&format!(
-                "SELECT {H_COLUMNS} FROM rollout_hosts h WHERE host = ?1 AND workload != '' \
-                 AND state IN ('baking', 'healthy') \
-                 AND rowid = (SELECT rowid FROM rollout_hosts x WHERE x.host = h.host AND x.workload = h.workload \
-                              ORDER BY created_at DESC, rowid DESC LIMIT 1)"
-            ))
+            .prepare(&format!("SELECT {H_COLUMNS} {NEWEST_PLACEMENTS}"))
             .map_err(db_error)?;
         let rows = stmt
             .query_map(params![host], h_row)
@@ -610,6 +615,34 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(got.contains("w"), removed, "{got:?}");
+    }
+
+    /// Health reports and fleet views look removed workloads up: the lookup
+    /// must seek each workload's newest row, never scan or sort the history.
+    #[tokio::test]
+    async fn newest_placements_are_found_by_index_not_by_scan() {
+        let store = Store::in_memory().await.unwrap();
+        let plan: Vec<String> = store
+            .call(|db| {
+                let mut stmt = db
+                    .conn()
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN SELECT rowid {NEWEST_PLACEMENTS}"
+                    ))
+                    .map_err(db_error)?;
+                stmt.query_map(params!["c"], |r| r.get::<_, String>(3))
+                    .map_err(db_error)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+        assert!(
+            plan.iter().all(
+                |step| !step.contains("TEMP B-TREE") && !step.starts_with("SCAN rollout_hosts")
+            ),
+            "{plan:#?}"
+        );
     }
 
     #[tokio::test]
