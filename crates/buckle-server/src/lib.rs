@@ -21,6 +21,7 @@ pub mod grpc;
 pub mod identity;
 pub mod join;
 pub mod metrics;
+pub mod node_ops;
 pub mod notifications;
 pub mod rollout;
 pub mod schedules;
@@ -262,6 +263,7 @@ pub async fn run_with(
         joins: joins.clone(),
         identity: issuer.clone(),
         workload: Default::default(),
+        node_ops: Default::default(),
     };
     let grpc_listener = tokio::net::TcpListener::bind(&config.listen.grpc)
         .await

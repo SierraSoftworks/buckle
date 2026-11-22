@@ -139,12 +139,101 @@ pub struct CredentialRequest {
     pub api: Option<String>,
 }
 
+/// What a host asks a cluster's steward to do to the host's own node. The
+/// host holds no credential for it: the server checks the request and the
+/// steward acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeOp {
+    /// Read the node's state; changes nothing.
+    Status,
+    /// Hand the node back to the scheduler: stop a drain, mark it eligible
+    /// (Kubernetes: uncordon).
+    Undrain,
+    /// Take the node out of scheduling and move its work elsewhere
+    /// (Kubernetes: cordon and evict).
+    Drain,
+    /// A token the node presents to join the cluster, for the pool the
+    /// server picks.
+    Join,
+}
+
+impl NodeOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeOp::Status => "status",
+            NodeOp::Undrain => "undrain",
+            NodeOp::Drain => "drain",
+            NodeOp::Join => "join",
+        }
+    }
+}
+
+impl std::fmt::Display for NodeOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A node operation on `target` (a cluster, as `fleet.clusters` names it).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NodeRequest {
+    pub target: String,
+    pub op: NodeOp,
+    /// `drain`: how long the node's work gets to move before it is stopped;
+    /// `None`: the steward's default.
+    pub deadline: Option<std::time::Duration>,
+}
+
+/// How a node operation went, and the node's state after it.
+#[derive(Clone, Default)]
+pub struct NodeReply {
+    /// Whether the scheduler knows a live node of the host's name.
+    pub registered: bool,
+    /// Whether the scheduler places work on it.
+    pub eligible: bool,
+    pub draining: bool,
+    /// Whether the operation changed anything.
+    pub changed: bool,
+    /// What happened, one line.
+    pub summary: String,
+    /// `join`: the pool the token is for (empty: the scheduler's default).
+    pub pool: String,
+    /// `join`: the token.
+    pub token: Option<secrecy::SecretString>,
+}
+
+impl std::fmt::Debug for NodeReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeReply")
+            .field("registered", &self.registered)
+            .field("eligible", &self.eligible)
+            .field("draining", &self.draining)
+            .field("changed", &self.changed)
+            .field("summary", &self.summary)
+            .field("pool", &self.pool)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Issues cluster credentials to tasks. The agent provides one; local runs
 /// have none.
 #[async_trait]
 pub trait ClusterCredentials: Send + Sync + std::fmt::Debug {
     async fn credential(&self, request: &CredentialRequest)
     -> crate::Result<secrecy::SecretString>;
+
+    /// Asks the cluster's steward, through the server, for an operation on
+    /// this host's own node.
+    async fn node(&self, request: &NodeRequest) -> crate::Result<NodeReply> {
+        Err(crate::error::user(
+            format!(
+                "Nothing here can ask {}'s steward for a node operation.",
+                request.target
+            ),
+            &["Run it through the Buckle server on an enrolled agent."],
+        ))
+    }
 }
 
 /// Everything a task needs while planning or applying.

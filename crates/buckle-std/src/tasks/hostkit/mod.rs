@@ -960,6 +960,10 @@ mod registry_tests {
     fn system_samples() -> Vec<(&'static str, serde_json::Value)> {
         vec![
             (
+                "cluster.node",
+                json!({"cluster": "home-nomad", "op": "join", "dest": "/etc/nomad.d/intro.jwt", "mode": "0600", "unless": "true", "deadline": "5m"}),
+            ),
+            (
                 "apt.repository",
                 json!({"name": "x", "uri": "https://x.example", "suites": ["s"]}),
             ),

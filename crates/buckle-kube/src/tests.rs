@@ -783,3 +783,102 @@ async fn a_scoped_target_keeps_its_index_inside_its_scope() {
     assert!(fake.object("v1", "ConfigMap", "default", &name).is_none());
     assert_eq!(owned(&cx).await.unwrap().len(), 1);
 }
+
+fn node_fixture(fake: &FakeKube, name: &str, unschedulable: bool) {
+    fake.insert(json!({
+        "apiVersion": "v1", "kind": "Node",
+        "metadata": {"name": name},
+        "spec": {"unschedulable": unschedulable},
+    }));
+}
+
+fn pod_on(node: &str, name: &str, extra: Value) -> Value {
+    let mut pod = json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": {"nodeName": node},
+    });
+    for (k, v) in extra.as_object().into_iter().flatten() {
+        pod["metadata"][k] = v.clone();
+    }
+    pod
+}
+
+/// A drain cordons the node and asks its pods to leave, except the ones
+/// that belong on every node; a second one finds nothing to do, and an
+/// uncordon hands the node back.
+#[tokio::test]
+async fn a_node_is_drained_once_and_handed_back() {
+    use crate::nodes;
+    let fake = FakeKube::new();
+    node_fixture(&fake, "web-1", false);
+    fake.insert(pod_on("web-1", "site", json!({})));
+    fake.insert(pod_on(
+        "web-1",
+        "db",
+        json!({"annotations": {"fake/pdb": "held"}}),
+    ));
+    fake.insert(pod_on(
+        "web-1",
+        "logs",
+        json!({"ownerReferences": [{"kind": "DaemonSet", "name": "logs"}]}),
+    ));
+    fake.insert(pod_on("web-2", "elsewhere", json!({})));
+    let kube = fake.client();
+
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    let drained = nodes::drain(&kube, &node).await.unwrap();
+
+    assert_eq!(
+        drained,
+        Some(nodes::Drained {
+            evicted: 1,
+            held: 1
+        })
+    );
+    let pod = |name: &str| fake.object("v1", "Pod", "default", name);
+    assert!(pod("site").is_none());
+    assert!(pod("db").is_some() && pod("logs").is_some() && pod("elsewhere").is_some());
+    let cordoned = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(!cordoned.schedulable);
+    assert_eq!(nodes::drain(&kube, &cordoned).await.unwrap(), None);
+
+    assert!(nodes::uncordon(&kube, &cordoned).await.unwrap());
+    let back = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(back.schedulable);
+    assert!(!nodes::uncordon(&kube, &back).await.unwrap());
+    assert_eq!(nodes::find(&kube, "web-9").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_bootstrap_token_is_stored_where_the_api_server_reads_it() {
+    use crate::nodes;
+    use secrecy::ExposeSecret;
+    let fake = FakeKube::new();
+    fake.insert(
+        json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "kube-system"}}),
+    );
+    let kube = fake.client();
+
+    let token = nodes::bootstrap_token(
+        &kube,
+        "web-1",
+        Some("public"),
+        Duration::from_secs(600),
+        "abc123",
+        "0123456789abcdef",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(token.expose_secret(), "abc123.0123456789abcdef");
+    let stored = fake
+        .object("v1", "Secret", "kube-system", "bootstrap-token-abc123")
+        .unwrap();
+    assert_eq!(stored["type"], "bootstrap.kubernetes.io/token");
+    let groups = stored["stringData"]["auth-extra-groups"].as_str().unwrap();
+    assert!(
+        groups.contains("system:bootstrappers:buckle:public"),
+        "{groups}"
+    );
+}

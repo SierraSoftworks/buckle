@@ -279,6 +279,68 @@ pub struct ClusterDecl {
     /// How often the cluster's steward reads it when nothing wakes it.
     #[serde(default, skip_serializing_if = "ClusterWatch::is_default")]
     pub watch: ClusterWatch,
+    /// The node pools a host may join, read top to bottom: a `cluster.node`
+    /// `join` is for the first entry the host matches. None declared: the
+    /// scheduler's default pool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<ClusterPool>,
+}
+
+/// One entry of a cluster's `pools`: a pool's name, or a name with the
+/// `when` choosing its hosts. `when` is a trust selector (it reads only
+/// `host.id`, verified tags and reserved labels); without one the entry
+/// matches every node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "PoolRepr", into = "PoolRepr")]
+pub struct ClusterPool {
+    pub name: String,
+    pub when: Option<Filter>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum PoolRepr {
+    Name(String),
+    Entry(PoolEntry),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolEntry {
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    when: Option<Filter>,
+}
+
+impl From<PoolRepr> for ClusterPool {
+    fn from(repr: PoolRepr) -> Self {
+        match repr {
+            PoolRepr::Name(name) => Self { name, when: None },
+            PoolRepr::Entry(PoolEntry { name, when }) => Self { name, when },
+        }
+    }
+}
+
+impl From<ClusterPool> for PoolRepr {
+    fn from(pool: ClusterPool) -> Self {
+        match pool.when {
+            None => PoolRepr::Name(pool.name),
+            when => PoolRepr::Entry(PoolEntry {
+                name: pool.name,
+                when,
+            }),
+        }
+    }
+}
+
+/// The node pool a host joins a cluster in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolChoice<'a> {
+    /// The cluster declares no pools: the scheduler's default one.
+    Default,
+    Named(&'a str),
+    /// Pools are declared and the host matches none of them.
+    Refused,
 }
 
 /// How often a cluster's steward (the agent leasing it) reads the cluster
@@ -389,6 +451,18 @@ impl ClusterDecl {
     /// The selector choosing executors: `executors`, else `nodes`.
     pub fn executors(&self) -> Option<&Filter> {
         self.executors.as_ref().or(self.nodes.as_ref())
+    }
+
+    /// The pool `trusted` (a host's trust context) joins the cluster in: the
+    /// first entry of `pools` it matches.
+    pub fn pool(&self, trusted: &crate::selectors::HostContext) -> PoolChoice<'_> {
+        if self.pools.is_empty() {
+            return PoolChoice::Default;
+        }
+        self.pools
+            .iter()
+            .find(|p| p.when.as_ref().is_none_or(|f| trusted.matches(f)))
+            .map_or(PoolChoice::Refused, |p| PoolChoice::Named(&p.name))
     }
 
     /// The labels as text, the way host labels travel (`true`, `3`, `home`).

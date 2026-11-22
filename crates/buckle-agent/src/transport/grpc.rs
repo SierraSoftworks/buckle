@@ -394,6 +394,51 @@ impl Transport for GrpcTransport {
         Ok(super::convert::secrets_from_proto(Some(bundle)))
     }
 
+    async fn node_operation(
+        &self,
+        request: &buckle_core::task::NodeRequest,
+        revision: Option<&RevisionId>,
+    ) -> buckle_core::Result<buckle_core::task::NodeReply> {
+        let token = self.token();
+        let message = pb::NodeOperationRequest {
+            cluster: request.target.clone(),
+            op: super::convert::node_op_to_proto(request.op) as i32,
+            revision: revision.map(|r| r.0.clone()).unwrap_or_default(),
+            deadline: request.deadline.and_then(|d| d.try_into().ok()),
+        };
+        let reply = self
+            .client()
+            .node_operation(self.request(message, token.as_deref()))
+            .await
+            .map_err(|status| {
+                let advice: &[&str] = match status.code() {
+                    tonic::Code::PermissionDenied | tonic::Code::NotFound => &[
+                        "Check the cluster's `nodes` selector in buckle.yaml, and for a join its `pools`, which read only `host.id`, verified tags and reserved labels.",
+                    ],
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => &[
+                        "The cluster's steward must be connected and reach the cluster; the task is retried on the next run.",
+                    ],
+                    tonic::Code::FailedPrecondition => &[
+                        "Upgrade the agent that stewards the cluster; it predates node operations.",
+                    ],
+                    tonic::Code::Unimplemented => {
+                        &["Upgrade the Buckle server; it predates node operations."]
+                    }
+                    _ => &["Check the server's and the steward's logs for details."],
+                };
+                buckle_core::error::wrap_user(
+                    status,
+                    format!(
+                        "{}'s steward did not {} this host's node.",
+                        request.target, request.op
+                    ),
+                    advice,
+                )
+            })?
+            .into_inner();
+        Ok(super::convert::node_reply_from_proto(reply))
+    }
+
     async fn issue_identity(
         &self,
         request: &crate::identity::IdentityRequest,
@@ -419,6 +464,7 @@ impl Transport for GrpcTransport {
                 Purpose::Deploy => pb::IdentityPurpose::Deploy,
                 Purpose::Drain => pb::IdentityPurpose::Drain,
                 Purpose::Acl => pb::IdentityPurpose::Acl,
+                Purpose::Node => pb::IdentityPurpose::Node,
                 Purpose::Audience => pb::IdentityPurpose::Unspecified,
             } as i32,
             revision: request

@@ -1,8 +1,8 @@
 //! Controller scenarios driven by scripted fake hosts on tokio's paused clock.
 
 use super::controller::{
-    CHECK_DRIFT_CAPABILITY, SCHEDULED_NEEDS_CAPABILITY, SCOPES_CAPABILITY, TARGETS_CAPABILITY,
-    WORKLOADS_CAPABILITY,
+    CHECK_DRIFT_CAPABILITY, NODE_OPS_CAPABILITY, SCHEDULED_NEEDS_CAPABILITY, SCOPES_CAPABILITY,
+    TARGETS_CAPABILITY, WORKLOADS_CAPABILITY,
 };
 use super::model::{HostPhase, RolloutHostRecord, RolloutRecord, STRAGGLERS};
 use super::*;
@@ -81,6 +81,8 @@ struct Script {
     /// The agent does not announce the `scopes` capability (it holds no
     /// target to its bounds), so it never stewards a bounded target.
     no_scopes: bool,
+    /// The agent predates node operations.
+    no_node_ops: bool,
     /// Never answer an Apply aimed at a cluster target (the agent's own
     /// applies are answered).
     silent_target_apply: bool,
@@ -588,6 +590,7 @@ impl Harness {
 
     /// Connects `host` with a Hello naming `unreported` apply revisions.
     fn connect_with(&mut self, host: &str, applied: Option<&str>, unreported: Vec<String>) {
+        let no_node_ops = self.scripts[host].lock().unwrap().no_node_ops;
         let (legacy, no_targets, no_workloads, no_scopes) = {
             let s = self.scripts[host].lock().unwrap();
             (s.legacy_agent, s.no_targets, s.no_workloads, s.no_scopes)
@@ -619,6 +622,7 @@ impl Harness {
                 ]
                 .into_iter()
                 .chain((!no_scopes).then(|| SCOPES_CAPABILITY.to_owned()))
+                .chain((!no_node_ops).then(|| NODE_OPS_CAPABILITY.to_owned()))
                 .collect()
             },
             boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
@@ -4650,6 +4654,62 @@ async fn a_scoped_target_is_served_by_its_clusters_executors_within_its_namespac
     assert_eq!(bounds("public"), ("n1".to_owned(), edge.clone(), vec![]));
     assert_eq!(bounds(CLUSTER), ("n1".to_owned(), vec![], edge));
     assert_eq!(h.steward("public").await.as_deref(), Some("n1"));
+}
+
+/// A node operation goes to the cluster's steward with how to reach the
+/// cluster. Without a steward that can act on nodes it is refused, and so
+/// is one for anything but a cluster.
+#[rstest::rstest]
+#[case::steward("home-nomad", "", Ok(()))]
+#[case::older_agent("home-nomad", "old", Err(CommandErrorKind::Invalid))]
+#[case::steward_offline("home-nomad", "offline", Err(CommandErrorKind::Conflict))]
+#[case::a_host("n1", "", Err(CommandErrorKind::NotFound))]
+#[tokio::test(start_paused = true)]
+async fn a_node_operation_goes_to_the_clusters_steward(
+    #[case] target: &str,
+    #[case] steward: &str,
+    #[case] expected: Result<(), CommandErrorKind>,
+) {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, FLAT)
+        .await;
+    h.enrol("n1", "nomad").await;
+    h.script("n1", |s| s.no_node_ops = steward == "old");
+    h.connect("n1", None);
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::Completed).await;
+    if steward == "offline" {
+        h.disconnect("n1");
+        h.idle(1).await;
+    }
+
+    let sent = h
+        .command(Command::NodeOperation {
+            target: target.into(),
+            op_id: "op-1".into(),
+            op: buckle_proto::v1::NodeOp::Join,
+            node: "n2".into(),
+            pool: "public".into(),
+            revision: "r1".into(),
+            deadline: None,
+        })
+        .await;
+
+    assert_eq!(sent.as_ref().map(|_| ()).map_err(|e| e.kind), expected);
+    let asked: Vec<_> = h
+        .sent(|_, m| matches!(m, SMsg::NodeOperation(_)))
+        .into_iter()
+        .filter_map(|(_, to, m)| match m {
+            SMsg::NodeOperation(n) => Some((to, n)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked.len(), usize::from(expected.is_ok()), "{asked:?}");
+    if let Some((to, op)) = asked.first() {
+        assert_eq!((sent.unwrap().as_str(), to.as_str()), ("n1", "n1"));
+        assert_eq!((op.node.as_str(), op.pool.as_str()), ("n2", "public"));
+        assert_eq!(op.cluster.as_ref().map(|c| c.kind.as_str()), Some("nomad"));
+    }
 }
 
 /// A cluster none of whose candidate executors runs a pipeline per target is

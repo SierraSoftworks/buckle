@@ -29,6 +29,8 @@ pub enum Purpose {
     Drain,
     /// ACL policies, for executors only: never offered to `command.run`.
     Acl,
+    /// Node operations for the cluster's nodes, for executors only.
+    Node,
     /// Not a cluster credential: a token for the `fleet.identities` entry
     /// the request's `target` names, for another system to verify.
     Audience,
@@ -387,6 +389,16 @@ impl buckle_core::task::ClusterCredentials for TaskCredentials {
             Credential::Bearer { token, .. } => token.into(),
         })
     }
+
+    async fn node(
+        &self,
+        request: &buckle_core::task::NodeRequest,
+    ) -> buckle_core::Result<buckle_core::task::NodeReply> {
+        self.credentials
+            .transport
+            .node_operation(request, self.revision.as_ref())
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -612,6 +624,44 @@ mod tests {
                 .contains("did not issue an identity for denied"),
             "{err}"
         );
+    }
+
+    /// A task's node operation travels to the server with the revision
+    /// being run; the token of a join comes back to the task only.
+    #[tokio::test]
+    async fn a_task_asks_the_server_for_a_node_operation() {
+        use buckle_core::task::{ClusterCredentials, NodeOp, NodeRequest};
+        use secrecy::ExposeSecret;
+        let (fleet, _sessions) = crate::tests::fake_server::FakeFleet::new();
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(crate::transport::grpc::GrpcTransport::from_channel(
+            fleet.in_memory_channel(),
+            crate::store::Store::new(dir.path()),
+            Some("boot".into()),
+        ));
+        let tasks = TaskCredentials {
+            credentials: Arc::new(Credentials::new(transport, reqwest::Client::new())),
+            revision: Some(RevisionId::new("abc")),
+        };
+        let ask = |target: &str, op| NodeRequest {
+            target: target.into(),
+            op,
+            deadline: None,
+        };
+
+        let joined = tasks.node(&ask("home-nomad", NodeOp::Join)).await.unwrap();
+        let refused = tasks.node(&ask("denied", NodeOp::Undrain)).await;
+
+        assert!(
+            joined.changed && joined.summary.contains("abc"),
+            "{joined:?}"
+        );
+        assert_eq!(
+            joined.token.as_ref().map(|t| t.expose_secret().to_owned()),
+            Some("join-token".to_owned())
+        );
+        assert!(!format!("{joined:?}").contains("join-token"));
+        assert!(refused.is_err());
     }
 
     #[tokio::test]

@@ -593,6 +593,13 @@ fn validate_cluster(
             );
         }
     }
+    if decl.cluster.is_some() && !decl.pools.is_empty() {
+        report.error(
+            None,
+            format!("{location}.pools"),
+            "a scoped target has no nodes of its own; declare `pools` on its cluster instead",
+        );
+    }
     if let Some(trust) = &decl.trust {
         if decl.cluster.is_some() {
             report.error(
@@ -991,6 +998,10 @@ fleet:
     #[case::kubernetes_workload_by_label(
         &[("buckle.yaml", MIXED_FLEET), ("workloads/a/workload.yaml", "name: a\nwhen: 'cluster.labels.site == \"home\"'\nresources: [a.yaml]\n"), ("workloads/a/files/a.yaml", "")],
         "selects the nomad cluster 'home-nomad'"
+    )]
+    #[case::pools_on_a_scoped_target(
+        &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    c: { kind: nomad, cluster: p, scope: { namespaces: [edge] }, pools: [edge] }\n")],
+        "declare `pools` on its cluster"
     )]
     #[case::scoped_without_namespaces(
         &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    c: { kind: nomad, cluster: p }\n")],

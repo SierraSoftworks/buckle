@@ -479,3 +479,51 @@ async fn a_cluster_bake_ends_when_the_server_moves_past_it() {
     );
     h.stop().await.expect("clean exit");
 }
+
+/// A steward acts on a node as soon as it is asked, with nothing applied
+/// and no lane open, and names the request in its answer. A failure is an
+/// answer too: the host waiting for it is not left to time out.
+#[tokio::test(start_paused = true)]
+async fn a_steward_answers_node_operations() {
+    let nomad = buckle_nomad::testing::FakeNomad::new();
+    nomad.node("n-1", "web-1", "ready", false, false);
+    nomad.node("n-2", "twin", "ready", true, false);
+    nomad.node("n-3", "twin", "ready", true, false);
+    let mut h = Harness::start(Setup {
+        cluster: Some(nomad.clone()),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    assert!(session.hello.capabilities.iter().any(|c| c == "node_ops"));
+    session.send(welcome(None, None)).await;
+    let ask = |op_id: &str, node: &str| {
+        SMsg::NodeOperation(pb::RunNodeOperation {
+            op_id: op_id.into(),
+            target: NOMAD.into(),
+            cluster: Some(cluster("nomad")),
+            op: pb::NodeOp::Undrain as i32,
+            node: node.into(),
+            ..Default::default()
+        })
+    };
+    let done = |m: &AMsg| match m {
+        AMsg::NodeOperation(d) => Some(d.clone()),
+        _ => None,
+    };
+
+    session.send(ask("op-1", "web-1")).await;
+    let undrained = session.expect(done).await;
+    session.send(ask("op-2", "twin")).await;
+    let ambiguous = session.expect(done).await;
+
+    assert_eq!(undrained.op_id, "op-1");
+    let result = undrained.result.expect("it went through");
+    assert!(result.changed && result.eligible, "{result:?}");
+    assert_eq!(
+        nomad.node_state("n-1").unwrap()["SchedulingEligibility"],
+        "eligible"
+    );
+    assert_eq!(ambiguous.op_id, "op-2");
+    assert!(ambiguous.result.is_none() && !ambiguous.error.is_empty());
+}

@@ -81,16 +81,33 @@ impl Executor {
         purpose: Purpose,
         rollout: Option<&str>,
     ) -> buckle_core::Result<(Kube, Option<chrono::DateTime<Utc>>)> {
+        let access = super::Access {
+            target: &a.target,
+            spec: &a.spec,
+            revision: Some(&a.revision.id),
+            secrets: Some(&a.secrets),
+        };
+        self.kube_as(access, purpose, rollout).await
+    }
+
+    /// A Kubernetes client for a cluster carrying a credential for
+    /// `purpose`, and when the credential expires.
+    pub(super) async fn kube_as(
+        &self,
+        a: super::Access<'_>,
+        purpose: Purpose,
+        rollout: Option<&str>,
+    ) -> buckle_core::Result<(Kube, Option<chrono::DateTime<Utc>>)> {
         let kube = self
             .connect
-            .kubernetes(&a.target, &a.spec)?
+            .kubernetes(a.target, a.spec)?
             .home(a.spec.bounds.home());
         match &a.spec.identity {
             ClusterIdentity::BuckleJwt => {
                 let request = IdentityRequest {
-                    target: a.target.clone(),
+                    target: a.target.to_owned(),
                     purpose,
-                    revision: Some(a.revision.id.clone()),
+                    revision: a.revision.cloned(),
                     rollout: rollout.map(str::to_owned),
                 };
                 let credential = self.credentials.get(&request, &Login::Kubernetes).await?;
@@ -102,7 +119,7 @@ impl Executor {
                 Ok((kube, Some(expires)))
             }
             ClusterIdentity::Local | ClusterIdentity::Workload => Ok((kube, None)),
-            ClusterIdentity::Secret(name) => match a.secrets.get(name) {
+            ClusterIdentity::Secret(name) => match a.secrets.and_then(|s| s.get(name)) {
                 Some(secret) => Ok((kube.token(ApiSink.credential(secret)), None)),
                 None => Err(buckle_core::error::user(
                     format!(

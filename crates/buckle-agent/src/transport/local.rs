@@ -83,6 +83,9 @@ pub fn log_report(report: &Report) {
                 "cluster reachability"
             )
         }
+        Report::NodeOperation { op_id, result } => {
+            tracing::info!(%op_id, ok = result.is_ok(), "node operation")
+        }
         Report::Heartbeat { busy, .. } => tracing::debug!(busy, "heartbeat"),
         Report::Plan(plan) => tracing::info!(
             revision = %plan.revision.short(),

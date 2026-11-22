@@ -69,13 +69,12 @@ counts as a change, which is what fires handlers. `unless` and `only_if` also ru
 ```
 
 ```yaml
-# Drain this node before a reboot, with a credential the server issues for the cluster.
+# Read this node's allocations with a credential the server issues for the cluster.
 - command.run:
-    run: ["nomad", "node", "drain", "-self", "-enable", "-deadline", "10m", "-yes"]
-    unless: >-
-      nomad node status -self -json | grep -Eq '"SchedulingEligibility": *"ineligible"'
-    identity: { cluster: home-nomad }   # purpose: drain, passed as NOMAD_TOKEN
-  id: nomad-drain
+    run: ["nomad", "node", "status", "-self", "-short"]
+    identity: { cluster: home-nomad, purpose: read }   # passed as NOMAD_TOKEN
+    changed_when: never
+  id: nomad-node-status
 ```
 
 ```yaml
@@ -92,9 +91,10 @@ counts as a change, which is what fires handlers. `unless` and `only_if` also ru
 target, which reaches the command and its probes (not `remove`) in `env`. It is handled like a
 secret: never planned, logged or stored, and output is not captured unless `capture: always`.
 
-- **Grant**: `drain` (the default) goes to the cluster's `nodes`, `read` and `deploy` to its
-  `executors`; the cluster needs `identity: buckle_jwt` and the trust setup in
-  [the server docs](../../agent/server.md).
+- **Grant**: `read` and `deploy` go to the cluster's `executors`, `drain` (the default, kept for
+  fleets that still bind it) to its `nodes`; the cluster needs `identity: buckle_jwt` and the
+  trust setup in [the server docs](../../agent/server.md). To drain or undrain a node, use
+  [`cluster.node`](#cluster-node), which needs no credential on the host.
 - **Exchange**: Nomad logs in through the `buckle` auth method at `api`, else `NOMAD_ADDR`, else
   `http://127.0.0.1:4646`; Kubernetes (`kind: kubernetes`) takes the JWT as a bearer token.
 - **Audience**: `identity: { audience: NAME }` instead names a
@@ -110,3 +110,47 @@ non-zero exit rather than an error.
 A `command.run` is identified by its rendered command, so changing a variable inside `run` looks
 like removing one command and adding another. Give a templated command a stable `id` (`buckle
 validate` warns when one is missing); one with a `remove` command must have one.
+
+## cluster.node
+
+An operation on this host's own node of a cluster, done by the cluster's
+[steward](../fleet.md#stewards). The host holds no cluster credential: it asks the server, the
+server checks that it matches the cluster's `nodes`, and the steward acts on the node named like
+the host.
+
+```yaml
+# Hand the node back after a reboot. Its state is read on every plan, so a drift pass
+# corrects a node it finds out of scheduling; `retry` waits for a client that is still starting.
+- cluster.node: { cluster: home-nomad, op: undrain }
+  when: '!(host.labels.maintenance == true)'
+  retry: { limit: 6, delay: 10s }
+
+# Take the node out for maintenance.
+- cluster.node: { cluster: home-nomad, op: drain, deadline: 10m }
+  when: 'host.labels.maintenance == true'
+
+# A token to join with, for the pool the server picks; skipped once the node has joined.
+- cluster.node:
+    cluster: home-nomad
+    op: join
+    dest: /etc/nomad.d/intro.jwt
+    unless: test -s /opt/nomad/data/client/client-id
+```
+
+| `op` | Nomad | Kubernetes |
+|---|---|---|
+| `undrain` | Stops a drain, marks the node eligible. | Uncordons the node. |
+| `drain` | Starts a drain with `deadline` (default `1h`); a node already ineligible is left alone. | Cordons the node and evicts its pods (not DaemonSet or static ones); a cordoned node is left alone. |
+| `join` | A client introduction token for the node's name, valid 10 minutes. | A bootstrap token (`<id>.<secret>`), valid 10 minutes. |
+
+<KindReference registry="tasks" kind="cluster.node" />
+
+- **Who may ask**: a host matching the cluster's `nodes`, for the node of its own name only
+  (Nomad's `name`, the Kubernetes node name: the host's id). Never for a scoped target.
+- **Pool**: a `join` is for the first entry of the cluster's [`pools`](../fleet.md#node-pools)
+  the host matches, decided from what the server verified; with pools declared and no match there
+  is no token.
+- **Needs**: the server and the cluster's steward reachable, and a steward agent that announces
+  `node_ops`. Otherwise the task fails and the next run asks again. Local runs have no server.
+- **Audit**: `target.node.undrain`, `target.node.drain` and `target.node.join`, with the node and
+  pool; reading a node's state while planning is not audited. A join token is never stored.

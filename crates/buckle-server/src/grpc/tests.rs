@@ -177,6 +177,7 @@ async fn server_full(
             .unwrap(),
         ),
         workload: Default::default(),
+        node_ops: Default::default(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1344,6 +1345,9 @@ fleet:
       kind: nomad
       nodes: 'host.labels.nomad == true'
       executors: 'host.labels.role == "server"'
+      pools:
+        - { name: public, when: 'host.labels.role == "edge"' }
+        - { name: boundary, when: 'host.facts.tailscale.tags contains "tag:z2"' }
     tagged-nomad:
       kind: nomad
       executors: 'host.facts.tailscale.tags contains "tag:buckle"'
@@ -1439,6 +1443,157 @@ async fn audit_actions(s: &Server) -> Vec<(String, String)> {
         })
         .await
         .unwrap()
+}
+
+async fn node_operation(
+    s: &Server,
+    token: &str,
+    cluster: &str,
+    op: buckle_proto::v1::NodeOp,
+) -> tonic::Code {
+    let mut client = FleetClient::connect(format!("http://{}", s.addr))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(buckle_proto::v1::NodeOperationRequest {
+        cluster: cluster.into(),
+        op: op as i32,
+        ..Default::default()
+    });
+    request
+        .metadata_mut()
+        .insert(buckle_proto::TOKEN_METADATA_KEY, token.parse().unwrap());
+    match client.node_operation(request).await {
+        Ok(_) => tonic::Code::Ok,
+        Err(status) => status.code(),
+    }
+}
+
+/// A host may ask for an operation on its own node of a cluster it is a
+/// node of, and a join only for a pool the server picks from what it set
+/// itself. A request that passes is handed to the steward (none is
+/// connected here, hence `Unavailable`); every refusal is audited.
+#[rstest::rstest]
+#[case::node_asks(&[], &[("nomad", "true")], "home-nomad", buckle_proto::v1::NodeOp::Undrain, tonic::Code::Unavailable)]
+#[case::outsider(&[], &[("role", "server")], "home-nomad", buckle_proto::v1::NodeOp::Undrain, tonic::Code::PermissionDenied)]
+#[case::scoped_target(&[], &[("nomad", "true")], "public-nomad", buckle_proto::v1::NodeOp::Drain, tonic::Code::PermissionDenied)]
+#[case::unknown_cluster(&[], &[("nomad", "true")], "elsewhere", buckle_proto::v1::NodeOp::Drain, tonic::Code::NotFound)]
+#[case::join_in_its_pool(&[], &[("nomad", "true"), ("role", "edge")], "home-nomad", buckle_proto::v1::NodeOp::Join, tonic::Code::Unavailable)]
+#[case::join_outside_every_pool(&[], &[("nomad", "true")], "home-nomad", buckle_proto::v1::NodeOp::Join, tonic::Code::PermissionDenied)]
+#[case::join_on_a_reported_label(&[("role", "edge")], &[("nomad", "true")], "home-nomad", buckle_proto::v1::NodeOp::Join, tonic::Code::PermissionDenied)]
+#[tokio::test]
+async fn node_operations_are_checked_before_they_reach_a_steward(
+    #[case] reported: &[(&str, &str)],
+    #[case] labels: &[(&str, &str)],
+    #[case] cluster: &str,
+    #[case] op: buckle_proto::v1::NodeOp,
+    #[case] expected: tonic::Code,
+) {
+    let (s, token) = identity_host_reporting(reported, labels).await;
+
+    assert_eq!(node_operation(&s, &token, cluster, op).await, expected);
+
+    let audited: Vec<(String, String)> = s
+        .store
+        .call(|db| {
+            let filter = crate::store::AuditFilter {
+                limit: 100,
+                ..Default::default()
+            };
+            Ok(db
+                .audit()
+                .list(&filter)?
+                .0
+                .into_iter()
+                .filter(|e| e.action.starts_with("target.node"))
+                .map(|e| (e.action, e.outcome))
+                .collect())
+        })
+        .await
+        .unwrap();
+    let action = format!("target.node.{}", op.as_str_name()[8..].to_lowercase());
+    let outcome = match expected {
+        tonic::Code::Unavailable => "failed",
+        _ => "denied",
+    };
+    assert_eq!(audited, vec![(action, outcome.to_owned())]);
+}
+
+/// The whole path: the host asks, the cluster's steward is handed the
+/// operation on the host's own node, and its answer returns to the host.
+#[tokio::test]
+async fn a_node_operation_is_answered_by_the_clusters_steward() {
+    let (s, token) = identity_host(&[("role", "server"), ("nomad", "true")]).await;
+    // Reconnecting with the stable revision in place makes pi-1 the steward.
+    let mut again = hello("pi-1", &token, "2.0.0");
+    if let Some(agent_message::Msg::Hello(h)) = &mut again.msg {
+        h.capabilities = ["targets", "workloads", "scopes", "node_ops"]
+            .map(String::from)
+            .to_vec();
+    }
+    let (tx, mut stream, reply) = open(s.addr, again).await;
+    expect_welcome(reply);
+
+    let asking = {
+        let (addr, token) = (s.addr, token.clone());
+        tokio::spawn(async move {
+            let mut client = FleetClient::connect(format!("http://{addr}"))
+                .await
+                .unwrap();
+            // The lease follows the Welcome; ask until the steward is known.
+            loop {
+                let mut request = tonic::Request::new(buckle_proto::v1::NodeOperationRequest {
+                    cluster: "home-nomad".into(),
+                    op: buckle_proto::v1::NodeOp::Undrain as i32,
+                    ..Default::default()
+                });
+                request
+                    .metadata_mut()
+                    .insert(buckle_proto::TOKEN_METADATA_KEY, token.parse().unwrap());
+                match client.node_operation(request).await {
+                    Err(status) if status.code() == tonic::Code::Unavailable => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await
+                    }
+                    other => return other.map(|r| r.into_inner()),
+                }
+            }
+        })
+    };
+    let asked = loop {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), stream.message())
+            .await
+            .expect("the steward is asked")
+            .unwrap()
+            .unwrap();
+        if let Some(server_message::Msg::NodeOperation(op)) = next.msg {
+            break op;
+        }
+    };
+    assert_eq!(
+        (asked.target.as_str(), asked.node.as_str()),
+        ("home-nomad", "pi-1")
+    );
+    assert_eq!(asked.op(), buckle_proto::v1::NodeOp::Undrain);
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::NodeOperation(
+            buckle_proto::v1::NodeOperationDone {
+                op_id: asked.op_id,
+                result: Some(buckle_proto::v1::NodeOperationResult {
+                    registered: true,
+                    eligible: true,
+                    changed: true,
+                    summary: "handed pi-1 back".into(),
+                    ..Default::default()
+                }),
+                error: String::new(),
+            },
+        )),
+    })
+    .await
+    .unwrap();
+
+    let result = asking.await.unwrap().expect("answered");
+    assert!(result.changed && result.eligible);
+    assert_eq!(result.summary, "handed pi-1 back");
 }
 
 #[rstest::rstest]

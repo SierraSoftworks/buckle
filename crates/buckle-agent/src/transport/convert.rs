@@ -41,7 +41,9 @@ fn json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
 /// when an instruction names one, and echoes the workload on its reports),
 /// `check_drift` (it runs a drift pass when the server asks) and
 /// `scheduled_needs` (it plans modules whose `needs` name a group, or a
-/// module its host does not run: the rollout orders those).
+/// module its host does not run: the rollout orders those), `scopes` (it
+/// holds a cluster target to its bounds) and `node_ops` (as a cluster's
+/// steward it acts on the cluster's nodes for their hosts).
 pub const CAPABILITIES: &[&str] = &[
     "force_plan",
     "approval_digest",
@@ -50,7 +52,60 @@ pub const CAPABILITIES: &[&str] = &[
     "check_drift",
     "scheduled_needs",
     "scopes",
+    "node_ops",
 ];
+
+/// A node operation on the wire.
+pub fn node_op_to_proto(op: buckle_core::task::NodeOp) -> pb::NodeOp {
+    use buckle_core::task::NodeOp;
+    match op {
+        NodeOp::Status => pb::NodeOp::Status,
+        NodeOp::Undrain => pb::NodeOp::Undrain,
+        NodeOp::Drain => pb::NodeOp::Drain,
+        NodeOp::Join => pb::NodeOp::Join,
+    }
+}
+
+fn node_op_from_proto(op: pb::NodeOp) -> Option<buckle_core::task::NodeOp> {
+    use buckle_core::task::NodeOp;
+    match op {
+        pb::NodeOp::Unspecified => None,
+        pb::NodeOp::Status => Some(NodeOp::Status),
+        pb::NodeOp::Undrain => Some(NodeOp::Undrain),
+        pb::NodeOp::Drain => Some(NodeOp::Drain),
+        pb::NodeOp::Join => Some(NodeOp::Join),
+    }
+}
+
+/// A node operation's result as the server sent it.
+pub fn node_reply_from_proto(r: pb::NodeOperationResult) -> buckle_core::task::NodeReply {
+    buckle_core::task::NodeReply {
+        registered: r.registered,
+        eligible: r.eligible,
+        draining: r.draining,
+        changed: r.changed,
+        summary: r.summary,
+        pool: r.pool,
+        token: (!r.token.is_empty()).then(|| r.token.into()),
+    }
+}
+
+fn node_reply_to_proto(r: &buckle_core::task::NodeReply) -> pb::NodeOperationResult {
+    use secrecy::ExposeSecret;
+    pb::NodeOperationResult {
+        registered: r.registered,
+        eligible: r.eligible,
+        draining: r.draining,
+        changed: r.changed,
+        summary: r.summary.clone(),
+        pool: r.pool.clone(),
+        token: r
+            .token
+            .as_ref()
+            .map(|t| t.expose_secret().to_owned())
+            .unwrap_or_default(),
+    }
+}
 
 /// The protobuf Hello.
 pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
@@ -185,6 +240,20 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
         Msg::CheckDrift(c) => Instruction::CheckDrift {
             target: non_empty(c.target),
             workload: non_empty(c.workload),
+        },
+        Msg::NodeOperation(n) => match node_op_from_proto(n.op()) {
+            Some(op) => Instruction::NodeOperation {
+                op_id: n.op_id,
+                target: n.target,
+                cluster: n.cluster.map(cluster_from_proto),
+                op,
+                node: n.node,
+                pool: non_empty(n.pool),
+                revision: non_empty(n.revision).map(RevisionId),
+                deadline: duration_from_proto(n.deadline.as_ref()),
+            },
+            // An operation a newer server knows: nothing this agent can do.
+            None => Instruction::Ping,
         },
         Msg::Plan(p) => Instruction::RequestPlan {
             revision: RevisionId(p.revision),
@@ -626,6 +695,11 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
         Report::RebootFailed { boot_id, error } => Msg::RebootFailed(pb::RebootFailed {
             boot_id: boot_id.clone().unwrap_or_default(),
             error: error.clone(),
+        }),
+        Report::NodeOperation { op_id, result } => Msg::NodeOperation(pb::NodeOperationDone {
+            op_id: op_id.clone(),
+            result: result.as_ref().ok().map(node_reply_to_proto),
+            error: result.as_ref().err().cloned().unwrap_or_default(),
         }),
         Report::TargetStatus { reachable, error } => Msg::TargetStatus(pb::TargetStatus {
             target: String::new(),

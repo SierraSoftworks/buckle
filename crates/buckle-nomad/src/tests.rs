@@ -811,3 +811,83 @@ async fn a_scoped_target_keeps_its_index_and_orphan_search_inside_its_scope() {
         fake.requests()
     );
 }
+
+/// What a steward does to a node, by the state it finds it in: an
+/// operation that is already satisfied changes nothing.
+#[rstest::rstest]
+#[case::undrain_marks_a_drained_node_eligible("undrain", false, false, true, true, false)]
+#[case::undrain_stops_a_drain("undrain", false, true, true, true, false)]
+#[case::undrain_leaves_an_eligible_node("undrain", true, false, false, true, false)]
+#[case::drain_starts_on_an_eligible_node("drain", true, false, true, false, true)]
+#[case::drain_leaves_a_drained_node("drain", false, false, false, false, false)]
+#[tokio::test]
+async fn node_operations_converge(
+    #[case] op: &str,
+    #[case] eligible: bool,
+    #[case] draining: bool,
+    #[case] changed: bool,
+    #[case] eligible_after: bool,
+    #[case] draining_after: bool,
+) {
+    use crate::nodes;
+    let fake = FakeNomad::new();
+    fake.node("n-old", "web-1", "down", true, false);
+    fake.node("n-1", "web-1", "ready", eligible, draining);
+    fake.node("n-2", "web-2", "ready", true, false);
+    let nomad = fake.client();
+
+    let node = nodes::find(&nomad, "web-1").await.unwrap().unwrap();
+    assert_eq!(node.id, "n-1", "the node that went down is not the host");
+    let did = match op {
+        "undrain" => nodes::undrain(&nomad, &node).await.unwrap(),
+        _ => nodes::drain(&nomad, &node, std::time::Duration::from_secs(600))
+            .await
+            .unwrap(),
+    };
+
+    assert_eq!(did, changed);
+    let after = nodes::find(&nomad, "web-1").await.unwrap().unwrap();
+    assert_eq!(
+        (after.eligible, after.draining),
+        (eligible_after, draining_after)
+    );
+    let other = nodes::find(&nomad, "web-2").await.unwrap().unwrap();
+    assert!(
+        other.eligible && !other.draining,
+        "only the named node is touched"
+    );
+}
+
+#[tokio::test]
+async fn a_node_the_scheduler_cannot_tell_apart_is_refused() {
+    use crate::nodes;
+    let fake = FakeNomad::new();
+    fake.node("n-1", "web-1", "ready", true, false);
+    fake.node("n-2", "web-1", "ready", true, false);
+    let nomad = fake.client();
+
+    assert!(nodes::find(&nomad, "web-1").await.is_err());
+    assert_eq!(nodes::find(&nomad, "web-9").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn an_introduction_token_names_the_node_and_its_pool() {
+    use crate::nodes;
+    use secrecy::ExposeSecret;
+    let fake = FakeNomad::new();
+    let nomad = fake.client();
+    let ttl = std::time::Duration::from_secs(600);
+
+    let token = nodes::introduction_token(&nomad, "web-1", Some("public"), ttl)
+        .await
+        .unwrap();
+    nodes::introduction_token(&nomad, "web-2", None, ttl)
+        .await
+        .unwrap();
+
+    assert_eq!(token.expose_secret(), "intro:web-1:public");
+    let asked = fake.introductions();
+    assert_eq!(asked[0]["NodeName"], "web-1");
+    assert_eq!(asked[0]["NodePool"], "public");
+    assert!(asked[1]["NodePool"].is_null(), "no pool: Nomad's default");
+}

@@ -90,3 +90,4 @@ same time, even in different modules), and what happens on removal.
 | Kind | Use it to |
 |---|---|
 | [`command.run`](./commands.md#command-run) | Run anything else, guarded so it stays plannable. |
+| [`cluster.node`](./commands.md#cluster-node) | Have a cluster's steward undrain, drain or issue a join token for this host's node. |
