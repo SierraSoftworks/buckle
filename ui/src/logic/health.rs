@@ -12,6 +12,9 @@ use super::tone::Tone;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CheckState {
     Pass,
+    /// Its module (a cluster's: workload) is suspended: not read, and
+    /// failing nothing.
+    Paused,
     /// An informational check failing: worth seeing, never gating.
     Informational,
     /// The check could not run.
@@ -23,6 +26,7 @@ impl CheckState {
     pub fn of(status: &str, required: bool) -> Self {
         match status {
             "pass" => Self::Pass,
+            "paused" => Self::Paused,
             "fail" if !required => Self::Informational,
             "fail" => Self::Fail,
             _ => Self::Unknown,
@@ -32,7 +36,7 @@ impl CheckState {
     pub fn tone(self) -> Tone {
         match self {
             Self::Pass => Tone::Ok,
-            Self::Informational => Tone::Mute,
+            Self::Paused | Self::Informational => Tone::Mute,
             Self::Unknown => Tone::Warn,
             Self::Fail => Tone::Danger,
         }
@@ -41,6 +45,7 @@ impl CheckState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Pass => "passing",
+            Self::Paused => "paused",
             Self::Informational => "failing (informational)",
             Self::Unknown => "unknown",
             Self::Fail => "failing",
@@ -50,6 +55,7 @@ impl CheckState {
     pub fn slug(self) -> &'static str {
         match self {
             Self::Pass => "pass",
+            Self::Paused => "paused",
             Self::Informational => "info",
             Self::Unknown => "unknown",
             Self::Fail => "fail",
@@ -185,6 +191,7 @@ mod tests {
             ("fail", true, CheckState::Fail),
             ("fail", false, CheckState::Informational),
             ("unknown", true, CheckState::Unknown),
+            ("paused", true, CheckState::Paused),
         ] {
             assert_eq!(
                 CheckState::of(status, required),
@@ -198,7 +205,8 @@ mod tests {
     fn severity_puts_required_failures_first() {
         assert!(CheckState::Fail > CheckState::Unknown);
         assert!(CheckState::Unknown > CheckState::Informational);
-        assert!(CheckState::Informational > CheckState::Pass);
+        assert!(CheckState::Informational > CheckState::Paused);
+        assert!(CheckState::Paused > CheckState::Pass);
     }
 
     #[test]

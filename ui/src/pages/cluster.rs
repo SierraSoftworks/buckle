@@ -22,6 +22,7 @@ use crate::app::{Route, use_auth};
 use crate::components::{
     Button, Confirm, ErrorState, Kind, Loading, PageHead, Panel, Pill, Refresh, RouteLink,
     SplitButton, icons, target_items, use_drift_check, use_target_actions, use_toast,
+    use_unit_changes, use_unit_pause,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::controls::{TargetAction, TargetStanding, head_actions};
@@ -51,6 +52,7 @@ pub fn cluster_page(props: &Props) -> Html {
     let toast = use_toast();
     let navigator = use_navigator();
     let detail = use_fetch(props.id.clone(), |id| async move { api::host(&id).await });
+    use_unit_changes(&detail);
     let live = use_live_value(&detail, apply_host_detail);
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
@@ -83,6 +85,7 @@ pub fn cluster_page(props: &Props) -> Html {
         )
     };
     let check_drift = use_drift_check(detail.reload.clone());
+    let unit_pause = use_unit_pause(detail.reload.clone());
     let store = use_live();
     let newest = live.as_ref().and_then(|d| {
         let events = detail
@@ -448,10 +451,12 @@ pub fn cluster_page(props: &Props) -> Html {
                     aside={executors} />
             </div>
             <ModulesPanel detail={d.clone()} cluster=true on_action={on_action.clone()} on_check_drift={on_check_drift.clone()} newest={newest.clone()} picked={(*picked).clone()}
+                on_pause={admin.then(|| unit_pause.on_ask.clone())} reachable={can_act}
                 on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             <Panel title="Recent runs">{ runs(&d, now, shown, &show_run) }</Panel>
             { dialog.unwrap_or_default() }
             { target_actions.dialog }
+            { unit_pause.dialog }
         </div>
     }
 }

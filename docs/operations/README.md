@@ -33,6 +33,9 @@ it to open the host.
 
 <Screenshot name="overview-fleet" alt="The fleet map: one block per host, grouped by rollout stage" />
 
+**Suspended** follows while any module or workload is [suspended](./hosts.md#suspending-a-module-or-a-workload):
+what, where, why and since when, with those due a review first.
+
 The bell at the top right of every page counts what needs attention: registrations waiting for
 approval, offline agents, agents on an unexpected version, and the live rollout's failed, held or
 stale-plan hosts. Click it for the list.

@@ -233,6 +233,9 @@ pub struct HostDetail {
     /// selected workload's implicit and extra actions), in module order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<ActionInfo>,
+    /// The modules (a cluster's: workloads) suspended on this target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paused_units: Vec<PausedUnit>,
 }
 
 /// An action an operator can run on a target

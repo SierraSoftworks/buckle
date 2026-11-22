@@ -365,6 +365,50 @@ pub async fn run_action(
     .await
 }
 
+/// Suspends (or, with `resume`, resumes) `unit` on `target`: a host's
+/// module, or with `workload` a cluster's workload. Returns the run of its
+/// `@suspend` or `@resume` hook, when it has one.
+pub async fn pause_unit(
+    target: &str,
+    unit: &str,
+    workload: bool,
+    resume: bool,
+    note: String,
+    review_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<String>, ApiError> {
+    demo!(demo_store::pause_unit(
+        target, unit, resume, &note, review_at
+    ));
+    let done: buckle_api::UnitsResponse = write(
+        Method::Post,
+        if resume {
+            "/units/resume"
+        } else {
+            "/units/suspend"
+        },
+        Some(&buckle_api::UnitsRequest {
+            target: Some(target.to_owned()),
+            unit: Some(unit.to_owned()),
+            workload,
+            note,
+            review_at,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    match done.units.into_iter().next() {
+        Some(buckle_api::UnitOutcome { error: Some(e), .. }) => Err(ApiError::Conflict(e)),
+        Some(o) => Ok(o.run),
+        None => Ok(None),
+    }
+}
+
+/// Every unit suspended across the fleet.
+pub async fn paused_units() -> Result<Vec<buckle_api::PausedUnit>, ApiError> {
+    demo!(demo_store::paused_units());
+    get("/units/paused").await
+}
+
 /// Every action the fleet offers now, with the targets offering it that
 /// `selector` matches (blank: every target).
 pub async fn fleet_actions(selector: &str) -> Result<Vec<buckle_api::FleetAction>, ApiError> {

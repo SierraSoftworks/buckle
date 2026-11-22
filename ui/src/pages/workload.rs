@@ -18,7 +18,7 @@ use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::{
     Empty, ErrorState, Loading, PageHead, Panel, Pill, Refresh, RouteLink, WorkloadActions,
-    use_actions, use_drift_check, use_workload_rollout,
+    use_actions, use_drift_check, use_unit_changes, use_unit_pause, use_workload_rollout,
 };
 use crate::hooks::{use_fetch, use_live_value};
 use crate::logic::format::{count, rollout_label};
@@ -45,6 +45,7 @@ pub fn workload_page(props: &Props) -> Html {
         .and_then(|l| l.query::<Query>().ok())
         .and_then(|q| q.cluster);
     let data = use_fetch((), |_| cluster_details());
+    use_unit_changes(&data);
     let rollouts = use_workload_rollout();
     let check_drift = use_drift_check(data.reload.clone());
     let fleet = use_fetch((), |_| api::fleet());
@@ -234,6 +235,7 @@ fn placements(props: &PlacementsProps) -> Html {
         use_actions(Callback::from(move |_| reload.emit(())))
     };
     let check_drift = use_drift_check(props.reload.clone());
+    let unit_pause = use_unit_pause(props.reload.clone());
     let can_act = |d: &HostDetail| {
         props.admin
             && d.summary.status == HostStatus::Active
@@ -266,12 +268,14 @@ fn placements(props: &PlacementsProps) -> Html {
                             });
                             html! {
                                 <PlacementRow key={d.summary.id.clone()} detail={d.clone()} workload={props.workload.clone()}
-                                    {on_action} {on_check_drift} focus={props.details.len() == 1 || props.focus.as_deref() == Some(d.summary.id.as_str())} />
+                                    {on_action} {on_check_drift} on_pause={props.admin.then(|| unit_pause.on_ask.clone())}
+                                    reachable={can_act(d)} focus={props.details.len() == 1 || props.focus.as_deref() == Some(d.summary.id.as_str())} />
                             }
                         }) }
                     </tbody>
             </yewi::SimpleTable>
             { actions.dialog.clone() }
+            { unit_pause.dialog.clone() }
         </Panel>
     }
 }

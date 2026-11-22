@@ -26,7 +26,8 @@ use crate::components::{
     Button, Confirm, DiffView, Empty, ErrorBlock, ErrorState, JsonTree, Kind, Loading, MenuItem,
     PageHead, Panel, Pill, Refresh, RouteLink, SplitButton, TraceLink, action_items,
     changes::{RunChanges, Took},
-    host_state_pills, target_items, use_drift_check, use_target_actions, use_toast,
+    host_state_pills, target_items, use_drift_check, use_host_approval, use_target_actions,
+    use_toast, use_unit_changes, use_unit_pause,
 };
 use crate::hooks::{use_debounced, use_fetch, use_live_value, use_now};
 use crate::logic::controls::{TargetAction, TargetStanding, head_actions};
@@ -35,7 +36,7 @@ use crate::logic::format::{
     commit, relative, relative_opt, rollout_label, short, short_duration, timestamp,
 };
 use crate::logic::health::CheckState;
-use crate::logic::labels::{Change, Row, changes, collect, effective, rows};
+use crate::logic::labels::{Change, Row, changes, effective, join, split};
 use crate::logic::live::{apply_fleet, apply_host_detail};
 use crate::logic::run::newest_run;
 use crate::logic::tone::{Tone, check_status_tone, outcome_tone};
@@ -48,7 +49,6 @@ pub struct Props {
 
 #[derive(Clone, PartialEq)]
 enum Ask {
-    Approve,
     Pause,
     Resume,
     Upgrade,
@@ -62,6 +62,7 @@ pub fn host_page(props: &Props) -> Html {
     let toast = use_toast();
     let navigator = use_navigator();
     let detail = use_fetch(props.id.clone(), |id| async move { api::host(&id).await });
+    use_unit_changes(&detail);
     let live = use_live_value(&detail, apply_host_detail);
     let fleet = use_fetch((), |_| api::fleet());
     let fleet = use_live_value(&fleet, apply_fleet);
@@ -96,6 +97,8 @@ pub fn host_page(props: &Props) -> Html {
         )
     };
     let check_drift = use_drift_check(detail.reload.clone());
+    let unit_pause = use_unit_pause(detail.reload.clone());
+    let approval = use_host_approval(detail.reload.clone());
     let store = use_live();
     // A run that started since the detail was fetched is the newest.
     let newest = live.as_ref().and_then(|d| {
@@ -171,9 +174,6 @@ pub fn host_page(props: &Props) -> Html {
             let forgot = what == Ask::Forget;
             wasm_bindgen_futures::spawn_local(async move {
                 let result = match what {
-                    Ask::Approve => api::host_action(&id, "approve")
-                        .await
-                        .map(|_| format!("{id} approved.")),
                     Ask::Pause => api::host_action(&id, "pause").await.map(|_| {
                         format!("{id} paused: excluded from rollouts and drift correction.")
                     }),
@@ -242,7 +242,11 @@ pub fn host_page(props: &Props) -> Html {
             forgettable: true,
         });
         let mut modules: Vec<MenuItem> = if can_act {
-            action_items(&d.actions, &on_action, Some("Module actions"))
+            action_items(
+                &crate::logic::pause::runnable(&d.actions, &d.paused_units),
+                &on_action,
+                Some("Module actions"),
+            )
         } else {
             Vec::new()
         };
@@ -251,7 +255,10 @@ pub fn host_page(props: &Props) -> Html {
             &h.id,
         ));
         let items = target_items(&own, primary, modules, |a| match a {
-            TargetAction::ApproveRegistration => open(Ask::Approve),
+            TargetAction::ApproveRegistration => approval.on_ask.reform({
+                let h = h.clone();
+                move |_: MouseEvent| h.clone()
+            }),
             TargetAction::ApproveRollout => {
                 let (navigator, id) = (navigator.clone(), review.clone().unwrap_or_default());
                 Callback::from(move |_: MouseEvent| {
@@ -294,8 +301,6 @@ pub fn host_page(props: &Props) -> Html {
 
     let dialog = ask.as_ref().map(|a| {
         let (title, label, danger, body, typed): (String, String, bool, Html, Option<AttrValue>) = match a {
-            Ask::Approve => (format!("Approve {}", h.id), format!("Approve {}", h.id), false,
-                html! { <p>{ "The host joins the fleet, is assigned the stable revision and is selected by the next rollout." }</p> }, None),
             Ask::Pause => (format!("Pause {}", h.id), format!("Pause {}", h.id), false,
                 html! { <p>{ "A paused host stays in the fleet but is excluded from rollouts and drift correction until resumed." }</p> }, None),
             Ask::Resume => (format!("Resume {}", h.id), format!("Resume {}", h.id), false,
@@ -343,10 +348,19 @@ pub fn host_page(props: &Props) -> Html {
                             None => html! { <span class="muted">{ "nothing yet" }</span> },
                         }),
                         ("Groups", html! { <>{ for h.groups.iter().map(|g| html! { <Badge>{ g.clone() }</Badge> }) }</> }),
+                        ("Verified tags", match &h.verified_tags {
+                            Some(tags) if !tags.is_empty() => html! {
+                                <span data-testid="verified-tags" title="The ACL tags the server's own tailscaled verified for this host: what trust selectors read as host.facts.tailscale.tags">
+                                    { for tags.iter().map(|t| html! { <Badge mono=true>{ t.clone() }</Badge> }) }
+                                </span>
+                            },
+                            _ => html! { <span class="muted" data-testid="verified-tags" title="The server verified the host over the tailnet, and it carries no ACL tags">{ "none" }</span> },
+                        }),
                         ("Enrolled", html! { <span title={timestamp(h.first_seen)}>{ relative(h.first_seen, now) }</span> }),
                         ("Health read", html! { <span title={h.health_at.map(timestamp)}>{ relative_opt(h.health_at, now) }</span> }),
                         ("Drift checked", html! { <span title={h.drift_at.map(timestamp)} data-testid="drift-at">{ relative_opt(h.drift_at, now) }</span> }),
-                    ]) }
+                    // Only a host the server authenticated over the tailnet has tags to verify.
+                    ].into_iter().filter(|(label, _)| *label != "Verified tags" || h.verified_tags.is_some()).collect()) }
                     <NotesEditor id={h.id.clone()} notes={h.notes.clone()} admin={admin} on_saved={detail.reload.clone()} embedded=true />
                 </Panel>
                 <LabelsEditor detail={d.clone()} admin={admin} rollout_active={active.is_some()} on_saved={detail.reload.clone()} />
@@ -369,6 +383,7 @@ pub fn host_page(props: &Props) -> Html {
                 </Panel>
             }
             <ModulesPanel detail={d.clone()} on_action={module_actions.clone()} newest={newest.clone()} picked={(*picked).clone()}
+                on_pause={admin.then(|| unit_pause.on_ask.clone())} reachable={can_act}
                 on_pick={{ let picked = picked.clone(); Callback::from(move |run| picked.set(run)) }} />
             <Panel title="Recent runs">{ runs(&d, now, shown, &{
                 let picked = picked.clone();
@@ -389,6 +404,8 @@ pub fn host_page(props: &Props) -> Html {
             </Panel>
             { dialog.unwrap_or_default() }
             { target_actions.dialog }
+            { unit_pause.dialog }
+            { approval.dialog }
         </div>
     }
 }
@@ -543,26 +560,43 @@ pub(super) struct LabelsProps {
 pub(super) fn labels_editor(props: &LabelsProps) -> Html {
     let h = &props.detail.summary;
     let toast = use_toast();
-    let draft = use_state(|| rows(&h.labels));
+    // The labels the fleet reserves are edited apart from the rest: each
+    // has a row of its own that can change but not go.
+    let own = use_state(|| split(&h.labels, &h.reserved_labels).0);
+    let draft = use_state(|| split(&h.labels, &h.reserved_labels).1);
     let saving = use_state(|| false);
     let save_error = use_state(|| None::<String>);
     let preview = use_state(|| None::<Result<HostPreview, ApiError>>);
 
     // A different host, or labels saved elsewhere, reset the draft.
     {
-        let draft = draft.clone();
-        use_effect_with((h.id.clone(), h.labels.clone()), move |(_, labels)| {
-            draft.set(rows(labels));
-            || ()
-        });
+        let (own, draft) = (own.clone(), draft.clone());
+        use_effect_with(
+            (h.id.clone(), h.labels.clone(), h.reserved_labels.clone()),
+            move |(_, labels, reserved)| {
+                let (o, d) = split(labels, reserved);
+                own.set(o);
+                draft.set(d);
+                || ()
+            },
+        );
     }
 
-    let parsed = collect(&draft);
+    let parsed = join(&own, &draft, &h.reserved_labels);
     let errors: BTreeMap<usize, String> = parsed
         .as_ref()
         .err()
-        .map(|es| es.iter().map(|e| (e.row, e.message.clone())).collect())
+        .map(|es| {
+            es.iter()
+                .filter_map(|(row, m)| row.map(|i| (i, m.clone())))
+                .collect()
+        })
         .unwrap_or_default();
+    let own_error = parsed
+        .as_ref()
+        .err()
+        .and_then(|es| es.iter().find(|(row, _)| row.is_none()))
+        .map(|(_, m)| m.clone());
     let wanted = parsed.as_ref().ok().cloned();
     let settled = use_debounced(wanted.clone(), 300);
 
@@ -616,9 +650,28 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
             draft.set(next);
         })
     };
+    let edit_own = |i: usize| {
+        let own = own.clone();
+        Callback::from(move |value: String| {
+            let mut next = (*own).clone();
+            if let Some(row) = next.get_mut(i) {
+                row.value = value;
+            }
+            own.set(next);
+        })
+    };
     let reset = {
-        let (draft, labels) = (draft.clone(), h.labels.clone());
-        Callback::from(move |_: MouseEvent| draft.set(rows(&labels)))
+        let (own, draft, labels, reserved) = (
+            own.clone(),
+            draft.clone(),
+            h.labels.clone(),
+            h.reserved_labels.clone(),
+        );
+        Callback::from(move |_: MouseEvent| {
+            let (o, d) = split(&labels, &reserved);
+            own.set(o);
+            draft.set(d);
+        })
     };
     let save = {
         let (saving, save_error, toast, on_saved, id) = (
@@ -706,6 +759,37 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                     <h3 class="subhead">{ "Reported by the agent" }</h3>
                     <p>{ for h.agent_labels.iter().map(|(k, v)| html! { <span class="label">{ format!("{k}={v}") }</span> }) }
                         if h.agent_labels.is_empty() { <span class="muted">{ "none" }</span> }</p>
+                    if !h.reserved_labels.is_empty() {
+                        <h3 class="subhead" title="fleet.labels.reserved: trust decisions read these, so only the server sets them. The agent's own value is ignored, and a set label can change but not go.">
+                            { "Reserved" }
+                        </h3>
+                        <div class="kv-rows" role="group" aria-label="Reserved labels" data-testid="reserved-labels">
+                            { for h.reserved_labels.iter().enumerate().map(|(i, r)| html! {
+                                <div class="kv-row kv-row--reserved" data-label={r.key.clone()} data-set={r.value.is_some().to_string()}>
+                                    <span class="label label--server mono">{ r.key.clone() }</span>
+                                    <span aria-hidden="true">{ "=" }</span>
+                                    if props.admin {
+                                        <yewi::TextInput mono=true placeholder="not set" attrs={yewi::attrs! { "aria-label" => format!("Reserved label {}", r.key) }}
+                                            value={own.get(i).map(|row| row.value.clone()).unwrap_or_default()} on_input={edit_own(i)} />
+                                    } else {
+                                        { match &r.value {
+                                            Some(v) => html! { <span class="mono">{ v.clone() }</span> },
+                                            None => html! { <span class="muted">{ "not set" }</span> },
+                                        } }
+                                    }
+                                    if r.value.is_none() {
+                                        <Pill tone={Tone::Warn} label="needs a value" title="A host is approved once every reserved label has a value" />
+                                    }
+                                    if r.conflicts() {
+                                        <span class="kv-row__note text-warn" data-testid="reserved-conflict">
+                                            { format!("the agent reports '{}', which is ignored", r.reported.clone().unwrap_or_default()) }
+                                        </span>
+                                    }
+                                </div>
+                            }) }
+                            if let Some(msg) = &own_error { <span class="kv-row__error" role="alert">{ msg.clone() }</span> }
+                        </div>
+                    }
                     <h3 class="subhead">{ "Set by operators" }</h3>
                     if props.admin {
                         <div class="kv-rows" role="group" aria-label="Server labels">
@@ -724,8 +808,8 @@ pub(super) fn labels_editor(props: &LabelsProps) -> Html {
                             <Button small=true kind={Kind::Subtle} onclick={add}>{ crate::components::icons::plus() }{ "Add label" }</Button>
                         </div>
                     } else {
-                        <p>{ for h.labels.iter().map(|(k, v)| html! { <span class="label label--server">{ format!("{k}={v}") }</span> }) }
-                            if h.labels.is_empty() { <span class="muted">{ "none" }</span> }</p>
+                        <p>{ for draft.iter().map(|row| html! { <span class="label label--server">{ format!("{}={}", row.key, row.value) }</span> }) }
+                            if draft.is_empty() { <span class="muted">{ "none" }</span> }</p>
                     }
                 </div>
                 <div class="labels__preview">

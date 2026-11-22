@@ -782,6 +782,21 @@
     color: var(--yi-danger);
     font-size: 0.78rem;
   }
+
+  // Something to know about the row that is not wrong with it.
+  &__note {
+    grid-column: 1 / -1;
+    font-size: 0.78rem;
+  }
+
+  // A reserved label: its key is the fleet's, only its value is typed.
+  &--reserved {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+
+    > .label {
+      margin: 0;
+    }
+  }
 }
 
 .preview {

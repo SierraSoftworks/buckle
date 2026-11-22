@@ -1,6 +1,7 @@
 //! The shared, presentational components.
 
 pub mod actions;
+pub mod approve;
 pub mod attention;
 pub mod avatar;
 pub mod blueprint;
@@ -17,6 +18,7 @@ pub mod json_tree;
 pub mod link;
 pub mod meter;
 pub mod modal;
+pub mod pause;
 pub mod pipeline;
 pub mod plan;
 pub mod revision;
@@ -34,6 +36,7 @@ pub use actions::{
     ActionsButton, action_items, drift_item, target_items, use_actions, use_drift_check,
     use_target_actions,
 };
+pub use approve::use_host_approval;
 pub use changes::Changes;
 pub use commit::{Commit, CommitCard};
 pub use countdown::Countdown;
@@ -45,6 +48,7 @@ pub use json_tree::JsonTree;
 pub use link::RouteLink;
 pub use meter::{Meter, Segment};
 pub use modal::Confirm;
+pub use pause::{pause_item, suspended_pill, use_unit_changes, use_unit_pause};
 pub use pipeline::Pipeline;
 pub use plan::PlanGroupView;
 pub use revision::{RevisionLog, use_revision_actions};

@@ -55,6 +55,9 @@ pub fn me() -> Me {
     }
 }
 
+/// The label the demo fleet reserves (`fleet.labels.reserved`).
+pub const RESERVED_LABEL: &str = "zone";
+
 fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
@@ -295,10 +298,17 @@ pub fn hosts(now: DateTime<Utc>) -> Vec<HostSummary> {
         .enumerate()
         .map(|(i, s)| {
             let agent_labels = labels(s.agent);
-            let server_labels = labels(s.server);
+            let mut server_labels = labels(s.server);
+            let pending = s.id == "rpi-new";
+            let cloud = agent_labels.get("site").map(String::as_str) == Some("cloud");
+            // The fleet reserves `zone`: every host has it from the server,
+            // except the one still waiting for approval, which only reports it.
+            let zone = (!pending).then(|| if cloud { "public" } else { "internal" }.to_owned());
+            if let Some(zone) = &zone {
+                server_labels.insert(RESERVED_LABEL.into(), zone.clone());
+            }
             let effective = crate::logic::labels::effective(&agent_labels, &server_labels);
             let groups = groups_for(&effective);
-            let pending = s.id == "rpi-new";
             let offline = s.offline_mins.is_some();
             HostSummary {
                 id: s.id.clone(),
@@ -319,8 +329,16 @@ pub fn hosts(now: DateTime<Utc>) -> Vec<HostSummary> {
                 agent_labels,
                 labels: server_labels,
                 effective_labels: effective,
-                reserved_labels: Vec::new(),
-                verified_tags: None,
+                reserved_labels: vec![buckle_api::ReservedLabel {
+                    key: RESERVED_LABEL.into(),
+                    value: zone,
+                    reported: pending.then(|| "internal".to_owned()),
+                }],
+                verified_tags: Some(if cloud {
+                    vec!["tag:buckle".into(), "tag:public".into()]
+                } else {
+                    vec!["tag:buckle".into()]
+                }),
                 groups,
                 platform: Some(s.platform.into()),
                 arch: Some(s.arch.into()),
@@ -2572,6 +2590,7 @@ fn cluster_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
             vec![]
         },
         actions: demo_actions(host, !home),
+        paused_units: vec![],
     }
 }
 
@@ -2786,6 +2805,27 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
     } else {
         vec![]
     };
+    // One module is suspended, so the demo shows how that reads.
+    let paused_units = if host.id == "lab-2" {
+        vec![buckle_api::PausedUnit {
+            target: host.id.clone(),
+            unit: "backup".into(),
+            note: "The backup target is being migrated; snapshots would fail until it is back."
+                .into(),
+            by: "ada@example.com".into(),
+            at: now - Duration::hours(20),
+            review_at: Some(now + Duration::days(2)),
+        }]
+    } else {
+        vec![]
+    };
+    let mut health_checks = host_checks(&health_results, &host.id);
+    for c in &mut health_checks {
+        if paused_units.iter().any(|p| p.unit == c.module) {
+            c.status = "paused".into();
+            c.reason = Some("it is suspended".into());
+        }
+    }
     HostDetail {
         summary: host.clone(),
         facts: if pending {
@@ -2796,13 +2836,14 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         facts_at: Some(now - Duration::minutes(4)),
         resources,
         recent_runs,
-        health_checks: host_checks(&health_results, &host.id),
+        health_checks,
         health_results,
         drift,
         latest_run,
         workloads: vec![],
         executors: vec![],
         actions: demo_actions(host, pending),
+        paused_units,
     }
 }
 

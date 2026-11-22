@@ -56,6 +56,11 @@ pub struct JoinOptions {
     /// New hosts wait for approval (`agents.registration: approve`), except
     /// those enrolled by a join command, which an admin created.
     pub approval_required: bool,
+    /// The labels the fleet reserves (`fleet.labels.reserved`): a join
+    /// command needs a value for each, under
+    /// [`JoinRequest::server_labels`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserved_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -80,9 +80,45 @@ describe("registration and forgetting", () => {
     const { page, close } = await open("/hosts");
     const banner = page.getByTestId("pending-registrations");
     await banner.getByRole("button", { name: "Approve…" }).click();
-    await page.getByRole("alertdialog", { name: "Approve rpi-new" }).getByRole("button", { name: "Approve rpi-new" }).click();
+    // The fleet reserves `zone`: the server sets it, and the host needs one to join.
+    const dialog = page.getByRole("alertdialog", { name: "Approve rpi-new" });
+    const approve = dialog.getByRole("button", { name: "Approve rpi-new" });
+    assert.match(await dialog.textContent(), /The agent reports 'internal', which is ignored/);
+    await approve.click();
+    await dialog.getByText("Give 'zone' a value").waitFor();
+    await dialog.getByRole("textbox", { name: /Label zone/ }).fill("public");
+    await approve.click();
     await page.getByRole("status").filter({ hasText: "rpi-new approved" }).waitFor();
     await eventually(async () => assert.equal(await banner.count(), 0));
+    await page.locator('tr[data-host="rpi-new"]').getByRole("link", { name: "rpi-new", exact: true }).click();
+    await eventually(async () =>
+      assert.equal(await page.getByRole("textbox", { name: "Reserved label zone" }).inputValue(), "public"),
+    );
+    await close();
+  });
+
+  test("a host shows what the server verified of it, and a reserved label changes but never goes", async () => {
+    const { page, close } = await open("/hosts/pi-2");
+    assert.match(await page.getByTestId("verified-tags").textContent(), /tag:buckle/);
+    const zone = page.getByRole("textbox", { name: "Reserved label zone" });
+    assert.equal(await zone.inputValue(), "internal");
+    const save = page.getByRole("button", { name: "Save labels" });
+    await zone.fill("");
+    await page.getByText("its value can change, but it cannot be removed").waitFor();
+    assert.ok(await save.isDisabled());
+    await zone.fill("public");
+    await save.click();
+    await page.getByRole("status").filter({ hasText: "Labels of pi-2 saved" }).waitFor();
+    await eventually(async () => assert.match(await page.locator(".preview").textContent(), /zone=public/));
+    await close();
+  });
+
+  test("a pending host says which reserved label it still needs", async () => {
+    const { page, close } = await open("/hosts/rpi-new");
+    const row = page.getByTestId("reserved-labels").locator('[data-label="zone"]');
+    assert.equal(await row.getAttribute("data-set"), "false");
+    assert.match(await row.textContent(), /needs a value/);
+    assert.match(await row.getByTestId("reserved-conflict").textContent(), /the agent reports 'internal'/);
     await close();
   });
 
@@ -142,10 +178,15 @@ describe("add an agent", () => {
     await wizard.getByRole("textbox", { name: "Host name" }).fill("win-1");
     await wizard.getByLabel("Label 1 key").fill("role");
     await wizard.getByLabel("Label 1 value").fill("desktop");
-    await wizard.getByRole("button", { name: "Create command" }).click();
+    // The reserved label is the server's to set: required, and kept out of the command.
+    const create = wizard.getByRole("button", { name: "Create command" });
+    assert.ok(await create.isDisabled(), "a reserved label needs its value first");
+    await wizard.getByLabel("Reserved label zone").fill("internal");
+    await create.click();
 
     const command = await wizard.getByTestId("join-command").textContent();
     for (const want of [/install\.ps1/, /--token/, /--host-id win-1/, /--label role=desktop/]) assert.match(command, want);
+    assert.doesNotMatch(command, /zone/);
     assert.match(await wizard.textContent(), /elevated PowerShell/);
     assert.match(await wizard.getByTestId("join-arrival").textContent(), /Waiting for win-1/);
     await wizard.getByRole("button", { name: "Done" }).click();
@@ -160,6 +201,7 @@ describe("add an agent", () => {
     await wizard.getByRole("radio", { name: /Linux/ }).click();
     await wizard.getByRole("button", { name: "Next" }).click();
     await wizard.getByRole("button", { name: "tag:edge" }).click();
+    await wizard.getByLabel("Reserved label zone").fill("public");
     await wizard.getByRole("button", { name: "Continue in Tailscale" }).click();
     // The demo's consent returns at once, as Tailscale would to /hosts?join=….
     const command = await wizard.getByTestId("join-command").textContent();
@@ -271,6 +313,85 @@ describe("action rollouts", () => {
     const { page, close } = await open("/workloads/paste?cluster=home-nomad");
     const { face } = await offered(page.getByTestId("actions-home-nomad-paste"));
     assert.equal(face, "Restart");
+    await close();
+  });
+});
+
+describe("suspending a module or a workload", () => {
+  const toast = (page, text) => page.getByRole("status").filter({ hasText: text }).waitFor();
+
+  test("a module is suspended with a reason and a review day, reads as suspended, and is resumed", async () => {
+    const { page, close } = await open("/hosts/pi-2");
+    const row = page.locator('tr[data-module="nomad"]');
+    const actions = page.getByTestId("actions-nomad");
+    const head = async () => (await offered(page.getByTestId("host-actions"))).menu.some((m) => m.startsWith("Restart Nomad"));
+    assert.ok(await head(), "its action is offered while it runs");
+    await act(actions, "Suspend…");
+    const dialog = page.getByRole("alertdialog", { name: "Suspend nomad on pi-2" });
+    const suspend = dialog.getByRole("button", { name: "Suspend", exact: true });
+    assert.ok(await suspend.isDisabled(), "it always asks why");
+    await dialog.getByRole("textbox", { name: /Reason/ }).fill("Replacing its disk");
+    await dialog.locator('input[type="date"]').fill("2030-01-15");
+    await suspend.click();
+    await toast(page, "nomad is suspended on pi-2.");
+    await eventually(async () => assert.equal(await row.getAttribute("data-state"), "suspended"));
+    const text = await row.textContent();
+    for (const want of [/suspended/, /Replacing its disk/, /review on 2030-01-15/]) assert.match(text, want);
+
+    // Everything else leaves it alone: only resuming is offered, and its checks read paused.
+    assert.deepEqual(await offered(actions), { face: "Resume…", menu: [] });
+    assert.ok(!(await head()), "the host's menu drops its actions too");
+    if ((await row.getAttribute("class")).includes("expanded") === false) await row.click();
+    const check = page.locator('tr[data-detail-of="nomad"] .checks__item').first();
+    assert.equal(await check.getAttribute("data-state"), "paused");
+
+    await act(actions, "Resume…");
+    const resume = page.getByRole("alertdialog", { name: "Resume nomad on pi-2" });
+    assert.match(await resume.getByTestId("pause-note").textContent(), /Replacing its disk/);
+    await resume.getByRole("textbox", { name: /Reason/ }).fill("Disk replaced");
+    await resume.getByRole("button", { name: "Resume", exact: true }).click();
+    await toast(page, "nomad is resumed on pi-2.");
+    await eventually(async () => assert.notEqual(await row.getAttribute("data-state"), "suspended"));
+    assert.ok((await offered(actions)).menu.includes("Suspend…"));
+    await close();
+  });
+
+  test("a workload is suspended on one cluster from its row there", async () => {
+    const { page, close } = await open("/clusters/home-nomad");
+    await act(page.getByTestId("workloads").getByTestId("actions-paste"), "Suspend…");
+    const dialog = page.getByRole("alertdialog", { name: "Suspend paste on home-nomad" });
+    assert.match(await dialog.textContent(), /Its jobs on this cluster are stopped/);
+    await dialog.getByRole("textbox", { name: /Reason/ }).fill("CVE in the image");
+    await dialog.getByRole("button", { name: "Suspend", exact: true }).click();
+    await toast(page, "paste is suspended on home-nomad.");
+    const row = page.locator('tr[data-workload="paste"]');
+    await eventually(async () => assert.equal(await row.getAttribute("data-state"), "suspended"));
+    // Its page shows the placement the same way, with the others untouched.
+    await row.getByRole("link", { name: "paste", exact: true }).click();
+    const placements = page.getByTestId("placements");
+    await eventually(async () =>
+      assert.equal(await placements.locator('tr[data-workload="paste"][data-host="home-nomad"]').getAttribute("data-state"), "suspended"),
+    );
+    assert.notEqual(await placements.locator('tr[data-workload="paste"][data-host="lab-nomad"]').getAttribute("data-state"), "suspended");
+    await close();
+  });
+
+  test("the overview lists what is suspended, each linked to where it is resumed", async () => {
+    const { page, close } = await open("/");
+    const unit = page.getByTestId("suspended-units").locator('tr[data-unit="backup"][data-host="lab-2"]');
+    const text = await unit.textContent();
+    for (const want of [/backup target is being migrated/, /ada@example\.com/, /review on \d{4}-\d\d-\d\d/]) assert.match(text, want);
+    await unit.getByRole("link", { name: "backup", exact: true }).click();
+    assert.equal(await heading(page), "lab-2");
+    assert.equal(await page.locator('tr[data-module="backup"]').getAttribute("data-state"), "suspended");
+    await close();
+  });
+
+  test("viewers see what is suspended, without the controls", async () => {
+    const { page, close } = await open("/hosts/lab-2", { flags: "role=viewer" });
+    const row = page.locator('tr[data-module="backup"]');
+    assert.equal(await row.getAttribute("data-state"), "suspended");
+    assert.equal(await page.getByTestId("actions-backup").count(), 0);
     await close();
   });
 });

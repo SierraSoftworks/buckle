@@ -19,7 +19,7 @@ use crate::components::modal::Modal;
 use crate::components::{Button, Countdown, ErrorState, Kind, Loading, RouteLink, icons};
 use crate::hooks::use_fetch;
 use crate::logic::join::{
-    default_method, enrolled, needs_consent, notes, provisions_tailnet, request,
+    default_method, enrolled, needs_consent, notes, provisions_tailnet, request, unfinished,
 };
 use crate::logic::labels::Row;
 
@@ -66,6 +66,8 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
     let method = use_state(|| None::<JoinMethod>);
     let host = use_state(String::new);
     let labels = use_state(|| vec![Row::default()]);
+    // The values given for the labels the fleet reserves.
+    let reserved = use_state(std::collections::BTreeMap::<String, String>::new);
     let tags = use_state(|| None::<Vec<String>>);
     let ticket = use_state(|| None::<JoinTicket>);
     let busy = use_state(|| false);
@@ -120,13 +122,15 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
         (None, Some(ts)) => ts.tags.first().cloned().into_iter().collect(),
         (None, None) => vec![],
     };
-    let draft = (*platform).zip(method_now).map(|(p, m)| {
+    let draft = (*platform).zip(method_now).zip(opts).map(|((p, m), o)| {
         request(
             p,
             m,
             &host,
             &labels,
             if provisioning { &tags_now } else { &[] },
+            o,
+            &reserved,
         )
     });
 
@@ -341,8 +345,11 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
                 let host = host.clone();
                 Callback::from(move |value: String| host.set(value))
             };
+            // A reserved label still to fill in is not a problem to report.
+            let waiting = opts.and_then(|o| unfinished(o, &reserved));
             let problem = match &draft {
-                Some(Err(e)) => Some(e.clone()),
+                Some(Err(e)) if Some(e) != waiting.as_ref() => Some(e.clone()),
+                Some(Err(_)) => None,
                 _ => (*error).clone(),
             };
             let primary = if consent {
@@ -361,6 +368,31 @@ pub fn add_agent(props: &AddAgentProps) -> Html {
                     <yewi::TextInput mono=true placeholder="its hostname" value={(*host).clone()} on_input={on_host} />
                 </yewi::Field>
                                     { tag_choice }
+                                    if let Some(o) = opts.filter(|o| !o.reserved_labels.is_empty()) {
+                                        <yewi::Field group=true label="Reserved labels" required=true
+                                            hint="The fleet reserves these: trust decisions read them, so the server sets them when the host enrols and they never appear in the command.">
+                                            <div class="kv-rows" role="group" aria-label="Reserved labels" data-testid="join-reserved">
+                                                { for o.reserved_labels.iter().map(|key| {
+                                                    let on_input = {
+                                                        let (reserved, key) = (reserved.clone(), key.clone());
+                                                        Callback::from(move |value: String| {
+                                                            let mut next = (*reserved).clone();
+                                                            next.insert(key.clone(), value);
+                                                            reserved.set(next);
+                                                        })
+                                                    };
+                                                    html! {
+                                                        <div class="kv-row kv-row--reserved">
+                                                            <span class="label label--server mono">{ key.clone() }</span>
+                                                            <span aria-hidden="true">{ "=" }</span>
+                                                            <yewi::TextInput mono=true placeholder="value" attrs={yewi::attrs! { "aria-label" => format!("Reserved label {key}") }}
+                                                                value={reserved.get(key).cloned().unwrap_or_default()} {on_input} />
+                                                        </div>
+                                                    }
+                                                }) }
+                                            </div>
+                                        </yewi::Field>
+                                    }
                                     <yewi::Field group=true label="Labels" hint="The agent's own labels: they decide its groups and rollout phase.">
                                         <div class="kv-rows" role="group" aria-label="Labels">
                                             { for labels.iter().enumerate().map(|(i, row)| html! {

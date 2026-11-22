@@ -5,8 +5,9 @@ label or group. Hover a host's name for a summary; click its row to open it.
 
 ## The host page
 
-The host page shows its summary (platform, agent version, applied revision, groups), operator
-notes, labels, health checks, drift and its latest run. Its actions are at the top right.
+The host page shows its summary (platform, agent version, applied revision, groups and, for a
+host the server authenticated over the tailnet, its [verified tags](../modules/fleet.md#trust)),
+operator notes, labels, health checks, drift and its latest run. Its actions are at the top right.
 
 <Screenshot name="host-actions" alt="A host's page header with its Pause, Upgrade agent and Forget actions" />
 
@@ -32,6 +33,20 @@ testing, and resume it afterwards.
 Suspend is Pause with a narrower scope: one module on one host, or one workload on one cluster,
 while the rest of the target carries on. It always asks for a note, shown with the suspended
 unit and kept in the audit log.
+
+Each module's row on the host page offers **Suspend…**, as does each workload's row on a cluster's
+page and each placement's on the workload's. It asks for the reason and, if you like, a day to
+look at it again. The row then reads **suspended** with the reason, who suspended it and when,
+and offers only **Resume…**.
+
+<Screenshot name="host-suspend" alt="The Suspend dialog for one module of a host: its reason and an optional review day" />
+
+**Overview** lists everything suspended across the fleet, the units due a review first, each
+linked to where it is resumed.
+
+<Screenshot name="overview-suspended" alt="The overview's Suspended panel: one module with its reason, who suspended it and its review day" />
+
+The API does the same for one unit or many:
 
 ```sh
 curl -X POST "$BUCKLE/api/v1/units/suspend" -d '{
@@ -62,7 +77,8 @@ curl -X POST "$BUCKLE/api/v1/units/resume" -d '{"target": "edge-1", "unit": "clo
 
 Operator labels win over the labels the agent reports, and decide the host's groups and the
 rollout phase it falls into. A [reserved label](../modules/fleet.md#trust) is the operator's alone:
-the agent's value is ignored and the label cannot be removed. The editor previews the result as you type.
+it has a row of its own under **Reserved**, where its value can change but not go, and the
+agent's own value is ignored (and shown when it differs). The editor previews the result as you type.
 
 <Screenshot name="host-labels" alt="The labels editor and its preview of phase and groups" />
 

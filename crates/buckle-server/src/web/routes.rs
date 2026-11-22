@@ -863,10 +863,11 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
     let id = path.into_inner();
     let summary = summary_or_404(&state, &id).await?;
     let lookup = id.clone();
-    let (facts, row, runs, health, checks, drift, latest, record) = state
+    let (paused_units, facts, row, runs, health, checks, drift, latest, record) = state
         .store
         .call(move |db| {
             Ok((
+                db.paused().of(&lookup)?,
                 db.hosts().latest_facts(&lookup)?,
                 db.rollouts().latest_healthy_rows_for_host(&lookup)?,
                 // Newest first, the run in progress included.
@@ -915,6 +916,7 @@ async fn host_detail(state: Data, _: Authenticated, path: web::Path<String>) -> 
         workloads,
         executors,
         actions,
+        paused_units,
     }))
 }
 
@@ -1612,7 +1614,11 @@ fn join_error(e: crate::join::JoinError) -> ApiError {
 }
 
 async fn join_options(state: Data, _: Administrative) -> ApiResult {
-    Ok(HttpResponse::Ok().json(state.joins.settings().options()))
+    let mut options = state.joins.settings().options();
+    if let Some(rev) = crate::views::reference_revision(&state.store, &state.revisions).await {
+        options.reserved_labels = rev.fleet.reserved_labels().to_vec();
+    }
+    Ok(HttpResponse::Ok().json(options))
 }
 
 async fn join_create(

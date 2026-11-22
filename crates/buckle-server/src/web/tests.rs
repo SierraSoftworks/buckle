@@ -547,6 +547,16 @@ async fn reserved_labels_are_set_on_the_server_and_required_of_new_hosts() {
             })
             .to_request()
     };
+    let options: buckle_api::JoinOptions = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/api/v1/join").to_request(),
+    )
+    .await;
+    assert_eq!(
+        options.reserved_labels,
+        ["zone"],
+        "the wizard is told what to ask for"
+    );
     let without = test::call_service(&app, join(&[("site", "lab")])).await;
     assert_eq!(without.status(), StatusCode::BAD_REQUEST);
     let with = test::call_service(&app, join(&[("site", "lab"), ("zone", "home")])).await;
@@ -3653,6 +3663,16 @@ async fn admins_suspend_and_resume_units_by_target_or_selector() {
         test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1")).await).await;
     let names: Vec<&str> = detail.actions.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, vec!["drain"]);
+    let suspended: Vec<&str> = detail
+        .paused_units
+        .iter()
+        .map(|u| u.unit.as_str())
+        .collect();
+    assert_eq!(
+        suspended,
+        vec!["web"],
+        "a target's page says what is suspended there"
+    );
     let offered: Vec<buckle_api::FleetAction> =
         test::read_body_json(test::call_service(&app, get("/api/v1/actions")).await).await;
     assert_eq!(offered.len(), 1, "{offered:?}");

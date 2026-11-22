@@ -90,10 +90,11 @@ pub fn gather(clusters: &[(HostDetail, Option<RunReport>)]) -> Vec<FleetWorkload
                 .find(|v| v.name == placement.row.name)
                 .map(|v| v.needs.clone())
                 .unwrap_or_default();
+            // A placement that is suspended runs nothing, so it offers nothing.
             let actions: Vec<ActionInfo> = d
                 .actions
                 .iter()
-                .filter(|a| a.module == placement.row.name)
+                .filter(|a| a.module == placement.row.name && placement.row.paused.is_none())
                 .cloned()
                 .collect();
             match out.iter_mut().find(|w| w.name == placement.row.name) {
@@ -198,6 +199,7 @@ mod tests {
                 .collect(),
             executors: vec![],
             actions: vec![],
+            paused_units: vec![],
         }
     }
 

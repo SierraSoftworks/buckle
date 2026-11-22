@@ -6,20 +6,24 @@
 
 use std::collections::BTreeMap;
 
-use buckle_api::{Fleet, PlanGroup, RevisionSummary, RolloutDetail, RolloutState};
+use buckle_api::{
+    Fleet, HostSummary, PausedUnit, PlanGroup, RevisionSummary, RolloutDetail, RolloutState,
+    TargetKind,
+};
 use yew::prelude::*;
 
 use crate::api;
 use crate::app::{Route, use_auth};
 use crate::components::revision::RolloutProgress;
 use crate::components::{
-    Commit, CommitCard, Empty, ErrorState, Loading, Meter, PageHead, Panel, Pipeline, Refresh,
-    RevisionLog, RouteLink, Segment, use_revision_actions,
+    Commit, CommitCard, Empty, ErrorState, Loading, Meter, PageHead, Panel, Pill, Pipeline,
+    Refresh, RevisionLog, RouteLink, Segment, use_revision_actions, use_unit_changes,
 };
 use crate::hooks::{use_fetch, use_live_value, use_now};
 use crate::logic::fleet::{FleetStates, fleet_states};
-use crate::logic::format::{commit, count};
+use crate::logic::format::{commit, count, relative, timestamp};
 use crate::logic::live::{apply_fleet, apply_revisions, apply_rollout, apply_rollouts};
+use crate::logic::pause::{listed, review_due, review_text};
 use crate::logic::pipeline::{fleet_map, layout};
 use crate::logic::tone::{Tone, rollout_finished};
 use crate::pages::rollout::{
@@ -69,6 +73,8 @@ pub fn overview() -> Html {
     let revisions = use_fetch((), |_| async { api::revisions(0).await.map(|p| p.items) });
     let revisions_live = use_live_value(&revisions, apply_revisions);
     let revision_actions = use_revision_actions();
+    let paused = use_fetch((), |_| api::paused_units());
+    use_unit_changes(&paused);
 
     let content = match (&fleet_live, &fleet.error) {
         (None, Some(e)) => html! { <ErrorState error={e.clone()} retry={fleet.reload.clone()} /> },
@@ -107,6 +113,7 @@ pub fn overview() -> Html {
                         None => html! { <Empty title="No stages yet" message="The fleet is laid out on a rollout's stages once the first rollout starts." /> },
                     } }
                 </Panel>
+                { suspended(paused.value().cloned().unwrap_or_default(), &hosts, now) }
                 <Panel title="Rollouts" actions={html! { <yewi::Button size={yewi::Size::Small} variant={yewi::ButtonVariant::Subtle} href={yewi::NavTarget::route(Route::Rollouts)}>{ "All rollouts" }</yewi::Button> }}>
                     { match (&revisions_live, &revisions.error) {
                         (Some(list), _) if list.is_empty() => html! { <Empty title="No revisions yet" message="The server has not seen a commit of the configuration repository." /> },
@@ -128,11 +135,82 @@ pub fn overview() -> Html {
         <div class="page page--wide">
             <PageHead title="Overview" subtitle={html! { "The fleet from each host's latest health report and agent liveness." }}
                 actions={html! { <Refresh loading={fleet.loading || rollout.loading} reload={{
-                    let (a, b, c, d, e) = (fleet.reload.clone(), rollout.reload.clone(), revisions.reload.clone(), rollouts.reload.clone(), plans.reload.clone());
-                    Callback::from(move |_| { a.emit(()); b.emit(()); c.emit(()); d.emit(()); e.emit(()); })
+                    let (a, b, c, d, e, f) = (fleet.reload.clone(), rollout.reload.clone(), revisions.reload.clone(), rollouts.reload.clone(), plans.reload.clone(), paused.reload.clone());
+                    Callback::from(move |_| { a.emit(()); b.emit(()); c.emit(()); d.emit(()); e.emit(()); f.emit(()); })
                 }} /> }} />
             { content }
         </div>
+    }
+}
+
+/// The modules and workloads suspended across the fleet, those due a
+/// review first: each with why, by whom and since when, linked to where it
+/// is resumed. Nothing while none is suspended.
+fn suspended(
+    units: Vec<PausedUnit>,
+    targets: &BTreeMap<String, HostSummary>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Html {
+    if units.is_empty() {
+        return html! {};
+    }
+    let total = units.len();
+    let due = units.iter().filter(|p| review_due(p, now)).count();
+    let mut subtitle = format!(
+        "{} left alone by rollouts, drift correction and actions until resumed",
+        count(total, "module or workload", "modules and workloads")
+    );
+    if due > 0 {
+        subtitle.push_str(&format!(" · {due} due a review"));
+    }
+    html! {
+        <Panel title="Suspended" id="suspended" {subtitle}>
+            <yewi::SimpleTable variant={yewi::TableVariant::Ruled} wrap=true attrs={yewi::attrs! { "data-testid" => "suspended-units" }}>
+                <thead><tr>
+                    <th scope="col">{ "Unit" }</th>
+                    <th scope="col">{ "On" }</th>
+                    <th scope="col">{ "Why" }</th>
+                    <th scope="col">{ "Since" }</th>
+                    <th scope="col">{ "Review" }</th>
+                </tr></thead>
+                <tbody>
+                    { for listed(units, now).into_iter().map(|p| {
+                        let kind = targets.get(&p.target).map(|t| t.kind).unwrap_or_default();
+                        let cluster = kind != TargetKind::Host;
+                        html! {
+                            <tr key={format!("{}/{}", p.target, p.unit)} data-unit={p.unit.clone()} data-host={p.target.clone()}
+                                data-review={review_due(&p, now).then_some("due")}>
+                                <td>
+                                    if cluster {
+                                        <RouteLink to={Route::Workload { name: p.unit.clone() }} query={vec![("cluster".to_owned(), p.target.clone())]}
+                                            classes={classes!("mono", "strong")}>{ p.unit.clone() }</RouteLink>
+                                        <span class="cell-sub muted">{ "workload" }</span>
+                                    } else {
+                                        <RouteLink to={Route::Host { id: p.target.clone() }} classes={classes!("mono", "strong")}>{ p.unit.clone() }</RouteLink>
+                                        <span class="cell-sub muted">{ "module" }</span>
+                                    }
+                                </td>
+                                <td>
+                                    <RouteLink to={Route::target(&p.target, kind)} classes="mono">{ p.target.clone() }</RouteLink>
+                                </td>
+                                <td>{ p.note.clone() }</td>
+                                <td class="nowrap">
+                                    <span title={timestamp(p.at)}>{ relative(p.at, now) }</span>
+                                    <span class="cell-sub muted">{ format!("by {}", p.by) }</span>
+                                </td>
+                                <td class="nowrap">
+                                    { match review_text(&p, now) {
+                                        Some(text) if review_due(&p, now) => html! { <Pill tone={Tone::Warn} label={text} /> },
+                                        Some(text) => html! { <span class="muted">{ text }</span> },
+                                        None => html! { <span class="muted">{ "—" }</span> },
+                                    } }
+                                </td>
+                            </tr>
+                        }
+                    }) }
+                </tbody>
+            </yewi::SimpleTable>
+        </Panel>
     }
 }
 
