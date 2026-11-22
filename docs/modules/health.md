@@ -35,7 +35,7 @@ scrubbed of secret values before they leave the host.
 |---|---|
 | **Baseline**, before a host's wave | A host that is already unhealthy is held for an operator instead of being blamed for the change (`rollout.health.baseline`). |
 | **After apply** | Each module's checks run as soon as it and its handlers finish, so a failure is attributed to the module that caused it. |
-| **Bake** | The checks repeat every `interval` for the phase's `bake` window, lengthened by the `bake` of any module the run changed. A run that changed nothing does not bake. |
+| **Bake** | The checks repeat every `interval` for the `bake` of the modules the run changed (one reading when none sets one). A run that changed nothing does not bake. The phase's `bake` then holds the next phase that long after the phase's last apply. |
 | **Before the next phase** | Every host this rollout already updated is checked again; a regression pauses the rollout before the next phase starts. |
 | **Each drift pass** | Every 15 minutes by default, giving the Overview a current reading between rollouts. |
 

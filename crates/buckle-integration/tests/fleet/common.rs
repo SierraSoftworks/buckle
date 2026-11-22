@@ -27,10 +27,17 @@ pub fn app_module(fleet: Fleet, n: u32) -> Fleet {
 
 /// `app` writes `app.conf`, and is healthy while [`HEALTHY`] exists.
 pub fn checked_app_module(fleet: Fleet, n: u32) -> Fleet {
+    checked_app_module_baking(fleet, n, None)
+}
+
+/// [`checked_app_module`] with the module's own `bake`, so a run changing it
+/// bakes that long (else one health reading).
+pub fn checked_app_module_baking(fleet: Fleet, n: u32, bake: Option<&str>) -> Fleet {
+    let bake = bake.map(|b| format!("bake: {b}\n")).unwrap_or_default();
     fleet
         .module(
             "app",
-            "name: app\ntasks:\n  - file.copy: { src: app.conf, dest: /etc/app/app.conf, mode: \"0644\" }\nhealth:\n  - name: healthy\n    interval: 1s\n    file: { path: /run/app.healthy }\n",
+            format!("name: app\n{bake}tasks:\n  - file.copy: {{ src: app.conf, dest: /etc/app/app.conf, mode: \"0644\" }}\nhealth:\n  - name: healthy\n    interval: 1s\n    file: {{ path: /run/app.healthy }}\n"),
         )
         .file("app", "app.conf", app_conf(n))
 }

@@ -234,11 +234,28 @@ impl Harness {
     }
 
     /// A revision with `clusters` declared and `files` (modules, workloads)
-    /// beside `buckle.yaml`.
+    /// beside `buckle.yaml`. Without `files`, the `web` module (the one a
+    /// host's run changes by default) bakes as long as `health.bake` and
+    /// tolerates any failures, so a host row bakes that long (as well as its
+    /// phase) and is limited only by its phase.
     async fn revision_with(&self, id: &str, rollout: &str, clusters: &str, files: &[(&str, &str)]) {
         let dir = self.revisions.dir(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("buckle.yaml"), fleet_yaml_with(rollout, clusters)).unwrap();
+        let web = "modules/web/module.yaml";
+        if files.is_empty()
+            && let Some(bake) = regex::Regex::new(r"health: \{[^}]*bake: (\w+)")
+                .unwrap()
+                .captures(rollout)
+        {
+            let path = dir.join(web);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!("name: web\nbake: {}\nmax_failures: 100%\n", &bake[1]),
+            )
+            .unwrap();
+        }
         for (path, content) in files {
             let path = dir.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -531,7 +548,14 @@ impl Harness {
                         let changed = if s.unchanged && a.target.is_empty() {
                             vec![]
                         } else {
-                            s.changed.clone().unwrap_or_else(|| vec!["web".into()])
+                            // A placement's run changes its workload.
+                            s.changed.clone().unwrap_or_else(|| {
+                                vec![if a.workload.is_empty() {
+                                    "web".into()
+                                } else {
+                                    a.workload.clone()
+                                }]
+                            })
                         };
                         reply(AMsg::Result(ApplyResult {
                             target: a.target.clone(),
@@ -1199,8 +1223,9 @@ async fn a_percentage_budget_pauses_on_the_right_count() {
     );
 }
 
-/// A host bakes for its phase's `bake`, raised by the `bake` of each module
-/// its run changed; a host whose run changed nothing does not bake.
+/// A host bakes for the longest `bake` among the modules its run changed
+/// (its phase's `bake` is the phase's own window, not a minimum); a host whose
+/// run changed nothing does not bake.
 #[tokio::test(start_paused = true)]
 async fn a_host_bakes_for_the_longest_bake_among_the_modules_it_changed() {
     let mut h = Harness::new().await;
@@ -1241,7 +1266,7 @@ async fn a_host_bakes_for_the_longest_bake_among_the_modules_it_changed() {
     let window = |id: &str| host(&hosts, id).runtime.bake.clone().unwrap();
     assert_eq!(window("a").seconds, 600);
     assert_eq!(window("a").module.as_deref(), Some("nomad"));
-    assert_eq!(window("b").seconds, 60, "the phase's bake is the minimum");
+    assert_eq!(window("b").seconds, 5, "its own bake, not its phase's");
     assert!(window("c").unchanged);
     let (_, hosts) = h
         .wait(&id, "b baked", |_, hs| {
@@ -1251,7 +1276,7 @@ async fn a_host_bakes_for_the_longest_bake_among_the_modules_it_changed() {
     assert_eq!(
         host(&hosts, "a").state,
         HostPhase::Baking,
-        "nomad's bake outlasts the phase's"
+        "nomad's bake outlasts shell's"
     );
     h.wait_state(&id, RolloutState::Completed).await;
 }
@@ -4293,7 +4318,8 @@ const ONE_PHASE_ALL: &str =
     "  health: { bake: 30s }\n  phases:\n    - { name: all, select: 'true', parallel: 4 }\n";
 
 /// `nomad` on the nodes, a workload needing it, and `backup` needing the
-/// workload: three stages.
+/// workload: three stages. The nodes' runs change `web` and the workload
+/// bakes, each for 30s.
 const LAYERED: &[(&str, &str)] = &[
     (
         "modules/nomad/module.yaml",
@@ -4305,7 +4331,11 @@ const LAYERED: &[(&str, &str)] = &[
     ),
     (
         "workloads/postgres/workload.yaml",
-        "name: postgres\nneeds: ['module:nomad']\nresources: [postgres.nomad.hcl]\n",
+        "name: postgres\nneeds: ['module:nomad']\nresources: [postgres.nomad.hcl]\nbake: 30s\n",
+    ),
+    (
+        "modules/web/module.yaml",
+        "name: web\nbake: 30s\nmax_failures: 100%\n",
     ),
     (
         "workloads/postgres/files/postgres.nomad.hcl",
@@ -4317,7 +4347,7 @@ const LAYERED: &[(&str, &str)] = &[
 const FLAT: &[(&str, &str)] = &[
     (
         "workloads/postgres/workload.yaml",
-        "name: postgres\nresources: [postgres.nomad.hcl]\n",
+        "name: postgres\nresources: [postgres.nomad.hcl]\nbake: 30s\n",
     ),
     (
         "workloads/postgres/files/postgres.nomad.hcl",
@@ -4957,12 +4987,18 @@ async fn skipping_a_bake_finishes_the_host_now(
     }
 }
 
-/// A skipped bake no longer holds its phase: the phase bakes only until its
-/// last row still baking does.
+/// A skipped bake no longer holds its phase: the phase bakes until the last
+/// of its rows still baking, or its own (shorter) window, ends.
 #[tokio::test(start_paused = true)]
 async fn a_skipped_bake_no_longer_counts_towards_the_phase_bake() {
     let mut h = Harness::new().await;
-    h.revision("r1", LONG_BAKE).await;
+    h.revision_with(
+        "r1",
+        "  settle: 10m\n  health: { bake: 1m }\n  phases:\n    - { name: web, select: 'true', parallel: 2 }\n",
+        "",
+        &[("modules/web/module.yaml", "name: web\nbake: 1h\n")],
+    )
+    .await;
     h.enrol("a", "web").await;
     h.enrol("b", "web").await;
     h.connect("a", None);
@@ -5040,6 +5076,145 @@ async fn skipping_a_phase_bake_needs_a_baking_phase(
     assert_eq!(err.kind, want);
     let (_, hosts) = h.snapshot(&id).await;
     assert_eq!(host(&hosts, "a").state, HostPhase::Baking);
+}
+
+/// `web` without a `bake` of its own (and tolerating failures, so only the
+/// phases limit).
+const WEB_UNBAKED: &[(&str, &str)] =
+    &[("modules/web/module.yaml", "name: web\nmax_failures: 100%\n")];
+
+/// A phase's `bake` is its own window, counted from its last apply: a
+/// target without a `bake` of its own is healthy after one passing reading
+/// (freeing its slot at once), while the next phase waits out the window,
+/// unless an operator ends it.
+#[rstest::rstest]
+#[case::waited_out(false)]
+#[case::ended(true)]
+#[tokio::test(start_paused = true)]
+async fn a_phase_bakes_from_its_last_apply_and_holds_only_the_next_phase(#[case] end: bool) {
+    let mut h = Harness::new().await;
+    h.revision_with(
+        "r1",
+        "  health: { bake: 10m }\n  phases:\n    - { name: canary, select: 'host.groups contains \"canary\"' }\n    - { name: web, select: 'host.groups contains \"web\"' }\n",
+        "",
+        WEB_UNBAKED,
+    )
+    .await;
+    for (id, tier) in [("c1", "canary"), ("c2", "canary"), ("w1", "web")] {
+        h.enrol(id, tier).await;
+        h.connect(id, None);
+    }
+    let id = h.start("r1").await;
+    let window = chrono::Duration::minutes(10);
+    let (r, _) = h
+        .wait(&id, "the canary phase in its window", |r, hs| {
+            ["c1", "c2"]
+                .iter()
+                .all(|c| host(hs, c).state == HostPhase::Healthy)
+                && r.runtime.phases[0].state == buckle_api::rollout::PhaseState::Baking
+        })
+        .await;
+    let (first, last) = (
+        applied_at(&h, "c1").min(applied_at(&h, "c2")),
+        applied_at(&h, "c1").max(applied_at(&h, "c2")),
+    );
+    assert!(
+        last < first + chrono::Duration::minutes(1),
+        "the second canary takes the slot once the first has read healthy"
+    );
+    let until = r.runtime.phases[0].bake_until.expect("the window shows");
+    assert!(until >= last + window, "counted from the last apply");
+    assert!(h.applies().iter().all(|a| a.1 != "w1"), "web waits");
+    if end {
+        h.command(Command::Expedite {
+            rollout: id.clone(),
+            host: None,
+            workload: String::new(),
+            phase: Some("canary".into()),
+            note: String::new(),
+        })
+        .await
+        .unwrap();
+    }
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    assert_eq!(
+        applied_at(&h, "w1") < last + window,
+        end,
+        "web starts once the window is over or ended"
+    );
+}
+
+/// A target without a `bake` whose one reading fails is followed through
+/// settle: it is healthy once its checks recover, and fails if they do not.
+#[rstest::rstest]
+#[case::recovers(true)]
+#[case::stays_failing(false)]
+#[tokio::test(start_paused = true)]
+async fn an_unbaked_target_failing_its_reading_is_followed_through_settle(#[case] recovers: bool) {
+    let mut h = Harness::new().await;
+    h.revision_with(
+        "r1",
+        "  settle: 2m\n  phases:\n    - { name: web, select: 'true', max_failures: 0 }\n",
+        "",
+        WEB_UNBAKED,
+    )
+    .await;
+    h.enrol("a", "web").await;
+    h.script("a", |s| s.bake_fail = true);
+    h.connect("a", None);
+    let id = h.start("r1").await;
+    h.wait(&id, "failing its reading", |_, hs| {
+        let a = host(hs, "a");
+        a.state == HostPhase::Baking && !a.runtime.failing_since.is_empty()
+    })
+    .await;
+    // The agent is asked to sample through settle; it reads again later.
+    let asks: Vec<pb::RunHealth> = h
+        .sent(|x, m| {
+            x == "a" && matches!(m, SMsg::Health(r) if r.scope == HealthScope::Bake as i32)
+        })
+        .into_iter()
+        .filter_map(|(_, _, m)| match m {
+            SMsg::Health(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    let ask = asks.last().expect("asked to sample");
+    assert!(asks.len() >= 2, "asked again to cover settle: {asks:?}");
+    h.idle(30).await;
+    h.handle.agent_message(
+        "a",
+        AMsg::Health(HealthReport {
+            scope: HealthScope::Bake as i32,
+            request_id: ask.request_id.clone(),
+            revision: "r1".into(),
+            results: vec![pb::HealthResult {
+                module: "web".into(),
+                check: "http".into(),
+                required: true,
+                passed: recovers,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    );
+    let (_, hosts) = h
+        .wait_state(
+            &id,
+            if recovers {
+                RolloutState::Completed
+            } else {
+                RolloutState::Paused
+            },
+        )
+        .await;
+    let want = if recovers {
+        HostPhase::Healthy
+    } else {
+        HostPhase::Failed
+    };
+    assert_eq!(host(&hosts, "a").state, want);
 }
 
 /// A bake with failing checks is not skipped: skipping never passes a
@@ -6116,11 +6291,11 @@ fn tiers(server: &str, agent: &str) -> Vec<(&'static str, String)> {
     vec![
         (
             "modules/server/module.yaml",
-            format!("name: server\nwhen: 'host.groups contains \"db\"'\n{server}"),
+            format!("name: server\nwhen: 'host.groups contains \"db\"'\nbake: 30s\n{server}"),
         ),
         (
             "modules/agent/module.yaml",
-            format!("name: agent\nwhen: 'host.groups contains \"web\"'\n{agent}"),
+            format!("name: agent\nwhen: 'host.groups contains \"web\"'\nbake: 30s\n{agent}"),
         ),
     ]
 }
@@ -6138,6 +6313,15 @@ async fn scheduled(
     h.revision_with("r1", rollout, "", &files).await;
     for (id, tier) in hosts {
         h.enrol(id, tier).await;
+        // A run changes its tier's module (which bakes for `BAKE`).
+        let module = match *tier {
+            "db" => Some("server"),
+            "web" => Some("agent"),
+            _ => None,
+        };
+        if let Some(m) = module {
+            h.script(id, |s| s.changed = Some(vec![m.into()]));
+        }
         if !offline.contains(id) {
             h.connect(id, None);
         }
@@ -6475,7 +6659,10 @@ async fn an_agent_that_predates_group_needs_is_not_asked_to_plan_them() {
 #[tokio::test(start_paused = true)]
 async fn an_action_rollout_honours_limits_and_needs() {
     let mut files = tiers("parallel: 1\n", "needs: ['group:db']\n");
-    files.push(("modules/common/module.yaml", "name: common\n".to_owned()));
+    files.push((
+        "modules/common/module.yaml",
+        "name: common\nbake: 1m\n".to_owned(),
+    ));
     let mut h = Harness::new().await;
     let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
     h.revision_with(
@@ -6575,6 +6762,7 @@ async fn a_phase_of_hosts_and_placements_is_ordered_by_needs() {
         &clusters,
         &[
             ("modules/nomad/module.yaml", nomad.as_str()),
+            WEB_BAKES,
             ("workloads/app/workload.yaml", app.as_str()),
             ("workloads/app/files/app.nomad.hcl", "job \"app\" {}\n"),
             ("workloads/postgres/workload.yaml", postgres.as_str()),
@@ -6943,12 +7131,25 @@ async fn hosted_as(workload: &str) -> Harness {
     .await
 }
 
+/// The `web` module (what a host's run changes) baking for `BAKE`.
+const WEB_BAKES: (&str, &str) = (
+    "modules/web/module.yaml",
+    "name: web\nbake: 30s\nmax_failures: 100%\n",
+);
+
 /// A fleet whose cluster runs this server as the workload `app`, which the
-/// first phase selects, with `postgres` and the node `n1` in the last.
+/// first phase selects, with `postgres` and the node `n1` in the last; each
+/// bakes for `BAKE`.
 async fn self_hosted() -> Harness {
     let mut h = hosted_as("app").await;
-    let files = labelled(false);
-    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    let mut files = labelled(false);
+    for (path, content) in &mut files {
+        if path.ends_with("workload.yaml") {
+            content.push_str("bake: 30s\n");
+        }
+    }
+    let mut files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    files.push(WEB_BAKES);
     h.revision_with("r1", CANARY_WORKLOADS, NOMAD_CLUSTER, &files)
         .await;
     h.enrol("n1", "nomad").await;
@@ -6991,7 +7192,8 @@ async fn the_servers_own_placement_goes_last_and_alone() {
 #[tokio::test(start_paused = true)]
 async fn what_needs_the_servers_own_placement_follows_it() {
     let mut h = hosted_as("postgres").await;
-    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, TWO_WORKLOADS)
+    let files: Vec<_> = TWO_WORKLOADS.iter().copied().chain([WEB_BAKES]).collect();
+    h.revision_with("r1", ONE_PHASE_ALL, NOMAD_CLUSTER, &files)
         .await;
     h.enrol("n1", "nomad").await;
     h.connect("n1", None);

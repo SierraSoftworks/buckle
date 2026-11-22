@@ -1032,13 +1032,34 @@ fn awaits_reconnect(state: HostPhase) -> bool {
             ))
 }
 
-/// The `bake` of row `h`'s phase, in seconds.
+/// Row `h`'s own minimum bake, in seconds: none (one health reading, unless what its
+/// run changed sets a `bake`); a rollout from before the phase window: its
+/// phase's `bake`.
 fn phase_bake(phases: &[PhaseRuntime], h: &RolloutHostRecord) -> u64 {
     h.runtime
         .phase_index
         .and_then(|i| phases.get(i))
-        .map(|p| p.bake_seconds)
+        .map(|p| p.target_bake_seconds.unwrap_or(p.bake_seconds))
         .unwrap_or(0)
+}
+
+/// When phase `p`'s window closes: its `bake` counted from the last apply
+/// of a target it changed (their own bakes overlap it). `None` when nothing
+/// it changed applied, an operator ended it, or the rollout predates it.
+fn phase_window(live: &Live, p: usize) -> Option<DateTime<Utc>> {
+    let phase = live.record.runtime.phases.get(p)?;
+    if phase.target_bake_seconds.is_none() || phase.window_ended || phase.bake_seconds == 0 {
+        return None;
+    }
+    let last = live
+        .hosts
+        .iter()
+        .filter(|h| h.runtime.phase_index == Some(p) && h.runtime.applied)
+        .filter(|h| !matches!(h.state, HostPhase::Skipped | HostPhase::Missed))
+        .filter(|h| !limits::unchanged(h))
+        .filter_map(|h| h.runtime.applied_at)
+        .max()?;
+    Some(last + chrono::Duration::seconds(phase.bake_seconds as i64))
 }
 
 /// Row `h`'s bake window before any reboot: what its step resolved to,
@@ -1048,6 +1069,13 @@ fn row_bake(phases: &[PhaseRuntime], h: &RolloutHostRecord) -> u64 {
         .bake
         .as_ref()
         .map_or_else(|| phase_bake(phases, h), |b| b.seconds)
+}
+
+/// Whether row `h`'s bake reads its health: it has a window, or its run
+/// changed something (a target with no `bake` of its own is healthy once one
+/// reading after its apply passes; its phase's window covers the rest).
+fn row_reads_health(phases: &[PhaseRuntime], h: &RolloutHostRecord) -> bool {
+    row_bake(phases, h) > 0 || h.runtime.bake.as_ref().is_some_and(|w| !w.unchanged)
 }
 
 /// The shortest bake after a reboot, so that services coming up get checked.
@@ -1880,7 +1908,7 @@ impl Controller {
                         tracing::debug!(host = %c.host, "reconnected before rebooting; still waiting for the reboot");
                     }
                 }
-                HostPhase::Baking if self.bake_seconds(ri, hi) > 0 => {
+                HostPhase::Baking if self.reads_health(ri, hi) => {
                     // Resume the bake. Past its window, a host that was away
                     // reports afresh before it counts as baked, and a check
                     // still failing is followed through settle.
@@ -3655,7 +3683,14 @@ impl Controller {
             })
             .ok();
             if a.succeeded {
-                self.live[ri].hosts[hi].runtime.bake = Some(self.bake_window(ri, hi, None));
+                // The action's module (or workload) bakes as its run changed it.
+                let changed = self.live[ri]
+                    .record
+                    .runtime
+                    .action
+                    .as_ref()
+                    .map(|x| BTreeSet::from([x.module.clone()]));
+                self.live[ri].hosts[hi].runtime.bake = Some(self.bake_window(ri, hi, changed));
                 if let Some(reboot) = &a.reboot {
                     self.await_reboot(ri, hi, reboot);
                 }
@@ -4229,6 +4264,38 @@ impl Controller {
                     .collect()
             }
         };
+        // Expediting a phase (or the rollout) also ends the current phase's
+        // own window.
+        let cur = self.live[ri].record.runtime.current_phase;
+        let window = (host.is_none()
+            && phase.as_ref().is_none_or(|p| {
+                self.live[ri]
+                    .record
+                    .runtime
+                    .phases
+                    .get(cur)
+                    .is_some_and(|x| &x.name == p)
+            }))
+        .then(|| phase_window(&self.live[ri], cur))
+        .flatten()
+        .filter(|until| self.now() < *until);
+        if rows.is_empty() && window.is_some() {
+            let name = self.live[ri].record.runtime.phases[cur].name.clone();
+            self.command_audit(
+                actor,
+                if phase.is_some() {
+                    "rollout.phase.expedite"
+                } else {
+                    "rollout.expedite"
+                },
+                ri,
+                format!("{actor} ended {name}'s bake. {note}"),
+                serde_json::json!({"hosts": [], "failing": [], "phase": name, "note": note}),
+            );
+            self.live[ri].record.runtime.phases[cur].window_ended = true;
+            self.live[ri].dirty = true;
+            return Ok(rollout);
+        }
         if rows.is_empty() {
             return Err(CommandError::conflict(
                 match &phase {
@@ -4291,6 +4358,10 @@ impl Controller {
         for hi in clear {
             self.live[ri].hosts[hi].runtime.bake_until = Some(now);
             self.finish_step(ri, hi);
+        }
+        if window.is_some() && kept.is_empty() {
+            self.live[ri].record.runtime.phases[cur].window_ended = true;
+            self.live[ri].dirty = true;
         }
         Ok(rollout)
     }
@@ -4679,6 +4750,8 @@ impl Controller {
                 bake_until: None,
                 stages: 1,
                 open_stage: 0,
+                target_bake_seconds: Some(0),
+                window_ended: false,
             })
             .collect();
         // An action rollout has nothing to roll back to.
@@ -5774,6 +5847,7 @@ impl Controller {
         let until = now + chrono::Duration::seconds(bake as i64);
         {
             let h = &mut self.live[ri].hosts[hi];
+            h.runtime.applied_at = Some(now);
             h.runtime.bake_until = Some(until);
             h.runtime.failing_since.clear();
             h.runtime.bake_reports = 0;
@@ -5781,9 +5855,18 @@ impl Controller {
             h.runtime.bake_asked_until = None;
         }
         self.set_host_state(ri, hi, HostPhase::Baking, &why);
-        if bake > 0 {
+        if self.reads_health(ri, hi) {
             self.send_bake_request(ri, hi, until);
         }
+    }
+
+    /// [`row_reads_health`], counting a window a reboot raised.
+    fn reads_health(&self, ri: usize, hi: usize) -> bool {
+        self.bake_seconds(ri, hi) > 0
+            || row_reads_health(
+                &self.live[ri].record.runtime.phases,
+                &self.live[ri].hosts[hi],
+            )
     }
 
     /// Row `hi`'s bake window in seconds: what its step resolved to (see
@@ -6217,6 +6300,12 @@ impl Controller {
             consider(t);
         }
         for l in &self.live {
+            if l.record.is_running()
+                && let Some(until) = phase_window(l, l.record.runtime.current_phase)
+                && until > now
+            {
+                consider(until);
+            }
             for h in &l.hosts {
                 if h.state == HostPhase::Baking {
                     for since in h.runtime.failing_since.values() {
@@ -6226,7 +6315,7 @@ impl Controller {
                     // complete the host now; while a check is followed through
                     // settle it would spin (settle is the deadline then), and
                     // a host that has not reported is waited for a grace.
-                    let window = row_bake(&l.record.runtime.phases, h) > 0
+                    let window = row_reads_health(&l.record.runtime.phases, h)
                         || h.runtime
                             .reboot
                             .as_ref()
@@ -6299,7 +6388,7 @@ impl Controller {
                     // Baked: the window passed without a required check
                     // failing, and the host is connected and has reported
                     // (when it has a window at all).
-                    let window = self.bake_seconds(ri, hi) > 0;
+                    let window = self.reads_health(ri, hi);
                     // Past the window, a failing check is followed through
                     // settle, but the agent samples only until the `until`
                     // it was asked for: ask it to cover the rest.
@@ -6621,6 +6710,11 @@ impl Controller {
                 return changed;
             }
             if self.unapproved(ri, p, &hosts) {
+                return changed;
+            }
+            // What the phase changed is watched for its own `bake` after its
+            // last apply before the next phase starts.
+            if phase_window(&self.live[ri], p).is_some_and(|until| self.now() < until) {
                 return changed;
             }
             for &hi in &upto {
@@ -7538,6 +7632,10 @@ impl Controller {
             bake_until: None,
             stages: 1,
             open_stage: 0,
+            // The stragglers stage has no end to hold: each target bakes
+            // the whole `bake` on its own.
+            target_bake_seconds: None,
+            window_ended: false,
         });
         self.live[ri].record.runtime.current_phase = si;
         self.live[ri].record.runtime.stragglers_open = true;
@@ -7929,6 +8027,7 @@ impl Controller {
     }
 
     fn refresh_display(&mut self, ri: usize) {
+        let now = self.now();
         let live = &mut self.live[ri];
         let cur = live.record.runtime.current_phase;
         let running = live.record.is_running();
@@ -7969,9 +8068,11 @@ impl Controller {
                         matches!(live.hosts[h].state, HostPhase::Planned | HostPhase::Held)
                             && view::needs_approval(Some(phase), &live.hosts[h], &live.approvals)
                     });
+                let in_window =
+                    !any_flight && phase_window(live, i).is_some_and(|until| now < until);
                 if waiting_approval {
                     PhaseState::AwaitingApproval
-                } else if all_baking {
+                } else if all_baking || in_window {
                     PhaseState::Baking
                 } else {
                     PhaseState::Running
@@ -7989,12 +8090,18 @@ impl Controller {
                     _ => RolloutState::Rolling,
                 });
             }
-            // The phase bakes until its last baking row does: a row done
-            // (baked, skipped or failed) no longer holds it.
+            // The phase bakes until its last baking row does (a row done,
+            // baked, skipped or failed, no longer holds it), or its own
+            // window closes.
+            let window = (i == cur)
+                .then(|| phase_window(live, i))
+                .flatten()
+                .filter(|until| now < *until);
             let bake_until = hosts
                 .iter()
                 .filter(|&&h| live.hosts[h].state == HostPhase::Baking)
                 .filter_map(|&h| live.hosts[h].runtime.bake_until)
+                .chain(window)
                 .max();
             let phase = &mut live.record.runtime.phases[i];
             if phase.state != state || phase.bake_until != bake_until {

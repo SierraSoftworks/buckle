@@ -17,12 +17,13 @@ fn fleet(baseline: &str, settle: &str, bake: &str, n: u32) -> Fleet {
     let phases = format!(
         "    - {{ name: fleet, select: 'true', parallel: 10, approval: auto, bake: {bake}, max_failures: 0 }}\n"
     );
-    let fleet = common::checked_app_module(
+    let fleet = common::checked_app_module_baking(
         Fleet::with_phases(
             &format!("  health: {{ bake: 1s, baseline: {baseline} }}\n  settle: {settle}\n"),
             &phases,
         ),
         n,
+        Some(bake),
     );
     if n < 2 {
         return fleet;

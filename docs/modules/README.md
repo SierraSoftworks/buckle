@@ -76,7 +76,7 @@ health:
 | `handlers` | Named tasks run at the end of the module when a task notifies them. |
 | `actions` | Named tasks an operator runs on demand ([below](#actions)). |
 | `health` | [Health checks](./health.md) for this module. |
-| `bake` | How long a rollout bakes a host whose run changed this module, when longer than the phase's `bake` (see [Bake and promote](../operations/rollouts.md#_4-bake-and-promote)). |
+| `bake` | How long a rollout bakes a host whose run changed this module, holding its `parallel` slot and what `needs` it (see [Bake and promote](../operations/rollouts.md#_4-bake-and-promote)). Without one, a host is healthy after one passing reading. |
 | `facts.provides` | Fact providers to refresh after this module applies (for example `[tailscale]`), so dependants see the new values. |
 | `removal.policy` | `cleanup` or `leave`: the default [removal](#removal) for this module's tasks. |
 

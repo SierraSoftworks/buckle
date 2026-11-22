@@ -2557,6 +2557,8 @@ async fn each_phase_names_the_required_checks_of_the_modules_its_hosts_apply() {
         bake_until: None,
         stages: 1,
         open_stage: 0,
+        target_bake_seconds: None,
+        window_ended: false,
     };
     let mut rollout = finished_rollout("7", None);
     rollout.runtime.phases = vec![phase("canary"), phase("rest")];
@@ -2798,6 +2800,8 @@ async fn run_reports_are_served_per_host_and_per_rollout_host() {
                 bake_until: None,
                 stages: 1,
                 open_stage: 0,
+                target_bake_seconds: None,
+                window_ended: false,
             }];
             db.rollouts().save(&rollout)?;
             db.rollouts().save_host(&planned)?;

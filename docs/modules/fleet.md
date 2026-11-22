@@ -333,7 +333,7 @@ rollout:
 | `supersede` | `latest` | A revision that arrives mid-rollout waits for the current one. `latest` then rolls only the newest waiting revision, `sequential` rolls each in turn, and `replace` aborts the current rollout and starts the new one at once. |
 | `on_failure` | `pause` | When a phase exceeds its failure budget: `pause` for an operator, `rollback` automatically, or `continue`. |
 | `settle` | `2m` | A required check must fail continuously this long before it counts, so a restarting service is not blamed. |
-| `health.bake` | `5m` | The minimum time each host's checks repeat after it applies, unless a phase sets its own `bake`. A module's own `bake` lengthens it for runs that changed that module; a run that changed nothing does not bake. |
+| `health.bake` | `5m` | How long each phase waits after its last apply of a changed target before the next phase starts, unless a phase sets its own `bake`. A target's own bake comes from the `bake` of what its run changed (one health reading without one; see [Bake and promote](../operations/rollouts.md#_4-bake-and-promote)). |
 | `health.baseline` | `hold` | A host already unhealthy before its wave: `hold` waits for an operator to force or skip it, `skip` leaves it out, `ignore` applies anyway. |
 | `local_rollback.enabled` | `true` | Let an agent that loses the server after an apply roll itself back. |
 | `local_rollback.after` | `5m` | How long without a session before it does. |
@@ -350,7 +350,7 @@ Each phase:
 | `select` | **required** | A selector over `host.*` for hosts and over `workload.*` and `cluster.*` for [placements](../operations/rollouts.md#placements) (a workload on a cluster). A target belongs to the **first** phase whose selector matches it, and only that one. One phase takes both with a selector for each joined by `||` ([cluster selectors](./expressions.md#cluster-selectors)), ordered inside it by `needs`. |
 | `parallel` | `1` | Targets applied at once: a count, or a percentage of the phase's targets (rounded up). Targets whose plan changes nothing run alongside, outside the count. |
 | `approval` | `auto` | `required` stops for an operator to approve the phase's plans; `if_destructive` only when a plan removes or deletes something. |
-| `bake` | `health.bake` | The minimum time to watch health after each host applies. |
+| `bake` | `health.bake` | The phase's window: how long after its last apply the next phase waits. |
 | `max_failures` | `0` | Failed hosts tolerated (a count or a percentage) before the phase pauses. |
 
 Without `phases`, one implicit phase selects every target, one at a time. Hosts and placements
