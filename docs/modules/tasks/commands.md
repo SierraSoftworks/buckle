@@ -145,8 +145,12 @@ the host.
 
 <KindReference registry="tasks" kind="cluster.node" />
 
-- **Who may ask**: a host matching the cluster's `nodes`, for the node of its own name only
-  (Nomad's `name`, the Kubernetes node name: the host's id). Never for a scoped target.
+- **Who may ask**: a host matching the cluster's `nodes`, for its own node only. Never for a
+  scoped target.
+- **Which node**: the one named like the host (Nomad's `name`, the Kubernetes node name), by a
+  name the server verified: the host's id, or on a tailnet its MagicDNS name
+  (`web-1.tailnet.ts.net`), since a scheduler names a node after the machine's hostname. A `join`
+  token is for whichever of the two the host reports as its hostname, else its id.
 - **Pool**: a `join` is for the first entry of the cluster's [`pools`](../fleet.md#node-pools)
   the host matches, decided from what the server verified; with pools declared and no match there
   is no token.

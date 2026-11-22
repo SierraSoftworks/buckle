@@ -876,6 +876,23 @@ impl FleetService {
     }
 
     /// Authenticates a unary/streaming content call by per-host token or whois.
+    /// The tailnet DNS name the server's own tailscaled gives `host`, the
+    /// caller [`Self::caller`] identified: `None` off a tailnet, and for a
+    /// caller known by a token.
+    async fn tailnet_name<T>(&self, request: &Request<T>, host: &str) -> Option<String> {
+        if !self.uses(AgentAuth::Tailscale) {
+            return None;
+        }
+        let (peer, whois) = (Peer::of(request).addr?, self.whois.as_ref()?);
+        if !whois.covers(&peer) {
+            return None;
+        }
+        let identity = whois.whois(&peer).await.ok()??;
+        (identity.node == host)
+            .then_some(identity.dns_name)
+            .flatten()
+    }
+
     async fn caller<T>(&self, request: &Request<T>) -> Result<String, Status> {
         if self.uses(AgentAuth::Tailscale)
             && let (Some(peer), Some(whois)) = (Peer::of(request).addr, &self.whois)
@@ -1983,6 +2000,7 @@ impl Fleet for FleetService {
         use buckle_core::model::PoolChoice;
         use buckle_proto::v1::NodeOp;
         let host = self.caller(&request).await?;
+        let dns_name = self.tailnet_name(&request, &host).await;
         let req = request.into_inner();
         let op = req.op();
         let name = match op {
@@ -2020,12 +2038,16 @@ impl Fleet for FleetService {
             .load(&revision)
             .await
             .map_err(|_| Status::not_found("no such revision"))?;
-        let ctx = crate::fleet::record_context(
-            &record,
-            &facts.unwrap_or(serde_json::Value::Null),
-            &loaded.fleet,
-        );
+        let facts = facts.unwrap_or(serde_json::Value::Null);
+        let ctx = crate::fleet::record_context(&record, &facts, &loaded.fleet);
         let trusted = crate::fleet::trust_context(&record, &loaded.fleet);
+        // The scheduler names a node after the machine's hostname. The host
+        // says which of its verified names that is; it cannot add one.
+        let (node, aliases) = crate::node_ops::names(
+            &host,
+            dns_name.as_deref(),
+            facts["net"]["hostname"].as_str(),
+        );
         // Reading a node's state is not worth an audit line each drift
         // pass; everything that changes one (or is refused) is.
         let audit = |outcome: &str, message: String, pool: Option<&str>| NewAudit {
@@ -2035,7 +2057,7 @@ impl Fleet for FleetService {
             outcome: outcome.into(),
             subject: Some(req.cluster.clone()),
             message,
-            detail: Some(serde_json::json!({ "node": host, "pool": pool, "revision": revision })),
+            detail: Some(serde_json::json!({ "node": node, "pool": pool, "revision": revision })),
             trace_id: None,
         };
         let refuse = |reason: String| {
@@ -2079,7 +2101,8 @@ impl Fleet for FleetService {
                     target: req.cluster.clone(),
                     op_id: op_id.clone(),
                     op,
-                    node: host.clone(),
+                    node: node.clone(),
+                    aliases: aliases.clone(),
                     pool: pool.clone(),
                     revision: revision.clone(),
                     deadline: req.deadline.and_then(|d| d.try_into().ok()),

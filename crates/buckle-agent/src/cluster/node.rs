@@ -18,11 +18,26 @@ pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NodeTask<'a> {
     pub op: NodeOp,
-    /// The node's name: the id of the host that asked.
+    /// The node's name: one the server verified for the host that asked.
     pub node: &'a str,
+    /// That host's other verified names; its node carries any of them.
+    pub aliases: &'a [String],
     /// `join`: the pool the server picked; `None`: the default pool.
     pub pool: Option<&'a str>,
     pub deadline: Option<Duration>,
+}
+
+impl<'a> NodeTask<'a> {
+    /// Every name the host's node may carry, the server's choice first.
+    fn names(&self) -> Vec<&'a str> {
+        let mut names = vec![self.node];
+        for alias in self.aliases {
+            if !names.contains(&alias.as_str()) {
+                names.push(alias);
+            }
+        }
+        names
+    }
 }
 
 impl Executor {
@@ -65,8 +80,9 @@ impl Executor {
                 ..Default::default()
             });
         }
-        let Some(node) = nodes::find(&nomad, name).await? else {
-            return Ok(unregistered(access.target, name));
+        let names = task.names();
+        let Some(node) = nodes::find(&nomad, &names).await? else {
+            return Ok(unregistered(access.target, &names));
         };
         let changed = match task.op {
             NodeOp::Undrain => nodes::undrain(&nomad, &node).await?,
@@ -76,7 +92,9 @@ impl Executor {
             NodeOp::Status | NodeOp::Join => false,
         };
         let node = match changed {
-            true => nodes::find(&nomad, name).await?.unwrap_or(node),
+            true => nodes::find(&nomad, &[node.name.as_str()])
+                .await?
+                .unwrap_or(node),
             false => node,
         };
         Ok(NodeReply {
@@ -84,7 +102,7 @@ impl Executor {
             eligible: node.eligible,
             draining: node.draining,
             changed,
-            summary: summary(task.op, changed, name, access.target),
+            summary: summary(task.op, changed, &node.name, access.target),
             pool: node.pool,
             token: None,
         })
@@ -111,9 +129,18 @@ impl Executor {
                 ..Default::default()
             });
         }
-        let Some(node) = nodes::find(&kube, name).await? else {
-            return Ok(unregistered(access.target, name));
+        let names = task.names();
+        let mut found = None;
+        for candidate in &names {
+            if let Some(node) = nodes::find(&kube, candidate).await? {
+                found = Some(node);
+                break;
+            }
+        }
+        let Some(node) = found else {
+            return Ok(unregistered(access.target, &names));
         };
+        let name = node.name.as_str();
         let mut note = String::new();
         let changed = match task.op {
             NodeOp::Undrain => nodes::uncordon(&kube, &node).await?,
@@ -145,9 +172,9 @@ impl Executor {
     }
 }
 
-fn unregistered(target: &str, name: &str) -> NodeReply {
+fn unregistered(target: &str, names: &[&str]) -> NodeReply {
     NodeReply {
-        summary: format!("{target} has no live node named {name}"),
+        summary: format!("{target} has no live node named {}", names.join(" or ")),
         ..Default::default()
     }
 }

@@ -373,7 +373,8 @@ message RunNodeOperation {
   string target = 2;
   ClusterTarget cluster = 3;
   NodeOp op = 4;
-  // The node: the requesting host's id, as the server verified it.
+  // The node: a name the server verified for the requesting host. Its id,
+  // or its tailnet DNS name when that is what the host calls itself.
   string node = 5;
   // NODE_OP_JOIN: the pool the token is for; empty for the scheduler's
   // default pool.
@@ -383,6 +384,10 @@ message RunNodeOperation {
   // NODE_OP_DRAIN: how long the node's work gets to move; unset: the
   // steward's default.
   google.protobuf.Duration deadline = 8;
+  // The host's other verified names. Its node carries `node` or one of
+  // these: a scheduler names a node after the machine's hostname, which on
+  // a tailnet is often the DNS name and not the short one.
+  repeated string aliases = 9;
 }
 
 // How a RunNodeOperation went. Not durable: the host waiting for it asks

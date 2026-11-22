@@ -370,8 +370,10 @@ pub enum Instruction {
         /// How to reach it.
         cluster: Option<WireCluster>,
         op: buckle_core::task::NodeOp,
-        /// The node's name: the asking host's id.
+        /// The node's name: one the server verified for the asking host.
         node: String,
+        /// That host's other verified names.
+        aliases: Vec<String>,
         /// `join`: the pool the token is for; `None`: the default pool.
         pool: Option<String>,
         /// The revision declaring the cluster, for the credential.

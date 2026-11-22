@@ -1204,6 +1204,7 @@ fn node_task<'a>(op: buckle_core::task::NodeOp, node: &'a str) -> node::NodeTask
     node::NodeTask {
         op,
         node,
+        aliases: &[],
         pool: Some("public"),
         deadline: None,
     }
@@ -1246,6 +1247,38 @@ async fn a_steward_acts_on_a_node_with_its_node_credential() {
         Some("intro:web-9:public".to_owned())
     );
     assert_eq!(fake.logins(), vec![format!("jwt:{TARGET}:Node")]);
+}
+
+/// A machine whose hostname is its tailnet DNS name registers under that
+/// name: the steward finds the node by any of the host's verified names and
+/// leaves another host's node alone.
+#[tokio::test]
+async fn a_steward_finds_a_node_named_by_the_hosts_dns_name() {
+    use buckle_core::task::NodeOp;
+    let fake = FakeNomad::new();
+    fake.node("n-1", "web-1.tail.ts.net", "ready", false, false);
+    fake.node("n-2", "web-2.tail.ts.net", "ready", false, false);
+    let ex = executor(&fake);
+    let a = assignment(revision("r1", &[]), ClusterIdentity::BuckleJwt, 7);
+    let aliases = ["web-1.tail.ts.net".to_owned()];
+    let task = node::NodeTask {
+        aliases: &aliases,
+        ..node_task(NodeOp::Undrain, "web-1")
+    };
+
+    let undrained = ex.node(access(&a), task).await.unwrap();
+    let other = ex
+        .node(access(&a), node_task(NodeOp::Status, "web-2"))
+        .await
+        .unwrap();
+
+    assert!(undrained.registered && undrained.changed && undrained.eligible);
+    assert!(
+        undrained.summary.contains("web-1.tail.ts.net"),
+        "{}",
+        undrained.summary
+    );
+    assert!(!other.registered, "a short name alone does not reach it");
 }
 
 #[tokio::test]

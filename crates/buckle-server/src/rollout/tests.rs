@@ -4714,6 +4714,7 @@ async fn a_node_operation_goes_to_the_clusters_steward(
             op_id: "op-1".into(),
             op: buckle_proto::v1::NodeOp::Join,
             node: "n2".into(),
+            aliases: vec!["n2.tail.ts.net".into()],
             pool: "public".into(),
             revision: "r1".into(),
             deadline: None,
