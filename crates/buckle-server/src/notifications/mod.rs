@@ -277,6 +277,7 @@ impl Notifier {
             .extract_if(.., |h| h.kind == TargetKind::Cluster)
             .collect();
         let skipped = crate::schedules::skipped(&self.store, &self.revisions).await?;
+        let paused = self.store.call(|db| db.paused().list()).await?;
         let checks: Vec<TargetChecks<'_>> = checks
             .iter()
             .map(|(target, checks)| TargetChecks { target, checks })
@@ -291,6 +292,7 @@ impl Notifier {
                 skipped: &skipped,
                 refusals: &refusals,
                 webhooks: &webhooks,
+                paused: &paused,
                 watching_since: Some(self.started),
             },
             now,

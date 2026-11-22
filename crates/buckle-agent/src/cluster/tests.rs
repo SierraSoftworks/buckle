@@ -122,6 +122,7 @@ fn assignment(revision: Arc<Revision>, identity: ClusterIdentity, key: u8) -> As
             labels: IndexMap::new(),
             fingerprints: Arc::new(InstallKey::from_bytes([key; 32])),
             bounds: Default::default(),
+            paused: Default::default(),
         }),
         revision,
         secrets: Arc::new(secrets),
@@ -1266,4 +1267,82 @@ async fn a_scoped_target_has_no_nodes_to_act_on() {
         fake.node_state("n-1").unwrap()["SchedulingEligibility"],
         "ineligible"
     );
+}
+
+fn suspended(a: Assignment, workloads: &[&str]) -> Assignment {
+    Assignment {
+        spec: Arc::new(TargetSpec {
+            paused: workloads.iter().map(|w| (*w).to_owned()).collect(),
+            ..(*a.spec).clone()
+        }),
+        ..a
+    }
+}
+
+/// Suspending stops a workload's jobs, and from then on nothing plans it,
+/// removes what it owns or counts its checks, whatever the revision says.
+#[tokio::test]
+async fn a_suspended_workload_is_stopped_and_then_left_alone() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let mut both = workload_files("paste", "");
+    both.extend(workload_files("atuin", ""));
+    let a = assignment(revision("r1", &both), ClusterIdentity::Local, 7);
+    assert!(apply(&ex, &a).await.succeeded);
+
+    let a = suspended(a, &["paste", "atuin"]);
+    let outcome = run_action(&ex, &a, "paste", buckle_core::model::SUSPEND_ACTION).await;
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    assert_eq!(fake.job("default", "paste").unwrap()["Stop"], true);
+
+    // The next revision drops atuin; neither is touched while suspended.
+    let next = suspended(
+        assignment(
+            revision("r2", &workload_files("paste", "")),
+            ClusterIdentity::Local,
+            7,
+        ),
+        &["paste", "atuin"],
+    );
+    let plan = ex.plan(&next, None, None).await.unwrap().plan;
+    assert!(plan.is_empty(), "{plan:#?}");
+    assert!(plan.removals.is_empty(), "{:#?}", plan.removals);
+    let held: Vec<&str> = plan.held.iter().map(|h| h.module.as_str()).collect();
+    assert_eq!(held, vec!["paste"]);
+
+    let report = ex
+        .health(&next, HealthScope::Drift, None, None)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|r| r.status == HealthStatus::Paused),
+        "{report:?}"
+    );
+
+    // Resumed, the next plan starts the job again.
+    let resumed = suspended(next, &[]);
+    let plan = ex.plan(&resumed, None, Some("paste")).await.unwrap().plan;
+    assert!(
+        !plan.is_empty(),
+        "a stopped job is planned again: {plan:#?}"
+    );
+}
+
+#[tokio::test]
+async fn suspending_a_workload_with_nothing_registered_succeeds() {
+    let fake = FakeNomad::new();
+    let ex = executor(&fake);
+    let a = assignment(
+        revision("r1", &workload_files("paste", "")),
+        ClusterIdentity::Local,
+        7,
+    );
+
+    let outcome = run_action(&ex, &a, "paste", buckle_core::model::SUSPEND_ACTION).await;
+
+    assert!(outcome.succeeded, "{:?}", outcome.error);
+    assert_eq!(outcome.changes, 0);
 }

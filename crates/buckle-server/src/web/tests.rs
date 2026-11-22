@@ -3510,3 +3510,185 @@ async fn schedules_start_action_rollouts_and_keep_their_history() {
     let missing = test::call_service(&app, get("/api/v1/schedules/nope")).await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
+
+/// Suspending and resuming over the API: by target or by selector, one
+/// outcome per unit, and a suspended module's actions (its hooks never)
+/// offered nowhere.
+#[actix_web::test]
+async fn admins_suspend_and_resume_units_by_target_or_selector() {
+    let store = Store::in_memory().await.unwrap();
+    store
+        .call(|db| db.kv().set("stable_revision", "r1"))
+        .await
+        .unwrap();
+    let e = env_on(
+        store,
+        WebConfig {
+            admin_acl: acl("true"),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .await;
+    let module = e.state.revisions.dir("r1").join("modules/web");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("module.yaml"),
+        "name: web\nactions:\n  '@suspend': { command.run: { run: [\"true\"] } }\n  drain: { command.run: { run: [\"true\"] } }\n",
+    )
+    .unwrap();
+    revision(&e, "r1", "version: 2\n").await;
+    let mut sessions = Vec::new();
+    for host in ["pi-1", "pi-2", "old"] {
+        add_host(&e.store, host, HostStatus::Active).await;
+        let h = host.to_owned();
+        e.store
+            .call(move |db| db.hosts().set_applied_revision(&h, "r1"))
+            .await
+            .unwrap();
+        sessions.push(e.sessions.attach(host));
+        e.state.controller.connected(crate::rollout::Connected {
+            host: host.to_owned(),
+            applied_revision: Some("r1".into()),
+            last_plan_digest: None,
+            unreported_apply_revisions: Vec::new(),
+            new_session: true,
+            // `old` runs an agent that cannot hold a module.
+            capabilities: if host == "old" {
+                Vec::new()
+            } else {
+                vec![crate::rollout::UNIT_PAUSE_CAPABILITY.to_owned()]
+            },
+            boot_id: None,
+        });
+    }
+    let app = test::init_service(app(e.state.clone())).await;
+    let (cookie, token) = csrf(&app).await;
+    let post = |verb: &str, body: buckle_api::UnitsRequest| {
+        test::TestRequest::post()
+            .uri(&format!("/api/v1/units/{verb}"))
+            .cookie(cookie.clone())
+            .insert_header((auth::CSRF_HEADER, token.clone()))
+            .set_json(body)
+            .to_request()
+    };
+    let web = |target: Option<&str>, selector: Option<&str>, note: &str| buckle_api::UnitsRequest {
+        target: target.map(str::to_owned),
+        selector: selector.map(str::to_owned),
+        unit: Some("web".into()),
+        note: note.into(),
+        ..Default::default()
+    };
+
+    for (what, body, status) in [
+        (
+            "no note",
+            web(Some("pi-1"), None, " "),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "a target and a selector",
+            web(Some("pi-1"), Some("true"), "why"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "a host without a module named",
+            buckle_api::UnitsRequest {
+                unit: None,
+                ..web(Some("pi-1"), None, "why")
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "a module the host does not run",
+            buckle_api::UnitsRequest {
+                unit: Some("db".into()),
+                ..web(Some("pi-1"), None, "why")
+            },
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "an agent that cannot hold it",
+            web(Some("old"), None, "why"),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let resp = test::call_service(&app, post("suspend", body)).await;
+        assert_eq!(resp.status(), status, "{what}");
+    }
+
+    let resp =
+        test::call_service(&app, post("suspend", web(None, Some("true"), "kernel CVE"))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let done: buckle_api::UnitsResponse = test::read_body_json(resp).await;
+    let outcome: Vec<(&str, bool, bool)> = done
+        .units
+        .iter()
+        .map(|u| (u.target.as_str(), u.run.is_some(), u.error.is_some()))
+        .collect();
+    assert_eq!(
+        outcome,
+        vec![
+            ("old", false, true),
+            ("pi-1", true, false),
+            ("pi-2", true, false)
+        ],
+        "each unit says what became of it: {done:?}"
+    );
+
+    let get = |uri: &str| test::TestRequest::get().uri(uri).to_request();
+    let paused: Vec<buckle_api::PausedUnit> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/units/paused")).await).await;
+    let units: Vec<(&str, &str, &str)> = paused
+        .iter()
+        .map(|u| (u.target.as_str(), u.unit.as_str(), u.note.as_str()))
+        .collect();
+    assert_eq!(
+        units,
+        vec![("pi-1", "web", "kernel CVE"), ("pi-2", "web", "kernel CVE")]
+    );
+
+    // Its hook is never offered, and its own action only where it runs.
+    let detail: buckle_api::HostDetail =
+        test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1")).await).await;
+    let names: Vec<&str> = detail.actions.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, vec!["drain"]);
+    let offered: Vec<buckle_api::FleetAction> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/actions")).await).await;
+    assert_eq!(offered.len(), 1, "{offered:?}");
+    assert_eq!(offered[0].targets, vec!["old"]);
+    let start = test::TestRequest::post()
+        .uri("/api/v1/rollouts")
+        .cookie(cookie.clone())
+        .insert_header((auth::CSRF_HEADER, token.clone()))
+        .set_json(buckle_api::StartActionRollout {
+            module: "web".into(),
+            action: "drain".into(),
+            selector: Some("host.id != \"old\"".into()),
+            ..Default::default()
+        })
+        .to_request();
+    let resp = test::call_service(&app, start).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "an action waits where its module is suspended everywhere"
+    );
+
+    let resp = test::call_service(&app, post("resume", web(Some("pi-1"), None, "patched"))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = test::call_service(&app, post("resume", web(Some("pi-1"), None, "again"))).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "not suspended any more"
+    );
+    let resp = test::call_service(&app, post("resume", web(None, Some("true"), "patched"))).await;
+    let done: buckle_api::UnitsResponse = test::read_body_json(resp).await;
+    let resumed: Vec<&str> = done.units.iter().map(|u| u.target.as_str()).collect();
+    assert_eq!(resumed, vec!["pi-2"], "only what is suspended");
+    let paused: Vec<buckle_api::PausedUnit> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/units/paused")).await).await;
+    assert!(paused.is_empty(), "{paused:?}");
+    drop(sessions);
+}

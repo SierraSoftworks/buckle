@@ -11,7 +11,7 @@ mod schedule;
 mod task_decl;
 mod workload;
 
-pub use action_decl::ActionDecl;
+pub use action_decl::{ActionDecl, RESUME_ACTION, SUSPEND_ACTION, reserved_action};
 pub use cluster::{
     Bounds, ClusterDecl, ClusterIdentity, ClusterKind, ClusterPool, ClusterScope, ClusterTrust,
     PoolChoice, trust_problem, yaml_scalar_text,

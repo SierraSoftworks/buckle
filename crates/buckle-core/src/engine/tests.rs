@@ -4614,6 +4614,10 @@ async fn a_stale_action_plan_is_refused() {
 #[case::no_action("cron: '@daily'\nmodule: m\naction: nope", Some("does not declare"))]
 #[case::confirm_without_note("cron: '@daily'\nmodule: m\naction: reboot", Some("`note`"))]
 #[case::confirm_with_note("cron: '@daily'\nmodule: m\naction: reboot\nnote: weekly", None)]
+#[case::a_suspend_hook(
+    "cron: '@daily'\nmodule: m\naction: '@suspend'",
+    Some("only Suspend and Resume run")
+)]
 fn schedules_are_validated(#[case] schedule: &str, #[case] error: Option<&str>) {
     let m = module(
         "name: m\nactions:\n  upgrade: { test.file: { path: /u, run: r } }\n  reboot: { test.file: { path: /r, run: r }, confirm: true }\n",
@@ -4631,4 +4635,160 @@ fn schedules_are_validated(#[case] schedule: &str, #[case] error: Option<&str>) 
             "{report}"
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Paused modules
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_paused_module_is_left_alone_until_it_is_resumed() {
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision("r1", FLEET, drift_modules("r1", "paused-held"));
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+
+    // The next revision changes `a` and drops `c`, both paused.
+    let mut modules = drift_modules("r2", "paused-held");
+    modules.retain(|m| m.config.name != "c" && m.config.name != "b");
+    modules.push(module("name: b\n"));
+    let r2 = revision("r2", FLEET, modules);
+    let paused = inputs_with_store(r2.clone(), &sys, store.clone())
+        .with_paused(["a".to_owned(), "c".to_owned()]);
+    let plan = plan(&paused).await;
+    let held: Vec<&str> = plan.held.iter().map(|h| h.module.as_str()).collect();
+    assert_eq!(held, vec!["a"], "{:#?}", plan.held);
+    assert!(plan.held[0].reason.contains("paused"));
+    assert!(!module_names(&plan).contains(&"a"));
+    let removed: Vec<&str> = plan
+        .removals
+        .iter()
+        .map(|r| r.resource.module.as_str())
+        .collect();
+    assert_eq!(removed, vec!["b"], "a paused module keeps what it owns");
+
+    let (outcome, _) = apply_plan(&paused, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(sys.file_string("/dr/a").as_deref(), Some("one"));
+    assert!(sys.exists("/dr/c"));
+    let state = store.load().unwrap();
+    assert_eq!(state.applied_revision, Some(RevisionId::new("r2")));
+    assert_eq!(state.module_revisions["a"], RevisionId::new("r1"));
+
+    let resumed = inputs_with_store(r2, &sys, store);
+    let (outcome, _) = apply(&resumed).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(sys.file_string("/dr/a").as_deref(), Some("two"));
+    assert!(!sys.exists("/dr/c"));
+}
+
+#[rstest]
+#[case::caught_up(true, "two")]
+#[case::left_behind(false, "one")]
+#[tokio::test]
+async fn drift_brings_a_resumed_module_to_the_applied_revision(
+    #[case] catch_up: bool,
+    #[case] content: &str,
+) {
+    let run = if catch_up {
+        "dr-caught-up"
+    } else {
+        "dr-behind"
+    };
+    let sys = FakeSystem::new();
+    let store = Arc::new(MemoryStateStore::default());
+    let r1 = revision("r1", FLEET, drift_modules("r1", run));
+    let (outcome, _) = apply(&inputs_with_store(r1, &sys, store.clone())).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    // `a` is suspended while r2 rolls out (`b` fails at r2, so leave it out).
+    let mut modules = drift_modules("r2", run);
+    modules.retain(|m| m.config.name == "a");
+    let r2 = revision("r2", FLEET, modules);
+    let paused = inputs_with_store(r2.clone(), &sys, store.clone())
+        .with_removals(false)
+        .with_paused(["a".to_owned()]);
+    let (outcome, _) = apply(&paused).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+
+    let mut drift = inputs_with_store(r2, &sys, store.clone())
+        .with_drift(true)
+        .with_removals(false);
+    if catch_up {
+        drift = drift.with_catch_up(["a".to_owned()]);
+    }
+    let (plan, _) = Engine::drift(&drift).await.unwrap();
+    assert_eq!(plan.held.is_empty(), catch_up, "{:#?}", plan.held);
+    let (outcome, _) = apply_plan(&drift, &plan).await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(sys.file_string("/dr/a").as_deref(), Some(content));
+    let at = if catch_up { "r2" } else { "r1" };
+    assert_eq!(
+        store.load().unwrap().module_revisions["a"],
+        RevisionId::new(at)
+    );
+}
+
+#[tokio::test]
+async fn a_paused_modules_checks_report_paused_and_its_actions_still_run() {
+    let rev = revision("r1", FLEET, vec![module(ACTION_MODULE)]);
+    let sys = FakeSystem::new();
+    let inputs = inputs(rev, &sys).with_paused(["web".to_owned()]);
+
+    let report = Engine::health(&inputs, crate::health::HealthScope::Drift, None)
+        .await
+        .unwrap();
+    assert!(!report.results.is_empty());
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|r| r.status == crate::health::HealthStatus::Paused),
+        "{report:#?}"
+    );
+    assert!(report.healthy(&[]));
+
+    let outcome = run_action(&inputs, "web", "rotate").await;
+    assert!(outcome.succeeded, "{outcome:#?}");
+    assert_eq!(outcome.changes, 1);
+    assert!(
+        outcome.health.is_none_or(|h| h.results.is_empty()),
+        "what a hook stopped is not checked"
+    );
+}
+
+#[rstest]
+#[case::suspend("'@suspend': { systemd.restart: { name: x } }", None)]
+#[case::resume("'@resume': { systemd.restart: { name: x } }", None)]
+#[case::another_reserved_name(
+    "'@pause': { systemd.restart: { name: x } }",
+    Some("names that start with `@`")
+)]
+fn only_buckles_own_actions_start_with_an_at_sign(
+    #[case] action: &str,
+    #[case] problem: Option<&str>,
+) {
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![module(&format!("name: m\nactions:\n  {action}\n"))],
+    );
+    let report = validate(&rev).unwrap();
+    let messages: Vec<&str> = report.errors.iter().map(|e| e.message.as_str()).collect();
+    match problem {
+        None => assert!(messages.is_empty(), "{messages:#?}"),
+        Some(p) => assert!(messages.iter().any(|m| m.contains(p)), "{messages:#?}"),
+    }
+}
+
+#[test]
+fn an_unquoted_reserved_action_name_says_to_quote_it() {
+    use crate::error::HumanizableError;
+    let err = serde_yaml::from_str::<serde_yaml::Value>("actions:\n  @suspend: {}\n")
+        .unwrap_err()
+        .to_human_error();
+    assert!(
+        err.advice().iter().any(|a| a.contains("'@suspend'")),
+        "{err:?}"
+    );
 }

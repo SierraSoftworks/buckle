@@ -95,7 +95,7 @@ pub(super) async fn report(
 ) {
     for r in results {
         let reason = match &r.status {
-            HealthStatus::Pass => None,
+            HealthStatus::Pass | HealthStatus::Paused => None,
             HealthStatus::Fail { reason } | HealthStatus::Unknown { reason } => {
                 Some(reason.clone())
             }
@@ -188,6 +188,18 @@ pub(super) async fn run_scope(
     let mut results = Vec::new();
     for module in targets {
         if module.config.health.is_empty() {
+            continue;
+        }
+        if planner.paused.contains(&module.config.name) {
+            results.extend(module.config.health.iter().map(|decl| HealthResult {
+                module: module.config.name.clone(),
+                check: decl.display_name().to_owned(),
+                kind: decl.check.kind.clone(),
+                required: decl.required,
+                status: HealthStatus::Paused,
+                at: planner.system.now(),
+                duration_ms: 0,
+            }));
             continue;
         }
         let ctx = match planner.module_context(&contexts, &module.config) {

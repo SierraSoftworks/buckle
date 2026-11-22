@@ -38,6 +38,17 @@ impl HumanizableError for std::io::Error {
 
 impl HumanizableError for serde_yaml::Error {
     fn to_human_error(self) -> Error {
+        // YAML reserves `@`, which Buckle's own action names start with.
+        if self.to_string().contains("cannot start any token") {
+            return wrap_user(
+                self,
+                "A YAML document could not be parsed.",
+                &[
+                    "A key or value that starts with `@` must be quoted: write '@suspend': and '@resume':.",
+                    "The internal error names the line and column.",
+                ],
+            );
+        }
         wrap_user(
             self,
             "A YAML document could not be parsed.",

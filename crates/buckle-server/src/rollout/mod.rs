@@ -13,7 +13,8 @@ pub mod view;
 
 pub use controller::{
     Command, CommandError, CommandErrorKind, Connected, ControllerDeps, ControllerHandle,
-    ControllerOptions, approval_token, encode_pending_report, pending_report_key, spawn,
+    ControllerOptions, UNIT_PAUSE_CAPABILITY, approval_token, encode_pending_report,
+    pending_report_key, spawn,
 };
 pub use link::{HostLink, Sessions};
 pub use model::RolloutAction;

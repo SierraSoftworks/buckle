@@ -69,7 +69,34 @@ pub struct TargetSpec {
     /// The part of the cluster the target may touch: a scoped target's
     /// namespaces, or the ones a cluster has handed to its scoped targets.
     pub bounds: Bounds,
+    /// The workloads an operator suspended here: nothing is planned for
+    /// them or removed of theirs, and their checks report paused.
+    pub paused: BTreeSet<String>,
 }
+
+impl TargetSpec {
+    /// `workloads` without the suspended ones, and those as a plan holds
+    /// them.
+    fn hold_paused<'a>(
+        &self,
+        workloads: Vec<&'a LoadedWorkload>,
+    ) -> (Vec<&'a LoadedWorkload>, Vec<buckle_core::plan::Held>) {
+        let (held, kept): (Vec<_>, Vec<_>) = workloads
+            .into_iter()
+            .partition(|w| self.paused.contains(&w.config.name));
+        let held = held
+            .into_iter()
+            .map(|w| buckle_core::plan::Held {
+                module: w.config.name.clone(),
+                reason: PAUSED.to_owned(),
+            })
+            .collect();
+        (kept, held)
+    }
+}
+
+/// What a workload held because it is suspended says in the plan.
+const PAUSED: &str = "it is paused";
 
 impl std::fmt::Debug for TargetSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,6 +106,7 @@ impl std::fmt::Debug for TargetSpec {
             .field("identity", &self.identity)
             .field("labels", &self.labels)
             .field("bounds", &self.bounds)
+            .field("paused", &self.paused)
             .finish_non_exhaustive()
     }
 }
@@ -438,7 +466,7 @@ impl Executor {
         }
         let nomad = self.client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
-        let workloads = scoped(a.workloads(&ctx), scope);
+        let (workloads, held) = a.spec.hold_paused(scoped(a.workloads(&ctx), scope));
         // ACL policies need a management token, which only workloads that
         // list one ask for; the cluster binds `acl` to it.
         let acl = if workloads
@@ -456,7 +484,8 @@ impl Executor {
         let mut warnings = Vec::new();
         let mut indeterminate = Vec::new();
         let mut declared: Vec<ObjectKey> = implicit.present.clone();
-        let mut undecided: BTreeSet<String> = BTreeSet::new();
+        // A suspended workload keeps what it owns, selected or not.
+        let mut undecided: BTreeSet<String> = a.spec.paused.clone();
         let mut earlier: Vec<ObjectKey> = Vec::new();
         let mut namespaces_created: BTreeSet<String> = BTreeSet::new();
         let selected: BTreeSet<String> = workloads.iter().map(|w| w.config.name.clone()).collect();
@@ -611,7 +640,8 @@ impl Executor {
             warnings,
             units,
             removals,
-        ))
+        )
+        .holding(held))
     }
 
     /// Applies `planned`'s workloads as their `needs` allow, several at once
@@ -972,6 +1002,10 @@ impl Executor {
                     at: Utc::now(),
                     duration_ms: 0,
                 };
+            if a.spec.paused.contains(module) {
+                results.push(result("job", "nomad.job", true, HealthStatus::Paused));
+                continue;
+            }
             let owned = jobs.remove(module).unwrap_or_default();
             if w.config.jobs().next().is_some() && owned.is_empty() {
                 results.push(result(
@@ -1129,11 +1163,14 @@ async fn action_steps(
             &["Run actions of the workloads the cluster's page lists."],
         ));
     };
+    // Suspend stops the workload's jobs, as its Stop action does; with
+    // none registered there is nothing to stop.
+    let suspend = action == buckle_core::model::SUSPEND_ACTION;
     if let Some(implicit) = w
         .config
         .implicit_actions()
         .iter()
-        .find(|i| i.name == action)
+        .find(|i| i.name == if suspend { "stop" } else { action })
     {
         let job = match implicit.name {
             "restart" => Action::Restart,
@@ -1157,7 +1194,7 @@ async fn action_steps(
                 run: ActionRun::Job(job.clone()),
             })
             .collect();
-        if steps.is_empty() {
+        if steps.is_empty() && !suspend {
             return Err(buckle_core::error::user(
                 format!(
                     "The workload {workload} has no job registered on {}.",
@@ -1167,6 +1204,9 @@ async fn action_steps(
             ));
         }
         return Ok(steps);
+    }
+    if suspend {
+        return Ok(Vec::new());
     }
     if let Some(t) = w.task_actions.iter().find(|t| t.name == action) {
         return task_action_steps(nomad, a, workload, t, instances).await;
@@ -1868,6 +1908,14 @@ fn nomad_removal(removal: WorkloadRemoval) -> buckle_nomad::Removal {
 /// The plan's resource key of a cluster object: `paste/nomad.job[default/paste]`.
 fn resource_key(module: &str, kind: &str, key: &str) -> ResourceKey {
     ResourceKey::new(module, kind, key)
+}
+
+impl ClusterPlan {
+    /// The plan with the suspended workloads it leaves alone.
+    fn holding(mut self, held: Vec<buckle_core::plan::Held>) -> Self {
+        self.plan = self.plan.with_held(held);
+        self
+    }
 }
 
 /// The plan of a cluster target, from its parts.

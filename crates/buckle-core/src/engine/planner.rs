@@ -227,7 +227,14 @@ pub(super) struct Planner<'a> {
     /// JSON schemas by task kind, for secret-field aware spec rendering.
     schemas: Mutex<HashMap<&'static str, Arc<serde_json::Value>>>,
     pub clusters: Option<Arc<dyn crate::task::ClusterCredentials>>,
+    /// Paused modules (see [`Inputs::paused`]).
+    pub paused: &'a BTreeSet<String>,
+    /// Resumed modules a drift plan catches up (see [`Inputs::catch_up`]).
+    pub catch_up: BTreeSet<String>,
 }
+
+/// What a module held because it is paused says in the plan.
+pub const PAUSED: &str = "it is paused";
 
 impl<'a> Planner<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -239,6 +246,7 @@ impl<'a> Planner<'a> {
         select: Option<&'a crate::Filter>,
         waived: Arc<Vec<String>>,
         agent_vars: &'a Vars,
+        paused: &'a BTreeSet<String>,
     ) -> crate::Result<Self> {
         Ok(Self {
             revision,
@@ -253,6 +261,8 @@ impl<'a> Planner<'a> {
             drift: false,
             schemas: Mutex::new(HashMap::new()),
             clusters: None,
+            paused,
+            catch_up: BTreeSet::new(),
         })
     }
 
@@ -268,8 +278,10 @@ impl<'a> Planner<'a> {
             inputs.select.as_ref(),
             Arc::new(inputs.waived_checks.clone()),
             &inputs.agent_vars,
+            &inputs.paused,
         )?;
         planner.drift = inputs.drift;
+        planner.catch_up = inputs.catch_up.clone();
         planner.clusters = inputs.clusters.clone();
         planner.plan_system = Arc::new(crate::system::PlanGuard::new(
             inputs.system.clone(),
@@ -1435,13 +1447,33 @@ pub(super) async fn plan_with(
     let mut selection = planner.select(&contexts)?;
     let revision = planner.revision;
 
-    // Drift re-plans only what this host has applied at this revision.
+    // A paused module is left exactly as it is, whatever the plan is for.
     let mut held: Vec<Held> = Vec::new();
+    if !planner.paused.is_empty() {
+        let mut hold = |name: &String| {
+            let paused = planner.paused.contains(name);
+            if paused {
+                held.push(Held {
+                    module: name.clone(),
+                    reason: PAUSED.to_owned(),
+                });
+            }
+            !paused
+        };
+        selection.order.retain(|m| hold(&m.config.name));
+        selection.conditional.retain(|(m, _)| hold(&m.config.name));
+    }
+    // Drift re-plans only what this host has applied at this revision.
     if planner.drift {
         let id = &revision.id;
+        // A resumed module is brought to this revision, unless it failed.
+        let applied = |name: &String| {
+            state.module_at(name, id)
+                || (planner.catch_up.contains(name) && !state.failed_modules.contains_key(name))
+        };
         selection.order.retain(|m| {
             let name = &m.config.name;
-            if state.module_at(name, id) {
+            if applied(name) {
                 return true;
             }
             let reason = match (
@@ -1462,7 +1494,7 @@ pub(super) async fn plan_with(
         });
         let (keep, unapplied): (Vec<_>, Vec<_>) = std::mem::take(&mut selection.conditional)
             .into_iter()
-            .partition(|(m, _)| state.module_at(&m.config.name, id));
+            .partition(|(m, _)| applied(&m.config.name));
         selection.conditional = keep;
         selection
             .skipped
@@ -1723,6 +1755,8 @@ pub(super) async fn plan_with(
         .map(|d| d.module.clone())
         .chain(undecided.iter().cloned())
         .chain(problems.iter().map(|p| p.module.clone()))
+        // A paused module keeps what it owns even once nothing selects it.
+        .chain(planner.paused.iter().cloned())
         .collect();
     // Drift never removes what a revision other than its own recorded.
     if planner.drift {
@@ -1856,6 +1890,7 @@ pub(super) async fn dry_run(
         ));
     }
     let agent_vars = Vars::new();
+    let paused = BTreeSet::new();
     // Kinds are checked against the platform the facts describe, not the one
     // running `buckle validate`.
     let platform = crate::Platform::from_facts(facts).unwrap_or_else(crate::Platform::current);
@@ -1867,6 +1902,7 @@ pub(super) async fn dry_run(
         None,
         Arc::new(Vec::new()),
         &agent_vars,
+        &paused,
     )?;
     let contexts = planner.contexts(facts);
     let selection = planner.select(&contexts)?;

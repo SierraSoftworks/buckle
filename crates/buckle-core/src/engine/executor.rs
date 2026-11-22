@@ -939,6 +939,9 @@ impl<'a> Executor<'a> {
         // Once the run has asked for a reboot, checks would judge the host
         // before the change takes effect (and a failure would roll the
         // module back): they run after the reboot instead, in the bake.
+        // A paused module's checks are not run: an action is all that
+        // reaches one, and what it stopped is meant to stay stopped.
+        let run_health = run_health && !planner.paused.contains(&module);
         let deferred_by_reboot =
             run_health && config.is_some_and(|c| !c.health.is_empty()) && self.reboot_pending();
         if deferred_by_reboot {

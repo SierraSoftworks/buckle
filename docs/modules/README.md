@@ -158,6 +158,27 @@ handlers:
 
 [`apt.upgrade`](./tasks/packages.md#apt-upgrade) is meant for an action.
 
+### Suspend and resume hooks
+
+[Suspending](../operations/hosts.md#suspending-a-module-or-a-workload) a module pauses it on one
+host. Two reserved actions say what else that takes; a module with neither is only paused.
+
+```yaml
+actions:
+  '@suspend':
+    command.run: { run: [systemctl, stop, cloudflared] }
+  '@resume':
+    command.run: { run: [systemctl, start, cloudflared] }
+```
+
+* **Names.** `'@suspend'` and `'@resume'` are quoted (YAML reserves a leading `@`); any other
+  name that starts with `@` is rejected.
+* **Running.** `@suspend` runs once the module is paused; `@resume` runs while it still is, and
+  the pause lifts when it succeeded. Neither is offered as an action, run in an action rollout
+  or named by a schedule.
+* **Health.** The module's checks do not run after either hook: they read `paused` until the
+  module is resumed.
+
 ## Removal
 
 Buckle records every resource it applies. When a task leaves the configuration, or its module or

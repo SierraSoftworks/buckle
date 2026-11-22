@@ -125,6 +125,8 @@ pub struct Welcome {
     pub secrets: Vec<WireSecret>,
     /// Digest of the stable revision's tarball, to verify the cached tree.
     pub stable_tree_digest: Option<String>,
+    /// The host's modules an operator suspended.
+    pub paused_modules: Vec<String>,
 }
 
 impl std::fmt::Debug for Welcome {
@@ -141,6 +143,7 @@ impl std::fmt::Debug for Welcome {
             .field("status", &self.status)
             .field("secrets", &self.secrets)
             .field("stable_tree_digest", &self.stable_tree_digest)
+            .field("paused_modules", &self.paused_modules)
             .finish()
     }
 }
@@ -163,6 +166,8 @@ pub struct WireCluster {
     pub namespaces: Vec<String>,
     /// The namespaces the cluster's scoped targets own.
     pub excluded_namespaces: Vec<String>,
+    /// The workloads an operator suspended on the target.
+    pub paused_workloads: Vec<String>,
 }
 
 impl Drop for WireCluster {
@@ -180,6 +185,7 @@ impl std::fmt::Debug for WireCluster {
             .field("labels", &self.labels)
             .field("namespaces", &self.namespaces)
             .field("excluded_namespaces", &self.excluded_namespaces)
+            .field("paused_workloads", &self.paused_workloads)
             .finish_non_exhaustive()
     }
 }
@@ -197,6 +203,8 @@ pub struct HostUpdate {
     pub secrets: Vec<WireSecret>,
     /// Digest of the stable revision's tarball.
     pub stable_tree_digest: Option<String>,
+    /// The host's modules an operator suspended.
+    pub paused_modules: Vec<String>,
 }
 
 /// What the control plane tells the agent to do.

@@ -158,6 +158,14 @@ type HealthFn = Box<dyn Fn(&RevisionId, HealthScope) -> HealthReport + Send + Sy
 type OutcomeFn = Box<dyn Fn(&Plan) -> ApplyOutcome + Send + Sync>;
 type ApplyErrorFn = Box<dyn Fn(&Plan) -> Option<buckle_core::Error> + Send + Sync>;
 
+/// What a plan or apply was told about suspended modules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suspension {
+    pub call: &'static str,
+    pub paused: Vec<String>,
+    pub catch_up: Vec<String>,
+}
+
 /// A scripted runner that records every call.
 pub struct FakeRunner {
     plans: Mutex<HashMap<RevisionId, VecDeque<Plan>>>,
@@ -169,6 +177,7 @@ pub struct FakeRunner {
     plan_facts: Mutex<Option<Facts>>,
     applied_secrets: Mutex<Vec<(RevisionId, Vec<String>)>>,
     drift_flags: Mutex<Vec<(&'static str, RevisionId, bool)>>,
+    suspensions: Mutex<Vec<Suspension>>,
     calls: Mutex<Vec<Call>>,
     changed: Notify,
     boot_id: Mutex<Option<String>>,
@@ -187,6 +196,7 @@ impl Default for FakeRunner {
             plan_facts: Mutex::new(None),
             applied_secrets: Mutex::new(Vec::new()),
             drift_flags: Mutex::new(Vec::new()),
+            suspensions: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             changed: Notify::new(),
             boot_id: Mutex::new(Some("boot-1".into())),
@@ -285,6 +295,19 @@ impl FakeRunner {
         lock(&self.drift_flags).clone()
     }
 
+    /// The suspended and resumed modules each plan and apply was given.
+    pub fn suspensions(&self) -> Vec<Suspension> {
+        lock(&self.suspensions).clone()
+    }
+
+    fn note_suspension(&self, call: &'static str, ctx: &RunContext) {
+        lock(&self.suspensions).push(Suspension {
+            call,
+            paused: ctx.paused.clone(),
+            catch_up: ctx.catch_up.clone(),
+        });
+    }
+
     /// The names of the secrets each apply was given, in order.
     pub fn applied_secrets(&self) -> Vec<(RevisionId, Vec<String>)> {
         lock(&self.applied_secrets).clone()
@@ -348,6 +371,7 @@ impl Runner for FakeRunner {
             force: ctx.force,
         });
         lock(&self.drift_flags).push(("plan", revision.id.clone(), ctx.drift));
+        self.note_suspension("plan", ctx);
         let facts = lock(&self.plan_facts)
             .clone()
             .unwrap_or_else(|| ctx.facts.clone());
@@ -368,6 +392,7 @@ impl Runner for FakeRunner {
             force: ctx.force,
         });
         lock(&self.drift_flags).push(("apply", revision.id.clone(), ctx.drift));
+        self.note_suspension("apply", ctx);
         {
             let mut names: Vec<String> = ctx.secrets.iter().map(|s| s.name().to_owned()).collect();
             names.sort();

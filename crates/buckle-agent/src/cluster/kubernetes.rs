@@ -143,7 +143,7 @@ impl Executor {
     ) -> buckle_core::Result<ClusterPlan> {
         let kube = self.kube_client(a, Purpose::Deploy, rollout).await?;
         let ctx = a.context();
-        let workloads = super::scoped(a.workloads(&ctx), scope);
+        let (workloads, held) = a.spec.hold_paused(super::scoped(a.workloads(&ctx), scope));
         let base = buckle_kube::Context::new(
             kube.clone(),
             &a.target,
@@ -177,7 +177,8 @@ impl Executor {
         let mut modules = Vec::new();
         let mut warnings = Vec::new();
         let mut indeterminate = Vec::new();
-        let mut undecided: BTreeSet<String> = BTreeSet::new();
+        // A suspended workload keeps what it owns, selected or not.
+        let mut undecided: BTreeSet<String> = a.spec.paused.clone();
         let mut earlier: Vec<KubeKey> = Vec::new();
         let mut landing: BTreeSet<String> = BTreeSet::new();
 
@@ -313,15 +314,7 @@ impl Executor {
             };
             steps.push(RemovalStep::Kube(orphan, removal, ocx));
         }
-        Ok(finish(
-            a,
-            modules,
-            removals,
-            indeterminate,
-            warnings,
-            units,
-            steps,
-        ))
+        Ok(finish(a, modules, removals, indeterminate, warnings, units, steps).holding(held))
     }
 
     /// [`Executor::health`] for a Kubernetes cluster: each controller's
@@ -362,6 +355,15 @@ impl Executor {
                     at: Utc::now(),
                     duration_ms: 0,
                 };
+            if a.spec.paused.contains(module) {
+                results.push(result(
+                    "objects",
+                    buckle_kube::primitives::MANIFEST_KIND,
+                    true,
+                    HealthStatus::Paused,
+                ));
+                continue;
+            }
             let keys = owned.remove(module).unwrap_or_default();
             if w.config.of_kind(ResourceKind::Manifest).next().is_some() && keys.is_empty() {
                 results.push(result(

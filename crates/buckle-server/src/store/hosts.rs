@@ -593,6 +593,9 @@ impl<'c> Hosts<'c> {
             .execute("DELETE FROM host_drift WHERE host_id = ?1", params![id])
             .map_err(db_error)?;
         self.conn
+            .execute("DELETE FROM paused_units WHERE target = ?1", params![id])
+            .map_err(db_error)?;
+        self.conn
             .execute("DELETE FROM agent_reports WHERE host = ?1", params![id])
             .map_err(db_error)?;
         let n = self

@@ -967,11 +967,12 @@ impl FleetService {
             .call(move |db| {
                 let rec = db.hosts().get(&h)?;
                 let facts = db.hosts().latest_facts(&h)?.map(|(f, _)| f);
-                Ok((rec, facts.unwrap_or(serde_json::Value::Null)))
+                let paused: Vec<String> = db.paused().of(&h)?.into_iter().map(|u| u.unit).collect();
+                Ok((rec, facts.unwrap_or(serde_json::Value::Null), paused))
             })
             .await;
-        let (record, facts) = match record {
-            Ok((Some(r), f)) => (r, f),
+        let (record, facts, paused_modules) = match record {
+            Ok((Some(r), f, p)) => (r, f, p),
             _ => {
                 return Welcome {
                     server_version: self.server_version.clone(),
@@ -1005,6 +1006,7 @@ impl FleetService {
             None => String::new(),
         };
         Welcome {
+            paused_modules,
             stable_tree_digest,
             server_version: self.server_version.clone(),
             session_id: session_id.to_string(),
@@ -1398,7 +1400,9 @@ impl FleetService {
                         check: r.check.clone(),
                         kind: r.kind.clone(),
                         required: r.required,
-                        status: if r.unknown {
+                        status: if r.paused {
+                            "paused"
+                        } else if r.unknown {
                             "unknown"
                         } else if r.passed {
                             "pass"

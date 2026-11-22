@@ -330,6 +330,10 @@ impl Lane {
                             || s.kind != w.spec.kind
                     });
                 if let Some(spec) = spec {
+                    // What a suspended workload's checks say changes at once.
+                    if spec.paused != w.spec.paused {
+                        w.health_due = now;
+                    }
                     w.spec = spec;
                 }
                 w.applied = terms.applied;

@@ -650,6 +650,7 @@ pub fn render_health(report: &HealthReport, waived: &[String]) -> String {
             HealthStatus::Pass => ("✓", String::new()),
             HealthStatus::Fail { reason } => ("✗", format!("  {reason}")),
             HealthStatus::Unknown { reason } => ("?", format!("  unknown: {reason}")),
+            HealthStatus::Paused => ("‖", "  paused".to_owned()),
         };
         let flag = if !r.required {
             "  (informational)"

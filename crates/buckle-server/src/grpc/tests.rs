@@ -999,6 +999,72 @@ async fn health_readings_belong_to_the_rollout_that_applied_their_revision() {
     assert_eq!(events[0].rollout.as_deref(), Some("ro-1"));
 }
 
+/// A host hears which of its modules are suspended as soon as it connects,
+/// and what their checks report is stored as paused: nothing fails.
+#[tokio::test]
+async fn a_suspended_module_is_named_in_the_welcome_and_its_checks_read_paused() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let (tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let welcome = expect_welcome(reply);
+    assert!(welcome.paused_modules.is_empty());
+    drop(tx);
+    s.store
+        .call(|db| {
+            db.paused().set(&buckle_api::PausedUnit {
+                target: "pi-1".into(),
+                unit: "web".into(),
+                note: "disk swap".into(),
+                by: "alice".into(),
+                at: chrono::Utc::now(),
+                review_at: None,
+            })
+        })
+        .await
+        .unwrap();
+    let (tx, _stream, reply) = open(s.addr, hello("pi-1", &welcome.issued_token, "2.0.0")).await;
+    assert_eq!(expect_welcome(reply).paused_modules, vec!["web"]);
+
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::Health(buckle_proto::v1::HealthReport {
+            scope: buckle_proto::v1::HealthScope::Drift as i32,
+            revision: "r1".into(),
+            results: vec![buckle_proto::v1::HealthResult {
+                module: "web".into(),
+                check: "api".into(),
+                kind: "http".into(),
+                required: true,
+                passed: false,
+                unknown: true,
+                paused: true,
+                reason: "paused".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    let checks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let checks = s.store.call(|db| db.health().checks("pi-1")).await.unwrap();
+            if !checks.is_empty() {
+                return checks;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the readings are stored");
+    assert_eq!(checks[0].status, "paused");
+    let host = s
+        .store
+        .call(|db| db.hosts().get("pi-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(host.health, buckle_api::HealthSummary::Failing);
+}
+
 fn module_started(digest: &str) -> AgentMessage {
     apply_event(
         digest,

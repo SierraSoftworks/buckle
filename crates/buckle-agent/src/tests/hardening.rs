@@ -650,6 +650,58 @@ async fn a_host_paused_while_connected_stops_correcting_drift() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_resumed_module_is_caught_up_by_a_drift_pass_at_once() {
+    let fake = FakeRunner::new();
+    let plan = plan_with_changes(&rev("rev1"), 2);
+    fake.with_plans(
+        &rev("rev1"),
+        vec![plan.clone(), plan_with_changes(&rev("rev1"), 0)],
+    );
+    let mut h = Harness::start(Setup {
+        runner: fake.clone(),
+        yaml: "drift: { interval: 10h, correct: true }\n".into(),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle(FLEET_YAML));
+    session.send(assign("rev1", &digest)).await;
+    let suspend = |modules: &[&str]| {
+        pb::server_message::Msg::HostUpdate(pb::HostUpdate {
+            status: "active".into(),
+            paused_modules: modules.iter().map(|m| m.to_string()).collect(),
+            ..Default::default()
+        })
+    };
+    session.send(suspend(&["web"])).await;
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.load_agent_state().paused_modules == ["web"]).await;
+    session
+        .send(pb::server_message::Msg::Apply(apply(
+            "rev1",
+            plan.digest.as_str(),
+        )))
+        .await;
+    assert!(session.expect(apply_result).await.succeeded);
+    assert!(
+        fake.suspensions()
+            .iter()
+            .all(|s| s.paused == ["web"] && s.catch_up.is_empty()),
+        "{:#?}",
+        fake.suspensions()
+    );
+
+    session.send(suspend(&[])).await;
+    // Nothing drifted, and the module is still applied at the revision.
+    let caught_up = |s: &crate::testing::Suspension| s.call == "apply" && s.catch_up == ["web"];
+    wait_until(|| fake.suspensions().iter().any(caught_up)).await;
+    wait_until(|| store.load_agent_state().resumed_modules.is_empty()).await;
+    assert!(store.load_agent_state().paused_modules.is_empty());
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_engine_stale_plan_is_reported_as_a_stale_plan_not_a_failure() {
     let fake = FakeRunner::new();
     let approved = plan_with_changes(&rev("rev1"), 1);

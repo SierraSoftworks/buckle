@@ -282,6 +282,10 @@ message HealthResult {
   string reason = 7;
   google.protobuf.Timestamp at = 8;
   uint32 duration_ms = 9;
+  // The check's module (or workload) is paused: it did not run and counts
+  // neither as passing nor as failing. Sent with `unknown` set, which is
+  // how a server that predates it reads the result.
+  bool paused = 10;
 }
 
 message HealthReport {
@@ -489,6 +493,8 @@ message HostUpdate {
   SecretBundle secrets = 4;
   // Digest of the stable revision's tarball, as in Welcome.
   string stable_tree_digest = 5;
+  // The host's modules an operator suspended, as in Welcome.
+  repeated string paused_modules = 6;
 }
 
 // The server stored these durable reports (ApplyResult, LocalRollback) in a
@@ -512,6 +518,11 @@ message Welcome {
   // Digest of the stable revision's tarball; the agent verifies the tree it
   // caches for local rollback (and every re-fetch) against it.
   string stable_tree_digest = 8;
+  // The host's modules an operator suspended: the agent keeps the list
+  // with its status and leaves them alone in every plan, apply, drift pass
+  // and rollback (their checks report paused) until a later Welcome or
+  // HostUpdate drops them. An agent announces `unit_pause` when it does.
+  repeated string paused_modules = 9;
 }
 
 message Assign {
@@ -555,6 +566,10 @@ message ClusterTarget {
   // For a cluster with scoped targets: the namespaces those own, which the
   // executor refuses to plan this target's objects in.
   repeated string excluded_namespaces = 7;
+  // The workloads an operator suspended on this target: the executor plans
+  // nothing for them, removes nothing of theirs and reports their checks
+  // as paused.
+  repeated string paused_workloads = 8;
 }
 
 message RequestPlan {

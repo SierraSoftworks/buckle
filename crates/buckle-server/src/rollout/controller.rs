@@ -228,6 +228,25 @@ pub enum Command {
         revision: String,
         deadline: Option<Duration>,
     },
+    /// Suspend `unit` on `target` (a host's module, a cluster's workload):
+    /// pause it, then run its `@suspend` where it has one (a workload:
+    /// stop its jobs); replies with that run's id, or nothing.
+    Suspend {
+        target: String,
+        unit: String,
+        /// Why; asked for, and shown with the suspended unit.
+        note: String,
+        /// When to look at it again: past it, the unit asks for attention.
+        review_at: Option<DateTime<Utc>>,
+    },
+    /// Resume a suspended unit: run its `@resume` where it has one, and
+    /// lift the pause once that succeeded; replies with that run's id, or
+    /// nothing when the pause is lifted at once.
+    ResumeUnit {
+        target: String,
+        unit: String,
+        note: String,
+    },
 }
 
 impl Command {
@@ -253,6 +272,8 @@ impl Command {
             Command::MoveLease { .. } => "target.steward.move",
             Command::CheckDrift { .. } => "host.drift.check",
             Command::NodeOperation { .. } => "target.node",
+            Command::Suspend { .. } => "target.unit.suspend",
+            Command::ResumeUnit { .. } => "target.unit.resume",
         }
     }
 }
@@ -657,6 +678,10 @@ pub const SCHEDULED_NEEDS_CAPABILITY: &str = "scheduled_needs";
 /// hosts (`RunNodeOperation`) only once it announces it.
 pub const NODE_OPS_CAPABILITY: &str = "node_ops";
 
+/// An agent leaves a suspended module (a steward: a suspended workload)
+/// alone only once it announces it: a unit is suspended on such agents only.
+pub const UNIT_PAUSE_CAPABILITY: &str = "unit_pause";
+
 /// An agent holds a target to its bounds (a scoped target's namespaces, the
 /// ones a cluster handed to its scoped targets) only once it announces it;
 /// an older one would apply such a target as a whole cluster, so it is
@@ -796,6 +821,12 @@ struct Controller {
     stable: Option<String>,
     stable_dirty: bool,
     excluded: HashSet<String>,
+    /// The suspended units (`paused_units`), by (target, unit): a host's
+    /// module, a cluster's workload.
+    paused: HashSet<(String, String)>,
+    /// `@resume` runs under way, by run id: who resumed the unit, and why.
+    /// The pause is lifted when one succeeds.
+    resuming: HashMap<String, (String, String)>,
     /// Hosts this controller has seen connect and not yet seen disconnect.
     /// A dropped session leaves the link before its disconnect reaches the
     /// controller; until then the host is not taken for offline.
@@ -985,6 +1016,12 @@ impl Controller {
                     out.push((r, hosts, approvals));
                 }
                 let all = db.hosts().list()?;
+                let paused: HashSet<(String, String)> = db
+                    .paused()
+                    .list()?
+                    .into_iter()
+                    .map(|u| (u.target, u.unit))
+                    .collect();
                 let excluded: HashSet<String> = all
                     .iter()
                     .filter(|h| h.status != HostStatus::Active)
@@ -1004,11 +1041,11 @@ impl Controller {
                 Ok((
                     out,
                     db.kv().get(keys::STABLE_REVISION)?,
-                    (excluded, seen, pending, executors),
+                    (excluded, seen, pending, executors, paused),
                 ))
             })
             .await?;
-        let (excluded, host_seen, pending, executors) = excluded;
+        let (excluded, host_seen, pending, executors, paused) = excluded;
         let mut replay = Vec::new();
         for (key, value) in pending {
             match decode_pending_report(&value) {
@@ -1118,6 +1155,8 @@ impl Controller {
             stable,
             stable_dirty: false,
             excluded,
+            paused,
+            resuming: HashMap::new(),
             online: HashSet::new(),
             capabilities: HashMap::new(),
             boot_ids: HashMap::new(),
@@ -1202,7 +1241,27 @@ impl Controller {
     /// connected and not excluded either.
     fn row_eligible(&self, ri: usize, hi: usize) -> bool {
         !self.excluded.contains(&self.live[ri].hosts[hi].host)
+            && !self.row_paused(ri, hi)
             && self.row_session(ri, hi).is_some_and(|s| self.eligible(&s))
+    }
+
+    /// Whether row `hi` is a suspended unit's: a suspended workload's
+    /// placement or, in an action rollout, a target the action's module (a
+    /// cluster's: workload) is suspended on. Such a row is left alone as an
+    /// excluded target's is. A host's row stays in a rollout while one of
+    /// its modules is suspended: its agent holds the module.
+    fn row_paused(&self, ri: usize, hi: usize) -> bool {
+        if self.paused.is_empty() {
+            return false;
+        }
+        let live = &self.live[ri];
+        let h = &live.hosts[hi];
+        let unit = match &live.record.runtime.action {
+            Some(action) => &action.module,
+            None if h.runtime.kind == TargetKind::Workload => &h.workload,
+            None => return false,
+        };
+        self.paused.contains(&(h.host.clone(), unit.clone()))
     }
 
     /// Whether row `hi` is open: its phase is the current one (or the
@@ -1257,7 +1316,7 @@ impl Controller {
     /// grace that started then has passed.
     fn offline_for_phase(&self, ri: usize, hi: usize) -> bool {
         let h = &self.live[ri].hosts[hi];
-        if self.excluded.contains(&h.host) {
+        if self.excluded.contains(&h.host) || self.row_paused(ri, hi) {
             return true;
         }
         if h.runtime.disconnected_at.is_some() {
@@ -1548,7 +1607,23 @@ impl Controller {
                     match msg {
                         agent_message::Msg::Result(r) => self.on_apply_result(&host, r),
                         agent_message::Msg::Rollback(r) => self.on_local_rollback(&host, r),
-                        agent_message::Msg::Action(a) => self.on_action_result(&host, a),
+                        agent_message::Msg::Action(a) => {
+                            // A host module's `@resume` that succeeded
+                            // lifts its pause.
+                            let resumed = a.succeeded
+                                && a.target.is_empty()
+                                && a.action == buckle_core::model::RESUME_ACTION;
+                            let (run, module) = (a.action_id.clone(), a.module.clone());
+                            self.on_action_result(&host, a);
+                            let by = self.resuming.remove(&run);
+                            if resumed && self.paused.contains(&(host.clone(), module.clone())) {
+                                let (actor, note) =
+                                    by.unwrap_or_else(|| ("controller".to_owned(), String::new()));
+                                if let Err(e) = self.lift(&actor, &host, &module, &note).await {
+                                    tracing::error!(host = %host, module = %module, error = %e.error.description(), "the module's @resume succeeded but its pause could not be lifted; resume it again");
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1639,7 +1714,7 @@ impl Controller {
         {
             self.live[ri].hosts[hi].runtime.disconnected_at = None;
             self.touch_host(ri, hi);
-            if self.excluded.contains(&self.live[ri].hosts[hi].host) {
+            if self.excluded.contains(&self.live[ri].hosts[hi].host) || self.row_paused(ri, hi) {
                 return;
             }
             let state = self.live[ri].hosts[hi].state;
@@ -2395,6 +2470,7 @@ impl Controller {
         }
         if record.is_none() {
             self.host_seen.remove(host);
+            self.paused.retain(|(t, _)| t != host);
             self.forget_host(host);
             return;
         }
@@ -2499,9 +2575,17 @@ impl Controller {
     /// effective labels and, when active, the stable revision's secrets), as
     /// Welcome would on the next session (design §08 "Registration").
     async fn push_host_update(&self, record: &crate::store::HostRecord) {
+        let mut paused_modules: Vec<String> = self
+            .paused
+            .iter()
+            .filter(|(t, _)| t == &record.id)
+            .map(|(_, unit)| unit.clone())
+            .collect();
+        paused_modules.sort();
         let mut update = pb::HostUpdate {
             status: crate::store::hosts_status_str(record.status).to_owned(),
             labels: record.labels.clone().into_iter().collect(),
+            paused_modules,
             ..Default::default()
         };
         if let Some(stable) = self.stable.clone() {
@@ -2580,12 +2664,30 @@ impl Controller {
         revision: String,
         instances: Option<buckle_api::ActionInstances>,
         note: String,
+        // Suspend and Resume running the unit's own hook: they have
+        // checked what the unit is doing in a rollout themselves.
+        hook: bool,
     ) -> Result<String, CommandError> {
-        let applying = self.live.iter().any(|l| {
-            l.hosts.iter().any(|h| {
-                h.host == target && (h.state.in_flight() || h.state == HostPhase::RollingBack)
-            })
-        });
+        if !hook && buckle_core::model::reserved_action(&action) {
+            return Err(CommandError::invalid(
+                format!("'{action}' runs only when '{module}' is suspended or resumed."),
+                &["Suspend or resume the module instead."],
+            ));
+        }
+        if !hook && self.paused.contains(&(target.clone(), module.clone())) {
+            return Err(CommandError::conflict(
+                format!(
+                    "'{module}' is suspended on {target}: its actions wait until it is resumed."
+                ),
+                &["Resume it first."],
+            ));
+        }
+        let applying = !hook
+            && self.live.iter().any(|l| {
+                l.hosts.iter().any(|h| {
+                    h.host == target && (h.state.in_flight() || h.state == HostPhase::RollingBack)
+                })
+            });
         if applying {
             return Err(CommandError::conflict(
                 format!("{target} is applying in a rollout."),
@@ -2715,6 +2817,349 @@ impl Controller {
             trace_id_of(&span),
         );
         Ok(run_id)
+    }
+
+    /// What `unit` is on `target`: the target's record, the revision it
+    /// runs, and what suspending or resuming the unit runs there.
+    async fn unit(
+        &self,
+        target: &str,
+        unit: &str,
+    ) -> Result<(crate::store::HostRecord, String, crate::actions::UnitHooks), CommandError> {
+        let t = target.to_owned();
+        let (record, facts) = self
+            .store
+            .call(move |db| {
+                Ok((
+                    db.hosts().target(&t)?,
+                    db.hosts().latest_facts(&t)?.map(|(f, _)| f),
+                ))
+            })
+            .await
+            .map_err(CommandError::internal)?;
+        let record =
+            record.ok_or_else(|| CommandError::not_found(format!("No target '{target}'.")))?;
+        let Some(applied) = record.applied_revision.clone() else {
+            return Err(CommandError::conflict(
+                format!("{target} has not applied a revision yet: it runs nothing to suspend."),
+                &["Suspend it once a rollout has reached the target."],
+            ));
+        };
+        let rev = self
+            .revisions
+            .load(&applied)
+            .await
+            .map_err(CommandError::internal)?;
+        let facts = facts.unwrap_or(serde_json::Value::Null);
+        let hooks = crate::actions::unit(&rev, &record, &facts, unit).ok_or_else(|| {
+            CommandError::not_found(format!(
+                "{target} runs no '{unit}' at revision {}.",
+                short(&applied)
+            ))
+        })?;
+        Ok((record, applied, hooks))
+    }
+
+    /// Tells `record`'s agent (a cluster's steward) which of its units are
+    /// suspended now.
+    async fn tell_paused(&mut self, record: &crate::store::HostRecord) {
+        match record.kind {
+            TargetKind::Host => self.push_host_update(record).await,
+            TargetKind::Cluster | TargetKind::Workload => {
+                if let Some(steward) = self.executors.get(&record.id).cloned()
+                    && self.connected(&steward)
+                {
+                    self.send_lease(&steward, &record.id).await;
+                }
+            }
+        }
+    }
+
+    /// Suspends `unit` on `target` (see [`Command::Suspend`]). The pause is
+    /// kept by the unit's agent (a workload's: the cluster's steward), so
+    /// that one has to be connected and new enough to keep it; and the
+    /// pause is in place before `@suspend` runs, so that nothing puts back
+    /// what the hook stops. Suspending a suspended unit runs the hook again
+    /// and takes the new note.
+    async fn suspend(
+        &mut self,
+        actor: &str,
+        target: String,
+        unit: String,
+        note: String,
+        review_at: Option<DateTime<Utc>>,
+    ) -> Result<String, CommandError> {
+        let note = note.trim().to_owned();
+        if note.is_empty() {
+            return Err(CommandError::invalid(
+                "Say why it is suspended.",
+                &["The note is shown with the suspended unit and kept in the audit log."],
+            ));
+        }
+        let (record, applied, hooks) = self.unit(&target, &unit).await?;
+        if record.status != HostStatus::Active {
+            return Err(CommandError::conflict(
+                format!(
+                    "{target} is {:?}; a unit is suspended on active targets only.",
+                    record.status
+                ),
+                &["A target that is not active is left alone as a whole."],
+            ));
+        }
+        let changing = self.live.iter().any(|l| {
+            l.hosts.iter().any(|h| {
+                h.host == target
+                    && (h.state.in_flight() || h.state == HostPhase::RollingBack)
+                    && match (&l.record.runtime.action, h.runtime.kind) {
+                        (Some(action), _) => action.module == unit,
+                        (None, TargetKind::Workload) => h.workload == unit,
+                        (None, _) => true,
+                    }
+            })
+        });
+        if changing {
+            return Err(CommandError::conflict(
+                format!("'{unit}' on {target} is changing in a rollout."),
+                &["Suspend it once the rollout has finished with it, or pause the rollout first."],
+            ));
+        }
+        let session = match record.kind {
+            TargetKind::Host => Some(target.clone()),
+            TargetKind::Cluster | TargetKind::Workload => self.executors.get(&target).cloned(),
+        };
+        let Some(session) = session.filter(|s| self.eligible(s)) else {
+            return Err(CommandError::conflict(
+                format!(
+                    "{target} is out of reach: {}.",
+                    match record.kind {
+                        TargetKind::Host => "its agent is offline",
+                        _ => "no steward of it is connected",
+                    }
+                ),
+                &[
+                    "Suspend it once the agent is back: the agent keeps the pause.",
+                    "To keep rollouts off a whole host meanwhile, pause the host.",
+                ],
+            ));
+        };
+        if !self.has_capability(&session, UNIT_PAUSE_CAPABILITY) {
+            return Err(CommandError::conflict(
+                format!("The agent on {session} predates suspending a module or a workload."),
+                &["Upgrade the agent (its host page), then suspend again."],
+            ));
+        }
+        let key = (target.clone(), unit.clone());
+        let was = self.paused.contains(&key);
+        let row = buckle_api::PausedUnit {
+            target: target.clone(),
+            unit: unit.clone(),
+            note: note.clone(),
+            by: actor.to_owned(),
+            at: self.now(),
+            review_at,
+        };
+        self.store
+            .call(move |db| db.paused().set(&row))
+            .await
+            .map_err(CommandError::internal)?;
+        self.paused.insert(key.clone());
+        self.tell_paused(&record).await;
+        let run = if hooks.suspend {
+            let started = self
+                .run_action(
+                    actor,
+                    target.clone(),
+                    unit.clone(),
+                    buckle_core::model::SUSPEND_ACTION.to_owned(),
+                    "Suspend".to_owned(),
+                    applied,
+                    None,
+                    note.clone(),
+                    true,
+                )
+                .await;
+            match started {
+                Ok(run) => run,
+                Err(e) => {
+                    // Nothing was stopped: the unit is as it was.
+                    if !was {
+                        let (t, u) = key.clone();
+                        let undone = self.store.call(move |db| db.paused().remove(&t, &u)).await;
+                        if undone.is_ok() {
+                            self.paused.remove(&key);
+                            self.tell_paused(&record).await;
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            String::new()
+        };
+        let mut detail = serde_json::json!({"unit": unit, "note": note});
+        if let Some(at) = review_at {
+            detail["review_at"] = serde_json::json!(at);
+        }
+        if !run.is_empty() {
+            detail["run"] = serde_json::json!(run);
+        }
+        self.audit(
+            actor,
+            "target.unit.suspend",
+            &target,
+            format!("{actor} suspended {unit} on {target}: {note}"),
+            detail,
+            None,
+        );
+        Ok(run)
+    }
+
+    /// Resumes `unit` on `target` (see [`Command::ResumeUnit`]). A host's
+    /// module declaring `@resume` stays suspended while that runs, and is
+    /// let go when it succeeded (see [`Controller::lift`]); anything else
+    /// is let go at once.
+    async fn resume_unit(
+        &mut self,
+        actor: &str,
+        target: String,
+        unit: String,
+        note: String,
+    ) -> Result<String, CommandError> {
+        let note = note.trim().to_owned();
+        if note.is_empty() {
+            return Err(CommandError::invalid(
+                "Say why it is resumed.",
+                &["The note is kept in the audit log."],
+            ));
+        }
+        if !self.paused.contains(&(target.clone(), unit.clone())) {
+            return Err(CommandError::conflict(
+                format!("'{unit}' is not suspended on {target}."),
+                &["Nothing to resume."],
+            ));
+        }
+        // A unit the target no longer runs has nothing to run: let it go.
+        let hook = match self.unit(&target, &unit).await {
+            Ok((_, applied, hooks)) if hooks.resume => Some(applied),
+            _ => None,
+        };
+        let Some(applied) = hook else {
+            self.lift(actor, &target, &unit, &note).await?;
+            return Ok(String::new());
+        };
+        let run = self
+            .run_action(
+                actor,
+                target,
+                unit,
+                buckle_core::model::RESUME_ACTION.to_owned(),
+                "Resume".to_owned(),
+                applied,
+                None,
+                note.clone(),
+                true,
+            )
+            .await?;
+        self.resuming.insert(run.clone(), (actor.to_owned(), note));
+        Ok(run)
+    }
+
+    /// Lifts `unit`'s pause on `target` and lets it converge: a host's
+    /// agent catches the module up with a drift pass; a workload's
+    /// placement goes back to the stragglers stage of the stable revision.
+    async fn lift(
+        &mut self,
+        actor: &str,
+        target: &str,
+        unit: &str,
+        note: &str,
+    ) -> Result<(), CommandError> {
+        let (t, u) = (target.to_owned(), unit.to_owned());
+        let record = self
+            .store
+            .call(move |db| {
+                db.paused().remove(&t, &u)?;
+                Ok((
+                    db.hosts().target(&t)?,
+                    db.hosts().latest_facts(&t)?.map(|(f, _)| f),
+                ))
+            })
+            .await
+            .map_err(CommandError::internal)?;
+        self.paused.remove(&(target.to_owned(), unit.to_owned()));
+        let message = if note.is_empty() {
+            format!("{actor} resumed {unit} on {target}")
+        } else {
+            format!("{actor} resumed {unit} on {target}: {note}")
+        };
+        self.audit(
+            actor,
+            "target.unit.resume",
+            target,
+            message,
+            serde_json::json!({"unit": unit, "note": note}),
+            None,
+        );
+        let (Some(record), facts) = record else {
+            return Ok(());
+        };
+        self.tell_paused(&record).await;
+        if record.kind != TargetKind::Host {
+            let facts = facts.unwrap_or(serde_json::Value::Null);
+            self.revive_placement(&record, &facts, unit).await;
+        }
+        if let Some(host) = crate::views::load_summary(&self.store, &self.revisions, target).await {
+            self.events.publish(LiveEvent::HostChanged { host });
+        }
+        Ok(())
+    }
+
+    /// A resumed workload's placement on cluster `record` converges where
+    /// a target that missed its phase does: one waiting for its plan gets
+    /// it, and in the rollout whose stragglers stage is open, one that
+    /// finished (what `@suspend` stopped is to start again) or missed its
+    /// phase rejoins that stage, as does one the rollout never had.
+    async fn revive_placement(
+        &mut self,
+        record: &crate::store::HostRecord,
+        facts: &serde_json::Value,
+        unit: &str,
+    ) {
+        for ri in 0..self.live.len() {
+            if self.live[ri].record.runtime.action.is_some() {
+                continue;
+            }
+            let stragglers = self.live[ri]
+                .stragglers_index()
+                .filter(|_| self.live[ri].record.runtime.stragglers_open);
+            let row = self.live[ri].find_row(&record.id, unit);
+            match (row, stragglers) {
+                (Some(hi), _) if self.live[ri].hosts[hi].state == HostPhase::PlanPending => {
+                    self.request_plan(ri, hi);
+                }
+                (Some(hi), Some(si))
+                    if matches!(
+                        self.live[ri].hosts[hi].state,
+                        HostPhase::Healthy | HostPhase::Missed
+                    ) =>
+                {
+                    self.keep_applied_plan(ri, hi);
+                    {
+                        let h = &mut self.live[ri].hosts[hi];
+                        h.runtime.failing_since.clear();
+                        h.runtime.request_id = None;
+                        h.runtime.bake_until = None;
+                        h.runtime.bake = None;
+                    }
+                    self.move_to_stragglers(ri, hi, si);
+                }
+                (None, Some(si)) => {
+                    self.add_cluster_stragglers(ri, record, facts, si, false)
+                        .await;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Asks `target` to check for drift now (see [`Command::CheckDrift`]):
@@ -3149,9 +3594,18 @@ impl Controller {
                 note,
             } => {
                 self.run_action(
-                    actor, target, module, action, label, revision, instances, note,
+                    actor, target, module, action, label, revision, instances, note, false,
                 )
                 .await
+            }
+            Command::Suspend {
+                target,
+                unit,
+                note,
+                review_at,
+            } => self.suspend(actor, target, unit, note, review_at).await,
+            Command::ResumeUnit { target, unit, note } => {
+                self.resume_unit(actor, target, unit, note).await
             }
             Command::Start { revision, note } => self.start(&revision, actor, &note).await,
             Command::MoveLease { target, host, note } => {
@@ -6036,6 +6490,12 @@ impl Controller {
                             self.live[ri].hosts[hi].runtime.error = Some(w.reason.clone());
                             self.set_host_state(ri, hi, HostPhase::Missed, &w.reason);
                         }
+                        None if self.row_paused(ri, hi) => self.set_host_state(
+                            ri,
+                            hi,
+                            HostPhase::Missed,
+                            "suspended during its phase",
+                        ),
                         None => self.set_host_state(
                             ri,
                             hi,
@@ -8573,6 +9033,13 @@ impl Controller {
         let identity = declared
             .map(|d| d.identity.to_string())
             .unwrap_or_else(|| spec.identity.clone());
+        let mut paused_workloads: Vec<String> = self
+            .paused
+            .iter()
+            .filter(|(t, _)| t == target)
+            .map(|(_, unit)| unit.clone())
+            .collect();
+        paused_workloads.sort();
         pb::ClusterTarget {
             kind,
             api,
@@ -8581,6 +9048,7 @@ impl Controller {
             fingerprint_key: self.secrets.fingerprint_key(target),
             namespaces: bounds.namespaces,
             excluded_namespaces: bounds.excluded,
+            paused_workloads,
         }
     }
 
@@ -8741,6 +9209,7 @@ fn health_result_json(x: &pb::HealthResult) -> serde_json::Value {
         "required": x.required,
         "passed": x.passed,
         "unknown": x.unknown,
+        "paused": x.paused,
         "reason": x.reason,
     })
 }
