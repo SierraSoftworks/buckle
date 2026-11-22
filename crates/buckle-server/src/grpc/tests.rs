@@ -1551,6 +1551,11 @@ async fn cluster_host(
         })
         .await
         .unwrap();
+    // The declared clusters become targets now, not whenever a summary of
+    // the host happens to be loaded after the stable revision is set.
+    crate::views::reference_revision_synced(&s.store, &s.revisions)
+        .await
+        .expect("the stable revision loads");
     (s, token)
 }
 
