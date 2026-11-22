@@ -39,23 +39,30 @@ struct Stub {
     node_pool: String,
 }
 
-/// The live node named `name`: one that is not `down` (a reinstalled host
-/// leaves its previous node behind until Nomad collects it). `None` when
-/// there is none; an error when several are live, since nothing says which
-/// one the host is.
-pub async fn find(nomad: &Nomad, name: &str) -> Result<Option<Node>> {
-    let filter = format!("Name == {}", json!(name));
+/// The live node that carries one of `names` (the names of one host): one
+/// that is not `down` (a reinstalled host leaves its previous node behind
+/// until Nomad collects it). `None` when there is none; an error when
+/// several are live, since nothing says which one the host is.
+pub async fn find(nomad: &Nomad, names: &[&str]) -> Result<Option<Node>> {
+    let filter = names
+        .iter()
+        .map(|name| format!("Name == {}", json!(name)))
+        .collect::<Vec<_>>()
+        .join(" or ");
     let path = client::with_query("/v1/nodes", "filter", &filter);
     let stubs: Vec<Stub> = nomad.get(&path).await?.unwrap_or_default();
     let mut live = stubs
         .into_iter()
-        .filter(|n| n.name == name && n.status != "down");
+        .filter(|n| names.contains(&n.name.as_str()) && n.status != "down");
     let Some(node) = live.next() else {
         return Ok(None);
     };
     if live.next().is_some() {
         return Err(user(
-            format!("More than one live Nomad node is named {name}."),
+            format!(
+                "More than one live Nomad node is named {}.",
+                names.join(" or ")
+            ),
             &["Give every client its own `name`, or remove the stale node with `nomad node gc`."],
         ));
     }

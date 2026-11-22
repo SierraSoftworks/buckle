@@ -836,7 +836,7 @@ async fn node_operations_converge(
     fake.node("n-2", "web-2", "ready", true, false);
     let nomad = fake.client();
 
-    let node = nodes::find(&nomad, "web-1").await.unwrap().unwrap();
+    let node = nodes::find(&nomad, &["web-1"]).await.unwrap().unwrap();
     assert_eq!(node.id, "n-1", "the node that went down is not the host");
     let did = match op {
         "undrain" => nodes::undrain(&nomad, &node).await.unwrap(),
@@ -846,12 +846,12 @@ async fn node_operations_converge(
     };
 
     assert_eq!(did, changed);
-    let after = nodes::find(&nomad, "web-1").await.unwrap().unwrap();
+    let after = nodes::find(&nomad, &["web-1"]).await.unwrap().unwrap();
     assert_eq!(
         (after.eligible, after.draining),
         (eligible_after, draining_after)
     );
-    let other = nodes::find(&nomad, "web-2").await.unwrap().unwrap();
+    let other = nodes::find(&nomad, &["web-2"]).await.unwrap().unwrap();
     assert!(
         other.eligible && !other.draining,
         "only the named node is touched"
@@ -866,8 +866,30 @@ async fn a_node_the_scheduler_cannot_tell_apart_is_refused() {
     fake.node("n-2", "web-1", "ready", true, false);
     let nomad = fake.client();
 
-    assert!(nodes::find(&nomad, "web-1").await.is_err());
-    assert_eq!(nodes::find(&nomad, "web-9").await.unwrap(), None);
+    assert!(nodes::find(&nomad, &["web-1"]).await.is_err());
+    assert_eq!(nodes::find(&nomad, &["web-9"]).await.unwrap(), None);
+}
+
+/// A scheduler names a node after the machine's hostname, which may be the
+/// host's short name or its DNS name: the node is whichever one is live.
+#[rstest::rstest]
+#[case::short_name(&["web-1", "web-1.tail.ts.net"], Some("n-1"))]
+#[case::dns_name(&["web-2", "web-2.tail.ts.net"], Some("n-2"))]
+#[case::another_hosts_node(&["web-3", "web-3.tail.ts.net"], None)]
+#[tokio::test]
+async fn a_node_is_found_by_any_of_its_hosts_names(
+    #[case] names: &[&str],
+    #[case] id: Option<&str>,
+) {
+    use crate::nodes;
+    let fake = FakeNomad::new();
+    fake.node("n-1", "web-1", "ready", true, false);
+    fake.node("n-2", "web-2.tail.ts.net", "ready", true, false);
+    fake.node("n-3", "web-3.other.example", "ready", true, false);
+    let nomad = fake.client();
+
+    let found = nodes::find(&nomad, names).await.unwrap();
+    assert_eq!(found.map(|n| n.id), id.map(str::to_owned));
 }
 
 #[tokio::test]

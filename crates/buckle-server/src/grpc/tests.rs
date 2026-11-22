@@ -1447,7 +1447,25 @@ async fn identity_host_reporting(
     labels: &[(&str, &str)],
 ) -> (Server, String) {
     let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
-    let mut first = hello("pi-1", "boot", "2.0.0");
+    cluster_host(s, "pi-1", "boot", reported, labels).await
+}
+
+/// A host the tailnet names `tail-1` (see [`FakeWhois`]), with `labels`, on
+/// a fleet that declares clusters. It needs no token.
+async fn tailnet_host(labels: &[(&str, &str)]) -> (Server, String) {
+    let whois = Some(FakeWhois::tagged("tag:buckle"));
+    let s = server(Registration::Auto, whois, vec![AgentAuth::Tailscale]).await;
+    cluster_host(s, "tail-1", "", &[], labels).await
+}
+
+async fn cluster_host(
+    s: Server,
+    host: &'static str,
+    token: &str,
+    reported: &[(&str, &str)],
+    labels: &[(&str, &str)],
+) -> (Server, String) {
+    let mut first = hello(host, token, "2.0.0");
     if let Some(agent_message::Msg::Hello(h)) = &mut first.msg {
         h.labels = reported
             .iter()
@@ -1465,7 +1483,7 @@ async fn identity_host_reporting(
         .call(move |db| {
             db.kv()
                 .set(crate::store::kv::keys::STABLE_REVISION, "abc")?;
-            db.hosts().set_labels("pi-1", &labels).map(|_| ())
+            db.hosts().set_labels(host, &labels).map(|_| ())
         })
         .await
         .unwrap();
@@ -1585,12 +1603,26 @@ async fn node_operations_are_checked_before_they_reach_a_steward(
 }
 
 /// The whole path: the host asks, the cluster's steward is handed the
-/// operation on the host's own node, and its answer returns to the host.
+/// operation on the host's own node, and its answer returns to the host. The
+/// node is named by what the server verified: the host's id, and on a
+/// tailnet its DNS name too, since a scheduler names a node after the
+/// machine's hostname.
+#[rstest::rstest]
+#[case::known_by_token(false, "pi-1", &[])]
+#[case::on_a_tailnet(true, "tail-1", &["tail-1.tail1234.ts.net"])]
 #[tokio::test]
-async fn a_node_operation_is_answered_by_the_clusters_steward() {
-    let (s, token) = identity_host(&[("role", "server"), ("nomad", "true")]).await;
-    // Reconnecting with the stable revision in place makes pi-1 the steward.
-    let mut again = hello("pi-1", &token, "2.0.0");
+async fn a_node_operation_is_answered_by_the_clusters_steward(
+    #[case] tailnet: bool,
+    #[case] host: &'static str,
+    #[case] aliases: &[&str],
+) {
+    let labels = [("role", "server"), ("nomad", "true")];
+    let (s, token) = match tailnet {
+        true => tailnet_host(&labels).await,
+        false => identity_host(&labels).await,
+    };
+    // Reconnecting with the stable revision in place makes it the steward.
+    let mut again = hello(host, &token, "2.0.0");
     if let Some(agent_message::Msg::Hello(h)) = &mut again.msg {
         h.capabilities = ["targets", "workloads", "scopes", "node_ops"]
             .map(String::from)
@@ -1612,9 +1644,11 @@ async fn a_node_operation_is_answered_by_the_clusters_steward() {
                     op: buckle_proto::v1::NodeOp::Undrain as i32,
                     ..Default::default()
                 });
-                request
-                    .metadata_mut()
-                    .insert(buckle_proto::TOKEN_METADATA_KEY, token.parse().unwrap());
+                if !token.is_empty() {
+                    request
+                        .metadata_mut()
+                        .insert(buckle_proto::TOKEN_METADATA_KEY, token.parse().unwrap());
+                }
                 match client.node_operation(request).await {
                     Err(status) if status.code() == tonic::Code::Unavailable => {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await
@@ -1636,8 +1670,9 @@ async fn a_node_operation_is_answered_by_the_clusters_steward() {
     };
     assert_eq!(
         (asked.target.as_str(), asked.node.as_str()),
-        ("home-nomad", "pi-1")
+        ("home-nomad", host)
     );
+    assert_eq!(asked.aliases, aliases);
     assert_eq!(asked.op(), buckle_proto::v1::NodeOp::Undrain);
     tx.send(AgentMessage {
         msg: Some(agent_message::Msg::NodeOperation(

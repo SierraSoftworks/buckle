@@ -253,7 +253,7 @@ impl Task for ClusterNode {
                     spec.cluster
                 ),
                 &[
-                    "Give the task a `retry` so it waits for the node to register, and check that the node's name is the host's id.",
+                    "Give the task a `retry` so it waits for the node to register, and check that the node is named like the host: its id, or its tailnet DNS name.",
                 ],
             )),
             _ if reply.changed => Ok(Applied::changed(reply.summary)),

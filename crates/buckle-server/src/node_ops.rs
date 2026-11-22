@@ -94,6 +94,28 @@ impl NodeOps {
     }
 }
 
+/// What the scheduler may call `host`'s node: the name to act on first, and
+/// the host's other verified names. A scheduler names a node after the
+/// machine's hostname, which on a tailnet is the short name (the host's id)
+/// or the DNS name (`dns_name`, as the server's own tailscaled gave it).
+/// `reported` is the hostname the host says it has: it picks among the
+/// verified names and never adds one.
+pub fn names(host: &str, dns_name: Option<&str>, reported: Option<&str>) -> (String, Vec<String>) {
+    let mut verified = vec![host.to_owned()];
+    if let Some(dns) = dns_name.map(|d| d.trim_end_matches('.'))
+        && !dns.is_empty()
+        && !dns.eq_ignore_ascii_case(host)
+    {
+        verified.push(dns.to_owned());
+    }
+    let first = reported
+        .map(|r| r.trim_end_matches('.'))
+        .and_then(|r| verified.iter().position(|v| v.eq_ignore_ascii_case(r)))
+        .unwrap_or(0);
+    let node = verified.remove(first);
+    (node, verified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +155,22 @@ mod tests {
         ops.close("op-1");
         ops.answer("op-1", "pi", done("late"));
         assert!(answer.try_recv().is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::short_hostname(Some("pi.tail.ts.net"), Some("pi"), "pi", &["pi.tail.ts.net"])]
+    #[case::hostname_is_the_dns_name(Some("pi.tail.ts.net."), Some("pi.tail.ts.net"), "pi.tail.ts.net", &["pi"])]
+    #[case::nothing_reported(Some("pi.tail.ts.net"), None, "pi", &["pi.tail.ts.net"])]
+    #[case::a_reported_name_is_never_added(Some("pi.tail.ts.net"), Some("nas"), "pi", &["pi.tail.ts.net"])]
+    #[case::off_the_tailnet(None, Some("pi.example.com"), "pi", &[])]
+    fn a_node_is_named_by_what_the_server_verified(
+        #[case] dns_name: Option<&str>,
+        #[case] reported: Option<&str>,
+        #[case] node: &str,
+        #[case] aliases: &[&str],
+    ) {
+        let (first, rest) = names("pi", dns_name, reported);
+        assert_eq!(first, node);
+        assert_eq!(rest, aliases);
     }
 }

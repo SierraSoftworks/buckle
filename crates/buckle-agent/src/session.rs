@@ -900,12 +900,13 @@ impl Shared {
                     // A node of a cluster this agent stewards asks for an
                     // operation on itself. Served beside the cluster's lane:
                     // an apply under way must not hold a booting node up.
-                    Some(Instruction::NodeOperation { op_id, target, cluster, op, node, pool, revision, deadline }) => {
+                    Some(Instruction::NodeOperation { op_id, target, cluster, op, node, aliases, pool, revision, deadline }) => {
                         let shared = self.clone();
                         tokio::spawn(async move {
                             let task = crate::cluster::node::NodeTask {
                                 op,
                                 node: &node,
+                                aliases: &aliases,
                                 pool: pool.as_deref(),
                                 deadline,
                             };

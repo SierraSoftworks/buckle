@@ -252,6 +252,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
                 cluster: n.cluster.map(cluster_from_proto),
                 op,
                 node: n.node,
+                aliases: n.aliases,
                 pool: non_empty(n.pool),
                 revision: non_empty(n.revision).map(RevisionId),
                 deadline: duration_from_proto(n.deadline.as_ref()),

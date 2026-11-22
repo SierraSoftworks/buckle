@@ -285,8 +285,10 @@ pub enum Command {
         /// Names the request in the steward's answer.
         op_id: String,
         op: pb::NodeOp,
-        /// The node: the asking host's id.
+        /// The node: a name verified for the asking host.
         node: String,
+        /// The host's other verified names (see [`crate::node_ops::names`]).
+        aliases: Vec<String>,
         /// A join's pool; empty for the scheduler's default.
         pool: String,
         /// The revision whose fleet declares the cluster.
@@ -3348,6 +3350,7 @@ impl Controller {
         op_id: String,
         op: pb::NodeOp,
         node: String,
+        aliases: Vec<String>,
         pool: String,
         revision: String,
         deadline: Option<Duration>,
@@ -3390,6 +3393,7 @@ impl Controller {
             cluster: Some(cluster),
             op: op as i32,
             node,
+            aliases,
             pool,
             revision,
             deadline: deadline.and_then(|d| d.try_into().ok()),
@@ -3713,11 +3717,12 @@ impl Controller {
                 op_id,
                 op,
                 node,
+                aliases,
                 pool,
                 revision,
                 deadline,
             } => {
-                self.node_operation(target, op_id, op, node, pool, revision, deadline)
+                self.node_operation(target, op_id, op, node, aliases, pool, revision, deadline)
                     .await
             }
             Command::StartAction {
