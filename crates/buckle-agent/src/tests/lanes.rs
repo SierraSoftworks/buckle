@@ -423,9 +423,19 @@ fn targeted_health(
     scope: pb::HealthScope,
     until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> SMsg {
+    placement_health(target, "", request_id, scope, until)
+}
+
+fn placement_health(
+    target: &str,
+    workload: &str,
+    request_id: &str,
+    scope: pb::HealthScope,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> SMsg {
     SMsg::Health(pb::RunHealth {
         target: target.into(),
-        workload: String::new(),
+        workload: workload.into(),
         revision: "rev1".into(),
         request_id: request_id.into(),
         scope: scope as i32,
@@ -477,6 +487,147 @@ async fn a_cluster_bake_ends_when_the_server_moves_past_it() {
         "answered only after {:?}",
         since.elapsed()
     );
+    h.stop().await.expect("clean exit");
+}
+
+const WEB_JOB: &str = r#"{"ID": "web", "Type": "service", "TaskGroups": [{"Name": "web", "Count": 1, "Tasks": [{"Name": "web"}]}]}"#;
+
+fn two_workloads() -> Vec<(&'static str, &'static str)> {
+    let mut files = paste_files();
+    files.extend([
+        (
+            "workloads/web/workload.yaml",
+            "name: web\nresources: [web.nomad.hcl]\n",
+        ),
+        ("workloads/web/files/web.nomad.hcl", WEB_JOB),
+    ]);
+    files
+}
+
+/// Plans `workload`'s placement of `revision` and sends its Apply, as a
+/// rollout would; returns once the plan is back and the Apply is sent.
+async fn start_placement(session: &mut ServerSession, digest: &str, workload: &str) {
+    session
+        .send(targeted_assign(NOMAD, "nomad", "rev1", digest))
+        .await;
+    session
+        .send(SMsg::Plan(pb::RequestPlan {
+            target: NOMAD.into(),
+            workload: workload.into(),
+            revision: "rev1".into(),
+            select: String::new(),
+        }))
+        .await;
+    let planned = session
+        .expect(|m| plan_result(m).filter(|p| p.workload == workload))
+        .await;
+    assert_eq!(planned.error, "", "{workload}");
+    session
+        .send(targeted_assign(NOMAD, "nomad", "rev1", digest))
+        .await;
+    session
+        .send(SMsg::Apply(pb::Apply {
+            target: NOMAD.into(),
+            workload: workload.into(),
+            approval_digest: planned.approval_digest.clone(),
+            ..apply("rev1", &planned.digest)
+        }))
+        .await;
+}
+
+/// A cluster's placements apply side by side: one waiting on its
+/// deployment does not hold a sibling's plan or apply.
+#[tokio::test(start_paused = true)]
+async fn placements_apply_side_by_side() {
+    let nomad = buckle_nomad::testing::FakeNomad::new();
+    let mut h = Harness::start(Setup {
+        cluster: Some(nomad.clone()),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = h.fleet.add_revision("rev1", bundle_files(&two_workloads()));
+    nomad.hold("default", "paste");
+
+    start_placement(&mut session, &digest, "paste").await;
+    start_placement(&mut session, &digest, "web").await;
+    let first = tokio::time::timeout(Duration::from_secs(120), session.expect(apply_result))
+        .await
+        .expect("web's apply waited behind paste's deployment");
+    assert_eq!(first.workload, "web", "{first:?}");
+    assert!(first.succeeded, "{first:?}");
+
+    nomad.release("default", "paste");
+    let second = session.expect(apply_result).await;
+    assert_eq!(second.workload, "paste", "{second:?}");
+    assert!(second.succeeded, "{second:?}");
+    h.stop().await.expect("clean exit");
+}
+
+/// One placement's bake samples beside the cluster's lane: a sibling
+/// placement's baseline or plan is answered at once, not after the bake's
+/// window, and the bake keeps sampling (regression: a canary bake held the
+/// whole cluster, leaving its other workloads "baseline" and "plan pending").
+#[rstest::rstest]
+#[case::baseline(SMsg::Health(pb::RunHealth {
+    target: NOMAD.into(),
+    workload: "web".into(),
+    revision: "rev1".into(),
+    request_id: "baseline-web".into(),
+    scope: pb::HealthScope::Baseline as i32,
+    ..Default::default()
+}))]
+#[case::plan(SMsg::Plan(pb::RequestPlan {
+    target: NOMAD.into(),
+    workload: "web".into(),
+    revision: "rev1".into(),
+    select: String::new(),
+}))]
+#[tokio::test(start_paused = true)]
+async fn a_placement_bake_does_not_hold_its_siblings(#[case] sibling: SMsg) {
+    let nomad = buckle_nomad::testing::FakeNomad::new();
+    let mut h = Harness::start(Setup {
+        cluster: Some(nomad.clone()),
+        ..Default::default()
+    })
+    .await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    let digest = apply_cluster(&h, &mut session, NOMAD, "nomad", "rev1", &paste_files()).await;
+
+    let until = chrono::Utc::now() + chrono::Duration::minutes(15);
+    session
+        .send(placement_health(
+            NOMAD,
+            "paste",
+            "bake-paste",
+            pb::HealthScope::Bake,
+            Some(until),
+        ))
+        .await;
+    assert_eq!(session.expect(health_report).await.request_id, "bake-paste");
+
+    let since = tokio::time::Instant::now();
+    session
+        .send(targeted_assign(NOMAD, "nomad", "rev1", &digest))
+        .await;
+    session.send(sibling).await;
+    let answered = |m: &AMsg| match m {
+        AMsg::Health(r) if r.workload == "web" => Some(()),
+        AMsg::Plan(p) if p.workload == "web" => Some(()),
+        _ => None,
+    };
+    session.expect(answered).await;
+    assert!(
+        since.elapsed() < Duration::from_secs(60),
+        "the sibling was answered only after {:?}",
+        since.elapsed()
+    );
+    let sampled = session
+        .expect(|m| health_report(m).filter(|r| r.request_id == "bake-paste"))
+        .await;
+    assert_eq!(sampled.workload, "paste");
     h.stop().await.expect("clean exit");
 }
 

@@ -5,9 +5,12 @@
 //! stragglers stage, which promotion opens (design §10 "Controller
 //! algorithm").
 
-use crate::common::{self, APP_CONF, CANARY_THEN_REST};
+use crate::common::{self, APP_CONF};
 use buckle_api::{HostRolloutState, PhaseState, RolloutState};
 use buckle_integration::{World, phase, rollout_host};
+
+/// Canary (approval required, a window long enough to watch) then the rest.
+const CANARY_THEN_REST: &str = "    - { name: canary, select: 'host.groups contains \"canary\"', parallel: 1, approval: required, bake: 5s }\n    - { name: rest, select: 'true', parallel: 2, approval: auto, bake: 1s }\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canary_approval_applies_only_the_canary_then_the_rollout_advances_and_stragglers_converge()
@@ -56,7 +59,15 @@ async fn canary_approval_applies_only_the_canary_then_the_rollout_advances_and_s
     // Approving the canary phase applies the canary and nothing else.
     world.approve(&id, "canary").await;
     let detail = world
-        .wait_rollout_host(&id, "canary-1", HostRolloutState::Baking)
+        .wait_rollout(&id, "the canary phase in its window", |d| {
+            phase(d, "canary").is_some_and(|p| p.state == PhaseState::Baking)
+                && rollout_host(d, "canary-1").is_some_and(|h| {
+                    matches!(
+                        h.state,
+                        HostRolloutState::Baking | HostRolloutState::Healthy
+                    )
+                })
+        })
         .await;
     assert_eq!(
         world.agent("canary-1").file(APP_CONF),

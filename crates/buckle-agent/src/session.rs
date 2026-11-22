@@ -44,6 +44,10 @@ mod bakes;
 mod lanes;
 mod targets;
 
+/// How often an upgrade waiting for the agent to be idle looks again, once
+/// nothing but deferred upgrades is left to run.
+const IDLE_POLL: Duration = Duration::from_secs(1);
+
 /// Tunables of the session loop. The defaults are the design's values; tests
 /// shorten some of them.
 #[derive(Debug, Clone)]
@@ -1171,6 +1175,11 @@ impl Shared {
         len: Arc<AtomicUsize>,
         requeue: mpsc::WeakUnboundedSender<Queued>,
     ) {
+        // Whether the last thing the worker did was put an upgrade back
+        // without running anything since: only deferred upgrades are left
+        // (a lane is busy, or another deferred upgrade is all that is
+        // queued), so the next deferral waits instead of spinning.
+        let mut deferring = false;
         while let Some(queued) = rx.recv().await {
             len.fetch_sub(1, Ordering::SeqCst);
             // An upgrade sent `when_idle` waits until nothing else is queued
@@ -1183,6 +1192,13 @@ impl Shared {
                 && let Some(tx) = requeue.upgrade()
             {
                 tracing::debug!("deferring the upgrade until the agent is idle");
+                if deferring {
+                    tokio::select! {
+                        _ = tokio::time::sleep(IDLE_POLL) => {}
+                        _ = self.stop.cancelled() => {}
+                    }
+                }
+                deferring = true;
                 len.fetch_add(1, Ordering::SeqCst);
                 if tx.send(queued).is_err() {
                     len.fetch_sub(1, Ordering::SeqCst);
@@ -1209,6 +1225,7 @@ impl Shared {
                 }
                 continue;
             }
+            deferring = false;
             self.busy.store(true, Ordering::SeqCst);
             self.execute(queued.op).await;
             self.busy.store(false, Ordering::SeqCst);

@@ -69,7 +69,7 @@ removal: stop
 | `resources` | The objects the workload consists of, applied in list order and removed in reverse ([below](#resources)). |
 | `namespace` | The namespace the workload's entities live in, created if missing. Absent: the scheduler's default. Required on a [scoped target](./fleet.md#scoped-targets), which cannot create it: a workload on the cluster itself does. |
 | `health` | Checks beside the implicit ones (each job's deployment and allocations; a Deployment's rollout). |
-| `bake` | How long a rollout bakes the cluster after a run that changed this workload, when longer than the phase's `bake`. |
+| `bake` | How long a rollout bakes the placement after a run that changed this workload (one health reading without one). |
 | `timeouts` | How long an apply waits on the scheduler: `placement` for a placement it cannot make yet (default `5m`; on Nomad a blocked evaluation, such as a static port the old allocation still holds; on Kubernetes a controller's pods left unschedulable) and `rollout` for the whole deployment (default `1h`; on Kubernetes the Deployment, StatefulSet or DaemonSet rollout; the job's `progress_deadline` or the Deployment's `progressDeadlineSeconds` usually ends it first). |
 | `restart_on` | Resources (by file or secret name) whose change restarts the jobs even when their specs did not change. |
 | `removal` | What happens when the workload is dropped: `stop` (default), `purge` or `keep`. |

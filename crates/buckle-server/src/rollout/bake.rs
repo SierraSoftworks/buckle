@@ -14,6 +14,7 @@ pub use buckle_api::rollout::BakeWindow;
 pub fn reason(w: &BakeWindow) -> String {
     match (&w.module, w.unchanged) {
         (_, true) => "applied; nothing changed, so no bake".to_owned(),
+        _ if w.seconds == 0 => "applied; checking health once".to_owned(),
         (Some(m), _) => format!(
             "applied; baking {} for {m}",
             humantime_serde::re::humantime::format_duration(Duration::from_secs(w.seconds))

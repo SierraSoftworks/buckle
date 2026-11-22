@@ -154,6 +154,14 @@ pub struct PhaseRuntime {
     /// The deepest dependency level a target has opened at so far.
     #[serde(default)]
     pub open_stage: u32,
+    /// Each target's own minimum bake. `None`: a rollout from before the
+    /// phase window, whose targets bake `bake_seconds` each and whose phase
+    /// keeps no window of its own.
+    #[serde(default)]
+    pub target_bake_seconds: Option<u64>,
+    /// An operator ended the phase's window early.
+    #[serde(default)]
+    pub window_ended: bool,
 }
 
 fn one() -> u32 {
@@ -315,6 +323,10 @@ pub struct HostRuntime {
     /// Outstanding RunHealth request (baseline).
     #[serde(default)]
     pub request_id: Option<String>,
+    /// When the current step's apply finished (its bake started): the
+    /// phase's window counts from its last one.
+    #[serde(default)]
+    pub applied_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub bake_until: Option<DateTime<Utc>>,
     /// The bake window the current step resolved to from what its run

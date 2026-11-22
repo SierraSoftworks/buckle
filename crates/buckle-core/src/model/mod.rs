@@ -357,7 +357,10 @@ pub enum FailurePolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthPolicy {
-    /// Default bake duration per phase.
+    /// How long the next phase waits after a phase's last apply of a target
+    /// it changed (a phase's own `bake` overrides it). A target bakes on its
+    /// own only for the `bake` of the modules or workloads its run changed,
+    /// else for one health reading.
     #[serde(default = "HealthPolicy::default_bake", with = "humantime_serde")]
     pub bake: Duration,
     #[serde(default)]
@@ -604,8 +607,8 @@ pub struct ModuleConfig {
     #[serde(default)]
     pub health: Vec<HealthDecl>,
     /// How long a rollout watches a host after a run that changed this
-    /// module. The phase's `bake` is the minimum; a run that changed nothing
-    /// does not bake.
+    /// module (else one health reading); a run that changed nothing does not
+    /// bake.
     #[serde(default, with = "humantime_serde")]
     pub bake: Option<Duration>,
     #[serde(default)]

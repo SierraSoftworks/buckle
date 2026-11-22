@@ -743,8 +743,8 @@ pub struct WorkloadConfig {
     /// allocations; a Deployment's rollout and pods).
     #[serde(default)]
     pub health: Vec<HealthDecl>,
-    /// How long a rollout watches the cluster after a run that changed this
-    /// workload; the phase's `bake` is the minimum.
+    /// How long a rollout watches the placement after a run that changed
+    /// this workload (else one health reading).
     #[serde(default, with = "humantime_serde")]
     pub bake: Option<std::time::Duration>,
     /// How long an apply waits on the scheduler; absent: the executor's

@@ -195,22 +195,29 @@ earlier phases keep the new revision.
 
 ## 4. Bake and promote
 
-After each host applies, its checks repeat for the phase's `bake`; the next phase starts once every
-updated host passes the health gate. The bake follows what the run changed:
+Two independent bakes follow an apply:
+
+- **The target's bake** follows what its run changed, and frees its `parallel` slot (and whatever
+  `needs` it) when it passes.
+- **The phase's `bake`** is a window counted from the phase's last apply of a target it changed,
+  overlapping the targets' own bakes. The next phase starts once it has passed and every updated
+  target passes the health gate.
 
 ```yaml
 # modules/nomad/module.yaml
-bake: 15m   # a run that changed nomad bakes for 15m, even in a 1m phase
+bake: 15m   # a run that changed nomad bakes for 15m
 ```
 
-| The run changed | The host bakes for |
+| The run changed | The target bakes for |
 |---|---|
 | nothing | no time: it is healthy as soon as its result arrives |
-| modules without their own `bake` | the phase's `bake` |
-| a module with a longer `bake` | the longest such `bake` (the host's row names the module) |
+| modules (or a workload) without their own `bake` | one health reading after the apply |
+| a module with a `bake` | the longest such `bake` (the row names the module) |
 
-So a phase whose hosts all come out unchanged moves on at once, and a short phase `bake` lets
-low-risk changes through quickly while risky modules hold the rollout as long as they need. Expand a row under **Targets** for its timeline through
+A failing required check is followed through `settle` either way. So a phase whose targets all come
+out unchanged moves on at once, low-risk changes move through a phase as fast as `parallel`
+allows, and risky modules hold their slots as long as they need while the phase's window soaks the
+whole phase. **Skip bake** on a phase ends its window as well as its rows' bakes. Expand a row under **Targets** for its timeline through
 the rollout and its run report. **Targets** lists what changes by default; **All** in its head adds
 the unchanged hosts and workloads (`?targets=all` in the link keeps that view).
 
