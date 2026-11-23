@@ -812,6 +812,26 @@ async fn a_scoped_target_keeps_its_index_and_orphan_search_inside_its_scope() {
     );
 }
 
+/// Community Edition answers 501 to the quota list and logs an error for
+/// each request, so a target's cluster is asked once.
+#[tokio::test]
+async fn a_cluster_without_quotas_is_asked_for_them_once() {
+    let fake = FakeNomad::new();
+    let mut cx = cx(&fake, "r1");
+    cx.target = "community-nomad".into();
+
+    for _ in 0..3 {
+        assert_eq!(orphans(&cx, &[]).await.unwrap(), vec![]);
+    }
+
+    let asked = fake
+        .requests()
+        .iter()
+        .filter(|(_, p)| p.starts_with("/v1/quotas"))
+        .count();
+    assert_eq!(asked, 1, "{:?}", fake.requests());
+}
+
 /// What a steward does to a node, by the state it finds it in: an
 /// operation that is already satisfied changes nothing.
 #[rstest::rstest]
