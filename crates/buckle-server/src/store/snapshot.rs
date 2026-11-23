@@ -151,6 +151,31 @@ fn take(conn: &rusqlite::Connection, to: &Path) -> Result<()> {
     })
 }
 
+/// Removes the snapshots older than [`RESTORE_WITHIN`], which a downgrade
+/// would refuse to put back anyway; how many went.
+pub(super) fn expire(path: &Path, now: SystemTime) -> usize {
+    snapshots(path)
+        .into_iter()
+        .filter(|(_, p)| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| now.duration_since(at).ok())
+                .is_some_and(|age| age > RESTORE_WITHIN)
+        })
+        .filter(|(_, p)| match std::fs::remove_file(p) {
+            Ok(()) => {
+                tracing::info!(snapshot = %p.display(), "removed a database snapshot too old to restore");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(snapshot = %p.display(), error = %e, "an expired database snapshot could not be removed");
+                false
+            }
+        })
+        .count()
+}
+
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);

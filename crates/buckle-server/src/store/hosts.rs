@@ -605,7 +605,8 @@ impl<'c> Hosts<'c> {
         Ok(n > 0)
     }
 
-    /// Stores a facts document and prunes history older than seven days.
+    /// Stores a target's facts document, replacing the one it held: only
+    /// the latest is ever read.
     pub fn record_facts(
         &self,
         id: &str,
@@ -614,15 +615,9 @@ impl<'c> Hosts<'c> {
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO host_facts (host_id, facts, collected_at) VALUES (?1, ?2, ?3)",
+                "INSERT INTO host_facts (host_id, facts, collected_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (host_id) DO UPDATE SET facts = excluded.facts, collected_at = excluded.collected_at",
                 params![id, to_json(facts)?, ts(at)],
-            )
-            .map_err(db_error)?;
-        let cutoff = at - chrono::Duration::days(7);
-        self.conn
-            .execute(
-                "DELETE FROM host_facts WHERE host_id = ?1 AND collected_at < ?2",
-                params![id, ts(cutoff)],
             )
             .map_err(db_error)?;
         Ok(())
@@ -633,7 +628,7 @@ impl<'c> Hosts<'c> {
         let row: Option<(String, String)> = self
             .conn
             .query_row(
-                "SELECT facts, collected_at FROM host_facts WHERE host_id = ?1 ORDER BY collected_at DESC LIMIT 1",
+                "SELECT facts, collected_at FROM host_facts WHERE host_id = ?1",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )

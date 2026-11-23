@@ -15,6 +15,7 @@ pub mod kv;
 pub mod notifications;
 mod paused;
 mod reports;
+pub mod retention;
 mod revisions;
 pub mod rollouts;
 mod runs;
@@ -23,7 +24,7 @@ mod snapshot;
 pub use approvals::{ApprovalRecord, Approvals};
 pub use audit::{Audit, AuditFilter, NewAudit};
 pub use drift::Drift;
-pub use health::{HEALTH_EPOCHS, HealthEventRecord, HealthEvents};
+pub use health::{HEALTH_EPOCHS, HEALTH_RETENTION, HealthEventRecord, HealthEvents};
 pub(crate) use hosts::status_str as hosts_status_str;
 pub use hosts::{HostRecord, Hosts, NewCluster, NewHost, WORKLOAD_AUTH_PREFIX};
 pub use kv::Kv;
@@ -391,6 +392,58 @@ CREATE TABLE paused_units (
     r#"
 CREATE INDEX rollout_hosts_workload ON rollout_hosts(host, workload, created_at);
 "#,
+    // 19: a target keeps only its latest facts (nothing reads older ones),
+    // and health readings are stored run-length encoded: a reading equal to
+    // its check's previous one extends that row (`last_at`, `readings`).
+    // Existing rows are folded the same way.
+    r#"
+CREATE TABLE host_facts_v19 (
+    host_id TEXT PRIMARY KEY NOT NULL,
+    facts TEXT NOT NULL,
+    collected_at TEXT NOT NULL
+);
+INSERT INTO host_facts_v19 (host_id, facts, collected_at)
+SELECT host_id, facts, MAX(collected_at) FROM host_facts GROUP BY host_id;
+DROP TABLE host_facts;
+ALTER TABLE host_facts_v19 RENAME TO host_facts;
+
+CREATE TABLE health_events_v19 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host TEXT NOT NULL,
+    rollout TEXT,
+    scope TEXT NOT NULL,
+    module TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT '',
+    required INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL,
+    reason TEXT,
+    at TEXT NOT NULL,
+    last_at TEXT NOT NULL,
+    readings INTEGER NOT NULL DEFAULT 1
+);
+INSERT INTO health_events_v19 (id, host, rollout, scope, module, check_name, kind, required, status, reason, at, last_at, readings)
+SELECT MIN(id), host, rollout, scope, module, check_name, kind, required, status, reason, MIN(at), MAX(at), COUNT(*)
+FROM (
+    SELECT *, SUM(starts) OVER (PARTITION BY host, module, check_name ORDER BY id ROWS UNBOUNDED PRECEDING) AS span
+    FROM (
+        SELECT *, CASE WHEN LAG(id) OVER w IS NOT NULL
+                        AND LAG(rollout) OVER w IS rollout AND LAG(scope) OVER w = scope
+                        AND LAG(kind) OVER w = kind AND LAG(required) OVER w = required
+                        AND LAG(status) OVER w = status AND LAG(reason) OVER w IS reason
+                   THEN 0 ELSE 1 END AS starts
+        FROM health_events
+        WINDOW w AS (PARTITION BY host, module, check_name ORDER BY id)
+    )
+)
+GROUP BY host, module, check_name, span
+ORDER BY MIN(id);
+DROP TABLE health_events;
+ALTER TABLE health_events_v19 RENAME TO health_events;
+CREATE INDEX health_events_host ON health_events(host, last_at);
+CREATE INDEX health_events_check ON health_events(host, module, check_name, id);
+CREATE INDEX health_events_last ON health_events(last_at);
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.
@@ -398,6 +451,8 @@ CREATE INDEX rollout_hosts_workload ON rollout_hosts(host, workload, created_at)
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
     restored: Option<Arc<Restored>>,
+    /// The database file (`None` in memory), for its snapshots.
+    path: Option<Arc<PathBuf>>,
 }
 
 /// The database was at a newer schema than this server knows (an older
@@ -515,6 +570,7 @@ impl Store {
         migrations: &'static [&'static str],
     ) -> Result<Self> {
         let path = path.to_path_buf();
+        let file = path.clone();
         let (conn, restored) =
             tokio::task::spawn_blocking(move || -> Result<(Connection, Option<Restored>)> {
                 if let Some(parent) = path.parent() {
@@ -529,6 +585,7 @@ impl Store {
                 let restored = snapshot::prepare(&path, migrations.len() as i64)?;
                 let conn = connect(&path)?;
                 migrate(&conn, migrations)?;
+                incremental_vacuum(&conn)?;
                 Ok((conn, restored))
             })
             .await
@@ -536,6 +593,7 @@ impl Store {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             restored: restored.map(Arc::new),
+            path: Some(Arc::new(file)),
         })
     }
 
@@ -546,6 +604,7 @@ impl Store {
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             restored: None,
+            path: None,
         };
         store.migrate().await?;
         Ok(store)
@@ -648,11 +707,20 @@ fn schema(conn: &Connection) -> Result<i64> {
     .map_err(db_error)
 }
 
+/// The most the WAL keeps on disk after a checkpoint.
+const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
 fn configure(conn: &Connection, on_disk: bool) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(db_error)?;
+    // Takes effect on a new database only; an existing one is converted by
+    // `incremental_vacuum` after migrating.
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+        .map_err(db_error)?;
     if on_disk {
         conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(db_error)?;
+        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)
             .map_err(db_error)?;
     }
     conn.pragma_update(None, "synchronous", "NORMAL")
@@ -660,6 +728,24 @@ fn configure(conn: &Connection, on_disk: bool) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(db_error)?;
     Ok(())
+}
+
+/// Converts a database created before `auto_vacuum` was set, so that the
+/// space retention frees goes back to the file system: a one-off VACUUM,
+/// which rewrites the file (and needs room for a copy of it).
+fn incremental_vacuum(conn: &Connection) -> Result<()> {
+    let mode: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .map_err(db_error)?;
+    if mode == 2 {
+        return Ok(());
+    }
+    tracing::info!(
+        "compacting the database once so that freed space is returned to the file system"
+    );
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+        .map_err(db_error)?;
+    conn.execute_batch("VACUUM").map_err(db_error)
 }
 
 fn migrate(conn: &Connection, migrations: &[&str]) -> Result<()> {

@@ -229,6 +229,11 @@ pub async fn run_with(
     ));
     tasks.push(tokio::spawn(scheduler.clone().run(cancel.clone())));
 
+    tasks.push(tokio::spawn(store::retention::run(
+        store.clone(),
+        cancel.clone(),
+    )));
+
     tasks.push(tokio::spawn(metrics::run(
         store.clone(),
         sessions.clone(),

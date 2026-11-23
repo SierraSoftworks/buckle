@@ -22,16 +22,30 @@ docker run --rm -v buckle-data:/data -v "$PWD":/backup alpine \
 ### Downgrading
 
 A release that changes the database's schema keeps a snapshot of the database from before it does,
-beside it in `data_dir` (`buckle.db.schema-N`; one is kept, the latest upgrade's).
+beside it in `data_dir` (`buckle.db.schema-N`; one is kept, the latest upgrade's, and removed once
+it is seven days old, when it could no longer be restored).
 
 - **Going back**: start the previous version. It finds the database at a schema it does not know,
   puts the snapshot back and sets the newer database aside (`buckle.db.schema-M.set-aside`). The
   audit log records it (`server.store.restored`).
 - **What is lost**: whatever the newer version recorded since the upgrade. Agents report their
   state again when they reconnect.
-- **When it refuses**: without a snapshot, or with one more than seven days old, the previous
-  version does not start and says what to do. Restore a backup, or copy the snapshot in place by
-  hand to accept the loss.
+- **When it refuses**: without a snapshot (it is removed after seven days), or with one more than
+  seven days old, the previous version does not start and says what to do. Restore a backup, or
+  copy the snapshot in place by hand to accept the loss.
+
+### Retention
+
+The server sweeps its database hourly and returns the space it frees to the file system.
+
+- **Health readings**: stored as runs of identical readings, kept 30 days after last seen.
+- **Facts**: the latest report per target only.
+- **Rollouts and runs**: after 90 days a finished rollout's plans and a run's outcome and step
+  events are dropped; the rows and their summaries stay. Each target's newest row, newest healthy
+  row and newest run keep everything.
+
+The first start of a release with this sweep compacts the database once (a `VACUUM`), which needs
+free space for a copy of it.
 
 ### Readiness
 
