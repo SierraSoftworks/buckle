@@ -14,6 +14,8 @@ use buckle_core::plan::{Diff, Planned};
 use buckle_core::secrets::Redacted;
 use buckle_core::task::Applied;
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 
 /// The entity kinds a spec file can declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,8 +301,13 @@ pub(crate) async fn remove(cx: &Context, key: &ObjectKey) -> Result<Applied> {
     Ok(Applied::changed(format!("deleted {key}")))
 }
 
+/// The targets whose cluster answered 501 to the quota list: Nomad
+/// Community Edition, which logs every such request as an error. Asked once
+/// per process, so a cluster that gains Enterprise is seen after a restart.
+static WITHOUT_QUOTAS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
 /// The entities stamped by `cx.target`. Quotas are Enterprise-only, so a
-/// cluster without them (404 or an error) has none.
+/// cluster without them (404, 501 or an error) has none.
 pub(crate) async fn owned(cx: &Context) -> Result<Vec<Orphan>> {
     let mut out = Vec::new();
     for kind in [
@@ -308,10 +315,13 @@ pub(crate) async fn owned(cx: &Context) -> Result<Vec<Orphan>> {
         EntityKind::NodePool,
         EntityKind::Quota,
     ] {
-        let list = match cx.nomad.get::<Vec<Value>>(kind.list_url()).await {
-            Ok(list) => list.unwrap_or_default(),
-            Err(_) if kind == EntityKind::Quota => Vec::new(),
-            Err(e) => return Err(e),
+        let list = if kind == EntityKind::Quota {
+            quotas(cx).await
+        } else {
+            cx.nomad
+                .get::<Vec<Value>>(kind.list_url())
+                .await?
+                .unwrap_or_default()
         };
         for item in list {
             if let Some(s) = read_stamps(kind, &item).filter(|s| s.target == cx.target) {
@@ -324,6 +334,23 @@ pub(crate) async fn owned(cx: &Context) -> Result<Vec<Orphan>> {
         }
     }
     Ok(out)
+}
+
+async fn quotas(cx: &Context) -> Vec<Value> {
+    if WITHOUT_QUOTAS.lock().unwrap().contains(&cx.target) {
+        return Vec::new();
+    }
+    let url = EntityKind::Quota.list_url();
+    let Ok(resp) = cx.nomad.send("GET", url, None).await else {
+        return Vec::new();
+    };
+    if resp.status == 501 {
+        WITHOUT_QUOTAS.lock().unwrap().insert(cx.target.clone());
+    }
+    if resp.status != 200 {
+        return Vec::new();
+    }
+    serde_json::from_slice(&resp.body).unwrap_or_default()
 }
 
 #[cfg(test)]

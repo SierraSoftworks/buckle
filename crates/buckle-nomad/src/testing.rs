@@ -645,7 +645,8 @@ impl FakeNomad {
                     }),
                 )
             }
-            ("GET", ["quotas"]) => not_found,
+            // Community Edition's answer, which the agent logs as an error.
+            ("GET", ["quotas"]) => (501, json!("Nomad Enterprise only endpoint")),
             _ => not_found,
         }
     }
