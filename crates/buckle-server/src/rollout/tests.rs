@@ -458,6 +458,7 @@ impl Harness {
                             results.push(check(w, true));
                         }
                         reply(AMsg::Health(HealthReport {
+                            local: None,
                             target: h.target.clone(),
                             workload: h.workload.clone(),
                             scope: h.scope,
@@ -1349,6 +1350,7 @@ async fn a_flap_inside_settle_is_not_a_failure() {
     h.handle.agent_message(
         "a",
         AMsg::Health(HealthReport {
+            local: None,
             target: String::new(),
             workload: String::new(),
             scope: HealthScope::Bake as i32,
@@ -1990,6 +1992,7 @@ fn answer_baseline(h: &Harness, host: &str) {
     h.handle.agent_message(
         host,
         AMsg::Health(HealthReport {
+            local: None,
             target: String::new(),
             workload: String::new(),
             scope: HealthScope::Baseline as i32,
@@ -2195,6 +2198,11 @@ async fn approving_pausing_and_relabelling_reach_a_connected_agent() {
         .collect();
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].status, "paused");
+    assert_eq!(
+        updates[0].local_runs,
+        Some(pb::LocalRuns::default()),
+        "every update carries the fleet's local runs policy"
+    );
     assert_eq!(
         updates[0].labels.get("tier").map(String::as_str),
         Some("db")
@@ -3203,6 +3211,7 @@ async fn a_bake_report_for_another_revision_or_request_is_not_this_bake() {
     .await;
     let failing = |revision: &str, request: &str| {
         AMsg::Health(HealthReport {
+            local: None,
             target: String::new(),
             workload: String::new(),
             scope: HealthScope::Bake as i32,

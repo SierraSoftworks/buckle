@@ -2,8 +2,8 @@
 //! messages in [`buckle_proto::v1`].
 
 use super::{
-    Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, UpgradeReport, WatchConfig,
-    Welcome, WireCluster, WireSecret,
+    ApplyPolicy, Hello, HostUpdate, Instruction, LocalRollbackRecord, Report, UpgradeReport,
+    WatchConfig, Welcome, WireCluster, WireSecret,
 };
 use buckle_core::health::{HealthReport, HealthResult, HealthStatus};
 use buckle_core::plan::RevisionId;
@@ -134,6 +134,7 @@ pub fn hello_to_proto(hello: &Hello) -> pb::Hello {
             .iter()
             .map(|r| r.0.clone())
             .collect(),
+        unreported_local_runs: hello.unreported_local_runs.clone(),
         capabilities: CAPABILITIES.iter().map(|c| (*c).to_owned()).collect(),
         boot_id: hello.boot_id.clone().unwrap_or_default(),
         workload_token: hello.workload_token.clone().unwrap_or_default(),
@@ -214,6 +215,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             secrets: secrets_from_proto(w.secrets),
             stable_tree_digest: non_empty(w.stable_tree_digest),
             paused_modules: w.paused_modules,
+            local_apply: apply_policy(w.local_runs),
         }),
         Msg::Assign(a) => Instruction::Assign {
             revision: RevisionId(a.revision),
@@ -331,6 +333,7 @@ pub fn instruction_from_proto(message: pb::ServerMessage) -> Option<Instruction>
             secrets: secrets_from_proto(u.secrets),
             stable_tree_digest: non_empty(u.stable_tree_digest),
             paused_modules: u.paused_modules,
+            local_apply: apply_policy(u.local_runs),
         }),
         Msg::Ack(a) => Instruction::Ack {
             report_ids: a.report_ids,
@@ -398,6 +401,7 @@ pub fn health_report_to_proto(
     report: &HealthReport,
 ) -> pb::HealthReport {
     pb::HealthReport {
+        local: None,
         target: String::new(),
         workload: String::new(),
         scope: scope_to_proto(report.scope) as i32,
@@ -470,6 +474,7 @@ pub fn apply_event_to_proto(
         })
         .unwrap_or_default();
     pb::ApplyEvent {
+        local: None,
         target: String::new(),
         workload: String::new(),
         action_id: String::new(),
@@ -621,6 +626,7 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             outcome,
             applied_revision,
         } => Msg::Result(pb::ApplyResult {
+            local: None,
             target: String::new(),
             workload: String::new(),
             report_id: *report_id,
@@ -726,6 +732,22 @@ pub fn report_to_proto(report: &Report) -> pb::AgentMessage {
             }
             return inner;
         }
+        Report::Local { origin, report } => {
+            let mut inner = report_to_proto(report);
+            let local = Some(pb::LocalOrigin {
+                run_id: origin.run_id.clone(),
+                uid: origin.uid,
+                user: origin.user.clone(),
+                pid: origin.pid.unwrap_or_default(),
+            });
+            match inner.msg.as_mut() {
+                Some(Msg::Apply(m)) => m.local = local,
+                Some(Msg::Result(m)) => m.local = local,
+                Some(Msg::Health(m)) => m.local = local,
+                _ => {}
+            }
+            return inner;
+        }
     };
     pb::AgentMessage { msg: Some(msg) }
 }
@@ -748,6 +770,15 @@ fn set_target(msg: &mut pb::agent_message::Msg, target: &str, workload: &str) {
     *t = target.to_owned();
     if let Some(w) = w {
         *w = workload.to_owned();
+    }
+}
+
+/// What the server said about applies from a host's own command line.
+fn apply_policy(local_runs: Option<pb::LocalRuns>) -> ApplyPolicy {
+    match local_runs {
+        None => ApplyPolicy::Unknown,
+        Some(l) if l.apply_off => ApplyPolicy::Off,
+        Some(_) => ApplyPolicy::Allowed,
     }
 }
 

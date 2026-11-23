@@ -35,7 +35,8 @@ pub enum Command {
     /// Show what applying a configuration directory, or the revision the
     /// agent on this host was assigned, would change on this host.
     Plan(local::PlanArgs),
-    /// Apply a configuration directory to this host.
+    /// Apply a configuration directory to this host, or have the agent on
+    /// this host apply the revision it is on again (to put drift right).
     Apply(local::ApplyArgs),
     /// Show the last apply on this host (every module and step with its state
     /// and any errors) and, where an agent runs, what that agent is doing.
@@ -169,6 +170,22 @@ mod tests {
             Some(PathBuf::from("/tmp/agent.sock"))
         );
         assert_eq!(health.modules, vec!["docker"]);
+
+        let cli = Cli::parse_from([
+            "buckle",
+            "apply",
+            "--include-rolled-back",
+            "--no-wait",
+            "--no-reboot",
+            "--waive",
+            "web/http",
+        ]);
+        let Command::Apply(apply) = cli.command else {
+            panic!("`apply` parses as Apply");
+        };
+        assert_eq!(apply.local.config, None);
+        assert!(apply.agent.include_rolled_back && apply.agent.no_wait && apply.no_reboot);
+        assert_eq!(apply.waive_checks, vec!["web/http"]);
     }
 
     /// The agent decides the host, its labels and its facts; a directory
@@ -179,6 +196,8 @@ mod tests {
     #[case::facts(&["health", "--facts", "pi.json"])]
     #[case::revision_of_a_directory(&["plan", "--config", "/srv/cfg", "--revision", "assigned"])]
     #[case::no_wait_on_a_directory(&["health", "--config", "/srv/cfg", "--no-wait"])]
+    #[case::a_revision_to_apply(&["apply", "--revision", "assigned"])]
+    #[case::rolled_back_modules_of_a_directory(&["apply", "--config", "/srv/cfg", "--include-rolled-back"])]
     fn flags_of_the_other_kind_of_run_are_refused(#[case] args: &[&str]) {
         let parsed = Cli::try_parse_from(["buckle"].into_iter().chain(args.iter().copied()));
         assert!(parsed.is_err(), "{args:?} must not parse");

@@ -44,6 +44,9 @@ pub struct Hello {
     /// Revisions whose apply is running, or whose result is not yet
     /// acknowledged (it follows the Welcome).
     pub unreported_apply_revisions: Vec<RevisionId>,
+    /// Local applies that are running, or whose result is not yet
+    /// acknowledged.
+    pub unreported_local_runs: Vec<String>,
     /// The identity of the current boot, when the host exposes one.
     pub boot_id: Option<String>,
     /// An in-cluster executor's workload identity token.
@@ -68,6 +71,7 @@ impl std::fmt::Debug for Hello {
                 "unreported_apply_revisions",
                 &self.unreported_apply_revisions,
             )
+            .field("unreported_local_runs", &self.unreported_local_runs)
             .field("boot_id", &self.boot_id)
             .field(
                 "workload_token",
@@ -127,6 +131,8 @@ pub struct Welcome {
     pub stable_tree_digest: Option<String>,
     /// The host's modules an operator suspended.
     pub paused_modules: Vec<String>,
+    /// Whether the fleet lets `buckle apply` run on the host itself.
+    pub local_apply: ApplyPolicy,
 }
 
 impl std::fmt::Debug for Welcome {
@@ -144,6 +150,7 @@ impl std::fmt::Debug for Welcome {
             .field("secrets", &self.secrets)
             .field("stable_tree_digest", &self.stable_tree_digest)
             .field("paused_modules", &self.paused_modules)
+            .field("local_apply", &self.local_apply)
             .finish()
     }
 }
@@ -205,6 +212,45 @@ pub struct HostUpdate {
     pub stable_tree_digest: Option<String>,
     /// The host's modules an operator suspended.
     pub paused_modules: Vec<String>,
+    /// Whether the fleet lets `buckle apply` run on the host itself.
+    pub local_apply: ApplyPolicy,
+}
+
+/// The fleet's answer to `buckle apply` on a host itself, as the server
+/// last gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyPolicy {
+    /// The server has not said: it predates local applies, and would take
+    /// one's result for a rollout's.
+    #[default]
+    Unknown,
+    /// Root on the host may re-apply the revision the host is on.
+    Allowed,
+    /// The fleet turned it off.
+    Off,
+}
+
+impl ApplyPolicy {
+    /// Whether the server has not said.
+    pub fn is_unknown(&self) -> bool {
+        *self == ApplyPolicy::Unknown
+    }
+}
+
+/// Who started a run on the host itself, through the agent's socket
+/// ([`crate::local`]), rather than the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalOrigin {
+    /// The agent's id for the run.
+    pub run_id: String,
+    /// The caller, from the socket's peer credentials.
+    pub uid: u32,
+    /// The account's name, or the uid when it has none.
+    pub user: String,
+    /// The caller's process, when the platform reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
 }
 
 /// What the control plane tells the agent to do.
@@ -648,6 +694,15 @@ pub enum Report {
         /// The report.
         report: Box<Report>,
     },
+    /// A report of a run started on the host itself: the inner report
+    /// travels with who ran it, and the server never takes it for rollout
+    /// progress.
+    Local {
+        /// Who ran it.
+        origin: LocalOrigin,
+        /// The report.
+        report: Box<Report>,
+    },
 }
 
 /// The outcome of an Upgrade, as reported to the server.
@@ -668,8 +723,20 @@ impl Report {
             Report::ApplyResult { report_id, .. } => Some(*report_id),
             Report::LocalRollback(record) => Some(record.report_id),
             Report::ActionResult(run) => Some(run.report_id),
-            Report::For { report, .. } => report.report_id(),
+            Report::For { report, .. } | Report::Local { report, .. } => report.report_id(),
             _ => None,
+        }
+    }
+
+    /// `self` as a report of the local run `origin` names, or as it is for
+    /// `None`.
+    pub fn from_local(self, origin: Option<&LocalOrigin>) -> Report {
+        match origin {
+            Some(origin) => Report::Local {
+                origin: origin.clone(),
+                report: Box::new(self),
+            },
+            None => self,
         }
     }
 
@@ -753,6 +820,9 @@ pub enum DurableReport {
         /// The workload placement the run was for, when scoped to one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workload: Option<String>,
+        /// Who ran it, when it was started on the host itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local: Option<LocalOrigin>,
     },
     /// A local or module rollback.
     LocalRollback(LocalRollbackRecord),
@@ -782,14 +852,26 @@ impl DurableReport {
     }
 
     /// The revision an ApplyResult reports on, when it is about the host
-    /// itself (Hello announces those).
+    /// itself and answers the server's Apply (Hello announces those).
     pub fn apply_revision(&self) -> Option<&RevisionId> {
         match self {
             DurableReport::ApplyResult {
                 revision,
                 target: None,
+                local: None,
                 ..
             } => Some(revision),
+            _ => None,
+        }
+    }
+
+    /// The local run an ApplyResult reports on, when it is one's.
+    pub fn local_run(&self) -> Option<&str> {
+        match self {
+            DurableReport::ApplyResult {
+                local: Some(origin),
+                ..
+            } => Some(&origin.run_id),
             _ => None,
         }
     }
@@ -809,6 +891,7 @@ impl DurableReport {
                 applied_revision: applied_revision.clone(),
                 target: None,
                 workload: None,
+                local: None,
             }),
             Report::LocalRollback(record) => Some(DurableReport::LocalRollback(record.clone())),
             Report::ActionResult(run) => Some(DurableReport::ActionResult {
@@ -827,6 +910,7 @@ impl DurableReport {
                     revision,
                     outcome,
                     applied_revision,
+                    local,
                     ..
                 } => Some(DurableReport::ApplyResult {
                     report_id,
@@ -835,6 +919,7 @@ impl DurableReport {
                     applied_revision,
                     target: Some(target.clone()),
                     workload: workload.clone(),
+                    local,
                 }),
                 DurableReport::ActionResult { run, report_id, .. } => {
                     Some(DurableReport::ActionResult {
@@ -844,6 +929,26 @@ impl DurableReport {
                         workload: workload.clone(),
                     })
                 }
+                other => Some(other),
+            },
+            Report::Local { origin, report } => match Self::from_report(report)? {
+                DurableReport::ApplyResult {
+                    report_id,
+                    revision,
+                    outcome,
+                    applied_revision,
+                    target,
+                    workload,
+                    ..
+                } => Some(DurableReport::ApplyResult {
+                    report_id,
+                    revision,
+                    outcome,
+                    applied_revision,
+                    target,
+                    workload,
+                    local: Some(origin.clone()),
+                }),
                 other => Some(other),
             },
             _ => None,
@@ -860,6 +965,7 @@ impl DurableReport {
                 applied_revision,
                 target,
                 workload,
+                local,
             } => match serde_json::from_value(outcome.clone()) {
                 Ok(outcome) => Some(
                     Report::ApplyResult {
@@ -868,7 +974,8 @@ impl DurableReport {
                         outcome,
                         applied_revision: applied_revision.clone(),
                     }
-                    .about_placement(target.as_deref(), workload.as_deref()),
+                    .about_placement(target.as_deref(), workload.as_deref())
+                    .from_local(local.as_ref()),
                 ),
                 Err(err) => {
                     tracing::warn!(report = report_id, error = %err, "dropping a stored apply result that no longer parses");

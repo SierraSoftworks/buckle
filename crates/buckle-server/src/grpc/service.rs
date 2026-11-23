@@ -996,6 +996,7 @@ impl FleetService {
                     session_id: session_id.to_string(),
                     status: status_str(authed.status).into(),
                     issued_token: authed.issued_token.clone().unwrap_or_default(),
+                    local_runs: Some(self.agents.local_runs.to_proto()),
                     ..Default::default()
                 };
             }
@@ -1032,6 +1033,7 @@ impl FleetService {
             labels: record.labels.clone().into_iter().collect(),
             status: status_str(record.status).into(),
             secrets,
+            local_runs: Some(self.agents.local_runs.to_proto()),
         }
     }
 
@@ -1076,6 +1078,193 @@ impl FleetService {
         );
     }
 
+    /// An apply event of a run started at the host's own command line: the
+    /// run is recorded under the agent's id for it, with who ran it.
+    async fn local_event(&self, host: &str, e: &buckle_proto::v1::ApplyEvent) {
+        let Some(origin) = e.local.clone().filter(|o| !o.run_id.is_empty()) else {
+            return;
+        };
+        let now = self.now();
+        let StepEvent {
+            event,
+            parsed,
+            key,
+            module,
+            step_id,
+            state,
+        } = StepEvent::of(e);
+        tracing::debug!(buckle.host = %host, run = %origin.run_id, key = %key, event = %event, "local apply event");
+        let (h, revision, digest) = (host.to_owned(), e.revision.clone(), e.plan_digest.clone());
+        let run = self
+            .store
+            .transaction(move |db| {
+                let run = match db.runs().get(&h, &origin.run_id)? {
+                    // Not a local run of this host: the id is someone
+                    // else's.
+                    Some(run) if run.local.is_none() => return Ok(None),
+                    Some(run) => run,
+                    None if db.runs().exists(&origin.run_id)? => return Ok(None),
+                    None => {
+                        let run = RunRecord {
+                            id: origin.run_id.clone(),
+                            host: h.clone(),
+                            rollout: None,
+                            revision,
+                            plan_digest: digest,
+                            started_at: now,
+                            finished_at: now,
+                            outcome: crate::store::RUNNING.to_owned(),
+                            changes: 0,
+                            removals: 0,
+                            error: None,
+                            trace_id: None,
+                            outcome_json: None,
+                            action: None,
+                            local: Some(local_user(&origin)),
+                        };
+                        db.runs().add(&run)?;
+                        run
+                    }
+                };
+                db.runs().record_event(
+                    &run.id,
+                    &key,
+                    module.as_deref(),
+                    step_id.as_deref(),
+                    state.as_deref(),
+                    &event,
+                    now,
+                )?;
+                Ok(Some(run))
+            })
+            .await;
+        match run {
+            Ok(Some(run)) => {
+                if let Some(event) = &parsed {
+                    self.events.publish(LiveEvent::RunProgress {
+                        progress: crate::views::progress(&run, event, now),
+                    });
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(buckle.host = %host, "a local apply event names a run that is not a local run; ignoring it");
+            }
+            Err(e) => {
+                tracing::warn!(buckle.host = %host, error = %e, "a local apply event could not be stored");
+            }
+        }
+    }
+
+    /// The result of a run started at the host's own command line. It
+    /// re-applied the revision the host is on, so no rollout hears of it:
+    /// the run is recorded with who ran it, audited and acknowledged.
+    async fn local_result(&self, host: &str, r: &buckle_proto::v1::ApplyResult) {
+        let Some(origin) = r.local.clone().filter(|o| !o.run_id.is_empty()) else {
+            return;
+        };
+        let now = self.now();
+        let duration = r
+            .duration
+            .as_ref()
+            .map(|d| {
+                chrono::Duration::seconds(d.seconds) + chrono::Duration::nanoseconds(d.nanos as i64)
+            })
+            .unwrap_or_default();
+        let outcome: Option<buckle_core::engine::ApplyOutcome> =
+            serde_json::from_slice(&r.outcome_json).ok();
+        let user = local_user(&origin);
+        let result = RunRecord {
+            id: origin.run_id.clone(),
+            host: host.to_owned(),
+            rollout: None,
+            revision: r.revision.clone(),
+            plan_digest: r.plan_digest.clone(),
+            started_at: now - duration,
+            finished_at: now,
+            outcome: if r.succeeded {
+                "succeeded"
+            } else if r.needs_attention {
+                "needs_attention"
+            } else {
+                "failed"
+            }
+            .into(),
+            changes: r.changes,
+            removals: r.removals,
+            error: (!r.error.is_empty()).then(|| r.error.clone()),
+            trace_id: None,
+            outcome_json: (!r.outcome_json.is_empty())
+                .then(|| String::from_utf8_lossy(&r.outcome_json).into_owned()),
+            action: None,
+            local: Some(user.clone()),
+        };
+        let (agent, report_id) = (host.to_owned(), r.report_id);
+        let stored = self
+            .store
+            .transaction(move |db| {
+                if report_id != 0
+                    && !db
+                        .reports()
+                        .first_arrival(&agent, report_id, "local_apply_result", now)?
+                {
+                    return Ok(None);
+                }
+                let mut run = result;
+                match db.runs().get(&run.host, &run.id)? {
+                    // Not a local run of this host: the id is someone
+                    // else's.
+                    Some(open) if open.local.is_none() => return Ok(None),
+                    Some(open) => {
+                        run.started_at = open.started_at;
+                        run.trace_id = open.trace_id;
+                        db.runs().finish(&run)?;
+                    }
+                    None if db.runs().exists(&run.id)? => return Ok(None),
+                    None => {
+                        db.runs().add(&run)?;
+                    }
+                }
+                Ok(Some(run))
+            })
+            .await;
+        let run = match stored {
+            Err(e) => {
+                // Unacknowledged, so the agent sends it again.
+                tracing::warn!(buckle.host = %host, error = %e, "a local apply's result could not be stored");
+                return;
+            }
+            Ok(run) => run,
+        };
+        if let Some(run) = run {
+            self.events.publish(LiveEvent::RunProgress {
+                progress: crate::views::finished_progress(&run, outcome.as_ref()),
+            });
+            let how = match run.outcome.as_str() {
+                "succeeded" if run.changes == 1 => "1 change".to_owned(),
+                "succeeded" => format!("{} changes", run.changes),
+                _ => format!(
+                    "it failed: {}",
+                    run.error.as_deref().unwrap_or("no reason given")
+                ),
+            };
+            self.audit(
+                &format!("{user}@{host}"),
+                "host.apply.local",
+                host,
+                format!(
+                    "{user} (uid {}) re-applied revision {} from {host}'s own command line: {how}",
+                    origin.uid,
+                    run.revision.get(..8).unwrap_or(&run.revision),
+                ),
+            )
+            .await;
+            self.publish_host(host).await;
+        }
+        if report_id != 0 {
+            self.ack(host, vec![report_id]);
+        }
+    }
+
     async fn route(&self, host: &str, msg: agent_message::Msg) {
         // A steward's answer to a node operation goes to the call waiting
         // for it and nowhere else: it may carry a join token.
@@ -1087,6 +1276,14 @@ impl FleetService {
                 };
                 self.node_ops.answer(&done.op_id, host, outcome);
                 return;
+            }
+            // A run started at the host's own command line is recorded
+            // with who ran it and is no part of any rollout.
+            agent_message::Msg::Apply(e) if e.local.is_some() => {
+                return self.local_event(host, &e).await;
+            }
+            agent_message::Msg::Result(r) if r.local.is_some() => {
+                return self.local_result(host, &r).await;
             }
             other => other,
         };
@@ -1184,33 +1381,14 @@ impl FleetService {
                     .map(|()| true)
             }
             agent_message::Msg::Apply(e) => {
-                let event = String::from_utf8_lossy(&e.event_json).into_owned();
-                let parsed: Option<buckle_core::engine::ApplyEvent> =
-                    serde_json::from_str(&event).ok();
-                let key = match &parsed {
-                    Some(ev) => crate::views::event_key(ev),
-                    None => format!("raw:{}/{}", e.module, e.step_id),
-                };
-                // From the wire fields, else the event itself (older agents).
-                let step = parsed.as_ref().and_then(|ev| ev.step());
-                let module = (!e.module.is_empty())
-                    .then(|| e.module.clone())
-                    .or_else(|| step.map(|(m, _)| m.to_owned()));
-                let step_id = (!e.step_id.is_empty())
-                    .then(|| e.step_id.clone())
-                    .or_else(|| {
-                        step.map(|(_, id)| id.to_owned())
-                            .filter(|id| !id.is_empty())
-                    });
-                let state = (!e.step_state.is_empty())
-                    .then(|| e.step_state.clone())
-                    .or_else(|| {
-                        parsed
-                            .as_ref()
-                            .and_then(|ev| ev.step_state())
-                            .and_then(|st| serde_json::to_value(st).ok())
-                            .and_then(|v| v.as_str().map(str::to_owned))
-                    });
+                let StepEvent {
+                    event,
+                    parsed,
+                    key,
+                    module,
+                    step_id,
+                    state,
+                } = StepEvent::of(e);
                 tracing::debug!(buckle.host = %host, key = %key, event = %event, "apply event");
                 let (digest, revision) = (e.plan_digest.clone(), e.revision.clone());
                 let action_id = e.action_id.clone();
@@ -1276,6 +1454,7 @@ impl FleetService {
                     outcome_json: (!a.outcome_json.is_empty())
                         .then(|| String::from_utf8_lossy(&a.outcome_json).into_owned()),
                     action: Some(label.clone()),
+                    local: None,
                 };
                 let pending = durable_id.map(|id| {
                     (
@@ -1354,6 +1533,7 @@ impl FleetService {
                     outcome_json: (!r.outcome_json.is_empty())
                         .then(|| String::from_utf8_lossy(&r.outcome_json).into_owned()),
                     action: None,
+                    local: None,
                 };
                 // A placement's result speaks for one workload: the cluster
                 // is on the revision once every placement is (the
@@ -1589,6 +1769,9 @@ impl FleetService {
                 | agent_message::Msg::RebootFailed(_)
                 | agent_message::Msg::TargetStatus(_)
         );
+        // Readings someone asked for at the host's command line are the
+        // host's health, never a rollout's bake or gate.
+        let local_health = matches!(&msg, agent_message::Msg::Health(h) if h.local.is_some());
         if matches!(
             msg,
             agent_message::Msg::Plan(_)
@@ -1596,7 +1779,8 @@ impl FleetService {
                 | agent_message::Msg::Health(_)
                 | agent_message::Msg::Rollback(_)
                 | agent_message::Msg::RebootFailed(_)
-        ) {
+        ) && !local_health
+        {
             self.controller.agent_message(host, msg);
         }
         if notify_ui {
@@ -1605,6 +1789,66 @@ impl FleetService {
             }
             self.publish_host(host).await;
         }
+    }
+}
+
+/// An apply event as the store keeps it.
+struct StepEvent {
+    /// `buckle_core::engine::ApplyEvent` as JSON.
+    event: String,
+    parsed: Option<buckle_core::engine::ApplyEvent>,
+    /// What a later event of the same step replaces.
+    key: String,
+    module: Option<String>,
+    step_id: Option<String>,
+    state: Option<String>,
+}
+
+impl StepEvent {
+    fn of(e: &buckle_proto::v1::ApplyEvent) -> Self {
+        let event = String::from_utf8_lossy(&e.event_json).into_owned();
+        let parsed: Option<buckle_core::engine::ApplyEvent> = serde_json::from_str(&event).ok();
+        let key = match &parsed {
+            Some(ev) => crate::views::event_key(ev),
+            None => format!("raw:{}/{}", e.module, e.step_id),
+        };
+        // From the wire fields, else the event itself (older agents).
+        let step = parsed.as_ref().and_then(|ev| ev.step());
+        let module = (!e.module.is_empty())
+            .then(|| e.module.clone())
+            .or_else(|| step.map(|(m, _)| m.to_owned()));
+        let step_id = (!e.step_id.is_empty())
+            .then(|| e.step_id.clone())
+            .or_else(|| {
+                step.map(|(_, id)| id.to_owned())
+                    .filter(|id| !id.is_empty())
+            });
+        let state = (!e.step_state.is_empty())
+            .then(|| e.step_state.clone())
+            .or_else(|| {
+                parsed
+                    .as_ref()
+                    .and_then(|ev| ev.step_state())
+                    .and_then(|st| serde_json::to_value(st).ok())
+                    .and_then(|v| v.as_str().map(str::to_owned))
+            });
+        Self {
+            event,
+            parsed,
+            key,
+            module,
+            step_id,
+            state,
+        }
+    }
+}
+
+/// Who ran a local run, as its record names them.
+fn local_user(origin: &buckle_proto::v1::LocalOrigin) -> String {
+    if origin.user.is_empty() {
+        format!("uid {}", origin.uid)
+    } else {
+        origin.user.clone()
     }
 }
 
@@ -1646,6 +1890,7 @@ fn open_run(
         trace_id: None,
         outcome_json: None,
         action: None,
+        local: None,
     };
     run.id = db.runs().add(&run)?;
     Ok(run)
@@ -1834,6 +2079,11 @@ impl Fleet for FleetService {
                     closed.extend(db.runs().abandon_unless_unreported(
                         &h,
                         &hello2.unreported_apply_revisions,
+                        now,
+                    )?);
+                    closed.extend(db.runs().abandon_local_unless_unreported(
+                        &h,
+                        &hello2.unreported_local_runs,
                         now,
                     )?);
                     Ok(closed)

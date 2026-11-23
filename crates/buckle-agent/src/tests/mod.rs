@@ -217,6 +217,7 @@ pub fn welcome(stable: Option<&str>, issued_token: Option<&str>) -> pb::server_m
         stable_revision: stable.unwrap_or_default().into(),
         issued_token: issued_token.unwrap_or_default().into(),
         status: "active".into(),
+        local_runs: Some(pb::LocalRuns::default()),
         ..Default::default()
     })
 }

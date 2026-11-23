@@ -75,6 +75,11 @@ pub fn log_report(report: &Report) {
                     .entered();
             log_report(report)
         }
+        Report::Local { origin, report } => {
+            let _span =
+                tracing::info_span!("local", run = %origin.run_id, user = %origin.user).entered();
+            log_report(report)
+        }
         Report::Facts(_) => tracing::debug!("facts collected"),
         Report::TargetStatus { reachable, error } => {
             tracing::info!(

@@ -90,6 +90,7 @@ async fn the_agent_transport_enrols_is_assigned_and_fetches_a_verified_revision(
             arch: "aarch64".into(),
             bootstrap: true,
             unreported_apply_revisions: vec![],
+            unreported_local_runs: vec![],
             boot_id: None,
             workload_token: None,
             workload_jwks: None,

@@ -90,6 +90,10 @@ message Hello {
   // there, for a server that cannot reach the cluster: once the token
   // verifies against a key the server already trusts, it learns the rest.
   string workload_jwks = 14;
+  // Local applies (LocalOrigin.run_id) running now, or whose ApplyResult
+  // the server has not acknowledged yet. A local run the server shows as
+  // running that is not listed here ended without a result.
+  repeated string unreported_local_runs = 15;
 }
 
 message Facts {
@@ -159,6 +163,22 @@ message ApplyEvent {
   // With `target`: the placement the run belongs to (as the Apply or
   // RunAction named it). Empty: the whole cluster.
   string workload = 11;
+  // Set when the run was started on the host itself, not by the server.
+  LocalOrigin local = 12;
+}
+
+// Who started a run on the host itself (`buckle apply` or `buckle health`
+// there, through the agent's socket). A report carrying one is never
+// rollout progress: the server records it against the host and who ran it.
+message LocalOrigin {
+  // The agent's id for the run (`local-…`), the same on every report of it.
+  string run_id = 1;
+  // The caller, from the socket's peer credentials.
+  uint32 uid = 2;
+  // The account's name, or the uid when it has none.
+  string user = 3;
+  // The caller's process, when the platform reports it; else 0.
+  int32 pid = 4;
 }
 
 // A structured error: what went wrong, the causes beneath it (outermost
@@ -209,6 +229,8 @@ message ApplyResult {
   // With `target`: the one workload placement this concerns, echoed from
   // the instruction. Empty: the whole cluster.
   string workload = 20;
+  // Set when the run was started on the host itself, not by the server.
+  LocalOrigin local = 21;
 }
 
 message Reboot {
@@ -300,6 +322,8 @@ message HealthReport {
   // With `target`: the one workload placement this concerns. Empty: the
   // whole cluster.
   string workload = 6;
+  // Set when the checks were run on the host itself, not for the server.
+  LocalOrigin local = 7;
 }
 
 message Drift {
@@ -500,6 +524,19 @@ message HostUpdate {
   string stable_tree_digest = 5;
   // The host's modules an operator suspended, as in Welcome.
   repeated string paused_modules = 6;
+  // What the fleet lets the host's own operators run, as in Welcome.
+  LocalRuns local_runs = 7;
+}
+
+// What the fleet lets a host's own operators run through its agent
+// (`agents.local_runs` on the server). The agent keeps the last one it was
+// sent, so the policy holds while it is disconnected. Unset (an older
+// server, which would take a local apply's result for a rollout's): the
+// agent refuses local applies.
+message LocalRuns {
+  // `buckle apply` on the host is refused. Plans and health checks change
+  // nothing and always run.
+  bool apply_off = 1;
 }
 
 // The server stored these durable reports (ApplyResult, LocalRollback) in a
@@ -528,6 +565,8 @@ message Welcome {
   // and rollback (their checks report paused) until a later Welcome or
   // HostUpdate drops them. An agent announces `unit_pause` when it does.
   repeated string paused_modules = 9;
+  // What the fleet lets the host's own operators run through its agent.
+  LocalRuns local_runs = 10;
 }
 
 message Assign {

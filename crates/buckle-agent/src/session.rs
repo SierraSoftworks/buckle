@@ -307,6 +307,8 @@ struct Shared {
     watchdog_queued: AtomicBool,
     /// The revision an Apply is running for, for Hello.
     applying: Mutex<Option<RevisionId>>,
+    /// The local apply that is running, if one is.
+    applying_local: Mutex<Option<String>>,
     /// The span of the current (or last) session, which agent-initiated
     /// passes follow from.
     session_span: Mutex<Option<tracing::Span>>,
@@ -551,6 +553,7 @@ impl Agent {
                 watchdog_wake: Notify::new(),
                 watchdog_queued: AtomicBool::new(false),
                 applying: Mutex::new(None),
+                applying_local: Mutex::new(None),
                 use_bootstrap: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
                 session_span: Mutex::new(None),
@@ -922,8 +925,17 @@ impl Shared {
         }
         unreported.sort();
         unreported.dedup();
+        let mut local_runs: Vec<String> = data
+            .agent
+            .unacked_reports
+            .iter()
+            .filter_map(DurableReport::local_run)
+            .map(str::to_owned)
+            .collect();
+        local_runs.extend(self.applying_local.lock().ok().and_then(|g| g.clone()));
         Hello {
             unreported_apply_revisions: unreported,
+            unreported_local_runs: local_runs,
             host_id: self.host_id.clone(),
             agent_version: self.options.agent_version.clone(),
             labels: self.config.labels.clone(),
@@ -1168,6 +1180,7 @@ impl Shared {
                 queue,
             );
             self.adopt_paused(&mut data, &welcome.paused_modules, queue);
+            data.agent.local_apply = welcome.local_apply;
             if let Ok(mut guard) = self.watchdog.lock()
                 && let Some(w) = guard.take()
             {
@@ -1253,6 +1266,9 @@ impl Shared {
             queue,
         );
         self.adopt_paused(&mut data, &update.paused_modules, queue);
+        if !update.local_apply.is_unknown() {
+            data.agent.local_apply = update.local_apply;
+        }
         self.save_agent(&data);
     }
 
@@ -1292,6 +1308,12 @@ impl Shared {
     fn set_applying(&self, revision: Option<RevisionId>) {
         if let Ok(mut guard) = self.applying.lock() {
             *guard = revision;
+        }
+    }
+
+    fn set_applying_local(&self, run: Option<String>) {
+        if let Ok(mut guard) = self.applying_local.lock() {
+            *guard = run;
         }
     }
 
@@ -1535,7 +1557,13 @@ impl Shared {
                 self.reboot_if_pending().await;
             }
             Op::Reboot => self.reboot_if_pending().await,
-            Op::Local(run) => self.local(run).await,
+            Op::Local(run) => {
+                let reboots = run.reboots();
+                self.local(run).await;
+                if reboots {
+                    self.reboot_if_pending().await;
+                }
+            }
         }
     }
 
@@ -1913,19 +1941,47 @@ impl Shared {
         report: bool,
         record: bool,
     ) -> ApplyOutcome {
+        self.run_apply_for(rev, ctx, plan, report, record, None)
+            .await
+    }
+
+    /// [`Self::run_apply`], for the local caller of `local` when there is
+    /// one: the caller watches the run, its reports name who ran it, and
+    /// the host only reboots when the caller asked for that.
+    async fn run_apply_for(
+        &self,
+        rev: Arc<Revision>,
+        ctx: &RunContext,
+        plan: &Plan,
+        report: bool,
+        record: bool,
+        local: Option<&local::LocalRun>,
+    ) -> ApplyOutcome {
         let started = Instant::now();
+        let origin = local.map(local::LocalRun::origin);
+        if let Some(origin) = &origin {
+            self.set_applying_local(Some(origin.run_id.clone()));
+        }
         let (tx, rx) = mpsc::channel(256);
+        let rx = match local {
+            Some(run) => run.watch(rx),
+            None => rx,
+        };
         let sink = if report {
             self.sink.clone()
         } else {
             ReportSink::default()
         };
-        let forwarder = tokio::spawn(coalesce::forward(
+        let forwarder = tokio::spawn(coalesce::forward_for(
             rx,
             sink,
             rev.id.clone(),
             plan.digest.to_string(),
             self.options.event_spacing,
+            coalesce::EventScope {
+                local: origin.clone(),
+                ..Default::default()
+            },
         ));
         let result = self.runner.apply(rev.clone(), ctx, plan, tx).await;
         let _ = forwarder.await;
@@ -1937,10 +1993,30 @@ impl Shared {
                     // engine's own check: nothing was applied. Report the
                     // fresh plan for re-approval, as for a digest mismatch.
                     tracing::warn!(approved = %stale.planned, fresh = %stale.fresh, "the engine refused a stale plan");
-                    if report {
-                        self.report_stale(rev.clone(), ctx, plan).await;
+                    // Nobody approved a local caller's plan: it runs again.
+                    let failed = failed_outcome(plan, &err, started);
+                    match &origin {
+                        None if report => self.report_stale(rev.clone(), ctx, plan).await,
+                        None => {}
+                        // The server may have seen the run start: it hears
+                        // how it ended.
+                        Some(origin) => {
+                            let applied = self.data.lock().await.agent.applied_revision.clone();
+                            let report_id = self.next_report_id().await;
+                            self.send_durable(
+                                Report::ApplyResult {
+                                    report_id,
+                                    revision: rev.id.clone(),
+                                    outcome: failed.clone(),
+                                    applied_revision: applied,
+                                }
+                                .from_local(Some(origin)),
+                            )
+                            .await;
+                            self.set_applying_local(None);
+                        }
                     }
-                    return failed_outcome(plan, &err, started);
+                    return failed;
                 }
                 tracing::error!(error = %err.description(), "the apply failed");
                 failed_outcome(plan, &err, started)
@@ -1971,16 +2047,28 @@ impl Shared {
         }
         if report {
             let report_id = self.next_report_id().await;
-            if let Some(reboot) = &outcome.reboot {
+            // What the server hears: a reboot only when one will happen.
+            let mut reported = outcome.clone();
+            if local.is_some_and(|run| !run.reboots()) {
+                reported.reboot = None;
+            }
+            if let Some(reboot) = &reported.reboot {
                 self.schedule_reboot(report_id, reboot.clone()).await;
             }
-            self.send_durable(Report::ApplyResult {
-                report_id,
-                revision: rev.id.clone(),
-                outcome: outcome.clone(),
-                applied_revision: applied,
-            })
+            self.send_durable(
+                Report::ApplyResult {
+                    report_id,
+                    revision: rev.id.clone(),
+                    outcome: reported,
+                    applied_revision: applied,
+                }
+                .from_local(origin.as_ref()),
+            )
             .await;
+        }
+        // The result is now among the unacknowledged reports.
+        if origin.is_some() {
+            self.set_applying_local(None);
         }
         outcome
     }

@@ -1,5 +1,5 @@
-//! Local runs: a caller on the agent's socket plans, checks health and reads
-//! the status, in turn with what the server asks for. These run in real
+//! Local runs: a caller on the agent's socket plans, applies, checks health
+//! and reads the status, in turn with what the server asks for. These run in real
 //! time, over a real socket, with the client the command line uses.
 
 use super::hardening::{assign_with, gated_with, secret};
@@ -7,6 +7,7 @@ use super::*;
 use crate::local::client::{Client, Events};
 use crate::local::{Choice, Event, Request, Status};
 use crate::testing::{Call, plan_with_changes};
+use buckle_core::engine::ApplyEvent;
 use buckle_core::health::{HealthReport, HealthScope};
 use buckle_core::plan::RevisionId;
 use pretty_assertions::assert_eq;
@@ -406,5 +407,209 @@ async fn secrets_never_cross_the_socket() {
     assert!(!reason.contains("hunter2"), "{reason}");
     assert!(reason.contains("401"), "the rest stays: {reason}");
     assert_eq!(exit_code(&events), 1, "a failing required check exits 1");
+    h.stop().await.expect("clean exit");
+}
+
+fn local_apply() -> Request {
+    Request::Apply {
+        select: None,
+        waive: Vec::new(),
+        include_rolled_back: false,
+        reboot: false,
+    }
+}
+
+fn drift_report(msg: &pb::agent_message::Msg) -> Option<pb::Drift> {
+    match msg {
+        pb::agent_message::Msg::Drift(d) => Some(d.clone()),
+        _ => None,
+    }
+}
+
+/// A host on `rev1` (with `rev2` assigned) whose drift pass reports and
+/// corrects nothing on its own.
+fn reporting_only(runner: Arc<FakeRunner>) -> Setup {
+    Setup {
+        yaml: "drift: { interval: 1h, correct: false }\n".into(),
+        ..in_a_rollout(runner)
+    }
+}
+
+#[rstest]
+#[case::drifted(2)]
+#[case::as_configured(0)]
+#[tokio::test]
+async fn a_local_apply_puts_drift_right_and_the_server_hears_who_ran_it(#[case] changes: usize) {
+    let fake = FakeRunner::new();
+    let drifted = plan_with_changes(&rev("rev1"), changes);
+    fake.with_plans(&rev("rev1"), vec![drifted.clone()]);
+    fake.with_events(vec![ApplyEvent::ModuleStarted { module: "m".into() }]);
+    let mut h = Harness::start(reporting_only(fake.clone())).await;
+    let mut session = h.sessions.accept().await;
+    session.send(welcome(None, None)).await;
+    // The agent's own pass at start-up reports the drift and leaves it.
+    let found = session.expect(drift_report).await;
+    assert_eq!((found.changes as usize, found.corrected), (changes, false));
+    let mut client = connect(&h).await;
+    status_when(&mut client, |s| idle(s) && s.connected).await;
+
+    let events = finish(client.run(local_apply(), false).await.expect("accepted")).await;
+
+    let Event::Started {
+        run_id, revision, ..
+    } = &events[0]
+    else {
+        panic!("the run starts: {events:?}");
+    };
+    assert_eq!(revision, &rev("rev1"), "never the assigned revision");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Plan { plan, .. } if plan.changes() == changes)),
+        "the caller sees what will change: {events:?}"
+    );
+    assert_eq!(exit_code(&events), 0);
+    let outcome = events.iter().find_map(|e| match e {
+        Event::Outcome { outcome, rebooting } => Some((outcome.succeeded, *rebooting)),
+        _ => None,
+    });
+    if changes == 0 {
+        assert_eq!(outcome, None, "nothing to apply: {events:?}");
+        let checked = session.expect(drift_report).await;
+        assert_eq!((checked.changes, checked.corrected), (0, false));
+        assert!(fake.applies().is_empty(), "{:?}", fake.calls());
+    } else {
+        assert_eq!(outcome, Some((true, false)));
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Apply(_))),
+            "the caller follows the apply: {events:?}"
+        );
+        // The server hears every part of the run with who ran it.
+        let received = session
+            .collect_until(|m| matches!(m, pb::agent_message::Msg::Drift(_)))
+            .await;
+        let origins: Vec<pb::LocalOrigin> = received
+            .iter()
+            .filter_map(|(_, m)| match m {
+                pb::agent_message::Msg::Apply(e) => Some(e.local.clone()),
+                pb::agent_message::Msg::Result(r) => Some(r.local.clone()),
+                _ => None,
+            })
+            .map(|origin| origin.expect("a local run names who ran it"))
+            .collect();
+        assert!(origins.len() >= 2, "events and the result: {received:?}");
+        for origin in &origins {
+            assert_eq!(&origin.run_id, run_id);
+            assert!(!origin.user.is_empty(), "{origin:?}");
+        }
+        let result = received.iter().find_map(|(_, m)| apply_result(m));
+        let result = result.expect("the result is reported");
+        assert!(result.succeeded && result.report_id != 0, "{result:?}");
+        assert_eq!(result.revision, "rev1");
+        let corrected = received.iter().find_map(|(_, m)| drift_report(m));
+        assert!(corrected.is_some_and(|d| d.corrected), "{received:?}");
+        assert_eq!(
+            fake.drift_flags().last(),
+            Some(&("apply", rev("rev1"), true)),
+            "applied as a drift pass applies: removals never run"
+        );
+    }
+    let after = status_when(&mut client, idle).await;
+    assert_eq!(
+        (after.applied, after.assigned),
+        (Some(rev("rev1")), Some(rev("rev2"))),
+        "a local apply never moves the host to another revision"
+    );
+    h.stop().await.expect("clean exit");
+}
+
+#[rstest]
+#[case::the_fleet_says_no("active", Some(true), &[], "does not allow")]
+#[case::a_server_too_old_to_record_it("active", None, &[], "has not said")]
+#[case::a_paused_host("paused", Some(false), &[], "paused")]
+#[case::rolled_back_modules("active", Some(false), &["m"], "--include-rolled-back")]
+#[tokio::test]
+async fn a_local_apply_is_refused_where_the_host_may_not_change(
+    #[case] status: &str,
+    #[case] apply_off: Option<bool>,
+    #[case] rolled_back: &'static [&'static str],
+    #[case] why: &str,
+) {
+    let fake = FakeRunner::new();
+    fake.with_plans(&rev("rev1"), vec![plan_with_changes(&rev("rev1"), 1)]);
+    let mut setup = reporting_only(fake.clone());
+    setup.prepare = Some(Box::new(move |state_dir: &Path| {
+        let store = Store::new(state_dir);
+        store.ensure().expect("ensure");
+        crate::bundle::extract_atomic(
+            &bundle(FLEET_YAML),
+            &store.revision_dir(&rev("rev1")).expect("dir"),
+        )
+        .expect("extract");
+        store
+            .save_agent_state(&crate::store::AgentState {
+                applied_revision: Some(rev("rev1")),
+                rolled_back_modules: rolled_back.iter().map(|m| (*m).to_owned()).collect(),
+                ..Default::default()
+            })
+            .expect("agent state");
+    }));
+    let mut h = Harness::start(setup).await;
+    let session = h.sessions.accept().await;
+    session
+        .send(pb::server_message::Msg::Welcome(pb::Welcome {
+            server_version: "2.0.0".into(),
+            session_id: "s1".into(),
+            status: status.into(),
+            local_runs: apply_off.map(|apply_off| pb::LocalRuns { apply_off }),
+            ..Default::default()
+        }))
+        .await;
+    let mut client = connect(&h).await;
+    status_when(&mut client, |s| idle(s) && s.connected).await;
+
+    let events = finish(client.run(local_apply(), false).await.expect("accepted")).await;
+
+    let Some(Event::Done {
+        exit_code: 1,
+        error: Some(error),
+    }) = events.last()
+    else {
+        panic!("the apply is refused: {events:?}");
+    };
+    let said = format!("{} {}", error.message, error.advice.join(" "));
+    assert!(said.contains(why), "{said}");
+    assert!(fake.applies().is_empty(), "{:?}", fake.calls());
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test]
+async fn a_local_result_the_server_never_acknowledged_is_announced_and_sent_again() {
+    let fake = FakeRunner::new();
+    fake.with_plans(&rev("rev1"), vec![plan_with_changes(&rev("rev1"), 1)]);
+    let mut h = Harness::start(reporting_only(fake.clone())).await;
+    let mut first = h.sessions.accept().await;
+    first.send(welcome(None, None)).await;
+    let mut client = connect(&h).await;
+    status_when(&mut client, |s| idle(s) && s.connected).await;
+    let events = finish(client.run(local_apply(), false).await.expect("accepted")).await;
+    assert_eq!(exit_code(&events), 0);
+    let sent = first.expect(apply_result).await;
+    let run_id = sent.local.clone().expect("a local run").run_id;
+
+    first.close();
+    let mut second = h.sessions.accept().await;
+    assert_eq!(second.hello.unreported_local_runs, vec![run_id.clone()]);
+    assert_eq!(
+        second.hello.unreported_apply_revisions,
+        Vec::<String>::new(),
+        "no rollout's apply of this revision is running or unreported"
+    );
+    second.send(welcome(None, None)).await;
+    let again = second.expect(apply_result).await;
+    assert_eq!(
+        (again.report_id, again.local.map(|o| o.run_id)),
+        (sent.report_id, Some(run_id))
+    );
     h.stop().await.expect("clean exit");
 }

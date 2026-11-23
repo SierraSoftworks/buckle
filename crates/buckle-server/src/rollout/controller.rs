@@ -45,6 +45,8 @@ pub struct ControllerOptions {
     /// The placement that runs this server, when a cluster of the fleet
     /// does (see [`OwnPlacement`]).
     pub own: Option<OwnPlacement>,
+    /// What agents are told their hosts' command lines may do.
+    pub local_runs: pb::LocalRuns,
     /// This server's version, as it names itself.
     pub version: String,
 }
@@ -121,6 +123,7 @@ impl Default for ControllerOptions {
             disconnect_timeout: Duration::from_secs(600),
             apply_timeout: Duration::from_secs(30 * 60),
             own: None,
+            local_runs: pb::LocalRuns::default(),
             version: crate::VERSION.to_owned(),
         }
     }
@@ -2715,6 +2718,7 @@ impl Controller {
             status: crate::store::hosts_status_str(record.status).to_owned(),
             labels: record.labels.clone().into_iter().collect(),
             paused_modules,
+            local_runs: Some(self.options.local_runs),
             ..Default::default()
         };
         if let Some(stable) = self.stable.clone() {
@@ -2891,6 +2895,7 @@ impl Controller {
             trace_id: trace_id_of(&span),
             outcome_json: None,
             action: Some(label.clone()),
+            local: None,
         };
         let by = actor.to_owned();
         self.store
@@ -3606,6 +3611,7 @@ impl Controller {
             trace_id: trace_id_of(&span),
             outcome_json: None,
             action: Some(action.key()),
+            local: None,
         });
         {
             let h = &mut self.live[ri].hosts[hi];
@@ -5796,7 +5802,8 @@ impl Controller {
             .ok()?;
         let any_digest = h.runtime.force_plan || h.runtime.approval_digest.is_some();
         runs.into_iter().find(|r| {
-            (any_digest || r.plan_digest == digest)
+            r.local.is_none()
+                && (any_digest || r.plan_digest == digest)
                 && r.revision == revision
                 && r.finished_at >= since
         })

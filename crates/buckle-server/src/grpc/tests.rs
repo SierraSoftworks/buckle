@@ -1214,6 +1214,174 @@ async fn a_new_session_keeps_a_run_it_reports_as_still_running() {
     assert!(run_of(&s, &first).await.is_running());
 }
 
+/// Who ran the local run `run_id`, as agents report it.
+fn ran_locally(run_id: &str) -> Option<buckle_proto::v1::LocalOrigin> {
+    Some(buckle_proto::v1::LocalOrigin {
+        run_id: run_id.into(),
+        uid: 0,
+        user: "root".into(),
+        pid: 4242,
+    })
+}
+
+fn local_started(run_id: &str) -> AgentMessage {
+    let mut event = module_started("local-plan");
+    if let Some(agent_message::Msg::Apply(e)) = &mut event.msg {
+        e.local = ran_locally(run_id);
+    }
+    event
+}
+
+fn local_result(run_id: &str, report_id: u64) -> AgentMessage {
+    let mut result = result_for("local-plan", report_id);
+    if let Some(agent_message::Msg::Result(r)) = &mut result.msg {
+        r.changes = 2;
+        r.local = ran_locally(run_id);
+    }
+    result
+}
+
+#[tokio::test]
+async fn a_local_apply_is_recorded_with_who_ran_it_and_is_no_rollout_s_run() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    // A rollout's apply is recorded and still open.
+    tx.send(module_started("d1")).await.unwrap();
+    let rollout_run = next_progress(&mut live).await.run_id;
+
+    tx.send(local_started("local-1")).await.unwrap();
+    assert_eq!(next_progress(&mut live).await.run_id, "local-1");
+    tx.send(local_result("local-1", 21)).await.unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![21]);
+    let done = next_progress(&mut live).await;
+    assert_eq!(
+        (done.run_id.as_str(), done.run_state),
+        ("local-1", buckle_api::RunState::Succeeded)
+    );
+
+    let local = run_of(&s, "local-1").await;
+    assert_eq!(
+        (
+            local.outcome.as_str(),
+            local.changes,
+            local.local.as_deref(),
+            local.rollout.as_deref()
+        ),
+        ("succeeded", 2, Some("root"), None)
+    );
+    let key = crate::rollout::pending_report_key("pi-1", 21);
+    let (open, latest, pending, audit) = s
+        .store
+        .call(move |db| {
+            Ok((
+                db.runs().open_for_host("pi-1")?,
+                db.runs().latest_for_host("pi-1")?,
+                db.kv().get(&key)?,
+                db.audit()
+                    .list(&crate::store::AuditFilter {
+                        limit: 100,
+                        ..Default::default()
+                    })?
+                    .0,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (open.map(|r| r.id), latest.map(|r| r.id)),
+        (Some(rollout_run.clone()), Some(rollout_run)),
+        "the host's apply for its rollout is still the open and the latest one"
+    );
+    assert_eq!(pending, None, "no rollout reacts to a local result");
+    let entry = audit
+        .iter()
+        .find(|e| e.action == "host.apply.local")
+        .expect("audited");
+    assert_eq!(entry.actor, "root@pi-1");
+    assert_eq!(entry.subject.as_deref(), Some("pi-1"));
+
+    // The agent sends an unacknowledged result again: nothing is doubled.
+    tx.send(local_result("local-1", 21)).await.unwrap();
+    assert_eq!(next_ack(&mut stream).await, vec![21]);
+    let (runs, total) = s
+        .store
+        .call(|db| db.runs().page("pi-1", None, 10))
+        .await
+        .unwrap();
+    assert_eq!((runs.len(), total), (2, 2));
+}
+
+#[tokio::test]
+async fn a_local_report_never_touches_a_run_that_is_not_a_local_one() {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, mut stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    expect_welcome(reply);
+    tx.send(module_started("d1")).await.unwrap();
+    let rollout_run = next_progress(&mut live).await.run_id;
+
+    tx.send(local_started(&rollout_run)).await.unwrap();
+    tx.send(local_result(&rollout_run, 31)).await.unwrap();
+    assert_eq!(
+        next_ack(&mut stream).await,
+        vec![31],
+        "acknowledged, so the agent stops sending it"
+    );
+    let run = run_of(&s, &rollout_run).await;
+    assert!(run.is_running() && run.local.is_none(), "{run:?}");
+    let id = rollout_run.clone();
+    let events = s.store.call(move |db| db.runs().events(&id)).await.unwrap();
+    assert_eq!(events.len(), 1, "only the rollout's own event");
+}
+
+#[rstest::rstest]
+#[case::still_running(&["local-1"], true)]
+#[case::gone(&[], false)]
+#[tokio::test]
+async fn a_new_session_closes_the_local_runs_it_does_not_report(
+    #[case] unreported: &[&str],
+    #[case] running: bool,
+) {
+    let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
+    let mut live = s.events.subscribe();
+    let (tx, stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let token = expect_welcome(reply).issued_token;
+    tx.send(local_started("local-1")).await.unwrap();
+    next_progress(&mut live).await;
+    drop((tx, stream));
+    let mut again = hello("pi-1", &token, "2.0.0");
+    if let Some(agent_message::Msg::Hello(h)) = &mut again.msg {
+        h.unreported_local_runs = unreported.iter().map(|r| r.to_string()).collect();
+    }
+    let (_tx, _stream, reply) = open(s.addr, again).await;
+    expect_welcome(reply);
+    let run = run_of(&s, "local-1").await;
+    assert_eq!(run.is_running(), running, "{run:?}");
+}
+
+#[rstest::rstest]
+#[case::allowed(crate::config::Switch::On)]
+#[case::turned_off(crate::config::Switch::Off)]
+#[tokio::test]
+async fn the_welcome_says_whether_hosts_may_apply_locally(#[case] apply: crate::config::Switch) {
+    let s = server_full(
+        Registration::Auto,
+        None,
+        vec![AgentAuth::Token],
+        SessionGuard::default(),
+        AgentsConfig {
+            local_runs: crate::config::LocalRunsConfig { apply },
+            ..Default::default()
+        },
+    )
+    .await;
+    let (_tx, _stream, reply) = open(s.addr, hello("pi-1", "boot", "2.0.0")).await;
+    let policy = expect_welcome(reply).local_runs.expect("always sent");
+    assert_eq!(policy.apply_off, apply == crate::config::Switch::Off);
+}
+
 #[tokio::test]
 async fn a_result_for_another_plan_closes_the_open_run_which_its_own_result_still_completes() {
     let s = server(Registration::Auto, None, vec![AgentAuth::Token]).await;
@@ -2183,6 +2351,7 @@ async fn action_events_and_results_land_in_the_action_run_beside_an_open_apply()
         trace_id: None,
         outcome_json: None,
         action: Some("web/restart".into()),
+        local: None,
     };
     s.store
         .call(move |db| db.runs().add(&action).map(|_| ()))

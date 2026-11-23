@@ -373,6 +373,7 @@ impl Shared {
                         target: Some(target.clone()),
                         workload: workload.clone(),
                         action_id: Some(action_id.clone()),
+                        local: None,
                     },
                 ));
                 let outcome = self
@@ -416,6 +417,7 @@ impl Shared {
                 target: Some(target.to_owned()),
                 workload: workload.map(str::to_owned),
                 action_id: None,
+                local: None,
             },
         ));
         let outcome = self.executor.apply(planned, tx).await;

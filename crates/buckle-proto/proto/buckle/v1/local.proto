@@ -4,9 +4,10 @@ package buckle.v1;
 
 import "buckle/v1/fleet.proto";
 
-// What `buckle plan`, `buckle health` and `buckle status` ask of the agent
-// running on the same host, over a Unix socket only that host's users can
-// reach (root, and the members of the group agent.yaml names).
+// What `buckle plan`, `buckle apply`, `buckle health` and `buckle status` ask
+// of the agent running on the same host, over a Unix socket only that
+// host's users can reach (root, and the members of the group agent.yaml
+// names).
 //
 // The agent runs each request as an operation on its own worker, behind
 // whatever the server has it doing, against the revisions the server
@@ -15,8 +16,15 @@ import "buckle/v1/fleet.proto";
 service LocalAgent {
   // Plans a revision on this host. Nothing is sent to the server.
   rpc Plan(LocalPlanRequest) returns (stream LocalEvent);
-  // Runs the health checks of a revision's modules on this host.
+  // Runs the health checks of a revision's modules on this host, and
+  // reports them to the server as the host's health, with who ran them.
   rpc Health(LocalHealthRequest) returns (stream LocalEvent);
+  // Re-applies the revision already applied on this host, as the drift pass
+  // does unattended: it corrects drift and never moves the host to another
+  // revision (rollouts do that). Reported to the server with who ran it.
+  // The agent only accepts it from root (or the user it runs as), and only
+  // while the fleet allows local applies.
+  rpc Apply(LocalApplyRequest) returns (stream LocalEvent);
   // What the agent is doing and the last run it recorded. Answered at
   // once, whatever the worker is busy with.
   rpc Status(LocalStatusRequest) returns (LocalStatus);
@@ -46,10 +54,24 @@ message LocalHealthRequest {
   bool no_wait = 3;
 }
 
+message LocalApplyRequest {
+  // An optional filt-rs task selector (it only narrows the run).
+  string select = 1;
+  // Checks (module/check) waived for this run.
+  repeated string waive = 2;
+  // Apply although modules are back on the stable revision after a failure
+  // (the drift pass leaves those hosts to the server).
+  bool include_rolled_back = 3;
+  // Reboot the host when the run asks for it; otherwise it only says so.
+  bool reboot = 4;
+  bool no_wait = 5;
+}
+
 message LocalStatusRequest {}
 
 // One step in the life of a request: any number of `queued`, then `started`,
-// its result, and `done` last.
+// its result (for an apply: the plan, its events, then the outcome), and
+// `done` last.
 message LocalEvent {
   oneof event {
     LocalQueued queued = 1;
@@ -57,7 +79,23 @@ message LocalEvent {
     LocalPlan plan = 3;
     LocalHealth health = 4;
     LocalDone done = 5;
+    LocalApplyEvent apply_event = 6;
+    LocalOutcome outcome = 7;
   }
+}
+
+// Progress of an apply, as it happens.
+message LocalApplyEvent {
+  // buckle_core::engine::ApplyEvent as JSON.
+  bytes event_json = 1;
+}
+
+// How an apply went.
+message LocalOutcome {
+  // buckle_core::engine::ApplyOutcome as JSON (its health report included).
+  bytes outcome_json = 1;
+  // The run asked for a reboot and the agent is about to carry it out.
+  bool rebooting = 2;
 }
 
 // The request waits behind other work; sent again whenever that changes.

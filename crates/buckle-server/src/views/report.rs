@@ -681,6 +681,7 @@ pub fn pending_report(
         trace_id: None,
         outcome_json: None,
         action: None,
+        local: None,
     };
     run_report(&run, Some(plan), &[], None, &[])
 }
@@ -919,6 +920,7 @@ mod tests {
             trace_id: None,
             outcome_json: None,
             action: None,
+            local: None,
         }
     }
 

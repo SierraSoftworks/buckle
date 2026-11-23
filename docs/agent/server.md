@@ -54,6 +54,7 @@ agents:
     server_url: http://buckle.example.ts.net:7700
   # tailscale_socket: /var/run/tailscale/tailscaled.sock
   # trusted_proxies: ["tag:nomad-tailscale"]   # agents behind a Tailscale Service (PROXY protocol v2)
+  # local_runs: { apply: off }      # no `buckle apply` from a host's own command line
   minimum_agent_version: "2.0.0"
   desired_version: "2.3.1"
   disconnect_timeout: 10m
@@ -136,6 +137,7 @@ and the fleet stays on the last valid one.
 | `join.ttl` | `1h` | How long a join command's single-use keys work; at most an hour. |
 | `tailscale_socket` | `/var/run/tailscale/tailscaled.sock` | The `tailscaled` LocalAPI socket used to identify tailnet peers. |
 | `trusted_proxies` | `[]` | TCP proxies in front of the gRPC port (a Tailscale Service host) whose connections may open with a PROXY protocol v2 header; whois then identifies the agent by the forwarded address. Entries are `tag:…` (matched by whois on the proxy), IP addresses or CIDR ranges. Other peers' headers are never read. |
+| `local_runs.apply` | `on` | Whether root on a host may [re-apply the revision the host is on](./local.md#on-a-host-with-an-agent) with `buckle apply` there. `off` refuses it on every host; planning and health checks from the command line always work. |
 | `minimum_agent_version` | | Older agents are refused (before anything is recorded, so they can enrol once upgraded). |
 | `desired_version` | server's version | The version the UI offers when an admin upgrades an agent. |
 | `disconnect_timeout` | `10m` | A host disconnected this long in the middle of its wave counts as failed, and a cluster whose steward stays away this long is leased to another host. |
