@@ -6,6 +6,8 @@
 //! * [`session`] — the session loop, operations, drift, heartbeats and the
 //!   local rollback watchdog.
 //! * [`runner`] — the seam to the engine ([`runner::EngineRunner`]).
+//! * [`local`] — the socket `buckle plan|health|status` reach the running
+//!   agent through.
 //! * [`install`] and [`update`] — `buckle up` and self-update.
 
 pub mod backoff;
@@ -15,6 +17,7 @@ pub mod coalesce;
 pub mod config;
 pub mod identity;
 pub mod install;
+pub mod local;
 pub mod runner;
 pub mod session;
 pub mod sink;
@@ -99,7 +102,9 @@ pub async fn run_with_system(
         agent_version: agent_version.to_owned(),
         ..Default::default()
     };
+    let socket = (config.local.socket_path(), config.local.group.clone());
     Agent::new(config, transport, runner, updater, options)?
+        .with_local_socket(socket.0, socket.1)
         .run(shutdown)
         .await
 }

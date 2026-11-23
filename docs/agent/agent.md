@@ -105,6 +105,8 @@ vars:
 telemetry:
   otlp_endpoint: http://127.0.0.1:4317
   otlp_headers: { x-honeycomb-team: "…" }
+local:
+  group: buckle                           # who, beside root, may run `buckle plan` on this host
 ```
 
 | Key | Default | Description |
@@ -123,6 +125,8 @@ telemetry:
 | `vars` | `{}` | Host-specific variable overrides: the last, highest-precedence [vars](../modules/fleet.md#vars) layer. |
 | `telemetry.otlp_endpoint` | | Where to export traces, metrics and logs. `--otel-endpoint` and `OTEL_EXPORTER_OTLP_*` take precedence. |
 | `telemetry.otlp_headers` | `{}` | Extra OTLP headers, such as an API key. |
+| `local.socket` | `/run/buckle/agent.sock` | The Unix socket [`buckle plan`, `health` and `status`](./local.md#on-a-host-with-an-agent) reach the agent on (`/var/run/buckle/agent.sock` on macOS; not served on Windows yet). Created with mode 0600, owned by root. |
+| `local.group` | | A group whose members may use the socket too (mode 0660). When the group does not exist the agent logs a warning and does not serve the socket. |
 | `workload_identity.token_file` | | For an [executor inside a cluster](./server.md#in-cluster-executors): the workload identity token file, read on every connect (Nomad: `secrets/nomad_buckle.jwt` from `identity { name = "buckle", aud = ["buckle"], file = true }`). Needs `host_id`. |
 | `workload_identity.jwks_url` | | The cluster's key set as the executor reaches it (Nomad: `/.well-known/jwks.json`), relayed to a server that cannot reach the cluster. |
 

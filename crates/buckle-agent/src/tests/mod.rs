@@ -8,6 +8,8 @@
 pub(crate) mod fake_server;
 mod hardening;
 mod lanes;
+#[cfg(unix)]
+mod local;
 mod reboot;
 mod scenarios;
 
@@ -60,6 +62,8 @@ pub struct Setup {
     pub cluster: Option<buckle_nomad::testing::FakeNomad>,
     /// The Kubernetes cluster targets reach (else none is reachable).
     pub kube: Option<buckle_kube::testing::FakeKube>,
+    /// Serve local runs on [`Harness::socket`].
+    pub local_socket: bool,
 }
 
 /// Reaches every cluster target through one in-memory Nomad or Kubernetes.
@@ -115,6 +119,7 @@ impl Default for Setup {
             custom_runner: None,
             cluster: None,
             kube: None,
+            local_socket: false,
         }
     }
 }
@@ -165,6 +170,9 @@ impl Harness {
                 kube: setup.kube,
             }));
         }
+        if setup.local_socket {
+            agent = agent.with_local_socket(dir.path().join("agent.sock"), None);
+        }
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn(agent.run(shutdown.clone()));
         Self {
@@ -180,6 +188,12 @@ impl Harness {
 
     pub fn state_dir(&self) -> PathBuf {
         self.dir.path().join("state")
+    }
+
+    /// Where the agent serves local runs (with [`Setup::local_socket`]).
+    #[cfg(unix)]
+    pub fn socket(&self) -> PathBuf {
+        self.dir.path().join("agent.sock")
     }
 
     pub async fn stop(mut self) -> buckle_core::Result<i32> {

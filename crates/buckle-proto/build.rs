@@ -16,7 +16,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".buckle.v1.Hello",
             ".buckle.v1.HostUpdate",
         ])
-        .compile_protos(&["proto/buckle/v1/fleet.proto"], &["proto"])?;
+        .compile_protos(
+            &["proto/buckle/v1/fleet.proto", "proto/buckle/v1/local.proto"],
+            &["proto"],
+        )?;
     println!("cargo:rerun-if-changed=proto/buckle/v1/fleet.proto");
+    println!("cargo:rerun-if-changed=proto/buckle/v1/local.proto");
     Ok(())
 }

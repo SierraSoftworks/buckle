@@ -1,8 +1,48 @@
 # Local commands
 
-These commands run the Buckle engine once, on this host, against a configuration directory. They
-are how you author and test modules, check a repository in CI, and bootstrap a host before (or
-instead of) installing an agent. The agent runs exactly the same engine.
+These commands run the Buckle engine once, on this host. With `--config DIR` they run it against a
+configuration directory: that is how you author and test modules, check a repository in CI, and
+bootstrap a host before (or instead of) installing an agent. The agent runs exactly the same engine.
+
+## On a host with an agent
+
+Without `--config`, `plan`, `health` and `status` ask the agent running on this host instead of
+running the engine themselves, so you can see what a host would change, or why it is unhealthy, with
+its real revision, facts, vars and secrets.
+
+```text
+$ sudo buckle plan
+waiting behind: apply 4be01c7a (rollout r-91)
+revision  9d06eafc80bcec9d6ce55cb95024c021743f8717 (applied)      host  pi-4      facts  os=debian/bookworm arch=aarch64
+…
+note: the server has assigned revision 4be01c7a to this host; preview it with --revision assigned.
+```
+
+**The agent runs it**
+
+- The run joins the agent's queue and takes its turn behind a rollout, a drift pass or another
+  local run, so it never collides with work the server sent. The command says what it waits behind;
+  `--no-wait` fails instead when the agent is busy, and Ctrl-C gives up the place in the queue.
+- Nothing is sent to the server, and secrets only cross to the command as
+  `«secret:NAME@fingerprint»`.
+- `apply` still needs `--config` (applying through the agent is not available yet).
+
+**Which revision**
+
+- `--revision applied` (the default) is the revision applied on this host. `plan` then shows drift:
+  exactly what the agent's next drift pass would find.
+- `--revision assigned` is the revision the server last assigned (what a rollout in progress will
+  apply here), planned as that rollout plans it.
+- You choose among the revisions the server gave the agent, never a directory, facts or labels:
+  `--host-id`, `--labels` and `--facts` need `--config`.
+
+**Finding and reaching the agent**
+
+- The socket is `local.socket` in [agent.yaml](./agent.md#agent-yaml) (`/run/buckle/agent.sock`),
+  read from `--agent-config`; `--socket` names it directly.
+- Root may always connect; members of `local.group` may too, when agent.yaml names one.
+- A host with no agent.yaml gets an error asking for `--config`: the command never falls back to
+  running the engine itself. Linux and macOS only for now.
 
 ## plan
 
@@ -79,12 +119,28 @@ sudo buckle status
 sudo buckle status --output json
 ```
 
+On a host with an agent, `status` asks the agent and leads with what it is doing: its connection,
+its applied and assigned revisions, the running operation and what is queued behind it.
+
+```text
+agent     pi-4 · 2.21.0 · connected to https://buckle.example.com:7700 (active)
+revision  applied 9d06eafc · assigned 4be01c7a
+doing     apply 4be01c7a (rollout r-91)
+queued    local plan by ben
+
+last run  revision 9d06eafc… · finished 2026-11-23 13:04:11 UTC · succeeded
+```
+
+With `--state-dir` or `--config` (and on a host with no agent) it reads the last run from the state
+directory instead, which also works while the agent is stopped.
+
 ## health
 
 <CliCommand command="health" />
 
 Runs the checks of the modules this host applied, exactly as a rollout's bake does, and exits `1`
-when a required check fails. `--module` limits it to some modules.
+when a required check fails. `--module` limits it to some modules. Without `--config` the
+[agent runs them](#on-a-host-with-an-agent), in turn with its own work.
 
 ## facts
 

@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package buckle.v1;
+
+import "buckle/v1/fleet.proto";
+
+// What `buckle plan`, `buckle health` and `buckle status` ask of the agent
+// running on the same host, over a Unix socket only that host's users can
+// reach (root, and the members of the group agent.yaml names).
+//
+// The agent runs each request as an operation on its own worker, behind
+// whatever the server has it doing, against the revisions the server
+// assigned: a caller never supplies a configuration directory, facts or
+// vars, and secret values never cross the socket.
+service LocalAgent {
+  // Plans a revision on this host. Nothing is sent to the server.
+  rpc Plan(LocalPlanRequest) returns (stream LocalEvent);
+  // Runs the health checks of a revision's modules on this host.
+  rpc Health(LocalHealthRequest) returns (stream LocalEvent);
+  // What the agent is doing and the last run it recorded. Answered at
+  // once, whatever the worker is busy with.
+  rpc Status(LocalStatusRequest) returns (LocalStatus);
+}
+
+// Which of the agent's revisions a request is about.
+enum LocalRevision {
+  // The revision applied on this host.
+  LOCAL_REVISION_APPLIED = 0;
+  // The revision the server last assigned (what a rollout wants here), which
+  // may be ahead of the applied one; the applied one when there is none.
+  LOCAL_REVISION_ASSIGNED = 1;
+}
+
+message LocalPlanRequest {
+  LocalRevision revision = 1;
+  // An optional filt-rs task selector (it only narrows the plan).
+  string select = 2;
+  // Fail rather than wait when the agent is busy.
+  bool no_wait = 3;
+}
+
+message LocalHealthRequest {
+  LocalRevision revision = 1;
+  // Only these modules; empty: every module selected here.
+  repeated string modules = 2;
+  bool no_wait = 3;
+}
+
+message LocalStatusRequest {}
+
+// One step in the life of a request: any number of `queued`, then `started`,
+// its result, and `done` last.
+message LocalEvent {
+  oneof event {
+    LocalQueued queued = 1;
+    LocalStarted started = 2;
+    LocalPlan plan = 3;
+    LocalHealth health = 4;
+    LocalDone done = 5;
+  }
+}
+
+// The request waits behind other work; sent again whenever that changes.
+message LocalQueued {
+  // What runs before it, in order (the running operation first), in words:
+  // "apply 4f2c81a (rollout 812)".
+  repeated string ahead = 1;
+}
+
+message LocalStarted {
+  // The agent's id for the run.
+  string run_id = 1;
+  // The revision the run is about.
+  string revision = 2;
+  // The host's revisions when the run started; empty when there is none.
+  string applied_revision = 3;
+  string assigned_revision = 4;
+}
+
+message LocalPlan {
+  // The redacted plan as JSON (buckle_core::plan::Plan).
+  bytes plan_json = 1;
+  // The facts tree the plan was made with, as JSON.
+  bytes facts_json = 2;
+}
+
+message LocalHealth {
+  // The scrubbed report as JSON (buckle_core::health::HealthReport).
+  bytes report_json = 1;
+}
+
+message LocalDone {
+  // The process exit code the command ends with: as for the same command
+  // given `--config` (plan: 2 when something would change).
+  int32 exit_code = 1;
+  // Set when the request could not run or was refused.
+  ErrorDetail error = 2;
+}
+
+message LocalStatus {
+  string host_id = 1;
+  string agent_version = 2;
+  // The server the agent is enrolled with; empty for one watching a
+  // directory.
+  string server = 3;
+  // Whether a session with it is up.
+  bool connected = 4;
+  // pending, active or paused, as the server last said; empty when unknown.
+  string host_status = 5;
+  string applied_revision = 6;
+  string assigned_revision = 7;
+  string stable_revision = 8;
+  // What the agent's worker is doing; empty when it is idle.
+  string running = 9;
+  // What waits behind it, in order.
+  repeated string queued = 10;
+  // Modules an operator suspended here, and modules back on the stable
+  // revision after a failure.
+  repeated string paused_modules = 11;
+  repeated string rolled_back_modules = 12;
+  // The last run recorded in the state directory, as JSON
+  // (buckle_core::state::RunRecord), and its full outcome
+  // (buckle_core::engine::ApplyOutcome); empty when there is none.
+  bytes run_json = 13;
+  bytes outcome_json = 14;
+}

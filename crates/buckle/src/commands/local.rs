@@ -1,10 +1,14 @@
 //! `buckle plan|apply|health|facts|validate`: the engine against a local
 //! configuration directory, with the real host behind it.
 //!
+//! Without `--config`, `plan`, `health` and `status` ask the Buckle agent
+//! running on this host instead ([`super::via_agent`]).
+//!
 //! Exit codes: `plan` returns 0 when nothing would change and 2 when it would
 //! (so CI can detect drift); the others return 0 on success and 1 on failure.
 //! Errors propagate as human errors and exit 1.
 
+use super::via_agent;
 use crate::render;
 use buckle_core::engine::{ApplyEvent, Engine, Inputs, Revision};
 use buckle_core::facts::Facts;
@@ -32,18 +36,20 @@ pub enum OutputFormat {
 /// Arguments shared by the local commands.
 #[derive(Args, Debug, Clone)]
 pub struct LocalArgs {
-    /// The configuration directory (containing buckle.yaml).
+    /// The configuration directory (containing buckle.yaml). Without it,
+    /// `plan` and `health` ask the Buckle agent running on this host, which
+    /// runs them against the revision its server assigned.
     #[arg(short, long, env = "BUCKLE_CONFIG", value_name = "DIR")]
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
 
     /// Host identity to plan as; defaults to the hostname.
-    #[arg(long)]
+    #[arg(long, requires = "config")]
     pub host_id: Option<String>,
 
     /// Labels for this host, as comma-separated key=value pairs. Values are
     /// typed like YAML scalars: `canary=true` is a boolean, `rack=3` a number,
     /// `rack="3"` a string.
-    #[arg(long, value_parser = parse_labels, default_value = "")]
+    #[arg(long, value_parser = parse_labels, default_value = "", requires = "config")]
     pub labels: BTreeMap<String, String>,
 
     /// Restrict to tasks matching this filt-rs selector, e.g. 'task.tags contains "network"'.
@@ -58,8 +64,20 @@ pub struct LocalArgs {
     pub output: OutputFormat,
 
     /// Use these facts (a JSON file) instead of collecting them; for authoring and tests.
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", requires = "config")]
     pub facts: Option<PathBuf>,
+}
+
+impl LocalArgs {
+    /// The configuration directory, for a command that only runs against one.
+    fn config_dir(&self, command: &str) -> buckle_core::Result<&Path> {
+        self.config.as_deref().ok_or_else(|| {
+            buckle_core::error::user(
+                format!("`buckle {command}` needs a configuration directory."),
+                &["Pass --config DIR (the directory containing buckle.yaml)."],
+            )
+        })
+    }
 }
 
 fn default_state_dir() -> &'static str {
@@ -85,6 +103,8 @@ pub fn parse_labels(s: &str) -> Result<BTreeMap<String, String>, String> {
 pub struct PlanArgs {
     #[command(flatten)]
     pub local: LocalArgs,
+    #[command(flatten)]
+    pub agent: via_agent::RunArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -105,17 +125,22 @@ pub struct ApplyArgs {
 #[derive(Args, Debug, Clone)]
 pub struct StatusArgs {
     /// The configuration directory. Accepted so that `status` takes the same
-    /// flags as `plan` and `apply`; the report itself comes from the state
-    /// directory.
+    /// flags as `plan` and `apply`; with it the report comes from the state
+    /// directory, never from the agent.
     #[arg(short, long, env = "BUCKLE_CONFIG", value_name = "DIR")]
     pub config: Option<PathBuf>,
 
-    /// Where the agent keeps its state (resources, shadows, facts cache).
-    #[arg(long, env = "BUCKLE_STATE_DIR", default_value = default_state_dir())]
-    pub state_dir: PathBuf,
+    /// Read the last run from this state directory instead of asking the
+    /// agent. The default on a host with no agent set up, where it is
+    /// /var/lib/buckle (C:\ProgramData\buckle on Windows).
+    #[arg(long, env = "BUCKLE_STATE_DIR", value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
 
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output: OutputFormat,
+
+    #[command(flatten)]
+    pub agent: via_agent::AgentArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -125,6 +150,8 @@ pub struct HealthArgs {
     /// Only these modules.
     #[arg(long = "module")]
     pub modules: Vec<String>,
+    #[command(flatten)]
+    pub agent: via_agent::RunArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -235,8 +262,8 @@ struct Local {
 }
 
 impl Local {
-    async fn load(args: &LocalArgs) -> buckle_core::Result<Self> {
-        let revision = load_revision(&args.config)?;
+    async fn load(args: &LocalArgs, command: &str) -> buckle_core::Result<Self> {
+        let revision = load_revision(args.config_dir(command)?)?;
         let system = real_system(Some(&args.state_dir))?;
         let host = HostIdentity {
             id: args.host_id.clone().unwrap_or_else(|| system.hostname()),
@@ -277,11 +304,16 @@ impl Local {
 }
 
 pub async fn plan(args: PlanArgs) -> buckle_core::Result<i32> {
+    if args.local.config.is_none() {
+        let select = args.local.select.clone();
+        let (out, notes) = (&mut std::io::stdout(), &mut std::io::stderr());
+        return via_agent::plan(&args.agent, select, args.local.output, out, notes).await;
+    }
     plan_to(args, &mut std::io::stdout()).await
 }
 
 pub(crate) async fn plan_to(args: PlanArgs, out: &mut dyn Write) -> buckle_core::Result<i32> {
-    let local = Local::load(&args.local).await?;
+    let local = Local::load(&args.local, "plan").await?;
     let (plan, facts) = Engine::plan(&local.inputs).await?;
     match args.output {
         OutputFormat::Text => {
@@ -306,14 +338,15 @@ fn agent_enrolled(state_dir: &Path) -> bool {
 }
 
 pub async fn apply(args: ApplyArgs) -> buckle_core::Result<i32> {
+    let config = args.local.config_dir("apply")?;
     if agent_enrolled(&args.local.state_dir) {
         eprintln!(
             "warning: {} belongs to a Buckle agent enrolled with a server. Applying {} here changes what that agent manages: it reports the difference as drift and may put it back.",
             args.local.state_dir.display(),
-            args.local.config.display()
+            config.display()
         );
     }
-    let mut local = Local::load(&args.local).await?;
+    let mut local = Local::load(&args.local, "apply").await?;
     local.inputs = local.inputs.with_waived_checks(args.waive_checks.clone());
     let (plan, facts) = Engine::plan(&local.inputs).await?;
     let stdout = std::io::stdout();
@@ -409,27 +442,26 @@ pub async fn apply(args: ApplyArgs) -> buckle_core::Result<i32> {
     Ok(if outcome.succeeded { 0 } else { 1 })
 }
 
-pub async fn status(args: StatusArgs) -> buckle_core::Result<i32> {
-    status_to(args, &mut std::io::stdout())
+/// The last run recorded on this host, and its full outcome when kept.
+pub(crate) struct LastRun {
+    pub run: Option<buckle_core::state::RunRecord>,
+    pub outcome: Option<buckle_core::engine::ApplyOutcome>,
 }
 
-/// Prints the report of the last apply on this host (by `buckle apply` or
-/// the agent) from the state directory. Exits 1 when that run did not
-/// succeed.
-pub(crate) fn status_to(args: StatusArgs, out: &mut dyn Write) -> buckle_core::Result<i32> {
-    let store = FileStateStore::new(args.state_dir.join("state.cbor"));
-    let state = store.load()?;
-    let last = store.load_last_run()?;
-    let run = state.runs.last();
-    if args.output == OutputFormat::Json {
-        let _ = writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "run": run, "outcome": last }))
-                .unwrap_or_default()
-        );
-    } else {
-        match run {
+impl LastRun {
+    /// 1 when the run did not succeed.
+    pub fn exit_code(&self) -> i32 {
+        let succeeded = match (&self.outcome, &self.run) {
+            (Some(outcome), _) => outcome.succeeded,
+            (None, Some(run)) => run.outcome == buckle_core::state::RunOutcome::Succeeded,
+            (None, None) => true,
+        };
+        if succeeded { 0 } else { 1 }
+    }
+
+    /// The run as text; `nothing` when there is none.
+    pub fn render(&self, out: &mut dyn Write, nothing: &str) {
+        match &self.run {
             Some(run) => {
                 let _ = writeln!(
                     out,
@@ -442,19 +474,19 @@ pub(crate) fn status_to(args: StatusArgs, out: &mut dyn Write) -> buckle_core::R
                         .unwrap_or_default()
                 );
             }
-            None if last.is_none() => {
-                let _ = writeln!(out, "no run is recorded in {}", args.state_dir.display());
-                return Ok(0);
+            None if self.outcome.is_none() => {
+                let _ = writeln!(out, "{nothing}");
+                return;
             }
             None => {}
         }
-        match &last {
+        match &self.outcome {
             Some(outcome) => {
                 let _ = writeln!(out);
                 let _ = out.write_all(render::render_outcome(outcome).as_bytes());
             }
             None => {
-                if let Some(error) = run.and_then(|r| r.error.as_ref()) {
+                if let Some(error) = self.run.as_ref().and_then(|r| r.error.as_ref()) {
                     let _ = writeln!(out, "error: {error}");
                 }
                 let _ = writeln!(
@@ -464,20 +496,72 @@ pub(crate) fn status_to(args: StatusArgs, out: &mut dyn Write) -> buckle_core::R
             }
         }
     }
-    let succeeded = match (&last, run) {
-        (Some(outcome), _) => outcome.succeeded,
-        (None, Some(run)) => run.outcome == buckle_core::state::RunOutcome::Succeeded,
-        (None, None) => true,
+}
+
+/// The agent's socket when `status` should ask the agent: one is set up on
+/// this host and the caller named no directory to read instead.
+fn status_agent(args: &StatusArgs) -> buckle_core::Result<Option<PathBuf>> {
+    if args.config.is_some() || args.state_dir.is_some() || !cfg!(unix) {
+        return Ok(None);
+    }
+    args.agent.find()
+}
+
+pub async fn status(args: StatusArgs) -> buckle_core::Result<i32> {
+    match status_agent(&args)? {
+        Some(socket) => via_agent::status(&socket, args.output, &mut std::io::stdout()).await,
+        None => status_to(args, &mut std::io::stdout()),
+    }
+}
+
+/// Prints the report of the last apply on this host (by `buckle apply` or
+/// the agent) from the state directory. Exits 1 when that run did not
+/// succeed.
+pub(crate) fn status_to(args: StatusArgs, out: &mut dyn Write) -> buckle_core::Result<i32> {
+    let state_dir = args
+        .state_dir
+        .unwrap_or_else(|| PathBuf::from(default_state_dir()));
+    let store = FileStateStore::new(state_dir.join("state.cbor"));
+    let mut state = store.load()?;
+    let last = LastRun {
+        run: state.runs.pop(),
+        outcome: store.load_last_run()?,
     };
-    Ok(if succeeded { 0 } else { 1 })
+    if args.output == OutputFormat::Json {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "run": last.run, "outcome": last.outcome })
+            )
+            .unwrap_or_default()
+        );
+    } else {
+        last.render(
+            out,
+            &format!("no run is recorded in {}", state_dir.display()),
+        );
+    }
+    Ok(last.exit_code())
 }
 
 pub async fn health(args: HealthArgs) -> buckle_core::Result<i32> {
+    if args.local.config.is_none() {
+        if args.local.select.is_some() {
+            return Err(buckle_core::error::user(
+                "--select only applies to `buckle health` with a configuration directory.",
+                &["Pass --module NAME to check some of the agent's modules, or add --config DIR."],
+            ));
+        }
+        let (out, notes) = (&mut std::io::stdout(), &mut std::io::stderr());
+        let modules = args.modules.clone();
+        return via_agent::health(&args.agent, modules, args.local.output, out, notes).await;
+    }
     health_to(args, &mut std::io::stdout()).await
 }
 
 pub(crate) async fn health_to(args: HealthArgs, out: &mut dyn Write) -> buckle_core::Result<i32> {
-    let local = Local::load(&args.local).await?;
+    let local = Local::load(&args.local, "health").await?;
     let modules = (!args.modules.is_empty()).then_some(args.modules.as_slice());
     let report = Engine::health(&local.inputs, HealthScope::Manual, modules).await?;
     match args.local.output {
@@ -699,7 +783,7 @@ mod tests {
 
     fn local_args(dir: &Path, output: OutputFormat) -> LocalArgs {
         LocalArgs {
-            config: dir.to_path_buf(),
+            config: Some(dir.to_path_buf()),
             host_id: Some("test-host".into()),
             labels: parse_labels("site=home,canary=true").unwrap(),
             select: None,
@@ -744,6 +828,7 @@ mod tests {
         let code = plan_to(
             PlanArgs {
                 local: local_args(dir.path(), OutputFormat::Text),
+                agent: Default::default(),
             },
             &mut out,
         )
@@ -779,6 +864,7 @@ mod tests {
         let code = plan_to(
             PlanArgs {
                 local: local_args(dir.path(), OutputFormat::Json),
+                agent: Default::default(),
             },
             &mut out,
         )
@@ -802,6 +888,7 @@ mod tests {
         let code = plan_to(
             PlanArgs {
                 local: local_args(dir.path(), OutputFormat::Text),
+                agent: Default::default(),
             },
             &mut out,
         )
@@ -901,17 +988,29 @@ mod tests {
         write_config(dir.path(), "cli.test_file");
         let mut args = local_args(dir.path(), OutputFormat::Text);
         args.select = Some("host.labels.role ==".into());
-        let err = plan_to(PlanArgs { local: args }, &mut Vec::new())
-            .await
-            .unwrap_err();
+        let err = plan_to(
+            PlanArgs {
+                local: args,
+                agent: Default::default(),
+            },
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.is(buckle_core::error::Kind::User));
         assert!(err.message().contains("selector"), "{}", err.message());
 
         let mut args = local_args(dir.path(), OutputFormat::Text);
         args.facts = Some(dir.path().join("missing.json"));
-        let err = plan_to(PlanArgs { local: args }, &mut Vec::new())
-            .await
-            .unwrap_err();
+        let err = plan_to(
+            PlanArgs {
+                local: args,
+                agent: Default::default(),
+            },
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.is(buckle_core::error::Kind::User));
     }
 
@@ -925,9 +1024,15 @@ mod tests {
         let mut args = local_args(&fixtures().join("config/minimal"), OutputFormat::Text);
         args.state_dir = dir.path().join("state");
         let mut out = Vec::new();
-        let code = plan_to(PlanArgs { local: args }, &mut out)
-            .await
-            .unwrap_or_else(|e| panic!("{}", e.message()));
+        let code = plan_to(
+            PlanArgs {
+                local: args,
+                agent: Default::default(),
+            },
+            &mut out,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message()));
         let text = String::from_utf8(out).unwrap();
         assert!(code == 0 || code == 2, "{text}");
         assert!(text.contains("\nmotd\n"), "{text}");
@@ -946,8 +1051,9 @@ mod tests {
     fn status_args(dir: &Path) -> StatusArgs {
         StatusArgs {
             config: None,
-            state_dir: dir.to_path_buf(),
+            state_dir: Some(dir.to_path_buf()),
             output: OutputFormat::Text,
+            agent: Default::default(),
         }
     }
 

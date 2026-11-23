@@ -16,7 +16,7 @@ pub struct AgentArgs {
     pub windows_service: bool,
 }
 
-fn default_config_path() -> &'static str {
+pub(super) fn default_config_path() -> &'static str {
     if cfg!(windows) {
         r"C:\ProgramData\buckle\agent.yaml"
     } else {
