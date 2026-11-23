@@ -32,9 +32,11 @@ use crate::logic::tone::{
 pub enum RevisionAsk {
     Start(RevisionSummary),
     RollBack(RevisionSummary),
+    /// Roll the stable revision out again, to correct drift.
+    Reapply(RevisionSummary),
 }
 
-/// The state behind a revision's Start and Roll back buttons and the dialog
+/// The state behind a revision's Start, Roll back and Re-apply buttons and the dialog
 /// that confirms them.
 pub struct RevisionActions {
     ask: Option<RevisionAsk>,
@@ -69,11 +71,16 @@ pub fn use_revision_actions() -> RevisionActions {
         Callback::from(move |note: String| {
             let Some(what) = (*ask).clone() else { return };
             let rev = match &what {
-                RevisionAsk::Start(r) | RevisionAsk::RollBack(r) => r.clone(),
+                RevisionAsk::Start(r) | RevisionAsk::RollBack(r) | RevisionAsk::Reapply(r) => {
+                    r.clone()
+                }
             };
             let note = match &what {
                 RevisionAsk::RollBack(_) if note.is_empty() => {
                     format!("Roll the fleet back to {}", commit(&rev.commit))
+                }
+                RevisionAsk::Reapply(_) if note.is_empty() => {
+                    format!("Re-apply {}", commit(&rev.commit))
                 }
                 _ => note,
             };
@@ -148,6 +155,14 @@ impl RevisionActions {
                     if let Some(q) = queued { <Note>{ q }</Note> }
                 </Confirm>
             },
+            RevisionAsk::Reapply(r) => html! {
+                <Confirm title={format!("Re-apply {}", commit(&r.commit))} confirm_label="Re-apply" note=true
+                    busy={self.busy} error={self.error.clone()} on_confirm={self.run.clone()} on_cancel={cancel}>
+                    <p>{ format!("Starts a new rollout of the stable revision “{}”. Every target plans again against it, so only what drifted changes; those changes go through the phases' gates, approvals and bakes as usual.", first_line(&r.message)) }</p>
+                    <p class="muted">{ "Targets with nothing to change finish without a bake. A re-apply has nothing to roll back to: pause or abort it instead." }</p>
+                    if let Some(q) = queued { <Note>{ q }</Note> }
+                </Confirm>
+            },
         }
     }
 }
@@ -160,8 +175,8 @@ pub struct RevisionControlsProps {
     pub open: Callback<RevisionAsk>,
 }
 
-/// The rollout controls of a revision card: [Stable] for the current stable
-/// release, a red [Corrupt] for a revision that failed validation, an orange
+/// The rollout controls of a revision card: Re-apply and [Stable] for the
+/// current stable release, a red [Corrupt] for a revision that failed validation, an orange
 /// Rollback for an older one, a blue Review for a
 /// proposed rollout awaiting approval, and a blue [Running] marker for a
 /// rollout in progress that needs nothing. A newer revision nobody has
@@ -184,7 +199,13 @@ pub fn revision_controls(props: &RevisionControlsProps) -> Html {
             </>
         },
         Some(Stance::Stable) => html! {
-            <span class="marker tone-ok" title="The release the fleet is on">{ "Stable" }</span>
+            <>
+                if admin && props.rollout.as_ref().is_none_or(|r| rollout_finished(r.state)) {
+                    <Button small=true title="Roll this revision out again, to correct drift"
+                        onclick={ask(RevisionAsk::Reapply(rev.clone()))}>{ "Re-apply…" }</Button>
+                }
+                <span class="marker tone-ok" title="The release the fleet is on">{ "Stable" }</span>
+            </>
         },
         Some(Stance::Running) => html! {
             <span class="marker tone-active" title="A rollout of this revision is in progress">{ "Running" }</span>

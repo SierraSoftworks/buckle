@@ -537,6 +537,7 @@ mod tests {
                 trace_url: None,
                 action: None,
                 changes: None,
+                reapply: false,
             },
             phases,
             plans,

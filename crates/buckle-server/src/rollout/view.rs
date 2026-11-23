@@ -201,6 +201,7 @@ pub fn summary(record: &RolloutRecord, hosts: &[RolloutHostRecord]) -> RolloutSu
                 schedule: a.schedule.clone(),
             }),
         changes: None,
+        reapply: record.runtime.reapply,
     }
 }
 

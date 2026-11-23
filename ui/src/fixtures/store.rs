@@ -808,6 +808,7 @@ pub fn start_rollout(revision: &str, note: &str) -> Result<RolloutSummary, ApiEr
             RolloutState::Planning
         };
         detail.summary.triggered_by = actor();
+        detail.summary.reapply = rev.is_stable;
         detail.summary.started_at = Utc::now();
         detail.summary.current_phase = None;
         detail.events.clear();

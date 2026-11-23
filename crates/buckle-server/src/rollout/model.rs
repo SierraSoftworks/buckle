@@ -220,6 +220,10 @@ pub struct RolloutRuntime {
     /// An action rollout: what each target runs in place of an apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<RolloutAction>,
+    /// It re-applies the revision that was already stable when it froze
+    /// (correcting drift), so it has nothing to roll back to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reapply: bool,
 }
 
 /// The action an action rollout runs on each of its targets, from the

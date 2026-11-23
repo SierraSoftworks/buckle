@@ -30,6 +30,15 @@ With `rollout.trigger: manual`, or to re-run a revision, use **Start rollout…*
 Rollouts. A revision that arrives while another rollout is running waits for it or replaces it,
 according to `rollout.supersede`.
 
+### Re-apply the stable revision
+
+**Re-apply…** on the stable revision's row (or on the page of its latest finished rollout) starts
+a new rollout of the revision the fleet is already on, to correct drift or redo manual changes.
+
+- Every target plans again; only what drifted changes, through the usual phases, approvals and bakes.
+- Targets with nothing to change finish without a baseline, gate or bake.
+- A re-apply has nothing to roll back to: pause or abort it instead.
+
 ## 2. Watch the pipeline
 
 Every targeted agent sends a plan, then each phase applies in waves of `parallel` hosts. The

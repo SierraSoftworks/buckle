@@ -670,6 +670,7 @@ mod tests {
                 trace_url: None,
                 action: None,
                 changes: None,
+                reapply: false,
             },
             phases: vec![RolloutPhase {
                 name: "home".into(),
