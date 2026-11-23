@@ -9,7 +9,7 @@
             "default": null,
             "env": "BUCKLE_CONFIG",
             "flag": "--config",
-            "help": "The configuration directory (containing buckle.yaml). Without it, `plan` and `health` ask the Buckle agent running on this host, which runs them against the revision its server assigned",
+            "help": "The configuration directory (containing buckle.yaml). Without it, `plan`, `apply` and `health` ask the Buckle agent running on this host, which runs them against the revision its server assigned (`apply` only ever re-applies the one the host is on)",
             "options": [],
             "repeatable": false,
             "required": false,
@@ -137,13 +137,13 @@
         "usage": "buckle plan [OPTIONS]"
       },
       {
-        "about": "Apply a configuration directory to this host",
+        "about": "Apply a configuration directory to this host, or have the agent on this host apply the revision it is on again (to put drift right)",
         "args": [
           {
             "default": null,
             "env": "BUCKLE_CONFIG",
             "flag": "--config",
-            "help": "The configuration directory (containing buckle.yaml). Without it, `plan` and `health` ask the Buckle agent running on this host, which runs them against the revision its server assigned",
+            "help": "The configuration directory (containing buckle.yaml). Without it, `plan`, `apply` and `health` ask the Buckle agent running on this host, which runs them against the revision its server assigned (`apply` only ever re-applies the one the host is on)",
             "options": [],
             "repeatable": false,
             "required": false,
@@ -251,6 +251,50 @@
             "required": false,
             "short": null,
             "value": null
+          },
+          {
+            "default": "/etc/buckle/agent.yaml",
+            "env": "BUCKLE_AGENT_CONFIG",
+            "flag": "--agent-config",
+            "help": "The agent's configuration, read for where its socket is",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "FILE"
+          },
+          {
+            "default": null,
+            "env": "BUCKLE_AGENT_SOCKET",
+            "flag": "--socket",
+            "help": "The agent's socket, when it is not the one agent.yaml names",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": "PATH"
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--no-wait",
+            "help": "Without --config: fail instead of waiting when the agent is busy",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": null
+          },
+          {
+            "default": null,
+            "env": null,
+            "flag": "--include-rolled-back",
+            "help": "Without --config: also apply modules that were rolled back after a failure and wait for the server",
+            "options": [],
+            "repeatable": false,
+            "required": false,
+            "short": null,
+            "value": null
           }
         ],
         "path": "apply",
@@ -328,7 +372,7 @@
             "default": null,
             "env": "BUCKLE_CONFIG",
             "flag": "--config",
-            "help": "The configuration directory (containing buckle.yaml). Without it, `plan` and `health` ask the Buckle agent running on this host, which runs them against the revision its server assigned",
+            "help": "The configuration directory (containing buckle.yaml). Without it, `plan`, `apply` and `health` ask the Buckle agent running on this host, which runs them against the revision its server assigned (`apply` only ever re-applies the one the host is on)",
             "options": [],
             "repeatable": false,
             "required": false,

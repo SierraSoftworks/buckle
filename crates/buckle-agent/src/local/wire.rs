@@ -78,6 +78,15 @@ pub(super) fn health_request(r: pb::LocalHealthRequest) -> Request {
     }
 }
 
+pub(super) fn apply_request(r: pb::LocalApplyRequest) -> Request {
+    Request::Apply {
+        select: Some(r.select).filter(|s| !s.is_empty()),
+        waive: r.waive,
+        include_rolled_back: r.include_rolled_back,
+        reboot: r.reboot,
+    }
+}
+
 pub(super) fn event_to_proto(event: &Event) -> pb::LocalEvent {
     use pb::local_event::Event as E;
     let event = match event {
@@ -101,6 +110,13 @@ pub(super) fn event_to_proto(event: &Event) -> pb::LocalEvent {
         }),
         Event::Health(report) => E::Health(pb::LocalHealth {
             report_json: json(report),
+        }),
+        Event::Apply(event) => E::ApplyEvent(pb::LocalApplyEvent {
+            event_json: json(event),
+        }),
+        Event::Outcome { outcome, rebooting } => E::Outcome(pb::LocalOutcome {
+            outcome_json: json(outcome),
+            rebooting: *rebooting,
         }),
         Event::Done { exit_code, error } => E::Done(pb::LocalDone {
             exit_code: *exit_code,
@@ -127,6 +143,15 @@ pub(super) fn event_from_proto(event: pb::LocalEvent) -> buckle_core::Result<Opt
             facts: optional(&p.facts_json).unwrap_or_default(),
         },
         Some(E::Health(h)) => Event::Health(parse("a health report", &h.report_json)?),
+        Some(E::ApplyEvent(e)) => match optional(&e.event_json) {
+            Some(event) => Event::Apply(Box::new(event)),
+            // Progress this buckle cannot read is only not shown.
+            None => return Ok(None),
+        },
+        Some(E::Outcome(o)) => Event::Outcome {
+            outcome: Box::new(parse("an apply's outcome", &o.outcome_json)?),
+            rebooting: o.rebooting,
+        },
         Some(E::Done(d)) => Event::Done {
             exit_code: d.exit_code,
             error: d.error.as_ref().map(error_detail_from_proto),
@@ -201,6 +226,13 @@ mod tests {
                     buckle_core::error::ErrorReport::user("refused").with_advice(["Try later."]),
                 ),
             },
+            Event::Apply(Box::new(buckle_core::engine::ApplyEvent::ModuleStarted {
+                module: "m".into(),
+            })),
+            Event::Outcome {
+                outcome: Box::new(crate::testing::succeeded(&plan)),
+                rebooting: true,
+            },
         ];
         let back: Vec<Event> = events
             .iter()
@@ -221,6 +253,14 @@ mod tests {
         assert!(matches!(
             &back[3],
             Event::Done { exit_code: 2, error: Some(e) } if e.message == "refused" && e.advice == ["Try later."]
+        ));
+        assert!(matches!(
+            &back[4],
+            Event::Apply(e) if matches!(&**e, buckle_core::engine::ApplyEvent::ModuleStarted { module } if module == "m")
+        ));
+        assert!(matches!(
+            &back[5],
+            Event::Outcome { outcome, rebooting: true } if outcome.succeeded
         ));
     }
 

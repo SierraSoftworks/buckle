@@ -94,6 +94,8 @@ pub struct EventScope {
     pub workload: Option<String>,
     /// The RunAction the events belong to, when they are not an apply's.
     pub action_id: Option<String>,
+    /// Who started the run, when it was started on the host itself.
+    pub local: Option<crate::transport::LocalOrigin>,
 }
 
 /// [`forward`] with the events' `scope`: the cluster target (and placement)
@@ -110,6 +112,7 @@ pub async fn forward_for(
         target,
         workload,
         action_id,
+        local,
     } = scope;
     let mut pending: IndexMap<String, (chrono::DateTime<chrono::Utc>, ApplyEvent)> =
         IndexMap::new();
@@ -127,7 +130,8 @@ pub async fn forward_for(
             event,
             action_id: action_id.clone(),
         }
-        .about_placement(target.as_deref(), workload.as_deref());
+        .about_placement(target.as_deref(), workload.as_deref())
+        .from_local(local.as_ref());
         async move { sink.send(report).await }
     };
 

@@ -1,9 +1,11 @@
-//! `buckle plan|health|status` without `--config`: the command is carried
+//! `buckle plan|apply|health|status` without `--config`: the command is carried
 //! out by the Buckle agent running on this host, over its local socket, and
 //! only rendered here.
 //!
 //! * The agent runs it against a revision the server assigned, in turn with
 //!   its own work; this process never touches the state directory.
+//! * `apply` only re-applies the revision the host is on (it puts drift
+//!   right); a newer revision reaches the host through its rollout.
 //! * Progress notes (what the run waits behind, which revision it is about)
 //!   go to stderr, so stdout stays the result alone.
 //! * A host with no agent set up is an error naming `--config`, never a
@@ -13,6 +15,7 @@ use super::local::OutputFormat;
 use crate::render;
 use buckle_agent::local::client::Client;
 use buckle_agent::local::{Choice, Event, Request, Status};
+use buckle_core::engine::{ApplyEvent, ApplyOutcome};
 use buckle_core::error::{ErrorKind, ErrorReport};
 use buckle_core::health::HealthReport;
 use buckle_core::plan::{Plan, RevisionId};
@@ -74,6 +77,22 @@ pub struct RunArgs {
     /// Without --config: fail instead of waiting when the agent is busy.
     #[arg(long, conflicts_with = "config")]
     pub no_wait: bool,
+}
+
+/// How `buckle apply` runs through the agent.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ApplyRunArgs {
+    #[command(flatten)]
+    pub agent: AgentArgs,
+
+    /// Without --config: fail instead of waiting when the agent is busy.
+    #[arg(long, conflicts_with = "config")]
+    pub no_wait: bool,
+
+    /// Without --config: also apply modules that were rolled back after a
+    /// failure and wait for the server.
+    #[arg(long, conflicts_with = "config")]
+    pub include_rolled_back: bool,
 }
 
 impl AgentArgs {
@@ -161,7 +180,43 @@ struct Ran {
     assigned: Option<RevisionId>,
     plan: Option<(Plan, serde_json::Value)>,
     health: Option<HealthReport>,
+    /// An apply's outcome, and whether the agent reboots the host for it.
+    outcome: Option<(ApplyOutcome, bool)>,
     exit_code: i32,
+}
+
+/// An apply as it happens: its plan, then each step.
+struct Progress<'a> {
+    out: &'a mut dyn Write,
+    live: render::LiveRenderer,
+}
+
+impl<'a> Progress<'a> {
+    fn new(out: &'a mut dyn Write, interactive: bool) -> Self {
+        Self {
+            out,
+            live: render::LiveRenderer::new(interactive),
+        }
+    }
+
+    fn plan(&mut self, plan: &Plan, label: &str, facts: &serde_json::Value) {
+        let _ = self
+            .out
+            .write_all(render::render_plan(plan, label, Some(facts)).as_bytes());
+        let _ = writeln!(self.out);
+        let _ = self.out.flush();
+    }
+
+    fn event(&mut self, event: &ApplyEvent) {
+        let _ = self.out.write_all(self.live.event(event).as_bytes());
+        let _ = self.out.flush();
+    }
+
+    fn close(&mut self) {
+        let mut rest = String::new();
+        self.live.close(&mut rest);
+        let _ = self.out.write_all(rest.as_bytes());
+    }
 }
 
 impl Ran {
@@ -195,10 +250,17 @@ impl Ran {
     }
 }
 
-/// Runs `request` on the agent, saying on `notes` what it waits behind.
-async fn run(args: &RunArgs, request: Request, notes: &mut dyn Write) -> buckle_core::Result<Ran> {
-    let mut client = Client::connect(&args.agent.socket()?).await?;
-    let mut events = client.run(request, args.no_wait).await?;
+/// Runs `request` on the agent, saying on `notes` what it waits behind and
+/// showing an apply on `progress` as it happens.
+async fn run(
+    agent: &AgentArgs,
+    no_wait: bool,
+    request: Request,
+    notes: &mut dyn Write,
+    mut progress: Option<Progress<'_>>,
+) -> buckle_core::Result<Ran> {
+    let mut client = Client::connect(&agent.socket()?).await?;
+    let mut events = client.run(request, no_wait).await?;
     let mut ran = Ran::default();
     loop {
         match events.next().await? {
@@ -223,8 +285,24 @@ async fn run(args: &RunArgs, request: Request, notes: &mut dyn Write) -> buckle_
                 ran.applied = applied;
                 ran.assigned = assigned;
             }
-            Some(Event::Plan { plan, facts }) => ran.plan = Some((*plan, facts)),
+            Some(Event::Plan { plan, facts }) => {
+                if let Some(progress) = progress.as_mut() {
+                    progress.plan(&plan, &ran.label(), &facts);
+                }
+                ran.plan = Some((*plan, facts));
+            }
             Some(Event::Health(report)) => ran.health = Some(report),
+            Some(Event::Apply(event)) => {
+                if let Some(progress) = progress.as_mut() {
+                    progress.event(&event);
+                }
+            }
+            Some(Event::Outcome { outcome, rebooting }) => {
+                if let Some(progress) = progress.as_mut() {
+                    progress.close();
+                }
+                ran.outcome = Some((*outcome, rebooting));
+            }
             Some(Event::Done { exit_code, error }) => {
                 return match error {
                     Some(error) => Err(error_from(error)),
@@ -266,7 +344,7 @@ pub(crate) async fn plan(
         revision: args.revision.into(),
         select,
     };
-    let ran = run(args, request, notes).await?;
+    let ran = run(&args.agent, args.no_wait, request, notes, None).await?;
     let (plan, facts) = ran.plan.as_ref().ok_or_else(|| no_result("a plan"))?;
     match output {
         OutputFormat::Text => {
@@ -292,7 +370,7 @@ pub(crate) async fn health(
         revision: args.revision.into(),
         modules,
     };
-    let ran = run(args, request, notes).await?;
+    let ran = run(&args.agent, args.no_wait, request, notes, None).await?;
     let report = ran
         .health
         .as_ref()
@@ -308,6 +386,75 @@ pub(crate) async fn health(
         let _ = writeln!(notes, "{note}");
     }
     Ok(ran.exit_code)
+}
+
+/// What `buckle apply` asks of the agent, beside where the agent is.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ApplyRequest {
+    pub select: Option<String>,
+    pub waive: Vec<String>,
+    /// Reboot the host when the run asks for it.
+    pub reboot: bool,
+    /// Whether progress may redraw its lines (a terminal).
+    pub interactive: bool,
+}
+
+/// `buckle apply` through the agent: the revision the host is on, applied
+/// again.
+pub(crate) async fn apply(
+    args: &ApplyRunArgs,
+    asked: ApplyRequest,
+    out: &mut dyn Write,
+    notes: &mut dyn Write,
+) -> buckle_core::Result<i32> {
+    let request = Request::Apply {
+        select: asked.select,
+        waive: asked.waive.clone(),
+        include_rolled_back: args.include_rolled_back,
+        reboot: asked.reboot,
+    };
+    let progress = Progress::new(&mut *out, asked.interactive);
+    let ran = run(&args.agent, args.no_wait, request, notes, Some(progress)).await?;
+    applied(&ran, &asked.waive, out);
+    if let Some(note) = ran.note(Revision::Applied) {
+        let _ = writeln!(notes, "{note}");
+    }
+    Ok(ran.exit_code)
+}
+
+/// How an apply through the agent ended, below its plan and progress.
+fn applied(ran: &Ran, waived: &[String], out: &mut dyn Write) {
+    match &ran.outcome {
+        None => {
+            let _ = writeln!(out, "nothing to do");
+        }
+        Some((outcome, rebooting)) => {
+            let _ = writeln!(out);
+            let _ = out.write_all(render::render_outcome(outcome).as_bytes());
+            if let Some(report) = &outcome.health
+                && !report.results.is_empty()
+            {
+                let _ = writeln!(out);
+                let _ = out.write_all(render::render_health(report, waived).as_bytes());
+            }
+            if let Some(reboot) = &outcome.reboot {
+                let by = reboot.requested_by.join(", ");
+                let _ = writeln!(out);
+                let _ = if *rebooting {
+                    writeln!(
+                        out,
+                        "the agent reboots this host in {}s ({by})",
+                        reboot.delay.as_secs()
+                    )
+                } else {
+                    writeln!(
+                        out,
+                        "a reboot is needed ({by}); not rebooting (--no-reboot)"
+                    )
+                };
+            }
+        }
+    }
 }
 
 /// What the agent is doing, in the lines above its last run.
@@ -454,6 +601,41 @@ mod tests {
             ),
             None => assert_eq!(said, None),
         }
+    }
+
+    fn outcome(reboot: bool) -> ApplyOutcome {
+        let mut outcome = serde_json::json!({
+            "plan_digest": "d1", "succeeded": true, "changes": 2, "removals": 0,
+            "duration_ms": 5, "module_results": [], "failed_module": null,
+            "rolled_back_modules": [], "not_started": [], "health": null, "error": null,
+        });
+        if reboot {
+            outcome["reboot"] = serde_json::json!({
+                "delay": "30s", "timeout": "10m", "requested_by": ["kernel/system.reboot[now]"],
+            });
+        }
+        serde_json::from_value(outcome).expect("an outcome")
+    }
+
+    #[rstest]
+    #[case::as_configured(None, "nothing to do", "reboot")]
+    #[case::applied(Some((outcome(false), false)), "succeeded", "reboot")]
+    #[case::rebooting(Some((outcome(true), true)), "the agent reboots this host in 30s", "--no-reboot")]
+    #[case::reboot_held(Some((outcome(true), false)), "not rebooting (--no-reboot)", "the agent reboots")]
+    fn an_apply_ends_with_what_happened(
+        #[case] outcome: Option<(ApplyOutcome, bool)>,
+        #[case] says: &str,
+        #[case] never: &str,
+    ) {
+        let ran = Ran {
+            outcome,
+            ..ran(Some("a"), Some("a"), "a")
+        };
+        let mut out = Vec::new();
+        applied(&ran, &[], &mut out);
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(text.contains(says), "missing {says:?} in:\n{text}");
+        assert!(!text.contains(never), "unexpected {never:?} in:\n{text}");
     }
 
     #[test]

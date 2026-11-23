@@ -15,7 +15,8 @@ use tonic::transport::server::UdsConnectInfo;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Socket {
     pub path: PathBuf,
-    /// Members of this group may plan, check health and read the status.
+    /// Members of this group may plan, check health and read the status
+    /// (applying stays root's).
     pub group: Option<String>,
 }
 
@@ -143,8 +144,13 @@ type Events = std::pin::Pin<
 >;
 
 impl Service {
-    fn run(&self, request: super::Request, actor: Actor, no_wait: bool) -> tonic::Response<Events> {
-        let events = self.control.submit(request, actor, no_wait);
+    async fn run(
+        &self,
+        request: super::Request,
+        actor: Actor,
+        no_wait: bool,
+    ) -> tonic::Response<Events> {
+        let events = self.control.submit(request, actor, no_wait).await;
         // Dropping the stream (the caller left) closes the run's channel,
         // which takes a run that has not started out of the queue.
         let stream = tokio_stream::wrappers::ReceiverStream::new(events)
@@ -157,6 +163,7 @@ impl Service {
 impl pb::local_agent_server::LocalAgent for Service {
     type PlanStream = Events;
     type HealthStream = Events;
+    type ApplyStream = Events;
 
     async fn plan(
         &self,
@@ -165,7 +172,7 @@ impl pb::local_agent_server::LocalAgent for Service {
         let actor = actor(&request)?;
         let request = request.into_inner();
         let no_wait = request.no_wait;
-        Ok(self.run(wire::plan_request(request), actor, no_wait))
+        Ok(self.run(wire::plan_request(request), actor, no_wait).await)
     }
 
     async fn health(
@@ -175,7 +182,19 @@ impl pb::local_agent_server::LocalAgent for Service {
         let actor = actor(&request)?;
         let request = request.into_inner();
         let no_wait = request.no_wait;
-        Ok(self.run(wire::health_request(request), actor, no_wait))
+        Ok(self
+            .run(wire::health_request(request), actor, no_wait)
+            .await)
+    }
+
+    async fn apply(
+        &self,
+        request: tonic::Request<pb::LocalApplyRequest>,
+    ) -> Result<tonic::Response<Events>, tonic::Status> {
+        let actor = actor(&request)?;
+        let request = request.into_inner();
+        let no_wait = request.no_wait;
+        Ok(self.run(wire::apply_request(request), actor, no_wait).await)
     }
 
     async fn status(

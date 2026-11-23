@@ -663,6 +663,7 @@ async fn a_cluster_summary_names_its_executor_and_tallies_its_workloads() {
                 trace_id: None,
                 outcome_json: None,
                 action: None,
+                local: None,
             };
             let id = db.runs().add(&run)?;
             use buckle_core::engine::ApplyEvent as E;
@@ -1990,6 +1991,7 @@ async fn trace_ids_come_with_links_when_a_template_is_configured() {
         error: None,
         trace_id: Some("feed01".into()),
         action: None,
+        local: None,
     };
     e.store
         .call(move |db| {
@@ -2847,6 +2849,7 @@ async fn run_reports_are_served_per_host_and_per_rollout_host() {
         trace_id: None,
         outcome_json: None,
         action: None,
+        local: None,
     };
     let module = plan.modules[0].module.clone();
     let event = serde_json::to_string(&buckle_core::engine::ApplyEvent::ModuleStarted {

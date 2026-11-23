@@ -11,7 +11,7 @@
 //! | `secrets/<id>.cbor` | the secrets scoped to this host for a revision (0600) |
 //! | `tmp/` | scratch space planning may write to |
 
-use crate::transport::{DurableReport, LocalRollbackRecord};
+use crate::transport::{ApplyPolicy, DurableReport, LocalRollbackRecord};
 use crate::watchdog::WatchdogState;
 use buckle_core::error::HumanizableResult;
 use buckle_core::plan::RevisionId;
@@ -64,6 +64,11 @@ pub struct AgentState {
     /// module stays untouched while the server is out of reach.
     #[serde(default)]
     pub paused_modules: Vec<String>,
+    /// Whether the fleet lets `buckle apply` run on the host itself, from
+    /// the last Welcome or HostUpdate. Kept on disk so the answer holds
+    /// while the server is out of reach.
+    #[serde(default, skip_serializing_if = "ApplyPolicy::is_unknown")]
+    pub local_apply: ApplyPolicy,
     /// Modules resumed since the host last applied: the next drift pass
     /// brings them to the applied revision, which they sat out while
     /// suspended.

@@ -444,6 +444,11 @@ CREATE INDEX health_events_host ON health_events(host, last_at);
 CREATE INDEX health_events_check ON health_events(host, module, check_name, id);
 CREATE INDEX health_events_last ON health_events(last_at);
 "#,
+    // 20: who ran a run started at the host's own command line (a local
+    // run, see `RunRecord::local`).
+    r#"
+ALTER TABLE runs ADD COLUMN local TEXT;
+"#,
 ];
 
 /// A handle to the database. Cheap to clone.

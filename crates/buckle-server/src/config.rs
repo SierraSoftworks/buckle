@@ -533,6 +533,9 @@ pub struct AgentsConfig {
     /// whois on the proxy) or an IP address or CIDR range.
     #[serde(default)]
     pub trusted_proxies: Vec<TrustedProxy>,
+    /// What a host's own command line may ask of its agent.
+    #[serde(default)]
+    pub local_runs: LocalRunsConfig,
     /// What the join commands generated for new hosts contain.
     #[serde(default)]
     pub join: JoinConfig,
@@ -566,6 +569,7 @@ impl std::fmt::Debug for AgentsConfig {
             .field("tailscale_socket", &self.tailscale_socket)
             .field("tailscale", &self.tailscale)
             .field("trusted_proxies", &self.trusted_proxies)
+            .field("local_runs", &self.local_runs)
             .field("join", &self.join)
             .field("disconnect_timeout", &self.disconnect_timeout)
             .field("apply_timeout", &self.apply_timeout)
@@ -601,11 +605,43 @@ impl Default for AgentsConfig {
             tailscale_socket: Self::default_tailscale_socket(),
             tailscale: TailscaleConfig::default(),
             trusted_proxies: Vec::new(),
+            local_runs: LocalRunsConfig::default(),
             join: JoinConfig::default(),
             disconnect_timeout: Self::default_disconnect_timeout(),
             apply_timeout: Self::default_apply_timeout(),
         }
     }
+}
+
+/// `agents.local_runs`: what `buckle` on a host may ask of the agent running
+/// there. Planning and health checks are always allowed (they change
+/// nothing); the fleet decides whether a host may be changed from its own
+/// command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalRunsConfig {
+    /// Whether root on a host may re-apply the revision the host is on
+    /// (`buckle apply` there). `on` unless set.
+    #[serde(default)]
+    pub apply: Switch,
+}
+
+impl LocalRunsConfig {
+    /// The policy as agents are told it.
+    pub fn to_proto(self) -> buckle_proto::v1::LocalRuns {
+        buckle_proto::v1::LocalRuns {
+            apply_off: self.apply == Switch::Off,
+        }
+    }
+}
+
+/// A setting that is `on` or `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Switch {
+    #[default]
+    On,
+    Off,
 }
 
 /// An `agents.trusted_proxies` entry: a proxy node's ACL tag, or the
@@ -1229,6 +1265,27 @@ secrets:
             &format!("  registration: approve\n  trusted_proxies: [\"{entry}\"]\n"),
         );
         assert_eq!(with_env(&yaml).is_ok(), ok);
+    }
+
+    #[rstest]
+    #[case::unset("", Some(Switch::On))]
+    #[case::on("  local_runs: { apply: on }\n", Some(Switch::On))]
+    #[case::off("  local_runs: { apply: off }\n", Some(Switch::Off))]
+    #[case::neither("  local_runs: { apply: sometimes }\n", None)]
+    fn hosts_may_apply_from_their_own_command_line_unless_turned_off(
+        #[case] setting: &str,
+        #[case] expected: Option<Switch>,
+    ) {
+        let yaml = EXAMPLE.replace(
+            "  registration: approve\n",
+            &format!("  registration: approve\n{setting}"),
+        );
+        let apply = with_env(&yaml).ok().map(|cfg| cfg.agents.local_runs.apply);
+        assert_eq!(apply, expected);
+        if let Some(apply) = expected {
+            let told = LocalRunsConfig { apply }.to_proto();
+            assert_eq!(told.apply_off, apply == Switch::Off);
+        }
     }
 
     const PROVISIONING: &str = "  tailscale:\n    allowed_tags: [\"tag:buckle\"]\n    provisioning: { client_id: c, client_secret: shh }\n";

@@ -114,6 +114,22 @@ impl Client {
                     })
                     .await
             }
+            Request::Apply {
+                select,
+                waive,
+                include_rolled_back,
+                reboot,
+            } => {
+                self.inner
+                    .apply(pb::LocalApplyRequest {
+                        select: select.unwrap_or_default(),
+                        waive,
+                        include_rolled_back,
+                        reboot,
+                        no_wait,
+                    })
+                    .await
+            }
         }
         .map_err(refused)?;
         Ok(Events {

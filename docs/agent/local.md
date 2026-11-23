@@ -6,9 +6,9 @@ bootstrap a host before (or instead of) installing an agent. The agent runs exac
 
 ## On a host with an agent
 
-Without `--config`, `plan`, `health` and `status` ask the agent running on this host instead of
-running the engine themselves, so you can see what a host would change, or why it is unhealthy, with
-its real revision, facts, vars and secrets.
+Without `--config`, `plan`, `apply`, `health` and `status` ask the agent running on this host
+instead of running the engine themselves, so you can see what a host would change, put drift right
+or find out why it is unhealthy, with its real revision, facts, vars and secrets.
 
 ```text
 $ sudo buckle plan
@@ -23,9 +23,9 @@ note: the server has assigned revision 4be01c7a to this host; preview it with --
 - The run joins the agent's queue and takes its turn behind a rollout, a drift pass or another
   local run, so it never collides with work the server sent. The command says what it waits behind;
   `--no-wait` fails instead when the agent is busy, and Ctrl-C gives up the place in the queue.
-- Nothing is sent to the server, and secrets only cross to the command as
-  `«secret:NAME@fingerprint»`.
-- `apply` still needs `--config` (applying through the agent is not available yet).
+- Secrets only cross to the command as `«secret:NAME@fingerprint»`.
+- A plan stays on the host. An apply, and a `health` run of every module of the applied revision,
+  are reported to the server with who ran them.
 
 **Which revision**
 
@@ -35,6 +35,18 @@ note: the server has assigned revision 4be01c7a to this host; preview it with --
   apply here), planned as that rollout plans it.
 - You choose among the revisions the server gave the agent, never a directory, facts or labels:
   `--host-id`, `--labels` and `--facts` need `--config`.
+
+**Applying**
+
+- `sudo buckle apply` re-applies the revision the host is already on, as a drift pass does: it puts
+  back what drifted and never removes anything. A newer revision reaches the host through its
+  rollout, never from the command line (`--revision` is for `plan` and `health`).
+- It takes root, and a fleet that allows it: [`agents.local_runs.apply: off`](./server.md#agents)
+  on the server turns it off for every host. A paused host refuses, and so does one with modules
+  rolled back after a failure, unless you pass `--include-rolled-back`.
+- The run appears among the host's runs on the server with the user who ran it, and in the audit
+  log as `host.apply.local`. It reboots the host when a step asks for it; `--no-reboot` says so
+  instead.
 
 **Finding and reaching the agent**
 
@@ -109,6 +121,29 @@ halts: modules already running finish, nothing new starts and removals are skipp
 without a terminal and without `--yes` the removal is refused.
 
 `--waive module/check` lets a run pass a check you know is failing for an unrelated reason.
+
+Without `--config`, the [agent applies](#on-a-host-with-an-agent) the revision the host is on
+again, to put drift right:
+
+```text
+$ sudo buckle apply
+revision  9d06eafc80bcec9d6ce55cb95024c021743f8717 (applied)      host  pi-4      facts  os=debian/bookworm arch=aarch64
+selected  docker packages sysctl tailscale ssh users firewall nomad    (8 of 12 modules)
+
+sysctl
+  ~ file.template[/etc/sysctl.d/90-buckle.conf]          update /etc/sysctl.d/90-buckle.conf (1 line)
+      - vm.swappiness = 60
+      + vm.swappiness = 10
+
+summary  1 modules changed · 1 changes · 0 removals · 0 deferred · plan digest 5e0c1a77
+
+sysctl  applied · 1 change · 12ms
+  ✓ file.template[/etc/sysctl.d/90-buckle.conf] wrote /etc/sysctl.d/90-buckle.conf  12ms
+
+result   succeeded · modules: 1 applied · steps: 1 changed · 0 removals · 0.4s · plan digest 5e0c1a77
+```
+
+When the host is as configured it prints the plan and `nothing to do`.
 
 ## status
 

@@ -162,6 +162,7 @@ pub async fn run_with(
             options: rollout::ControllerOptions {
                 disconnect_timeout: config.agents.disconnect_timeout,
                 apply_timeout: config.agents.apply_timeout,
+                local_runs: config.agents.local_runs.to_proto(),
                 own,
                 version: VERSION.to_owned(),
             },

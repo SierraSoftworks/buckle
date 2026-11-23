@@ -1,11 +1,13 @@
-//! Local runs: `buckle plan`, `buckle health` and `buckle status` on a host
-//! whose agent is running ask that agent, over a Unix socket, instead of
-//! running the engine themselves.
+//! Local runs: `buckle plan`, `buckle apply`, `buckle health` and
+//! `buckle status` on a host whose agent is running ask that agent, over a
+//! Unix socket, instead of running the engine themselves.
 //!
 //! * The agent runs each request as an operation on its own worker
 //!   ([`crate::session`]), so it can never collide with work the server sent.
 //! * A caller chooses among the revisions the server assigned
-//!   ([`Choice`]); it never supplies a directory, facts or vars.
+//!   ([`Choice`]); it never supplies a directory, facts or vars. An apply
+//!   is only ever of the revision already applied (a drift fix), from root,
+//!   while the fleet allows it.
 //! * Plans arrive redacted and health reports scrubbed: secret values never
 //!   cross the socket.
 //!
@@ -18,6 +20,7 @@ pub(crate) mod server;
 #[cfg(unix)]
 mod wire;
 
+use buckle_core::engine::{ApplyEvent, ApplyOutcome};
 use buckle_core::error::ErrorReport;
 use buckle_core::health::HealthReport;
 use buckle_core::plan::{Plan, RevisionId};
@@ -63,6 +66,19 @@ pub enum Request {
         /// Only these modules; empty: every module selected here.
         modules: Vec<String>,
     },
+    /// Re-apply the applied revision, as the drift pass does: it corrects
+    /// drift and never moves the host to another revision.
+    Apply {
+        /// A filt-rs task selector (it only narrows the run).
+        select: Option<String>,
+        /// Checks (`module/check`) waived for this run.
+        waive: Vec<String>,
+        /// Apply although modules are back on the stable revision after a
+        /// failure.
+        include_rolled_back: bool,
+        /// Reboot when the run asks for it.
+        reboot: bool,
+    },
 }
 
 impl Request {
@@ -71,18 +87,21 @@ impl Request {
         match self {
             Request::Plan { .. } => "plan",
             Request::Health { .. } => "health",
+            Request::Apply { .. } => "apply",
         }
     }
 
     pub fn revision(&self) -> Choice {
         match self {
             Request::Plan { revision, .. } | Request::Health { revision, .. } => *revision,
+            Request::Apply { .. } => Choice::Applied,
         }
     }
 }
 
 /// One step in the life of a run: any number of `Queued`, then `Started`,
-/// the run's result, and `Done` last.
+/// the run's result (for an apply: `Plan`, its `Apply` events, `Outcome`),
+/// and `Done` last.
 #[derive(Debug, Clone)]
 pub enum Event {
     /// The run waits behind other work (sent again whenever that changes).
@@ -103,6 +122,14 @@ pub enum Event {
         facts: serde_json::Value,
     },
     Health(HealthReport),
+    /// Progress of an apply.
+    Apply(Box<ApplyEvent>),
+    /// How an apply went.
+    Outcome {
+        outcome: Box<ApplyOutcome>,
+        /// The run asked for a reboot and the agent is about to reboot.
+        rebooting: bool,
+    },
     Done {
         /// The exit code the command ends with.
         exit_code: i32,

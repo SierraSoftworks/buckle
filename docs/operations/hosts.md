@@ -94,7 +94,9 @@ Buckle (a hand-edited file, a stopped service) is drift, listed on the host page
 
 With `drift.correct: true` (the default) the agent puts it back and the drift is recorded; with
 `false` it is only reported. Unattended correction never removes anything. To keep a manual change,
-put it in the configuration, or pause the host while you work.
+put it in the configuration, or pause the host while you work. On the host itself,
+[`sudo buckle apply`](../agent/local.md#on-a-host-with-an-agent) runs the same correction by hand;
+its run is recorded with the user who ran it.
 
 **Check drift** (host and cluster page heads) runs that pass now instead of waiting for the timer;
 **Drift checked** in the summary moves when its report arrives. A cluster is checked by its steward,

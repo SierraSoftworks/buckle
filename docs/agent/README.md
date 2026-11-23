@@ -5,7 +5,7 @@ Every role Buckle plays is a subcommand of the one `buckle` binary.
 | Command | Use it to |
 |---|---|
 | [`plan`](./local.md#plan) | See what applying a configuration directory, or the agent's revision, would change on this host. |
-| [`apply`](./local.md#apply) | Apply a configuration directory to this host. |
+| [`apply`](./local.md#apply) | Apply a configuration directory to this host, or have its agent put drift right. |
 | [`status`](./local.md#status) | Show the last apply on this host, step by step, and what its agent is doing. |
 | [`health`](./local.md#health) | Run the health checks of the modules applied to this host. |
 | [`facts`](./local.md#facts) | Print what Buckle knows about this host. |

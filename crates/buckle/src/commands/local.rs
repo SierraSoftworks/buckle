@@ -37,8 +37,9 @@ pub enum OutputFormat {
 #[derive(Args, Debug, Clone)]
 pub struct LocalArgs {
     /// The configuration directory (containing buckle.yaml). Without it,
-    /// `plan` and `health` ask the Buckle agent running on this host, which
-    /// runs them against the revision its server assigned.
+    /// `plan`, `apply` and `health` ask the Buckle agent running on this
+    /// host, which runs them against the revision its server assigned
+    /// (`apply` only ever re-applies the one the host is on).
     #[arg(short, long, env = "BUCKLE_CONFIG", value_name = "DIR")]
     pub config: Option<PathBuf>,
 
@@ -120,6 +121,8 @@ pub struct ApplyArgs {
     /// Do not reboot when the run asks for it (`system.reboot`); say so instead.
     #[arg(long)]
     pub no_reboot: bool,
+    #[command(flatten)]
+    pub agent: via_agent::ApplyRunArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -338,6 +341,17 @@ fn agent_enrolled(state_dir: &Path) -> bool {
 }
 
 pub async fn apply(args: ApplyArgs) -> buckle_core::Result<i32> {
+    if args.local.config.is_none() {
+        use std::io::IsTerminal;
+        let asked = via_agent::ApplyRequest {
+            select: args.local.select.clone(),
+            waive: args.waive_checks.clone(),
+            reboot: !args.no_reboot,
+            interactive: std::io::stdout().is_terminal(),
+        };
+        let (out, notes) = (&mut std::io::stdout(), &mut std::io::stderr());
+        return via_agent::apply(&args.agent, asked, out, notes).await;
+    }
     let config = args.local.config_dir("apply")?;
     if agent_enrolled(&args.local.state_dir) {
         eprintln!(
