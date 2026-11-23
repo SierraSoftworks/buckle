@@ -6512,8 +6512,14 @@ async fn a_rollouts_limits_say_what_is_in_use_and_what_failed() {
         &[],
     )
     .await;
+    // The target holding the slot waits on its baseline until the test
+    // answers it: otherwise it fails at once, and a poll can miss the
+    // moment it was in flight.
     for d in ["d1", "d2", "d3"] {
-        h.script(d, |s| s.apply_fail = Some(vec![]));
+        h.script(d, |s| {
+            s.apply_fail = Some(vec![]);
+            s.silent_baseline = true;
+        });
     }
     let revision = h.revisions.load("r1").await.unwrap();
     let id = h.start("r1").await;
@@ -6543,6 +6549,8 @@ async fn a_rollouts_limits_say_what_is_in_use_and_what_failed() {
     );
     assert!(server.failures.is_empty() && server.holding.is_empty());
 
+    let slot = hosts.iter().find(|x| x.state.in_flight()).unwrap();
+    answer_baseline(&h, &slot.host);
     let (_, hosts) = h.wait_state(&id, RolloutState::Paused).await;
     let limits = super::limits::view(&revision, &hosts);
     let server = limits.iter().find(|l| l.name == "server").unwrap();
