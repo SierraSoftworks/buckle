@@ -1,5 +1,6 @@
 //! The gRPC protocol between Buckle agents and the Buckle server, generated
-//! from `proto/buckle/v1/fleet.proto` with tonic.
+//! from `proto/buckle/v1/fleet.proto` with tonic, and the one the command
+//! line speaks to the agent on its own host (`proto/buckle/v1/local.proto`).
 //!
 //! Conventions:
 //! * Revision and digest fields are hex strings.

@@ -297,7 +297,15 @@ mod tests {
         let config = plan.args.iter().find(|a| a.flag == "--config").unwrap();
         assert_eq!(config.short.as_deref(), Some("-c"));
         assert_eq!(config.env.as_deref(), Some("BUCKLE_CONFIG"));
-        assert!(config.required);
+        // Without a directory, `plan` asks the agent on this host.
+        assert!(!config.required);
+        let validate = cli.commands.iter().find(|c| c.path == "validate").unwrap();
+        assert!(
+            validate
+                .args
+                .iter()
+                .any(|a| a.flag == "--config" && a.required)
+        );
         assert!(cli.commands.iter().any(|c| c.path == "up"));
         // The old spelling still works but is not advertised.
         assert!(!cli.commands.iter().any(|c| c.path.starts_with("install")));

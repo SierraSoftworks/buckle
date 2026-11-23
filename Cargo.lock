@@ -595,6 +595,7 @@ dependencies = [
  "humantime-serde",
  "hyper-util",
  "indexmap",
+ "nix 0.32.0",
  "notify",
  "pretty_assertions",
  "prost-types",

@@ -41,8 +41,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod bakes;
+mod board;
 mod lanes;
+mod local;
 mod targets;
+
+pub use local::LocalControl;
 
 /// How often an upgrade waiting for the agent to be idle looks again, once
 /// nothing but deferred upgrades is left to run.
@@ -160,30 +164,105 @@ enum Op {
     WatchdogCheck,
     /// Carries out a pending reboot (one a restart interrupted).
     Reboot,
+    /// What a caller on the local socket asked for.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Local(local::LocalRun),
+}
+
+impl Op {
+    /// The operation in words, for someone waiting behind it.
+    fn describe(&self) -> String {
+        match self {
+            Op::Assign { revision, .. } => format!("fetch revision {}", revision.short()),
+            Op::Plan { revision, .. } => format!("plan {}", revision.short()),
+            Op::Apply {
+                revision,
+                rollout_id,
+                ..
+            } => match rollout_id {
+                Some(rollout) => format!("apply {} (rollout {rollout})", revision.short()),
+                None => format!("apply {}", revision.short()),
+            },
+            Op::Rollback { revision, .. } => format!("roll back to {}", revision.short()),
+            Op::Health { scope, .. } => {
+                format!("health checks ({})", format!("{scope:?}").to_lowercase())
+            }
+            Op::Action { module, action, .. } => format!("action {module}/{action}"),
+            Op::Drift => "drift check".into(),
+            Op::Facts { .. } => "facts refresh".into(),
+            Op::Upgrade { version, .. } => format!("agent upgrade to {version}"),
+            Op::WatchdogCheck => "local rollback check".into(),
+            Op::Reboot => "reboot".into(),
+            Op::Local(run) => run.describe(),
+        }
+    }
 }
 
 struct Queued {
     op: Op,
     /// The session that queued it; `None` for agent-initiated work.
     generation: Option<u64>,
+    /// Its place number on the board.
+    place: u64,
 }
 
 #[derive(Clone)]
 struct Queue {
     tx: mpsc::UnboundedSender<Queued>,
     len: Arc<AtomicUsize>,
+    board: Arc<board::Board>,
 }
 
 impl Queue {
-    fn push(&self, op: Op, generation: Option<u64>) {
+    /// Queues `op`; returns its place number on the board.
+    fn push(&self, op: Op, generation: Option<u64>) -> u64 {
         self.len.fetch_add(1, Ordering::SeqCst);
-        if self.tx.send(Queued { op, generation }).is_err() {
+        let place = self.board.queue(op.describe());
+        let queued = Queued {
+            op,
+            generation,
+            place,
+        };
+        if self.tx.send(queued).is_err() {
             self.len.fetch_sub(1, Ordering::SeqCst);
+            self.board.take(place);
         }
+        place
     }
 
     fn is_empty(&self) -> bool {
         self.len.load(Ordering::SeqCst) == 0
+    }
+
+    /// A handle that does not keep the worker alive.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn downgrade(&self) -> WeakQueue {
+        WeakQueue {
+            tx: self.tx.downgrade(),
+            len: self.len.clone(),
+            board: self.board.clone(),
+        }
+    }
+}
+
+/// A [`Queue`] held by something that must not keep the worker alive once
+/// the agent stops (the local socket).
+#[derive(Clone)]
+struct WeakQueue {
+    tx: mpsc::WeakUnboundedSender<Queued>,
+    len: Arc<AtomicUsize>,
+    board: Arc<board::Board>,
+}
+
+impl WeakQueue {
+    /// The queue, unless the agent is stopping.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn upgrade(&self) -> Option<Queue> {
+        Some(Queue {
+            tx: self.tx.upgrade()?,
+            len: self.len.clone(),
+            board: self.board.clone(),
+        })
     }
 }
 
@@ -252,6 +331,8 @@ struct Shared {
     /// One lane per cluster target this agent speaks for, beside the host's
     /// own worker queue.
     lanes: lanes::Lanes,
+    /// What the worker is doing and what waits behind it, in words.
+    board: Arc<board::Board>,
 }
 
 enum SessionEnd {
@@ -264,6 +345,8 @@ enum SessionEnd {
 /// [`Runner`].
 pub struct Agent {
     shared: Arc<Shared>,
+    /// Where local runs are served, and the group that may ask for them.
+    local: Option<(std::path::PathBuf, Option<String>)>,
 }
 
 /// Labels typed the way the server types them (`"true"` is a boolean), so
@@ -475,8 +558,18 @@ impl Agent {
                 startup_drift: AtomicBool::new(true),
                 acked: Notify::new(),
                 lanes: lanes::Lanes::default(),
+                board: Arc::default(),
             }),
+            local: None,
         })
+    }
+
+    /// Serves local runs (`buckle plan`, `health` and `status` without
+    /// `--config`) on the Unix socket at `path`, open to root and to the
+    /// members of `group`.
+    pub fn with_local_socket(mut self, path: std::path::PathBuf, group: Option<String>) -> Self {
+        self.local = Some((path, group));
+        self
     }
 
     /// Reaches cluster targets through `connect` rather than over the
@@ -501,7 +594,12 @@ impl Agent {
         let queue = Queue {
             tx,
             len: Arc::new(AtomicUsize::new(0)),
+            board: shared.board.clone(),
         };
+        let local_cancel = CancellationToken::new();
+        let local = self
+            .local
+            .and_then(|(path, group)| shared.serve_local(path, group, &queue, &local_cancel));
         let worker = tokio::spawn(Shared::worker(
             shared.clone(),
             rx,
@@ -631,11 +729,67 @@ impl Agent {
                 }
             }
         }
+        // The socket goes last: a local run that was running has told its
+        // caller how it went, and the queued ones were dropped with the
+        // worker, which ends their callers' streams. A caller that does not
+        // hang up is not waited for.
+        local_cancel.cancel();
+        if let Some(mut local) = local
+            && tokio::time::timeout(Duration::from_secs(5), &mut local)
+                .await
+                .is_err()
+        {
+            local.abort();
+        }
         result
     }
 }
 
 impl Shared {
+    /// Starts serving local runs on the socket at `path`. A socket that
+    /// cannot be created is logged and the agent runs without it.
+    #[cfg(unix)]
+    fn serve_local(
+        self: &Arc<Self>,
+        path: std::path::PathBuf,
+        group: Option<String>,
+        queue: &Queue,
+        cancel: &CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let socket = crate::local::server::Socket { path, group };
+        match crate::local::server::bind(&socket) {
+            Ok(listener) => {
+                let control = LocalControl {
+                    shared: self.clone(),
+                    queue: queue.downgrade(),
+                };
+                Some(tokio::spawn(crate::local::server::serve(
+                    listener,
+                    socket.path,
+                    control,
+                    cancel.clone(),
+                )))
+            }
+            Err(err) => {
+                tracing::warn!(socket = %socket.path.display(), error = %err.description(), "not serving local runs: `buckle plan` and `buckle health` without --config will not reach this agent");
+                None
+            }
+        }
+    }
+
+    /// Nothing serves local runs on this platform yet.
+    #[cfg(not(unix))]
+    fn serve_local(
+        self: &Arc<Self>,
+        path: std::path::PathBuf,
+        _group: Option<String>,
+        _queue: &Queue,
+        _cancel: &CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        tracing::debug!(socket = %path.display(), "local runs are not served on this platform");
+        None
+    }
+
     /// Carries out a node operation on a cluster this agent stewards, as
     /// the server described the cluster.
     async fn node_operation(
@@ -971,7 +1125,7 @@ impl Shared {
                 {
                     queue.push(Op::Drift, None);
                 },
-                _ = facts.tick() => queue.push(Op::Facts { force_report: false }, None),
+                _ = facts.tick() => { queue.push(Op::Facts { force_report: false }, None); }
             }
         };
         self.connected.store(false, Ordering::SeqCst);
@@ -1181,6 +1335,11 @@ impl Shared {
         let mut deferring = false;
         while let Some(queued) = rx.recv().await {
             len.fetch_sub(1, Ordering::SeqCst);
+            // A local caller that left took its run out of the line itself.
+            let what = self
+                .board
+                .take(queued.place)
+                .unwrap_or_else(|| queued.op.describe());
             // An upgrade sent `when_idle` waits until nothing else is queued
             // (design §08: "install … when idle").
             if let Op::Upgrade {
@@ -1199,8 +1358,11 @@ impl Shared {
                 }
                 deferring = true;
                 len.fetch_add(1, Ordering::SeqCst);
+                let place = queued.place;
+                self.board.requeue(place, what);
                 if tx.send(queued).is_err() {
                     len.fetch_sub(1, Ordering::SeqCst);
+                    self.board.take(place);
                 }
                 continue;
             }
@@ -1226,7 +1388,9 @@ impl Shared {
             }
             deferring = false;
             self.busy.store(true, Ordering::SeqCst);
+            self.board.start(what);
             self.execute(queued.op).await;
+            self.board.finish();
             self.busy.store(false, Ordering::SeqCst);
         }
     }
@@ -1371,6 +1535,7 @@ impl Shared {
                 self.reboot_if_pending().await;
             }
             Op::Reboot => self.reboot_if_pending().await,
+            Op::Local(run) => self.local(run).await,
         }
     }
 

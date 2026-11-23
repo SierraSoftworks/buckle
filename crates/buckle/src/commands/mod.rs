@@ -10,6 +10,7 @@ pub mod install;
 pub mod local;
 pub mod server;
 pub mod update;
+pub mod via_agent;
 #[cfg(windows)]
 mod windows_service;
 
@@ -31,12 +32,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Show what applying a configuration directory would change on this host.
+    /// Show what applying a configuration directory, or the revision the
+    /// agent on this host was assigned, would change on this host.
     Plan(local::PlanArgs),
     /// Apply a configuration directory to this host.
     Apply(local::ApplyArgs),
-    /// Show the last apply on this host: every module and step with its state
-    /// and any errors.
+    /// Show the last apply on this host (every module and step with its state
+    /// and any errors) and, where an agent runs, what that agent is doing.
     Status(local::StatusArgs),
     /// Run the health checks of the modules applied to this host.
     Health(local::HealthArgs),
@@ -137,6 +139,52 @@ mod tests {
     }
 
     #[test]
+    fn commands_without_a_directory_go_to_the_agent() {
+        let cli = Cli::parse_from(["buckle", "plan"]);
+        let Command::Plan(plan) = cli.command else {
+            panic!("`plan` parses as Plan");
+        };
+        assert_eq!(plan.local.config, None);
+        assert_eq!(plan.agent.revision, via_agent::Revision::Applied);
+        assert!(!plan.agent.no_wait);
+
+        let cli = Cli::parse_from([
+            "buckle",
+            "health",
+            "--revision",
+            "assigned",
+            "--no-wait",
+            "--socket",
+            "/tmp/agent.sock",
+            "--module",
+            "docker",
+        ]);
+        let Command::Health(health) = cli.command else {
+            panic!("`health` parses as Health");
+        };
+        assert_eq!(health.agent.revision, via_agent::Revision::Assigned);
+        assert!(health.agent.no_wait);
+        assert_eq!(
+            health.agent.agent.socket,
+            Some(PathBuf::from("/tmp/agent.sock"))
+        );
+        assert_eq!(health.modules, vec!["docker"]);
+    }
+
+    /// The agent decides the host, its labels and its facts; a directory
+    /// run has no agent revisions to choose from.
+    #[rstest::rstest]
+    #[case::host_id(&["plan", "--host-id", "pi-4"])]
+    #[case::labels(&["plan", "--labels", "role=worker"])]
+    #[case::facts(&["health", "--facts", "pi.json"])]
+    #[case::revision_of_a_directory(&["plan", "--config", "/srv/cfg", "--revision", "assigned"])]
+    #[case::no_wait_on_a_directory(&["health", "--config", "/srv/cfg", "--no-wait"])]
+    fn flags_of_the_other_kind_of_run_are_refused(#[case] args: &[&str]) {
+        let parsed = Cli::try_parse_from(["buckle"].into_iter().chain(args.iter().copied()));
+        assert!(parsed.is_err(), "{args:?} must not parse");
+    }
+
+    #[test]
     fn subcommands_parse_their_documented_flags() {
         let cli = Cli::parse_from([
             "buckle",
@@ -150,7 +198,7 @@ mod tests {
         ]);
         match cli.command {
             Command::Plan(args) => {
-                assert_eq!(args.config, PathBuf::from("/srv/cfg"));
+                assert_eq!(args.config, Some(PathBuf::from("/srv/cfg")));
                 assert_eq!(args.labels.get("site").map(String::as_str), Some("home"));
                 assert_eq!(args.output, local::OutputFormat::Json);
             }

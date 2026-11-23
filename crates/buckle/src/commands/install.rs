@@ -95,6 +95,7 @@ pub async fn up(a: InstallAgentArgs) -> buckle_core::Result<i32> {
         telemetry: Default::default(),
         workload_identity: None,
         local_secret_exec: Vec::new(),
+        local: Default::default(),
     };
     config.validate()?;
     let options = buckle_agent::InstallOptions {

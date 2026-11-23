@@ -39,6 +39,9 @@ pub struct AgentConfig {
     /// authenticates with (`agents.auth: workload_identity` on the server).
     #[serde(default)]
     pub workload_identity: Option<WorkloadIdentityConfig>,
+    /// The socket `buckle plan`, `health` and `status` reach this agent on.
+    #[serde(default)]
+    pub local: LocalConfig,
     /// In local mode (`source`), programs the `exec` secret provider may run
     /// (e.g. `op`). Never read from agent.yaml: only an explicit command-line
     /// flag (`buckle agent --allow-secret-exec op`) enables it, as on the
@@ -116,6 +119,28 @@ pub struct WorkloadIdentityConfig {
     /// that cannot reach the cluster itself so it can follow key rotation.
     #[serde(default)]
     pub jwks_url: Option<String>,
+}
+
+/// How commands run on the host reach the agent ([`crate::local`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalConfig {
+    /// The Unix socket the agent listens on (`/run/buckle/agent.sock`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
+    /// A group whose members may plan, check health and read the status
+    /// beside root. Unset: root only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl LocalConfig {
+    /// Where the agent listens.
+    pub fn socket_path(&self) -> PathBuf {
+        self.socket
+            .clone()
+            .unwrap_or_else(crate::local::default_socket)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

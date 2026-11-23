@@ -21,11 +21,11 @@ fn rev(id: &str) -> RevisionId {
 
 /// A runner that writes `state.cbor` during apply the way the engine does
 /// (load at the start, save at the end), pausing in between until released.
-struct StateWritingRunner {
+pub(super) struct StateWritingRunner {
     inner: Arc<FakeRunner>,
     state: FileStateStore,
-    started: Notify,
-    release: Notify,
+    pub started: Notify,
+    pub release: Notify,
 }
 
 #[async_trait]
@@ -180,6 +180,14 @@ async fn a_welcome_during_an_apply_keeps_the_stable_revision_and_the_engine_stat
 
 /// A harness whose runner pauses every apply until released.
 async fn gated(fake: Arc<FakeRunner>) -> (Harness, Arc<StateWritingRunner>) {
+    gated_with(fake, Setup::default()).await
+}
+
+/// [`gated`], with the rest of the harness as `setup` says.
+pub(super) async fn gated_with(
+    fake: Arc<FakeRunner>,
+    setup: Setup,
+) -> (Harness, Arc<StateWritingRunner>) {
     let slot: Arc<std::sync::Mutex<Option<Arc<StateWritingRunner>>>> = Arc::default();
     let (inner, built) = (fake.clone(), slot.clone());
     let h = Harness::start(Setup {
@@ -194,7 +202,7 @@ async fn gated(fake: Arc<FakeRunner>) -> (Harness, Arc<StateWritingRunner>) {
             *built.lock().expect("lock") = Some(runner.clone());
             runner
         })),
-        ..Default::default()
+        ..setup
     })
     .await;
     let runner = slot.lock().expect("lock").clone().expect("built");
@@ -967,7 +975,7 @@ async fn a_session_without_a_welcome_times_out_and_reconnects() {
     h.stop().await.expect("clean exit");
 }
 
-fn secret(name: &str, value: &[u8], fingerprint: &str) -> pb::SecretValue {
+pub(super) fn secret(name: &str, value: &[u8], fingerprint: &str) -> pb::SecretValue {
     pb::SecretValue {
         name: name.into(),
         value: value.to_vec(),
@@ -975,7 +983,7 @@ fn secret(name: &str, value: &[u8], fingerprint: &str) -> pb::SecretValue {
     }
 }
 
-fn assign_with(
+pub(super) fn assign_with(
     revision: &str,
     digest: &str,
     secrets: Vec<pb::SecretValue>,
