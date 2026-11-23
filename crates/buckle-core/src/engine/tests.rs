@@ -1542,6 +1542,67 @@ async fn independent_modules_apply_concurrently() {
 }
 
 #[tokio::test]
+async fn applies_sharing_a_state_directory_run_one_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let rev = revision(
+        "r1",
+        FLEET,
+        vec![
+            module(
+                "name: a\ntasks: [ { test.file: { path: /lock/a, run: lock1, signal: lock1-a, wait_for: lock1-go } } ]\n",
+            ),
+            module("name: b\ntasks: [ { test.file: { path: /lock/b, run: lock1 } } ]\n"),
+        ],
+    );
+    let sys = FakeSystem::new();
+    // Two processes' views of one state directory, each applying one module.
+    let state_file = dir.path().join("state.cbor");
+    let only = |module: &str| {
+        Inputs::new(
+            rev.clone(),
+            HostIdentity {
+                id: "h1".into(),
+                labels: Labels::new(),
+            },
+            Arc::new(sys.clone()),
+            Arc::new(SecretStore::new()),
+            Arc::new(crate::state::FileStateStore::new(&state_file)),
+        )
+        .with_frozen_facts(default_facts())
+        .with_select(Some(
+            Filter::new(format!("module.name == \"{module}\"")).unwrap(),
+        ))
+    };
+    let (first, second) = (only("a"), only("b"));
+    let second_plan = plan(&second).await;
+    let running = tokio::spawn(async move { apply(&first).await });
+    wait_for("lock1-a").await.unwrap();
+    let waiting = tokio::spawn(async move { apply_plan(&second, &second_plan).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !calls("lock1").contains(&"apply:start b//lock/b".to_owned()),
+        "the second apply waits for the first: {:?}",
+        calls("lock1")
+    );
+    signal("lock1-go");
+    assert!(running.await.unwrap().0.succeeded);
+    assert!(waiting.await.unwrap().0.succeeded);
+    let state = crate::state::FileStateStore::new(&state_file)
+        .load()
+        .unwrap();
+    let recorded: Vec<&str> = state
+        .resources
+        .values()
+        .map(|r| r.key.key.as_str())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec!["/lock/a", "/lock/b"],
+        "neither run saved over what the other recorded"
+    );
+}
+
+#[tokio::test]
 async fn parallelism_one_runs_modules_sequentially() {
     let rev = revision(
         "r1",

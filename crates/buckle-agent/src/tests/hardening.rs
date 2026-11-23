@@ -1053,6 +1053,45 @@ async fn the_watchdog_fallback_survives_a_new_stable_revision() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_assigned_revision_stays_cached_across_a_restart() {
+    // A rollout assigned rev2 before the agent restarted; rev1 is applied.
+    let mut h = Harness::start(Setup {
+        prepare: Some(Box::new(|state_dir: &Path| {
+            let store = Store::new(state_dir);
+            store.ensure().expect("ensure");
+            for id in ["rev1", "rev2", "old"] {
+                crate::bundle::extract_atomic(
+                    &bundle(FLEET_YAML),
+                    &store.revision_dir(&rev(id)).expect("dir"),
+                )
+                .expect("extract");
+            }
+            store
+                .save_agent_state(&crate::store::AgentState {
+                    applied_revision: Some(rev("rev1")),
+                    assigned_revision: Some(rev("rev2")),
+                    ..Default::default()
+                })
+                .expect("agent state");
+        })),
+        ..Default::default()
+    })
+    .await;
+    h.fleet.add_revision("stable1", bundle(FLEET_YAML));
+    let session = h.sessions.accept().await;
+    // Caching the stable revision prunes what is no longer wanted.
+    session.send(welcome(Some("stable1"), None)).await;
+    let store = Store::new(h.state_dir());
+    wait_until(|| store.has_revision(&rev("stable1")) && !store.has_revision(&rev("old"))).await;
+    assert!(store.has_revision(&rev("rev1")));
+    assert!(
+        store.has_revision(&rev("rev2")),
+        "the assigned revision is still wanted after the restart"
+    );
+    h.stop().await.expect("clean exit");
+}
+
+#[tokio::test(start_paused = true)]
 async fn secrets_of_a_revision_that_never_arrived_are_pruned_once_unwanted() {
     let mut h = Harness::start(Setup::default()).await;
     let mut session = h.sessions.accept().await;

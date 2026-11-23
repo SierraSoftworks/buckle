@@ -101,12 +101,25 @@ struct Executor<'a> {
     record: bool,
 }
 
+/// Takes the state store's writer lock, waiting (off the async threads)
+/// for a run of another process to finish.
+async fn lock_state(inputs: &Inputs) -> crate::Result<crate::state::StateLock> {
+    let store = inputs.state.clone();
+    tokio::task::spawn_blocking(move || store.lock())
+        .await
+        .map_err(|e| crate::error::wrap_system(e, "Taking the state lock panicked.", &[]))?
+}
+
 /// `Engine::apply`.
 pub(super) async fn apply(
     inputs: &Inputs,
     plan: &Plan,
     events: Sender<ApplyEvent>,
 ) -> crate::Result<ApplyOutcome> {
+    // One apply at a time per state directory, whichever process runs it:
+    // held from before the state is loaded until the run has saved its last
+    // step.
+    let _state_lock = lock_state(inputs).await?;
     let started = tokio::time::Instant::now();
     let started_at = inputs.system.now();
     let planner = Planner::from_inputs(inputs, &inputs.revision)?;

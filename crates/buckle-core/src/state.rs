@@ -164,10 +164,22 @@ impl State {
     }
 }
 
+/// Held by the one run that may write a [`StateStore`]; dropping it lets
+/// the next run in.
+pub type StateLock = Box<dyn Send>;
+
 /// Persistence for [`State`].
 pub trait StateStore: Send + Sync {
     fn load(&self) -> crate::Result<State>;
     fn save(&self, state: &State) -> crate::Result<()>;
+
+    /// Waits for every other run writing this store to finish, then holds
+    /// it for the caller: an apply loads the state, changes the host and
+    /// saves as it goes, and two of them at once would each save over what
+    /// the other recorded. Stores only one process can reach hold nothing.
+    fn lock(&self) -> crate::Result<StateLock> {
+        Ok(Box::new(()))
+    }
 
     /// Keeps the full outcome of the last apply (every module and step), for
     /// `buckle status`. Kept apart from the state, which is saved after every
@@ -218,6 +230,50 @@ impl FileStateStore {
     /// state file.
     pub fn last_run_path(&self) -> PathBuf {
         self.path.with_file_name("last-run.json")
+    }
+
+    /// Where the lock every apply holds lives: `state.lock` beside the
+    /// state file.
+    pub fn lock_path(&self) -> PathBuf {
+        self.path.with_file_name("state.lock")
+    }
+
+    fn open_lock(&self) -> crate::Result<std::fs::File> {
+        let path = self.lock_path();
+        let opened = (|| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&path)
+        })();
+        opened.map_err(|e| {
+            crate::error::wrap_user(
+                e,
+                format!(
+                    "Buckle could not open its state lock at {}.",
+                    path.display()
+                ),
+                &["Run as a user that may write the state directory (root, for /var/lib/buckle), or pass --state-dir."],
+            )
+        })
+    }
+
+    /// Takes the lock if no other run holds it; `None` when one does.
+    pub fn try_lock(&self) -> crate::Result<Option<StateLock>> {
+        use crate::error::HumanizableResult;
+        let file = self.open_lock()?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Box::new(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e).to_human_error(),
+        }
     }
 
     /// Removes temp files a crashed earlier write left next to the state file.
@@ -303,6 +359,24 @@ impl StateStore for FileStateStore {
             let _ = std::fs::remove_file(&tmp);
         }
         written.to_human_error()
+    }
+
+    /// An advisory lock on [`FileStateStore::lock_path`], shared by every
+    /// process using this state directory (the agent, and `buckle apply`
+    /// beside it). The kernel drops it when the holder exits, however it
+    /// exits.
+    fn lock(&self) -> crate::Result<StateLock> {
+        use crate::error::HumanizableResult;
+        if let Some(lock) = self.try_lock()? {
+            return Ok(lock);
+        }
+        tracing::info!(
+            lock = %self.lock_path().display(),
+            "another Buckle run holds the state lock; waiting for it to finish"
+        );
+        let file = self.open_lock()?;
+        file.lock().to_human_error()?;
+        Ok(Box::new(file))
     }
 
     fn save_last_run(&self, outcome: &crate::engine::ApplyOutcome) -> crate::Result<()> {
@@ -453,6 +527,34 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn the_file_store_lock_admits_one_holder_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(dir.path().join("state.cbor"));
+        // Another handle on the same directory: another process's view.
+        let other = FileStateStore::new(dir.path().join("state.cbor"));
+        let held = store.lock().unwrap();
+        assert!(other.try_lock().unwrap().is_none(), "a second run waits");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _lock = other.lock().unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the waiter is held back while the lock is held"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the waiter gets the lock once it is released");
+        waiter.join().unwrap();
+        assert!(
+            store.try_lock().unwrap().is_some(),
+            "and releases it in turn"
+        );
     }
 
     #[test]

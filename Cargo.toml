@@ -23,7 +23,7 @@ edition = "2024"
 authors = ["Benjamin Pannell <benjamin@pannell.dev>"]
 license = "MIT"
 repository = "https://github.com/SierraSoftworks/buckle"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 buckle-core = { path = "crates/buckle-core" }
