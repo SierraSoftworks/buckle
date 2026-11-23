@@ -133,6 +133,7 @@ Unknown keys are rejected, so a misspelt key fails at start-up instead of being 
 | Path | Holds |
 |---|---|
 | `state.cbor` | Every resource Buckle applied (what makes removal possible), recent runs and cached facts. Saved after every step. |
+| `state.lock` | Held by whichever apply is writing `state.cbor`: the agent's, or a `buckle apply` run beside it, which waits its turn. |
 | `facts.d/` | Executables whose JSON output becomes [script facts](./facts.md#script). |
 | `tmp/` | Private copies of files being validated before they replace the real ones. |
 | `stash/` | Original lines replaced by `file.line` in sensitive files, so removal can restore them. |

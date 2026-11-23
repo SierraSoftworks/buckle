@@ -193,7 +193,6 @@ struct Data {
     secrets: HashMap<RevisionId, Arc<SecretStore>>,
     /// Persisted in agent.json: applied and stable revision, facts, …
     agent: AgentState,
-    assigned: Option<RevisionId>,
     /// The selector each recent plan digest was made with (only selected
     /// plans are remembered).
     selects: HashMap<String, String>,
@@ -1654,10 +1653,12 @@ impl Shared {
             let mut data = self.data.lock().await;
             if stable {
                 data.agent.stable_revision = Some(revision.clone());
-                self.save_agent(&data);
             }
             if desired {
-                data.assigned = Some(revision.clone());
+                data.agent.assigned_revision = Some(revision.clone());
+            }
+            if stable || desired {
+                self.save_agent(&data);
             }
         }
         let fetched = self
@@ -2331,7 +2332,7 @@ impl Shared {
         let mut keep: Vec<RevisionId> = [
             data.agent.applied_revision.clone(),
             data.agent.stable_revision.clone(),
-            data.assigned.clone(),
+            data.agent.assigned_revision.clone(),
         ]
         .into_iter()
         .flatten()
@@ -2536,7 +2537,7 @@ impl Shared {
             let data = self.data.lock().await;
             let mut ids: Vec<RevisionId> = [
                 data.agent.applied_revision.clone(),
-                data.assigned.clone(),
+                data.agent.assigned_revision.clone(),
                 data.agent.stable_revision.clone(),
             ]
             .into_iter()

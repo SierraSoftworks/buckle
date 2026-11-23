@@ -299,7 +299,20 @@ pub(crate) async fn plan_to(args: PlanArgs, out: &mut dyn Write) -> buckle_core:
     Ok(if plan.is_empty() { 0 } else { 2 })
 }
 
+/// Whether a Buckle agent enrolled with a server keeps its state in
+/// `state_dir` (it holds the per-host token the server issued).
+fn agent_enrolled(state_dir: &Path) -> bool {
+    state_dir.join("token").is_file()
+}
+
 pub async fn apply(args: ApplyArgs) -> buckle_core::Result<i32> {
+    if agent_enrolled(&args.local.state_dir) {
+        eprintln!(
+            "warning: {} belongs to a Buckle agent enrolled with a server. Applying {} here changes what that agent manages: it reports the difference as drift and may put it back.",
+            args.local.state_dir.display(),
+            args.local.config.display()
+        );
+    }
     let mut local = Local::load(&args.local).await?;
     local.inputs = local.inputs.with_waived_checks(args.waive_checks.clone());
     let (plan, facts) = Engine::plan(&local.inputs).await?;
@@ -343,6 +356,14 @@ pub async fn apply(args: ApplyArgs) -> buckle_core::Result<i32> {
         }
     }
 
+    // The engine takes the state lock itself; say so when that means waiting
+    // (for the agent's own run, or another `buckle apply`).
+    if FileStateStore::new(args.local.state_dir.join("state.cbor"))
+        .try_lock()?
+        .is_none()
+    {
+        println!("waiting for another Buckle run on this host to finish…");
+    }
     println!();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ApplyEvent>(256);
     let interactive = {
@@ -912,6 +933,14 @@ mod tests {
         assert!(text.contains("\nmotd\n"), "{text}");
         assert!(text.contains("sysctl    needs: motd"), "{text}");
         assert!(text.contains("summary  "), "{text}");
+    }
+
+    #[test]
+    fn a_state_directory_holding_a_host_token_belongs_to_an_enrolled_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!agent_enrolled(dir.path()));
+        std::fs::write(dir.path().join("token"), "host-token").unwrap();
+        assert!(agent_enrolled(dir.path()));
     }
 
     fn status_args(dir: &Path) -> StatusArgs {

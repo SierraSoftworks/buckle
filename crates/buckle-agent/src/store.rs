@@ -5,7 +5,8 @@
 //! | `token` | the per-host token issued at enrolment (0600) |
 //! | `install.key` | the key secret fingerprints are computed with (0600) |
 //! | `state.cbor` | the engine's resource state; written only by the engine (the agent reads it once, to migrate older state) |
-//! | `agent.json` | the agent's own bookkeeping: applied and stable revision, cached facts, last plan digest, labels, the local rollback watchdog, unacknowledged reports (0600) |
+//! | `state.lock` | the lock every apply holds while it writes `state.cbor`, shared with `buckle apply` run beside the agent |
+//! | `agent.json` | the agent's own bookkeeping: applied, assigned and stable revision, cached facts, last plan digest, labels, the local rollback watchdog, unacknowledged reports (0600) |
 //! | `revisions/<id>/` | extracted revision trees (the stable one is kept for local rollback) |
 //! | `secrets/<id>.cbor` | the secrets scoped to this host for a revision (0600) |
 //! | `tmp/` | scratch space planning may write to |
@@ -35,6 +36,11 @@ pub struct AgentState {
     /// The revision this host has applied (last successful run).
     #[serde(default)]
     pub applied_revision: Option<RevisionId>,
+    /// The revision the server last assigned (the one a rollout wants on
+    /// this host), which may be ahead of the applied one. Kept on disk so
+    /// that its cached tree and secrets survive a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_revision: Option<RevisionId>,
     /// The fleet's stable revision as last told by the server.
     #[serde(default)]
     pub stable_revision: Option<RevisionId>,
