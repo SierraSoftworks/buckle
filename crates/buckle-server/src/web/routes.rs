@@ -796,6 +796,7 @@ fn run_dto(state: &AppState, r: crate::store::RunRecord) -> RunSummary {
         error: r.error,
         trace_id: r.trace_id,
         action: r.action,
+        local: r.local,
     }
 }
 

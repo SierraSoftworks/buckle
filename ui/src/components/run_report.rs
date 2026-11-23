@@ -26,9 +26,9 @@ use crate::logic::format::{
 };
 use crate::logic::health::{Bucket, CheckState, current_state, timeline};
 use crate::logic::run::{
-    current_step, elapsed_ms, error_tone, expanded_by_default, module_has_problem, module_label,
-    module_slug, module_tally, module_tone, resource_module, run_finished, run_label, run_tally,
-    run_tone, step_glyph, step_key, step_label, step_progress, step_slug, step_tone,
+    current_step, elapsed_ms, error_tone, expanded_by_default, local_run_title, module_has_problem,
+    module_label, module_slug, module_tally, module_tone, resource_module, run_finished, run_label,
+    run_tally, run_tone, step_glyph, step_key, step_label, step_progress, step_slug, step_tone,
 };
 use crate::logic::tone::{Tone, check_status_tone};
 
@@ -266,6 +266,9 @@ fn summary(r: &RunReport, now: DateTime<Utc>, in_rollout: bool, noun: &str) -> H
                 <span class="mono" title={r.plan_digest.clone()}>{ format!("plan {}", short(&r.plan_digest)) }</span>
                 if let (Some(id), false) = (&r.rollout_id, in_rollout) {
                     <RouteLink to={Route::rollout(id)}>{ format!("rollout {}", rollout_label(id)) }</RouteLink>
+                }
+                if let Some(user) = &r.local {
+                    <Badge testid="run-local" title={local_run_title(user)}>{ format!("local · {user}") }</Badge>
                 }
                 if r.trace_id.is_some() { <TraceLink id={r.trace_id.clone()} url={r.trace_url.clone()} /> }
             </span>

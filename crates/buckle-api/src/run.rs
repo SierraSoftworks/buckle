@@ -248,6 +248,10 @@ pub struct RunReport {
     /// For an operator's action, `module/action`; absent for an apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// For an apply someone ran at the host's own command line (`buckle
+    /// apply` there), their user name on the host; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
 }
 
 /// A live update to one step or module of a run in progress; the UI applies it
@@ -453,6 +457,7 @@ mod tests {
             trace_id: None,
             trace_url: None,
             action: None,
+            local: None,
         }
     }
 

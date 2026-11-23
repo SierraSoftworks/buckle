@@ -363,6 +363,10 @@ pub struct RunSummary {
     /// For an operator's action, `module/action`; absent for an apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// For an apply someone ran at the host's own command line (`buckle
+    /// apply` there), their user name on the host; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
 }
 
 /// An operator's action run on one target outside any rollout, as

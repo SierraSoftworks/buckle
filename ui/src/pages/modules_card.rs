@@ -648,6 +648,9 @@ fn run_picker(props: &PickerProps) -> Html {
             .clone()
             .filter(|_| !listed)
             .map(|s| (AttrValue::from(s), AttrValue::from("newest")));
+        // A run started on the host itself is never the newest the card
+        // follows: that stays the fleet's latest apply.
+        let newest_at = runs.iter().position(|r| r.local.is_none());
         let options = unlisted
             .into_iter()
             .chain(runs.iter().enumerate().map(|(i, r)| {
@@ -657,10 +660,18 @@ fn run_picker(props: &PickerProps) -> Html {
                     .map(str::to_string)
                     .unwrap_or_else(|| r.outcome.replace('_', " "));
                 let label = format!(
-                    "{}{} · {state} · {}",
-                    if i == 0 { "newest · " } else { "" },
+                    "{}{} · {state} · {}{}",
+                    if Some(i) == newest_at {
+                        "newest · "
+                    } else {
+                        ""
+                    },
                     relative(r.started_at, now),
-                    commit(&r.revision)
+                    commit(&r.revision),
+                    match &r.local {
+                        Some(user) => format!(" · local, by {user}"),
+                        None => String::new(),
+                    }
                 );
                 (AttrValue::from(r.id.clone()), AttrValue::from(label))
             }))
