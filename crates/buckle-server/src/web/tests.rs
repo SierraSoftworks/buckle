@@ -2055,6 +2055,70 @@ async fn trace_ids_come_with_links_when_a_template_is_configured() {
 }
 
 #[actix_web::test]
+async fn a_run_from_the_host_s_own_command_line_names_who_ran_it() {
+    let e = env(WebConfig::default()).await;
+    add_host(&e.store, "pi-1", HostStatus::Active).await;
+    let run = |id: &str, local: Option<&str>, minutes_ago: i64| crate::store::RunRecord {
+        id: id.into(),
+        outcome_json: None,
+        host: "pi-1".into(),
+        rollout: None,
+        revision: "r1".into(),
+        plan_digest: "d".into(),
+        started_at: chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
+        finished_at: chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
+        outcome: "succeeded".into(),
+        changes: 1,
+        removals: 0,
+        error: None,
+        trace_id: None,
+        action: None,
+        local: local.map(str::to_owned),
+    };
+    let (rollout_s, local) = (run("run-1", None, 10), run("local-1", Some("ben"), 1));
+    e.store
+        .call(move |db| {
+            db.runs().add(&rollout_s)?;
+            db.runs().add(&local)
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(app(e.state.clone())).await;
+    let get = |uri: &'static str| test::TestRequest::get().uri(uri).to_request();
+
+    let runs: buckle_api::Page<buckle_api::RunSummary> =
+        test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1/runs")).await).await;
+    let who = |id: &str| {
+        runs.items
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.local.clone())
+    };
+    assert_eq!(who("local-1"), Some(Some("ben".into())));
+    assert_eq!(who("run-1"), Some(None));
+
+    let report: buckle_api::RunReport = test::read_body_json(
+        test::call_service(&app, get("/api/v1/hosts/pi-1/runs/local-1")).await,
+    )
+    .await;
+    assert_eq!(report.local.as_deref(), Some("ben"));
+
+    let host: buckle_api::HostDetail =
+        test::read_body_json(test::call_service(&app, get("/api/v1/hosts/pi-1")).await).await;
+    assert!(
+        host.recent_runs
+            .iter()
+            .any(|r| r.local.as_deref() == Some("ben")),
+        "listed among the host's recent runs"
+    );
+    assert_eq!(
+        host.latest_run.map(|r| r.id).as_deref(),
+        Some("run-1"),
+        "the host's latest apply stays the fleet's own"
+    );
+}
+
+#[actix_web::test]
 async fn without_a_template_trace_ids_stay_text() {
     let e = env(WebConfig::default()).await;
     e.store

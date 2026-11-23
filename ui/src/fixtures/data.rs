@@ -2571,8 +2571,10 @@ fn cluster_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         vec![]
     };
     let recent_runs = super::runs::summaries(host, now);
+    // A run someone started on the host itself is never its latest apply.
     let latest_run = recent_runs
-        .first()
+        .iter()
+        .find(|r| r.local.is_none())
         .map(|r| super::runs::report_for(&host.id, r, now));
     HostDetail {
         summary: host.clone(),
@@ -2783,8 +2785,10 @@ pub fn host_detail(host: &HostSummary, now: DateTime<Utc>) -> HostDetail {
         _ => {}
     }
     let recent_runs = super::runs::summaries(host, now);
+    // A run someone started on the host itself is never its latest apply.
     let latest_run = recent_runs
-        .first()
+        .iter()
+        .find(|r| r.local.is_none())
         .map(|r| super::runs::report_for(&host.id, r, now));
     let drift = if host.drifted {
         vec![

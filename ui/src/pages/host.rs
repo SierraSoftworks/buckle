@@ -38,7 +38,7 @@ use crate::logic::format::{
 use crate::logic::health::CheckState;
 use crate::logic::labels::{Change, Row, changes, effective, join, split};
 use crate::logic::live::{apply_fleet, apply_host_detail};
-use crate::logic::run::newest_run;
+use crate::logic::run::{local_run_title, newest_run};
 use crate::logic::tone::{Tone, check_status_tone, outcome_tone};
 use crate::store::use_live;
 
@@ -515,7 +515,13 @@ pub(super) fn runs(
                             if let Some(action) = &r.action {
                                 <td><Badge title="An operator's action">{ format!("action {action}") }</Badge></td>
                             } else {
-                                <td class="mono" title={r.plan_digest.clone()}>{ short(&r.plan_digest) }</td>
+                                <td>
+                                    <span class="mono" title={r.plan_digest.clone()}>{ short(&r.plan_digest) }</span>
+                                    if let Some(user) = &r.local {
+                                        { " " }
+                                        <Badge testid="run-local" title={local_run_title(user)}>{ format!("local · {user}") }</Badge>
+                                    }
+                                </td>
                             }
                             <td>
                                 <Pill tone={outcome_tone(&r.outcome)} label={r.outcome.replace('_', " ")} />

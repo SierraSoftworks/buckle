@@ -30,6 +30,8 @@ use crate::logic::run::run_finished;
 
 /// The host whose run `?demo&live` moves on.
 pub const LIVE_HOST: &str = "pi-4";
+/// The host someone applied on by hand since its rollout.
+pub const LOCAL_RUN_HOST: &str = "pi-3";
 
 /// A run's id: the host and the revision it applied (each revision runs once
 /// per host in the demo).
@@ -232,6 +234,7 @@ fn report(
         error: None,
         trace_url: Some(trace_url(&trace)),
         action: None,
+        local: None,
         trace_id: Some(trace),
     };
     r.recount();
@@ -1168,6 +1171,9 @@ fn workloads_run(host: &str, s: &RunSummary, now: DateTime<Utc>) -> RunReport {
 
 /// The report of a run, from its summary.
 pub fn report_for(host: &str, s: &RunSummary, now: DateTime<Utc>) -> RunReport {
+    if s.local.is_some() {
+        return drift_fix(host, s, now);
+    }
     match (host, s.revision.as_str()) {
         ("home-nomad", _) => workloads_run(host, s, now),
         (LIVE_HOST, NEW_REV) => live(s.started_at, now),
@@ -1177,6 +1183,37 @@ pub fn report_for(host: &str, s: &RunSummary, now: DateTime<Utc>) -> RunReport {
         (_, NEW_REV) => clean(host, s.started_at, now),
         _ => generic(host, s, now),
     }
+}
+
+/// A run someone started at the host's own command line: one module put
+/// back as configured, outside any rollout.
+fn drift_fix(host: &str, s: &RunSummary, now: DateTime<Utc>) -> RunReport {
+    let common = module(
+        "common",
+        ModuleState::Applied,
+        vec![step(
+            "file.template",
+            "/etc/sysctl.d/90-buckle.conf",
+            "update /etc/sysctl.d/90-buckle.conf (1 line)",
+            StepState::Changed,
+            Some("wrote /etc/sysctl.d/90-buckle.conf"),
+            12,
+        )],
+        vec![],
+    );
+    let mut r = report(
+        host,
+        &s.revision,
+        RunState::Succeeded,
+        s.started_at,
+        vec![common],
+        vec![],
+        now,
+    );
+    r.id = s.id.clone();
+    r.rollout_id = None;
+    r.local = s.local.clone();
+    r
 }
 
 /// The summary a report is listed under.
@@ -1197,6 +1234,7 @@ pub fn summary_of(r: &RunReport, outcome: &str, error: Option<&str>) -> RunSumma
         trace_id: r.trace_id.clone(),
         trace_url: r.trace_url.clone(),
         action: r.action.clone(),
+        local: r.local.clone(),
     }
 }
 
@@ -1222,6 +1260,7 @@ pub fn summaries(host: &HostSummary, now: DateTime<Utc>) -> Vec<RunSummary> {
             trace_id: None,
             trace_url: None,
             action: None,
+            local: None,
         };
         summary_of(&report_for(id, &skeleton, now), outcome, error)
     };
@@ -1275,6 +1314,13 @@ pub fn summaries(host: &HostSummary, now: DateTime<Utc>) -> Vec<RunSummary> {
     if let Some(run) = newest {
         runs.insert(0, run);
     }
+    // Someone put drift right by hand since.
+    if id == LOCAL_RUN_HOST {
+        let mut fix = entry(NEW_REV, ago(4), "success", None);
+        fix.id = format!("local-{id}");
+        fix.local = Some("ben".into());
+        runs.insert(0, summary_of(&report_for(id, &fix, now), "success", None));
+    }
     runs
 }
 
@@ -1298,6 +1344,7 @@ mod tests {
             trace_id: None,
             trace_url: None,
             action: None,
+            local: None,
         }
     }
 

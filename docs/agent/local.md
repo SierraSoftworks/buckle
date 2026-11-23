@@ -44,9 +44,9 @@ note: the server has assigned revision 4be01c7a to this host; preview it with --
 - It takes root, and a fleet that allows it: [`agents.local_runs.apply: off`](./server.md#agents)
   on the server turns it off for every host. A paused host refuses, and so does one with modules
   rolled back after a failure, unless you pass `--include-rolled-back`.
-- The run appears among the host's runs on the server with the user who ran it, and in the audit
-  log as `host.apply.local`. It reboots the host when a step asks for it; `--no-reboot` says so
-  instead.
+- The run appears under **Recent runs** on the host's page, marked `local` with the user who ran
+  it, and in the audit log as `host.apply.local`. It reboots the host when a step asks for it;
+  `--no-reboot` says so instead.
 
 **Finding and reaching the agent**
 

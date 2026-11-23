@@ -583,6 +583,7 @@ pub fn run_report(
         trace_id: run.trace_id.clone(),
         trace_url: None,
         action: run.action.clone(),
+        local: run.local.clone(),
     };
     if let Some(plan) = plan {
         from_plan(&mut report, plan);

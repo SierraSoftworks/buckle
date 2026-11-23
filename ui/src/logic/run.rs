@@ -558,6 +558,14 @@ pub fn follow_run_list(
     newest
 }
 
+/// What the "local" mark on a run means, for its tooltip: `user` applied
+/// the host's revision again from the host's own command line.
+pub fn local_run_title(user: &str) -> String {
+    format!(
+        "{user} ran `buckle apply` on the host itself: its revision applied again, outside any rollout"
+    )
+}
+
 /// What an update the report cannot take is about, so that the same
 /// question is not asked again before the last answer is in: the run, when
 /// it is not the run held (or none is); the module, when the report does
@@ -960,6 +968,7 @@ pub(crate) mod tests {
             trace_id: None,
             trace_url: None,
             action: None,
+            local: None,
         };
         r.recount();
         r
@@ -1423,6 +1432,7 @@ pub(crate) mod tests {
             trace_id: None,
             trace_url: None,
             action: None,
+            local: None,
         };
         let on = |host: &str, run: &str, state: RunState| LiveEvent::RunProgress {
             progress: RunProgress {
@@ -1539,6 +1549,7 @@ pub(crate) mod tests {
             trace_id: None,
             trace_url: None,
             action: None,
+            local: None,
         };
         let mut list = vec![summary("run-1")];
         let mut p = progress(None, None);

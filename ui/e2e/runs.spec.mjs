@@ -108,6 +108,24 @@ describe("a host's latest run", () => {
     await close();
   });
 
+  test("a run started on the host itself is marked local with who ran it, and is not the run the card follows", async () => {
+    const { page, close } = await open("/hosts/pi-3");
+    const report = card(page);
+    await report.locator(".run").waitFor();
+    assert.notEqual(await report.locator(".run").getAttribute("data-run"), "local-pi-3", "the fleet's latest apply shows first");
+    assert.equal(await report.getByTestId("run-local").count(), 0);
+
+    const local = page.locator('tr[data-run="local-pi-3"]');
+    assert.match(await local.getByTestId("run-local").textContent(), /local · ben/);
+    assert.equal(await page.locator("tr[data-run]").getByTestId("run-local").count(), 1, "no other run is marked");
+
+    await local.getByRole("button", { name: /Show the report of the run started/ }).click();
+    await eventually(async () => assert.equal(await report.locator(".run").getAttribute("data-run"), "local-pi-3"));
+    assert.match(await report.getByTestId("run-local").textContent(), /local · ben/);
+    assert.match(await page.getByLabel("Run to show").locator("option:checked").textContent(), /local, by ben$/);
+    await close();
+  });
+
   test("blocked steps make a run that needs attention, with the reason as a warning", async () => {
     const { page, close } = await open("/hosts/edge-1");
     const report = card(page);
