@@ -200,6 +200,7 @@ mod tests {
                 schedule: None,
             }),
             changes: None,
+            reapply: false,
         }
     }
 

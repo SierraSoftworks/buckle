@@ -99,14 +99,15 @@ describe("every page renders in demo mode", () => {
     assert.equal((await items.first().locator(".commit__rollout").textContent()).trim(), "#42");
     // The message body is part of the card.
     assert.match(await items.first().textContent(), /allocation GC stall/);
-    // One control per card: [Running] for the rollout in progress, [Stable] for
-    // the release the fleet is on, an orange Rollback for every older one, and
+    // One control per card: [Running] for the rollout in progress, [Stable] and
+    // Re-apply for the release the fleet is on, an orange Rollback for every older one, and
     // [Corrupt] for a rejected commit, which cannot be deployed but can be
     // validated again (a newer server may accept it).
     assert.equal(await items.first().locator(".marker", { hasText: "Running" }).count(), 1);
     assert.equal(await page.locator(".marker", { hasText: "Stable" }).count(), 1);
     const stable = page.locator(".gitlog__item--stable");
     assert.equal(await stable.locator(".marker", { hasText: "Stable" }).count(), 1);
+    assert.equal(await stable.getByRole("button", { name: "Re-apply…", exact: true }).count(), 1);
     assert.equal(await page.getByRole("button", { name: "Rollback…", exact: true }).count(), 5);
     const rejected = page.locator(".gitlog__item--rejected");
     assert.equal(await rejected.locator(".marker", { hasText: "Corrupt" }).count(), 1);
@@ -469,6 +470,20 @@ describe("every page renders in demo mode", () => {
     const meta = await rolled.locator(".commit__meta").boundingBox();
     await page.mouse.click(meta.x + 4, meta.y + meta.height / 2);
     assert.match(await heading(page), /^Rollout /);
+    await close();
+  });
+
+  test("the stable revision's latest rollout re-applies it as a new rollout", async () => {
+    const { page, close } = await open("/rollouts/41");
+    assert.equal((await offered(page.getByTestId("rollout-controls"))).face, "Re-apply…");
+    await act(page.getByTestId("rollout-controls"), "Re-apply…");
+    const dialog = page.getByRole("alertdialog", { name: /Re-apply/ });
+    await dialog.getByRole("button", { name: "Re-apply", exact: true }).click();
+    await page.waitForURL(/\/rollouts\/43$/);
+    await page.locator(".page-head .pill", { hasText: "re-apply" }).waitFor();
+    // Queued behind the running rollout, it offers no re-apply of its own.
+    await page.locator(".page-head .pill", { hasText: "detected" }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "Re-apply…" }).count(), 0);
     await close();
   });
 

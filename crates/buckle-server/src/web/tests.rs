@@ -3037,7 +3037,8 @@ async fn admins_run_the_actions_a_host_offers_with_notes_audited() {
         ..Default::default()
     })
     .await;
-    revision(&e, "r1", "version: 2\n").await;
+    // The tree is complete before the revision is recorded: the controller
+    // may load (and cache) it as soon as it is.
     let module = e.state.revisions.dir("r1").join("modules/web");
     std::fs::create_dir_all(&module).unwrap();
     std::fs::write(
@@ -3045,6 +3046,7 @@ async fn admins_run_the_actions_a_host_offers_with_notes_audited() {
         "name: web\nactions:\n  restart: { systemd.restart: { name: nginx }, name: Restart nginx }\n  drain: { command.run: { run: [\"true\"] }, confirm: true }\n",
     )
     .unwrap();
+    revision(&e, "r1", "version: 2\n").await;
     for host in ["pi-1", "pi-2"] {
         add_host(&e.store, host, HostStatus::Active).await;
         let h = host.to_owned();
@@ -3272,12 +3274,8 @@ async fn admins_start_action_rollouts_over_the_targets_a_selector_matches() {
 #[actix_web::test]
 async fn task_action_blocks_are_offered_as_workload_actions() {
     let e = env(WebConfig::default()).await;
-    revision(
-        &e,
-        "r1",
-        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.labels.nomad == true'\n",
-    )
-    .await;
+    // The tree is complete before the revision is recorded: the controller
+    // may load (and cache) it as soon as it is.
     let dir = e.state.revisions.dir("r1");
     let w = dir.join("workloads/otelcol/files");
     std::fs::create_dir_all(&w).unwrap();
@@ -3302,6 +3300,12 @@ async fn task_action_blocks_are_offered_as_workload_actions() {
         "name: otelcol\nresources: [otelcol.nomad.hcl]\n",
     )
     .unwrap();
+    revision(
+        &e,
+        "r1",
+        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.labels.nomad == true'\n",
+    )
+    .await;
     e.store
         .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "r1"))
         .await
@@ -3348,12 +3352,8 @@ async fn task_action_blocks_are_offered_as_workload_actions() {
 #[actix_web::test]
 async fn workload_selectors_pick_the_placements_offering_an_action() {
     let e = env(WebConfig::default()).await;
-    revision(
-        &e,
-        "r1",
-        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.labels.nomad == true'\n",
-    )
-    .await;
+    // The tree is complete before the revision is recorded: the controller
+    // may load (and cache) it as soon as it is.
     let dir = e.state.revisions.dir("r1");
     for (name, tier) in [("grafana", "web"), ("postgres", "db")] {
         let w = dir.join(format!("workloads/{name}/files"));
@@ -3369,6 +3369,12 @@ async fn workload_selectors_pick_the_placements_offering_an_action() {
         )
         .unwrap();
     }
+    revision(
+        &e,
+        "r1",
+        "version: 2\nfleet:\n  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.labels.nomad == true'\n",
+    )
+    .await;
     e.store
         .call(|db| db.kv().set(crate::store::kv::keys::STABLE_REVISION, "r1"))
         .await

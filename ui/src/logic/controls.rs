@@ -13,7 +13,7 @@ use super::tone::{rollout_active, rollout_finished};
 pub enum Stance {
     /// Rejected by validation: it cannot be deployed.
     Corrupt,
-    /// The release the fleet is on.
+    /// The release the fleet is on: it can be re-applied.
     Stable,
     /// Older than the stable release: roll the fleet back to it.
     Rollback,
@@ -23,6 +23,15 @@ pub enum Stance {
     Running,
     /// Newer than the stable release and not rolled out (a manual trigger).
     Start,
+}
+
+/// Whether the finished `rollout` can be re-applied from its page: it is
+/// the latest rollout of `rev`, the stable revision. A queued rollout of it
+/// (or a newer one) waits its turn, so it is not offered then.
+pub fn reapplicable(rollout: &RolloutSummary, rev: Option<&RevisionSummary>) -> bool {
+    rollout_finished(rollout.state)
+        && rollout.action.is_none()
+        && rev.is_some_and(|r| r.is_stable && r.rollout_id.as_deref() == Some(rollout.id.as_str()))
 }
 
 /// The stance of `rev` given its `rollout` and the creation time of the
@@ -35,15 +44,16 @@ pub fn stance(
     if rev.status == RevisionStatus::Rejected {
         return Some(Stance::Corrupt);
     }
-    if rev.is_stable {
-        return Some(Stance::Stable);
-    }
+    // A re-apply of the stable revision is a rollout in progress too.
     if let Some(r) = rollout.filter(|r| rollout_active(r.state)) {
         return Some(if r.state == RolloutState::AwaitingApproval {
             Stance::Review
         } else {
             Stance::Running
         });
+    }
+    if rev.is_stable {
+        return Some(Stance::Stable);
     }
     if stable_at.is_some_and(|s| rev.created_at < s) {
         return Some(Stance::Rollback);
@@ -108,8 +118,9 @@ pub struct Decisions {
 pub struct Standing {
     pub failed: usize,
     pub baking: usize,
-    /// An action rollout: there is nothing to roll back to.
-    pub action: bool,
+    /// There is nothing to roll back to: an action rollout, or a re-apply
+    /// of the revision the fleet was already on.
+    pub no_rollback: bool,
 }
 
 /// What an operator can decide for a rollout in `state`, with `approve` the
@@ -139,7 +150,7 @@ pub fn decisions(state: RolloutState, approve: Option<&str>, hosts: Standing) ->
     if state == RolloutState::AwaitingApproval {
         all.push(Decision::Reject);
     }
-    if !hosts.action
+    if !hosts.no_rollback
         && matches!(
             state,
             RolloutState::Paused | RolloutState::Rolling | RolloutState::Baking
@@ -279,6 +290,22 @@ mod tests {
         let stable_at = Some(Utc::now() - chrono::Duration::days(2));
         let cases = [
             (revision(true, 2, Valid), None, Some(Stance::Stable)),
+            (
+                revision(true, 2, Valid),
+                Some(Completed),
+                Some(Stance::Stable),
+            ),
+            // Re-applying the stable revision.
+            (
+                revision(true, 2, Valid),
+                Some(Rolling),
+                Some(Stance::Running),
+            ),
+            (
+                revision(true, 2, Valid),
+                Some(AwaitingApproval),
+                Some(Stance::Review),
+            ),
             (revision(false, 5, Valid), None, Some(Stance::Rollback)),
             (
                 revision(false, 5, Valid),
@@ -323,6 +350,30 @@ mod tests {
     }
 
     #[test]
+    fn only_the_latest_finished_rollout_of_the_stable_revision_is_reapplicable() {
+        let latest = |stable| RevisionSummary {
+            rollout_id: Some("1".into()),
+            ..revision(stable, 1, RevisionStatus::Valid)
+        };
+        let cases = [
+            (RolloutState::Completed, latest(true), true),
+            (RolloutState::Aborted, latest(true), true),
+            (RolloutState::Rolling, latest(true), false),
+            (RolloutState::Completed, latest(false), false),
+            // A newer rollout of the same revision speaks for it.
+            (
+                RolloutState::Completed,
+                revision(true, 1, RevisionStatus::Valid),
+                false,
+            ),
+        ];
+        for (state, rev, want) in cases {
+            assert_eq!(reapplicable(&rollout(state), Some(&rev)), want, "{state:?}");
+        }
+        assert!(!reapplicable(&rollout(RolloutState::Completed), None));
+    }
+
+    #[test]
     fn the_face_is_what_the_rollout_waits_on() {
         let cases = [
             (
@@ -357,13 +408,13 @@ mod tests {
         assert!(menu(RolloutState::Paused, None).contains(&Rollback));
         assert!(!menu(RolloutState::Planning, None).contains(&Rollback));
         let action = Standing {
-            action: true,
+            no_rollback: true,
             ..Default::default()
         };
         let paused = decisions(RolloutState::Paused, None, action).unwrap().menu;
         assert!(
             !paused.contains(&Rollback),
-            "an action rollout has nothing to roll back to"
+            "an action rollout or a re-apply has nothing to roll back to"
         );
         assert!(paused.contains(&Abort));
         assert!(menu(RolloutState::AwaitingApproval, Some("canary")).contains(&Reject));

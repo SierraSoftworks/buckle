@@ -313,6 +313,10 @@ pub struct RolloutSummary {
     /// updates leave it out, so a client keeps the one it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<crate::ChangeCounts>,
+    /// A re-apply: it rolls out the revision the fleet was already on (to
+    /// correct drift), so it has nothing to roll back to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reapply: bool,
 }
 
 /// The action an action rollout runs.

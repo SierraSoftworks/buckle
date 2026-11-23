@@ -3845,6 +3845,12 @@ impl Controller {
                         &["Only a running or paused rollout can be rolled back."],
                     ));
                 }
+                if self.live[ri].record.runtime.reapply {
+                    return Err(CommandError::conflict(
+                        "A re-apply cannot be rolled back: it applies the revision the fleet was already on.",
+                        &["Pause or abort it, or start a rollout of an older revision."],
+                    ));
+                }
                 if self.live[ri].record.runtime.previous_stable.is_none() {
                     return Err(CommandError::conflict(
                         "There is no previous stable revision to roll back to.",
@@ -4759,9 +4765,13 @@ impl Controller {
                 window_ended: false,
             })
             .collect();
-        // An action rollout has nothing to roll back to.
+        // An action rollout has nothing to roll back to, and nor has a
+        // re-apply of the revision the fleet is already on.
+        live.record.runtime.reapply =
+            only.is_none() && self.stable.as_deref() == Some(live.record.revision.as_str());
         live.record.runtime.previous_stable = match &only {
             Some(_) => None,
+            None if live.record.runtime.reapply => None,
             None => self.stable.clone(),
         };
         live.record.started_at = now;

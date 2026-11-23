@@ -1422,6 +1422,29 @@ async fn continue_waives_the_failed_checks_and_finishes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_reapply_of_the_stable_revision_has_nothing_to_roll_back_to() {
+    let mut h = Harness::new().await;
+    h.revision("r1", "  health: { bake: 30s }\n").await;
+    h.enrol("a", "web").await;
+    h.connect("a", None);
+    let first = h.start("r1").await;
+    let (r, _) = h.wait_state(&first, RolloutState::Completed).await;
+    assert!(!r.runtime.reapply);
+    h.script("a", |s| s.apply_fail = Some(vec![]));
+    let id = h.start("r1").await;
+    let (r, _) = h.wait_state(&id, RolloutState::Paused).await;
+    assert!(r.runtime.reapply);
+    assert_eq!(r.runtime.previous_stable, None);
+    let refused = h
+        .command(Command::Rollback {
+            rollout: id.clone(),
+            note: String::new(),
+        })
+        .await;
+    assert!(refused.is_err(), "a re-apply cannot be rolled back");
+}
+
+#[tokio::test(start_paused = true)]
 async fn rollback_applies_the_stable_revision_newest_phase_first() {
     let mut h = Harness::new().await;
     let three = "  health: { bake: 30s }\n  phases:\n    - { name: canary, select: 'host.groups contains \"canary\"' }\n    - { name: web, select: 'host.groups contains \"web\"' }\n    - { name: db, select: 'host.groups contains \"db\"' }\n";

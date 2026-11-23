@@ -19,14 +19,15 @@ use crate::components::ui::{Note, NoteKind};
 use crate::api::{self, ApiError};
 use crate::app::{Route, use_auth};
 use crate::components::meter::{Segment, stage_segments};
+use crate::components::revision::RevisionAsk;
 use crate::components::ui::Copyable;
 use crate::components::{
     Button, Changes, Commit, CommitCard, Confirm, Countdown, ErrorBlock, ErrorState, HostLink,
     HoverTip, Kind, Loading, MenuItem, Meter, PageHead, Panel, Pill, Pipeline, PlanViews, Refresh,
-    RouteLink, RunReportView, Segmented, SplitButton, TraceLink, use_toast,
+    RouteLink, RunReportView, Segmented, SplitButton, TraceLink, use_revision_actions, use_toast,
 };
 use crate::hooks::{RunSource, use_debounced, use_fetch, use_live_value, use_now, use_run_report};
-use crate::logic::controls::{Decision, Standing, decisions, replan_label};
+use crate::logic::controls::{Decision, Standing, decisions, reapplicable, replan_label};
 use crate::logic::fleet_plan::{Phases, fleet_tally};
 use crate::logic::format::{count, relative, rollout_label, short, since, timestamp};
 use crate::logic::limits;
@@ -113,13 +114,17 @@ pub fn rollout_page(props: &Props) -> Html {
         .as_ref()
         .map(|d| d.1.summary.id.clone())
         .unwrap_or_else(|| props.id.clone());
-    // The URL settles on the rollout's name (or its id, without one).
+    // The URL settles on the rollout's name (or its id, without one), once
+    // the rollout it names has loaded: right after moving to another
+    // rollout, the one before it is still held.
     {
         let navigator = use_navigator();
         let canonical = detail
             .data
             .as_ref()
-            .map(|d| Route::rollout(&d.1.summary.id))
+            .map(|d| &d.1.summary)
+            .filter(|s| s.id == props.id || s.name.as_deref() == Some(props.id.as_str()))
+            .map(|s| Route::rollout(&s.id))
             .filter(|r| {
                 *r != Route::Rollout {
                     id: props.id.clone(),
@@ -222,6 +227,7 @@ pub fn rollout_page(props: &Props) -> Html {
         });
     }
     let actions = use_rollout_actions(id.clone(), detail.set.clone());
+    let revision_actions = use_revision_actions();
     // The Plans card: Combined (the union) or By target (distinct plans).
     let plans_view = use_state(|| AttrValue::from("combined"));
 
@@ -266,6 +272,11 @@ pub fn rollout_page(props: &Props) -> Html {
         }
         <div class="rollout-meta">
             <Pill tone={rollout_state_tone(s.state)} label={rollout_state_label(s.state)} />
+            if s.reapply {
+                <span title="A rollout of the revision the fleet was already on, to correct drift">
+                    <Pill tone={Tone::Info} label="re-apply" />
+                </span>
+            }
             if let Some(f) = &d.fleet { <Changes tally={fleet_tally(f)} /> }
             <span class="muted">{ format!("{} · started {}", s.triggered_by, relative(s.started_at, now)) }</span>
             if let Some(f) = s.finished_at { <span class="muted">{ format!("finished {}", relative(f, now)) }</span> }
@@ -283,6 +294,7 @@ pub fn rollout_page(props: &Props) -> Html {
     let head_actions = html! { <>
         <Refresh loading={detail.loading} reload={{ let (a, b) = (detail.reload.clone(), plans.reload.clone()); Callback::from(move |_| { a.emit(()); b.emit(()); }) }} />
         if admin { { controls(&d, focused.map(|p| p.name.as_str()), &open) } }
+        if admin { { reapply_control(&d.summary, revisions.value().map(|v| v.as_slice()).unwrap_or(&[]), &revision_actions.open) } }
     </> };
 
     let approving: &[&RolloutPhase] = if finished { &[] } else { &wanting };
@@ -344,7 +356,32 @@ pub fn rollout_page(props: &Props) -> Html {
                 { timeline(d.events.iter().filter(|e| e.host.is_none()).collect(), s.started_at) }
             </Panel>
             { dialog }
+            { revision_actions.dialog(&[]) }
         </div>
+    }
+}
+
+/// Re-apply for the latest finished rollout of the stable revision: a new
+/// rollout of it, to correct drift.
+fn reapply_control(
+    s: &buckle_api::RolloutSummary,
+    revisions: &[buckle_api::RevisionSummary],
+    open: &Callback<RevisionAsk>,
+) -> Html {
+    let rev = revisions.iter().find(|r| r.id == s.revision);
+    let Some(rev) = rev.filter(|r| reapplicable(s, Some(r))).cloned() else {
+        return html! {};
+    };
+    let open = open.clone();
+    let items = vec![
+        MenuItem::new(
+            "Re-apply…",
+            Callback::from(move |_: MouseEvent| open.emit(RevisionAsk::Reapply(rev.clone()))),
+        )
+        .title("Roll this revision out again, to correct drift"),
+    ];
+    html! {
+        <SplitButton {items} menu_label="More rollout actions" testid="rollout-controls" />
     }
 }
 
@@ -537,7 +574,7 @@ pub(crate) fn controls(
     let standing = Standing {
         failed: failed(detail).len(),
         baking: baking(detail).len(),
-        action: detail.summary.action.is_some(),
+        no_rollback: detail.summary.action.is_some() || detail.summary.reapply,
     };
     let Some(d) = decisions(detail.summary.state, approve, standing) else {
         return html! {};
