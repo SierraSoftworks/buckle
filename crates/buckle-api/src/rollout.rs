@@ -164,6 +164,62 @@ pub struct RolloutHost {
     /// `max_failures` of a module or workload it runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<RolloutWait>,
+    /// The host's nodes the rollout takes out of scheduling around its run
+    /// (a cluster's `maintenance.drain`), one per cluster. While a node
+    /// drains the host shows as applying, and while it is handed back as
+    /// baking.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<RolloutNode>,
+}
+
+/// A host's node of a cluster, as the rollout drains it before a run that
+/// disrupts it and hands it back once the host is healthy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutNode {
+    pub cluster: String,
+    pub state: RolloutNodeState,
+    /// Why the run disrupts the node: `k3s changes and disrupts the node`,
+    /// `a change in os notifies the reboot handler os:reboot`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    /// What the cluster's steward last said, or why it was not asked yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Since when the node is in `state`.
+    pub since: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutNodeState {
+    /// Being taken out of scheduling; the run waits for it.
+    Draining,
+    /// Out of scheduling while the run applies and its checks pass.
+    Drained,
+    /// Being handed back to the scheduler; the host is healthy then.
+    Undraining,
+    /// Handed back.
+    Undrained,
+    /// The host failed (or was skipped) while its node was out of
+    /// scheduling: it stays so until the host is retried and healthy, or
+    /// an operator hands it back on the scheduler.
+    LeftDrained,
+    /// Neither drained nor handed back by the rollout: the scheduler has
+    /// no live node of the host's name, or it was out of scheduling before.
+    Unmanaged,
+}
+
+impl RolloutNodeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RolloutNodeState::Draining => "draining",
+            RolloutNodeState::Drained => "drained",
+            RolloutNodeState::Undraining => "undraining",
+            RolloutNodeState::Undrained => "undrained",
+            RolloutNodeState::LeftDrained => "left_drained",
+            RolloutNodeState::Unmanaged => "unmanaged",
+        }
+    }
 }
 
 /// What keeps a rollout target from starting.

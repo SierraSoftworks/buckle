@@ -607,6 +607,21 @@ fn validate_cluster(
             "a scoped target has no nodes of its own; declare `pools` on its cluster instead",
         );
     }
+    if decl.maintenance.is_some() {
+        if decl.cluster.is_some() {
+            report.error(
+                None,
+                format!("{location}.maintenance"),
+                "a scoped target has no nodes of its own; declare `maintenance` on its cluster instead",
+            );
+        } else if decl.nodes.is_none() {
+            report.error(
+                None,
+                format!("{location}.maintenance"),
+                "`maintenance` drains the cluster's nodes, but the cluster declares no `nodes`; add the selector choosing them",
+            );
+        }
+    }
     if let Some(trust) = &decl.trust {
         if decl.cluster.is_some() {
             report.error(
@@ -1013,6 +1028,14 @@ fleet:
     #[case::pools_on_a_scoped_target(
         &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    c: { kind: nomad, cluster: p, scope: { namespaces: [edge] }, pools: [edge] }\n")],
         "declare `pools` on its cluster"
+    )]
+    #[case::maintenance_on_a_scoped_target(
+        &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    c: { kind: nomad, cluster: p, scope: { namespaces: [edge] }, maintenance: { drain: disruptive } }\n")],
+        "declare `maintenance` on its cluster"
+    )]
+    #[case::maintenance_without_nodes(
+        &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    c: { kind: kubernetes, executors: 'true', maintenance: { drain: always } }\n")],
+        "declares no `nodes`"
     )]
     #[case::scoped_without_namespaces(
         &[("buckle.yaml", "version: 2\nfleet:\n  clusters:\n    p: { kind: nomad, nodes: 'true' }\n    c: { kind: nomad, cluster: p }\n")],

@@ -3676,6 +3676,7 @@ async fn admins_suspend_and_resume_units_by_target_or_selector() {
                 vec![crate::rollout::UNIT_PAUSE_CAPABILITY.to_owned()]
             },
             boot_id: None,
+            dns_name: None,
         });
     }
     let app = test::init_service(app(e.state.clone())).await;

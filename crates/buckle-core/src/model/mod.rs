@@ -14,7 +14,7 @@ mod workload;
 pub use action_decl::{ActionDecl, RESUME_ACTION, SUSPEND_ACTION, reserved_action};
 pub use cluster::{
     Bounds, ClusterDecl, ClusterIdentity, ClusterKind, ClusterPool, ClusterScope, ClusterTrust,
-    PoolChoice, trust_problem, yaml_scalar_text,
+    DrainPolicy, NodeMaintenance, PoolChoice, trust_problem, yaml_scalar_text,
 };
 pub use schedule::{Parsed as ParsedSchedule, ScheduleApproval, ScheduleDecl};
 pub use task_decl::{RetryPolicy, TaskDecl};
@@ -611,10 +611,24 @@ pub struct ModuleConfig {
     /// bake.
     #[serde(default, with = "humantime_serde")]
     pub bake: Option<Duration>,
+    /// What a run that changes this module disrupts beyond the module
+    /// itself: `node`, the work a cluster schedules on the host (the
+    /// scheduler's own agent, its container runtime). A rollout drains the
+    /// host's node first where the cluster's `maintenance` says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disrupts: Option<Disrupts>,
     #[serde(default)]
     pub facts: ModuleFacts,
     #[serde(default)]
     pub removal: RemovalConfig,
+}
+
+/// What a module's changes disrupt (`disrupts` in `module.yaml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Disrupts {
+    /// The work the clusters the host is a node of schedule on it.
+    Node,
 }
 
 impl ModuleConfig {

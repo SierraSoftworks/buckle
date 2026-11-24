@@ -126,6 +126,9 @@ fleet:
       pools:                                        # optional: the node pool a host joins, first match wins
         - { name: public, when: 'host.facts.tailscale.tags contains "tag:public"' }
         - home
+      maintenance:                                  # optional: drain a node around a run that disrupts it
+        drain: disruptive                           # never (default) | disruptive | always
+        deadline: 10m                               # how long its work gets to move; absent: 1h
       trust:                                        # optional: an executor running inside the cluster
         jwks_url: http://nomad.home:4646/.well-known/jwks.json
         subjects: [default/buckle-executor]
@@ -145,6 +148,7 @@ fleet:
 | `cluster`, `scope` | A [scoped target](#scoped-targets): part of another cluster, holding only the namespaces listed. |
 | `watch` | How often the steward reads the cluster when nothing wakes it: `health` (default `60s`) covers a dropped Nomad long poll, `drift` (default `10m`) re-plans the applied revision. |
 | `pools` | The [node pools](#node-pools) a host may join the cluster in. Not on a scoped target. |
+| `maintenance` | Whether a rollout [drains a host's node](#node-maintenance) before a run that disrupts it, and hands it back once the host is healthy. Needs `nodes`; not on a scoped target. |
 | `trust` | Which workload identities may speak for the cluster from inside it ([in-cluster executors](../agent/server.md#in-cluster-executors)): `jwks_url` the server reads the signing keys from, or `keys` pinned as a JWKS document; an optional `issuer`; `subjects` as `namespace/job` (Nomad, default `default/buckle-executor`) or `sub` (Kubernetes, default `system:serviceaccount:buckle-system:buckle-executor`). Not on a scoped target. |
 
 ### Scoped targets
@@ -188,6 +192,55 @@ for. The server picks; the host has no say.
 - **No match**: no token. With no `pools` at all, tokens are for the scheduler's default pool.
 - **`nodes` is not trust**: it reads what agents report, so an entry without `when` hands a token
   to any host that claims to be a node. Give every entry a `when` where joining must be earned.
+
+### Node maintenance
+
+`maintenance` has a rollout take a host's node out of scheduling before a run that would disrupt
+the work the cluster runs on it, and hand it back once the host is healthy. It is declared once,
+on the cluster; the modules say what disrupts the node, and the plan says whether a run does.
+
+```yaml
+fleet:
+  clusters:
+    labk3s:
+      kind: kubernetes
+      nodes: 'host.groups contains "k3s-server" || host.groups contains "k3s-agent"'
+      executors: 'host.groups contains "k3s-server"'
+      maintenance: { drain: disruptive, deadline: 10m }
+```
+
+```yaml
+# modules/k3s-agent/module.yaml
+name: k3s-agent
+disrupts: node   # a run that changes this module restarts what the node's pods run on
+```
+
+| `drain` | Drains the node before |
+|---|---|
+| `never` (default) | nothing: the node keeps its work through every run, as without `maintenance`. |
+| `disruptive` | a run that reboots the host, or changes a module marked [`disrupts: node`](./README.md#module-yaml). |
+| `always` | every run that changes something on the host. |
+
+- **What reboots**: a [`system.reboot`](./tasks/system.md#system-reboot) task that plans a reboot,
+  or a `system.reboot` handler a changing task notifies. A handler with `only_if` decides only when
+  it runs (after `apt.upgrade`, say), so being notified is enough. A module planned only at apply
+  time counts when it is marked, or could reboot.
+- **Nothing to change, nothing drained**: a host whose plan changes nothing is never drained,
+  whatever `drain` says.
+- **Who drains**: the cluster's [steward](#stewards), with its `node` credential, as for a
+  [`cluster.node`](./tasks/commands.md#cluster-node) task; the host holds no cluster credential.
+  The steward may be the host itself (a k3s server draining its own node).
+- **`deadline`**: how long the node's work gets to move (Nomad's drain deadline, after which it
+  stops what is left; default `1h`). The rollout waits that long, and two minutes more, for the
+  drain to finish before it fails the host. A Kubernetes drain cordons the node and asks each pod
+  to leave (not DaemonSet or static pods) once; it does not wait for the pods to be gone, and a
+  pod a disruption budget holds stays.
+- **Not a task**: a `cluster.node` task or handler that drains or undrains a node of such a
+  cluster would undo the rollout's drain in the middle of a run, so `buckle validate` refuses it.
+  Actions may still drain or undrain on demand.
+
+[Rolling out changes](../operations/rollouts.md#draining-nodes) shows what a drained host looks
+like in a rollout, and what happens when its run fails.
 
 ### Stewards
 

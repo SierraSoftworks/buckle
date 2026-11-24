@@ -20,6 +20,7 @@ mod context;
 mod executor;
 mod graph;
 pub mod loader;
+pub mod maintenance;
 mod planner;
 pub mod targets;
 pub mod task_actions;

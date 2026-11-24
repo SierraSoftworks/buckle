@@ -29,6 +29,8 @@ pub const PROGRESS_ACTIONS: &[&str] = &[
     "rollout.host.applying",
     "rollout.host.baking",
     "rollout.host.rolling_back",
+    "rollout.host.draining",
+    "rollout.host.undraining",
 ];
 
 /// Whether an entry by `actor` with `action` is a progress transition.

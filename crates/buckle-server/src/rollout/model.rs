@@ -24,6 +24,10 @@ pub enum HostPhase {
     Baseline,
     /// Baseline failed; waiting for an operator to force or skip.
     Held,
+    /// Its run disrupts a node of a cluster whose `maintenance` drains it:
+    /// the cluster's steward takes the node out of scheduling before the
+    /// Apply is sent. Nothing is applied yet.
+    Draining,
     /// Apply sent; waiting for ApplyResult.
     Applying,
     /// Applied, and the run asked for a reboot: waiting for the agent to
@@ -31,6 +35,9 @@ pub enum HostPhase {
     Rebooting,
     /// Applied; checks repeating for the bake window.
     Baking,
+    /// Applied and baked: the cluster's steward hands the node it drained
+    /// back to the scheduler before the host counts as healthy.
+    Undraining,
     /// Applied and baked.
     Healthy,
     /// Apply, bake or a local rollback failed; counts against the budget.
@@ -52,9 +59,11 @@ impl HostPhase {
             HostPhase::PlanPending => HostRolloutState::PlanPending,
             HostPhase::Planned | HostPhase::Baseline => HostRolloutState::Planned,
             HostPhase::Held => HostRolloutState::Held,
-            HostPhase::Applying | HostPhase::RollingBack => HostRolloutState::Applying,
+            HostPhase::Draining | HostPhase::Applying | HostPhase::RollingBack => {
+                HostRolloutState::Applying
+            }
             HostPhase::Rebooting => HostRolloutState::Rebooting,
-            HostPhase::Baking => HostRolloutState::Baking,
+            HostPhase::Baking | HostPhase::Undraining => HostRolloutState::Baking,
             HostPhase::Healthy => HostRolloutState::Healthy,
             HostPhase::Failed => HostRolloutState::Failed,
             HostPhase::Skipped => HostRolloutState::Skipped,
@@ -67,7 +76,12 @@ impl HostPhase {
     pub fn in_flight(self) -> bool {
         matches!(
             self,
-            HostPhase::Baseline | HostPhase::Applying | HostPhase::Rebooting | HostPhase::Baking
+            HostPhase::Baseline
+                | HostPhase::Draining
+                | HostPhase::Applying
+                | HostPhase::Rebooting
+                | HostPhase::Baking
+                | HostPhase::Undraining
         )
     }
 
@@ -90,9 +104,11 @@ impl HostPhase {
             HostPhase::Planned => "planned",
             HostPhase::Baseline => "baseline",
             HostPhase::Held => "held",
+            HostPhase::Draining => "draining",
             HostPhase::Applying => "applying",
             HostPhase::Rebooting => "rebooting",
             HostPhase::Baking => "baking",
+            HostPhase::Undraining => "undraining",
             HostPhase::Healthy => "healthy",
             HostPhase::Failed => "failed",
             HostPhase::Skipped => "skipped",
@@ -506,6 +522,105 @@ pub struct HostRuntime {
     /// the row is not baked before it answers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub confirming: bool,
+    /// The host's nodes of clusters whose `maintenance` drains them, as
+    /// this rollout drained (or left) them: one per cluster, kept across
+    /// attempts so that a node a failed attempt left drained is handed
+    /// back once a later one is healthy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<NodeHold>,
+    /// The row is draining and has yet to find out which of its nodes the
+    /// run drains (that needs its host's facts and the run's revision).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub node_check: bool,
+    /// Every node the current run drains is out of scheduling: the next
+    /// Apply goes out without draining again. Cleared once it is sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drain_ready: bool,
+}
+
+/// A host's node of a cluster that drains it around disruptive runs
+/// (`maintenance` in `fleet.clusters`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeHold {
+    pub cluster: String,
+    pub state: buckle_api::RolloutNodeState,
+    /// Why the run that drained it disrupts the node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    /// The node was in scheduling when the rollout read it before its
+    /// drain (or an earlier attempt drained it), so the rollout hands it
+    /// back. A node out of scheduling before the rollout stays so.
+    #[serde(default)]
+    pub ours: bool,
+    /// The name the scheduler knows the node by, and the host's other
+    /// verified names (see [`crate::node_ops::names`]).
+    pub node: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// The revision whose fleet declares the cluster, for the steward's
+    /// credential.
+    pub revision: String,
+    /// `maintenance.deadline`, in seconds; absent: the steward's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<u64>,
+    /// When it entered `state`.
+    pub since: DateTime<Utc>,
+    /// When the drain or undrain under way gives up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+    /// When to ask the steward next (a drain, a poll of one under way, an
+    /// undrain); absent while an answer is awaited or nothing is to ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_at: Option<DateTime<Utc>>,
+    /// The drain was started: the steward is polled until the scheduler
+    /// has moved the node's work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub started: bool,
+    /// The operation awaiting the steward's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<NodeOpWait>,
+    /// What the steward last said, or why it was not asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl NodeHold {
+    /// Out of scheduling (or on its way) by the rollout's doing: handed
+    /// back once the host is healthy.
+    pub fn held(&self) -> bool {
+        use buckle_api::RolloutNodeState as S;
+        self.ours && matches!(self.state, S::Draining | S::Drained | S::LeftDrained)
+    }
+
+    pub fn view(&self) -> buckle_api::RolloutNode {
+        buckle_api::RolloutNode {
+            cluster: self.cluster.clone(),
+            state: self.state,
+            reasons: self.reasons.clone(),
+            summary: self.summary.clone(),
+            since: self.since,
+        }
+    }
+}
+
+/// A node operation sent to a cluster's steward for a rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeOpWait {
+    /// Echoed in the steward's answer (see [`super::controller::NODE_OP_PREFIX`]).
+    pub id: String,
+    /// The only agent whose answer counts.
+    pub steward: String,
+    pub op: NodeOpKind,
+    pub sent_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeOpKind {
+    Drain,
+    /// Reads a drain under way.
+    Status,
+    Undrain,
 }
 
 /// What keeps a row from starting.
