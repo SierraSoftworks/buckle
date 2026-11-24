@@ -140,7 +140,7 @@ the host.
 | `op` | Nomad | Kubernetes |
 |---|---|---|
 | `undrain` | Stops a drain, marks the node eligible. | Uncordons the node. |
-| `drain` | Starts a drain with `deadline` (default `1h`); a node already ineligible is left alone. | Cordons the node and evicts its pods (not DaemonSet or static ones); a cordoned node is left alone. |
+| `drain` | Starts a drain with `deadline` (default `1h`); a node already ineligible is left alone. | Cordons the node, marks it with `deadline` (default `1h`) and evicts its pods (not DaemonSet or static ones); a cordoned node is left alone. A rollout's [node maintenance](../fleet.md#node-maintenance) carries the drain on until the pods are gone; a task does not wait for them. |
 | `join` | A client introduction token for the node's name, valid 10 minutes. | A bootstrap token (`<id>.<secret>`), valid 10 minutes. |
 
 <KindReference registry="tasks" kind="cluster.node" />
