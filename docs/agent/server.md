@@ -372,7 +372,9 @@ kubectl create clusterrolebinding buckle-read --clusterrole=view --group=buckle:
 A [`cluster.node`](../modules/tasks/commands.md#cluster-node) task reaches the server as
 `NodeOperation { cluster, op }`. The server checks the host against the cluster's `nodes`, picks
 a join's pool from [`pools`](../modules/fleet.md#node-pools) and hands the operation to the
-cluster's steward, which acts with a `node` credential. No host holds one.
+cluster's steward, which acts with a `node` credential. No host holds one. A rollout draining a
+node around a disruptive run ([`maintenance`](../modules/fleet.md#node-maintenance)) asks the
+same steward with the same credential, so it needs nothing more.
 
 - **Nomad**: bind `node` to a policy with `node { policy = "write" }`, which covers eligibility,
   drains and client introduction tokens:

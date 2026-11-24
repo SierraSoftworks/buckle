@@ -230,6 +230,46 @@ whole phase. **Skip bake** on a phase ends its window as well as its rows' bakes
 the rollout and its run report. **Targets** lists what changes by default; **All** in its head adds
 the unchanged hosts and workloads (`?targets=all` in the link keeps that view).
 
+### Draining nodes
+
+On a node of a cluster with [`maintenance`](../modules/fleet.md#node-maintenance), a run that
+disrupts the node (it reboots the host, or changes a module marked `disrupts: node`) goes like
+this:
+
+1. **Baseline**: the host's checks are read first, as for any host. A host held at baseline is
+   never drained.
+2. **Drain**: the row shows as applying while the cluster's steward reads the node, takes it out of
+   scheduling and the scheduler moves its work (`rollout.host.drained` on the timeline). The Apply
+   is sent only then. A node already out of scheduling before the rollout, or one the scheduler
+   does not know, is applied as it is and left so (`rollout.host.drain_skipped`).
+3. **Apply, reboot, bake**: as for any host, including waiting for the reboot to come back. The
+   node takes no work meanwhile.
+4. **Undrain**: once the bake has passed, the row shows as baking while the steward hands the node
+   back (`rollout.host.undrained`); only then is the host healthy and its slot free.
+
+The row's `nodes` (in `GET /api/v1/rollouts/{id}`) say which cluster, why the run disrupts it, and
+where the node is: `draining`, `drained`, `undraining`, `undrained`, `left_drained` or
+`unmanaged`.
+
+- **A failed drain**: one the steward refuses, or that is not done within the cluster's `deadline`
+  and two minutes, fails the host before anything is applied, against the phase's
+  `max_failures`. A node it took out of scheduling goes back.
+- **A failed run**: a host whose apply, reboot or bake fails leaves its node out of scheduling
+  (`rollout.host.node_left_drained`; the failed host's attention item says so). Retrying the host
+  hands it back once the retry is healthy, and so does rolling the host back. Skipping it leaves
+  the node drained: hand it back on the scheduler (`nomad node eligibility -enable`,
+  `kubectl uncordon`).
+- **Nothing applied**: a host skipped (or failed) before its Apply went out, and a rollout paused
+  while the host drained, hand the node back at once; a paused host drains again when it resumes.
+- **One at a time**: the drain is part of the host's run, so it holds the host's `parallel` slot
+  from the drain to the undrain, and a phase with `parallel: 1` never has two nodes out at once.
+  `bake` and `settle` work as for any host, while the node is still out; a module's `bake` (or a
+  phase's) is no longer needed to keep the next node from going down while this one's work moves
+  back, so keep it to what the checks need.
+- **Action rollouts**: an action that reboots (its task is a `system.reboot`, or it notifies a
+  reboot handler) or belongs to a module marked `disrupts: node` drains the node around it the same
+  way, and so does a schedule rolling it out.
+
 When the last phase completes, the revision is **promoted** to stable: it is what new hosts get and
 what a rollback returns to. Hosts that missed their phase (offline, held or skipped) converge in the
 **stragglers** stage, `stragglers.parallel` at a time.

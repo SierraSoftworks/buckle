@@ -158,3 +158,8 @@ the host.
   `node_ops`. Otherwise the task fails and the next run asks again. Local runs have no server.
 - **Audit**: `target.node.undrain`, `target.node.drain` and `target.node.join`, with the node and
   pool; reading a node's state while planning is not audited. A join token is never stored.
+- **Around a rollout's runs**: to drain a node before a run that reboots the host (or restarts the
+  scheduler's agent) and hand it back once the host is healthy, declare
+  [`maintenance`](../fleet.md#node-maintenance) on the cluster instead of tasks: a `drain` task
+  would keep the node drained, and an `undrain` task would hand it back before the reboot.
+  `buckle validate` refuses both for such a cluster; actions may still use them.

@@ -77,6 +77,7 @@ health:
 | `actions` | Named tasks an operator runs on demand ([below](#actions)). |
 | `health` | [Health checks](./health.md) for this module. |
 | `bake` | How long a rollout bakes a host whose run changed this module, holding its `parallel` slot and what `needs` it (see [Bake and promote](../operations/rollouts.md#_4-bake-and-promote)). Without one, a host is healthy after one passing reading. |
+| `disrupts` | `node`: a run that changes this module disrupts the work a cluster schedules on the host (the scheduler's own agent, its container runtime). A rollout drains the host's node first where the cluster's [`maintenance`](./fleet.md#node-maintenance) says so; on a host that is no cluster's node it changes nothing. |
 | `facts.provides` | Fact providers to refresh after this module applies (for example `[tailscale]`), so dependants see the new values. |
 | `removal.policy` | `cleanup` or `leave`: the default [removal](#removal) for this module's tasks. |
 
@@ -127,7 +128,9 @@ handlers:
 ```
 
 A [`system.reboot`](./tasks/system.md#system-reboot) handler reboots the host once, after the whole
-run has finished and been reported, and a rollout waits for the host to come back.
+run has finished and been reported, and a rollout waits for the host to come back. On a node of a
+cluster with [`maintenance`](./fleet.md#node-maintenance), a run that notifies one drains the node
+first.
 
 ## Actions
 
