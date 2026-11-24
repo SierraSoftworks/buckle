@@ -35,6 +35,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::Span;
 
+mod maintenance;
+pub use maintenance::NODE_OP_PREFIX;
+
 /// Tunables that are not part of the fleet's rollout policy.
 #[derive(Debug, Clone)]
 pub struct ControllerOptions {
@@ -159,6 +162,9 @@ pub struct Connected {
     pub capabilities: Vec<String>,
     /// The boot the agent is running in (`Hello.boot_id`), when it said.
     pub boot_id: Option<String>,
+    /// The host's tailnet DNS name, as the server's tailscaled verified it
+    /// for the session: a name a scheduler may know its node by.
+    pub dns_name: Option<String>,
 }
 
 /// Operator actions (design §10 "Paused offers four operator decisions").
@@ -916,6 +922,9 @@ struct Controller {
     capabilities: HashMap<String, Vec<String>>,
     /// The boot each host's current (or last) session runs in.
     boot_ids: HashMap<String, String>,
+    /// Each host's tailnet DNS name as its last session verified it, for
+    /// naming its node to a cluster's steward.
+    dns_names: HashMap<String, String>,
     /// Each cluster's steward (kv `executor/<cluster>`): the host agent
     /// holding its lease, which watches it and runs its placements. Sticky:
     /// it stays while the host qualifies.
@@ -1277,6 +1286,7 @@ impl Controller {
             online: HashSet::new(),
             capabilities: HashMap::new(),
             boot_ids: HashMap::new(),
+            dns_names: HashMap::new(),
             executors,
             executors_dirty: BTreeSet::new(),
             stewards_dirty: BTreeMap::new(),
@@ -1557,6 +1567,7 @@ impl Controller {
         }
         self.live[ri].hosts[hi].state = state;
         self.touch_host(ri, hi);
+        self.on_row_state(ri, hi, state);
         if state.finished() || state == HostPhase::Held {
             self.live[ri].host_spans.remove(&host);
             self.live[ri].hosts[hi].runtime.released = false;
@@ -1710,6 +1721,7 @@ impl Controller {
                 agent_message::Msg::Health(h) => self.on_health(&host, h),
                 agent_message::Msg::Rollback(r) => self.on_local_rollback(&host, r),
                 agent_message::Msg::RebootFailed(f) => self.on_reboot_failed(&host, f),
+                agent_message::Msg::NodeOperation(d) => self.on_node_operation(&host, d),
                 _ => {}
             },
             Input::RevisionAdded(id) => self.on_revision_added(&id).await,
@@ -1808,6 +1820,10 @@ impl Controller {
             match &c.boot_id {
                 Some(boot) => self.boot_ids.insert(c.host.clone(), boot.clone()),
                 None => self.boot_ids.remove(&c.host),
+            };
+            match &c.dns_name {
+                Some(name) => self.dns_names.insert(c.host.clone(), name.clone()),
+                None => self.dns_names.remove(&c.host),
             };
         }
         for ri in 0..self.live.len() {
@@ -5830,6 +5846,10 @@ impl Controller {
             );
             return;
         }
+        // A run that disrupts a node it runs waits for the node to drain.
+        if self.hold_for_drain(ri, hi) {
+            return;
+        }
         if let Some(action) = self.live[ri].record.runtime.action.clone() {
             self.send_action(ri, hi, &action);
             return;
@@ -6212,6 +6232,11 @@ impl Controller {
     /// moves on to that step and plans it once what the step needs is done.
     fn finish_step(&mut self, ri: usize, hi: usize) {
         self.live[ri].hosts[hi].runtime.confirming = false;
+        // A node the rollout drained goes back before the row is healthy
+        // (or waits for its next step).
+        if self.hold_for_undrain(ri, hi) {
+            return;
+        }
         let Some(next) = self.live[ri].hosts[hi].runtime.next_step().cloned() else {
             self.set_host_state(ri, hi, HostPhase::Healthy, "baked");
             return;
@@ -6370,6 +6395,7 @@ impl Controller {
                 {
                     consider(started + apply_timeout);
                 }
+                Controller::node_deadlines(h, &mut consider);
             }
         }
         next
@@ -6381,6 +6407,13 @@ impl Controller {
             chrono::Duration::from_std(self.options.disconnect_timeout).unwrap_or_default();
         let apply_timeout =
             chrono::Duration::from_std(self.options.apply_timeout).unwrap_or_default();
+        // Node operations time out in finished rollouts too: one handing a
+        // node back after a rollback stays live until it has.
+        for ri in 0..self.live.len() {
+            for hi in 0..self.live[ri].hosts.len() {
+                self.node_timeouts(ri, hi);
+            }
+        }
         for ri in 0..self.live.len() {
             if self.live[ri].record.is_terminal() && !self.live[ri].record.runtime.stragglers_open {
                 continue;
@@ -6562,6 +6595,7 @@ impl Controller {
                 }
                 self.refresh_display(ri);
             }
+            changed |= self.drive_maintenance().await;
             changed |= self.start_next_queued().await;
             if !changed {
                 break;
@@ -8084,7 +8118,12 @@ impl Controller {
                     && hosts
                         .iter()
                         .filter(|&&h| live.hosts[h].state.in_flight())
-                        .all(|&h| live.hosts[h].state == HostPhase::Baking);
+                        .all(|&h| {
+                            matches!(
+                                live.hosts[h].state,
+                                HostPhase::Baking | HostPhase::Undraining
+                            )
+                        });
                 let waiting_approval = !any_flight
                     && hosts.iter().any(|&h| {
                         matches!(live.hosts[h].state, HostPhase::Planned | HostPhase::Held)
@@ -8936,6 +8975,7 @@ impl Controller {
                 || l.record.runtime.stragglers_open
                 || l.dirty
                 || !l.dirty_hosts.is_empty()
+                || Controller::handing_back(l)
         });
         true
     }

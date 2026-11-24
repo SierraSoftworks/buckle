@@ -106,7 +106,26 @@ struct Script {
     host_changes: Option<Vec<String>>,
     /// Never answer an Apply of this workload (a deployment still followed).
     silent_workload: Option<String>,
+    /// The JSON of the agent's own plans, in place of the default.
+    plan_json: Option<Vec<u8>>,
+    /// As a steward: drains fail with this error.
+    drain_error: Option<String>,
+    /// As a steward: undrains fail with this error.
+    undrain_error: Option<String>,
+    /// As a steward: never answer node operations.
+    silent_node_ops: bool,
 }
+
+/// A node as the fake scheduler sees it.
+#[derive(Debug, Clone, Default)]
+struct FakeNode {
+    eligible: bool,
+    /// Reads of a drain under way before it is done.
+    draining: u32,
+}
+
+/// The scheduler the stewards act on, by node name.
+type Scheduler = Arc<Mutex<BTreeMap<String, FakeNode>>>;
 
 /// Report ids for the fake agents' durable action results.
 static NEXT_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -127,6 +146,9 @@ struct Harness {
     session_ids: BTreeMap<String, u64>,
     /// What the controller is started with (again after a restart).
     options: ControllerOptions,
+    scheduler: Scheduler,
+    /// How many reads a drain takes to finish.
+    drain_reads: Arc<Mutex<u32>>,
 }
 
 const KEY: [u8; 32] = [9; 32];
@@ -194,7 +216,38 @@ impl Harness {
             scripts: BTreeMap::new(),
             log: Arc::new(Mutex::new(Vec::new())),
             session_ids: BTreeMap::new(),
+            scheduler: Arc::default(),
+            drain_reads: Arc::default(),
         }
+    }
+
+    /// A live node named `name`, in scheduling unless `eligible` is false.
+    fn node(&self, name: &str, eligible: bool) {
+        self.scheduler.lock().unwrap().insert(
+            name.into(),
+            FakeNode {
+                eligible,
+                draining: 0,
+            },
+        );
+    }
+
+    /// Whether node `name` is in scheduling.
+    fn eligible(&self, name: &str) -> bool {
+        self.scheduler.lock().unwrap()[name].eligible
+    }
+
+    /// The node operations sent, as (to, op, node), in order.
+    fn node_ops(&self) -> Vec<(String, pb::NodeOp, String)> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, to, m)| match m {
+                SMsg::NodeOperation(n) => Some((to.clone(), n.op(), n.node.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Stops the controller and starts a fresh one from the store.
@@ -359,6 +412,8 @@ impl Harness {
         let log = self.log.clone();
         let clock = self.clock.clone();
         let name = host.to_owned();
+        let scheduler = self.scheduler.clone();
+        let drain_reads = self.drain_reads.clone();
         tokio::spawn(async move {
             while let Some(m) = rx.recv().await {
                 let Some(m) = m.msg else { continue };
@@ -396,6 +451,9 @@ impl Harness {
                         },
                         plan_json: match (&s.target_changes, &s.host_changes) {
                             (Some(w), _) if !p.target.is_empty() => plan_json_changing(w),
+                            _ if p.target.is_empty() && s.plan_json.is_some() => {
+                                s.plan_json.clone().unwrap_or_default()
+                            }
                             (_, Some(m)) if p.target.is_empty() => plan_json_changing(m),
                             _ => b"{}".to_vec(),
                         },
@@ -621,6 +679,60 @@ impl Harness {
                             }),
                         ));
                     }
+                    SMsg::NodeOperation(_) if s.silent_node_ops => {}
+                    SMsg::NodeOperation(op) => {
+                        use pb::NodeOp;
+                        let kind = op.op();
+                        let failure = match kind {
+                            NodeOp::Drain => s.drain_error.clone(),
+                            NodeOp::Undrain => s.undrain_error.clone(),
+                            _ => None,
+                        };
+                        let result = match failure {
+                            Some(_) => None,
+                            None => {
+                                let mut nodes = scheduler.lock().unwrap();
+                                Some(match nodes.get_mut(&op.node) {
+                                    None => pb::NodeOperationResult {
+                                        summary: format!("no live node named {}", op.node),
+                                        ..Default::default()
+                                    },
+                                    Some(n) => {
+                                        let changed = match kind {
+                                            NodeOp::Drain if n.eligible => {
+                                                n.eligible = false;
+                                                n.draining = *drain_reads.lock().unwrap();
+                                                true
+                                            }
+                                            NodeOp::Undrain if !n.eligible || n.draining > 0 => {
+                                                n.eligible = true;
+                                                n.draining = 0;
+                                                true
+                                            }
+                                            NodeOp::Status => {
+                                                n.draining = n.draining.saturating_sub(1);
+                                                false
+                                            }
+                                            _ => false,
+                                        };
+                                        pb::NodeOperationResult {
+                                            registered: true,
+                                            eligible: n.eligible,
+                                            draining: n.draining > 0,
+                                            changed,
+                                            summary: format!("{kind:?} {}", op.node),
+                                            ..Default::default()
+                                        }
+                                    }
+                                })
+                            }
+                        };
+                        reply(AMsg::NodeOperation(pb::NodeOperationDone {
+                            op_id: op.op_id,
+                            result,
+                            error: failure.unwrap_or_default(),
+                        }));
+                    }
                     SMsg::Rollback(_) if s.silent_rollback => {}
                     SMsg::Rollback(r) => reply(AMsg::Result(ApplyResult {
                         target: r.target.clone(),
@@ -676,6 +788,7 @@ impl Harness {
                 .collect()
             },
             boot_id: self.scripts[host].lock().unwrap().boot_id.clone(),
+            dns_name: None,
         });
     }
 
@@ -7394,4 +7507,531 @@ fn a_server_knows_its_placement_from_its_environment(
             .map(|o| (o.target.as_str(), o.workload.as_str())),
         expected
     );
+}
+
+// ---------------------------------------------------------------- node maintenance
+
+/// `home-nomad` takes its nodes (the `nomad` tier) out of scheduling
+/// around a run that disrupts them (`maintenance.drain: POLICY`).
+fn maintained(policy: &str) -> String {
+    format!(
+        "  clusters:\n    home-nomad:\n      kind: nomad\n      nodes: 'host.groups contains \"nomad\"'\n      maintenance: {{ drain: {policy}, deadline: 10m }}\n"
+    )
+}
+
+/// One host at a time, each baking 30s.
+const ONE_BY_ONE: &str =
+    "  health: { bake: 30s }\n  phases:\n    - { name: all, select: 'true', parallel: 1 }\n";
+
+/// `nomad-agent` disrupts the node's work; `web` does not; `os` notifies a
+/// reboot handler, and offers an action that does.
+const NODE_MODULES: &[(&str, &str)] = &[
+    (
+        "modules/nomad-agent/module.yaml",
+        "name: nomad-agent\ndisrupts: node\nwhen: 'host.groups contains \"nomad\"'\n",
+    ),
+    ("modules/web/module.yaml", "name: web\n"),
+    (
+        "modules/os/module.yaml",
+        "name: os\nhandlers:\n  reboot: { system.reboot: { only_if: test -f /run/reboot-required } }\nactions:\n  upgrade:\n    apt.upgrade: {}\n    notify: [reboot]\n  status: { command.run: { run: uptime } }\n",
+    ),
+];
+
+/// A plan whose `os` change notifies the module's reboot handler.
+fn plan_json_rebooting() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "revision": "r1", "host": "n2", "digest": "d",
+        "modules": [{
+            "module": "os",
+            "steps": [{
+                "task": {"module": "os", "id": "curl", "kind": "apt.package"},
+                "resource": {"module": "os", "kind": "apt.package", "key": "curl"},
+                "planned": {"outcome": "change", "diff": {"kind": "opaque", "summary": "install curl"}},
+                "notifies": ["reboot"],
+            }],
+            "handlers": [{"module": "os", "handler": "reboot", "kind": "system.reboot", "summary": "reboot (no change)"}],
+        }],
+    }))
+    .unwrap()
+}
+
+/// Nodes n1 (the cluster's steward, by name) and n2, live and in
+/// scheduling, under `policy`; the hosts' plans change `changes`.
+async fn node_fleet(policy: &str, changes: &[&str]) -> Harness {
+    let mut h = Harness::new().await;
+    h.revision_with("r1", ONE_BY_ONE, &maintained(policy), NODE_MODULES)
+        .await;
+    for n in ["n1", "n2"] {
+        h.enrol(n, "nomad").await;
+        h.node(n, true);
+        let changes: Vec<String> = changes.iter().map(|c| c.to_string()).collect();
+        h.script(n, |s| s.host_changes = Some(changes));
+        h.connect(n, None);
+    }
+    h
+}
+
+fn node_of<'a>(row: &'a RolloutHostRecord, cluster: &str) -> &'a super::model::NodeHold {
+    row.runtime
+        .nodes
+        .iter()
+        .find(|n| n.cluster == cluster)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} holds no node of {cluster}: {:?}",
+                row.host, row.runtime.nodes
+            )
+        })
+}
+
+/// Where in the log `pred` first holds.
+fn first_sent(h: &Harness, pred: impl Fn(&str, &SMsg) -> bool) -> Option<usize> {
+    h.log
+        .lock()
+        .unwrap()
+        .iter()
+        .position(|(_, to, m)| pred(to, m))
+}
+
+fn last_position(h: &Harness, pred: impl Fn(&str, &SMsg) -> bool) -> Option<usize> {
+    h.log
+        .lock()
+        .unwrap()
+        .iter()
+        .rposition(|(_, to, m)| pred(to, m))
+}
+
+fn node_op_for(m: &SMsg, node: &str, op: pb::NodeOp) -> bool {
+    matches!(m, SMsg::NodeOperation(n) if n.node == node && n.op() == op)
+}
+
+/// A run that changes a module marked `disrupts: node` drains the node
+/// through the cluster's steward before its Apply, and hands it back only
+/// after its bake checks passed, before the host counts as healthy.
+#[tokio::test(start_paused = true)]
+async fn a_disruptive_run_drains_its_node_first_and_hands_it_back_once_healthy() {
+    let h = node_fleet("disruptive", &["nomad-agent"]).await;
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+
+    for n in ["n1", "n2"] {
+        let row = host(&hosts, n);
+        assert_eq!(row.state, HostPhase::Healthy);
+        let node = node_of(row, CLUSTER);
+        assert_eq!(node.state, buckle_api::RolloutNodeState::Undrained);
+        assert_eq!(node.reasons, ["nomad-agent changes and disrupts the node"]);
+        assert!(h.eligible(n), "{n} is back in scheduling");
+        // Read, drained, applied, baked, handed back: in that order.
+        let read = first_sent(&h, |_, m| node_op_for(m, n, pb::NodeOp::Status)).unwrap();
+        let drain = first_sent(&h, |_, m| node_op_for(m, n, pb::NodeOp::Drain)).unwrap();
+        let apply = first_sent(&h, |to, m| to == n && matches!(m, SMsg::Apply(_))).unwrap();
+        let bake = last_position(&h, |to, m| {
+            to == n && matches!(m, SMsg::Health(x) if x.scope == HealthScope::Bake as i32)
+        })
+        .unwrap();
+        let undrain = first_sent(&h, |_, m| node_op_for(m, n, pb::NodeOp::Undrain)).unwrap();
+        assert!(read < drain && drain < apply, "drained before the apply");
+        assert!(bake < undrain, "handed back only after its bake checks");
+    }
+    // Every operation went to the steward, n1, which drained itself too.
+    assert!(h.node_ops().iter().all(|(to, _, _)| to == "n1"));
+    // One host at a time: n2's node is drained only once n1's is back.
+    let n1_back = first_sent(&h, |_, m| node_op_for(m, "n1", pb::NodeOp::Undrain)).unwrap();
+    let n2_drain = first_sent(&h, |_, m| node_op_for(m, "n2", pb::NodeOp::Drain)).unwrap();
+    assert!(n1_back < n2_drain);
+    let actions = h.audit_actions(&id).await;
+    for action in ["rollout.host.drained", "rollout.host.undrained"] {
+        assert_eq!(
+            actions.iter().filter(|a| *a == action).count(),
+            2,
+            "{action} once per host in {actions:?}"
+        );
+    }
+}
+
+/// Only what the cluster's `drain` takes is drained: never a run that
+/// changes nothing, `disruptive` only a run that reboots or changes a
+/// marked module, `always` any run that changes something.
+#[rstest::rstest]
+#[case::harmless_change("disruptive", &["web"], false)]
+#[case::marked_module("disruptive", &["nomad-agent"], true)]
+#[case::never("never", &["nomad-agent"], false)]
+#[case::always("always", &["web"], true)]
+#[case::always_but_unchanged("always", &[], false)]
+#[tokio::test(start_paused = true)]
+async fn a_node_is_drained_only_for_a_run_its_cluster_drains_for(
+    #[case] policy: &str,
+    #[case] changes: &[&str],
+    #[case] drains: bool,
+) {
+    let h = node_fleet(policy, changes).await;
+    if changes.is_empty() {
+        for n in ["n1", "n2"] {
+            h.script(n, |s| s.unchanged = true);
+        }
+    }
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    let drained: Vec<String> = h
+        .node_ops()
+        .into_iter()
+        .filter(|(_, op, _)| *op == pb::NodeOp::Drain)
+        .map(|(_, _, node)| node)
+        .collect();
+    assert_eq!(drained.len(), if drains { 2 } else { 0 }, "{drained:?}");
+    assert!(h.eligible("n1") && h.eligible("n2"));
+    let marked = hosts
+        .iter()
+        .filter(|x| x.runtime.kind == TargetKind::Host)
+        .all(|x| x.runtime.nodes.is_empty() != drains);
+    assert!(
+        marked,
+        "{:#?}",
+        hosts.iter().map(|x| &x.runtime.nodes).collect::<Vec<_>>()
+    );
+}
+
+/// A change that notifies a reboot handler drains the node: the handler
+/// may still find nothing to do when it runs, which the plan cannot know.
+#[tokio::test(start_paused = true)]
+async fn a_change_that_notifies_a_reboot_handler_drains_the_node() {
+    let h = node_fleet("disruptive", &[]).await;
+    for n in ["n1", "n2"] {
+        h.script(n, |s| {
+            s.host_changes = None;
+            s.plan_json = Some(plan_json_rebooting());
+        });
+    }
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let node = node_of(host(&hosts, "n2"), CLUSTER);
+    assert_eq!(
+        node.reasons,
+        ["a change in os notifies the reboot handler os:reboot"]
+    );
+    assert_eq!(node.state, buckle_api::RolloutNodeState::Undrained);
+}
+
+/// A drain the steward cannot carry out fails the host before anything is
+/// applied, against the phase's budget; what it may have taken goes back.
+#[tokio::test(start_paused = true)]
+async fn a_drain_that_fails_fails_the_host_before_anything_is_applied() {
+    let h = node_fleet("disruptive", &["nomad-agent"]).await;
+    h.script("n1", |s| {
+        s.drain_error = Some("Permission denied: node:write".into())
+    });
+    let id = h.start("r1").await;
+    let (r, hosts) = h.wait_state(&id, RolloutState::Paused).await;
+    assert_eq!(r.runtime.pause.as_ref().unwrap().kind, "failure_budget");
+    let n1 = host(&hosts, "n1");
+    assert_eq!(n1.state, HostPhase::Failed);
+    let error = n1.runtime.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("could not drain its node on home-nomad")
+            && error.contains("node:write")
+            && error.contains("nothing was applied"),
+        "{error}"
+    );
+    assert!(!n1.runtime.applied);
+    assert!(
+        first_sent(&h, |_, m| matches!(m, SMsg::Apply(_))).is_none(),
+        "nothing was applied anywhere"
+    );
+    // The node was in scheduling when it was read: it is handed back.
+    h.wait(&id, "the node handed back", |_, hs| {
+        node_of(host(hs, "n1"), CLUSTER).state == buckle_api::RolloutNodeState::Undrained
+    })
+    .await;
+    assert!(h.eligible("n1"));
+}
+
+/// A drain under way is read until the scheduler has moved the node's
+/// work: only then does the Apply go out.
+#[tokio::test(start_paused = true)]
+async fn the_apply_waits_for_the_drain_to_finish() {
+    let h = node_fleet("disruptive", &["nomad-agent"]).await;
+    *h.drain_reads.lock().unwrap() = 3;
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::Completed).await;
+    let ops: Vec<pb::NodeOp> = h
+        .node_ops()
+        .into_iter()
+        .filter(|(_, _, node)| node == "n1")
+        .map(|(_, op, _)| op)
+        .collect();
+    use pb::NodeOp::{Drain, Status, Undrain};
+    assert_eq!(ops, [Status, Drain, Status, Status, Status, Undrain]);
+    let last_read = last_position(&h, |_, m| node_op_for(m, "n1", Status)).unwrap();
+    let apply = first_sent(&h, |to, m| to == "n1" && matches!(m, SMsg::Apply(_))).unwrap();
+    assert!(last_read < apply);
+}
+
+/// A run whose checks fail leaves its node drained, says so, and does not
+/// hand it back; the retry that is healthy does.
+#[tokio::test(start_paused = true)]
+async fn a_host_that_fails_its_bake_leaves_its_node_drained_until_a_retry_is_healthy() {
+    let h = node_fleet("disruptive", &["nomad-agent"]).await;
+    h.script("n1", |s| s.bake_fail = true);
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "n1 failed", |_, hs| {
+            host(hs, "n1").state == HostPhase::Failed
+        })
+        .await;
+    let node = node_of(host(&hosts, "n1"), CLUSTER);
+    assert_eq!(node.state, buckle_api::RolloutNodeState::LeftDrained);
+    assert!(!h.eligible("n1"), "still out of scheduling");
+    assert!(first_sent(&h, |_, m| node_op_for(m, "n1", pb::NodeOp::Undrain)).is_none());
+    let actions = h.audit_actions(&id).await;
+    assert!(
+        actions
+            .iter()
+            .any(|a| a == "rollout.host.node_left_drained"),
+        "{actions:?}"
+    );
+
+    h.script("n1", |s| s.bake_fail = false);
+    h.command(Command::Retry {
+        rollout: id.clone(),
+        host: "n1".into(),
+        workload: String::new(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "n1 healthy", |_, hs| {
+        host(hs, "n1").state == HostPhase::Healthy
+    })
+    .await;
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(
+        node_of(host(&hosts, "n1"), CLUSTER).state,
+        buckle_api::RolloutNodeState::Undrained
+    );
+    assert!(h.eligible("n1"));
+}
+
+/// A node already out of scheduling before the run (an operator drained
+/// it) is applied as it is and left so; one the scheduler does not know
+/// has nothing to drain.
+#[rstest::rstest]
+#[case::drained_by_hand(true)]
+#[case::not_a_live_node(false)]
+#[tokio::test(start_paused = true)]
+async fn a_node_the_rollout_did_not_drain_is_left_as_it_was(#[case] known: bool) {
+    let h = node_fleet("disruptive", &["nomad-agent"]).await;
+    if known {
+        h.node("n2", false);
+    } else {
+        h.scheduler.lock().unwrap().remove("n2");
+    }
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let n2 = host(&hosts, "n2");
+    assert_eq!(n2.state, HostPhase::Healthy);
+    let node = node_of(n2, CLUSTER);
+    assert_eq!(node.state, buckle_api::RolloutNodeState::Unmanaged);
+    let ops: Vec<pb::NodeOp> = h
+        .node_ops()
+        .into_iter()
+        .filter(|(_, _, node)| node == "n2")
+        .map(|(_, op, _)| op)
+        .collect();
+    assert_eq!(ops, [pb::NodeOp::Status], "read, and nothing else");
+    if known {
+        assert!(!h.eligible("n2"), "still drained by hand");
+    }
+    assert!(
+        h.audit_actions(&id)
+            .await
+            .iter()
+            .any(|a| a == "rollout.host.drain_skipped")
+    );
+}
+
+/// Without a steward that can act on nodes the drain waits, and the host
+/// fails once the wait gives up, with nothing applied.
+#[tokio::test(start_paused = true)]
+async fn a_drain_no_steward_takes_fails_the_host_once_its_wait_gives_up() {
+    let h = node_fleet("disruptive", &["nomad-agent"]).await;
+    h.script("n1", |s| s.silent_node_ops = true);
+    let id = h.start("r1").await;
+    let (_, hosts) = h
+        .wait(&id, "n1 failed", |_, hs| {
+            host(hs, "n1").state == HostPhase::Failed
+        })
+        .await;
+    let n1 = host(&hosts, "n1");
+    assert!(
+        n1.runtime
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("could not drain") && e.contains("nothing was applied")),
+        "{:?}",
+        n1.runtime.error
+    );
+    assert!(first_sent(&h, |_, m| matches!(m, SMsg::Apply(_))).is_none());
+    // Asked again after each unanswered try, then given up at the deadline
+    // (10m) and its grace.
+    let reads = h
+        .node_ops()
+        .iter()
+        .filter(|(_, op, node)| node == "n1" && *op == pb::NodeOp::Status)
+        .count();
+    assert!(reads > 1, "{reads}");
+}
+
+/// An action rollout whose action notifies a reboot handler drains each
+/// target's node around the action; one that does not, never.
+#[rstest::rstest]
+#[case::reboots("upgrade", true)]
+#[case::harmless("status", false)]
+#[tokio::test(start_paused = true)]
+async fn an_action_that_reboots_drains_the_node_around_it(
+    #[case] action: &str,
+    #[case] drains: bool,
+) {
+    let h = node_fleet("disruptive", &["web"]).await;
+    let id = h.start("r1").await;
+    h.wait_state(&id, RolloutState::Completed).await;
+    assert!(h.node_ops().is_empty(), "the revision changed only web");
+
+    let id = h
+        .command(Command::StartAction {
+            action: RolloutAction {
+                module: "os".into(),
+                action: action.into(),
+                label: "Upgrade packages".into(),
+                confirm: false,
+                selector: None,
+                instances: None,
+                schedule: None,
+                auto_approve: false,
+            },
+            targets: [("n2".to_string(), "r1".to_string())].into(),
+            note: String::new(),
+        })
+        .await
+        .unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let n2 = host(&hosts, "n2");
+    assert_eq!(n2.state, HostPhase::Healthy);
+    let drain = first_sent(&h, |_, m| node_op_for(m, "n2", pb::NodeOp::Drain));
+    assert_eq!(drain.is_some(), drains);
+    if drains {
+        let run = first_sent(&h, |to, m| to == "n2" && matches!(m, SMsg::Action(_))).unwrap();
+        let undrain = first_sent(&h, |_, m| node_op_for(m, "n2", pb::NodeOp::Undrain)).unwrap();
+        assert!(drain.unwrap() < run && run < undrain);
+        assert_eq!(
+            node_of(n2, CLUSTER).reasons,
+            ["os/upgrade notifies the reboot handler os:reboot"]
+        );
+    }
+    assert!(h.eligible("n2"));
+}
+
+/// Rolled back after its run failed, a host's node goes back.
+#[tokio::test(start_paused = true)]
+async fn a_rollback_hands_back_the_node_its_failed_run_left_drained() {
+    let mut h = Harness::new().await;
+    h.revision_with("r0", ONE_BY_ONE, &maintained("disruptive"), NODE_MODULES)
+        .await;
+    h.revision_with(
+        "r1",
+        &format!("  on_failure: rollback\n{ONE_BY_ONE}"),
+        &maintained("disruptive"),
+        NODE_MODULES,
+    )
+    .await;
+    h.stable("r0").await;
+    for n in ["n1", "n2"] {
+        h.enrol(n, "nomad").await;
+        h.node(n, true);
+        h.script(n, |s| s.host_changes = Some(vec!["nomad-agent".into()]));
+        h.connect(n, Some("r0"));
+    }
+    h.script("n1", |s| s.bake_fail = true);
+    let id = h.start("r1").await;
+    let (_, hosts) = h.wait_state(&id, RolloutState::RolledBack).await;
+    let n1 = host(&hosts, "n1");
+    assert_eq!(n1.state, HostPhase::RolledBack);
+    h.idle(60).await;
+    let (_, hosts) = h.snapshot(&id).await;
+    assert_eq!(
+        node_of(host(&hosts, "n1"), CLUSTER).state,
+        buckle_api::RolloutNodeState::Undrained
+    );
+    assert!(h.eligible("n1"));
+}
+
+/// A server restart in the middle of a drain loses nothing: the drain is
+/// read again once its answer is overdue, and the run goes on.
+#[tokio::test(start_paused = true)]
+async fn a_drain_survives_a_server_restart() {
+    let mut h = node_fleet("disruptive", &["nomad-agent"]).await;
+    *h.drain_reads.lock().unwrap() = 1000;
+    let id = h.start("r1").await;
+    h.wait(&id, "n1 draining", |_, hs| {
+        let n1 = host(hs, "n1");
+        n1.state == HostPhase::Draining && n1.runtime.nodes.iter().any(|n| n.started)
+    })
+    .await;
+    h.restart().await;
+    for n in ["n1", "n2"] {
+        h.connect(n, None);
+    }
+    // The scheduler finishes the drain while the server is away.
+    h.scheduler.lock().unwrap().get_mut("n1").unwrap().draining = 0;
+    *h.drain_reads.lock().unwrap() = 0;
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    let n1 = host(&hosts, "n1");
+    assert_eq!(n1.state, HostPhase::Healthy);
+    assert_eq!(
+        node_of(n1, CLUSTER).state,
+        buckle_api::RolloutNodeState::Undrained
+    );
+    assert!(h.eligible("n1"));
+}
+
+/// Paused while its node drains, a host applies nothing and hands the
+/// node back; resumed, it drains again and goes on.
+#[tokio::test(start_paused = true)]
+async fn a_pause_during_a_drain_hands_the_node_back() {
+    let h = node_fleet("disruptive", &["nomad-agent"]).await;
+    *h.drain_reads.lock().unwrap() = 3;
+    let id = h.start("r1").await;
+    h.wait(&id, "n1 draining", |_, hs| {
+        host(hs, "n1").state == HostPhase::Draining
+    })
+    .await;
+    h.command(Command::Pause {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    h.wait(&id, "n1 handed back", |_, hs| {
+        let n1 = host(hs, "n1");
+        n1.state == HostPhase::Planned
+            && node_of(n1, CLUSTER).state == buckle_api::RolloutNodeState::Undrained
+    })
+    .await;
+    assert!(h.eligible("n1"));
+    assert!(first_sent(&h, |_, m| matches!(m, SMsg::Apply(_))).is_none());
+    h.command(Command::Resume {
+        rollout: id.clone(),
+        note: String::new(),
+    })
+    .await
+    .unwrap();
+    let (_, hosts) = h.wait_state(&id, RolloutState::Completed).await;
+    assert!(hosts.iter().all(|x| x.state == HostPhase::Healthy));
+    let drains = h
+        .node_ops()
+        .iter()
+        .filter(|(_, op, node)| node == "n1" && *op == pb::NodeOp::Drain)
+        .count();
+    assert_eq!(drains, 2, "drained again once resumed");
+    assert!(h.eligible("n1"));
 }

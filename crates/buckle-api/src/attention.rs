@@ -384,6 +384,20 @@ pub fn build(inputs: &AttentionInputs<'_>, now: DateTime<Utc>) -> Vec<AttentionI
                     key.push_str(w);
                     summary = format!("{w} {summary}");
                 }
+                // A node the rollout drained stays out of scheduling until
+                // the host is healthy: say so where someone will look.
+                let drained: Vec<&str> = entry
+                    .nodes
+                    .iter()
+                    .filter(|n| n.state == crate::RolloutNodeState::LeftDrained)
+                    .map(|n| n.cluster.as_str())
+                    .collect();
+                if !drained.is_empty() {
+                    summary = format!(
+                        "{summary}; its node stays drained on {}",
+                        drained.join(", ")
+                    );
+                }
                 let item = AttentionItem::new(kind, tone, subject, &key, summary)
                     .since(Some(entry.updated_at));
                 if !out.iter().any(|i| i.id == item.id) {
@@ -645,6 +659,7 @@ mod tests {
             needs_attention: false,
             error_detail: None,
             run_id: None,
+            nodes: vec![],
         }
     }
 
@@ -759,6 +774,37 @@ mod tests {
         assert_eq!(list[1].summary, "agent 1.9.0, expected 2.0.0");
         assert_eq!(list[3].since, Some(now - Duration::minutes(25)));
         assert_eq!(list[0].path().as_deref(), Some("/hosts/pi-5"));
+    }
+
+    #[test]
+    fn a_failed_host_says_its_node_stays_drained() {
+        let now = Utc::now();
+        let mut failed = entry("pi-5", HostRolloutState::Failed, false);
+        failed.nodes = vec![crate::RolloutNode {
+            cluster: "labk3s".into(),
+            state: crate::RolloutNodeState::LeftDrained,
+            reasons: vec!["k3s changes and disrupts the node".into()],
+            summary: None,
+            since: now,
+        }];
+        let r = rollout(RolloutState::Paused, vec![failed]);
+        let hosts = [host("pi-5")];
+        let list = build(
+            &AttentionInputs {
+                hosts: &hosts,
+                rollout: Some(&r),
+                ..Default::default()
+            },
+            now,
+        );
+        let item = list
+            .iter()
+            .find(|i| i.id == "host/pi-5/failed/42/home")
+            .expect("the failed host is listed");
+        assert_eq!(
+            item.summary,
+            "failed in home; its node stays drained on labk3s"
+        );
     }
 
     #[test]

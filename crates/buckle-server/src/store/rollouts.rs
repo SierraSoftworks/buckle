@@ -403,7 +403,7 @@ impl<'c> Rollouts<'c> {
     pub fn applying_with_plan(&self, host: &str, plan_digest: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT rh.rollout FROM rollout_hosts rh JOIN rollouts r ON r.id = rh.rollout WHERE rh.host = ?1 AND rh.plan_digest = ?2 AND rh.state IN ('planned', 'baseline', 'held', 'applying', 'rolling_back') ORDER BY r.started_at DESC, rh.rowid DESC LIMIT 1",
+                "SELECT rh.rollout FROM rollout_hosts rh JOIN rollouts r ON r.id = rh.rollout WHERE rh.host = ?1 AND rh.plan_digest = ?2 AND rh.state IN ('planned', 'baseline', 'held', 'draining', 'applying', 'rolling_back') ORDER BY r.started_at DESC, rh.rowid DESC LIMIT 1",
                 params![host, plan_digest],
                 |r| r.get(0),
             )

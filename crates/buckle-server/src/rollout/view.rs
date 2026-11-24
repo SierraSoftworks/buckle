@@ -131,6 +131,7 @@ pub fn host(
                 kind: w.kind.api(),
                 reason: w.reason.clone(),
             }),
+        nodes: h.runtime.nodes.iter().map(|n| n.view()).collect(),
     }
 }
 

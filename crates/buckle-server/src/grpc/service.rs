@@ -880,10 +880,15 @@ impl FleetService {
     /// caller [`Self::caller`] identified: `None` off a tailnet, and for a
     /// caller known by a token.
     async fn tailnet_name<T>(&self, request: &Request<T>, host: &str) -> Option<String> {
+        self.tailnet_name_at(&Peer::of(request), host).await
+    }
+
+    /// [`Self::tailnet_name`] for a connection already accepted.
+    async fn tailnet_name_at(&self, conn: &Peer, host: &str) -> Option<String> {
         if !self.uses(AgentAuth::Tailscale) {
             return None;
         }
-        let (peer, whois) = (Peer::of(request).addr?, self.whois.as_ref()?);
+        let (peer, whois) = (conn.addr?, self.whois.as_ref()?);
         if !whois.covers(&peer) {
             return None;
         }
@@ -1269,6 +1274,16 @@ impl FleetService {
         // A steward's answer to a node operation goes to the call waiting
         // for it and nowhere else: it may carry a join token.
         let msg = match msg {
+            // Answers to the rollouts' own operations (a node drained
+            // around a disruptive run) go to the controller, which checks
+            // they come from the steward it asked.
+            agent_message::Msg::NodeOperation(done)
+                if done.op_id.starts_with(crate::rollout::NODE_OP_PREFIX) =>
+            {
+                self.controller
+                    .agent_message(host, agent_message::Msg::NodeOperation(done));
+                return;
+            }
             agent_message::Msg::NodeOperation(done) => {
                 let outcome = match done.result {
                     Some(result) if done.error.is_empty() => Ok(result),
@@ -2116,6 +2131,7 @@ impl Fleet for FleetService {
             new_session: true,
             capabilities: hello.capabilities.clone(),
             boot_id: (!hello.boot_id.is_empty()).then(|| hello.boot_id.clone()),
+            dns_name: self.tailnet_name_at(&conn, &host).await,
         });
         self.publish_host(&host).await;
 

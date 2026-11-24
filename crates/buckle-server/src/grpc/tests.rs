@@ -76,6 +76,7 @@ struct Server {
     guard: Arc<SessionGuard>,
     upgrades: Arc<crate::upgrades::AgentUpgrades>,
     joins: Arc<crate::join::Joins>,
+    node_ops: Arc<crate::node_ops::NodeOps>,
     cancel: CancellationToken,
 }
 
@@ -120,6 +121,7 @@ async fn server_full(
     agents: AgentsConfig,
 ) -> Server {
     let guard = Arc::new(guard);
+    let node_ops = Arc::new(crate::node_ops::NodeOps::default());
     let data = tempfile::tempdir().unwrap();
     let store = Store::in_memory().await.unwrap();
     let sessions = Arc::new(Sessions::new());
@@ -177,7 +179,7 @@ async fn server_full(
             .unwrap(),
         ),
         workload: Default::default(),
-        node_ops: Default::default(),
+        node_ops: node_ops.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -191,6 +193,7 @@ async fn server_full(
         guard,
         upgrades,
         joins,
+        node_ops,
         cancel,
     }
 }
@@ -1932,6 +1935,43 @@ async fn a_node_operation_is_answered_by_the_clusters_steward(
     let result = asking.await.unwrap().expect("answered");
     assert!(result.changed && result.eligible);
     assert_eq!(result.summary, "handed pi-1 back");
+}
+
+/// The answers to a rollout's own node operations (a node drained around
+/// a disruptive run) go to the rollout controller: whatever their id, they
+/// never answer a host's `NodeOperation` call, which may carry a token.
+#[rstest::rstest]
+#[case::a_hosts_call("op-1", true)]
+#[case::a_rollouts_drain("rollout-node:op-1", false)]
+#[tokio::test]
+async fn a_rollouts_node_operation_is_answered_to_the_controller(
+    #[case] op_id: &str,
+    #[case] reaches_the_call: bool,
+) {
+    let (s, token) = identity_host(&[("role", "server"), ("nomad", "true")]).await;
+    let (tx, _stream, reply) = open(s.addr, hello("pi-1", &token, "2.0.0")).await;
+    expect_welcome(reply);
+    let mut waiting = s.node_ops.open(op_id);
+    s.node_ops.sent_to(op_id, "pi-1");
+    tx.send(AgentMessage {
+        msg: Some(agent_message::Msg::NodeOperation(
+            buckle_proto::v1::NodeOperationDone {
+                op_id: op_id.into(),
+                result: Some(buckle_proto::v1::NodeOperationResult {
+                    registered: true,
+                    summary: "drained pi-1".into(),
+                    ..Default::default()
+                }),
+                error: String::new(),
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    let answered = tokio::time::timeout(std::time::Duration::from_millis(500), &mut waiting)
+        .await
+        .is_ok();
+    assert_eq!(answered, reaches_the_call);
 }
 
 #[rstest::rstest]
