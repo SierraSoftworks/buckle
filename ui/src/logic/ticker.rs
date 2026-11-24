@@ -75,9 +75,11 @@ pub fn transition(kind: &str) -> Option<HostRolloutState> {
         "plan_pending" => HostRolloutState::PlanPending,
         "planned" | "baseline" => HostRolloutState::Planned,
         "held" => HostRolloutState::Held,
-        "applying" | "rolling_back" => HostRolloutState::Applying,
+        // Draining the host's node comes before its apply, handing it back
+        // after its bake: the API shows them as applying and baking.
+        "draining" | "applying" | "rolling_back" => HostRolloutState::Applying,
         "rebooting" => HostRolloutState::Rebooting,
-        "baking" | "rebooted" => HostRolloutState::Baking,
+        "baking" | "rebooted" | "undraining" => HostRolloutState::Baking,
         "healthy" => HostRolloutState::Healthy,
         "failed" => HostRolloutState::Failed,
         "skipped" => HostRolloutState::Skipped,
@@ -262,6 +264,9 @@ mod tests {
                 Some(HostRolloutState::RolledBack),
             ),
             ("rollout.host.baseline", Some(HostRolloutState::Planned)),
+            ("rollout.host.draining", Some(HostRolloutState::Applying)),
+            ("rollout.host.undraining", Some(HostRolloutState::Baking)),
+            ("rollout.host.drained", None),
             ("rollout.host.skip", None),
             ("rollout.host.retry", None),
             ("rollout.paused", None),

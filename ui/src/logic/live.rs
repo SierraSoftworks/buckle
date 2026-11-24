@@ -457,6 +457,7 @@ mod tests {
             earlier: vec![],
             total: None,
             waiting: None,
+            nodes: vec![],
             needs_approval: false,
             needs_attention: false,
             error_detail: None,

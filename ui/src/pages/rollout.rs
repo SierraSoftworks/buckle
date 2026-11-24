@@ -1218,6 +1218,7 @@ fn tone_of_event(kind: &str) -> Tone {
         || kind.contains("check_failing")
         || kind.contains("lost")
         || kind.contains("skip")
+        || kind.contains("left_drained")
     {
         Tone::Warn
     } else if kind.contains("healthy")
