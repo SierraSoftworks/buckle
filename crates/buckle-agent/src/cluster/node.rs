@@ -141,34 +141,64 @@ impl Executor {
             return Ok(unregistered(access.target, &names));
         };
         let name = node.name.as_str();
-        let mut note = String::new();
-        let changed = match task.op {
-            NodeOp::Undrain => nodes::uncordon(&kube, &node).await?,
-            NodeOp::Drain => match nodes::drain(&kube, &node).await? {
-                Some(d) => {
-                    note = format!(
-                        " ({} pods evicted, {} held by a disruption budget)",
-                        d.evicted, d.held
-                    );
-                    true
+        // A drain Buckle has under way goes on whenever the node is read,
+        // as Nomad's drainer carries on its own (`nodes::proceed`).
+        let (changed, drained) = match task.op {
+            NodeOp::Undrain => (nodes::uncordon(&kube, &node).await?, None),
+            NodeOp::Drain => {
+                let deadline = task.deadline.unwrap_or(DRAIN_DEADLINE);
+                match nodes::drain(&kube, &node, deadline).await? {
+                    Some(d) => (true, Some(d)),
+                    None => (false, nodes::proceed(&kube, &node).await?),
                 }
-                None => false,
-            },
-            NodeOp::Status | NodeOp::Join => false,
+            }
+            NodeOp::Status => (false, nodes::proceed(&kube, &node).await?),
+            NodeOp::Join => (false, None),
         };
         let schedulable = match changed {
             true => task.op == NodeOp::Undrain,
             false => node.schedulable,
         };
+        let summary = match (drained, changed) {
+            (Some(d), false) => format!("draining {name} on {}{}", access.target, progress(&d)),
+            (Some(d), true) => summary(task.op, changed, name, access.target) + &progress(&d),
+            (None, _) => summary(task.op, changed, name, access.target),
+        };
         Ok(NodeReply {
             registered: true,
             eligible: schedulable,
-            draining: false,
+            draining: drained.is_some_and(|d| !d.done()),
             changed,
-            summary: summary(task.op, changed, name, access.target) + &note,
+            summary,
             pool: String::new(),
             token: None,
         })
+    }
+}
+
+/// How a Kubernetes drain stands, for the reply's summary.
+fn progress(d: &buckle_kube::nodes::Drained) -> String {
+    let mut parts = Vec::new();
+    if d.evicted > 0 {
+        parts.push(format!("{} evicted", pods(d.evicted)));
+    }
+    if d.deleted > 0 {
+        parts.push(format!("{} deleted past the deadline", pods(d.deleted)));
+    }
+    if d.held > 0 {
+        parts.push(format!("{} held by a disruption budget", pods(d.held)));
+    }
+    parts.push(match d.remaining {
+        0 => "nothing left to move".to_owned(),
+        n => format!("{} still on the node", pods(n)),
+    });
+    format!(" ({})", parts.join(", "))
+}
+
+fn pods(n: usize) -> String {
+    match n {
+        1 => "1 pod".to_owned(),
+        n => format!("{n} pods"),
     }
 }
 

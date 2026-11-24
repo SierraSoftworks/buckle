@@ -1281,6 +1281,79 @@ async fn a_steward_finds_a_node_named_by_the_hosts_dns_name() {
     assert!(!other.registered, "a short name alone does not reach it");
 }
 
+/// A Kubernetes steward reports a drain as under way until the node's pods
+/// are gone, as Nomad reports its own: a rollout reading the node keeps the
+/// drain going (asking again for what a disruption budget held) and applies
+/// only once the node is empty.
+#[tokio::test]
+async fn a_kubernetes_drain_is_under_way_until_the_node_is_empty() {
+    use buckle_core::task::NodeOp;
+    let fake = buckle_kube::testing::FakeKube::new();
+    fake.insert(serde_json::json!({
+        "apiVersion": "v1", "kind": "Node",
+        "metadata": {"name": "web-1"},
+        "spec": {},
+    }));
+    fake.insert(serde_json::json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "db", "namespace": "default", "annotations": {"fake/pdb": "held"}},
+        "spec": {"nodeName": "web-1"},
+    }));
+    let ex = Executor::new(Arc::new(Issuing), Arc::new(KubeFake(fake.clone())));
+    let a = kube_assignment(revision("r1", &[]), ClusterIdentity::BuckleJwt);
+    let ask = |op| {
+        let ex = &ex;
+        let a = &a;
+        async move {
+            ex.node(
+                access(a),
+                node::NodeTask {
+                    deadline: Some(std::time::Duration::from_secs(600)),
+                    ..node_task(op, "web-1")
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let before = ask(NodeOp::Status).await;
+    assert!(before.eligible && !before.draining);
+
+    let started = ask(NodeOp::Drain).await;
+    assert!(started.changed && !started.eligible && started.draining);
+    assert!(
+        started
+            .summary
+            .contains("1 pod held by a disruption budget"),
+        "{}",
+        started.summary
+    );
+
+    // Read again (the rollout's poll), and drained again (a retried row):
+    // still under way while the budget holds the pod.
+    let polled = ask(NodeOp::Status).await;
+    assert!(!polled.changed && polled.draining, "{}", polled.summary);
+    let again = ask(NodeOp::Drain).await;
+    assert!(!again.changed && again.draining, "{}", again.summary);
+
+    fake.edit(
+        "v1",
+        "Pod",
+        "default",
+        "db",
+        "kubectl",
+        serde_json::json!({"metadata": {"annotations": {"fake/pdb": null}}}),
+    );
+    let evicted = ask(NodeOp::Status).await;
+    assert!(evicted.draining, "the evicted pod is still shutting down");
+    let done = ask(NodeOp::Status).await;
+    assert!(!done.draining && !done.eligible, "{}", done.summary);
+
+    let undrained = ask(NodeOp::Undrain).await;
+    assert!(undrained.changed && undrained.eligible && !undrained.draining);
+}
+
 #[tokio::test]
 async fn a_scoped_target_has_no_nodes_to_act_on() {
     let fake = FakeNomad::new();

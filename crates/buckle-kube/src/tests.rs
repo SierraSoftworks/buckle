@@ -805,11 +805,12 @@ fn pod_on(node: &str, name: &str, extra: Value) -> Value {
 }
 
 /// A drain cordons the node and asks its pods to leave, except the ones
-/// that belong on every node; a second one finds nothing to do, and an
-/// uncordon hands the node back.
+/// that belong on every node; it goes on until the node is empty, asking
+/// again for what a disruption budget held, and an uncordon hands the node
+/// back.
 #[tokio::test]
-async fn a_node_is_drained_once_and_handed_back() {
-    use crate::nodes;
+async fn a_node_is_drained_until_its_pods_are_gone_and_handed_back() {
+    use crate::nodes::{self, Drained};
     let fake = FakeKube::new();
     node_fixture(&fake, "web-1", false);
     fake.insert(pod_on("web-1", "site", json!({})));
@@ -825,29 +826,219 @@ async fn a_node_is_drained_once_and_handed_back() {
     ));
     fake.insert(pod_on("web-2", "elsewhere", json!({})));
     let kube = fake.client();
+    let pod = |name: &str| fake.object("v1", "Pod", "default", name);
 
     let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
-    let drained = nodes::drain(&kube, &node).await.unwrap();
-
+    assert_eq!(node.drain_deadline, None);
+    let drained = nodes::drain(&kube, &node, Duration::from_secs(600))
+        .await
+        .unwrap();
     assert_eq!(
         drained,
-        Some(nodes::Drained {
+        Some(Drained {
             evicted: 1,
-            held: 1
+            held: 1,
+            deleted: 0,
+            remaining: 2,
         })
     );
-    let pod = |name: &str| fake.object("v1", "Pod", "default", name);
     assert!(pod("site").is_none());
     assert!(pod("db").is_some() && pod("logs").is_some() && pod("elsewhere").is_some());
+
+    // Cordoned, with the deadline it was given; a second drain starts nothing.
     let cordoned = nodes::find(&kube, "web-1").await.unwrap().unwrap();
     assert!(!cordoned.schedulable);
-    assert_eq!(nodes::drain(&kube, &cordoned).await.unwrap(), None);
+    let deadline = cordoned.drain_deadline.expect("a drain under way");
+    let left = deadline - chrono::Utc::now();
+    assert!(left > chrono::Duration::minutes(9) && left <= chrono::Duration::minutes(10));
+    assert_eq!(
+        nodes::drain(&kube, &cordoned, Duration::from_secs(600))
+            .await
+            .unwrap(),
+        None
+    );
 
-    assert!(nodes::uncordon(&kube, &cordoned).await.unwrap());
+    // The budget still holds the database: the drain waits.
+    let still = nodes::proceed(&kube, &cordoned).await.unwrap().unwrap();
+    assert_eq!((still.held, still.remaining), (1, 1));
+    assert!(!still.done());
+
+    // Once the budget allows it, the pod is asked again and leaves.
+    fake.edit(
+        "v1",
+        "Pod",
+        "default",
+        "db",
+        "kubectl",
+        json!({"metadata": {"annotations": {"fake/pdb": null}}}),
+    );
+    let moved = nodes::proceed(&kube, &cordoned).await.unwrap().unwrap();
+    assert_eq!((moved.evicted, moved.held), (1, 0));
+    assert!(pod("db").is_none());
+    let empty = nodes::proceed(&kube, &cordoned).await.unwrap().unwrap();
+    assert!(empty.done());
+
+    // Done: the node stays cordoned, without the drain's mark.
+    let drained = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(!drained.schedulable);
+    assert_eq!(drained.drain_deadline, None);
+    assert_eq!(nodes::proceed(&kube, &drained).await.unwrap(), None);
+
+    assert!(nodes::uncordon(&kube, &drained).await.unwrap());
     let back = nodes::find(&kube, "web-1").await.unwrap().unwrap();
     assert!(back.schedulable);
     assert!(!nodes::uncordon(&kube, &back).await.unwrap());
     assert_eq!(nodes::find(&kube, "web-9").await.unwrap(), None);
+}
+
+/// A node that has nothing to move is drained in one go: no mark is left.
+#[tokio::test]
+async fn an_empty_node_is_drained_at_once() {
+    use crate::nodes;
+    let fake = FakeKube::new();
+    node_fixture(&fake, "web-1", false);
+    fake.insert(pod_on(
+        "web-1",
+        "logs",
+        json!({"ownerReferences": [{"kind": "DaemonSet", "name": "logs"}]}),
+    ));
+    let mut done = pod_on("web-1", "job", json!({}));
+    done["status"] = json!({"phase": "Succeeded"});
+    fake.insert(done);
+    let kube = fake.client();
+
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    let drained = nodes::drain(&kube, &node, Duration::from_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(drained.done());
+    assert_eq!(drained.evicted, 0);
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(!node.schedulable);
+    assert_eq!(node.drain_deadline, None);
+}
+
+/// A pod already shutting down is waited for, not asked again.
+#[tokio::test]
+async fn a_pod_shutting_down_is_waited_for() {
+    use crate::nodes;
+    let fake = FakeKube::new();
+    node_fixture(&fake, "web-1", false);
+    fake.insert(pod_on(
+        "web-1",
+        "site",
+        json!({"deletionTimestamp": "2026-01-01T00:00:00Z"}),
+    ));
+    let kube = fake.client();
+
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    let drained = nodes::drain(&kube, &node, Duration::from_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((drained.evicted, drained.remaining), (0, 1));
+    assert!(fake.object("v1", "Pod", "default", "site").is_some());
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|(_, path)| path.ends_with("/eviction"))
+    );
+
+    fake.client()
+        .delete("/api/v1/namespaces/default/pods/site")
+        .await
+        .unwrap();
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(nodes::proceed(&kube, &node).await.unwrap().unwrap().done());
+}
+
+/// Past its deadline a drain deletes what is left, disruption budget or
+/// not, as Nomad stops what is left past its own.
+#[tokio::test]
+async fn past_the_deadline_what_is_left_is_deleted() {
+    use crate::nodes;
+    let fake = FakeKube::new();
+    node_fixture(&fake, "web-1", false);
+    fake.insert(pod_on(
+        "web-1",
+        "db",
+        json!({"annotations": {"fake/pdb": "held"}}),
+    ));
+    let kube = fake.client();
+
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    let first = nodes::drain(&kube, &node, Duration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((first.held, first.deleted), (1, 0));
+
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    let forced = nodes::proceed(&kube, &node).await.unwrap().unwrap();
+    assert_eq!((forced.deleted, forced.held), (1, 0));
+    assert!(fake.object("v1", "Pod", "default", "db").is_none());
+    assert!(
+        fake.requests().iter().any(
+            |(m, path)| m == "DELETE" && path.starts_with("/api/v1/namespaces/default/pods/db")
+        )
+    );
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(nodes::proceed(&kube, &node).await.unwrap().unwrap().done());
+}
+
+/// Uncordoning a node mid-drain ends the drain: its mark goes too, and
+/// nothing more is asked to leave.
+#[tokio::test]
+async fn an_uncordon_ends_a_drain() {
+    use crate::nodes;
+    let fake = FakeKube::new();
+    node_fixture(&fake, "web-1", false);
+    fake.insert(pod_on(
+        "web-1",
+        "db",
+        json!({"annotations": {"fake/pdb": "held"}}),
+    ));
+    let kube = fake.client();
+
+    let node = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    nodes::drain(&kube, &node, Duration::from_secs(600))
+        .await
+        .unwrap();
+    let cordoned = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(nodes::uncordon(&kube, &cordoned).await.unwrap());
+    let back = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(back.schedulable);
+    assert_eq!(back.drain_deadline, None);
+    assert_eq!(nodes::proceed(&kube, &back).await.unwrap(), None);
+
+    // By hand (`kubectl uncordon`): the mark stays until the steward reads
+    // the node, and the drain ends then.
+    nodes::drain(&kube, &back, Duration::from_secs(600))
+        .await
+        .unwrap();
+    fake.edit(
+        "v1",
+        "Node",
+        "",
+        "web-1",
+        "kubectl",
+        json!({"spec": {"unschedulable": null}}),
+    );
+    let by_hand = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert!(by_hand.schedulable && by_hand.drain_deadline.is_some());
+    let evictions = |f: &FakeKube| {
+        f.requests()
+            .iter()
+            .filter(|(_, path)| path.ends_with("/eviction"))
+            .count()
+    };
+    let before = evictions(&fake);
+    assert_eq!(nodes::proceed(&kube, &by_hand).await.unwrap(), None);
+    assert_eq!(evictions(&fake), before);
+    let after = nodes::find(&kube, "web-1").await.unwrap().unwrap();
+    assert_eq!(after.drain_deadline, None);
 }
 
 #[tokio::test]

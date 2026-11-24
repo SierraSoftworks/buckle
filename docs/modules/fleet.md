@@ -230,11 +230,15 @@ disrupts: node   # a run that changes this module restarts what the node's pods 
 - **Who drains**: the cluster's [steward](#stewards), with its `node` credential, as for a
   [`cluster.node`](./tasks/commands.md#cluster-node) task; the host holds no cluster credential.
   The steward may be the host itself (a k3s server draining its own node).
-- **`deadline`**: how long the node's work gets to move (Nomad's drain deadline, after which it
-  stops what is left; default `1h`). The rollout waits that long, and two minutes more, for the
-  drain to finish before it fails the host. A Kubernetes drain cordons the node and asks each pod
-  to leave (not DaemonSet or static pods) once; it does not wait for the pods to be gone, and a
-  pod a disruption budget holds stays.
+- **`deadline`**: how long the node's work gets to move (default `1h`). The rollout waits for the
+  drain to finish, that long and two minutes more, before it fails the host.
+  - **Nomad**: the drain's deadline, after which Nomad stops what is left.
+  - **Kubernetes**: the steward cordons the node and asks each pod to leave (not DaemonSet or
+    static pods), then, every time the rollout reads the node, asks again for the pods a
+    disruption budget held. The drain is done once only DaemonSet, static and finished pods are
+    left, pods still shutting down included. Past the deadline the steward deletes what is left,
+    budget or not, as Nomad does; each pod keeps its termination grace period. While the drain
+    runs the node carries the annotation `buckle.sierrasoftworks.com/drain-deadline`.
 - **Not a task**: a `cluster.node` task or handler that drains or undrains a node of such a
   cluster would undo the rollout's drain in the middle of a run, so `buckle validate` refuses it.
   Actions may still drain or undrain on demand.

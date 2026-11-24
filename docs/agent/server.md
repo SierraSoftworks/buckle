@@ -388,8 +388,8 @@ same steward with the same credential, so it needs nothing more.
   Introduction tokens only gate joining once the servers set
   `client_introduction { enforcement = "strict" }`.
 - **Kubernetes**: bind the group `buckle:node` to a ClusterRole that may `get` and `patch`
-  `nodes`, `list` `pods`, `create` `pods/eviction`, and a Role in `kube-system` that may `create`
-  `secrets` (bootstrap tokens).
+  `nodes`, `list` and `delete` `pods` (a drain past its deadline), `create` `pods/eviction`, and
+  a Role in `kube-system` that may `create` `secrets` (bootstrap tokens).
 - **`drain`**: the older purpose that handed a node's own host `node:write` through
   `command.run`. Once a fleet's modules use `cluster.node`, delete its binding rule and policy;
   the server keeps issuing it until then.
