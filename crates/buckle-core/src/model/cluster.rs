@@ -284,6 +284,71 @@ pub struct ClusterDecl {
     /// scheduler's default pool.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools: Vec<ClusterPool>,
+    /// What a rollout does with a host's node of this cluster around a run
+    /// that disrupts the node's work: take it out of scheduling first, and
+    /// hand it back once the host is healthy. Absent: nothing (`never`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<NodeMaintenance>,
+}
+
+/// `maintenance` on a cluster: whether a rollout drains a host's node
+/// before it applies a run that disrupts the node, and how long the node's
+/// work gets to move. The cluster's steward drains and undrains the node,
+/// as for a `cluster.node` task; the host holds no cluster credential.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeMaintenance {
+    #[serde(default)]
+    pub drain: DrainPolicy,
+    /// How long the node's work gets to move before the scheduler stops
+    /// it. Absent: the steward's default (one hour).
+    #[serde(
+        default,
+        with = "humantime_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deadline: Option<std::time::Duration>,
+}
+
+/// Which runs take a host's node out of scheduling first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DrainPolicy {
+    /// None: the node keeps its work through every run.
+    #[default]
+    Never,
+    /// Runs that reboot the host, or change a module marked
+    /// `disrupts: node`.
+    Disruptive,
+    /// Every run that changes something on the host.
+    Always,
+}
+
+impl DrainPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DrainPolicy::Never => "never",
+            DrainPolicy::Disruptive => "disruptive",
+            DrainPolicy::Always => "always",
+        }
+    }
+
+    /// Whether a run drains the node first: `changes` says whether it
+    /// changes anything at all, `disruptions` why it disrupts the node
+    /// (see [`crate::engine::maintenance`]).
+    pub fn drains(self, changes: bool, disruptions: &[String]) -> bool {
+        match self {
+            DrainPolicy::Never => false,
+            DrainPolicy::Disruptive => changes && !disruptions.is_empty(),
+            DrainPolicy::Always => changes,
+        }
+    }
+}
+
+impl std::fmt::Display for DrainPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// One entry of a cluster's `pools`: a pool's name, or a name with the
@@ -465,6 +530,15 @@ impl ClusterDecl {
             .map_or(PoolChoice::Refused, |p| PoolChoice::Named(&p.name))
     }
 
+    /// How a rollout drains this cluster's nodes, when it drains them at
+    /// all: a cluster with `nodes` of its own (not a scoped target) whose
+    /// `maintenance.drain` is not `never`.
+    pub fn drains(&self) -> Option<&NodeMaintenance> {
+        self.maintenance.as_ref().filter(|m| {
+            m.drain != DrainPolicy::Never && self.cluster.is_none() && self.nodes.is_some()
+        })
+    }
+
     /// The labels as text, the way host labels travel (`true`, `3`, `home`).
     pub fn text_labels(&self) -> std::collections::BTreeMap<String, String> {
         self.labels
@@ -587,5 +661,50 @@ labels: { cluster: home, canary: true, rank: 3 }
     fn unknown_fields_are_rejected() {
         assert!(serde_yaml::from_str::<ClusterDecl>("kind: nomad\ntoken: abc\n").is_err());
         assert!(serde_yaml::from_str::<ClusterDecl>("kind: swarm\n").is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::disruptive("drain: disruptive\n    deadline: 10m", Some((DrainPolicy::Disruptive, Some(600))))]
+    #[case::always("drain: always", Some((DrainPolicy::Always, None)))]
+    // Written but `never`: today's behaviour, nothing is drained.
+    #[case::never("drain: never", None)]
+    #[case::only_a_deadline("deadline: 5m", None)]
+    fn maintenance_says_which_runs_drain_the_node(
+        #[case] maintenance: &str,
+        #[case] drains: Option<(DrainPolicy, Option<u64>)>,
+    ) {
+        let decl: ClusterDecl = serde_yaml::from_str(&format!(
+            "kind: kubernetes\nnodes: 'host.groups contains \"k3s\"'\nmaintenance:\n    {maintenance}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            decl.drains()
+                .map(|m| (m.drain, m.deadline.map(|d| d.as_secs()))),
+            drains
+        );
+    }
+
+    #[test]
+    fn a_cluster_drains_nothing_without_nodes_or_maintenance() {
+        let without_maintenance: ClusterDecl =
+            serde_yaml::from_str("kind: nomad\nnodes: 'true'\n").unwrap();
+        assert!(without_maintenance.drains().is_none());
+        let without_nodes: ClusterDecl = serde_yaml::from_str(
+            "kind: nomad\nexecutors: 'true'\nmaintenance: { drain: always }\n",
+        )
+        .unwrap();
+        assert!(without_nodes.drains().is_none());
+        assert!(
+            serde_yaml::from_str::<ClusterDecl>(
+                "kind: nomad\nnodes: 'true'\nmaintenance: { drain: sometimes }\n"
+            )
+            .is_err()
+        );
+        assert!(
+            serde_yaml::from_str::<ClusterDecl>(
+                "kind: nomad\nnodes: 'true'\nmaintenance: { drain: always, grace: 1m }\n"
+            )
+            .is_err()
+        );
     }
 }

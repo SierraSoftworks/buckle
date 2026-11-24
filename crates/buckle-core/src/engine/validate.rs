@@ -444,13 +444,16 @@ pub fn validate(revision: &Revision) -> crate::Result<ValidationReport> {
             } else if let Some(problem) = command_run_templated_without_id(decl) {
                 report.warning(Some(name), &location, problem);
             }
+            if let Some(problem) = cluster_node_maintenance_problem(decl, &revision.fleet) {
+                report.error(Some(name), &location, problem);
+            }
         }
         for (hname, decl) in &m.config.handlers {
-            check_decl(
-                &mut report,
-                decl,
-                &format!("{file} handlers.{hname} ({})", decl.kind),
-            );
+            let location = format!("{file} handlers.{hname} ({})", decl.kind);
+            check_decl(&mut report, decl, &location);
+            if let Some(problem) = cluster_node_maintenance_problem(decl, &revision.fleet) {
+                report.error(Some(name), &location, problem);
+            }
         }
         for (aname, action) in &m.config.actions {
             let location = format!("{file} actions.{aname} ({})", action.task.kind);
@@ -647,6 +650,30 @@ pub fn cluster_node_problem(decl: &TaskDecl, fleet: &crate::model::FleetConfig) 
             "names the cluster '{cluster}', which fleet.clusters does not declare"
         )),
     }
+}
+
+/// A `cluster.node` task (or handler) that drains or undrains the node of
+/// a cluster whose `maintenance` drains it: rollouts already take the node
+/// out of scheduling and hand it back. The task would undo that in the
+/// middle of a run (an undrain before the reboot), and would change the
+/// host's plan between its approval and its apply. An action may still do
+/// either on demand.
+pub fn cluster_node_maintenance_problem(
+    decl: &TaskDecl,
+    fleet: &crate::model::FleetConfig,
+) -> Option<String> {
+    if decl.kind != "cluster.node" {
+        return None;
+    }
+    let spec = decl.spec.as_mapping()?;
+    let field = |key: &str| spec.get(serde_yaml::Value::String(key.into()))?.as_str();
+    let op = field("op").filter(|op| matches!(*op, "drain" | "undrain"))?;
+    let cluster = field("cluster")?;
+    let maintenance = fleet.fleet.clusters.get(cluster)?.drains()?;
+    Some(format!(
+        "{op}s the node of '{cluster}', whose `maintenance.drain: {}` already has rollouts drain the node before a run that disrupts it and hand it back once the host is healthy; remove the task (an action may still {op} it on demand)",
+        maintenance.drain
+    ))
 }
 
 /// A `command.run` whose `run` is templated and has no `id` is re-keyed
@@ -1047,6 +1074,66 @@ mod cluster_node_tests {
                 "{found:?}"
             ),
             None => assert_eq!(found, None),
+        }
+    }
+
+    const MAINTAINED: &str = "version: 2\nfleet:\n  clusters:\n    k3s: { kind: kubernetes, nodes: 'true', maintenance: { drain: disruptive, deadline: 10m } }\n    plain: { kind: nomad, nodes: 'true' }\n";
+
+    fn revision_errors(module: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("buckle.yaml"), MAINTAINED).unwrap();
+        let path = dir.path().join("modules/k3s/module.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, module).unwrap();
+        let rev =
+            super::super::loader::load_dir(dir.path(), crate::plan::RevisionId::new("r1")).unwrap();
+        // The core knows no task kinds of its own: only the drain matters.
+        validate(&rev)
+            .unwrap()
+            .errors
+            .into_iter()
+            .map(|e| e.to_string())
+            .filter(|e| e.contains("maintenance"))
+            .collect()
+    }
+
+    /// The rollout drains and undrains the node of a cluster with
+    /// `maintenance`: a task (or handler) doing the same would undo it in
+    /// the middle of the run. An action, run on demand, may.
+    #[rstest]
+    #[case::undrain_task(
+        "name: k3s\ndisrupts: node\ntasks:\n  - cluster.node: { cluster: k3s, op: undrain }\n",
+        Some("tasks[0]")
+    )]
+    #[case::drain_handler(
+        "name: k3s\nhandlers:\n  drain: { cluster.node: { cluster: k3s, op: drain } }\n",
+        Some("handlers.drain")
+    )]
+    #[case::an_action(
+        "name: k3s\nactions:\n  undrain: { cluster.node: { cluster: k3s, op: undrain } }\n",
+        None
+    )]
+    #[case::a_cluster_without_maintenance(
+        "name: k3s\ntasks:\n  - cluster.node: { cluster: plain, op: undrain }\n",
+        None
+    )]
+    #[case::a_join(
+        "name: k3s\ntasks:\n  - cluster.node: { cluster: k3s, op: join, dest: /etc/k3s/token }\n",
+        None
+    )]
+    fn a_node_task_does_not_fight_the_rollouts_drain(
+        #[case] module: &str,
+        #[case] problem: Option<&str>,
+    ) {
+        let errors = revision_errors(module);
+        match problem {
+            Some(location) => assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains(location) && e.contains("maintenance.drain: disruptive")),
+                "{errors:#?}"
+            ),
+            None => assert!(errors.is_empty(), "{errors:#?}"),
         }
     }
 }
