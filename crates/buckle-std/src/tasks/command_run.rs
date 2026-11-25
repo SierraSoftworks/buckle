@@ -50,8 +50,8 @@ use tracing::instrument;
 /// **Planning.** `creates` existing, `unless` exiting 0 or `only_if` exiting
 /// non-zero all make the plan a no-op. The `unless` and `only_if` probes run in
 /// plan mode too, so they must be read-only. A command with none of `creates`,
-/// `unless` or `changed_when` is planned as `always runs: <command>` so the
-/// author sees the smell; the plan of such a task is never a no-op.
+/// `unless`, `only_if` or `changed_when` is planned as `always runs: <command>`
+/// so the author sees the smell; the plan of such a task is never a no-op.
 ///
 /// **Applying.** The command runs and fails the task on a non-zero exit (except
 /// when `changed_when: exit:<code>` names that code). `changed_when` decides
@@ -359,7 +359,10 @@ fn user_wrapper_tool(platform: buckle_core::Platform) -> Option<&'static str> {
 
 /// Whether the plan of this task is "always runs": no guard says when it is done.
 pub fn always_runs(spec: &Spec) -> bool {
-    spec.creates.is_none() && spec.unless.is_none() && spec.changed_when.is_none()
+    spec.creates.is_none()
+        && spec.unless.is_none()
+        && spec.only_if.is_none()
+        && spec.changed_when.is_none()
 }
 
 impl CommandRun {
@@ -769,6 +772,8 @@ mod tests {
         assert!(always_runs(&s(json!({}))));
         assert!(!always_runs(&s(json!({"creates": "/x"}))));
         assert!(!always_runs(&s(json!({"changed_when": "never"}))));
+        assert!(!always_runs(&s(json!({"unless": ["probe"]}))));
+        assert!(!always_runs(&s(json!({"only_if": ["cond"]}))));
         let guarded = CommandRun
             .plan(&cx(&sys), &s(json!({"creates": "/x"})))
             .await

@@ -575,7 +575,7 @@ pub struct Step {
     pub planned: Planned,               // NoOp | Change { diff } | Blocked { reason }
     pub locks: Vec&lt;String&gt;,
     pub notifies: Vec&lt;String&gt;,          // handlers notified when the step changes something
-    pub always_runs: bool,              // a command.run with no creates/unless/changed_when
+    pub always_runs: bool,              // a command.run with no creates/unless/only_if/changed_when
     pub removal: RemovalPolicy,         // task &gt; module &gt; kind
 }
 
@@ -620,7 +620,7 @@ pub enum Diff {
 <li>Retries are per task (<code>retry: { limit: 3, delay: 5s }</code>), kept from v1 but moved to the task level where transient failures actually happen (downloads, apt locks).</li>
 <li><b>Health settle.</b> A module's checks run as soon as it and its handlers complete (the providers it declares in <code>facts.provides</code> are refreshed first, and the checks see the facts refreshed so far, not the plan-time snapshot), so a failure is attributed to the module that caused it. When the module changed something, a failing required check is re-run at its <code>interval</code> until <code>settle</code> (default 2 m) has elapsed since its first failure, so a restarting service is not blamed; failing past that marks the module unhealthy and triggers the rollback above. A module that changed nothing runs its checks once and reports them without gating, since nothing this run did can have broken it, and waived checks (a <em>continue</em>) report but no longer count. The agent then keeps checking for the bake window after the whole run, and the same rollback applies if a required check fails past <code>settle</code> there (section <a href="#protocol">08</a>). The server treats unhealthy like failed for rollout purposes.</li>
 <li><b>Plan errors and blocked steps</b> do not halt the run (nothing of the module ran); they make it unsuccessful: <code>failed</code> for a module that could not be planned, <code>needs_attention</code> for blocked steps.</li>
-<li><code>command.run</code> is the escape hatch and is designed to stay plannable: <code>creates:</code>, <code>unless:</code> (a probe that runs in plan mode) or <code>changed_when:</code> make it idempotent, and a command without any of them is reported in the plan as <em>always runs</em> so the author sees the smell.</li>
+<li><code>command.run</code> is the escape hatch and is designed to stay plannable: <code>creates:</code>, the plan-mode probes <code>unless:</code> and <code>only_if:</code>, or <code>changed_when:</code> make it idempotent, and a command without any of them is reported in the plan as <em>always runs</em> so the author sees the smell.</li>
 </ul>
 </section>
 
@@ -649,7 +649,7 @@ pub trait Task: Send + Sync + 'static {
     fn describe(spec: &amp;Self::Spec) -> String { Self::key(spec) }
     /// The locks this spec needs; by default `LOCKS`.
     fn locks(spec: &amp;Self::Spec) -> Vec&lt;String&gt;;
-    /// True for a task with no idempotency guard (command.run without creates, unless or changed_when).
+    /// True for a task with no idempotency guard (command.run without creates, unless, only_if or changed_when).
     fn always_runs(spec: &amp;Self::Spec) -> bool { false }
 
     /// Inspect the system. Pure: no writes (the plan-mode guard enforces it). Returns NoOp, Change(diff) or Blocked(reason).
