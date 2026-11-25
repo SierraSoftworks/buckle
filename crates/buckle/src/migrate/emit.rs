@@ -467,7 +467,7 @@ fn emit_module(
         let src = format!("{script_dir}/{}", script.name);
         let dest = format!("{HOST_SCRIPT_DIR}/{}/{}", package.id, script.name);
         tasks.push_str(&todo("  ", &format!(
-            "v1 ran {} on every apply, after the files. Add `creates:`, `unless:` or `changed_when:` to the command so v2 can plan it as a no-op.",
+            "v1 ran {} on every apply, after the files. Add `creates:`, `unless:`, `only_if:` or `changed_when:` to the command so v2 can plan it as a no-op.",
             script.name
         )));
         if script.interpreter != "bash" {

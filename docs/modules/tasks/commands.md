@@ -13,7 +13,7 @@ Buckle how to know whether it needs to run:
 
 `changed_when` (`always`, `never`, `output_contains:<text>` or `exit:<code>`) decides whether a run
 counts as a change, which is what fires handlers. `unless` and `only_if` also run while planning, so they must be read-only. A command with none of
-`creates`, `unless` or `changed_when` is planned as **always runs**, which every plan shows.
+`creates`, `unless`, `only_if` or `changed_when` is planned as **always runs**, which every plan shows.
 
 ```yaml
 # Join the tailnet once. The key only ever exists in the process environment.

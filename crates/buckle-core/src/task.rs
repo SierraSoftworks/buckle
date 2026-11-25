@@ -317,8 +317,8 @@ pub trait Task: Send + Sync + 'static {
     }
 
     /// Whether this task runs on every apply because it has no idempotency
-    /// guard (a `command.run` without `creates`, `unless` or `changed_when`).
-    /// Plans flag such steps so the author sees the smell.
+    /// guard (a `command.run` without `creates`, `unless`, `only_if` or
+    /// `changed_when`). Plans flag such steps so the author sees the smell.
     fn always_runs(spec: &Self::Spec) -> bool {
         let _ = spec;
         false

@@ -1851,7 +1851,7 @@ pub(super) fn warnings(plan: &Plan) -> Vec<String> {
     for step in plan.steps() {
         if step.always_runs {
             out.push(format!(
-                "{} always runs: it has no idempotency guard (creates, unless or changed_when)",
+                "{} always runs: it has no idempotency guard (creates, unless, only_if or changed_when)",
                 step.resource
             ));
         }

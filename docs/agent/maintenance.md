@@ -71,8 +71,8 @@ Wrote 6 files to ./fleet.
 ```yaml
 # modules/svc/module.yaml (excerpt)
 tasks:
-  # TODO(migrate): v1 ran 10-install.sh on every apply, after the files. Add `creates:`, `unless:`
-  # or `changed_when:` to the command so v2 can plan it as a no-op.
+  # TODO(migrate): v1 ran 10-install.sh on every apply, after the files. Add `creates:`, `unless:`,
+  # `only_if:` or `changed_when:` to the command so v2 can plan it as a no-op.
   - file.copy:
       src: "_scripts/10-install.sh"
       dest: "/var/lib/buckle/scripts/svc/10-install.sh"
